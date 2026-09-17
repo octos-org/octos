@@ -50,7 +50,8 @@ use chrono::{DateTime, NaiveDate, Utc};
 use libc::c_char;
 use octos_agent::{
     Agent, AgentConfig, ConversationResponse, GlobTool, GrepTool, IncompleteResponseError,
-    ListDirTool, ReadFileTool, ShellTool, ToolRegistry, WriteFileTool,
+    ListDirTool, MemoryLoadTool, MemorySearchTool, ReadFileTool, ShellTool, ToolRegistry,
+    WriteFileTool,
 };
 use octos_cli::commands::chat::create_provider_with_api_type;
 use octos_cli::config::Config;
@@ -59,8 +60,8 @@ use octos_core::{AgentId, MessageRole};
 use octos_llm::EmbeddingProvider;
 use octos_llm::LlmProvider;
 use octos_memory::{
-    DEFAULT_RECALL_DIMENSION, EpisodeStore, RecallConfig, RecallStore, Record, RecordKind,
-    SearchFilter, Trust,
+    DEFAULT_RECALL_DIMENSION, EpisodeStore, MemoryStore, RecallConfig, RecallStore, Record,
+    RecordKind, SearchFilter, Trust,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -509,6 +510,10 @@ pub struct OctosRuntime {
     /// `recall-index/` beside `episodes.redb`. Internally `RwLock`-guarded, so
     /// the uniffi facade may call it from several threads.
     recall: Arc<RecallStore>,
+    /// The directory both stores were opened in (the caller's `data_dir` or
+    /// the scratch dir). The agent's `memory_load` tool reads Knowledge pages
+    /// from the markdown bank under `<mem_dir>/memory`.
+    mem_dir: PathBuf,
     cwd: PathBuf,
     allow_shell: bool,
     default_max_iterations: u32,
@@ -698,6 +703,7 @@ impl OctosRuntime {
             llm,
             memory,
             recall,
+            mem_dir,
             cwd,
             allow_shell: cfg.allow_shell,
             default_max_iterations,
@@ -811,9 +817,13 @@ impl OctosRuntime {
     /// usage counters (`visits`, `last_visit`, `promoted`) are kernel-owned and
     /// reset (the store keeps the existing ones on re-ingest). When `vectors`
     /// is given its length must equal `records`'. When it is absent, `embed` is
-    /// true (the default) and an embedder is loaded, `Record::index_text()` is
-    /// embedded in batches of 16; without an embedder the records are indexed
-    /// BM25-only. The HNSW graph is persisted after the batch.
+    /// true (the default) and an embedder is loaded, the store is first asked
+    /// which records need a vector (`RecallStore::needs_vectors`: new id,
+    /// changed fingerprint / index text, or no usable stored vector) and only
+    /// those records' `Record::index_text()` are embedded, in batches of 16 —
+    /// re-submitting an unchanged batch embeds nothing and reports
+    /// `embedded: 0`. Without an embedder the records are indexed BM25-only.
+    /// The HNSW graph is persisted after the batch.
     pub fn memory_upsert(&self, json: &str) -> Result<String, CoreError> {
         let req: MemoryUpsertRequest = serde_json::from_str(json)
             .map_err(|e| self.memory_err(format!("invalid upsert json: {e}")))?;
@@ -853,13 +863,13 @@ impl OctosRuntime {
                 v
             }
             None if req.embed && self.has_embedder() && !records.is_empty() => {
-                let texts: Vec<String> = records.iter().map(Record::index_text).collect();
-                let mut out = Vec::with_capacity(records.len());
-                for chunk in texts.chunks(EMBED_BATCH) {
-                    let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
-                    out.extend(self.embed_batch(&refs)?.into_iter().map(Some));
-                }
-                embedded = out.len();
+                let needs = self
+                    .recall
+                    .needs_vectors(&records)
+                    .map_err(|e| self.memory_err(format!("memory vector probe failed: {e}")))?;
+                let (out, count) =
+                    embed_flagged(&records, &needs, |texts| self.embed_batch(texts))?;
+                embedded = count;
                 out
             }
             None => vec![None; records.len()],
@@ -962,9 +972,28 @@ impl OctosRuntime {
             .map_err(|e| self.memory_err(format!("serialize stats: {e}")))
     }
 
-    /// Build a fresh agent with a cwd-scoped FS toolset.
+    /// The runtime's embedder as a shared `EmbeddingProvider`, when the
+    /// `embed-llama` feature is on and a model was configured; `None`
+    /// otherwise (the memory tools then rank BM25-only).
+    fn embedding_provider(&self) -> Option<Arc<dyn octos_llm::EmbeddingProvider>> {
+        #[cfg(feature = "embed-llama")]
+        {
+            self.embedder
+                .clone()
+                .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>)
+        }
+        #[cfg(not(feature = "embed-llama"))]
+        {
+            None
+        }
+    }
+
+    /// Build a fresh agent with a cwd-scoped FS toolset plus the two-stage
+    /// memory retrieval tools (`memory_search` / `memory_load`) over this
+    /// runtime's Recall store, and the store attached so saved episodes are
+    /// mirrored into it.
     fn build_agent(&self, max_iterations: u32) -> Agent {
-        let tools = build_tools(&self.cwd, self.allow_shell);
+        let tools = self.build_tools();
         let config = AgentConfig {
             max_iterations,
             ..AgentConfig::default()
@@ -975,8 +1004,58 @@ impl OctosRuntime {
             tools,
             self.memory.clone(),
         )
+        .with_recall(self.recall.clone())
         .with_config(config)
     }
+
+    /// The FS toolset (see [`build_tools`]) plus `memory_search` and
+    /// `memory_load` bound to this runtime's Recall store, embedder and
+    /// markdown memory bank (`<mem_dir>/memory`).
+    fn build_tools(&self) -> ToolRegistry {
+        let mut registry = build_tools(&self.cwd, self.allow_shell);
+        registry.register(MemorySearchTool::new(
+            self.recall.clone(),
+            self.embedding_provider(),
+        ));
+        let bank = Arc::new(MemoryStore::at_memory_dir(self.mem_dir.join("memory")));
+        registry.register(MemoryLoadTool::new(self.recall.clone(), bank));
+        registry
+    }
+}
+
+/// Per-record vectors (`None` where nothing was embedded) plus how many
+/// vectors were actually produced — the result of [`embed_flagged`].
+type EmbeddedVectors = (Vec<Option<Vec<f32>>>, usize);
+
+/// Embed only the records flagged in `needs` (parallel to `records`),
+/// keeping positions: the returned `vectors` has one entry per record,
+/// `Some` for embedded ones and `None` for the rest. Batches of
+/// [`EMBED_BATCH`]. Also returns how many vectors were produced.
+fn embed_flagged<E>(
+    records: &[Record],
+    needs: &[bool],
+    mut embed: E,
+) -> Result<EmbeddedVectors, CoreError>
+where
+    E: FnMut(&[&str]) -> Result<Vec<Vec<f32>>, CoreError>,
+{
+    let targets: Vec<usize> = needs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &needed)| needed.then_some(i))
+        .collect();
+    let mut out: Vec<Option<Vec<f32>>> = vec![None; records.len()];
+    let mut embedded = 0usize;
+    for chunk in targets.chunks(EMBED_BATCH) {
+        let texts: Vec<String> = chunk.iter().map(|&i| records[i].index_text()).collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let vectors = embed(&refs)?;
+        embedded += vectors.len();
+        for (&i, vector) in chunk.iter().zip(vectors) {
+            out[i] = Some(vector);
+        }
+    }
+    Ok((out, embedded))
 }
 
 /// Minimal FS toolset, every tool confined to `cwd` via the default
@@ -1688,6 +1767,138 @@ mod tests {
             !dir.exists(),
             "scratch dir must be removed after octos_runtime_free: {dir:?}"
         );
+    }
+
+    /// Unique, caller-owned data dir (the runtime never removes it; the test
+    /// does).
+    fn tmp_data_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "octos-ffi-data-{}-{}",
+            std::process::id(),
+            MEM_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn native_runtime(data_dir: Option<&Path>) -> OctosRuntime {
+        OctosRuntime::from_config(RuntimeConfig {
+            provider: "openai".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            api_key: Some("dummy-key".to_string()),
+            data_dir: data_dir.map(|d| d.to_string_lossy().into_owned()),
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime built")
+    }
+
+    fn upsert_batch() -> serde_json::Value {
+        json!([
+            {"id": "doc:mail:42", "kind": "document", "source": "mail",
+             "timestamp": "2026-09-01T10:00:00Z", "title": "Dentist appointment",
+             "abstract": "Sunrise Dental on the 24th", "fingerprint": "h42"},
+            {"id": "episode:sess-1:7", "kind": "episode", "source": "episodes",
+             "timestamp": "2026-09-02T10:00:00Z", "title": "Fixed the build",
+             "abstract": "Bumped rustls and re-ran CI.", "fingerprint": "e7"}
+        ])
+    }
+
+    #[test]
+    fn memory_upsert_resubmitting_unchanged_batch_embeds_nothing() {
+        // Re-submitting an identical batch must be a no-op for the embedder:
+        // the store reports every record unchanged and `embedded` is 0.
+        let rt = native_runtime(None);
+        let req = json!({ "records": upsert_batch() }).to_string();
+
+        let first: serde_json::Value =
+            serde_json::from_str(&rt.memory_upsert(&req).expect("first upsert")).unwrap();
+        assert_eq!(first["inserted"], 2);
+        assert_eq!(first["unchanged"], 0);
+        assert_eq!(first["embedded"], 0, "no embedder loaded");
+
+        let second: serde_json::Value =
+            serde_json::from_str(&rt.memory_upsert(&req).expect("second upsert")).unwrap();
+        assert_eq!(second["inserted"], 0);
+        assert_eq!(second["updated"], 0);
+        assert_eq!(second["unchanged"], 2);
+        assert_eq!(second["embedded"], 0);
+    }
+
+    #[test]
+    fn embed_flagged_only_embeds_records_the_store_flags() {
+        // Store the batch WITH vectors, then probe: nothing needs a vector, so
+        // the embedder must not be called at all. Change one fingerprint and
+        // only that record is embedded, at its own position.
+        let rt = native_runtime(None);
+        let dim = rt.recall.dimension();
+        let vectors: Vec<Vec<f32>> = vec![vec![0.5; dim], vec![0.25; dim]];
+        let req = json!({ "records": upsert_batch(), "vectors": vectors }).to_string();
+        let report: serde_json::Value =
+            serde_json::from_str(&rt.memory_upsert(&req).expect("upsert with vectors")).unwrap();
+        assert_eq!(report["vectors_stored"], 2);
+
+        let mut records: Vec<Record> = serde_json::from_value(upsert_batch()).unwrap();
+        let needs = rt.recall.needs_vectors(&records).expect("probe");
+        assert_eq!(
+            needs,
+            vec![false, false],
+            "unchanged records keep their vectors"
+        );
+        let (out, embedded) = embed_flagged(&records, &needs, |texts| {
+            panic!("embedder called for {} unchanged records", texts.len())
+        })
+        .expect("nothing to embed");
+        assert_eq!(embedded, 0);
+        assert_eq!(out, vec![None, None]);
+
+        records[1].fingerprint = "e7-v2".to_string();
+        let needs = rt.recall.needs_vectors(&records).expect("probe");
+        assert_eq!(needs, vec![false, true]);
+        let mut calls = 0usize;
+        let (out, embedded) = embed_flagged(&records, &needs, |texts| {
+            calls += 1;
+            assert_eq!(texts.len(), 1);
+            assert!(texts[0].contains("Fixed the build"), "got {:?}", texts[0]);
+            Ok(vec![vec![1.0; dim]])
+        })
+        .expect("one record embedded");
+        assert_eq!(calls, 1);
+        assert_eq!(embedded, 1);
+        assert!(out[0].is_none(), "unchanged record keeps `None`");
+        assert_eq!(out[1].as_deref(), Some(&vec![1.0f32; dim][..]));
+    }
+
+    #[test]
+    fn build_agent_exposes_memory_tools_over_the_runtime_recall_store() {
+        // An embedded agent must see the runtime's Recall store: the two-stage
+        // retrieval tools are registered next to the FS toolset, with a
+        // persistent `data_dir` and with the scratch dir alike.
+        let data_dir = tmp_data_dir();
+        let rt = native_runtime(Some(&data_dir));
+        assert_eq!(rt.mem_dir, data_dir);
+        let agent = rt.build_agent(3);
+        let registry = agent.tool_registry();
+        assert!(
+            registry.get("memory_search").is_some(),
+            "memory_search missing"
+        );
+        assert!(registry.get("memory_load").is_some(), "memory_load missing");
+        assert!(
+            registry.get("read_file").is_some(),
+            "FS toolset still present"
+        );
+        assert!(
+            registry.get("shell").is_none(),
+            "shell stays opt-in (allow_shell defaults to false)"
+        );
+        drop(rt);
+        assert!(data_dir.exists(), "caller-owned data_dir is never removed");
+        let _ = std::fs::remove_dir_all(&data_dir);
+
+        let scratch = native_runtime(None);
+        let registry = scratch.build_agent(1);
+        assert!(registry.tool_registry().get("memory_search").is_some());
+        assert!(registry.tool_registry().get("memory_load").is_some());
     }
 
     #[test]

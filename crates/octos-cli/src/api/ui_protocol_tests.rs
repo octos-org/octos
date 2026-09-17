@@ -43408,6 +43408,36 @@ fn memory_ingest_decodes_document_records_and_forces_untrusted() {
 }
 
 #[test]
+fn memory_ingest_forces_untrusted_on_episode_records_too() {
+    // Every externally ingested record is data, never instructions: an
+    // `episode:` record claiming `trust: "trusted"` comes out untrusted
+    // exactly like a document does (only the kernel's own episode
+    // mirroring may write trusted episodes).
+    let validated = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "episode:sess-1:7",
+        "kind": "episode",
+        "source": "episodes",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "Fixed the build",
+        "abstract": "Bumped rustls and re-ran CI.",
+        "trust": "trusted",
+        "promoted": true,
+        "visits": 12,
+    })]))
+    .expect("valid episode record");
+    assert_eq!(validated.records.len(), 1);
+    let episode = &validated.records[0];
+    assert_eq!(episode.kind, octos_memory::RecordKind::Episode);
+    assert_eq!(
+        episode.trust,
+        octos_memory::Trust::Untrusted,
+        "ingested episodes can never claim trusted"
+    );
+    assert_eq!(episode.visits, 0);
+    assert!(!episode.promoted);
+}
+
+#[test]
 fn memory_ingest_rejects_knowledge_records() {
     let error = validate_memory_ingest(ingest_params(vec![json!({
         "id": "bank:acme-corp",

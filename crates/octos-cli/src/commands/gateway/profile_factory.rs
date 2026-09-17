@@ -739,6 +739,22 @@ impl ProfileActorFactoryBuilder {
         // invariant and doubled keychain lookups).
         let profile_embedder =
             create_embedder(&profile_config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+        // The routed profile's OWN recall index (its personal records live
+        // under its data dir); the gateway's store is only right when both
+        // are the same directory.
+        let profile_recall: Arc<octos_memory::RecallStore> = if profile_data_dir
+            == self.effective_octos_home
+        {
+            self.recall.clone()
+        } else {
+            crate::runtime::profile::open_recall_store(
+                &profile_data_dir,
+                &profile_config,
+                profile_embedder.as_deref(),
+            )
+            .await
+            .wrap_err_with(|| format!("failed to open recall store for profile '{profile_id}'"))?
+        };
 
         // Child bots with admin_mode=true reuse the parent's tool registry snapshot
         // (which already has full tools + admin API). Child bots with admin_mode=false
@@ -858,14 +874,14 @@ impl ProfileActorFactoryBuilder {
             ));
             tools.register(
                 octos_agent::RecallMemoryTool::new(self.memory_store.clone())
-                    .with_recall(self.recall.clone(), profile_embedder.clone()),
+                    .with_recall(profile_recall.clone(), profile_embedder.clone()),
             );
             tools.register(octos_agent::MemorySearchTool::new(
-                self.recall.clone(),
+                profile_recall.clone(),
                 profile_embedder.clone(),
             ));
             tools.register(octos_agent::MemoryLoadTool::new(
-                self.recall.clone(),
+                profile_recall.clone(),
                 self.memory_store.clone(),
             ));
             tools.register(octos_agent::SaveMemoryTool::new(self.memory_store.clone()));
@@ -1114,7 +1130,7 @@ impl ProfileActorFactoryBuilder {
             // `profile.config.lane_routing`. None = built-in defaults.
             lane_routing: effective_profile.config.lane_routing.clone(),
             memory_store: Some(self.memory_store.clone()),
-            recall: Some(self.recall.clone()),
+            recall: Some(profile_recall.clone()),
             // Codex round-2 MAJOR 3 (PR #1327 review): expose the
             // profile_id so `ActorFactory::spawn` can build a per-
             // session SessionScope (multi-tenant) and attach the

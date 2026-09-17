@@ -331,7 +331,7 @@ async fn open_recall(
     config: &Config,
     embedder: Option<&dyn octos_llm::EmbeddingProvider>,
 ) -> Result<Arc<octos_memory::RecallStore>> {
-    let store = crate::runtime::profile::open_recall_store(data_dir, config, embedder)
+    let store = crate::runtime::profile::open_recall_store_strict(data_dir, config, embedder)
         .await
         .wrap_err_with(|| {
             format!(
@@ -452,13 +452,20 @@ async fn run_ingest(file: PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
     for chunk in records.chunks(REINDEX_BATCH * 4) {
         let vectors: Vec<Option<Vec<f32>>> = match &embedder {
             Some(e) => {
-                let texts: Vec<String> = chunk.iter().map(|r| r.index_text()).collect();
-                let mut out = Vec::with_capacity(chunk.len());
-                for batch in texts.chunks(REINDEX_BATCH) {
-                    let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
-                    match e.embed(&refs).await {
-                        Ok(v) if v.len() == batch.len() => out.extend(v.into_iter().map(Some)),
-                        _ => out.extend(std::iter::repeat_n(None, batch.len())),
+                // Embed only what the store would actually use: new or
+                // changed records, or ones with no usable vector yet.
+                let needs = recall.needs_vectors(chunk)?;
+                let wanted: Vec<usize> = (0..chunk.len()).filter(|i| needs[*i]).collect();
+                let mut out: Vec<Option<Vec<f32>>> = vec![None; chunk.len()];
+                for batch in wanted.chunks(REINDEX_BATCH) {
+                    let texts: Vec<String> = batch.iter().map(|i| chunk[*i].index_text()).collect();
+                    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                    if let Ok(v) = e.embed(&refs).await {
+                        if v.len() == batch.len() {
+                            for (i, vec) in batch.iter().zip(v) {
+                                out[*i] = Some(vec);
+                            }
+                        }
                     }
                 }
                 out
@@ -490,7 +497,11 @@ async fn run_promote(
     data_dir: Option<PathBuf>,
 ) -> Result<()> {
     let (data_dir, config) = resolve(data_dir).await?;
-    let recall = open_recall(&data_dir, &config, None).await?;
+    // Same geometry as the runtime, or a narrower configured embedder would
+    // make every stored vector look foreign.
+    let embedder = crate::commands::chat::create_embedder(&config)
+        .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+    let recall = open_recall(&data_dir, &config, embedder.as_deref()).await?;
     let memory_store = octos_memory::MemoryStore::open(&data_dir)
         .await
         .wrap_err("failed to open memory store")?;

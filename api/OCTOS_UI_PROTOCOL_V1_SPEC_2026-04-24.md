@@ -1929,19 +1929,23 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   and namespaced by kind — documents `doc:<source>:<key>`, episodes
   `episode:<key>`; Knowledge (`bank:`) records are refused with
   "knowledge pages are written through save_memory / the memory bank,
-  not ingest"; documents can never claim `trust: "trusted"` (forced
-  `untrusted`). Title/abstract/body are clamped to the index caps
+  not ingest"; no ingested record — document or episode — can claim
+  `trust: "trusted"` (`trust` is forced `untrusted` for every record).
+  Title/abstract/body are clamped to the index caps
   (120 B / 300 B / 16 KiB). When `embed` (default `true`) is set, no
   `vectors` were supplied and the profile has an embedder, the server
-  embeds each record's index text (title + abstract + parent) in batches
-  of 16; an embedding failure fails the call (retry with `embed: false`
-  to store BM25-only). Without an embedder records are stored
-  BM25-only.
+  first asks the store which records need a vector (new id, changed
+  fingerprint or index text, or no usable stored vector) and embeds
+  only those records' index text (title + abstract + parent) in
+  batches of 16 — re-submitting an unchanged batch embeds nothing; an
+  embedding failure fails the call (retry with `embed: false` to store
+  BM25-only). Without an embedder records are stored BM25-only.
 - Result type: `MemoryIngestResult` — `{ inserted: number, updated:
   number, unchanged: number, vectors_stored: number, embedded: number }`
   (the `octos_memory::UpsertReport` counts plus how many vectors the
-  server embedded itself). The HNSW graph is persisted before the
-  result is sent.
+  server actually embedded in this call — unchanged records that kept
+  their stored vector are not counted). The HNSW graph is persisted
+  before the result is sent.
 - Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
   `invalid_params` per the validation above; `runtime_unavailable` as
   for `memory/search`; `internal_error` when embedding or the index

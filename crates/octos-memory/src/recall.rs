@@ -159,7 +159,13 @@ pub struct RecallStore {
     /// reused when its manifest carries the same value.
     generation: RwLock<u64>,
     graph_persisted: RwLock<bool>,
+    /// Serialises graph dumps so two callers never interleave writes to the
+    /// same graph files and manifest.
+    persist_lock: std::sync::Mutex<()>,
 }
+
+/// Tombstones tolerated in the graph before a compaction rebuild.
+const COMPACT_MIN_TOMBSTONES: usize = 1_000;
 
 impl RecallStore {
     /// Open or create the store under `data_dir`. Fails when another
@@ -218,6 +224,7 @@ impl RecallStore {
             meta: RwLock::new(HashMap::new()),
             generation: RwLock::new(0),
             graph_persisted: RwLock::new(false),
+            persist_lock: std::sync::Mutex::new(()),
         };
         store.load()?;
         Ok(store)
@@ -269,33 +276,60 @@ impl RecallStore {
             (records, vectors, embedder, generation)
         };
 
-        // Stored vectors from another embedder or width are unusable.
-        let vectors_valid = stored_embedder == self.config.embedder_id
-            && vectors
-                .values()
-                .all(|q| q.dimension() == self.config.dimension);
-        if !vectors_valid && !vectors.is_empty() {
+        // Stored vectors from another embedder or width are unusable HERE,
+        // but they are never deleted: a CLI opened with a different geometry
+        // must not destroy vectors the runtime can still use. They are
+        // simply ignored (records show as needing vectors) and overwritten
+        // by the next embedding.
+        let embedder_ok = stored_embedder == self.config.embedder_id;
+        let total_vectors = vectors.len();
+        let vectors: HashMap<String, QuantizedVector> = vectors
+            .into_iter()
+            .filter(|(_, q)| embedder_ok && q.dimension() == self.config.dimension)
+            .collect();
+        let vectors_valid = vectors.len() == total_vectors;
+        if !vectors_valid {
             tracing::warn!(
                 stored = %stored_embedder,
                 configured = %self.config.embedder_id,
-                "recall vectors were produced by another embedder — dropping them; \
-                 re-embed with `octos memory reindex`"
+                usable = vectors.len(),
+                total = total_vectors,
+                "recall vectors from another embedder/width are ignored until re-embedded \
+                 (`octos memory reindex`)"
             );
+        }
+        // Only a process that will WRITE vectors with a new embedder adopts
+        // the store: it purges the foreign vectors (they are about to be
+        // re-embedded) and records its geometry. A handle without an
+        // embedder — `octos memory promote`, a keyless CLI — leaves both the
+        // vectors and the recorded geometry untouched.
+        if !vectors_valid && !self.config.embedder_id.is_empty() && !self.degraded {
             let txn = self.db.begin_write()?;
             {
                 let mut vt = txn.open_table(VECTORS_TABLE)?;
-                let keys: Vec<String> = vectors.keys().cloned().collect();
-                for k in keys {
-                    vt.remove(k.as_str())?;
+                let mut mt = txn.open_table(META_TABLE)?;
+                let foreign: Vec<String> = {
+                    let mut ids = Vec::new();
+                    for entry in vt.iter()? {
+                        let (k, _) = entry?;
+                        if !vectors.contains_key(k.value()) {
+                            ids.push(k.value().to_string());
+                        }
+                    }
+                    ids
+                };
+                for id in &foreign {
+                    vt.remove(id.as_str())?;
                 }
+                mt.insert("embedder", self.config.embedder_id.as_str())?;
+                mt.insert("dimension", self.config.dimension.to_string().as_str())?;
+                tracing::info!(
+                    purged = foreign.len(),
+                    "recall: adopted the store for a new embedder"
+                );
             }
             txn.commit()?;
         }
-        let vectors = if vectors_valid {
-            vectors
-        } else {
-            HashMap::new()
-        };
 
         let by_id: HashMap<String, &Record> = records.iter().map(|r| (r.id.clone(), r)).collect();
         let mut meta: HashMap<String, Meta> = HashMap::with_capacity(records.len());
@@ -398,12 +432,20 @@ impl RecallStore {
         if self.degraded {
             return Ok(());
         }
+        let _serial = self.persist_lock.lock().unwrap_or_else(|e| e.into_inner());
         let dir = self.index_dir();
         std::fs::create_dir_all(&dir)?;
-        let generation = *self.generation.read().unwrap();
-        let (dumped, layout) = {
+        // Graph, layout and generation are read under one index lock:
+        // mutations bump the generation while holding the write lock, so
+        // this triple is always coherent.
+        let (dumped, layout, generation) = {
             let index = self.index.read().unwrap();
-            (index.dump_hnsw(&dir, GRAPH_BASENAME)?, index.layout())
+            let generation = *self.generation.read().unwrap();
+            (
+                index.dump_hnsw(&dir, GRAPH_BASENAME)?,
+                index.layout(),
+                generation,
+            )
         };
         if !dumped {
             let _ = std::fs::remove_file(dir.join(MANIFEST_FILE));
@@ -416,7 +458,7 @@ impl RecallStore {
             generation,
             layout,
         };
-        let tmp = dir.join(format!("{MANIFEST_FILE}.tmp"));
+        let tmp = dir.join(format!("{MANIFEST_FILE}.{}.tmp", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec(&manifest)?)?;
         std::fs::rename(&tmp, dir.join(MANIFEST_FILE))?;
         // The generation and embedder also live in redb so a manifest from
@@ -433,9 +475,62 @@ impl RecallStore {
         Ok(())
     }
 
-    fn bump_generation(&self) {
-        *self.generation.write().unwrap() += 1;
+    /// Advance the generation (call while holding the index write lock so
+    /// [`Self::persist_index`] never pairs a graph with the wrong number).
+    fn next_generation(&self) -> u64 {
+        let mut g = self.generation.write().unwrap();
+        *g += 1;
         *self.graph_persisted.write().unwrap() = false;
+        *g
+    }
+
+    /// Commit the generation (and geometry) with the same transaction that
+    /// changed vectors, so a crash before the next dump is detected on open
+    /// as a manifest/database mismatch rather than accepted silently.
+    fn write_meta(&self, txn: &redb::WriteTransaction, generation: u64) -> Result<()> {
+        let mut mt = txn.open_table(META_TABLE)?;
+        mt.insert("embedder", self.config.embedder_id.as_str())?;
+        mt.insert("dimension", self.config.dimension.to_string().as_str())?;
+        mt.insert("generation", generation.to_string().as_str())?;
+        Ok(())
+    }
+
+    /// Rebuild when tombstoned vectors outgrow a quarter of the live graph.
+    fn compact_if_needed(&self) -> Result<()> {
+        let (tomb, live) = {
+            let index = self.index.read().unwrap();
+            (index.tombstoned_vectors(), index.live_vector_points())
+        };
+        if tomb >= COMPACT_MIN_TOMBSTONES && tomb * 4 > live.max(1) {
+            self.rebuild()?;
+        }
+        Ok(())
+    }
+
+    /// Which of `records` would need a fresh vector on upsert: new ids,
+    /// changed text/fingerprint, or no usable stored vector. Ingest paths
+    /// use this to skip embedding work for unchanged records.
+    pub fn needs_vectors(&self, records: &[Record]) -> Result<Vec<bool>> {
+        let txn = self.db.begin_read()?;
+        let rt = txn.open_table(RECORDS_TABLE)?;
+        let meta = self.meta.read().unwrap();
+        let mut out = Vec::with_capacity(records.len());
+        for r in records {
+            let old = rt
+                .get(r.id.as_str())?
+                .and_then(|v| serde_json::from_str::<Record>(v.value()).ok());
+            let has_vector = meta.get(&r.id).is_some_and(|m| m.stored_vector);
+            let changed = match &old {
+                None => true,
+                Some(old) => {
+                    r.fingerprint.is_empty()
+                        || old.fingerprint != r.fingerprint
+                        || old.index_text() != r.index_text()
+                }
+            };
+            out.push(changed || !has_vector);
+        }
+        Ok(out)
     }
 
     // ------------------------------------------------------------ write
@@ -488,13 +583,14 @@ impl RecallStore {
                         && old.fingerprint == r.fingerprint
                         && old.index_text() == r.index_text()
                 });
-                let had_vector = meta.get(&r.id).is_some_and(|m| m.stored_vector);
+                let mut had_vector = meta.get(&r.id).is_some_and(|m| m.stored_vector);
                 if unchanged && (vector.is_none() || had_vector) {
                     report.unchanged += 1;
                     continue;
                 }
                 r.updated_at = now;
                 rt.insert(r.id.as_str(), serde_json::to_string(&*r)?.as_str())?;
+                let text_changed = old.is_some_and(|old| old.index_text() != r.index_text());
                 let stored_q = match vector {
                     Some(v) if v.len() >= self.config.dimension => {
                         let q = QuantizedVector::from_f32(&mrl_truncate(v, self.config.dimension));
@@ -508,10 +604,18 @@ impl RecallStore {
                     }
                     None => None,
                 };
+                // A stale vector must not rank new text: when the indexed
+                // text changed and no replacement arrived, drop the old
+                // vector so the record is BM25-only until re-embedded.
+                if stored_q.is_none() && text_changed && had_vector {
+                    vt.remove(r.id.as_str())?;
+                    had_vector = false;
+                }
                 // Re-index: tombstone the old entry (if any), insert fresh.
                 let was_resident = meta.get(&r.id).is_some_and(|m| m.resident);
                 index.remove(&r.id);
-                let resident_capacity = index.hnsw_points() < self.config.max_resident_vectors;
+                let resident_capacity =
+                    index.live_vector_points() < self.config.max_resident_vectors;
                 let hot = self.is_hot(r.timestamp, r.visits, now);
                 let resident_vec: Option<Vec<f32>> = match (&stored_q, had_vector) {
                     (Some(q), _) if hot && resident_capacity => Some(q.to_f32()),
@@ -544,10 +648,14 @@ impl RecallStore {
                     report.inserted += 1;
                 }
             }
+            if vector_changes {
+                let generation = self.next_generation();
+                self.write_meta(&txn, generation)?;
+            }
         }
         txn.commit()?;
         if vector_changes {
-            self.bump_generation();
+            self.compact_if_needed()?;
         }
         Ok(report)
     }
@@ -569,10 +677,14 @@ impl RecallStore {
                 index.remove(id);
                 meta.remove(id);
             }
+            if removed > 0 {
+                let generation = self.next_generation();
+                self.write_meta(&txn, generation)?;
+            }
         }
         txn.commit()?;
         if removed > 0 {
-            self.bump_generation();
+            self.compact_if_needed()?;
         }
         Ok(removed)
     }
@@ -599,12 +711,14 @@ impl RecallStore {
         record.visits = record.visits.saturating_add(1);
         record.last_visit = Some(Utc::now());
         let txn = self.db.begin_write()?;
-        let mut revived = false;
         {
             let mut rt = txn.open_table(RECORDS_TABLE)?;
             rt.insert(id, serde_json::to_string(&record)?.as_str())?;
             let vt = txn.open_table(VECTORS_TABLE)?;
+            // Lock order everywhere: index, then meta.
+            let mut index = self.index.write().unwrap();
             let mut meta = self.meta.write().unwrap();
+            let mut revived = false;
             if let Some(m) = meta.get_mut(id) {
                 m.visits = record.visits;
                 m.last_visit = record.last_visit;
@@ -613,8 +727,7 @@ impl RecallStore {
                         .get(id)?
                         .and_then(|b| QuantizedVector::from_bytes(b.value()))
                     {
-                        let mut index = self.index.write().unwrap();
-                        if index.hnsw_points() < self.config.max_resident_vectors
+                        if index.live_vector_points() < self.config.max_resident_vectors
                             && index.add_embedding(id, &q.to_f32())
                         {
                             m.resident = true;
@@ -623,11 +736,12 @@ impl RecallStore {
                     }
                 }
             }
+            if revived {
+                let generation = self.next_generation();
+                self.write_meta(&txn, generation)?;
+            }
         }
         txn.commit()?;
-        if revived {
-            self.bump_generation();
-        }
         Ok(true)
     }
 
@@ -685,19 +799,25 @@ impl RecallStore {
             let excess = resident.len() - self.config.max_resident_vectors;
             let evict: Vec<String> = resident.drain(..excess).map(|(id, _)| id).collect();
             let records = self.records_by_ids(&evict)?;
-            let mut index = self.index.write().unwrap();
-            let mut meta = self.meta.write().unwrap();
-            for r in records {
-                index.remove(&r.id);
-                index.insert(&r.id, &r.index_text(), None);
-                if let Some(m) = meta.get_mut(&r.id) {
-                    m.resident = false;
+            let txn = self.db.begin_write()?;
+            {
+                let mut index = self.index.write().unwrap();
+                let mut meta = self.meta.write().unwrap();
+                for r in records {
+                    index.remove(&r.id);
+                    index.insert(&r.id, &r.index_text(), None);
+                    if let Some(m) = meta.get_mut(&r.id) {
+                        m.resident = false;
+                    }
+                    report.vectors_evicted += 1;
                 }
-                report.vectors_evicted += 1;
+                let generation = self.next_generation();
+                self.write_meta(&txn, generation)?;
             }
+            txn.commit()?;
         }
         if report.vectors_evicted > 0 {
-            self.bump_generation();
+            self.compact_if_needed()?;
         }
         Ok(report)
     }
@@ -739,8 +859,11 @@ impl RecallStore {
             }
         }
         drop(meta);
-        *self.index.write().unwrap() = index;
-        self.bump_generation();
+        {
+            let mut slot = self.index.write().unwrap();
+            *slot = index;
+            let _ = self.next_generation();
+        }
         self.persist_index()
     }
 
@@ -814,26 +937,30 @@ impl RecallStore {
             );
         }
         let q = QuantizedVector::from_f32(&mrl_truncate(vector, self.config.dimension));
+        let now = Utc::now();
         let txn = self.db.begin_write()?;
         {
             let mut vt = txn.open_table(VECTORS_TABLE)?;
             vt.insert(id, q.to_bytes().as_slice())?;
+            // Lock order everywhere: index, then meta.
+            let mut index = self.index.write().unwrap();
+            let mut meta = self.meta.write().unwrap();
+            let hot = self.is_hot(record.timestamp, record.visits, now);
+            // A record whose old vector was tombstoned needs a fresh entry.
+            if !index.has_vector(id) && index.layout().iter().all(|(i, _)| i != id) {
+                index.insert(id, &record.index_text(), None);
+            }
+            let resident = hot
+                && index.live_vector_points() < self.config.max_resident_vectors
+                && index.add_embedding(id, &q.to_f32());
+            if let Some(m) = meta.get_mut(id) {
+                m.stored_vector = true;
+                m.resident = resident;
+            }
+            let generation = self.next_generation();
+            self.write_meta(&txn, generation)?;
         }
         txn.commit()?;
-        let now = Utc::now();
-        let mut meta = self.meta.write().unwrap();
-        let mut index = self.index.write().unwrap();
-        let hot = self.is_hot(record.timestamp, record.visits, now);
-        let resident = hot
-            && index.hnsw_points() < self.config.max_resident_vectors
-            && index.add_embedding(id, &q.to_f32());
-        if let Some(m) = meta.get_mut(id) {
-            m.stored_vector = true;
-            m.resident = resident;
-        }
-        drop(index);
-        drop(meta);
-        self.bump_generation();
         Ok(true)
     }
 
@@ -848,14 +975,21 @@ impl RecallStore {
     ) -> Result<Vec<Hit>> {
         let limit = filter.limit.clamp(1, 200);
         let truncated = query_vector.map(|v| mrl_truncate(v, self.config.dimension));
-        let candidates = {
-            let index = self.index.read().unwrap();
-            // Over-fetch so filters have something to bite on.
-            index.search_scored(query, truncated.as_deref(), limit * 6)
-        };
-        let filtered: Vec<(String, f32)> = {
-            let meta = self.meta.read().unwrap();
-            candidates
+        let has_filter = !filter.kinds.is_empty()
+            || !filter.sources.is_empty()
+            || filter.since.is_some()
+            || filter.until.is_some();
+        // Widen the candidate pool until the filter is satisfied or the whole
+        // index has been considered, so a selective filter (one calendar
+        // among thousands of mails) never comes back empty by truncation.
+        let index = self.index.read().unwrap();
+        let meta = self.meta.read().unwrap();
+        let total = index.len().max(1);
+        let mut pool = limit * 6;
+        let filtered: Vec<(String, f32)> = loop {
+            let candidates = index.search_scored(query, truncated.as_deref(), pool);
+            let considered = candidates.len();
+            let filtered: Vec<(String, f32)> = candidates
                 .into_iter()
                 .filter(|(id, _)| {
                     let Some(m) = meta.get(id) else { return false };
@@ -867,8 +1001,14 @@ impl RecallStore {
                 })
                 .map(|(id, s)| (id, s.combined))
                 .take(limit)
-                .collect()
+                .collect();
+            if !has_filter || filtered.len() >= limit || pool >= total || considered < pool {
+                break filtered;
+            }
+            pool = (pool * 4).min(total);
         };
+        drop(meta);
+        drop(index);
         let ids: Vec<String> = filtered.iter().map(|(id, _)| id.clone()).collect();
         let records = self.records_by_ids(&ids)?;
         let scores: HashMap<&str, f32> = filtered.iter().map(|(id, s)| (id.as_str(), *s)).collect();
@@ -1088,6 +1228,174 @@ mod tests {
         assert!(
             owner.get("doc:mail:x").unwrap().is_none(),
             "nothing leaks into the owner's store"
+        );
+    }
+
+    #[test]
+    fn should_drop_stale_vector_when_text_changes_without_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+        let mut r = doc("a", "alpha topic", "first", 1);
+        store
+            .upsert(vec![r.clone()], vec![Some(vec![1.0, 0.0, 0.0, 0.0])])
+            .unwrap();
+        assert_eq!(store.stats().vectors_stored, 1);
+        assert_eq!(store.needs_vectors(&[r.clone()]).unwrap(), vec![false]);
+        r.title = "completely different".into();
+        r.fingerprint = "fp-a2".into();
+        assert_eq!(store.needs_vectors(&[r.clone()]).unwrap(), vec![true]);
+        store.upsert(vec![r], vec![None]).unwrap();
+        let s = store.stats();
+        assert_eq!(
+            (s.vectors_stored, s.vectors_resident),
+            (0, 0),
+            "old vector must not rank the new text"
+        );
+        assert_eq!(store.records_needing_vectors(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn should_widen_candidates_until_filter_is_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+        // 80 mails all matching "meeting", one calendar event further down.
+        let mut recs: Vec<Record> = (0..80)
+            .map(|i| {
+                doc(
+                    &i.to_string(),
+                    "meeting notes meeting",
+                    "meeting agenda meeting",
+                    i,
+                )
+            })
+            .collect();
+        let mut ev = Record::new(
+            "doc:calendar:m",
+            RecordKind::Document,
+            "calendar",
+            Utc::now(),
+            "meeting",
+            "one word",
+        );
+        ev.fingerprint = "e".into();
+        recs.push(ev);
+        let n = recs.len();
+        store.upsert(recs, vec![None; n]).unwrap();
+        let hits = store
+            .search(
+                "meeting",
+                None,
+                &SearchFilter {
+                    sources: vec!["calendar".into()],
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["doc:calendar:m"]
+        );
+    }
+
+    #[test]
+    fn should_keep_vector_capacity_when_records_are_updated_repeatedly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(4);
+        c.max_resident_vectors = 2;
+        let store = RecallStore::open(dir.path(), c).unwrap();
+        for round in 0..5 {
+            let mut a = doc("a", &format!("alpha v{round}"), "x", 1);
+            a.fingerprint = format!("a{round}");
+            let mut b = doc("b", &format!("beta v{round}"), "y", 1);
+            b.fingerprint = format!("b{round}");
+            store
+                .upsert(
+                    vec![a, b],
+                    vec![
+                        Some(vec![1.0, 0.0, 0.0, 0.0]),
+                        Some(vec![0.0, 1.0, 0.0, 0.0]),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(
+                store.stats().vectors_resident,
+                2,
+                "round {round}: updates must not exhaust residency"
+            );
+        }
+    }
+
+    #[test]
+    fn should_detect_unpersisted_vector_writes_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+            store
+                .upsert(
+                    vec![doc("a", "alpha", "x", 1)],
+                    vec![Some(vec![1.0, 0.0, 0.0, 0.0])],
+                )
+                .unwrap();
+            store.persist_index().unwrap();
+            // A vector write after the dump, with no further dump (crash).
+            store
+                .upsert(
+                    vec![doc("b", "beta", "y", 1)],
+                    vec![Some(vec![0.0, 1.0, 0.0, 0.0])],
+                )
+                .unwrap();
+        }
+        let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+        let s = store.stats();
+        assert_eq!(
+            s.vectors_resident, 2,
+            "stale manifest rejected, graph rebuilt with both vectors"
+        );
+        let hits = store
+            .search(
+                "thing",
+                Some(&[0.0, 1.0, 0.0, 0.0]),
+                &SearchFilter {
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.first().map(|h| h.id.as_str()), Some("doc:mail:b"));
+    }
+
+    #[test]
+    fn should_keep_foreign_vectors_on_disk_but_ignore_them() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+            store
+                .upsert(
+                    vec![doc("a", "alpha", "x", 1)],
+                    vec![Some(vec![1.0, 0.0, 0.0, 0.0])],
+                )
+                .unwrap();
+            store.persist_index().unwrap();
+        }
+        {
+            // A keyless handle (no embedder) with a different width: must
+            // neither use nor destroy the vectors.
+            let mut other = cfg(8);
+            other.embedder_id = String::new();
+            let store = RecallStore::open(dir.path(), other).unwrap();
+            assert_eq!(
+                store.stats().vectors_stored,
+                0,
+                "foreign vectors are not used"
+            );
+        }
+        // Reopening with the original geometry finds the vectors intact.
+        let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+        assert_eq!(
+            store.stats().vectors_stored,
+            1,
+            "a foreign open must not destroy vectors"
         );
     }
 

@@ -36,6 +36,11 @@ pub struct HybridIndex {
     dimension_mismatches: usize,
     /// Whether the first mismatch has already been logged.
     mismatch_logged: bool,
+    /// Vector-bearing entries tombstoned by [`Self::remove`]. Their HNSW
+    /// points stay in the graph (hnsw_rs cannot delete), so capacity checks
+    /// count `hnsw_points - tombstoned_vectors` and the owner compacts by
+    /// rebuilding once tombstones pile up.
+    tombstoned_vectors: usize,
 }
 
 /// How much of the index is actually reachable by vector search.
@@ -205,6 +210,7 @@ impl HybridIndex {
             bm25_weight: DEFAULT_BM25_WEIGHT,
             dimension_mismatches: 0,
             mismatch_logged: false,
+            tombstoned_vectors: 0,
         }
     }
 
@@ -265,11 +271,10 @@ impl HybridIndex {
         // docs occupy `ids` without occupying HNSW slots, so a doc-count gate
         // would silently stop vectorizing every new episode once the store
         // passes 10k docs even with an empty vector index.
-        let hnsw_points = self
-            .hnsw
-            .as_ref()
-            .map(|hnsw| hnsw.get_nb_point())
-            .unwrap_or(0);
+        // Live points only: a tombstoned entry's point stays in the graph
+        // but must not count against the budget, or every update of an
+        // existing record would burn a slot for good.
+        let hnsw_points = self.live_vector_points();
         let at_capacity = hnsw_points >= HNSW_CAPACITY;
         // Capacity warnings only concern inserts that would actually touch
         // HNSW — a BM25-only insert neither consumes nor is affected by
@@ -366,6 +371,16 @@ impl HybridIndex {
         self.hnsw.as_ref().map(|h| h.get_nb_point()).unwrap_or(0)
     }
 
+    /// Graph points that still belong to a live (non-tombstoned) entry.
+    pub fn live_vector_points(&self) -> usize {
+        self.hnsw_points().saturating_sub(self.tombstoned_vectors)
+    }
+
+    /// Vector-bearing entries removed since this index was built.
+    pub fn tombstoned_vectors(&self) -> usize {
+        self.tombstoned_vectors
+    }
+
     /// Insertion-ordered `(id, has_vector)` pairs, tombstones as empty ids.
     /// This is the manifest a persisted graph needs: HNSW point ids are the
     /// positions in this list.
@@ -443,6 +458,9 @@ impl HybridIndex {
     pub fn remove(&mut self, episode_id: &str) -> bool {
         if let Some(pos) = self.ids.iter().position(|id| id == episode_id) {
             self.ids[pos].clear(); // tombstone — HNSW indices stay stable
+            if self.has_embedding[pos] {
+                self.tombstoned_vectors += 1;
+            }
             true
         } else {
             false
@@ -484,11 +502,7 @@ impl HybridIndex {
         // fetch would silently omit them. The strict cap restores the
         // invariant `hnsw.get_nb_point() <= HNSW_CAPACITY` so the
         // saturation rule is correct.
-        let hnsw_full = self
-            .hnsw
-            .as_ref()
-            .map(|h| h.get_nb_point() >= HNSW_CAPACITY)
-            .unwrap_or(false);
+        let hnsw_full = self.live_vector_points() >= HNSW_CAPACITY;
         if hnsw_full {
             tracing::warn!(
                 "HNSW index at capacity ({HNSW_CAPACITY}), skipping vector insert for {episode_id} (BM25 retained)"

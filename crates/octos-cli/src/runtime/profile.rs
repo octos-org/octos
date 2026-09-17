@@ -1081,13 +1081,11 @@ impl ProfileRuntime {
         let memory_store = Arc::new(MemoryStore::open(data_dir).await.wrap_err_with(|| {
             format!("failed to open memory store for profile '{}'", profile.id)
         })?);
-        let recall = Arc::new(
-            open_recall_store(data_dir, &config, embedder.as_deref())
-                .await
-                .wrap_err_with(|| {
-                    format!("failed to open recall store for profile '{}'", profile.id)
-                })?,
-        );
+        let recall = open_recall_store(data_dir, &config, embedder.as_deref())
+            .await
+            .wrap_err_with(|| {
+                format!("failed to open recall store for profile '{}'", profile.id)
+            })?;
 
         // Step 5: tool config store.
         let tool_config = Arc::new(ToolConfigStore::open(data_dir).await.wrap_err_with(|| {
@@ -1791,7 +1789,61 @@ pub(crate) async fn open_recall_store(
     data_dir: &Path,
     config: &Config,
     embedder: Option<&dyn octos_llm::EmbeddingProvider>,
+) -> Result<Arc<octos_memory::RecallStore>> {
+    // One handle per data dir per process: profiles routed by the gateway
+    // and the serve/gateway bootstrap share it instead of contending for
+    // the redb lock (a second open in the same process would only get the
+    // in-memory fallback).
+    static SHARED: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, Arc<octos_memory::RecallStore>>>,
+    > = std::sync::OnceLock::new();
+    let key = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    if let Some(existing) = SHARED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Ok(existing);
+    }
+    let recall_config = recall_config_for(config, embedder);
+    let dir = data_dir.to_path_buf();
+    let store = tokio::task::spawn_blocking(move || {
+        octos_memory::RecallStore::open_or_degraded(&dir, recall_config)
+    })
+    .await
+    .wrap_err("recall store open task failed")??;
+    let store = Arc::new(store);
+    SHARED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, store.clone());
+    Ok(store)
+}
+
+/// Strict opener for one-shot commands (`octos memory …`): refuses when a
+/// running serve/gateway owns the store instead of silently working on an
+/// in-memory copy, and resolves the SAME geometry as the runtime so vectors
+/// are never misread.
+pub(crate) async fn open_recall_store_strict(
+    data_dir: &Path,
+    config: &Config,
+    embedder: Option<&dyn octos_llm::EmbeddingProvider>,
 ) -> Result<octos_memory::RecallStore> {
+    let recall_config = recall_config_for(config, embedder);
+    let dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || octos_memory::RecallStore::open(&dir, recall_config))
+        .await
+        .wrap_err("recall store open task failed")?
+}
+
+/// The Recall geometry the runtime uses for `config` + `embedder`.
+pub(crate) fn recall_config_for(
+    config: &Config,
+    embedder: Option<&dyn octos_llm::EmbeddingProvider>,
+) -> octos_memory::RecallConfig {
     let mut recall_config = octos_memory::RecallConfig::default();
     if let Some(dim) = config.memory.as_ref().and_then(|m| m.recall_dimension) {
         recall_config.dimension = dim.max(8);
@@ -1813,12 +1865,7 @@ pub(crate) async fn open_recall_store(
             )
         })
         .unwrap_or_default();
-    let dir = data_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        octos_memory::RecallStore::open_or_degraded(&dir, recall_config)
-    })
-    .await
-    .wrap_err("recall store open task failed")?
+    recall_config
 }
 
 /// Background upkeep for the Recall/Knowledge index at profile bootstrap.

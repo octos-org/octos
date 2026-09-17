@@ -29205,8 +29205,9 @@ struct ValidatedMemoryIngest {
 /// (`RecordKind::parse`, so `doc` / `docs` are accepted); ids are
 /// non-empty and namespaced by kind (`doc:<source>:…`, `episode:…`);
 /// Knowledge records are refused outright (the bank is their write
-/// path); documents can never claim `trust: trusted` — forced
-/// `untrusted`. Server-owned usage fields (`visits`, `last_visit`,
+/// path); no externally ingested record — document or episode — can
+/// claim `trust: trusted`: `trust` is forced `untrusted` for every
+/// record. Server-owned usage fields (`visits`, `last_visit`,
 /// `promoted`) are reset; `RecallStore::upsert` re-merges them from
 /// the stored copy. Pure — unit-tested directly.
 fn validate_memory_ingest(params: MemoryIngestParams) -> Result<ValidatedMemoryIngest, RpcError> {
@@ -29290,8 +29291,6 @@ fn validate_memory_ingest(params: MemoryIngestParams) -> Result<ValidatedMemoryI
                         record.id
                     )));
                 }
-                // App content is data, never instructions.
-                record.trust = Trust::Untrusted;
             }
             RecordKind::Episode => {
                 if !record.id.starts_with(MEMORY_RECORD_EPISODE_PREFIX)
@@ -29305,6 +29304,10 @@ fn validate_memory_ingest(params: MemoryIngestParams) -> Result<ValidatedMemoryI
             }
             RecordKind::Knowledge => unreachable!("knowledge records are refused above"),
         }
+        // Externally ingested content is data, never instructions — for
+        // documents AND episodes alike. Only the kernel's own writes
+        // (episode mirroring, the memory bank) may carry `trusted`.
+        record.trust = Trust::Untrusted;
         record.clamp();
         records.push(record);
     }
@@ -29315,8 +29318,11 @@ fn validate_memory_ingest(params: MemoryIngestParams) -> Result<ValidatedMemoryI
 }
 
 /// `memory/ingest` — the one memory WRITE method. Validates, embeds
-/// server-side when asked (default) and possible, upserts into the
-/// profile's `RecallStore` and persists the graph. Identity is
+/// server-side when asked (default) and possible — only the records
+/// `RecallStore::needs_vectors` flags, so an unchanged batch is never
+/// re-embedded — upserts into the profile's `RecallStore` and persists
+/// the graph. `embedded` in the result counts only vectors this call
+/// actually produced. Identity is
 /// required exactly as for `memory/overview`; session-ingress
 /// credentials are refused upstream by the scope guard.
 async fn handle_memory_ingest(
@@ -29353,18 +29359,61 @@ async fn handle_memory_ingest(
             }
         };
     let mut embedded = 0usize;
-    let vectors: Vec<Option<Vec<f32>>> = match vectors {
-        Some(vectors) => vectors,
+    let (records, vectors): (Vec<octos_memory::Record>, Vec<Option<Vec<f32>>>) = match vectors {
+        Some(vectors) => (records, vectors),
         None => match runtime.embedder.as_ref().filter(|_| embed_requested) {
             Some(embedder) => {
-                let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(records.len());
-                for chunk in records.chunks(MEMORY_INGEST_EMBED_BATCH) {
-                    let texts: Vec<String> = chunk.iter().map(|r| r.index_text()).collect();
+                // Ask the store which records actually need a vector (new id,
+                // changed fingerprint / index text, or no usable stored
+                // vector) BEFORE embedding, so re-submitting an unchanged
+                // batch does no embedding work at all.
+                let recall = runtime.recall.clone();
+                let probed = tokio::task::spawn_blocking(move || {
+                    let needs = recall.needs_vectors(&records);
+                    (records, needs)
+                })
+                .await;
+                let (records, needs) = match probed {
+                    Ok((records, Ok(needs))) => (records, needs),
+                    Ok((_, Err(error))) => {
+                        let _ = send_rpc_error(
+                            ws,
+                            Some(id),
+                            RpcError::internal_error(format!(
+                                "{method}: recall vector probe failed: {error:#}"
+                            )),
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = send_rpc_error(
+                            ws,
+                            Some(id),
+                            RpcError::internal_error(format!(
+                                "{method}: recall vector probe task failed: {error}"
+                            )),
+                        );
+                        return;
+                    }
+                };
+                let targets: Vec<usize> = needs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, needed)| needed.then_some(index))
+                    .collect();
+                let mut out: Vec<Option<Vec<f32>>> = vec![None; records.len()];
+                for chunk in targets.chunks(MEMORY_INGEST_EMBED_BATCH) {
+                    let texts: Vec<String> = chunk
+                        .iter()
+                        .map(|&index| records[index].index_text())
+                        .collect();
                     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
                     match embedder.embed(&refs).await {
                         Ok(batch) if batch.len() == chunk.len() => {
                             embedded += batch.len();
-                            out.extend(batch.into_iter().map(Some));
+                            for (&index, vector) in chunk.iter().zip(batch) {
+                                out[index] = Some(vector);
+                            }
                         }
                         Ok(batch) => {
                             let _ = send_rpc_error(
@@ -29392,9 +29441,12 @@ async fn handle_memory_ingest(
                         }
                     }
                 }
-                out
+                (records, out)
             }
-            None => vec![None; records.len()],
+            None => {
+                let vectors = vec![None; records.len()];
+                (records, vectors)
+            }
         },
     };
     let record_count = records.len();

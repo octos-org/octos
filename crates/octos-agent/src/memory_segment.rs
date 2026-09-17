@@ -102,6 +102,10 @@ pub struct MemorySegmentProvider {
     recall: Option<Arc<RecallStore>>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     last: tokio::sync::Mutex<Option<Fingerprint>>,
+    /// `bank/entities/` mtime at the last index sync; a change (save_memory,
+    /// consolidation, a manual edit) re-syncs the Knowledge index before
+    /// ranking, so newly saved pages are searchable within the same session.
+    last_bank_sync: tokio::sync::Mutex<Option<Option<SystemTime>>>,
 }
 
 impl MemorySegmentProvider {
@@ -118,6 +122,7 @@ impl MemorySegmentProvider {
             recall: None,
             embedder: None,
             last: tokio::sync::Mutex::new(None),
+            last_bank_sync: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -133,7 +138,28 @@ impl MemorySegmentProvider {
         self
     }
 
+    /// Re-index bank pages when the bank directory changed since the last
+    /// sync (cheap stat otherwise).
+    async fn resync_bank_if_changed(&self) {
+        let Some(recall) = &self.recall else { return };
+        let bank_dir = tokio::fs::metadata(self.store.bank_entities_dir())
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let mut last = self.last_bank_sync.lock().await;
+        if last.as_ref() == Some(&bank_dir) {
+            return;
+        }
+        if let Err(e) =
+            crate::memory_index::sync_bank(&self.store, recall, self.embedder.as_deref()).await
+        {
+            tracing::warn!(error = %e, "memory segment: bank index sync failed");
+        }
+        *last = Some(bank_dir);
+    }
+
     async fn rank_for(&self, query: Option<&str>) -> Vec<String> {
+        self.resync_bank_if_changed().await;
         match (&self.recall, query) {
             (Some(recall), Some(q)) => {
                 crate::memory_index::rank_bank_pages(

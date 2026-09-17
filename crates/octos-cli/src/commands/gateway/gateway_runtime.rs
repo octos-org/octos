@@ -566,15 +566,13 @@ impl GatewayRuntime {
             rt.recall.clone()
         } else {
             let embedder_for_recall = create_embedder(&config);
-            Arc::new(
-                crate::runtime::profile::open_recall_store(
-                    &data_dir,
-                    &config,
-                    embedder_for_recall.as_deref(),
-                )
-                .await
-                .wrap_err("failed to open recall store")?,
+            crate::runtime::profile::open_recall_store(
+                &data_dir,
+                &config,
+                embedder_for_recall.as_deref(),
             )
+            .await
+            .wrap_err("failed to open recall store")?
         };
 
         // Derive project_dir from octos_home (when launched by process_manager)
