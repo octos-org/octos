@@ -322,6 +322,31 @@ fn unsafe_tty_check() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// Restore the account, not merely its existence. Never print credential bytes.
+fn restore_secret(account: &str, previous: Option<&str>) -> Result<()> {
+    match previous {
+        Some(previous) => keychain::set_secret(account, previous),
+        None => keychain::delete_secret(account).map(|_| ()),
+    }
+}
+
+fn replace_secret(account: &str, secret: &str) -> Result<Option<String>> {
+    let previous = keychain::get_secret(account)?;
+    if let Err(store_error) = keychain::set_secret(account, secret) {
+        // A backend can fail after changing the account (e.g. a sync failure).
+        // Preserve the prior credential in that case too.
+        return match restore_secret(account, previous.as_deref()) {
+            Ok(()) => Err(eyre::eyre!(
+                "secret store failed; rolled back the account: {store_error}"
+            )),
+            Err(rollback_error) => Err(eyre::eyre!(
+                "secret store failed ({store_error}); rollback also failed ({rollback_error}); check the account before retrying"
+            )),
+        };
+    }
+    Ok(previous)
+}
+
 /// #2234/45c — injectable profile-save seam (issue Tests requested:
 /// "Profile-save failure rolls back the newly stored secret"). Production
 /// passes the direct store save; tests inject a failing closure to pin the
@@ -369,27 +394,42 @@ fn set_key_with_save(
 
     // Shared keys: store once up front (also covers the orphan / no-profile
     // case). Scoped keys are stored per profile in the loop below.
-    if !scoped {
-        keychain::set_secret(name, &secret)?;
-    }
+    let shared_previous = if !scoped {
+        replace_secret(name, &secret)?
+    } else {
+        None
+    };
 
     // Update profile(s) to use the keychain marker
     let mut updated_count = 0;
     for mut profile in profiles {
         if profile_references_key(&profile, name) {
             let (account, marker) = keychain_target(name, &profile.id, &secret);
-            if scoped {
-                keychain::set_secret(&account, &secret)?;
-            }
+            let previous = if scoped {
+                replace_secret(&account, &secret)?
+            } else {
+                shared_previous.clone()
+            };
             profile.config.env_vars.insert(name.to_string(), marker);
             profile.updated_at = chrono::Utc::now();
-            // #2234/45b — store-then-save with rollback: if the profile
-            // save fails after the secret landed, delete the freshly
-            // stored account so a half-applied update leaves no orphan.
+            // Per-account rollback, not an all-profile transaction: earlier
+            // successful saves remain committed. In particular, a shared key
+            // must stay available once any successful save references it.
             if let Err(save_err) = save_profile(&profile) {
-                let _ = keychain::delete_secret(&account);
+                if !scoped && updated_count > 0 {
+                    return Err(eyre::eyre!(
+                        "profile '{}' save failed; {updated_count} profile(s) updated; shared secret retained for those profiles: {save_err}",
+                        profile.id
+                    ));
+                }
+                if let Err(rollback_error) = restore_secret(&account, previous.as_deref()) {
+                    return Err(eyre::eyre!(
+                        "profile '{}' save failed ({save_err}); secret rollback also failed ({rollback_error}); {updated_count} profile(s) updated; check the account before retrying",
+                        profile.id
+                    ));
+                }
                 return Err(eyre::eyre!(
-                    "profile '{}' save failed; rolled back the stored secret: {save_err}",
+                    "profile '{}' save failed; rolled back that account's secret; {updated_count} profile(s) updated: {save_err}",
                     profile.id
                 ));
             }
@@ -826,7 +866,6 @@ mod tests {
     /// scoped secret was stored, the save fails, the freshly stored account
     /// is deleted (rollback), and the error names the rollback.
     #[test]
-    #[cfg(target_os = "linux")]
     fn save_failure_rolls_back_stored_secret() {
         let tmp = tempfile::tempdir().unwrap();
         // Point BOTH the secret store and the profile store at the temp dir:
@@ -870,6 +909,153 @@ mod tests {
         // Profile JSON bytes unchanged (the injected save never ran).
         let after = std::fs::read_to_string(&json_path).unwrap_or_default();
         assert_eq!(profile_json_before, after, "profile bytes must not change");
+    }
+
+    #[test]
+    fn should_restore_existing_secret_when_profile_save_fails() {
+        for (name, account, secret) in [
+            ("SHARED_KEY", "SHARED_KEY", "new-fixture"),
+            (
+                "VERTEX_SA_JSON",
+                "VERTEX_SA_JSON::fixture",
+                "{\"type\":\"service_account\",\"private_key\":\"fixture\"}",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _root = keychain::test_override_secrets_root(tmp.path().join("secrets"));
+            let store = ProfileStore::open_unified(&tmp.path().join("profiles-home")).unwrap();
+            let mut profile = profile_with_llm("fixture", None);
+            profile
+                .config
+                .env_vars
+                .insert(name.into(), keychain::marker_for(account));
+            store.save(&profile).unwrap();
+            keychain::set_secret(account, "old-fixture").unwrap();
+            let err = set_key_with_save(name, Some(secret.into()), Some("fixture"), &store, |_| {
+                Err(eyre::eyre!("injected profile save failure"))
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("rolled back"));
+            assert_eq!(
+                keychain::get_secret(account).unwrap().as_deref(),
+                Some("old-fixture")
+            );
+            assert_eq!(
+                store.get("fixture").unwrap().unwrap().config.env_vars[name],
+                keychain::marker_for(account)
+            );
+        }
+    }
+
+    #[test]
+    fn should_keep_shared_secret_when_an_earlier_profile_save_succeeded() {
+        for old in [None, Some("old-fixture")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _root = keychain::test_override_secrets_root(tmp.path().join("secrets"));
+            let store = ProfileStore::open_unified(&tmp.path().join("profiles-home")).unwrap();
+            for id in ["first", "second"] {
+                let mut profile = profile_with_llm(id, None);
+                profile
+                    .config
+                    .env_vars
+                    .insert("SHARED_KEY".into(), "placeholder".into());
+                store.save(&profile).unwrap();
+            }
+            if let Some(old) = old {
+                keychain::set_secret("SHARED_KEY", old).unwrap();
+            }
+            let saved = std::cell::RefCell::new(Vec::new());
+            let err = set_key_with_save(
+                "SHARED_KEY",
+                Some("new-fixture".into()),
+                None,
+                &store,
+                |profile| {
+                    if !saved.borrow().is_empty() {
+                        eyre::bail!("injected second profile save failure");
+                    }
+                    store.save(profile)?;
+                    saved.borrow_mut().push(profile.id.clone());
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(saved.borrow().len(), 1);
+            assert_eq!(
+                keychain::get_secret("SHARED_KEY").unwrap().as_deref(),
+                Some("new-fixture"),
+                "a successfully saved marker must not dangle or silently rotate back"
+            );
+            assert!(err.to_string().contains("1 profile(s) updated"));
+            assert!(err.to_string().contains("retained"));
+            let saved_profile = store.get(&saved.borrow()[0]).unwrap().unwrap();
+            assert_eq!(
+                keychain::resolve_value("SHARED_KEY", &saved_profile.config.env_vars["SHARED_KEY"])
+                    .as_deref(),
+                Some("new-fixture")
+            );
+        }
+    }
+
+    #[test]
+    fn should_delete_only_new_uncommitted_shared_secret_on_save_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _root = keychain::test_override_secrets_root(tmp.path().join("secrets"));
+        let store = ProfileStore::open_unified(&tmp.path().join("profiles-home")).unwrap();
+        let mut profile = profile_with_llm("fixture", None);
+        profile
+            .config
+            .env_vars
+            .insert("KEY".into(), "placeholder".into());
+        store.save(&profile).unwrap();
+        let err = set_key_with_save(
+            "KEY",
+            Some("fixture".into()),
+            Some("fixture"),
+            &store,
+            |_| Err(eyre::eyre!("injected save failure")),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("rolled back"));
+        assert_eq!(keychain::get_secret("KEY").unwrap(), None);
+        assert_eq!(
+            store.get("fixture").unwrap().unwrap().config.env_vars["KEY"],
+            "placeholder"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_report_rollback_failure_instead_of_claiming_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("secrets");
+        let _root = keychain::test_override_secrets_root(root.clone());
+        let store = ProfileStore::open_unified(&tmp.path().join("profiles-home")).unwrap();
+        let mut profile = profile_with_llm("fixture", None);
+        profile
+            .config
+            .env_vars
+            .insert("KEY".into(), "keychain:".into());
+        store.save(&profile).unwrap();
+        keychain::set_secret("KEY", "old-fixture").unwrap();
+        let err = set_key_with_save(
+            "KEY",
+            Some("new-fixture".into()),
+            Some("fixture"),
+            &store,
+            |_| {
+                // Deterministic I/O failure during restoration; only this fixture
+                // account is removed. A directory cannot be replaced by a file.
+                std::fs::remove_file(root.join("KEY"))?;
+                std::fs::create_dir(root.join("KEY"))?;
+                eyre::bail!("injected save failure")
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("rollback also failed"));
+        assert!(!err.to_string().contains("rolled back"));
+        assert!(!err.to_string().contains("old-fixture"));
+        assert!(!err.to_string().contains("new-fixture"));
     }
 
     /// #2234/45c — secret-store failure leaves profile JSON bytes UNCHANGED
