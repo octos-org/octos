@@ -36,6 +36,7 @@ fn fixture_runtime(final_text: &str, stop_reason: octos_llm::StopReason) -> Octo
         model: "gpt-4o-mini".into(),
         api_key: Some("ffi-fixture-not-a-real-key".into()),
         max_iterations: Some(4),
+        embedding_auto_download: Some(false),
         ..RuntimeConfig::default()
     })
     .unwrap();

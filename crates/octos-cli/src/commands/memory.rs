@@ -94,6 +94,16 @@ enum MemoryAction {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Show the bundled embedding model (EmbeddingGemma-300M) status, or
+    /// fetch it now so the first session does not have to.
+    Embedder {
+        /// Download the model if it is missing or incomplete.
+        #[arg(long)]
+        fetch: bool,
+        /// Data directory (defaults to the resolved profile data dir).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Record a host-authored remember request (full consolidation
     /// authority — no model in the loop).
     Remember {
@@ -146,6 +156,7 @@ impl MemoryCommand {
                 data_dir,
             } => run_search(query.join(" "), kind, source, limit, data_dir).await,
             MemoryAction::Ingest { file, data_dir } => run_ingest(file, data_dir).await,
+            MemoryAction::Embedder { fetch, data_dir } => run_embedder(fetch, data_dir).await,
             MemoryAction::Promote {
                 min_visits,
                 limit,
@@ -408,6 +419,71 @@ async fn run_search(
             h.trust.as_str()
         );
         println!("      {}  ({})", h.abstract_, h.id.dimmed());
+    }
+    Ok(())
+}
+
+async fn run_embedder(fetch: bool, data_dir: Option<PathBuf>) -> Result<()> {
+    use crate::embed_model as em;
+    // The model cache is shared by every profile under the octos data root.
+    let root = match data_dir {
+        Some(d) => d,
+        None => octos_services::config_context::resolve_config_context(None).data_dir,
+    };
+    let status = em::model_status(&root);
+    println!("{}", "Bundled embedding model".bold());
+    println!(
+        "  model         EmbeddingGemma-300M Q8_0 ({})",
+        em::DEFAULT_MODEL_ID
+    );
+    println!("  path          {}", status.path.display());
+    println!(
+        "  on disk       {}",
+        if status.complete {
+            "complete".green().to_string()
+        } else if status.present {
+            format!(
+                "{} of {} bytes (incomplete)",
+                status.bytes,
+                em::DEFAULT_MODEL_BYTES
+            )
+            .yellow()
+            .to_string()
+        } else {
+            "absent".yellow().to_string()
+        }
+    );
+    println!("  source        {}", em::DEFAULT_MODEL_URL);
+    println!(
+        "  licence       {} (Gemma Terms of Use)",
+        em::DEFAULT_MODEL_LICENSE_URL
+    );
+    println!(
+        "  auto-download {}",
+        if em::downloads_allowed(None) {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if !cfg!(feature = "embed-llama") {
+        println!(
+            "  {} this build has no in-process embedder (feature embed-llama); the model is unused",
+            "note".yellow()
+        );
+    }
+    if fetch && !status.complete {
+        println!("fetching {} MB…", em::DEFAULT_MODEL_BYTES / (1024 * 1024));
+        let path = tokio::task::spawn_blocking(move || em::ensure_default_model(&root, true))
+            .await
+            .wrap_err("download task failed")??;
+        println!("{} {}", "ready".green().bold(), path.display());
+    } else if fetch {
+        println!("{} already complete", "ok".green());
+    } else if !status.complete {
+        println!(
+            "run `octos memory embedder --fetch` to download it now (otherwise the first session does)."
+        );
     }
     Ok(())
 }

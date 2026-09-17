@@ -4,12 +4,15 @@
 use super::*;
 
 /// A runtime whose stores live in a scratch dir (no `data_dir`). The dummy
-/// key builds the provider offline; no network is touched by memory calls.
+/// key builds the provider offline; no network is touched by memory calls
+/// (the default embedding model download is disabled, so the runtime is
+/// keyword-only).
 fn scratch_runtime() -> OctosRuntime {
     OctosRuntime::from_config(RuntimeConfig {
         provider: "openai".into(),
         model: "gpt-4o-mini".into(),
         api_key: Some("ffi-memory-not-a-real-key".into()),
+        embedding_auto_download: Some(false),
         ..RuntimeConfig::default()
     })
     .expect("runtime built")
@@ -274,6 +277,7 @@ fn should_persist_stores_under_data_dir_across_runtimes() {
         api_key: Some("ffi-memory-not-a-real-key".into()),
         data_dir: Some(data_dir.to_string_lossy().into_owned()),
         recall_dimension: Some(64),
+        embedding_auto_download: Some(false),
         ..RuntimeConfig::default()
     };
     {
@@ -305,6 +309,7 @@ fn should_reject_zero_recall_dimension() {
         model: "gpt-4o-mini".into(),
         api_key: Some("ffi-memory-not-a-real-key".into()),
         recall_dimension: Some(0),
+        embedding_auto_download: Some(false),
         ..RuntimeConfig::default()
     })
     .err()

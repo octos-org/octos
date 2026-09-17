@@ -38,7 +38,7 @@ uniffi = { version = "0.29", features = ["cli"] }
 serde_json = { workspace = true }
 
 [features]
-default = []
+default = ["embed-llama"]
 # Re-export octos-ffi's optional in-process GGUF embedder so `Runtime::embed`
 # returns real vectors instead of `NoEmbedder`. Off by default, so the plain
 # `cargo build --workspace` stays pure Rust.

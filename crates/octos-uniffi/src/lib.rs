@@ -78,6 +78,15 @@ pub struct Config {
     /// Recall vector width (default 256; clamped to the embedder's dimension).
     #[uniffi(default = None)]
     pub recall_dimension: Option<u32>,
+    /// Whether an `embed-llama` build may download the default embedding
+    /// model (EmbeddingGemma-300M, 334 MB, once, into `<data_dir>/models/`)
+    /// when `embedding_model_path` is unset and the file is not on disk.
+    /// Default `true` (`OCTOS_NO_MODEL_DOWNLOAD=1` in the environment forces
+    /// `false`). The download blocks [`Runtime::new`]; hosts that want to
+    /// control it call [`embedding_model_ensure`] first. With `false` and no
+    /// model the runtime is keyword-only (`embed` raises `NoEmbedder`).
+    #[uniffi(default = None)]
+    pub embedding_auto_download: Option<bool>,
 }
 
 impl From<Config> for octos_ffi::RuntimeConfig {
@@ -95,8 +104,37 @@ impl From<Config> for octos_ffi::RuntimeConfig {
             embedding_model_path: c.embedding_model_path,
             data_dir: c.data_dir,
             recall_dimension: c.recall_dimension.map(|d| d as usize),
+            embedding_auto_download: c.embedding_auto_download,
         }
     }
+}
+
+/// What is on disk for the default embedding model under `data_dir` (the same
+/// directory a [`Config::data_dir`] names), as JSON `{"path", "present",
+/// "bytes", "complete", "url", "license_url", "sha256"}` — exactly the C-ABI's
+/// `octos_embedding_model_status`. Needs no [`Runtime`] and never touches the
+/// network; `license_url` points at the Gemma Terms of Use that apply to the
+/// weights.
+#[uniffi::export]
+pub fn embedding_model_status(data_dir: String) -> Result<String, OctosError> {
+    Ok(octos_ffi::embedding_model_status(std::path::Path::new(
+        &data_dir,
+    ))?)
+}
+
+/// Make sure the default embedding model is complete under `data_dir`,
+/// downloading and verifying it (334 MB, once) when `download` is true, and
+/// return JSON `{"path"}` — exactly the C-ABI's `octos_embedding_model_ensure`.
+/// Blocks for the whole transfer, so call it from a plain thread before
+/// [`Runtime::new`] when the host wants to own the timing. Raises
+/// [`OctosError::Embed`] when the file is absent and `download` is false (or
+/// `OCTOS_NO_MODEL_DOWNLOAD` is set), or the download fails to verify.
+#[uniffi::export]
+pub fn embedding_model_ensure(data_dir: String, download: bool) -> Result<String, OctosError> {
+    Ok(octos_ffi::embedding_model_ensure(
+        std::path::Path::new(&data_dir),
+        download,
+    )?)
 }
 
 /// A one-shot task brief. Maps onto [`octos_ffi::TaskBrief`].
@@ -318,6 +356,8 @@ mod tests {
             embedding_model_path: None,
             data_dir: None,
             recall_dimension: None,
+            // Never fetch the default model in tests.
+            embedding_auto_download: Some(false),
         }
     }
 
@@ -336,6 +376,88 @@ mod tests {
         assert_eq!(native.api_type, None);
         assert_eq!(native.data_dir, None);
         assert_eq!(native.recall_dimension, None);
+        assert_eq!(native.embedding_auto_download, Some(false));
+    }
+
+    #[test]
+    fn embedding_model_status_reports_absent_model_for_empty_dir() {
+        let dir = tempfile_dir("status");
+        let status: serde_json::Value = serde_json::from_str(
+            &embedding_model_status(dir.to_string_lossy().into_owned()).expect("status ok"),
+        )
+        .unwrap();
+        assert_eq!(status["present"], false);
+        assert_eq!(status["complete"], false);
+        assert_eq!(status["bytes"], 0);
+        assert!(status["path"].as_str().unwrap().ends_with(".gguf"));
+        assert!(status["url"].as_str().unwrap().starts_with("https://"));
+        assert!(
+            status["license_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://")
+        );
+        assert_eq!(status["sha256"].as_str().unwrap().len(), 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedding_model_ensure_without_download_raises_embed_error() {
+        let dir = tempfile_dir("ensure");
+        match embedding_model_ensure(dir.to_string_lossy().into_owned(), false) {
+            Err(OctosError::Embed { msg }) => {
+                assert!(msg.contains("automatic download is disabled"), "got: {msg}");
+            }
+            other => panic!("expected Embed error, got {other:?}"),
+        }
+        assert!(!dir.join("models").exists(), "nothing downloaded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_without_model_and_download_opted_out_is_keyword_only() {
+        let dir = tempfile_dir("runtime");
+        let rt = Runtime::new(Config {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            embedding_auto_download: Some(false),
+            ..sample_config()
+        })
+        .unwrap_or_else(|e| panic!("build failed: {e}"));
+        assert!(!rt.inner.embedding_configured);
+        assert!(matches!(
+            rt.embed("hello".to_string()),
+            Err(OctosError::NoEmbedder)
+        ));
+        rt.memory_upsert(
+            r#"{"records":[{"id":"doc:mail:1","kind":"document","source":"mail",
+                "timestamp":"2026-09-01T10:00:00Z","title":"Dentist appointment",
+                "abstract":"Sunrise Dental on the 24th"}]}"#
+                .to_string(),
+        )
+        .expect("upsert ok");
+        let hits: serde_json::Value = serde_json::from_str(
+            &rt.memory_search(r#"{"query":"dentist"}"#.to_string())
+                .expect("keyword-only search works"),
+        )
+        .unwrap();
+        assert_eq!(hits["hits"][0]["id"], "doc:mail:1");
+        let stats: serde_json::Value = serde_json::from_str(&rt.memory_stats().unwrap()).unwrap();
+        assert_eq!(stats["embedder_id"], "");
+        assert!(!dir.join("models").exists(), "no download attempted");
+        drop(rt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unique caller-owned dir under the OS temp dir (removed by the test).
+    fn tempfile_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "octos-uniffi-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -592,6 +714,7 @@ mod tests {
             embedding_model_path: None,
             data_dir: None,
             recall_dimension: None,
+            embedding_auto_download: Some(false),
         };
         let rt = Runtime::new(cfg).expect("runtime built");
         let result = rt

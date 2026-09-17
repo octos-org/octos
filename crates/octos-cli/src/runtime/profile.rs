@@ -1855,21 +1855,19 @@ pub(crate) fn recall_config_for(
     // non-empty id lets the store adopt a new geometry (purging foreign
     // vectors), which must never happen because credentials or a model file
     // were merely unavailable this run.
-    recall_config.embedder_id = config
-        .embedding
-        .as_ref()
-        .filter(|_| embedder.is_some())
-        .map(|e| {
-            format!(
-                "{}/{}",
-                e.provider,
-                e.model
-                    .clone()
-                    .or_else(|| e.model_path.clone())
-                    .unwrap_or_default()
-            )
-        })
-        .unwrap_or_default();
+    recall_config.embedder_id = match (embedder.is_some(), config.embedding.as_ref()) {
+        (false, _) => String::new(),
+        // No `embedding` section but an embedder loaded ⇒ the bundled default.
+        (true, None) => crate::embed_model::DEFAULT_MODEL_ID.to_string(),
+        (true, Some(e)) => {
+            let model = e.model.clone().or_else(|| e.model_path.clone());
+            match model {
+                // The bundled model, referenced by its default path or none.
+                None => crate::embed_model::DEFAULT_MODEL_ID.to_string(),
+                Some(m) => format!("{}/{}", e.provider, m),
+            }
+        }
+    };
     recall_config
 }
 

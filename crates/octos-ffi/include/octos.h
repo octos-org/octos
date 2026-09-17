@@ -6,8 +6,8 @@
  *    Never use a handle after octos_runtime_free(); never free it twice or
  *    concurrently with any other call on the same handle. Free it from a plain
  *    (non-async) thread.
- *  - Strings returned by octos_run_task()/octos_embed()/octos_memory_*() or
- *    octos_take_last_partial_result() are owned by YOU and
+ *  - Strings returned by octos_run_task()/octos_embed()/octos_memory_*()/
+ *    octos_embedding_model_*() or octos_take_last_partial_result() are owned by YOU and
  *    must be freed, UNMODIFIED, with octos_string_free() -- never free(3),
  *    never twice, and do not alter the bytes or NUL terminator before freeing.
  *  - const char* from octos_last_error()/octos_version() must NOT be freed.
@@ -68,9 +68,34 @@ char *octos_run_task(OctosRuntime *runtime, const char *brief_json);
 
 // Embed `text`. Returns owned JSON `{"embedding": [f32, ...]}` that the caller
 // must free, UNMODIFIED, with [`octos_string_free`] — or NULL on error.
-// Requires the `embed-llama` feature and an `embedding_model_path` in the
-// config.
+// Requires the `embed-llama` feature and a loaded model: the config's
+// `embedding_model_path`, or the default model resolved at
+// [`octos_runtime_new`] (see [`octos_embedding_model_ensure`]). Without one
+// the last error is "no embedder configured".
 char *octos_embed(OctosRuntime *runtime, const char *text);
+
+// Report what is on disk for the default embedding model (EmbeddingGemma-300M
+// Q8_0) under `data_dir` — the same directory a runtime's `data_dir` config
+// names. Needs NO runtime handle and never touches the network. Returns owned
+// JSON `{"path", "present", "bytes", "complete", "url", "license_url",
+// "sha256"}` that the caller must free, UNMODIFIED, with [`octos_string_free`]
+// — or NULL on error. `complete` means present at the pinned size (a partial
+// download is `present` but not `complete`); `url` is the public release the
+// file is fetched from and `license_url` the terms that apply to the weights
+// (Gemma Terms of Use).
+char *octos_embedding_model_status(const char *data_dir);
+
+// Make sure the default embedding model is complete under `data_dir`,
+// downloading and SHA-256-verifying it (334 MB, once) when `download` is
+// true. Needs NO runtime handle, so a host can provision the model — on its
+// own schedule, from a plain thread — BEFORE [`octos_runtime_new`], which
+// otherwise blocks on the same download when `embedding_auto_download` is
+// not `false`. Returns owned JSON `{"path"}` that the caller must free,
+// UNMODIFIED, with [`octos_string_free`] — or NULL on error: the file is
+// absent and `download` is false (or `OCTOS_NO_MODEL_DOWNLOAD` is set in the
+// environment, which vetoes even an explicit `true`), or the download failed
+// or did not verify (the partial file is discarded).
+char *octos_embedding_model_ensure(const char *data_dir, bool download);
 
 // Push app records into the Recall memory index. `request_json` is
 // `{"records": [Record…], "vectors"?: [[f32…]|null…], "embed"?: bool}` where a
@@ -104,8 +129,8 @@ char *octos_memory_load(OctosRuntime *runtime, const char *id);
 char *octos_memory_stats(OctosRuntime *runtime);
 
 // Free a string returned by [`octos_run_task`], [`octos_embed`], an
-// `octos_memory_*` function, or [`octos_take_last_partial_result`]. NULL is a
-// no-op.
+// `octos_memory_*` or `octos_embedding_model_*` function, or
+// [`octos_take_last_partial_result`]. NULL is a no-op.
 //
 // The string is owned by the caller and MUST be freed here, UNMODIFIED — do
 // not alter its bytes or NUL terminator before freeing. (This reclaims via
@@ -123,8 +148,8 @@ const char *octos_last_error(void);
 // does not change the error diagnostic and does NOT turn the task into success.
 //
 // Consume once on the SAME thread, before another `octos_runtime_new`,
-// `octos_run_task`, `octos_embed`, or `octos_memory_*` call (success or
-// failure clears it).
+// `octos_run_task`, `octos_embed`, `octos_memory_*` or
+// `octos_embedding_model_*` call (success or failure clears it).
 // Any new error, including a caught panic, also clears it. Error/version
 // inspection and successful free calls leave it available. The caller must
 // free the returned allocation, UNMODIFIED, with [`octos_string_free`].

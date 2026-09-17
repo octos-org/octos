@@ -80,7 +80,9 @@ def main():
         with tempfile.TemporaryDirectory(prefix="octos-ffi-incomplete-smoke-") as cwd:
             config = {"provider": "custom", "model": "ffi-fixture", "api_key": "fixture-fake-only",
                       "base_url": f"http://127.0.0.1:{server.server_port}/v1", "cwd": cwd,
-                      "max_iterations": 3}
+                      "max_iterations": 3,
+                      # Never fetch the default embedding model in a smoke test.
+                      "embedding_auto_download": False}
             lib = ctypes.CDLL(str(library_dir / library_name("octos_ffi")))
             lib.octos_runtime_new.argtypes = [ctypes.c_char_p]
             lib.octos_runtime_new.restype = ctypes.c_void_p

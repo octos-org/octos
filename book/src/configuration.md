@@ -137,14 +137,19 @@ The complete configuration structure with all available fields:
     "model": null,       // default text-embedding-3-small (1536 dims)
     "dimensions": null   // pin the output size when the model's native size differs
   },
-  // ...or in-process, no API key, any GGUF model over llama.cpp. Needs a
-  // build with `--features embed-llama` (add embed-llama-metal / -cuda to
-  // offload); CPU otherwise. Changing provider or model changes the vector
-  // DIMENSION, which invalidates a populated index — re-embed stored
-  // episodes after switching, or their recall silently degrades to BM25.
+  // ...or in-process over llama.cpp (the DEFAULT when this section is
+  // omitted): EmbeddingGemma-300M Q8_0 is fetched once into
+  // <data_dir>/models/ (334 MB, Gemma Terms of Use — see
+  // docs/THIRD_PARTY_MODELS.md) and used with no API key. `model_path`
+  // points at any other GGUF; `auto_download: false` (or
+  // OCTOS_NO_MODEL_DOWNLOAD=1) keeps memory keyword-only until a model is
+  // supplied. Builds add embed-llama-metal / -cuda to offload; CPU otherwise.
+  // Changing provider or model changes the vector DIMENSION, which
+  // invalidates a populated index — re-embed after switching.
   // "embedding": {
   //   "provider": "llamacpp",
-  //   "model_path": "/path/to/embeddinggemma-300M-Q8_0.gguf"
+  //   "model_path": "/path/to/other-model.gguf",
+  //   "auto_download": true
   // },
 
   // Voice

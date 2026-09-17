@@ -108,6 +108,7 @@ What landed with this record (phase 1 in Octoscript-AppCard, phases 2–3 here):
   nominates hot Documents (≥ N loads, never twice) into the staging area as
   host fact notes carrying provenance, where the existing consolidation and
   guard decide what reaches `MEMORY.md`.
+- **Bundled embedder** — `embed-llama` is a default feature of `octos-cli`, `octos-ffi` and `octos-uniffi` (release builds include it; macOS adds Metal). With no `embedding` config the runtime uses EmbeddingGemma-300M Q8_0, fetched once into `<data_dir>/models/` from the public ggml-org release, SHA-256-pinned (`octos-cli/src/embed_model.rs`; `octos memory embedder [--fetch]`; `octos doctor` reports it; `embedding.auto_download=false` / `OCTOS_NO_MODEL_DOWNLOAD=1` opt out; licence in `docs/THIRD_PARTY_MODELS.md`). The Recall index records it as `llamacpp/embeddinggemma-300M-Q8_0`.
 - **Upkeep** — profile bootstrap spawns bank sync, vector backfill and aging;
   `octos memory search|ingest|promote` operate on the same store.
 - **Not done** — phase 4 (cross-device sync of derived records); the

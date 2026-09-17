@@ -9,7 +9,8 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 
 use octos_ffi::{
-    OctosRuntime, octos_last_error, octos_memory_load, octos_memory_search, octos_memory_stats,
+    OctosRuntime, octos_embed, octos_embedding_model_ensure, octos_embedding_model_status,
+    octos_last_error, octos_memory_load, octos_memory_search, octos_memory_stats,
     octos_memory_upsert, octos_run_task, octos_runtime_free, octos_runtime_new, octos_string_free,
     octos_version,
 };
@@ -25,7 +26,8 @@ fn last_error_string() -> String {
 }
 
 /// A config that constructs a provider offline (no network is touched until a
-/// task actually runs). The dummy key resolves through the reused
+/// task actually runs; the default embedding model download is disabled, so
+/// the runtime is keyword-only). The dummy key resolves through the reused
 /// `Config::get_api_key` env_vars path.
 fn valid_config_json() -> CString {
     CString::new(
@@ -33,7 +35,8 @@ fn valid_config_json() -> CString {
             "provider": "openai",
             "model": "gpt-4o-mini",
             "api_key": "sk-ffi-test-dummy",
-            "cwd": "."
+            "cwd": ".",
+            "embedding_auto_download": false
         }"#,
     )
     .unwrap()
@@ -239,6 +242,82 @@ fn memory_upsert_search_load_round_trip_bm25_only() {
     octos_runtime_free(rt);
 }
 
+#[test]
+fn embedding_model_status_reports_absent_model_without_a_runtime() {
+    // No runtime handle, no network: an empty data dir reports the default
+    // model as absent, with the provenance the host needs to show a user.
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
+    let status = take_json(octos_embedding_model_status(data_dir.as_ptr()));
+    assert_eq!(status["present"], false);
+    assert_eq!(status["complete"], false);
+    assert_eq!(status["bytes"], 0);
+    let path = status["path"].as_str().unwrap();
+    assert!(
+        path.starts_with(dir.path().to_str().unwrap()) && path.ends_with(".gguf"),
+        "got path {path}"
+    );
+    assert!(status["url"].as_str().unwrap().starts_with("https://"));
+    assert!(
+        status["license_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://")
+    );
+    assert_eq!(status["sha256"].as_str().unwrap().len(), 64);
+    assert!(
+        octos_last_error().is_null(),
+        "success clears the last error"
+    );
+
+    // NULL data_dir is rejected, not dereferenced.
+    assert!(octos_embedding_model_status(ptr::null()).is_null());
+    assert!(last_error_string().contains("data_dir: null"));
+}
+
+#[test]
+fn embedding_model_ensure_without_download_fails_when_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
+    assert!(octos_embedding_model_ensure(data_dir.as_ptr(), false).is_null());
+    let err = last_error_string();
+    assert!(err.contains("download is disabled"), "got: {err}");
+    assert!(
+        !dir.path().join("models").exists(),
+        "nothing is created when downloading is disabled"
+    );
+    assert!(octos_embedding_model_ensure(ptr::null(), false).is_null());
+    assert!(last_error_string().contains("data_dir: null"));
+}
+
+#[test]
+fn runtime_without_model_and_downloads_disabled_is_keyword_only() {
+    // The default-features build compiles the embedder, but with the download
+    // opted out and no model on disk the runtime still builds — keyword-only —
+    // and `octos_embed` reports the classic "no embedder configured".
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = CString::new(
+        serde_json::json!({
+            "provider": "openai", "model": "gpt-4o-mini", "api_key": "sk-ffi-test-dummy",
+            "data_dir": dir.path(), "embedding_auto_download": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let rt = octos_runtime_new(cfg.as_ptr());
+    assert!(!rt.is_null(), "error={}", last_error_string());
+    let text = CString::new("hello").unwrap();
+    assert!(octos_embed(rt, text.as_ptr()).is_null());
+    assert_eq!(last_error_string(), "no embedder configured");
+    let stats = take_json(octos_memory_stats(rt));
+    assert_eq!(stats["embedder_id"], "");
+    octos_runtime_free(rt);
+    assert!(
+        !dir.path().join("models").exists(),
+        "no download was attempted"
+    );
+}
+
 /// Real end-to-end run. Ignored: needs a live provider + network. Configure via
 /// env: `OCTOS_FFI_TEST_PROVIDER`, `OCTOS_FFI_TEST_MODEL`, and the provider's
 /// key env var (e.g. `OPENAI_API_KEY`). Run with:
@@ -256,7 +335,8 @@ fn e2e_run_task_returns_output_containing_ok() {
         "model": model,
         "api_key_env": key_env,
         "cwd": ".",
-        "max_iterations": 3
+        "max_iterations": 3,
+        "embedding_auto_download": false
     })
     .to_string();
     let cfg = CString::new(cfg_json).unwrap();

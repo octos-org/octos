@@ -55,6 +55,7 @@ use octos_agent::{
 };
 use octos_cli::commands::chat::create_provider_with_api_type;
 use octos_cli::config::Config;
+use octos_cli::embed_model;
 use octos_core::{AgentId, MessageRole};
 #[cfg(feature = "embed-llama")]
 use octos_llm::EmbeddingProvider;
@@ -282,9 +283,25 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub max_iterations: Option<u32>,
     /// Path to a GGUF embedding model. Enables [`OctosRuntime::embed`] (requires
-    /// the `embed-llama` build feature).
+    /// the `embed-llama` build feature). An explicit path is always honoured
+    /// as-is; when absent, an `embed-llama` build resolves the bundled default
+    /// model (EmbeddingGemma-300M Q8_0) under the data dir — see
+    /// [`RuntimeConfig::embedding_auto_download`].
     #[serde(default)]
     pub embedding_model_path: Option<String>,
+    /// Whether an `embed-llama` build may download the default embedding
+    /// model (334 MB, once, into `<data_dir>/models/`) when
+    /// `embedding_model_path` is unset and the file is not already complete.
+    /// Default `true`; `OCTOS_NO_MODEL_DOWNLOAD=1` in the process environment
+    /// overrides it to `false`. When the download is not allowed (or fails)
+    /// the runtime starts WITHOUT an embedder: memory search is keyword-only
+    /// and `embed` reports "no embedder configured". The download blocks
+    /// runtime creation, so hosts that want control over timing call
+    /// `octos_embedding_model_ensure` / `embedding_model_ensure` beforehand.
+    /// Without a `data_dir` the model lands in the per-runtime scratch dir
+    /// and is deleted with it, so set `data_dir` to keep it.
+    #[serde(default)]
+    pub embedding_auto_download: Option<bool>,
     /// Persistent data directory. When set, the episode store
     /// (`episodes.redb`) AND the Recall store (`recall.redb` +
     /// `recall-index/`) open under it and survive the runtime; the directory
@@ -517,9 +534,12 @@ pub struct OctosRuntime {
     cwd: PathBuf,
     allow_shell: bool,
     default_max_iterations: u32,
-    /// True when the config named an embedding model, used to distinguish
-    /// "no embedder configured" from "not compiled with embed-llama".
-    embedding_configured: bool,
+    /// True when an embedding model is in play: the config named one, or
+    /// (`embed-llama` builds) the default model was resolved and loaded. Used
+    /// to distinguish "no embedder configured" from "not compiled with
+    /// embed-llama"; `false` when the runtime fell back to keyword-only.
+    /// `pub` so hosts (and the uniffi facade) can tell which mode they got.
+    pub embedding_configured: bool,
     #[cfg(feature = "embed-llama")]
     embedder: Option<Arc<octos_embed_llama::LlamaEmbedder>>,
     /// The RESOLVED plaintext key the provider was built with — from whatever
@@ -609,13 +629,6 @@ impl OctosRuntime {
             .build()
             .map_err(|e| CoreError::Config(format!("failed to build tokio runtime: {e}")))?;
 
-        // Build the embedder BEFORE creating the memory scratch dir so that no
-        // fallible step follows dir creation (issue: a later failure would leak
-        // the dir). See the cleanup on the memory-open error path below.
-        #[cfg(feature = "embed-llama")]
-        let embedder =
-            build_embedder(cfg.embedding_model_path.as_deref()).map_err(CoreError::Embed)?;
-
         let cwd = match &cfg.cwd {
             Some(c) => PathBuf::from(c),
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -623,25 +636,68 @@ impl OctosRuntime {
         let default_max_iterations = cfg
             .max_iterations
             .unwrap_or_else(|| AgentConfig::default().max_iterations);
-        let embedding_configured = cfg.embedding_model_path.is_some();
-
-        // Recall index geometry: the configured width, clamped to what the
-        // embedder actually produces; the embedder id pins stored vectors and
-        // the persisted graph to the model that made them.
         let requested_dimension = cfg.recall_dimension.unwrap_or(DEFAULT_RECALL_DIMENSION);
         if requested_dimension == 0 {
             return Err(CoreError::Config(
                 "recall_dimension must be greater than zero".to_string(),
             ));
         }
+
+        // Where the memory stores (and the default embedding model) live. With
+        // `data_dir` they are persistent and caller-owned (nothing is removed
+        // on teardown). Otherwise: a unique scratch dir. Take RAII ownership of
+        // the scratch dir the moment we commit to its path, so that if the
+        // embedder fails to load, a store fails to open, or any later step
+        // errors, the local `scratch` drops and best-effort removes the dir —
+        // no mid-init leak. On success it moves into the struct's LAST field
+        // and is removed only after the stores' redb locks release on
+        // teardown. (`EpisodeStore::open` creates the dir before it can fail,
+        // and does not hold the lock on failure.)
+        let (mem_dir, scratch) = match &cfg.data_dir {
+            Some(dir) => (PathBuf::from(dir), ScratchDir::none()),
+            None => {
+                let seq = MEM_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let dir = std::env::temp_dir().join(format!(
+                    "octos-ffi-mem-{}-{}",
+                    std::process::id(),
+                    seq
+                ));
+                (dir.clone(), ScratchDir::new(dir))
+            }
+        };
+
+        // The embedder: an explicit `embedding_model_path` is loaded as-is
+        // (failure is fatal); otherwise an `embed-llama` build resolves the
+        // default model under `mem_dir` (already complete → load; else fetch
+        // when allowed; else keyword-only). Resolved BEFORE the stores open so
+        // the Recall config can be pinned to the model that will produce its
+        // vectors. `scratch` drops on the error path and removes the dir.
+        #[cfg(feature = "embed-llama")]
+        let resolved = resolve_embedder(&cfg, &mem_dir)?;
+        let embedding_configured = {
+            #[cfg(feature = "embed-llama")]
+            {
+                resolved.embedder.is_some()
+            }
+            #[cfg(not(feature = "embed-llama"))]
+            {
+                // Keeps `octos_embed`'s "not compiled in" diagnostic reachable
+                // when a model WAS named on a feature-off build.
+                cfg.embedding_model_path.is_some()
+            }
+        };
+
+        // Recall index geometry: the configured width, clamped to what the
+        // embedder actually produces; the embedder id pins stored vectors and
+        // the persisted graph to the model that made them.
         // `(dimension, id)` of the loaded embedder, if any.
         let loaded_embedder: Option<(usize, String)> = {
             #[cfg(feature = "embed-llama")]
             {
-                embedder
+                resolved
+                    .embedder
                     .as_ref()
-                    .zip(cfg.embedding_model_path.as_deref())
-                    .map(|(e, path)| (e.dimension().max(1), format!("llamacpp/{path}")))
+                    .map(|e| (e.dimension().max(1), resolved.id.clone()))
             }
             #[cfg(not(feature = "embed-llama"))]
             {
@@ -658,27 +714,6 @@ impl OctosRuntime {
             ..RecallConfig::default()
         };
 
-        // Where the memory stores live. With `data_dir` they are persistent and
-        // caller-owned (nothing is removed on teardown). Otherwise: a unique
-        // scratch dir. Take RAII ownership of the scratch dir the moment we
-        // commit to its path, so that if a store fails to open (or any later
-        // step errors) the local `scratch` drops and best-effort removes the
-        // dir — no mid-init leak. On success it moves into the struct's LAST
-        // field and is removed only after the stores' redb locks release on
-        // teardown. (`EpisodeStore::open` creates the dir before it can fail,
-        // and does not hold the lock on failure.)
-        let (mem_dir, scratch) = match &cfg.data_dir {
-            Some(dir) => (PathBuf::from(dir), ScratchDir::none()),
-            None => {
-                let seq = MEM_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let dir = std::env::temp_dir().join(format!(
-                    "octos-ffi-mem-{}-{}",
-                    std::process::id(),
-                    seq
-                ));
-                (dir.clone(), ScratchDir::new(dir))
-            }
-        };
         let memory = match tokio.block_on(EpisodeStore::open(&mem_dir)) {
             Ok(store) => Arc::new(store),
             Err(e) => {
@@ -709,7 +744,7 @@ impl OctosRuntime {
             default_max_iterations,
             embedding_configured,
             #[cfg(feature = "embed-llama")]
-            embedder,
+            embedder: resolved.embedder,
             secret: resolved_secret,
             scratch,
         })
@@ -1143,19 +1178,134 @@ fn guard<T>(default: T, ctx: &'static str, body: impl FnOnce() -> T) -> T {
 }
 
 #[cfg(feature = "embed-llama")]
-fn build_embedder(
-    path: Option<&str>,
-) -> Result<Option<Arc<octos_embed_llama::LlamaEmbedder>>, String> {
-    match path {
-        Some(p) => {
-            // n_gpu_layers = 0 -> CPU; hosts wanting Metal/CUDA build the
-            // corresponding feature which changes the linked backend.
-            let embedder = octos_embed_llama::LlamaEmbedder::from_model_file(p, 0)
-                .map_err(|e| format!("failed to load embedding model '{p}': {e}"))?;
-            Ok(Some(Arc::new(embedder)))
-        }
-        None => Ok(None),
+fn build_embedder(path: &Path) -> Result<Arc<octos_embed_llama::LlamaEmbedder>, CoreError> {
+    // n_gpu_layers = 0 -> CPU; hosts wanting Metal/CUDA build the
+    // corresponding feature which changes the linked backend.
+    let embedder = octos_embed_llama::LlamaEmbedder::from_model_file(path, 0).map_err(|e| {
+        CoreError::Embed(format!(
+            "failed to load embedding model '{}': {e}",
+            path.display()
+        ))
+    })?;
+    Ok(Arc::new(embedder))
+}
+
+/// The embedder an `embed-llama` runtime ended up with (see
+/// [`resolve_embedder`]).
+#[cfg(feature = "embed-llama")]
+struct ResolvedEmbedder {
+    /// `None` = keyword-only (no path configured and no default model).
+    embedder: Option<Arc<octos_embed_llama::LlamaEmbedder>>,
+    /// The `RecallConfig::embedder_id` that pins stored vectors to the model:
+    /// `llamacpp/<path>` for an explicit path,
+    /// [`embed_model::DEFAULT_MODEL_ID`] for the default model, empty when
+    /// there is no embedder.
+    id: String,
+}
+
+/// Pick and load the runtime's embedder. An explicit `embedding_model_path`
+/// is loaded verbatim and a load failure is fatal (unchanged semantics).
+/// Otherwise the default model is resolved under `data_dir`
+/// ([`resolve_default_model`]); when it is unavailable the runtime runs
+/// keyword-only rather than failing, so a host that is offline on first
+/// launch still gets a working (BM25) memory. A default model that IS on
+/// disk but fails to load is reported, like an explicit one.
+#[cfg(feature = "embed-llama")]
+fn resolve_embedder(cfg: &RuntimeConfig, data_dir: &Path) -> Result<ResolvedEmbedder, CoreError> {
+    if let Some(path) = cfg.embedding_model_path.as_deref() {
+        return Ok(ResolvedEmbedder {
+            embedder: Some(build_embedder(Path::new(path))?),
+            id: format!("llamacpp/{path}"),
+        });
     }
+    match resolve_default_model(data_dir, cfg.embedding_auto_download) {
+        Some(path) => Ok(ResolvedEmbedder {
+            embedder: Some(build_embedder(&path)?),
+            id: embed_model::DEFAULT_MODEL_ID.to_string(),
+        }),
+        None => Ok(ResolvedEmbedder {
+            embedder: None,
+            id: String::new(),
+        }),
+    }
+}
+
+/// Where the default model is for `data_dir`, fetching it first when it is
+/// absent/incomplete and `embed_model::downloads_allowed(auto_download)`.
+/// `None` means "run keyword-only": downloads are disabled, or the download
+/// failed (logged at `warn`; a host wanting the error itself calls
+/// [`embedding_model_ensure`] before building the runtime).
+#[cfg(feature = "embed-llama")]
+fn resolve_default_model(data_dir: &Path, auto_download: Option<bool>) -> Option<PathBuf> {
+    let status = embed_model::model_status(data_dir);
+    if status.complete {
+        return Some(status.path);
+    }
+    if !embed_model::downloads_allowed(auto_download) {
+        tracing::warn!(
+            path = %status.path.display(),
+            "default embedding model is not present and automatic download is disabled; \
+             memory search runs keyword-only"
+        );
+        return None;
+    }
+    match embed_model::ensure_default_model(data_dir, true) {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "default embedding model download failed; memory search runs keyword-only"
+            );
+            None
+        }
+    }
+}
+
+/// Reject an empty data dir before it silently resolves to `models/…` under
+/// the process cwd.
+fn checked_data_dir(data_dir: &Path) -> Result<&Path, CoreError> {
+    if data_dir.as_os_str().is_empty() {
+        return Err(CoreError::Embed("data_dir is empty".to_string()));
+    }
+    Ok(data_dir)
+}
+
+/// What is on disk for the default embedding model under `data_dir`, as the
+/// JSON `{"path", "present", "bytes", "complete", "url", "license_url",
+/// "sha256"}` the C-ABI and uniffi facades return (`octos_embedding_model_status`
+/// / `embedding_model_status`). `complete` is `present` AND the pinned size;
+/// `url` is where [`embedding_model_ensure`] fetches from and `license_url`
+/// the terms that apply to the weights (Gemma Terms of Use). Needs no
+/// runtime and never touches the network. Available in every build; the model
+/// is only USED by `embed-llama` builds.
+pub fn embedding_model_status(data_dir: &Path) -> Result<String, CoreError> {
+    let status = embed_model::model_status(checked_data_dir(data_dir)?);
+    let out = json!({
+        "path": status.path.to_string_lossy(),
+        "present": status.present,
+        "bytes": status.bytes,
+        "complete": status.complete,
+        "url": embed_model::DEFAULT_MODEL_URL,
+        "license_url": embed_model::DEFAULT_MODEL_LICENSE_URL,
+        "sha256": embed_model::DEFAULT_MODEL_SHA256,
+    });
+    Ok(out.to_string())
+}
+
+/// Make sure the default embedding model is complete under `data_dir`,
+/// downloading (and SHA-256-verifying) it when `download` is true, and
+/// return JSON `{"path"}`. Blocks for the whole 334 MB transfer; call it from
+/// a plain thread BEFORE building a runtime so the runtime constructor finds
+/// the file and does not download itself. Fails with [`CoreError::Embed`] when
+/// the file is absent and `download` is false — or `OCTOS_NO_MODEL_DOWNLOAD`
+/// is set in the environment, which vetoes even an explicit `true` — or the
+/// download does not verify (the partial file is discarded).
+pub fn embedding_model_ensure(data_dir: &Path, download: bool) -> Result<String, CoreError> {
+    let data_dir = checked_data_dir(data_dir)?;
+    let allowed = embed_model::downloads_allowed(Some(download));
+    let path = embed_model::ensure_default_model(data_dir, allowed)
+        .map_err(|e| CoreError::Embed(format!("{e:#}")))?;
+    Ok(json!({ "path": path.to_string_lossy() }).to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,8 +1437,10 @@ fn task_result_json(result: &TaskResult) -> String {
 
 /// Embed `text`. Returns owned JSON `{"embedding": [f32, ...]}` that the caller
 /// must free, UNMODIFIED, with [`octos_string_free`] — or NULL on error.
-/// Requires the `embed-llama` feature and an `embedding_model_path` in the
-/// config.
+/// Requires the `embed-llama` feature and a loaded model: the config's
+/// `embedding_model_path`, or the default model resolved at
+/// [`octos_runtime_new`] (see [`octos_embedding_model_ensure`]). Without one
+/// the last error is "no embedder configured".
 #[unsafe(no_mangle)]
 pub extern "C" fn octos_embed(runtime: *mut OctosRuntime, text: *const c_char) -> *mut c_char {
     guard(ptr::null_mut(), "octos_embed", || {
@@ -1334,6 +1486,69 @@ fn embed_serialize(_rt: &OctosRuntime, _text: &str) -> Result<*mut c_char, Strin
         "embedding support not compiled in (rebuild octos-ffi with --features embed-llama)"
             .to_string(),
     )
+}
+
+/// Shared body of the `octos_embedding_model_*` entry points: panic firewall,
+/// last-error reset, `data_dir` NULL/UTF-8 check, then `body` producing the
+/// owned JSON string. No runtime handle is involved.
+fn model_ffi(
+    data_dir: *const c_char,
+    ctx: &'static str,
+    body: impl FnOnce(&Path) -> Result<String, CoreError>,
+) -> *mut c_char {
+    guard(ptr::null_mut(), ctx, || {
+        clear_last_error();
+        // SAFETY: `cstr_to_str` NULL-checks and UTF-8-validates.
+        let result = unsafe { cstr_to_str(data_dir) }
+            .map_err(|e| format!("data_dir: {e}"))
+            .and_then(|dir| body(Path::new(dir)).map_err(|e| e.to_string()))
+            .and_then(to_owned_ptr);
+        match result {
+            Ok(p) => p,
+            Err(msg) => {
+                set_last_error(msg);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Report what is on disk for the default embedding model (EmbeddingGemma-300M
+/// Q8_0) under `data_dir` — the same directory a runtime's `data_dir` config
+/// names. Needs NO runtime handle and never touches the network. Returns owned
+/// JSON `{"path", "present", "bytes", "complete", "url", "license_url",
+/// "sha256"}` that the caller must free, UNMODIFIED, with [`octos_string_free`]
+/// — or NULL on error. `complete` means present at the pinned size (a partial
+/// download is `present` but not `complete`); `url` is the public release the
+/// file is fetched from and `license_url` the terms that apply to the weights
+/// (Gemma Terms of Use).
+#[unsafe(no_mangle)]
+pub extern "C" fn octos_embedding_model_status(data_dir: *const c_char) -> *mut c_char {
+    model_ffi(
+        data_dir,
+        "octos_embedding_model_status",
+        embedding_model_status,
+    )
+}
+
+/// Make sure the default embedding model is complete under `data_dir`,
+/// downloading and SHA-256-verifying it (334 MB, once) when `download` is
+/// true. Needs NO runtime handle, so a host can provision the model — on its
+/// own schedule, from a plain thread — BEFORE [`octos_runtime_new`], which
+/// otherwise blocks on the same download when `embedding_auto_download` is
+/// not `false`. Returns owned JSON `{"path"}` that the caller must free,
+/// UNMODIFIED, with [`octos_string_free`] — or NULL on error: the file is
+/// absent and `download` is false (or `OCTOS_NO_MODEL_DOWNLOAD` is set in the
+/// environment, which vetoes even an explicit `true`), or the download failed
+/// or did not verify (the partial file is discarded).
+#[unsafe(no_mangle)]
+pub extern "C" fn octos_embedding_model_ensure(
+    data_dir: *const c_char,
+    download: bool,
+) -> *mut c_char {
+    model_ffi(data_dir, "octos_embedding_model_ensure", |dir| {
+        embedding_model_ensure(dir, download)
+    })
 }
 
 /// Shared body of the `octos_memory_*` entry points: panic firewall, last-error
@@ -1424,8 +1639,8 @@ pub extern "C" fn octos_memory_stats(runtime: *mut OctosRuntime) -> *mut c_char 
 }
 
 /// Free a string returned by [`octos_run_task`], [`octos_embed`], an
-/// `octos_memory_*` function, or [`octos_take_last_partial_result`]. NULL is a
-/// no-op.
+/// `octos_memory_*` or `octos_embedding_model_*` function, or
+/// [`octos_take_last_partial_result`]. NULL is a no-op.
 ///
 /// The string is owned by the caller and MUST be freed here, UNMODIFIED — do
 /// not alter its bytes or NUL terminator before freeing. (This reclaims via
@@ -1460,8 +1675,8 @@ pub extern "C" fn octos_last_error() -> *const c_char {
 /// does not change the error diagnostic and does NOT turn the task into success.
 ///
 /// Consume once on the SAME thread, before another `octos_runtime_new`,
-/// `octos_run_task`, `octos_embed`, or `octos_memory_*` call (success or
-/// failure clears it).
+/// `octos_run_task`, `octos_embed`, `octos_memory_*` or
+/// `octos_embedding_model_*` call (success or failure clears it).
 /// Any new error, including a caught panic, also clears it. Error/version
 /// inspection and successful free calls leave it available. The caller must
 /// free the returned allocation, UNMODIFIED, with [`octos_string_free`].
@@ -1509,6 +1724,9 @@ mod incomplete_tests;
 
 #[cfg(test)]
 mod memory_tests;
+
+#[cfg(test)]
+mod model_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1714,7 +1932,8 @@ mod tests {
         // End-to-end through runtime_new_impl: rt.secret equals the exact key the
         // provider was built with (single resolution → pinned → mirrored).
         let cfg = CString::new(
-            r#"{"provider":"openai","model":"gpt-4o-mini","api_key":"pinme-key-123"}"#,
+            r#"{"provider":"openai","model":"gpt-4o-mini","api_key":"pinme-key-123",
+                "embedding_auto_download":false}"#,
         )
         .unwrap();
         let raw = runtime_new_impl(cfg.as_ptr()).expect("runtime built");
@@ -1732,6 +1951,7 @@ mod tests {
             provider: "openai".to_string(),
             model: "gpt-4o-mini".to_string(),
             api_key: Some("dummy-key".to_string()),
+            embedding_auto_download: Some(false),
             ..RuntimeConfig::default()
         })
         .expect("runtime built");
@@ -1752,9 +1972,11 @@ mod tests {
         // The C free path must still remove the scratch dir now that the manual
         // `remove_dir_all` is gone (drop order: store lock releases, then
         // `ScratchDir` removes the dir).
-        let cfg =
-            CString::new(r#"{"provider":"openai","model":"gpt-4o-mini","api_key":"dummy-key"}"#)
-                .unwrap();
+        let cfg = CString::new(
+            r#"{"provider":"openai","model":"gpt-4o-mini","api_key":"dummy-key",
+                "embedding_auto_download":false}"#,
+        )
+        .unwrap();
         let raw = runtime_new_impl(cfg.as_ptr()).expect("runtime built");
         // SAFETY: non-null handle just built by `runtime_new_impl`.
         let dir = unsafe { &*raw }.scratch_dir_for_test();
@@ -1787,6 +2009,7 @@ mod tests {
             model: "gpt-4o-mini".to_string(),
             api_key: Some("dummy-key".to_string()),
             data_dir: data_dir.map(|d| d.to_string_lossy().into_owned()),
+            embedding_auto_download: Some(false),
             ..RuntimeConfig::default()
         })
         .expect("runtime built")
