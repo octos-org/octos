@@ -39107,6 +39107,163 @@ async fn turn_start_still_rejects_when_turn_already_running() {
     );
 }
 
+/// Same refusal, now MACHINE-READABLE. Two UI Protocol clients (the TUI and
+/// the browser client) can attach to one `octos serve` and open the same
+/// session; the loser of the `turn/start` race used to get untyped prose it
+/// could not branch on. The refusal keeps that human string byte-for-byte and
+/// adds the `turn_in_progress` discriminator already used by the
+/// `session/rollback` guard, plus the id of the turn that actually holds the
+/// session so the client can address it (`turn/interrupt`, "the other window
+/// is busy on turn X").
+#[tokio::test(flavor = "current_thread")]
+async fn should_refuse_with_typed_turn_in_progress_when_turn_start_collides() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let provider = Arc::new(AppuiContinuationLlm::new("unused"));
+    let (state, _profile_runtime) =
+        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider).await;
+    let session_id = SessionKey::new("api", "typed-occupied");
+    let running_turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (entry, _) = synthetic_active_turn(&running_turn_id, true);
+    active_turns.lock().await.insert(session_id.clone(), entry);
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(32);
+
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "start-typed-busy".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: TurnId::new(),
+            input: vec![InputItem::Text {
+                text: "second turn".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+        },
+    )
+    .await;
+
+    let frame = recv_rpc_response_with_id(&mut rx, "start-typed-busy").await;
+    // Byte-for-byte unchanged human message — existing clients and tests
+    // match on it.
+    assert_eq!(
+        frame["error"]["message"],
+        json!("a turn is already running for this session"),
+        "frame: {frame}"
+    );
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!("turn_in_progress"),
+        "frame: {frame}"
+    );
+    assert_eq!(
+        frame["error"]["data"]["turn_id"],
+        json!(running_turn_id),
+        "the refusal must name the turn that actually holds the session: {frame}"
+    );
+}
+
+/// `session/list` must disclose per-session busy state. The active-turn
+/// registry is PROCESS-global, so the flag is honest for a session this
+/// connection never opened — that is the whole point: it is how the browser
+/// client learns the TUI is mid-turn in a session it can see but has not
+/// attached to.
+#[tokio::test(flavor = "current_thread")]
+async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
+    use octos_core::ui_protocol::SessionListParams;
+
+    let busy = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "list-busy");
+    let idle = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "list-idle");
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let manager = octos_bus::SessionManager::open(temp.path()).expect("session manager open");
+    let manager = Arc::new(TokioMutex::new(manager));
+    {
+        let mut guard = manager.lock().await;
+        for key in [&busy, &idle] {
+            guard
+                .add_message(
+                    key,
+                    Message {
+                        role: MessageRole::User,
+                        content: "hello".into(),
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        client_message_id: None,
+                        thread_id: None,
+                        timestamp: Utc::now(),
+                    },
+                )
+                .await
+                .expect("persist user message");
+        }
+    }
+    let state = Arc::new(AppState {
+        sessions: Some(manager),
+        ..AppState::empty_for_tests()
+    });
+
+    // A turn owned by ANOTHER connection, registered exactly as
+    // `handle_turn_start` does, in the process-global registry.
+    let registry = active_turns_registry();
+    let (entry, _) = synthetic_active_turn(&TurnId::new(), true);
+    registry.lock().await.insert(busy.clone(), entry);
+
+    let (ws, mut rx) = ws_connection_for_test(32);
+    handle_session_list(
+        &ws,
+        &state,
+        &HeaderMap::new(),
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "list-busy-flag".into(),
+        SessionListParams { cwd: None },
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut rx, "list-busy-flag").await;
+    registry.lock().await.remove(&busy);
+
+    let sessions = frame["result"]["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("session/list must return an array: {frame}"));
+    let find = |id: &str| {
+        sessions
+            .iter()
+            .find(|entry| entry["id"] == json!(id))
+            .unwrap_or_else(|| panic!("{id} missing from {frame}"))
+            .clone()
+    };
+    assert_eq!(
+        find("list-busy")["active_turn"],
+        json!(true),
+        "a session with a live turn must be flagged: {frame}"
+    );
+    assert_eq!(
+        find("list-idle")["active_turn"],
+        json!(false),
+        "an idle session must report false, not absent: {frame}"
+    );
+}
+
 /// LLM stub for the end-to-end mid-turn steer test. Call 0 announces it
 /// entered (so the test can steer while the model is "streaming"), waits
 /// for the go-signal, then returns a FINAL answer; the pending steer must

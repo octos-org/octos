@@ -566,6 +566,44 @@ pub struct SessionInfo {
     /// no user message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prompt: Option<String>,
+    /// Does this session have a live (non-terminal) turn RIGHT NOW?
+    ///
+    /// Sourced from the process-global active-turn registry, not from disk —
+    /// so it is honest about sessions the asking connection never opened,
+    /// which is the point: two UI Protocol clients (the TUI and the browser
+    /// client) can attach to one `octos serve`, and this is how one learns the
+    /// other is mid-turn before it tries a `turn/start` that would be refused.
+    ///
+    /// Always serialized (unlike the `Option` fields above, where absence
+    /// means "unknown"): `false` is a real, useful answer. Additive and
+    /// ungated — `session/list` itself is already behind
+    /// `auxiliary.rest_to_ws.v1`, and the sibling additive fields on this
+    /// struct carry no capability of their own. `#[serde(default)]` keeps the
+    /// gateway-merge deserialization below working against an older peer that
+    /// does not emit the field.
+    #[serde(default)]
+    pub active_turn: bool,
+}
+
+/// Does a listing entry correspond to a session with a live turn?
+///
+/// The active-turn registry is keyed by the WIRE [`SessionKey`]
+/// (`<profile>:api:<chat>` — what `turn/start` carries), while a per-profile
+/// or per-project store lists chat-BARE ids, so reconstruct the wire key for
+/// the listing's effective profile. An id that is ALREADY a full key (it
+/// carries the `:` channel separator, as legacy flat-layout entries can) is
+/// also matched verbatim; a chat-bare id is deliberately NOT, or profile A's
+/// live turn on `A:api:web-1` would light up profile B's own `web-1` row.
+/// Callers still holding the full key (the process-wide walk) match it
+/// exactly instead of going through here.
+fn session_id_has_active_turn(
+    active_turns: &std::collections::HashSet<SessionKey>,
+    effective_profile_id: &str,
+    listed_id: &str,
+) -> bool {
+    active_turns.contains(&SessionKey(format!(
+        "{effective_profile_id}:api:{listed_id}"
+    ))) || (listed_id.contains(':') && active_turns.contains(&SessionKey(listed_id.to_owned())))
 }
 
 fn is_internal_api_session_id(id: &str) -> bool {
@@ -594,6 +632,12 @@ pub async fn list_sessions(
     // `None` (the default, and always when the flag is off) → byte-identical
     // legacy behavior.
     cwd_sessions_root: Option<std::path::PathBuf>,
+    // Sessions with a live (non-terminal) turn, snapshotted from the
+    // process-global active-turn registry by the WS handler BEFORE this call
+    // (never while holding a sessions lock). Stamps `SessionInfo.active_turn`.
+    // The id shapes differ per store, so the mapping back onto the registry's
+    // wire keys happens here, where the effective profile is known.
+    active_turns: &std::collections::HashSet<SessionKey>,
 ) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
@@ -608,13 +652,27 @@ pub async fn list_sessions(
         Err(response) => return response,
     };
 
+    // Effective profile scope for this listing. Resolved up here (it used to
+    // sit below the cwd short-circuit) so the per-project branch can stamp
+    // `active_turn` against the same profile as every other scope. Both reads
+    // are pure functions of the state + headers, so hoisting them changes
+    // nothing else.
+    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
+    // A localhost / stdio UI Protocol connection has no routed profile
+    // header, but its authenticated profile is frozen onto the connection.
+    // Use that scope for every legacy fallback below; defaulting to `_main`
+    // here leaks solo/admin session metadata into an ordinary user's list.
+    let connection_scoped_profile_id =
+        connection_profile_id.filter(|_| routed_profile_id.is_none());
+    let effective_profile_id = connection_scoped_profile_id.unwrap_or(&profile_id);
+
     // Per-project listing short-circuit (`appui.sessions_in_cwd`). The
     // authorization gate above still runs (the connection must be allowed to
     // list at all); we then scope the listing to the cwd's `<cwd>/.octos`
     // store instead of the profile/global stores. Runs BEFORE the legacy
     // merge so a project session list never bleeds in another scope's rows.
     if let Some(cwd_root) = cwd_sessions_root {
-        let cwd_sessions = list_profile_sessions(&cwd_root);
+        let cwd_sessions = list_profile_sessions(&cwd_root, active_turns, effective_profile_id);
         return Json(cwd_sessions).into_response();
     }
 
@@ -660,14 +718,6 @@ pub async fn list_sessions(
     // keep the existing header + identity authorized resolution unchanged
     // — Layer-2 authorization still applies, and a parent viewing a
     // sub-account subdomain still lists the routed profile's sessions.
-    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
-    // A localhost / stdio UI Protocol connection has no routed profile
-    // header, but its authenticated profile is frozen onto the connection.
-    // Use that scope for every legacy fallback below; defaulting to `_main`
-    // here leaks solo/admin session metadata into an ordinary user's list.
-    let connection_scoped_profile_id =
-        connection_profile_id.filter(|_| routed_profile_id.is_none());
-    let effective_profile_id = connection_scoped_profile_id.unwrap_or(&profile_id);
     let profile_data_dir = match connection_profile_id {
         Some(pid) if routed_profile_id.is_none() => {
             resolve_profile_data_dir_by_id(&state, pid).ok()
@@ -677,7 +727,8 @@ pub async fn list_sessions(
             .ok(),
     };
     if let Some(profile_data_dir) = profile_data_dir {
-        let profile_sessions = list_profile_sessions(&profile_data_dir);
+        let profile_sessions =
+            list_profile_sessions(&profile_data_dir, active_turns, effective_profile_id);
         let existing: std::collections::HashSet<String> =
             all.iter().map(|s| s.id.clone()).collect();
         all.extend(
@@ -709,12 +760,17 @@ pub async fn list_sessions(
                     if existing.contains(chat_id) {
                         return None;
                     }
+                    // The process-wide store hands us the FULL wire key
+                    // before the prefix strip, so match the registry exactly
+                    // rather than reconstructing it.
+                    let active_turn = active_turns.contains(&SessionKey(id.clone()));
                     Some(SessionInfo {
                         id: chat_id.to_string(),
                         message_count: count,
                         title,
                         updated_at: updated_at.map(|dt| dt.to_rfc3339()),
                         last_prompt,
+                        active_turn,
                     })
                 }),
         );
@@ -749,9 +805,25 @@ pub async fn list_sessions(
                     // Merge, dedup by id (per-profile / standalone wins).
                     let existing: std::collections::HashSet<String> =
                         all.iter().map(|s| s.id.clone()).collect();
-                    all.extend(gateway_sessions.into_iter().filter(|s| {
-                        !existing.contains(&s.id) && !is_internal_api_session_id(&s.id)
-                    }));
+                    all.extend(
+                        gateway_sessions
+                            .into_iter()
+                            .filter(|s| {
+                                !existing.contains(&s.id) && !is_internal_api_session_id(&s.id)
+                            })
+                            // The gateway is a separate process with its own
+                            // registry, so trust its flag when it sets one and
+                            // otherwise fall back to ours.
+                            .map(|mut s| {
+                                s.active_turn = s.active_turn
+                                    || session_id_has_active_turn(
+                                        active_turns,
+                                        effective_profile_id,
+                                        &s.id,
+                                    );
+                                s
+                            }),
+                    );
                 }
             }
         }
@@ -789,7 +861,11 @@ pub async fn list_sessions(
 /// is needed inside this helper. The caller (`list_sessions`) handles
 /// header/identity authorization via [`resolve_profile_data_dir`]
 /// before invoking us.
-fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo> {
+fn list_profile_sessions(
+    profile_data_dir: &std::path::Path,
+    active_turns: &std::collections::HashSet<SessionKey>,
+    effective_profile_id: &str,
+) -> Vec<SessionInfo> {
     let Ok(mgr) = octos_bus::SessionManager::open(profile_data_dir) else {
         return Vec::new();
     };
@@ -799,12 +875,14 @@ fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo>
             if is_internal_api_session_id(&id) {
                 return None;
             }
+            let active_turn = session_id_has_active_turn(active_turns, effective_profile_id, &id);
             Some(SessionInfo {
                 id,
                 message_count: count,
                 title,
                 updated_at: updated_at.map(|dt| dt.to_rfc3339()),
                 last_prompt,
+                active_turn,
             })
         })
         .collect()
@@ -4366,6 +4444,7 @@ mod tests {
             title: None,
             updated_at: None,
             last_prompt: None,
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "test-session");
@@ -4392,6 +4471,7 @@ mod tests {
             title: Some("My Pinned Chat".into()),
             updated_at: None,
             last_prompt: None,
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["title"], "My Pinned Chat");
@@ -4405,6 +4485,7 @@ mod tests {
             title: None,
             updated_at: Some("2026-07-02T12:00:00+00:00".into()),
             last_prompt: None,
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["updated_at"], "2026-07-02T12:00:00+00:00");
@@ -4418,6 +4499,7 @@ mod tests {
             title: None,
             updated_at: None,
             last_prompt: Some("what is the capital of France?".into()),
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["last_prompt"], "what is the capital of France?");
@@ -4740,7 +4822,8 @@ mod tests {
             .unwrap();
         }
 
-        let mut sessions = list_profile_sessions(profile_data_dir);
+        let mut sessions =
+            list_profile_sessions(profile_data_dir, &Default::default(), MAIN_PROFILE_ID);
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
 
@@ -4800,7 +4883,8 @@ mod tests {
             .unwrap();
         }
 
-        let sessions = list_profile_sessions(profile_data_dir);
+        let sessions =
+            list_profile_sessions(profile_data_dir, &Default::default(), MAIN_PROFILE_ID);
         let session = sessions
             .iter()
             .find(|s| s.id == "web-501")
@@ -4818,7 +4902,7 @@ mod tests {
     #[tokio::test]
     async fn list_profile_sessions_returns_empty_when_dir_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let sessions = list_profile_sessions(tmp.path());
+        let sessions = list_profile_sessions(tmp.path(), &Default::default(), MAIN_PROFILE_ID);
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
         assert!(
             sessions.is_empty(),
@@ -4876,7 +4960,8 @@ mod tests {
         // call site, where `resolve_profile_data_dir` runs the
         // identity check FIRST and only hands us a path the
         // request is authorized to read.
-        let sessions = list_profile_sessions(profile_data_dir);
+        let sessions =
+            list_profile_sessions(profile_data_dir, &Default::default(), MAIN_PROFILE_ID);
         assert_eq!(sessions.len(), 2, "expected dspfac's two web chats");
         let ids: std::collections::HashSet<_> = sessions.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains("web-1779100000001-aa"));
@@ -4918,6 +5003,7 @@ mod tests {
             Some(Extension(AuthIdentity::Admin)),
             None,
             None,
+            &Default::default(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -5005,6 +5091,7 @@ mod tests {
             })),
             Some("tenant-user"),
             None,
+            &Default::default(),
         )
         .await;
 
@@ -5090,7 +5177,15 @@ mod tests {
 
         // connection_profile_id = "dev", empty headers, no identity — the
         // frozen scope a solo stdio connection carries.
-        let response = list_sessions(State(state), HeaderMap::new(), None, Some("dev"), None).await;
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            None,
+            Some("dev"),
+            None,
+            &Default::default(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -6007,7 +6102,15 @@ mod tests {
             ..AppState::empty_for_tests()
         });
 
-        let response = list_sessions(State(state), HeaderMap::new(), None, None, None).await;
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            None,
+            None,
+            None,
+            &Default::default(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -6065,7 +6168,15 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let response = list_sessions(State(state), HeaderMap::new(), None, None, None).await;
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            None,
+            None,
+            None,
+            &Default::default(),
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert_eq!(response.status(), StatusCode::OK);

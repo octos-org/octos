@@ -22326,18 +22326,22 @@ async fn handle_review_start(
         .await;
     });
 
-    let inserted = {
+    // `None` => admitted. `Some(turn_id)` => refused, carrying the id of the
+    // turn that actually holds the session. The id is captured in the SAME
+    // lock scope that makes the decision (never by re-acquiring the registry
+    // afterwards, which could name a different turn) and it costs no new
+    // await under the lock — it is a clone of a field already in hand.
+    let occupied_by = {
         let mut active = active_turns.lock().await;
         let occupied = match active.get(&session_id) {
             Some(existing) => {
                 let existing_state = existing.state.lock().await;
-                !matches!(*existing_state, TurnState::Terminal(_))
+                (!matches!(*existing_state, TurnState::Terminal(_)))
+                    .then(|| existing.turn_id.clone())
             }
-            None => false,
+            None => None,
         };
-        if occupied {
-            false
-        } else {
+        if occupied.is_none() {
             // Client-supplied turn ids carry no uniqueness guarantee — a
             // reused id must not inherit a prior turn's `session/btw` draft.
             btw_live_draft_clear(&session_id, &turn_id);
@@ -22354,16 +22358,12 @@ async fn handle_review_start(
                     abort: handle.abort_handle(),
                 },
             );
-            true
         }
+        occupied
     };
-    if !inserted {
+    if let Some(running_turn_id) = occupied_by {
         handle.abort();
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_request("a turn is already running for this session"),
-        );
+        let _ = send_rpc_error(ws, Some(id), turn_in_progress_refusal(&running_turn_id));
         return;
     }
 
@@ -23001,7 +23001,12 @@ async fn handle_turn_start_with_accept(
         }
     });
 
-    let inserted = {
+    // `None` => admitted. `Some(turn_id)` => refused, carrying the id of the
+    // turn that actually holds the session. The id is captured in the SAME
+    // lock scope that makes the decision (never by re-acquiring the registry
+    // afterwards, which could name a different turn) and it costs no new
+    // await under the lock — it is a clone of a field already in hand.
+    let occupied_by = {
         let mut active = active_turns.lock().await;
         // Allow replacing a `Terminal(_)` entry — the prior turn is finished;
         // we keep the entry only so a follow-up `turn/interrupt` can return
@@ -23010,13 +23015,12 @@ async fn handle_turn_start_with_accept(
         let occupied = match active.get(&session_id) {
             Some(existing) => {
                 let existing_state = existing.state.lock().await;
-                !matches!(*existing_state, TurnState::Terminal(_))
+                (!matches!(*existing_state, TurnState::Terminal(_)))
+                    .then(|| existing.turn_id.clone())
             }
-            None => false,
+            None => None,
         };
-        if occupied {
-            false
-        } else {
+        if occupied.is_none() {
             // Client-supplied turn ids carry no uniqueness guarantee — a
             // reused id must not inherit a prior turn's `session/btw` draft.
             btw_live_draft_clear(&session_id, &turn_id);
@@ -23031,16 +23035,12 @@ async fn handle_turn_start_with_accept(
                     abort: handle.abort_handle(),
                 },
             );
-            true
         }
+        occupied
     };
-    if !inserted {
+    if let Some(running_turn_id) = occupied_by {
         handle.abort();
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_request("a turn is already running for this session"),
-        );
+        let _ = send_rpc_error(ws, Some(id), turn_in_progress_refusal(&running_turn_id));
         return false;
     }
 
@@ -23859,6 +23859,23 @@ async fn drain_appui_due_master_continuations(
         )
         .await;
     }
+}
+
+/// The `turn/start` collision refusal, typed.
+///
+/// Two UI Protocol clients (the TUI and the browser client) can attach to one
+/// `octos serve` and open the SAME session; the process-global active-turn
+/// registry admits only one turn per session and the loser lands here. The
+/// human message is FROZEN — existing clients and tests match on it verbatim
+/// — so the machine-readable half rides in `data`, reusing the same
+/// `kind: "turn_in_progress"` discriminator the `session/rollback` guard
+/// already emits rather than inventing a second vocabulary word for the same
+/// condition. `turn_id` names the turn that actually holds the session, so a
+/// client can address it (`turn/interrupt`, or just "the other window is busy
+/// on turn X") instead of guessing.
+fn turn_in_progress_refusal(running_turn_id: &TurnId) -> RpcError {
+    RpcError::invalid_request("a turn is already running for this session")
+        .with_data(json!({ "kind": "turn_in_progress", "turn_id": running_turn_id }))
 }
 
 /// Snapshot of sessions that currently have an in-flight (non-terminal) turn in
@@ -27624,12 +27641,19 @@ async fn handle_session_list(
             }
         };
     let identity_ext = identity.cloned().map(Extension);
+    // Per-session busy state. Read from the PROCESS-global registry, not this
+    // connection's `connection_turns`, so the flag is honest about a session
+    // another client — the TUI next to this browser tab — is mid-turn in but
+    // this connection never opened. Taken as one snapshot BEFORE the listing
+    // so no sessions lock is ever held while the registry lock is.
+    let busy_sessions = active_turn_sessions(&active_turns_registry()).await;
     let response = super::handlers::list_sessions(
         State(state.clone()),
         headers.clone(),
         identity_ext,
         connection_profile_id,
         cwd_sessions_root,
+        &busy_sessions,
     )
     .await;
     let method = octos_core::ui_protocol::methods::SESSION_LIST;
