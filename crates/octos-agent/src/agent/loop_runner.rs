@@ -948,8 +948,18 @@ impl Agent {
                 // Refresh provider-backed prompt segments (e.g. the memory
                 // block when MEMORY.md changed on disk) before composing.
                 // No-op unless providers are registered; providers keep the
-                // unchanged path to a single stat.
-                self.refresh_prompt_segments().await;
+                // unchanged path to a single stat. The latest user text lets
+                // the memory segment rank bank pages for this turn.
+                let turn_query: Option<&str> = if user_content.trim().is_empty() {
+                    history
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == MessageRole::User)
+                        .map(|m| m.content.as_str())
+                } else {
+                    Some(user_content)
+                };
+                self.refresh_prompt_segments_for(turn_query).await;
 
                 // Build the system prompt via the shared helper in
                 // execution.rs so conversation + task loops compose the same
@@ -2776,21 +2786,34 @@ impl Agent {
                             );
                             episode.files_modified = files_modified.clone();
                             let ep_id = episode.id.clone();
+                            let mirror = octos_memory::record_from_episode(&episode);
 
                             if let Err(e) = self.memory.store(episode).await {
                                 warn!(error = %e, "failed to save episode to memory");
+                            }
+                            if let Some(recall) = &self.recall {
+                                if let Err(e) = recall.upsert(vec![mirror], vec![None]) {
+                                    warn!(error = %e, "failed to mirror episode into the recall index");
+                                }
                             }
 
                             // Fire-and-forget: embed summary and store embedding
                             if let Some(ref embedder) = self.embedder {
                                 let embedder = embedder.clone();
                                 let memory = self.memory.clone();
+                                let recall = self.recall.clone();
                                 let summary_text = summary_truncated;
                                 let episode_id = ep_id;
                                 tokio::spawn(async move {
                                     match embedder.embed(&[&summary_text]).await {
                                         Ok(vecs) => {
                                             if let Some(vec) = vecs.into_iter().next() {
+                                                if let Some(recall) = &recall {
+                                                    let _ = recall.store_vector(
+                                                        &format!("episode:{episode_id}"),
+                                                        &vec,
+                                                    );
+                                                }
                                                 if let Err(e) =
                                                     memory.store_embedding(&episode_id, vec).await
                                                 {

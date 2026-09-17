@@ -33,9 +33,11 @@ use octos_core::ui_protocol::{
     ContextCompactionCompletedEvent, ContextCompactionStartedEvent,
     ContextNormalizationReportedEvent, CronListParams, CronToggleParams, EnvelopeTokenUsage,
     EnvelopeV2, EnvelopeV2Notification, FileRef, HydratedMessage, HydratedTurn, InputItem,
-    MemoryEntityParams, MemoryOverviewParams, MessageDeltaEvent, MessageMeta, OutputCursor,
-    PayloadV2, PeerClosedEvent, PeerStagedEvent, ReplayLossyEvent, RpcError, RpcErrorResponse,
-    RpcRequest, RpcResponse, SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
+    MEMORY_INGEST_MAX_RECORDS, MEMORY_SEARCH_DEFAULT_LIMIT, MEMORY_SEARCH_MAX_LIMIT,
+    MemoryEntityParams, MemoryIngestParams, MemoryLoadParams, MemoryOverviewParams,
+    MemorySearchParams, MessageDeltaEvent, MessageMeta, OutputCursor, PayloadV2, PeerClosedEvent,
+    PeerStagedEvent, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
+    SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
     SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
     SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
@@ -451,6 +453,9 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
     octos_core::ui_protocol::methods::MEMORY_OVERVIEW,
     octos_core::ui_protocol::methods::MEMORY_ENTITY,
+    octos_core::ui_protocol::methods::MEMORY_SEARCH,
+    octos_core::ui_protocol::methods::MEMORY_LOAD,
+    octos_core::ui_protocol::methods::MEMORY_INGEST,
     octos_core::ui_protocol::methods::CRON_LIST,
     octos_core::ui_protocol::methods::CRON_TOGGLE,
     octos_core::ui_protocol::methods::SMART_HOME_STATUS_GET,
@@ -7289,6 +7294,42 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::MemorySearch(params) => {
+                handle_memory_search(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::MemoryLoad(params) => {
+                handle_memory_load(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::MemoryIngest(params) => {
+                handle_memory_ingest(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::CronList(params) => {
                 handle_cron_list(
                     &ws,
@@ -8114,6 +8155,18 @@ where
                 }
                 UiCommand::MemoryEntity(params) => {
                     handle_memory_entity(&ws, &state, &connection_headers, None, false, id, params)
+                        .await;
+                }
+                UiCommand::MemorySearch(params) => {
+                    handle_memory_search(&ws, &state, &connection_headers, None, false, id, params)
+                        .await;
+                }
+                UiCommand::MemoryLoad(params) => {
+                    handle_memory_load(&ws, &state, &connection_headers, None, false, id, params)
+                        .await;
+                }
+                UiCommand::MemoryIngest(params) => {
+                    handle_memory_ingest(&ws, &state, &connection_headers, None, false, id, params)
                         .await;
                 }
                 UiCommand::CronList(params) => {
@@ -18654,6 +18707,9 @@ fn route_rpc_command(
         | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE
         | octos_core::ui_protocol::methods::MEMORY_OVERVIEW
         | octos_core::ui_protocol::methods::MEMORY_ENTITY
+        | octos_core::ui_protocol::methods::MEMORY_SEARCH
+        | octos_core::ui_protocol::methods::MEMORY_LOAD
+        | octos_core::ui_protocol::methods::MEMORY_INGEST
         | octos_core::ui_protocol::methods::CRON_LIST
         | octos_core::ui_protocol::methods::CRON_TOGGLE => Some(features.auxiliary_rest_to_ws_v1),
         // UPCR-2026-023: `user_question/respond` is strict opt-in. A client
@@ -18794,6 +18850,9 @@ fn session_ingress_callable_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::CONTENT_BULK_DELETE
             | octos_core::ui_protocol::methods::MEMORY_OVERVIEW
             | octos_core::ui_protocol::methods::MEMORY_ENTITY
+            | octos_core::ui_protocol::methods::MEMORY_SEARCH
+            | octos_core::ui_protocol::methods::MEMORY_LOAD
+            | octos_core::ui_protocol::methods::MEMORY_INGEST
             | octos_core::ui_protocol::methods::CRON_LIST
             | octos_core::ui_protocol::methods::CRON_TOGGLE
             | octos_core::ui_protocol::methods::SESSION_FORK
@@ -18828,6 +18887,9 @@ fn validate_session_ingress_command_scope(
         | UiCommand::ContentBulkDelete(_)
         | UiCommand::MemoryOverview(_)
         | UiCommand::MemoryEntity(_)
+        | UiCommand::MemorySearch(_)
+        | UiCommand::MemoryLoad(_)
+        | UiCommand::MemoryIngest(_)
         | UiCommand::CronList(_)
         | UiCommand::CronToggle(_)
         | UiCommand::SessionFork(_)
@@ -28757,6 +28819,632 @@ async fn handle_memory_entity(
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Recall / Knowledge index: `memory/search`, `memory/load`, `memory/ingest`
+// (docs/adr/personal-memory-tiers.md). Auth-bound like `memory/overview`:
+// the identity resolves to a profile through the same `/api/my/*` rules,
+// then the profile's live `ProfileRuntime` supplies the `RecallStore`, the
+// bank `MemoryStore` and the optional embedder. `RecallStore` is
+// synchronous (redb + in-process HNSW), so every call runs on the
+// blocking pool.
+// ---------------------------------------------------------------------------
+
+/// Id prefix of Knowledge records — the bank page slug follows it.
+const MEMORY_RECORD_BANK_PREFIX: &str = "bank:";
+/// Id prefix of episode records.
+const MEMORY_RECORD_EPISODE_PREFIX: &str = "episode:";
+/// Id prefix of app document records; `doc:<source>:` is enforced.
+const MEMORY_RECORD_DOC_PREFIX: &str = "doc:";
+/// Batch size for server-side embedding on `memory/ingest`.
+const MEMORY_INGEST_EMBED_BATCH: usize = 16;
+/// Refusal text for knowledge records on `memory/ingest`; pinned by
+/// `memory_ingest_rejects_knowledge_records`.
+const MEMORY_INGEST_KNOWLEDGE_REFUSAL: &str =
+    "knowledge pages are written through save_memory / the memory bank, not ingest";
+
+/// Resolve the caller to its profile's live runtime: the identity →
+/// profile-id step is the one `memory/overview` takes through
+/// `memory_panel::my_memory` (`resolve_my_profile_id`), and the runtime
+/// lookup is the session path's `ensure_session_profile_runtime`. A
+/// profile without a bootstrappable runtime answers with the same
+/// `runtime_unavailable` message the session helpers use.
+async fn resolve_memory_profile_runtime(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: &AuthIdentity,
+    method: &str,
+) -> Result<(String, Arc<crate::runtime::ProfileRuntime>), RpcError> {
+    let Some(profile_store) = state.profile_store.as_ref() else {
+        return Err(RpcError::runtime_not_ready(format!(
+            "{method}: profile store not configured on this server"
+        )));
+    };
+    let profile_id =
+        crate::api::auth_handlers::resolve_my_profile_id(identity, profile_store, state, headers)
+            .map_err(|status| {
+            let context = RestResourceContext::resource("profile", "");
+            rest_status_to_rpc_error(method, status, None, &context)
+        })?;
+    // Boxed on purpose: the runtime lookup embeds the whole cold-bootstrap
+    // future (`ProfileRuntime::bootstrap_with_host_plugins`), and the three
+    // Recall handlers are inlined into the WS and stdio dispatch state
+    // machines. Keeping that future on the heap keeps the dispatch futures
+    // — which tests await on a 2 MiB thread stack — from growing by three
+    // bootstraps.
+    match Box::pin(ensure_session_profile_runtime(state, Some(&profile_id))).await? {
+        Some(runtime) => Ok((profile_id, runtime)),
+        None => Err(runtime_unavailable_error(
+            profile_runtime_unavailable_message(state, &profile_id),
+        )),
+    }
+}
+
+/// Parse a `since` / `until` bound: RFC 3339 (any offset, normalised to
+/// UTC) or a bare `YYYY-MM-DD`. A bare date is the START of that UTC day
+/// for `since` and its END (23:59:59.999999) for `until`, so
+/// `until: "2026-02-01"` includes the whole of 1 Feb — `RecallStore`
+/// applies `until` inclusively.
+fn parse_memory_time_bound(
+    method: &str,
+    field: &str,
+    raw: &str,
+    end_of_day: bool,
+) -> Result<chrono::DateTime<chrono::Utc>, RpcError> {
+    let raw = raw.trim();
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(ts.with_timezone(&chrono::Utc));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        let time = if end_of_day {
+            chrono::NaiveTime::from_hms_micro_opt(23, 59, 59, 999_999)
+        } else {
+            chrono::NaiveTime::from_hms_opt(0, 0, 0)
+        }
+        .expect("constant time of day is valid");
+        return Ok(date.and_time(time).and_utc());
+    }
+    Err(RpcError::invalid_params(format!(
+        "{method}: `{field}` must be an RFC 3339 timestamp or a YYYY-MM-DD date, got {raw:?}"
+    )))
+}
+
+/// Build the `RecallStore` filter from `memory/search` params: kinds
+/// must parse (`episode` / `document` / `knowledge`), the time bounds
+/// must parse and be ordered, and `limit` defaults to
+/// [`MEMORY_SEARCH_DEFAULT_LIMIT`] and is clamped to
+/// `1..=MEMORY_SEARCH_MAX_LIMIT`. Pure — unit-tested directly.
+fn memory_search_filter(
+    params: &MemorySearchParams,
+) -> Result<octos_memory::SearchFilter, RpcError> {
+    let method = octos_core::ui_protocol::methods::MEMORY_SEARCH;
+    if params.query.trim().is_empty() {
+        return Err(RpcError::invalid_params(format!(
+            "{method}: `query` must not be empty"
+        )));
+    }
+    let mut kinds = Vec::with_capacity(params.kinds.len());
+    for kind in &params.kinds {
+        let parsed = octos_memory::RecordKind::parse(kind).ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "{method}: unknown kind {kind:?} (expected episode, document or knowledge)"
+            ))
+        })?;
+        if !kinds.contains(&parsed) {
+            kinds.push(parsed);
+        }
+    }
+    let sources: Vec<String> = params
+        .sources
+        .iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let since = params
+        .since
+        .as_deref()
+        .map(|raw| parse_memory_time_bound(method, "since", raw, false))
+        .transpose()?;
+    let until = params
+        .until
+        .as_deref()
+        .map(|raw| parse_memory_time_bound(method, "until", raw, true))
+        .transpose()?;
+    if let (Some(since), Some(until)) = (since, until) {
+        if since > until {
+            return Err(RpcError::invalid_params(format!(
+                "{method}: `since` must not be after `until`"
+            )));
+        }
+    }
+    let limit = params
+        .limit
+        .unwrap_or(MEMORY_SEARCH_DEFAULT_LIMIT)
+        .clamp(1, MEMORY_SEARCH_MAX_LIMIT);
+    Ok(octos_memory::SearchFilter {
+        kinds,
+        sources,
+        since,
+        until,
+        limit,
+    })
+}
+
+/// `memory/search` — stage one of the two-stage retrieval: rank the
+/// profile's Recall + Knowledge index and return abstracts only. The
+/// query is embedded with the profile's embedder when one is configured
+/// (hybrid BM25 + vector); without one, or when embedding fails, the
+/// search degrades to BM25-only rather than refusing — the ADR's
+/// "never disabled for lack of an embedder" rule.
+async fn handle_memory_search(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: MemorySearchParams,
+) {
+    let method = octos_core::ui_protocol::methods::MEMORY_SEARCH;
+    let Some(identity) = identity.cloned() else {
+        // Web PR #114 contract: see `close_ws_with_code` doc-comment —
+        // close before error so it survives writer backpressure.
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let filter = match memory_search_filter(&params) {
+        Ok(filter) => filter,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let (profile_id, runtime) =
+        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
+    let query = params.query.trim().to_owned();
+    let query_vector = match runtime.embedder.as_ref() {
+        Some(embedder) => match embedder.embed(&[query.as_str()]).await {
+            Ok(mut vectors) if !vectors.is_empty() => Some(vectors.swap_remove(0)),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    target: "octos::ui_protocol::ws::aux",
+                    profile_id = %profile_id,
+                    error = %format!("{error:#}"),
+                    "memory/search: query embedding failed; falling back to BM25-only"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let recall = runtime.recall.clone();
+    let searched = tokio::task::spawn_blocking(move || {
+        recall.search(&query, query_vector.as_deref(), &filter)
+    })
+    .await;
+    let hits = match searched {
+        Ok(Ok(hits)) => hits,
+        Ok(Err(error)) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!("{method}: recall search failed: {error:#}")),
+            );
+            return;
+        }
+        Err(error) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!("{method}: recall search task failed: {error}")),
+            );
+            return;
+        }
+    };
+    let hits: Vec<Value> = hits
+        .iter()
+        .filter_map(|hit| serde_json::to_value(hit).ok())
+        .collect();
+    send_aux_rpc_result(ws, id, method, json!({ "hits": hits }));
+}
+
+/// `memory/load` — stage two: fetch one record by id and count the
+/// visit (heat). Knowledge records (`bank:<slug>`) also carry the bank
+/// page text, capped at the `memory/entity` budget with an explicit
+/// `page_truncated` flag (clean UTF-8 prefix, no in-band marker).
+async fn handle_memory_load(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: MemoryLoadParams,
+) {
+    let method = octos_core::ui_protocol::methods::MEMORY_LOAD;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let record_id = params.id.trim().to_owned();
+    if record_id.is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: `id` must not be empty")),
+        );
+        return;
+    }
+    let (profile_id, runtime) =
+        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
+    let recall = runtime.recall.clone();
+    let lookup_id = record_id.clone();
+    let fetched = tokio::task::spawn_blocking(move || {
+        let record = recall.get(&lookup_id)?;
+        if record.is_some() {
+            // A load is a visit: bump the heat so hot records keep
+            // their vector and get nominated for promotion.
+            if let Err(error) = recall.touch(&lookup_id) {
+                tracing::debug!(
+                    target: "octos::ui_protocol::ws::aux",
+                    id = %lookup_id,
+                    error = %format!("{error:#}"),
+                    "memory/load: touch failed"
+                );
+            }
+        }
+        Ok::<_, eyre::Report>(record)
+    })
+    .await;
+    let record = match fetched {
+        Ok(Ok(Some(record))) => record,
+        Ok(Ok(None)) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::not_found("memory_record", record_id),
+            );
+            return;
+        }
+        Ok(Err(error)) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!("{method}: recall lookup failed: {error:#}")),
+            );
+            return;
+        }
+        Err(error) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!("{method}: recall lookup task failed: {error}")),
+            );
+            return;
+        }
+    };
+    let mut page: Option<String> = None;
+    let mut page_truncated = false;
+    if let Some(slug) = record_id.strip_prefix(MEMORY_RECORD_BANK_PREFIX) {
+        match runtime.memory_store.read_entity(slug).await {
+            Ok(Some(mut text)) => {
+                let cut = cap_index_by_escaped_len(&text, MEMORY_RPC_ENTITY_CONTENT_BUDGET);
+                page_truncated = cut < text.len();
+                if page_truncated {
+                    text.truncate(cut);
+                }
+                page = Some(text);
+            }
+            Ok(None) => {
+                // Indexed page whose file is gone (deleted after the
+                // last bank re-index) — the record still answers.
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "octos::ui_protocol::ws::aux",
+                    profile_id = %profile_id,
+                    slug = %slug,
+                    error = %format!("{error:#}"),
+                    "memory/load: bank page read failed; returning the record without it"
+                );
+            }
+        }
+    }
+    let record = match serde_json::to_value(&record) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!("{method}: serialize record failed: {error}")),
+            );
+            return;
+        }
+    };
+    let mut body = json!({ "record": record, "page_truncated": page_truncated });
+    if let Some(page) = page {
+        body["page"] = json!(page);
+    }
+    send_aux_rpc_result(ws, id, method, body);
+}
+
+/// Records + optional parallel vectors accepted by `memory/ingest`.
+#[derive(Debug)]
+struct ValidatedMemoryIngest {
+    records: Vec<octos_memory::Record>,
+    vectors: Option<Vec<Option<Vec<f32>>>>,
+}
+
+/// Validate `memory/ingest` params into typed records. Rules (all
+/// `invalid_params`, with `records[i]` in the message):
+/// at most [`MEMORY_INGEST_MAX_RECORDS`] records and at least one;
+/// `vectors`, when present, parallel to `records`; each record decodes
+/// as `octos_memory::Record` after its `kind` is parsed leniently
+/// (`RecordKind::parse`, so `doc` / `docs` are accepted); ids are
+/// non-empty and namespaced by kind (`doc:<source>:…`, `episode:…`);
+/// Knowledge records are refused outright (the bank is their write
+/// path); documents can never claim `trust: trusted` — forced
+/// `untrusted`. Server-owned usage fields (`visits`, `last_visit`,
+/// `promoted`) are reset; `RecallStore::upsert` re-merges them from
+/// the stored copy. Pure — unit-tested directly.
+fn validate_memory_ingest(params: MemoryIngestParams) -> Result<ValidatedMemoryIngest, RpcError> {
+    use octos_memory::{Record, RecordKind, Trust};
+    let method = octos_core::ui_protocol::methods::MEMORY_INGEST;
+    let requested = params.records.len();
+    if requested == 0 {
+        return Err(RpcError::invalid_params(format!(
+            "{method}: `records` must contain at least one record"
+        )));
+    }
+    if requested > MEMORY_INGEST_MAX_RECORDS {
+        return Err(RpcError::invalid_params(format!(
+            "{method}: at most {MEMORY_INGEST_MAX_RECORDS} records per call (got {requested})"
+        ))
+        .with_data(json!({
+            "max_records": MEMORY_INGEST_MAX_RECORDS,
+            "requested_records": requested,
+        })));
+    }
+    if let Some(vectors) = params.vectors.as_ref() {
+        if vectors.len() != requested {
+            return Err(RpcError::invalid_params(format!(
+                "{method}: `vectors` must be parallel to `records` ({} vectors for {requested} records)",
+                vectors.len()
+            )));
+        }
+    }
+    let mut records = Vec::with_capacity(requested);
+    for (index, mut raw) in params.records.into_iter().enumerate() {
+        let Some(object) = raw.as_object_mut() else {
+            return Err(RpcError::invalid_params(format!(
+                "{method}: records[{index}] must be an object"
+            )));
+        };
+        let kind = match object.get("kind").and_then(Value::as_str) {
+            Some(kind) => RecordKind::parse(kind).ok_or_else(|| {
+                RpcError::invalid_params(format!(
+                    "{method}: records[{index}].kind {kind:?} is not one of episode, document, knowledge"
+                ))
+            })?,
+            None => {
+                return Err(RpcError::invalid_params(format!(
+                    "{method}: records[{index}].kind is required"
+                )));
+            }
+        };
+        if kind == RecordKind::Knowledge {
+            return Err(RpcError::invalid_params(format!(
+                "{method}: records[{index}]: {MEMORY_INGEST_KNOWLEDGE_REFUSAL}"
+            )));
+        }
+        object.insert("kind".into(), json!(kind.as_str()));
+        // Usage counters are server-owned; a producer cannot inflate
+        // heat or mark its own records promoted.
+        object.remove("visits");
+        object.remove("last_visit");
+        object.remove("promoted");
+        object.remove("updated_at");
+        let mut record: Record = serde_json::from_value(raw).map_err(|error| {
+            RpcError::invalid_params(format!("{method}: records[{index}]: {error}"))
+        })?;
+        record.id = record.id.trim().to_owned();
+        if record.id.is_empty() {
+            return Err(RpcError::invalid_params(format!(
+                "{method}: records[{index}].id must not be empty"
+            )));
+        }
+        record.source = record.source.trim().to_owned();
+        if record.source.is_empty() {
+            return Err(RpcError::invalid_params(format!(
+                "{method}: records[{index}].source must not be empty"
+            )));
+        }
+        match kind {
+            RecordKind::Document => {
+                let expected = format!("{MEMORY_RECORD_DOC_PREFIX}{}:", record.source);
+                if !record.id.starts_with(&expected) || record.id.len() == expected.len() {
+                    return Err(RpcError::invalid_params(format!(
+                        "{method}: records[{index}].id {:?} must be namespaced as {expected}<key>",
+                        record.id
+                    )));
+                }
+                // App content is data, never instructions.
+                record.trust = Trust::Untrusted;
+            }
+            RecordKind::Episode => {
+                if !record.id.starts_with(MEMORY_RECORD_EPISODE_PREFIX)
+                    || record.id.len() == MEMORY_RECORD_EPISODE_PREFIX.len()
+                {
+                    return Err(RpcError::invalid_params(format!(
+                        "{method}: records[{index}].id {:?} must be namespaced as {MEMORY_RECORD_EPISODE_PREFIX}<key>",
+                        record.id
+                    )));
+                }
+            }
+            RecordKind::Knowledge => unreachable!("knowledge records are refused above"),
+        }
+        record.clamp();
+        records.push(record);
+    }
+    Ok(ValidatedMemoryIngest {
+        records,
+        vectors: params.vectors,
+    })
+}
+
+/// `memory/ingest` — the one memory WRITE method. Validates, embeds
+/// server-side when asked (default) and possible, upserts into the
+/// profile's `RecallStore` and persists the graph. Identity is
+/// required exactly as for `memory/overview`; session-ingress
+/// credentials are refused upstream by the scope guard.
+async fn handle_memory_ingest(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    close_on_auth_unavailable: bool,
+    id: String,
+    params: MemoryIngestParams,
+) {
+    let method = octos_core::ui_protocol::methods::MEMORY_INGEST;
+    let Some(identity) = identity.cloned() else {
+        if close_on_auth_unavailable {
+            let _ = close_ws_with_code(ws, 1008, "auth_expired");
+        }
+        let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
+        return;
+    };
+    let embed_requested = params.embed.unwrap_or(true);
+    let ValidatedMemoryIngest { records, vectors } = match validate_memory_ingest(params) {
+        Ok(validated) => validated,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let (profile_id, runtime) =
+        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
+    let mut embedded = 0usize;
+    let vectors: Vec<Option<Vec<f32>>> = match vectors {
+        Some(vectors) => vectors,
+        None => match runtime.embedder.as_ref().filter(|_| embed_requested) {
+            Some(embedder) => {
+                let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(records.len());
+                for chunk in records.chunks(MEMORY_INGEST_EMBED_BATCH) {
+                    let texts: Vec<String> = chunk.iter().map(|r| r.index_text()).collect();
+                    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                    match embedder.embed(&refs).await {
+                        Ok(batch) if batch.len() == chunk.len() => {
+                            embedded += batch.len();
+                            out.extend(batch.into_iter().map(Some));
+                        }
+                        Ok(batch) => {
+                            let _ = send_rpc_error(
+                                ws,
+                                Some(id),
+                                RpcError::internal_error(format!(
+                                    "{method}: embedder returned {} vectors for {} texts",
+                                    batch.len(),
+                                    chunk.len()
+                                )),
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            // Explicit failure over a silently vectorless
+                            // write: the app can retry with `embed: false`.
+                            let _ = send_rpc_error(
+                                ws,
+                                Some(id),
+                                RpcError::internal_error(format!(
+                                    "{method}: embedding failed: {error:#} (retry with `embed: false` to store BM25-only)"
+                                )),
+                            );
+                            return;
+                        }
+                    }
+                }
+                out
+            }
+            None => vec![None; records.len()],
+        },
+    };
+    let record_count = records.len();
+    let recall = runtime.recall.clone();
+    let upserted = tokio::task::spawn_blocking(move || {
+        let report = recall.upsert(records, vectors)?;
+        recall.persist_index()?;
+        Ok::<_, eyre::Report>(report)
+    })
+    .await;
+    let report = match upserted {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!("{method}: recall upsert failed: {error:#}")),
+            );
+            return;
+        }
+        Err(error) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::internal_error(format!("{method}: recall upsert task failed: {error}")),
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        target: "octos::ui_protocol::ws::aux",
+        profile_id = %profile_id,
+        records = record_count,
+        inserted = report.inserted,
+        updated = report.updated,
+        unchanged = report.unchanged,
+        vectors_stored = report.vectors_stored,
+        embedded,
+        "memory/ingest"
+    );
+    send_aux_rpc_result(
+        ws,
+        id,
+        method,
+        json!({
+            "inserted": report.inserted,
+            "updated": report.updated,
+            "unchanged": report.unchanged,
+            "vectors_stored": report.vectors_stored,
+            "embedded": embedded,
+        }),
+    );
 }
 
 async fn handle_cron_list(

@@ -34,6 +34,7 @@ pub mod loop_detect;
 pub mod mcp;
 pub mod mcp_auth;
 pub mod mcp_server;
+pub mod memory_index;
 pub mod memory_segment;
 pub mod permissions;
 pub mod plugins;
@@ -210,8 +211,8 @@ pub use tools::{
     DelegateTool, DelegationEvent, DelegationOutcome, DepthBudget, DiffEditTool,
     DispatchContextContract, DispatchOutcome, DispatchRequest, DispatchResponse, EditFileTool,
     GlobTool, GrepTool, HttpMcpAgent, ListDirTool, MAX_DEPTH, MakeTypeEntry, ManageSkillsTool,
-    McpAgentBackend, McpAgentBackendConfig, MemoryNoteTool, MessageTool,
-    MofaDescribeContentTypeTool, MofaMakeTool, PeerCloseCallback, PeerCloseTool,
+    McpAgentBackend, McpAgentBackendConfig, MemoryLoadTool, MemoryNoteTool, MemorySearchTool,
+    MessageTool, MofaDescribeContentTypeTool, MofaMakeTool, PeerCloseCallback, PeerCloseTool,
     PeerGatherCallback, PeerGatherTool, PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged,
     PeerHandoffTool, PeerListCallback, PeerListTool, PeerRespondAnswer, PeerRespondCallback,
     PeerRespondRequest, PeerRespondTool, PeerSendInputCallback, PeerSendInputRequest,

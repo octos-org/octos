@@ -712,6 +712,14 @@ pub struct MemoryConfig {
     /// Automatic memory refreshing (capture + consolidation pipeline).
     #[serde(default)]
     pub refresh: Option<MemoryRefreshConfig>,
+
+    /// Width of the vectors kept by the Recall/Knowledge index
+    /// (Matryoshka-truncated from the embedder's output, int8 at rest).
+    /// Defaults to [`octos_memory::DEFAULT_RECALL_DIMENSION`] (256); never
+    /// wider than the configured embedder. See
+    /// docs/adr/personal-memory-tiers.md.
+    #[serde(default)]
+    pub recall_dimension: Option<usize>,
 }
 
 /// Automatic memory-refresh settings. Default OFF: when disabled there is

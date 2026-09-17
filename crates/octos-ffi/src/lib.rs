@@ -4,7 +4,9 @@
 //! (ffi-napi/koffi), Go (cgo), or plain C can drive an octos [`Agent`] without
 //! linking Rust. It wraps the same provider-construction and agent loop the
 //! `octos` CLI uses (see `octos-cli/src/commands/chat.rs`), trimmed to a
-//! one-shot task runner plus an optional embedder.
+//! one-shot task runner plus an optional embedder, and exposes the Recall
+//! memory index (`octos_memory_*`, see `docs/adr/personal-memory-tiers.md`) so
+//! a host app can push its records (mail, calendar, contacts) and search them.
 //!
 //! # SAFETY
 //!
@@ -44,6 +46,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use chrono::{DateTime, NaiveDate, Utc};
 use libc::c_char;
 use octos_agent::{
     Agent, AgentConfig, ConversationResponse, GlobTool, GrepTool, IncompleteResponseError,
@@ -55,13 +58,24 @@ use octos_core::{AgentId, MessageRole};
 #[cfg(feature = "embed-llama")]
 use octos_llm::EmbeddingProvider;
 use octos_llm::LlmProvider;
-use octos_memory::EpisodeStore;
+use octos_memory::{
+    DEFAULT_RECALL_DIMENSION, EpisodeStore, RecallConfig, RecallStore, Record, RecordKind,
+    SearchFilter, Trust,
+};
 use serde::Deserialize;
 use serde_json::json;
 
 /// Monotonic counter used to give every runtime a unique on-disk scratch dir
 /// for its (minimal) episodic memory store.
 static MEM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Upper bound on records accepted by one [`OctosRuntime::memory_upsert`]
+/// call; hosts page larger syncs.
+pub const MAX_UPSERT_RECORDS: usize = 500;
+/// Records embedded per embedder call during an upsert.
+const EMBED_BATCH: usize = 16;
+/// Default `limit` for [`OctosRuntime::memory_search`] (the ADR's k≈10).
+const DEFAULT_SEARCH_LIMIT: usize = 10;
 
 thread_local! {
     /// Most recent failure on this thread. Read (never freed) by
@@ -270,6 +284,18 @@ pub struct RuntimeConfig {
     /// the `embed-llama` build feature).
     #[serde(default)]
     pub embedding_model_path: Option<String>,
+    /// Persistent data directory. When set, the episode store
+    /// (`episodes.redb`) AND the Recall store (`recall.redb` +
+    /// `recall-index/`) open under it and survive the runtime; the directory
+    /// is never removed by this crate. When absent both live in a per-runtime
+    /// scratch dir under the OS temp dir that is deleted on free/drop.
+    #[serde(default)]
+    pub data_dir: Option<String>,
+    /// Vector width kept by the Recall index (Matryoshka truncation target).
+    /// Defaults to 256; clamped down to the embedder's own dimension when an
+    /// embedder is loaded. Must be > 0.
+    #[serde(default)]
+    pub recall_dimension: Option<usize>,
 }
 
 /// The per-task brief consumed by [`OctosRuntime::run_task`]. The C-ABI
@@ -280,6 +306,53 @@ pub struct TaskBrief {
     pub prompt: String,
     #[serde(default)]
     pub max_iterations: Option<u32>,
+}
+
+/// Input of [`OctosRuntime::memory_upsert`] / `octos_memory_upsert`.
+///
+/// Each record is the wire form of `octos_memory::Record`: `id`, `kind`
+/// (`"document"` | `"episode"`), `source`, `timestamp` (RFC3339), `title`,
+/// `abstract`, optional `parent` / `body` / `fingerprint`. Other `Record`
+/// fields are ignored or overwritten (`trust` → untrusted, counters reset).
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryUpsertRequest {
+    pub records: Vec<Record>,
+    /// One entry per record: a raw embedding (any width ≥ the recall
+    /// dimension; Matryoshka-truncated by the store) or `null`. When present,
+    /// no embedding is done here.
+    #[serde(default)]
+    pub vectors: Option<Vec<Option<Vec<f32>>>>,
+    /// Embed `Record::index_text()` for records without a vector when an
+    /// embedder is loaded. Default `true`.
+    #[serde(default = "default_true")]
+    pub embed: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Input of [`OctosRuntime::memory_search`] / `octos_memory_search`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemorySearchRequest {
+    pub query: String,
+    /// Record kinds to keep (`"document"`, `"episode"`, `"knowledge"`); empty
+    /// = all.
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// Sources to keep (`"mail"`, `"calendar"`, …); empty = all.
+    #[serde(default)]
+    pub sources: Vec<String>,
+    /// Inclusive lower bound on the record timestamp: RFC3339, or
+    /// `YYYY-MM-DD` (start of that day, UTC).
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Inclusive upper bound: RFC3339, or `YYYY-MM-DD` (end of that day, UTC).
+    #[serde(default)]
+    pub until: Option<String>,
+    /// Max hits (default 10; the store clamps to 1..=200).
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// Token accounting for a completed or incomplete [`OctosRuntime::run_task`].
@@ -326,6 +399,10 @@ pub enum CoreError {
     /// The provider truncated a conversational response. This is a failure,
     /// with the actual partial output and all consumed turn usage available.
     Incomplete { partial: TaskResult },
+    /// Recall-memory failure (`memory_upsert`/`memory_search`/`memory_load`/
+    /// `memory_stats`): a malformed request, a rejected record, a missing
+    /// record ("no such record") or a store error.
+    Memory(String),
 }
 
 impl std::fmt::Display for CoreError {
@@ -334,7 +411,8 @@ impl std::fmt::Display for CoreError {
             CoreError::Config(m)
             | CoreError::Provider(m)
             | CoreError::Run(m)
-            | CoreError::Embed(m) => f.write_str(m),
+            | CoreError::Embed(m)
+            | CoreError::Memory(m) => f.write_str(m),
             CoreError::NoEmbedder => f.write_str("no embedder configured"),
             CoreError::Incomplete { .. } => f.write_str(INCOMPLETE_RESPONSE_MESSAGE),
         }
@@ -373,14 +451,15 @@ impl From<&ConversationResponse> for TaskResult {
     }
 }
 
-/// RAII owner of the ephemeral episodic-memory scratch dir that THIS crate
-/// created under the OS temp dir. Its `Drop` best-effort removes the dir
-/// (errors ignored).
+/// RAII owner of the ephemeral memory scratch dir that THIS crate created under
+/// the OS temp dir. Its `Drop` best-effort removes the dir (errors ignored).
 ///
 /// It only ever owns a `mkdtemp`-style path this crate itself minted — NEVER a
-/// user-supplied `cwd`/path — so dropping it can never delete caller data. It
-/// is declared as the LAST field of [`OctosRuntime`] so declaration-order field
-/// drop runs it AFTER the `Arc<EpisodeStore>`: the redb file lock releases
+/// user-supplied `cwd`/`data_dir` — so dropping it can never delete caller
+/// data; a runtime opened on a caller's `data_dir` holds
+/// [`ScratchDir::none`], which owns nothing. It is declared as the LAST field
+/// of [`OctosRuntime`] so declaration-order field drop runs it AFTER the
+/// `Arc<EpisodeStore>` and `Arc<RecallStore>`: the redb file locks release
 /// first, then the dir is removed. That is exactly the ordering the old manual
 /// `octos_runtime_free` cleanup guaranteed by hand (a Drop that removed first
 /// would fail on Windows / lock-sensitive platforms). Holding it locally in
@@ -391,6 +470,11 @@ struct ScratchDir(Option<PathBuf>);
 impl ScratchDir {
     fn new(path: PathBuf) -> Self {
         ScratchDir(Some(path))
+    }
+
+    /// No scratch dir to remove (the stores live in a caller-owned `data_dir`).
+    fn none() -> Self {
+        ScratchDir(None)
     }
 }
 
@@ -421,6 +505,10 @@ pub struct OctosRuntime {
     tokio: tokio::runtime::Runtime,
     llm: Arc<dyn LlmProvider>,
     memory: Arc<EpisodeStore>,
+    /// The Recall index (app records + episodes): `recall.redb` +
+    /// `recall-index/` beside `episodes.redb`. Internally `RwLock`-guarded, so
+    /// the uniffi facade may call it from several threads.
+    recall: Arc<RecallStore>,
     cwd: PathBuf,
     allow_shell: bool,
     default_max_iterations: u32,
@@ -436,11 +524,12 @@ pub struct OctosRuntime {
     /// `octos_last_error`. (It already lives inside `llm`, so this is not new
     /// exposure.)
     secret: Option<String>,
-    /// RAII owner of the episodic-memory scratch dir. MUST be the LAST field so
-    /// it drops AFTER `memory` (releasing the redb lock) on both the C free path
-    /// and a native drop. See [`ScratchDir`]. `allow(dead_code)`: it exists only
-    /// for its `Drop` side effect (removing the dir) and its declaration
-    /// position — outside `#[cfg(test)]` nothing reads it explicitly.
+    /// RAII owner of the memory scratch dir. MUST be the LAST field so it drops
+    /// AFTER `memory` and `recall` (releasing their redb locks) on both the C
+    /// free path and a native drop. See [`ScratchDir`]. `allow(dead_code)`: it
+    /// exists only for its `Drop` side effect (removing the dir) and its
+    /// declaration position — outside `#[cfg(test)]` nothing reads it
+    /// explicitly.
     #[allow(dead_code)]
     scratch: ScratchDir,
 }
@@ -531,17 +620,60 @@ impl OctosRuntime {
             .unwrap_or_else(|| AgentConfig::default().max_iterations);
         let embedding_configured = cfg.embedding_model_path.is_some();
 
-        // Minimal episodic memory store in a unique scratch dir. Take RAII
-        // ownership of the dir the moment we commit to its path, so that if the
-        // store fails to open (or any later step errors) the local `scratch`
-        // drops and best-effort removes the dir — no mid-init leak. On success
-        // it moves into the struct's LAST field and is removed only after the
-        // store's redb lock releases on teardown. (`EpisodeStore::open` creates
-        // the dir before it can fail, and does not hold the lock on failure.)
-        let seq = MEM_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mem_dir =
-            std::env::temp_dir().join(format!("octos-ffi-mem-{}-{}", std::process::id(), seq));
-        let scratch = ScratchDir::new(mem_dir.clone());
+        // Recall index geometry: the configured width, clamped to what the
+        // embedder actually produces; the embedder id pins stored vectors and
+        // the persisted graph to the model that made them.
+        let requested_dimension = cfg.recall_dimension.unwrap_or(DEFAULT_RECALL_DIMENSION);
+        if requested_dimension == 0 {
+            return Err(CoreError::Config(
+                "recall_dimension must be greater than zero".to_string(),
+            ));
+        }
+        // `(dimension, id)` of the loaded embedder, if any.
+        let loaded_embedder: Option<(usize, String)> = {
+            #[cfg(feature = "embed-llama")]
+            {
+                embedder
+                    .as_ref()
+                    .zip(cfg.embedding_model_path.as_deref())
+                    .map(|(e, path)| (e.dimension().max(1), format!("llamacpp/{path}")))
+            }
+            #[cfg(not(feature = "embed-llama"))]
+            {
+                None
+            }
+        };
+        let (recall_dimension, embedder_id) = match loaded_embedder {
+            Some((dim, id)) => (requested_dimension.min(dim), id),
+            None => (requested_dimension, String::new()),
+        };
+        let recall_cfg = RecallConfig {
+            dimension: recall_dimension,
+            embedder_id,
+            ..RecallConfig::default()
+        };
+
+        // Where the memory stores live. With `data_dir` they are persistent and
+        // caller-owned (nothing is removed on teardown). Otherwise: a unique
+        // scratch dir. Take RAII ownership of the scratch dir the moment we
+        // commit to its path, so that if a store fails to open (or any later
+        // step errors) the local `scratch` drops and best-effort removes the
+        // dir — no mid-init leak. On success it moves into the struct's LAST
+        // field and is removed only after the stores' redb locks release on
+        // teardown. (`EpisodeStore::open` creates the dir before it can fail,
+        // and does not hold the lock on failure.)
+        let (mem_dir, scratch) = match &cfg.data_dir {
+            Some(dir) => (PathBuf::from(dir), ScratchDir::none()),
+            None => {
+                let seq = MEM_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let dir = std::env::temp_dir().join(format!(
+                    "octos-ffi-mem-{}-{}",
+                    std::process::id(),
+                    seq
+                ));
+                (dir.clone(), ScratchDir::new(dir))
+            }
+        };
         let memory = match tokio.block_on(EpisodeStore::open(&mem_dir)) {
             Ok(store) => Arc::new(store),
             Err(e) => {
@@ -551,11 +683,21 @@ impl OctosRuntime {
                 )));
             }
         };
+        let recall = match RecallStore::open(&mem_dir, recall_cfg) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                // `memory` drops first (releasing its lock), then `scratch`.
+                return Err(CoreError::Config(format!(
+                    "failed to open recall store: {e}"
+                )));
+            }
+        };
 
         Ok(OctosRuntime {
             tokio,
             llm,
             memory,
+            recall,
             cwd,
             allow_shell: cfg.allow_shell,
             default_max_iterations,
@@ -603,10 +745,29 @@ impl OctosRuntime {
     /// Embed `text`, returning the raw vector. Requires the `embed-llama`
     /// feature and a configured `embedding_model_path`; otherwise
     /// [`CoreError::NoEmbedder`]. Error text is credential-scrubbed.
-    #[cfg(feature = "embed-llama")]
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, CoreError> {
+        let mut vectors = self.embed_batch(&[text])?;
+        Ok(vectors.swap_remove(0))
+    }
+
+    /// Whether a real embedder is loaded (feature on AND a model path given).
+    fn has_embedder(&self) -> bool {
+        #[cfg(feature = "embed-llama")]
+        {
+            self.embedder.is_some()
+        }
+        #[cfg(not(feature = "embed-llama"))]
+        {
+            false
+        }
+    }
+
+    /// Embed a batch, returning exactly `texts.len()` vectors. Error text is
+    /// credential-scrubbed.
+    #[cfg(feature = "embed-llama")]
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, CoreError> {
         let embedder = self.embedder.as_ref().ok_or(CoreError::NoEmbedder)?;
-        let mut vectors = self.tokio.block_on(embedder.embed(&[text])).map_err(|e| {
+        let vectors = self.tokio.block_on(embedder.embed(texts)).map_err(|e| {
             CoreError::Embed(scrub_secret(
                 format!("embed failed: {e}"),
                 self.secret.as_deref(),
@@ -615,14 +776,190 @@ impl OctosRuntime {
         if vectors.is_empty() {
             return Err(CoreError::Embed("embedder returned no vectors".to_string()));
         }
-        Ok(vectors.swap_remove(0))
+        if vectors.len() != texts.len() {
+            return Err(CoreError::Embed(format!(
+                "embedder returned {} vectors for {} texts",
+                vectors.len(),
+                texts.len()
+            )));
+        }
+        Ok(vectors)
     }
 
     /// Embed stub when the crate is built without the `embed-llama` feature —
     /// always [`CoreError::NoEmbedder`].
     #[cfg(not(feature = "embed-llama"))]
-    pub fn embed(&self, _text: &str) -> Result<Vec<f32>, CoreError> {
+    fn embed_batch(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, CoreError> {
         Err(CoreError::NoEmbedder)
+    }
+
+    fn memory_err(&self, msg: impl Into<String>) -> CoreError {
+        CoreError::Memory(scrub_secret(msg.into(), self.secret.as_deref()))
+    }
+
+    /// Insert or update app records in the Recall index.
+    ///
+    /// Input JSON: `{"records": [Record…], "vectors"?: [[f32…]|null…],
+    /// "embed"?: bool}` — see [`MemoryUpsertRequest`]. Output JSON: the
+    /// store's `UpsertReport` (`inserted`, `updated`, `unchanged`,
+    /// `vectors_stored`) plus `"embedded"`, the number of records this call
+    /// embedded itself.
+    ///
+    /// Rules: at most [`MAX_UPSERT_RECORDS`] records; every record needs a
+    /// non-empty `id`; `kind: "knowledge"` is rejected (bank pages are not
+    /// written through this seam); `trust` is forced to `untrusted` and the
+    /// usage counters (`visits`, `last_visit`, `promoted`) are kernel-owned and
+    /// reset (the store keeps the existing ones on re-ingest). When `vectors`
+    /// is given its length must equal `records`'. When it is absent, `embed` is
+    /// true (the default) and an embedder is loaded, `Record::index_text()` is
+    /// embedded in batches of 16; without an embedder the records are indexed
+    /// BM25-only. The HNSW graph is persisted after the batch.
+    pub fn memory_upsert(&self, json: &str) -> Result<String, CoreError> {
+        let req: MemoryUpsertRequest = serde_json::from_str(json)
+            .map_err(|e| self.memory_err(format!("invalid upsert json: {e}")))?;
+        if req.records.len() > MAX_UPSERT_RECORDS {
+            return Err(self.memory_err(format!(
+                "too many records: {} > {MAX_UPSERT_RECORDS} per call",
+                req.records.len()
+            )));
+        }
+        let mut records = req.records;
+        for (i, r) in records.iter_mut().enumerate() {
+            if r.id.trim().is_empty() {
+                return Err(self.memory_err(format!("record #{i}: id is empty")));
+            }
+            if r.kind == RecordKind::Knowledge {
+                return Err(self.memory_err(format!(
+                    "record '{}': kind \"knowledge\" is not accepted through this seam",
+                    r.id
+                )));
+            }
+            r.trust = Trust::Untrusted;
+            r.visits = 0;
+            r.last_visit = None;
+            r.promoted = false;
+        }
+
+        let mut embedded = 0usize;
+        let vectors: Vec<Option<Vec<f32>>> = match req.vectors {
+            Some(v) => {
+                if v.len() != records.len() {
+                    return Err(self.memory_err(format!(
+                        "vectors length {} does not match records length {}",
+                        v.len(),
+                        records.len()
+                    )));
+                }
+                v
+            }
+            None if req.embed && self.has_embedder() && !records.is_empty() => {
+                let texts: Vec<String> = records.iter().map(Record::index_text).collect();
+                let mut out = Vec::with_capacity(records.len());
+                for chunk in texts.chunks(EMBED_BATCH) {
+                    let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+                    out.extend(self.embed_batch(&refs)?.into_iter().map(Some));
+                }
+                embedded = out.len();
+                out
+            }
+            None => vec![None; records.len()],
+        };
+
+        let report = self
+            .recall
+            .upsert(records, vectors)
+            .map_err(|e| self.memory_err(format!("memory upsert failed: {e}")))?;
+        self.recall
+            .persist_index()
+            .map_err(|e| self.memory_err(format!("memory index persist failed: {e}")))?;
+        let mut out = serde_json::to_value(&report)
+            .map_err(|e| self.memory_err(format!("serialize upsert report: {e}")))?;
+        out["embedded"] = json!(embedded);
+        Ok(out.to_string())
+    }
+
+    /// Two-stage retrieval, stage one: rank records and return their
+    /// abstracts. Input JSON: `{"query": str, "kinds"?: [str], "sources"?:
+    /// [str], "since"?: str, "until"?: str, "limit"?: n}` — see
+    /// [`MemorySearchRequest`]. Output JSON: `{"hits": [Hit…]}` with each hit
+    /// `{id, kind, source, title, abstract, score, timestamp, trust}`. The
+    /// query is embedded when an embedder is loaded (hybrid ranking), else
+    /// BM25 only.
+    pub fn memory_search(&self, json: &str) -> Result<String, CoreError> {
+        let req: MemorySearchRequest = serde_json::from_str(json)
+            .map_err(|e| self.memory_err(format!("invalid search json: {e}")))?;
+        let query = req.query.trim();
+        if query.is_empty() {
+            return Err(self.memory_err("query is empty"));
+        }
+        let mut kinds = Vec::with_capacity(req.kinds.len());
+        for k in &req.kinds {
+            kinds.push(
+                RecordKind::parse(k)
+                    .ok_or_else(|| self.memory_err(format!("unknown kind '{k}'")))?,
+            );
+        }
+        let since = req
+            .since
+            .as_deref()
+            .map(|s| parse_time_bound(s, false))
+            .transpose()
+            .map_err(|e| self.memory_err(format!("since: {e}")))?;
+        let until = req
+            .until
+            .as_deref()
+            .map(|s| parse_time_bound(s, true))
+            .transpose()
+            .map_err(|e| self.memory_err(format!("until: {e}")))?;
+        let filter = SearchFilter {
+            kinds,
+            sources: req.sources,
+            since,
+            until,
+            limit: req.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
+        };
+        let query_vector = if self.has_embedder() {
+            Some(self.embed(query)?)
+        } else {
+            None
+        };
+        let hits = self
+            .recall
+            .search(query, query_vector.as_deref(), &filter)
+            .map_err(|e| self.memory_err(format!("memory search failed: {e}")))?;
+        serde_json::to_string(&json!({ "hits": hits }))
+            .map_err(|e| self.memory_err(format!("serialize hits: {e}")))
+    }
+
+    /// Stage two: load one record by id, counting the visit (`touch`). Output
+    /// JSON: `{"record": Record}`; error "no such record" when absent.
+    pub fn memory_load(&self, id: &str) -> Result<String, CoreError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(self.memory_err("id is empty"));
+        }
+        let touched = self
+            .recall
+            .touch(id)
+            .map_err(|e| self.memory_err(format!("memory touch failed: {e}")))?;
+        let record = if touched {
+            self.recall
+                .get(id)
+                .map_err(|e| self.memory_err(format!("memory load failed: {e}")))?
+        } else {
+            None
+        };
+        let record = record.ok_or_else(|| self.memory_err("no such record"))?;
+        serde_json::to_string(&json!({ "record": record }))
+            .map_err(|e| self.memory_err(format!("serialize record: {e}")))
+    }
+
+    /// The Recall store's `RecallStats` as JSON (`records`, `vectors_stored`,
+    /// `vectors_resident`, `by_kind`, `by_source`, `dimension`, `embedder_id`,
+    /// `graph_persisted`, `disk_bytes`).
+    pub fn memory_stats(&self) -> Result<String, CoreError> {
+        serde_json::to_string(&self.recall.stats())
+            .map_err(|e| self.memory_err(format!("serialize stats: {e}")))
     }
 
     /// Build a fresh agent with a cwd-scoped FS toolset.
@@ -656,6 +993,25 @@ fn build_tools(cwd: &Path, allow_shell: bool) -> ToolRegistry {
         registry.register(ShellTool::new(cwd));
     }
     registry
+}
+
+/// Parse a search time bound: RFC3339 (any offset, normalised to UTC) or a
+/// bare `YYYY-MM-DD`, which means the start of that UTC day for a lower bound
+/// and the end of it (`23:59:59.999`) for an upper bound.
+fn parse_time_bound(s: &str, end_of_day: bool) -> Result<DateTime<Utc>, String> {
+    let s = s.trim();
+    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+        return Ok(t.with_timezone(&Utc));
+    }
+    let date = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map_err(|_| format!("'{s}' is neither RFC3339 nor YYYY-MM-DD"))?;
+    let time = if end_of_day {
+        date.and_hms_milli_opt(23, 59, 59, 999)
+    } else {
+        date.and_hms_opt(0, 0, 0)
+    };
+    time.map(|t| t.and_utc())
+        .ok_or_else(|| format!("'{s}' is not a valid date"))
 }
 
 /// Convert a C string pointer to `&str`, rejecting NULL and non-UTF-8.
@@ -901,8 +1257,96 @@ fn embed_serialize(_rt: &OctosRuntime, _text: &str) -> Result<*mut c_char, Strin
     )
 }
 
-/// Free a string returned by [`octos_run_task`], [`octos_embed`], or
-/// [`octos_take_last_partial_result`]. NULL is a no-op.
+/// Shared body of the `octos_memory_*` entry points: panic firewall, last-error
+/// reset, runtime NULL check, then `body` producing the owned JSON string.
+fn memory_ffi(
+    runtime: *mut OctosRuntime,
+    ctx: &'static str,
+    body: impl FnOnce(&OctosRuntime) -> Result<String, String>,
+) -> *mut c_char {
+    guard(ptr::null_mut(), ctx, || {
+        clear_last_error();
+        // SAFETY: NULL-checked; must be a live handle from `octos_runtime_new`.
+        let result = unsafe { runtime.as_ref() }
+            .ok_or_else(|| "runtime pointer is null".to_string())
+            .and_then(body)
+            .and_then(to_owned_ptr);
+        match result {
+            Ok(p) => p,
+            Err(msg) => {
+                set_last_error(msg);
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// Push app records into the Recall memory index. `request_json` is
+/// `{"records": [Record…], "vectors"?: [[f32…]|null…], "embed"?: bool}` where a
+/// Record is `{"id", "kind": "document"|"episode", "source", "timestamp":
+/// RFC3339, "title", "abstract", "parent"?, "body"?, "fingerprint"?}`. At most
+/// 500 records per call; `kind: "knowledge"` is rejected; `trust` is forced to
+/// untrusted. Without `vectors`, records are embedded here when an embedder is
+/// loaded (else indexed BM25-only). Returns owned JSON `{"inserted",
+/// "updated", "unchanged", "vectors_stored", "embedded"}` that the caller must
+/// free, UNMODIFIED, with [`octos_string_free`] — or NULL on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn octos_memory_upsert(
+    runtime: *mut OctosRuntime,
+    request_json: *const c_char,
+) -> *mut c_char {
+    memory_ffi(runtime, "octos_memory_upsert", |rt| {
+        // SAFETY: `cstr_to_str` NULL-checks and UTF-8-validates.
+        let raw = unsafe { cstr_to_str(request_json) }.map_err(|e| format!("request_json: {e}"))?;
+        rt.memory_upsert(raw).map_err(|e| e.to_string())
+    })
+}
+
+/// Search the Recall memory index. `request_json` is `{"query": "...",
+/// "kinds"?: [..], "sources"?: [..], "since"?: RFC3339|YYYY-MM-DD, "until"?:
+/// RFC3339|YYYY-MM-DD, "limit"?: N}`. Returns owned JSON `{"hits": [{"id",
+/// "kind", "source", "title", "abstract", "score", "timestamp", "trust"}…]}`
+/// that the caller must free, UNMODIFIED, with [`octos_string_free`] — or NULL
+/// on error. The query is embedded when an embedder is loaded; BM25 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn octos_memory_search(
+    runtime: *mut OctosRuntime,
+    request_json: *const c_char,
+) -> *mut c_char {
+    memory_ffi(runtime, "octos_memory_search", |rt| {
+        // SAFETY: `cstr_to_str` NULL-checks and UTF-8-validates.
+        let raw = unsafe { cstr_to_str(request_json) }.map_err(|e| format!("request_json: {e}"))?;
+        rt.memory_search(raw).map_err(|e| e.to_string())
+    })
+}
+
+/// Load one Recall record by `id`, counting the visit. Returns owned JSON
+/// `{"record": Record}` that the caller must free, UNMODIFIED, with
+/// [`octos_string_free`] — or NULL on error (last error "no such record" when
+/// the id is unknown).
+#[unsafe(no_mangle)]
+pub extern "C" fn octos_memory_load(runtime: *mut OctosRuntime, id: *const c_char) -> *mut c_char {
+    memory_ffi(runtime, "octos_memory_load", |rt| {
+        // SAFETY: `cstr_to_str` NULL-checks and UTF-8-validates.
+        let id = unsafe { cstr_to_str(id) }.map_err(|e| format!("id: {e}"))?;
+        rt.memory_load(id).map_err(|e| e.to_string())
+    })
+}
+
+/// Recall index statistics. Returns owned JSON `{"records", "vectors_stored",
+/// "vectors_resident", "by_kind", "by_source", "dimension", "embedder_id",
+/// "graph_persisted", "disk_bytes"}` that the caller must free, UNMODIFIED,
+/// with [`octos_string_free`] — or NULL on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn octos_memory_stats(runtime: *mut OctosRuntime) -> *mut c_char {
+    memory_ffi(runtime, "octos_memory_stats", |rt| {
+        rt.memory_stats().map_err(|e| e.to_string())
+    })
+}
+
+/// Free a string returned by [`octos_run_task`], [`octos_embed`], an
+/// `octos_memory_*` function, or [`octos_take_last_partial_result`]. NULL is a
+/// no-op.
 ///
 /// The string is owned by the caller and MUST be freed here, UNMODIFIED — do
 /// not alter its bytes or NUL terminator before freeing. (This reclaims via
@@ -937,7 +1381,8 @@ pub extern "C" fn octos_last_error() -> *const c_char {
 /// does not change the error diagnostic and does NOT turn the task into success.
 ///
 /// Consume once on the SAME thread, before another `octos_runtime_new`,
-/// `octos_run_task`, or `octos_embed` call (success or failure clears it).
+/// `octos_run_task`, `octos_embed`, or `octos_memory_*` call (success or
+/// failure clears it).
 /// Any new error, including a caught panic, also clears it. Error/version
 /// inspection and successful free calls leave it available. The caller must
 /// free the returned allocation, UNMODIFIED, with [`octos_string_free`].
@@ -982,6 +1427,9 @@ impl OctosRuntime {
 
 #[cfg(test)]
 mod incomplete_tests;
+
+#[cfg(test)]
+mod memory_tests;
 
 #[cfg(test)]
 mod tests {

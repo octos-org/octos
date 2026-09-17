@@ -4773,6 +4773,7 @@ name = "octos-ffi"
 version = "2.0.3-rc.11"
 dependencies = [
  "async-trait",
+ "chrono",
  "eyre",
  "libc",
  "octos-agent",
@@ -4783,6 +4784,7 @@ dependencies = [
  "octos-memory",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -5030,6 +5032,7 @@ name = "octos-uniffi"
 version = "2.0.3-rc.11"
 dependencies = [
  "octos-ffi",
+ "serde_json",
  "uniffi",
 ]
 

@@ -19,8 +19,8 @@ credential handling.
 | `Config` (record) | dict / data class of provider, model, key, cwd, … |
 | `Brief` (record) | `{ prompt, max_iterations? }` |
 | `TaskResult` / `TokenUsage` (records) | outputs |
-| `OctosError` (error enum) | exception (`Config`/`Provider`/`Run`/`Embed`/`NoEmbedder`/`Incomplete`) |
-| `Runtime` (object) | `new(config)`, `run_task(brief)`, `embed(text)` |
+| `OctosError` (error enum) | exception (`Config`/`Provider`/`Run`/`Embed`/`NoEmbedder`/`Incomplete`/`Memory`) |
+| `Runtime` (object) | `new(config)`, `run_task(brief)`, `embed(text)`, `memory_upsert(json)`, `memory_search(json)`, `memory_load(id)`, `memory_stats()` |
 
 Methods are **synchronous**: the async agent loop is driven by a `block_on`
 inside the core, so callers see plain blocking calls — call them from a normal
@@ -73,13 +73,35 @@ print(rt.run_task(Brief(prompt="Reply OK")).output)
 
 Optional `Config` fields default sensibly (`api_key_env`, `base_url`,
 `api_type`, `cwd`, `allow_shell=False`, `max_iterations`,
-`embedding_model_path`), so only `provider` and `model` (plus a credential) are
-required. Set `api_type="anthropic"` (or `"responses"`) to drive a
-`provider="custom"` Anthropic-compatible endpoint onto the right protocol.
+`embedding_model_path`, `data_dir`, `recall_dimension`), so only `provider` and
+`model` (plus a credential) are required. Set `api_type="anthropic"` (or
+`"responses"`) to drive a `provider="custom"` Anthropic-compatible endpoint
+onto the right protocol. Set `data_dir` to keep the episode + Recall memory
+stores on disk across runtimes (otherwise they live in a scratch dir removed
+on drop).
 
 Errors surface as an `OctosError` exception; a failed provider build or run
 carries a scrubbed message, and `embed` without an embedder raises
 `OctosError.NoEmbedder`.
+
+### Recall memory
+
+The four `memory_*` methods take and return JSON strings with exactly the
+contracts of the C-ABI's `octos_memory_*` functions (documented in the
+[`octos-ffi` README](../octos-ffi/README.md#memory-the-recall-index)); a
+failure raises `OctosError.Memory` (e.g. `no such record`). No embedder is
+needed — the index is BM25-only until one is configured:
+
+```python
+import json
+rt.memory_upsert(json.dumps({"records": [
+    {"id": "doc:mail:42", "kind": "document", "source": "mail",
+     "timestamp": "2026-09-01T10:00:00Z", "title": "Dentist appointment",
+     "abstract": "Sunrise Dental on the 24th", "fingerprint": "h42"}]}))
+hits = json.loads(rt.memory_search(json.dumps({"query": "dentist", "limit": 5})))["hits"]
+record = json.loads(rt.memory_load(hits[0]["id"]))["record"]
+stats = json.loads(rt.memory_stats())
+```
 
 A provider `max_tokens` stop raises `OctosError.Incomplete`, **not** a successful
 `TaskResult`. Its `partial` field contains the actual output, accumulated token

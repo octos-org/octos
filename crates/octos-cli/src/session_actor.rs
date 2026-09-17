@@ -2985,6 +2985,9 @@ pub struct ActorFactory {
     /// Memory store for saving long-form outputs (research reports) to the
     /// memory bank so only a summary is injected into session context.
     pub memory_store: Option<Arc<MemoryStore>>,
+    /// Recall/Knowledge index for `memory_search`/`memory_load` and the
+    /// relevance-ranked memory segment (docs/adr/personal-memory-tiers.md).
+    pub recall: Option<Arc<octos_memory::RecallStore>>,
     /// Resolved `memory.max_inject_tokens` for per-session memory segments.
     /// Paired with `memory_store`; `memory_refresh_enabled` gates the
     /// capture-policy text and the per-turn refresh provider.
@@ -4061,11 +4064,14 @@ impl ActorFactory {
             // first refresh would place memory AFTER the tail
             // (pre → post → memory). Empty segments render as nothing.
             agent.set_prompt_segment(octos_agent::MEMORY_SEGMENT_NAME, String::new());
-            let provider = octos_agent::MemorySegmentProvider::new(
+            let mut provider = octos_agent::MemorySegmentProvider::new(
                 memory_store.clone(),
                 self.memory_inject_tokens,
                 self.memory_refresh_enabled,
             );
+            if let Some(recall) = &self.recall {
+                provider = provider.with_recall(recall.clone(), self.embedder.clone());
+            }
             let provider = if self.memory_refresh_enabled {
                 provider
             } else {
@@ -4081,6 +4087,9 @@ impl ActorFactory {
 
         if let Some(ref embedder) = self.embedder {
             agent = agent.with_embedder(embedder.clone());
+        }
+        if let Some(recall) = &self.recall {
+            agent = agent.with_recall(recall.clone());
         }
         if let Some(ref hooks) = self.hooks {
             agent = agent.with_hooks(hooks.clone());

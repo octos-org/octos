@@ -6,7 +6,7 @@
  *    Never use a handle after octos_runtime_free(); never free it twice or
  *    concurrently with any other call on the same handle. Free it from a plain
  *    (non-async) thread.
- *  - Strings returned by octos_run_task()/octos_embed() or
+ *  - Strings returned by octos_run_task()/octos_embed()/octos_memory_*() or
  *    octos_take_last_partial_result() are owned by YOU and
  *    must be freed, UNMODIFIED, with octos_string_free() -- never free(3),
  *    never twice, and do not alter the bytes or NUL terminator before freeing.
@@ -72,8 +72,40 @@ char *octos_run_task(OctosRuntime *runtime, const char *brief_json);
 // config.
 char *octos_embed(OctosRuntime *runtime, const char *text);
 
-// Free a string returned by [`octos_run_task`], [`octos_embed`], or
-// [`octos_take_last_partial_result`]. NULL is a no-op.
+// Push app records into the Recall memory index. `request_json` is
+// `{"records": [Record…], "vectors"?: [[f32…]|null…], "embed"?: bool}` where a
+// Record is `{"id", "kind": "document"|"episode", "source", "timestamp":
+// RFC3339, "title", "abstract", "parent"?, "body"?, "fingerprint"?}`. At most
+// 500 records per call; `kind: "knowledge"` is rejected; `trust` is forced to
+// untrusted. Without `vectors`, records are embedded here when an embedder is
+// loaded (else indexed BM25-only). Returns owned JSON `{"inserted",
+// "updated", "unchanged", "vectors_stored", "embedded"}` that the caller must
+// free, UNMODIFIED, with [`octos_string_free`] — or NULL on error.
+char *octos_memory_upsert(OctosRuntime *runtime, const char *request_json);
+
+// Search the Recall memory index. `request_json` is `{"query": "...",
+// "kinds"?: [..], "sources"?: [..], "since"?: RFC3339|YYYY-MM-DD, "until"?:
+// RFC3339|YYYY-MM-DD, "limit"?: N}`. Returns owned JSON `{"hits": [{"id",
+// "kind", "source", "title", "abstract", "score", "timestamp", "trust"}…]}`
+// that the caller must free, UNMODIFIED, with [`octos_string_free`] — or NULL
+// on error. The query is embedded when an embedder is loaded; BM25 otherwise.
+char *octos_memory_search(OctosRuntime *runtime, const char *request_json);
+
+// Load one Recall record by `id`, counting the visit. Returns owned JSON
+// `{"record": Record}` that the caller must free, UNMODIFIED, with
+// [`octos_string_free`] — or NULL on error (last error "no such record" when
+// the id is unknown).
+char *octos_memory_load(OctosRuntime *runtime, const char *id);
+
+// Recall index statistics. Returns owned JSON `{"records", "vectors_stored",
+// "vectors_resident", "by_kind", "by_source", "dimension", "embedder_id",
+// "graph_persisted", "disk_bytes"}` that the caller must free, UNMODIFIED,
+// with [`octos_string_free`] — or NULL on error.
+char *octos_memory_stats(OctosRuntime *runtime);
+
+// Free a string returned by [`octos_run_task`], [`octos_embed`], an
+// `octos_memory_*` function, or [`octos_take_last_partial_result`]. NULL is a
+// no-op.
 //
 // The string is owned by the caller and MUST be freed here, UNMODIFIED — do
 // not alter its bytes or NUL terminator before freeing. (This reclaims via
@@ -91,7 +123,8 @@ const char *octos_last_error(void);
 // does not change the error diagnostic and does NOT turn the task into success.
 //
 // Consume once on the SAME thread, before another `octos_runtime_new`,
-// `octos_run_task`, or `octos_embed` call (success or failure clears it).
+// `octos_run_task`, `octos_embed`, or `octos_memory_*` call (success or
+// failure clears it).
 // Any new error, including a caught panic, also clears it. Error/version
 // inspection and successful free calls leave it available. The caller must
 // free the returned allocation, UNMODIFIED, with [`octos_string_free`].

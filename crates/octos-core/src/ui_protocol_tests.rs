@@ -852,6 +852,9 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "content/bulk_delete",
             "memory/overview",
             "memory/entity",
+            "memory/search",
+            "memory/load",
+            "memory/ingest",
             "cron/list",
             "cron/toggle",
             "router/set_mode",
@@ -981,6 +984,9 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "content/bulk_delete",
             "memory/overview",
             "memory/entity",
+            "memory/search",
+            "memory/load",
+            "memory/ingest",
             "cron/list",
             "cron/toggle",
             "router/set_mode",
@@ -1073,6 +1079,9 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "content/bulk_delete",
                 "memory/overview",
                 "memory/entity",
+                "memory/search",
+                "memory/load",
+                "memory/ingest",
                 "cron/list",
                 "cron/toggle",
                 "router/set_mode",
@@ -4766,6 +4775,31 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
             methods::MEMORY_ENTITY,
         ),
         (
+            UiCommand::MemorySearch(MemorySearchParams {
+                query: "dentist".into(),
+                kinds: vec!["document".into()],
+                sources: vec!["calendar".into()],
+                since: Some("2026-01-01".into()),
+                until: None,
+                limit: Some(5),
+            }),
+            methods::MEMORY_SEARCH,
+        ),
+        (
+            UiCommand::MemoryLoad(MemoryLoadParams {
+                id: "doc:mail:42".into(),
+            }),
+            methods::MEMORY_LOAD,
+        ),
+        (
+            UiCommand::MemoryIngest(MemoryIngestParams {
+                records: vec![serde_json::json!({ "id": "doc:mail:42" })],
+                vectors: None,
+                embed: Some(false),
+            }),
+            methods::MEMORY_INGEST,
+        ),
+        (
             UiCommand::CronList(CronListParams::default()),
             methods::CRON_LIST,
         ),
@@ -4779,13 +4813,14 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
     ];
     assert_eq!(
         cases.len(),
-        17,
-        "17 UiCommand arms cover the 17 auxiliary methods \
+        20,
+        "20 UiCommand arms cover the 20 auxiliary methods \
              (`session/list`, `session/snapshot`, `session/messages_page`, \
              `session/status.get`, `session/files.list`, `session/tasks.list`, \
              `session/workspace.get`, `session/title.set`, `session/delete`, \
              `system/status.get`, `content/list`, `content/delete`, \
              `content/bulk_delete`, `memory/overview`, `memory/entity`, \
+             `memory/search`, `memory/load`, `memory/ingest`, \
              `cron/list`, `cron/toggle`) — `content/delete` and \
              `content/bulk_delete` are distinct methods"
     );
@@ -4993,6 +5028,9 @@ fn aux_rest_to_ws_v1_methods_are_capability_gated() {
         methods::CONTENT_BULK_DELETE,
         methods::MEMORY_OVERVIEW,
         methods::MEMORY_ENTITY,
+        methods::MEMORY_SEARCH,
+        methods::MEMORY_LOAD,
+        methods::MEMORY_INGEST,
         methods::CRON_LIST,
         methods::CRON_TOGGLE,
     ] {
@@ -5021,6 +5059,9 @@ fn aux_rest_to_ws_v1_methods_are_capability_gated() {
         methods::CONTENT_BULK_DELETE,
         methods::MEMORY_OVERVIEW,
         methods::MEMORY_ENTITY,
+        methods::MEMORY_SEARCH,
+        methods::MEMORY_LOAD,
+        methods::MEMORY_INGEST,
         methods::CRON_LIST,
         methods::CRON_TOGGLE,
     ] {
@@ -5234,6 +5275,68 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
         serde_json::json!({ "name": "acme-corp" }),
     );
 
+    // memory/search — optional filters are omitted when unset; the
+    // wire shape is `{ query, kinds?, sources?, since?, until?, limit? }`.
+    assert_eq!(
+        serde_json::to_value(MemorySearchParams {
+            query: "dentist".into(),
+            ..Default::default()
+        })
+        .expect("serialize"),
+        serde_json::json!({ "query": "dentist" }),
+    );
+    assert_eq!(
+        serde_json::to_value(MemorySearchParams {
+            query: "dentist".into(),
+            kinds: vec!["document".into(), "knowledge".into()],
+            sources: vec!["calendar".into()],
+            since: Some("2026-01-01".into()),
+            until: Some("2026-02-01T00:00:00Z".into()),
+            limit: Some(5),
+        })
+        .expect("serialize"),
+        serde_json::json!({
+            "query": "dentist",
+            "kinds": ["document", "knowledge"],
+            "sources": ["calendar"],
+            "since": "2026-01-01",
+            "until": "2026-02-01T00:00:00Z",
+            "limit": 5,
+        }),
+    );
+    let decoded: MemorySearchParams =
+        serde_json::from_value(serde_json::json!({ "query": "q" })).expect("decode");
+    assert_eq!(decoded.kinds, Vec::<String>::new());
+    assert_eq!(decoded.limit, None);
+
+    // memory/load — `{ id }`
+    assert_eq!(
+        serde_json::to_value(MemoryLoadParams {
+            id: "bank:acme-corp".into(),
+        })
+        .expect("serialize"),
+        serde_json::json!({ "id": "bank:acme-corp" }),
+    );
+
+    // memory/ingest — `{ records, vectors?, embed? }`
+    assert_eq!(
+        serde_json::to_value(MemoryIngestParams {
+            records: vec![serde_json::json!({ "id": "doc:mail:1" })],
+            vectors: Some(vec![Some(vec![0.5, 0.25]), None]),
+            embed: Some(false),
+        })
+        .expect("serialize"),
+        serde_json::json!({
+            "records": [{ "id": "doc:mail:1" }],
+            "vectors": [[0.5, 0.25], null],
+            "embed": false,
+        }),
+    );
+    let decoded: MemoryIngestParams =
+        serde_json::from_value(serde_json::json!({ "records": [] })).expect("decode");
+    assert_eq!(decoded.vectors, None);
+    assert_eq!(decoded.embed, None);
+
     // cron/list — empty
     assert_eq!(
         serde_json::to_value(CronListParams::default()).expect("serialize"),
@@ -5408,6 +5511,59 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
             "content": "# acme",
             "content_truncated": false,
             "content_total_bytes": 6,
+        }),
+    );
+
+    // memory/search — `{ hits: [<octos_memory::Hit JSON>...] }`
+    assert_eq!(
+        serde_json::to_value(MemorySearchResult {
+            hits: vec![serde_json::json!({ "id": "doc:mail:1", "score": 0.9 })],
+        })
+        .expect("serialize"),
+        serde_json::json!({ "hits": [{ "id": "doc:mail:1", "score": 0.9 }] }),
+    );
+
+    // memory/load — `{ record, page?, page_truncated }`; `page` is
+    // omitted for Recall records and present for `bank:` knowledge.
+    assert_eq!(
+        serde_json::to_value(MemoryLoadResult {
+            record: serde_json::json!({ "id": "doc:mail:1" }),
+            page: None,
+            page_truncated: false,
+        })
+        .expect("serialize"),
+        serde_json::json!({ "record": { "id": "doc:mail:1" }, "page_truncated": false }),
+    );
+    assert_eq!(
+        serde_json::to_value(MemoryLoadResult {
+            record: serde_json::json!({ "id": "bank:acme" }),
+            page: Some("# acme".into()),
+            page_truncated: true,
+        })
+        .expect("serialize"),
+        serde_json::json!({
+            "record": { "id": "bank:acme" },
+            "page": "# acme",
+            "page_truncated": true,
+        }),
+    );
+
+    // memory/ingest — the UpsertReport counts, all always present.
+    assert_eq!(
+        serde_json::to_value(MemoryIngestResult {
+            inserted: 3,
+            updated: 1,
+            unchanged: 2,
+            vectors_stored: 4,
+            embedded: 4,
+        })
+        .expect("serialize"),
+        serde_json::json!({
+            "inserted": 3,
+            "updated": 1,
+            "unchanged": 2,
+            "vectors_stored": 4,
+            "embedded": 4,
         }),
     );
 

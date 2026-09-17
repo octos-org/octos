@@ -1,9 +1,12 @@
-# Personal memory — three tiers by trust, one index
+# ADR-001 — Personal memory: three tiers by trust, one index
 
-- Date: 2026-09-16 (proposal)
-- Status: **Proposed**. Phase 1 (plugin skill, no kernel change) starts in
-  Octoscript-AppCard alongside this ADR; phases 2–3 land in `octos-memory` /
-  `octos-agent` behind follow-up PRs that cite this record.
+- Date: 2026-09-16 (proposal) / 2026-09-17 (implementation landed with the
+  record; see "Implementation" below)
+- Status: **Accepted — implemented through phase 3** on this branch. Phase 1
+  (plugin skill, no kernel change) lives in Octoscript-AppCard
+  (`apps/personal-data`, PR #98); phases 2–3 are in `octos-memory`,
+  `octos-agent`, `octos-cli`, `octos-ffi`/`octos-uniffi` in the same PR as
+  this record. Phase 4 (cross-device) stays optional and unimplemented.
 - Scope: `octos-memory`, `octos-agent` tools, `octos-cli` runtime/profile,
   plugin skills; app-side ingestion in Octoscript-AppCard (Mail, Calendar) and
   the OctoSense phone shell.
@@ -62,6 +65,54 @@ Never index credentials or app secrets. Mail bodies are indexed only on opt-in (
 2. **Recall tier in the kernel** — `Document` record kind beside `Episode`; `memory/ingest` UI-protocol method and FFI `octos_memory_upsert/search`; `memory_search`/`memory_load` tools; `save_episodes` on for the embedded runtime; persisted HNSW, int8 vectors, MRL truncation, heat aging, per-source caps. Acceptance: 10 k mails within the budget above, cold start < 1 s, p95 search < 50 ms on a OnePlus 6, BM25-only works.
 3. **Knowledge indexed and fed** — bank indexing, relevance-selected injection, heat-driven promotion through consolidation with provenance. Acceptance: a 500-page bank selects the right pages ≥ 90 % on a small eval set; the guard blocks the injection corpus.
 4. **Cross-device (optional)** — derived records carried by the calendar-style sync server; redb single-writer means the kernel owns the index and apps ingest through it.
+
+## Implementation
+
+What landed with this record (phase 1 in Octoscript-AppCard, phases 2–3 here):
+
+- **Records and quantised vectors** — `octos_memory::{Record, RecordKind, Trust}`
+  (`record.rs`: title ≤ 120 B, abstract ≤ 300 B, optional body ≤ 16 KiB,
+  fingerprint, visits/last_visit, `heat()`); `quant.rs` (`mrl_truncate`,
+  `QuantizedVector` int8 with per-vector scale, 6-byte header on disk).
+- **One index, persisted** — `octos_memory::RecallStore` (`recall.rs`):
+  `<data_dir>/recall.redb` (tables `records`, `vectors`, `meta`) plus
+  `<data_dir>/recall-index/` with the dumped HNSW graph and a manifest pinned
+  to (embedder, dimension, generation). Open reloads the graph when the
+  manifest matches, else rebuilds from the int8 vectors and dumps again.
+  `HybridIndex` gained `dump_hnsw`/`load_hnsw`/`attach_hnsw`/`layout`.
+  Residency: only records inside `hot_days` (default 180) or ever visited
+  keep a vector in the graph; the rest stay BM25-only until `touch`.
+  `age()` evicts vectors beyond `max_resident_vectors` and deletes records
+  beyond `max_records_per_source` by heat; `rebuild()` compacts. Vectors from
+  a different embedder id or width are dropped on open and re-embedded by
+  the backfill. Default width 256 (`memory.recall_dimension`), never wider
+  than the configured embedder.
+- **Tools** — `memory_search {query, kinds?, sources?, since?, until?, limit?}`
+  and `memory_load {id}` (`octos-agent/src/tools/memory_{search,load}.rs`);
+  `recall_memory` accepts `query` and answers with the best-matching bank page.
+  Results label every record's trust; document bodies are not stored unless
+  the producer sent them, so `memory_load` points back at the owning app.
+- **Ingestion** — UI protocol `memory/search`, `memory/load`, `memory/ingest`
+  (auth-bound, `auxiliary.rest_to_ws.v1`); FFI `octos_memory_upsert` /
+  `octos_memory_search` / `octos_memory_load` / `octos_memory_stats` and the
+  uniffi `Runtime::memory_*` twins; `octos memory ingest <file.json>`. Ingest
+  refuses Knowledge records and forces Documents to untrusted.
+- **Episodes** — every saved episode is mirrored as `episode:<id>` (vector
+  stored after the fire-and-forget embed); the existing automatic injection
+  path is unchanged.
+- **Knowledge** — `memory_index::sync_bank` mirrors bank pages as
+  `bank:<slug>` Knowledge records on content-hash change (and drops deleted
+  pages); the memory prompt segment now ranks bank rows by relevance to the
+  turn (`MemorySegmentProvider::with_recall`, top 12 rows, remainder disclosed)
+  instead of listing every page alphabetically; `octos memory promote`
+  nominates hot Documents (≥ N loads, never twice) into the staging area as
+  host fact notes carrying provenance, where the existing consolidation and
+  guard decide what reaches `MEMORY.md`.
+- **Upkeep** — profile bootstrap spawns bank sync, vector backfill and aging;
+  `octos memory search|ingest|promote` operate on the same store.
+- **Not done** — phase 4 (cross-device sync of derived records); the
+  `personal-data` skill keeps its own app-side index until the apps push
+  records through `memory/ingest` (next step on the app side).
 
 ## Consequences
 

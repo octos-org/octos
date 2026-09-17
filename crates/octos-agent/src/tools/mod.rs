@@ -838,7 +838,9 @@ pub mod http;
 pub mod list_dir;
 pub mod manage_skills;
 pub mod mcp_agent;
+pub mod memory_load;
 pub mod memory_note;
+pub mod memory_search;
 pub mod message;
 pub mod peer_close;
 pub mod peer_gather;
@@ -907,7 +909,9 @@ pub use mcp_agent::{
     StdioMcpAgent, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
     record_dispatch,
 };
+pub use memory_load::MemoryLoadTool;
 pub use memory_note::MemoryNoteTool;
+pub use memory_search::MemorySearchTool;
 pub use message::MessageTool;
 pub use peer_close::{PeerCloseCallback, PeerCloseTool};
 pub use peer_gather::{PeerGatherCallback, PeerGatherTool};

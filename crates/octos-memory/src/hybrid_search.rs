@@ -353,6 +353,91 @@ impl HybridIndex {
         }
     }
 
+    /// Whether `id` is indexed (not tombstoned) and carries a vector.
+    pub fn has_vector(&self, id: &str) -> bool {
+        self.ids
+            .iter()
+            .position(|x| x == id)
+            .is_some_and(|i| self.has_embedding[i])
+    }
+
+    /// Points currently held by the HNSW graph (tombstones included).
+    pub fn hnsw_points(&self) -> usize {
+        self.hnsw.as_ref().map(|h| h.get_nb_point()).unwrap_or(0)
+    }
+
+    /// Insertion-ordered `(id, has_vector)` pairs, tombstones as empty ids.
+    /// This is the manifest a persisted graph needs: HNSW point ids are the
+    /// positions in this list.
+    pub fn layout(&self) -> Vec<(String, bool)> {
+        self.ids
+            .iter()
+            .cloned()
+            .zip(self.has_embedding.iter().copied())
+            .collect()
+    }
+
+    /// Write the HNSW graph and its vectors to `dir/<basename>.hnsw.{graph,data}`.
+    /// Returns `false` when the index holds no vectors (nothing written).
+    pub fn dump_hnsw(&self, dir: &std::path::Path, basename: &str) -> eyre::Result<bool> {
+        let Some(hnsw) = &self.hnsw else {
+            return Ok(false);
+        };
+        std::fs::create_dir_all(dir)?;
+        hnsw.file_dump(dir, basename)
+            .map_err(|e| eyre::eyre!("hnsw dump failed: {e}"))?;
+        Ok(true)
+    }
+
+    /// Reload a graph written by [`Self::dump_hnsw`].
+    ///
+    /// `hnsw_rs` ties the reloaded graph's lifetime to its loader, so the
+    /// loader is leaked once per open; a store opens once per process.
+    pub fn load_hnsw(
+        dir: &std::path::Path,
+        basename: &str,
+    ) -> eyre::Result<Hnsw<'static, f32, DistCosine>> {
+        let io: &'static mut hnsw_rs::hnswio::HnswIo =
+            Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(dir, basename)));
+        io.load_hnsw::<f32, DistCosine>()
+            .map_err(|e| eyre::eyre!("hnsw reload failed: {e}"))
+    }
+
+    /// Adopt a reloaded graph for an index rebuilt (BM25 side) in the same
+    /// layout: `layout` must be the exact `(id, has_vector)` sequence the
+    /// graph was dumped with, so point ids line up with positions. The index
+    /// must be empty.
+    pub fn attach_hnsw(
+        &mut self,
+        hnsw: Hnsw<'static, f32, DistCosine>,
+        layout: &[(String, bool)],
+        text_of: impl Fn(&str) -> Option<String>,
+    ) -> eyre::Result<()> {
+        if !self.ids.is_empty() {
+            eyre::bail!("attach_hnsw requires an empty index");
+        }
+        for (id, has_vector) in layout {
+            if id.is_empty() {
+                // Tombstone: keep the slot so later positions still line up.
+                self.ids.push(String::new());
+                self.doc_lengths.push(0);
+                self.has_embedding.push(false);
+                continue;
+            }
+            let text = text_of(id).unwrap_or_default();
+            self.insert(id, &text, None);
+            let idx = self.ids.len() - 1;
+            self.has_embedding[idx] = *has_vector;
+        }
+        self.avg_dl = if self.doc_lengths.is_empty() {
+            0.0
+        } else {
+            self.total_len as f64 / self.doc_lengths.len() as f64
+        };
+        self.hnsw = Some(hnsw);
+        Ok(())
+    }
+
     /// Tombstone an entry by clearing its ID so search skips it.
     /// Returns true if the episode was found and removed.
     pub fn remove(&mut self, episode_id: &str) -> bool {

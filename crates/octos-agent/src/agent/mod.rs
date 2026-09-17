@@ -370,6 +370,9 @@ pub struct Agent {
     pub(super) memory: Arc<EpisodeStore>,
     /// Embedding provider for hybrid memory search.
     pub(super) embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Recall/Knowledge index; saved episodes are mirrored into it so
+    /// `memory_search` sees them (docs/adr/personal-memory-tiers.md).
+    pub(super) recall: Option<Arc<octos_memory::RecallStore>>,
     /// Whether THIS conversation has already saved its episode (#1587
     /// write side). Set on the first compaction; subsequent compactions
     /// skip. One conversation episode per session — bounded regardless of
@@ -629,6 +632,7 @@ impl Agent {
             tools,
             memory,
             embedder: None,
+            recall: None,
             conversation_episode_saved: std::sync::atomic::AtomicBool::new(false),
             system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
             segment_providers: RwLock::new(Vec::new()),
@@ -715,6 +719,7 @@ impl Agent {
             tools,
             memory,
             embedder: None,
+            recall: None,
             conversation_episode_saved: std::sync::atomic::AtomicBool::new(false),
             system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
             segment_providers: RwLock::new(Vec::new()),
@@ -1186,6 +1191,13 @@ impl Agent {
         self
     }
 
+    /// Attach the Recall/Knowledge index so saved episodes are mirrored
+    /// into it (and memory prompt segments can rank bank pages).
+    pub fn with_recall(mut self, recall: Arc<octos_memory::RecallStore>) -> Self {
+        self.recall = Some(recall);
+        self
+    }
+
     /// Set lifecycle hooks executor.
     pub fn with_hooks(mut self, hooks: Arc<HookExecutor>) -> Self {
         self.hooks = Some(hooks);
@@ -1450,6 +1462,13 @@ impl Agent {
     /// providers are registered, and providers keep the unchanged path
     /// cheap (typically one stat).
     pub async fn refresh_prompt_segments(&self) {
+        self.refresh_prompt_segments_for(None).await
+    }
+
+    /// Like [`Self::refresh_prompt_segments`] but tells providers what the
+    /// upcoming turn is about, so relevance-selected segments (the memory
+    /// bank rows) can re-rank for it.
+    pub async fn refresh_prompt_segments_for(&self, query: Option<&str>) {
         let providers: Vec<Arc<dyn PromptSegmentProvider>> = self
             .segment_providers
             .read()
@@ -1460,7 +1479,7 @@ impl Agent {
         }
         let mut updates = Vec::new();
         for provider in providers {
-            if let Some(content) = provider.refresh().await {
+            if let Some(content) = provider.refresh_for(query).await {
                 updates.push((provider.segment_name().to_string(), content));
             }
         }

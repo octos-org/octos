@@ -32,11 +32,14 @@ octos-embed-llama = { workspace = true, optional = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `since`/`until` parsing for `octos_memory_search` (RFC3339 or YYYY-MM-DD).
+chrono = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 eyre = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 default = []

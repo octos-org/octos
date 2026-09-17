@@ -484,6 +484,12 @@ pub struct ProfileRuntime {
     /// memories window) for this profile.
     pub memory_store: Arc<MemoryStore>,
 
+    /// Long-lived Recall/Knowledge index (`<data_dir>/recall.redb` +
+    /// `recall-index/`) — app records, mirrored episodes and bank pages
+    /// behind `memory_search` / `memory_load` and `memory/ingest`
+    /// (docs/adr/personal-memory-tiers.md).
+    pub recall: Arc<octos_memory::RecallStore>,
+
     /// The profile's embedding provider (None when no `embedding`
     /// config and no resolvable key). Sessions hand this to
     /// SpawnTool / DelegateTool so worker agents embed the episodes
@@ -746,7 +752,16 @@ impl ProfileRuntime {
                 .unwrap_or_else(|| factory.clone())
         });
 
-        tools.register(octos_agent::RecallMemoryTool::new(
+        tools.register(
+            octos_agent::RecallMemoryTool::new(self.memory_store.clone())
+                .with_recall(self.recall.clone(), self.embedder.clone()),
+        );
+        tools.register(octos_agent::MemorySearchTool::new(
+            self.recall.clone(),
+            self.embedder.clone(),
+        ));
+        tools.register(octos_agent::MemoryLoadTool::new(
+            self.recall.clone(),
             self.memory_store.clone(),
         ));
         tools.register(octos_agent::SaveMemoryTool::new(self.memory_store.clone()));
@@ -873,6 +888,7 @@ impl ProfileRuntime {
             prompt_parts,
             memory: self.memory.clone(),
             memory_store: self.memory_store.clone(),
+            recall: self.recall.clone(),
             embedder: self.embedder.clone(),
             memory_inject_tokens: self.memory_inject_tokens,
             memory_refresh_enabled: self.memory_refresh_enabled,
@@ -1065,6 +1081,13 @@ impl ProfileRuntime {
         let memory_store = Arc::new(MemoryStore::open(data_dir).await.wrap_err_with(|| {
             format!("failed to open memory store for profile '{}'", profile.id)
         })?);
+        let recall = Arc::new(
+            open_recall_store(data_dir, &config, embedder.as_deref())
+                .await
+                .wrap_err_with(|| {
+                    format!("failed to open recall store for profile '{}'", profile.id)
+                })?,
+        );
 
         // Step 5: tool config store.
         let tool_config = Arc::new(ToolConfigStore::open(data_dir).await.wrap_err_with(|| {
@@ -1230,7 +1253,18 @@ impl ProfileRuntime {
 
         // Memory bank tools — registered profile-side so every
         // session inherits the same memory_store.
-        tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
+        tools.register(
+            octos_agent::RecallMemoryTool::new(memory_store.clone())
+                .with_recall(recall.clone(), embedder.clone()),
+        );
+        tools.register(octos_agent::MemorySearchTool::new(
+            recall.clone(),
+            embedder.clone(),
+        ));
+        tools.register(octos_agent::MemoryLoadTool::new(
+            recall.clone(),
+            memory_store.clone(),
+        ));
         tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
         tools.register(octos_agent::RecordMemoryUseTool::new(memory_store.clone()));
         if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
@@ -1618,6 +1652,17 @@ impl ProfileRuntime {
                 .wrap_err("invalid profile approval_policy")?;
         }
 
+        // Recall/Knowledge index upkeep (docs/adr/personal-memory-tiers.md):
+        // mirror bank pages, embed records that arrived without vectors,
+        // and apply the heat policy. Runs off the bootstrap path so a large
+        // bank never delays the first turn; errors only log.
+        spawn_recall_maintenance(
+            recall.clone(),
+            memory_store.clone(),
+            embedder.clone(),
+            profile.id.clone(),
+        );
+
         // Start the background memory-refresh sweep when enabled. The
         // flock decides ownership when serve and gateway share a profile
         // dir; the loser just logs and skips.
@@ -1686,6 +1731,7 @@ impl ProfileRuntime {
             memory_refresh_enabled,
             memory,
             memory_store,
+            recall,
             embedder,
             memory_refresh,
             tool_config,
@@ -1735,6 +1781,92 @@ impl ProfileRuntime {
 /// is already dropped — but readers reasonably expect the runtime to
 /// own its background tasks). Codex flagged this on the M11-F serve
 /// regression bundle review.
+/// Open the profile's Recall/Knowledge index sized to the embedder.
+///
+/// Vectors are Matryoshka-truncated to `memory.recall_dimension` (default
+/// 256) and quantised, so the index never needs the embedder's full width;
+/// an embedder narrower than that lowers the width instead. Without an
+/// embedder the store still opens and answers keyword (BM25) queries.
+pub(crate) async fn open_recall_store(
+    data_dir: &Path,
+    config: &Config,
+    embedder: Option<&dyn octos_llm::EmbeddingProvider>,
+) -> Result<octos_memory::RecallStore> {
+    let mut recall_config = octos_memory::RecallConfig::default();
+    if let Some(dim) = config.memory.as_ref().and_then(|m| m.recall_dimension) {
+        recall_config.dimension = dim.max(8);
+    }
+    if let Some(e) = embedder {
+        recall_config.dimension = recall_config.dimension.min(e.dimension());
+    }
+    recall_config.embedder_id = config
+        .embedding
+        .as_ref()
+        .map(|e| {
+            format!(
+                "{}/{}",
+                e.provider,
+                e.model
+                    .clone()
+                    .or_else(|| e.model_path.clone())
+                    .unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
+    let dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        octos_memory::RecallStore::open_or_degraded(&dir, recall_config)
+    })
+    .await
+    .wrap_err("recall store open task failed")?
+}
+
+/// Background upkeep for the Recall/Knowledge index at profile bootstrap.
+pub(crate) fn spawn_recall_maintenance(
+    recall: Arc<octos_memory::RecallStore>,
+    memory_store: Arc<MemoryStore>,
+    embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+    profile_id: String,
+) {
+    tokio::spawn(async move {
+        if let Err(e) =
+            octos_agent::memory_index::sync_bank(&memory_store, &recall, embedder.as_deref()).await
+        {
+            tracing::warn!(profile = %profile_id, error = %e, "recall: bank sync failed");
+        }
+        if let Some(e) = embedder.as_deref() {
+            match octos_agent::memory_index::backfill_vectors(&recall, e, 2_000).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(profile = %profile_id, vectors = n, "recall: backfilled vectors")
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(profile = %profile_id, error = %err, "recall: vector backfill failed")
+                }
+            }
+        }
+        let aged = {
+            let recall = recall.clone();
+            tokio::task::spawn_blocking(move || {
+                let report = recall.age(chrono::Utc::now())?;
+                recall.persist_index()?;
+                Ok::<_, eyre::Report>(report)
+            })
+            .await
+        };
+        match aged {
+            Ok(Ok(report)) if report.records_deleted > 0 || report.vectors_evicted > 0 => {
+                tracing::info!(profile = %profile_id, ?report, "recall: aged index")
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(profile = %profile_id, error = %e, "recall: aging failed"),
+            Err(e) => {
+                tracing::warn!(profile = %profile_id, error = %e, "recall: aging task failed")
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

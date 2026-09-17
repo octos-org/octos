@@ -39,7 +39,11 @@ cbindgen --config crates/octos-ffi/cbindgen.toml \
 | `void octos_runtime_free(OctosRuntime*)` | Free the runtime (NULL-safe). |
 | `char* octos_run_task(OctosRuntime*, const char* brief_json)` | Run one task; returns owned JSON, NULL on error. |
 | `char* octos_embed(OctosRuntime*, const char* text)` | Embed text (needs `embed-llama` + a model path); NULL on error. |
-| `void octos_string_free(char*)` | Free a string returned by `octos_run_task`/`octos_embed`/`octos_take_last_partial_result`. |
+| `char* octos_memory_upsert(OctosRuntime*, const char* request_json)` | Push app records into the Recall memory index; returns owned JSON report, NULL on error. |
+| `char* octos_memory_search(OctosRuntime*, const char* request_json)` | Search the Recall index; returns owned JSON `{"hits": [...]}`, NULL on error. |
+| `char* octos_memory_load(OctosRuntime*, const char* id)` | Load one record (counts a visit); returns owned JSON `{"record": ...}`, NULL on error. |
+| `char* octos_memory_stats(OctosRuntime*)` | Recall index statistics as owned JSON; NULL on error. |
+| `void octos_string_free(char*)` | Free a string returned by `octos_run_task`/`octos_embed`/`octos_memory_*`/`octos_take_last_partial_result`. |
 | `const char* octos_last_error(void)` | Thread-local last error; do NOT free; valid until the next FFI call on this thread. |
 | `char* octos_take_last_partial_result(void)` | Take the last incomplete task's owned JSON once, on the same thread; NULL if absent. Free with `octos_string_free`. |
 | `const char* octos_version(void)` | Static version string. |
@@ -55,12 +59,95 @@ cbindgen --config crates/octos-ffi/cbindgen.toml \
   "cwd": "/path/to/workspace",     // optional; FS tools are confined here
   "allow_shell": false,            // optional; off by default
   "max_iterations": 20,            // optional
-  "embedding_model_path": "/models/embed.gguf"  // optional (embed-llama)
+  "embedding_model_path": "/models/embed.gguf",  // optional (embed-llama)
+  "data_dir": "/data/octos",       // optional; persistent episode + Recall stores
+  "recall_dimension": 256          // optional; Recall vector width (default 256)
 }
 ```
 
 `brief_json`: `{"prompt": "...", "max_iterations"?: N}`.
 Task result: `{"output": "...", "iterations": N, "tokens": {"input", "output", ...}}`.
+
+### Memory: the Recall index
+
+The runtime owns the kernel's Recall index (`docs/adr/personal-memory-tiers.md`,
+phase 2): one BM25 + vector index over app records — mail, calendar events,
+contacts, notes — that a host app pushes in and the agent (or the host)
+searches. With `data_dir` set, `episodes.redb`, `recall.redb` and
+`recall-index/` live under it and persist across runtimes; without it they
+live in a scratch dir that `octos_runtime_free` removes. The index stores only
+`title`/`abstract`/metadata (no bodies unless the host opts in with `body`);
+the apps stay the record of truth. It never requires an embedder: with none
+configured every call still works, BM25-only. With one, `upsert` embeds
+records it was not given vectors for and `search` embeds the query (hybrid
+ranking). Vectors are Matryoshka-truncated to `recall_dimension` (clamped to
+the embedder's width) and quantised to int8 at rest.
+
+`octos_memory_upsert(rt, request_json)` — at most **500 records per call**:
+
+```json
+{
+  "records": [
+    {"id": "doc:mail:42", "kind": "document", "source": "mail",
+     "timestamp": "2026-09-01T10:00:00Z",
+     "title": "Dentist appointment", "abstract": "Sunrise Dental on the 24th",
+     "parent": "thread:7", "fingerprint": "sha1-of-message"}
+  ],
+  "vectors": [[0.1, 0.2, "..."]],   // optional; one entry (or null) per record
+  "embed": true                     // optional; default true
+}
+```
+
+Record fields: `id` (namespaced, e.g. `doc:<source>:<key>`), `kind`
+(`"document"` | `"episode"` — `"knowledge"` is **rejected**: bank pages are not
+written through this seam), `source`, `timestamp` (RFC3339), `title` (kept to
+120 B), `abstract` (300 B), optional `parent`, `body` (16 KiB, opt-in) and
+`fingerprint` (a change detector: unchanged records are skipped and keep their
+vector). `trust` is always forced to `untrusted`; `visits`/`last_visit`/
+`promoted` are kernel-owned and ignored on input. When `vectors` is present it
+must have one entry per record and no embedding happens; when absent and
+`embed` is true, records are embedded in batches of 16 if an embedder is
+loaded. Result:
+
+```json
+{"inserted": 1, "updated": 0, "unchanged": 0, "vectors_stored": 1, "embedded": 1}
+```
+
+`octos_memory_search(rt, request_json)`:
+
+```json
+{"query": "dentist", "kinds": ["document"], "sources": ["mail", "calendar"],
+ "since": "2026-09-01", "until": "2026-09-30T23:59:59Z", "limit": 10}
+```
+
+Only `query` is required. `since`/`until` accept RFC3339 or `YYYY-MM-DD`
+(start of that UTC day for `since`, end of it for `until`; both inclusive);
+`limit` defaults to 10 (clamped to 1–200). Result — hits carry the abstract,
+so most answers need no second call:
+
+```json
+{"hits": [{"id": "doc:mail:42", "kind": "document", "source": "mail",
+           "title": "Dentist appointment", "abstract": "Sunrise Dental on the 24th",
+           "score": 0.83, "timestamp": "2026-09-01T10:00:00Z", "trust": "untrusted"}]}
+```
+
+`octos_memory_load(rt, id)` returns `{"record": {…full Record…}}` (including
+`body` when stored, `visits`, `last_visit`, `updated_at`) and counts the visit,
+which feeds the heat that decides what stays vector-resident and what gets
+nominated for promotion. An unknown id fails with last error `no such record`.
+
+`octos_memory_stats(rt)` returns the store's `RecallStats`:
+
+```json
+{"records": 12000, "vectors_stored": 11800, "vectors_resident": 6000,
+ "by_kind": {"document": 12000}, "by_source": {"mail": 10000, "calendar": 2000},
+ "dimension": 256, "embedder_id": "llamacpp//models/embed.gguf",
+ "graph_persisted": true, "disk_bytes": 14200000}
+```
+
+All four return owned JSON to free with `octos_string_free`, or NULL with the
+diagnostic in `octos_last_error`. Treat hit and record content as **untrusted
+data**, never as instructions, when placing it in a prompt.
 
 ### Incomplete responses are failures with recoverable output
 
@@ -99,7 +186,7 @@ other error kinds retain their existing behavior.
   block internally). The panic firewall contains such misuse (returns
   null/no-op) but the runtime cannot then clean up fully.
 - **Returned strings are immutable + caller-owned.** Strings from
-  `octos_run_task`/`octos_embed`/`octos_take_last_partial_result` MUST be freed, UNMODIFIED, with
+  `octos_run_task`/`octos_embed`/`octos_memory_*`/`octos_take_last_partial_result` MUST be freed, UNMODIFIED, with
   `octos_string_free` — never `free(3)`, never twice, and do not alter the bytes
   or the NUL terminator before freeing (freeing rescans for the NUL; a mutated
   terminator corrupts the allocator).

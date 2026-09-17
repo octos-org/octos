@@ -9,8 +9,9 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 
 use octos_ffi::{
-    OctosRuntime, octos_last_error, octos_run_task, octos_runtime_free, octos_runtime_new,
-    octos_string_free, octos_version,
+    OctosRuntime, octos_last_error, octos_memory_load, octos_memory_search, octos_memory_stats,
+    octos_memory_upsert, octos_run_task, octos_runtime_free, octos_runtime_new, octos_string_free,
+    octos_version,
 };
 
 /// Helper: read the thread-local last-error as an owned String (or empty).
@@ -142,6 +143,100 @@ fn last_error_reflects_most_recent_failure() {
         first, second,
         "last_error did not update to the newest failure"
     );
+}
+
+/// Read an owned FFI string as JSON and free it.
+fn take_json(p: *mut libc::c_char) -> serde_json::Value {
+    assert!(!p.is_null(), "expected JSON, error={}", last_error_string());
+    // SAFETY: non-null owned string from the FFI; read then freed exactly once.
+    let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned();
+    octos_string_free(p);
+    serde_json::from_str(&s).unwrap()
+}
+
+#[test]
+fn memory_entry_points_null_runtime_are_safe() {
+    let req = CString::new(r#"{"records":[]}"#).unwrap();
+    assert!(octos_memory_upsert(ptr::null_mut(), req.as_ptr()).is_null());
+    assert!(last_error_string().contains("null"));
+    assert!(octos_memory_search(ptr::null_mut(), req.as_ptr()).is_null());
+    assert!(last_error_string().contains("null"));
+    assert!(octos_memory_load(ptr::null_mut(), req.as_ptr()).is_null());
+    assert!(last_error_string().contains("null"));
+    assert!(octos_memory_stats(ptr::null_mut()).is_null());
+    assert!(last_error_string().contains("null"));
+}
+
+#[test]
+fn memory_entry_points_null_argument_are_safe() {
+    let cfg = valid_config_json();
+    let rt = octos_runtime_new(cfg.as_ptr());
+    assert!(!rt.is_null(), "error={}", last_error_string());
+    assert!(octos_memory_upsert(rt, ptr::null()).is_null());
+    assert!(last_error_string().contains("null"));
+    assert!(octos_memory_search(rt, ptr::null()).is_null());
+    assert!(last_error_string().contains("null"));
+    assert!(octos_memory_load(rt, ptr::null()).is_null());
+    assert!(last_error_string().contains("null"));
+    octos_runtime_free(rt);
+}
+
+#[test]
+fn memory_upsert_search_load_round_trip_bm25_only() {
+    // No embedder configured: the index is BM25-only and every call still
+    // works (the ADR's "recall is never disabled for lack of an embedder").
+    let cfg = valid_config_json();
+    let rt = octos_runtime_new(cfg.as_ptr());
+    assert!(!rt.is_null(), "error={}", last_error_string());
+
+    let upsert = CString::new(
+        serde_json::json!({
+            "records": [
+                {"id": "doc:mail:42", "kind": "document", "source": "mail",
+                 "timestamp": "2026-09-01T10:00:00Z", "title": "Dentist appointment",
+                 "abstract": "Sunrise Dental on the 24th", "fingerprint": "h42"},
+                {"id": "doc:calendar:7", "kind": "document", "source": "calendar",
+                 "timestamp": "2026-09-20T08:00:00Z", "title": "Weekend hike with Sam",
+                 "abstract": "West Hill trail", "parent": "series:hikes"}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let report = take_json(octos_memory_upsert(rt, upsert.as_ptr()));
+    assert_eq!(report["inserted"], 2);
+    assert_eq!(report["embedded"], 0);
+    assert!(octos_last_error().is_null());
+
+    let search = CString::new(r#"{"query":"dentist","since":"2026-09-01","limit":5}"#).unwrap();
+    let hits = take_json(octos_memory_search(rt, search.as_ptr()));
+    let hits = hits["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["id"], "doc:mail:42");
+    assert_eq!(hits[0]["trust"], "untrusted");
+
+    let id = CString::new("doc:calendar:7").unwrap();
+    let loaded = take_json(octos_memory_load(rt, id.as_ptr()));
+    assert_eq!(loaded["record"]["parent"], "series:hikes");
+    assert_eq!(loaded["record"]["visits"], 1);
+
+    let missing = CString::new("doc:calendar:none").unwrap();
+    assert!(octos_memory_load(rt, missing.as_ptr()).is_null());
+    assert_eq!(last_error_string(), "no such record");
+
+    let stats = take_json(octos_memory_stats(rt));
+    assert_eq!(stats["records"], 2);
+    assert_eq!(stats["by_source"]["mail"], 1);
+
+    let bank = CString::new(
+        r#"{"records":[{"id":"bank:x","kind":"knowledge","source":"bank",
+            "timestamp":"2026-09-01T00:00:00Z","title":"x","abstract":"y"}]}"#,
+    )
+    .unwrap();
+    assert!(octos_memory_upsert(rt, bank.as_ptr()).is_null());
+    assert!(last_error_string().contains("knowledge"));
+
+    octos_runtime_free(rt);
 }
 
 /// Real end-to-end run. Ignored: needs a live provider + network. Configure via

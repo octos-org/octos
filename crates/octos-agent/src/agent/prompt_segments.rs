@@ -30,6 +30,13 @@ pub trait PromptSegmentProvider: Send + Sync {
     /// (including the first call); `None` when unchanged. Implementations
     /// must keep the unchanged path cheap — typically a single `stat`.
     async fn refresh(&self) -> Option<String>;
+
+    /// [`Self::refresh`] with the upcoming turn's user text, for providers
+    /// that select content by relevance. Default ignores the query.
+    async fn refresh_for(&self, query: Option<&str>) -> Option<String> {
+        let _ = query;
+        self.refresh().await
+    }
 }
 
 /// One prompt segment: optional name + raw content.
