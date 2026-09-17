@@ -601,9 +601,47 @@ fn session_id_has_active_turn(
     effective_profile_id: &str,
     listed_id: &str,
 ) -> bool {
-    active_turns.contains(&SessionKey(format!(
-        "{effective_profile_id}:api:{listed_id}"
-    ))) || (listed_id.contains(':') && active_turns.contains(&SessionKey(listed_id.to_owned())))
+    active_turns
+        .iter()
+        .any(|key| active_turn_key_matches(key, effective_profile_id, listed_id))
+}
+
+/// Does one active-turn registry key denote the session a listing row names?
+///
+/// The registry is keyed by the session id EXACTLY as it arrived on the wire,
+/// which is whatever shape the client chose: a bare handle (`web-1`), a
+/// channel-qualified key (`api:web-1`) or a fully profiled one
+/// (`coding:api:web-1`). The listing stores, meanwhile, hand back either the
+/// full key (the process-wide walk) or the chat id alone (per-profile and
+/// per-project stores). Reconstructing a key from the row would have to guess
+/// both the profile and the CHANNEL, so this inverts the mapping instead and
+/// decomposes the registry key, which needs no guessing.
+///
+/// A profiled key matches only its own profile's rows — profile A's turn on
+/// `A:api:web-1` must never light up profile B's `web-1`. An unprofiled key
+/// carries no tenant dimension to check, so a bare row in another profile's
+/// listing could in principle match it; that ambiguity is inherent to a
+/// client that opened an unprofiled session and is not introduced here.
+/// Topics are folded away by `chat_id`/`base_key`: a turn in `…#research` does
+/// make the session busy.
+fn active_turn_key_matches(key: &SessionKey, effective_profile_id: &str, listed_id: &str) -> bool {
+    // The row carried the whole key (or the client used a colon-less handle
+    // and the store listed it unchanged).
+    if key.0 == listed_id {
+        return true;
+    }
+    // A colon-less key has no chat-id component to compare — `chat_id()`
+    // returns empty for it — so the verbatim check above was its only chance.
+    if !key.base_key().contains(':') {
+        return false;
+    }
+    if key.chat_id() != listed_id {
+        return false;
+    }
+    match key.profile_id() {
+        Some(profile_id) => profile_id == effective_profile_id,
+        None => true,
+    }
 }
 
 fn is_internal_api_session_id(id: &str) -> bool {
@@ -7013,5 +7051,52 @@ mod tests {
         let err = decide_resolved_profile_id(&state, Some(&identity), None, None)
             .expect_err("must signal missing context");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The registry is keyed by the session id AS SENT, and clients send three
+    /// different shapes. A live run against a real server caught the original
+    /// mapping reconstructing `<profile>:api:<row>` and therefore reporting a
+    /// colon-less session as idle while a turn was demonstrably running in it.
+    #[test]
+    fn should_match_every_wire_key_shape_when_listing_reports_a_session() {
+        let bare = SessionKey("shared-session".to_owned());
+        let channelled = SessionKey("api:web-1".to_owned());
+        let profiled = SessionKey("coding:api:web-1".to_owned());
+        let topicked = SessionKey("coding:api:web-1#research".to_owned());
+
+        // A colon-less handle is listed unchanged and must match itself.
+        assert!(active_turn_key_matches(&bare, "main", "shared-session"));
+        assert!(!active_turn_key_matches(&bare, "main", "other"));
+
+        // Per-profile stores list the chat id alone.
+        assert!(active_turn_key_matches(&channelled, "main", "web-1"));
+        assert!(active_turn_key_matches(&profiled, "coding", "web-1"));
+        // The process-wide walk lists the whole key.
+        assert!(active_turn_key_matches(
+            &profiled,
+            "coding",
+            "coding:api:web-1"
+        ));
+        // A turn in a topic bucket still makes the session busy.
+        assert!(active_turn_key_matches(&topicked, "coding", "web-1"));
+
+        // Cross-tenant: profile A's turn must not light up profile B's row.
+        assert!(!active_turn_key_matches(
+            &profiled,
+            "other-profile",
+            "web-1"
+        ));
+        // A different conversation in the same profile is not this row.
+        assert!(!active_turn_key_matches(&profiled, "coding", "web-2"));
+    }
+
+    #[test]
+    fn should_report_no_active_turn_when_the_registry_is_empty() {
+        let empty = std::collections::HashSet::new();
+        assert!(!session_id_has_active_turn(
+            &empty,
+            "main",
+            "shared-session"
+        ));
     }
 }
