@@ -607,6 +607,23 @@ async fn bind_http_listener(
 /// client matches it verbatim (octoscode `transport.rs` DATA_DIR_LOCKED_MARKER).
 pub(crate) const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
 
+/// Contention on the serve lock is not always a second long-lived serve: the
+/// goal operator CLI holds the same lock across an ms-scale offline append
+/// (#2181), and a serve (re)spawned inside that window must not be refused
+/// with the marker — octoscode STOPS relaunching on it, so a transient
+/// conflict would permanently kill the session until manual intervention
+/// (#2357). Wait out transient holders on this bounded budget before emitting
+/// the marker. A genuinely running serve holds the lock for its whole
+/// lifetime, so the refusal contract (and the greppable marker) is unchanged —
+/// only delayed by at most this budget in the true-conflict case. The budget
+/// assumes the goal CLI's offline hold stays well under it; its append can
+/// fsync a snapshot compaction, so this is a heuristic bound, not a guarantee.
+const SERVE_LOCK_CONTENTION_RETRY_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(2_000);
+/// Poll step for the contention retry: small next to the budget so a
+/// transient release is picked up promptly.
+const SERVE_LOCK_CONTENTION_RETRY_STEP: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Held for the serve process's whole lifetime: an exclusive OS advisory lock
 /// (flock / LockFileEx via `fs2`) on `<data_dir>/.octos-serve.lock`. redb is
 /// single-writer-single-process, so two `octos serve` against one data dir can
@@ -634,12 +651,13 @@ impl Drop for ServeDataDirLock {
     }
 }
 
-/// Acquire the serve single-writer lock for `data_dir`, or return a clear error
-/// carrying [`DATA_DIR_LOCKED_MARKER`] when another serve already holds it.
-/// Contention is detected structurally via the platform's canonical
-/// lock-contended errno (`fs2::lock_contended_error`), never string matching.
-/// Fully-qualified `fs2::FileExt` calls: std 1.89 grew inherent methods of the
-/// same names and the workspace MSRV is 1.85.
+/// Acquire the serve single-writer lock for `data_dir`, or return a clear
+/// error carrying [`DATA_DIR_LOCKED_MARKER`] when another serve still holds it
+/// after [`SERVE_LOCK_CONTENTION_RETRY_BUDGET`] of waiting out a transient
+/// holder (#2357). Contention is detected structurally via the platform's
+/// canonical lock-contended errno (`fs2::lock_contended_error`), never string
+/// matching. Fully-qualified `fs2::FileExt` calls: std 1.89 grew inherent
+/// methods of the same names and the workspace MSRV is 1.85.
 fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDirLock> {
     std::fs::create_dir_all(data_dir)
         .wrap_err_with(|| format!("failed to create data dir: {}", data_dir.display()))?;
@@ -650,20 +668,29 @@ fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDi
         .truncate(false)
         .open(&lock_path)
         .wrap_err_with(|| format!("failed to open serve lockfile: {}", lock_path.display()))?;
-    match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(ServeDataDirLock { _file: file }),
-        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-            Err(eyre::eyre!(
-                "{DATA_DIR_LOCKED_MARKER}: another octos server is already running for this data \
-                 directory ({}). Close the other octoscode (or `octos serve`), or start this one \
-                 against a different --data-dir.",
-                data_dir.display()
-            ))
+    let deadline = std::time::Instant::now() + SERVE_LOCK_CONTENTION_RETRY_BUDGET;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(ServeDataDirLock { _file: file }),
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(eyre::eyre!(
+                        "{DATA_DIR_LOCKED_MARKER}: another octos server is already running for \
+                         this data directory ({}). Close the other octoscode (or `octos serve`), \
+                         or start this one against a different --data-dir.",
+                        data_dir.display()
+                    ));
+                }
+                std::thread::sleep(SERVE_LOCK_CONTENTION_RETRY_STEP.min(deadline - now));
+            }
+            Err(error) => {
+                return Err(eyre::Report::new(error).wrap_err(format!(
+                    "failed to acquire serve single-writer lock: {}",
+                    lock_path.display()
+                )));
+            }
         }
-        Err(error) => Err(eyre::Report::new(error).wrap_err(format!(
-            "failed to acquire serve single-writer lock: {}",
-            lock_path.display()
-        ))),
     }
 }
 
@@ -731,11 +758,15 @@ impl ServeCommand {
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
 
         // Single-writer guard: redb is single-process, so a second `octos serve`
-        // on this data dir can't coexist. Fail FAST here with one clean,
+        // on this data dir can't coexist. Fail here with one clean,
         // client-greppable refusal instead of crashing mid-startup opening
         // `admin_audit.redb` (which a stdio client silently respawned in a
-        // ~5s loop). Held for the whole process via `_data_dir_lock`; released
-        // on exit so a relaunch after the prior serve quits still starts.
+        // ~5s loop). Transient contention (the goal operator CLI's ms-scale
+        // offline-append hold, #2181) is first waited out on a short budget
+        // (#2357): octoscode stops relaunching on the marker, so a transient
+        // conflict must never produce one. Held for the whole process via
+        // `_data_dir_lock`; released on exit so a relaunch after the prior
+        // serve quits still starts.
         let _data_dir_lock = match acquire_serve_data_dir_lock(&data_dir) {
             Ok(guard) => guard,
             Err(error) => {
@@ -2430,10 +2461,12 @@ mod tests {
     }
 
     /// Two `octos serve` against one data dir can't coexist (redb is
-    /// single-process). The second must be refused FAST with a stable,
+    /// single-process). The second must be refused with a stable,
     /// client-greppable marker — not crash mid-startup opening `admin_audit.redb`
     /// (which a stdio client respawned in a silent ~5s loop). Releasing the first
     /// (process exit) must free the lock so a legitimate relaunch still starts.
+    /// (The refusal is delayed by the #2357 contention budget, so this test's
+    /// wall time includes it.)
     #[test]
     fn second_serve_on_same_data_dir_is_refused_with_a_greppable_marker() {
         let dir = tempfile::tempdir().unwrap();
@@ -2457,6 +2490,77 @@ mod tests {
         drop(first);
         let _relaunch = acquire_serve_data_dir_lock(dir.path())
             .expect("after the holder exits, a fresh serve acquires the lock");
+    }
+
+    /// #2357 — the lock is no longer held only by a long-lived serve: the goal
+    /// operator CLI holds it across an ms-scale offline append (#2181). A serve
+    /// spawned inside that window must WAIT OUT the transient holder instead of
+    /// emitting the one-shot marker refusal — octoscode stops relaunching on
+    /// the marker, so a transient conflict would permanently kill the session.
+    /// The holder releases mid-budget; acquisition must retry past the first
+    /// contention and succeed. The acquirer runs on its own thread behind a
+    /// channel handshake so the hold provably overlaps the first try_lock —
+    /// a main-thread scheduling hiccup can never release the lock early and
+    /// turn this into a false pass/fail.
+    #[test]
+    fn serve_lock_acquisition_waits_out_a_transient_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".octos-serve.lock");
+        let transient = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open lockfile");
+        fs2::FileExt::try_lock_exclusive(&transient).expect("transient holder takes the lock");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let dir_path = dir.path().to_path_buf();
+        let acquirer = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce acquisition start");
+            acquire_serve_data_dir_lock(&dir_path)
+        });
+        started_rx.recv().expect("acquirer announces start");
+
+        // Release mid-budget: comfortably past the acquirer's first try_lock,
+        // comfortably inside SERVE_LOCK_CONTENTION_RETRY_BUDGET on any host.
+        let released_at = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(transient);
+
+        let guard = acquirer
+            .join()
+            .expect("acquirer thread")
+            .expect("a transient holder must be waited out, not refused");
+        assert!(
+            released_at.elapsed() >= std::time::Duration::from_millis(150),
+            "acquisition can only succeed after the release, so it must have waited"
+        );
+        drop(guard);
+    }
+
+    /// #2357 — the retry budget must not soften the true-conflict contract: a
+    /// live serve holds the lock for its whole lifetime, so a second serve is
+    /// still refused with the same greppable marker, just delayed by the
+    /// budget. (Wall time of this test grows by the budget.)
+    #[test]
+    fn serve_lock_acquisition_still_refuses_a_live_holder_after_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_serve_data_dir_lock(dir.path()).expect("first serve acquires the lock");
+
+        let started = std::time::Instant::now();
+        let err = acquire_serve_data_dir_lock(dir.path())
+            .err()
+            .expect("a live holder must still be refused after the retry budget");
+        assert!(
+            err.to_string().contains(DATA_DIR_LOCKED_MARKER),
+            "refusal must still carry the stable client-greppable marker; got: {err}"
+        );
+        assert!(
+            started.elapsed() >= SERVE_LOCK_CONTENTION_RETRY_BUDGET,
+            "the refusal must come only after the full contention budget"
+        );
+        drop(first);
     }
 
     /// Unix flock ownership follows the open file description, so a forked
