@@ -364,6 +364,9 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::CONTENT_BULK_DELETE
         | methods::MEMORY_OVERVIEW
         | methods::MEMORY_ENTITY
+        | methods::MEMORY_SEARCH
+        | methods::MEMORY_LOAD
+        | methods::MEMORY_INGEST
         | methods::CRON_LIST
         | methods::CRON_TOGGLE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
         methods::AGENT_LIST
@@ -1241,6 +1244,18 @@ pub mod methods {
     pub const MEMORY_OVERVIEW: &str = "memory/overview";
     /// Replaces `GET /api/my/memory/entities/{name}` — full entity page.
     pub const MEMORY_ENTITY: &str = "memory/entity";
+    /// Recall/Knowledge index search (BM25 + optional vectors) — returns
+    /// ranked hits `{id, kind, source, title, abstract, score,
+    /// timestamp, trust}`; bodies are fetched with [`MEMORY_LOAD`].
+    /// See `docs/adr/personal-memory-tiers.md`.
+    pub const MEMORY_SEARCH: &str = "memory/search";
+    /// Load one Recall/Knowledge record by id (second stage after
+    /// [`MEMORY_SEARCH`]); for `bank:` knowledge records the page text
+    /// rides along. Counts a visit (heat).
+    pub const MEMORY_LOAD: &str = "memory/load";
+    /// Ingest app records (documents / episodes) into the Recall index.
+    /// The only memory WRITE method; knowledge pages are refused here.
+    pub const MEMORY_INGEST: &str = "memory/ingest";
     /// Replaces `GET /api/my/cron` — cron panel job listing.
     pub const CRON_LIST: &str = "cron/list";
     /// Replaces `PUT /api/my/cron/{job_id}/enabled` — cron job toggle.
@@ -1404,6 +1419,9 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::CONTENT_BULK_DELETE,
     methods::MEMORY_OVERVIEW,
     methods::MEMORY_ENTITY,
+    methods::MEMORY_SEARCH,
+    methods::MEMORY_LOAD,
+    methods::MEMORY_INGEST,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -1531,6 +1549,9 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::CONTENT_BULK_DELETE,
     methods::MEMORY_OVERVIEW,
     methods::MEMORY_ENTITY,
+    methods::MEMORY_SEARCH,
+    methods::MEMORY_LOAD,
+    methods::MEMORY_INGEST,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -3545,6 +3566,99 @@ pub struct MemoryEntityResult {
     pub content_total_bytes: usize,
 }
 
+/// Default `limit` for `memory/search` when the caller omits it.
+pub const MEMORY_SEARCH_DEFAULT_LIMIT: usize = 10;
+/// Hard ceiling for `memory/search.limit`; larger values are clamped.
+pub const MEMORY_SEARCH_MAX_LIMIT: usize = 50;
+/// Hard ceiling on `memory/ingest.records.len()` per call.
+pub const MEMORY_INGEST_MAX_RECORDS: usize = 500;
+
+/// Params for `memory/search` — first stage of the two-stage Recall /
+/// Knowledge retrieval (`docs/adr/personal-memory-tiers.md`). `query`
+/// is free text; `kinds` narrows to `"episode"` / `"document"` /
+/// `"knowledge"` (empty = all); `sources` narrows to record sources
+/// (e.g. `"mail"`, empty = all); `since` / `until` are RFC 3339
+/// timestamps or `YYYY-MM-DD` dates; `limit` defaults to
+/// [`MEMORY_SEARCH_DEFAULT_LIMIT`] and is clamped to
+/// [`MEMORY_SEARCH_MAX_LIMIT`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySearchParams {
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// Result for `memory/search`. Each hit is the JSON of
+/// `octos_memory::Hit` — `{ id, kind, source, title, abstract, score,
+/// timestamp, trust }` — ranked best first. App-sourced hits carry
+/// `trust: "untrusted"`; callers must treat their text as data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemorySearchResult {
+    pub hits: Vec<Value>,
+}
+
+/// Params for `memory/load` — second stage: fetch one record by the
+/// `id` a `memory/search` hit returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryLoadParams {
+    pub id: String,
+}
+
+/// Result for `memory/load`. `record` is the JSON of
+/// `octos_memory::Record`. For Knowledge records (`id` starts with
+/// `bank:`) `page` carries the bank page markdown, capped at the same
+/// RPC-layer byte budget as `memory/entity` (`page_truncated` reports
+/// the cap; capped text is a clean UTF-8 prefix). For Recall records
+/// `page` is `null` — the app owning the record is the record of
+/// truth for its body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryLoadResult {
+    pub record: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
+    #[serde(default)]
+    pub page_truncated: bool,
+}
+
+/// Params for `memory/ingest` — write app records into the Recall
+/// index. Each element of `records` is an `octos_memory::Record` JSON
+/// (`id`, `kind`, `source`, `timestamp`, `title`, `abstract` required;
+/// `parent`, `body`, `trust`, `fingerprint` optional). `vectors`, when
+/// supplied, is parallel to `records` (one optional embedding each);
+/// otherwise the server embeds `Record::index_text()` itself when
+/// `embed` (default `true`) and an embedder is configured. At most
+/// [`MEMORY_INGEST_MAX_RECORDS`] records per call. Knowledge (`bank:`)
+/// records are refused — they are written through the memory bank.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemoryIngestParams {
+    pub records: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<Vec<Option<Vec<f32>>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed: Option<bool>,
+}
+
+/// Result for `memory/ingest` — the `octos_memory::UpsertReport`
+/// counts: how many records were new, changed, or already identical
+/// (by fingerprint), how many vectors were stored, and how many of
+/// those the server embedded itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryIngestResult {
+    pub inserted: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub vectors_stored: usize,
+    pub embedded: usize,
+}
+
 /// Params for `cron/list`. Empty today; the struct exists so `{}` /
 /// `null` params decode uniformly (mirrors [`SystemStatusGetParams`];
 /// the wire `params` MEMBER must still be present).
@@ -4006,6 +4120,9 @@ pub enum UiCommand {
     ContentBulkDelete(ContentBulkDeleteParams),
     MemoryOverview(MemoryOverviewParams),
     MemoryEntity(MemoryEntityParams),
+    MemorySearch(MemorySearchParams),
+    MemoryLoad(MemoryLoadParams),
+    MemoryIngest(MemoryIngestParams),
     CronList(CronListParams),
     CronToggle(CronToggleParams),
     // ---- Wave4-A: adaptive router controls ----
@@ -4061,6 +4178,9 @@ impl UiCommand {
             Self::ContentBulkDelete(_) => methods::CONTENT_BULK_DELETE,
             Self::MemoryOverview(_) => methods::MEMORY_OVERVIEW,
             Self::MemoryEntity(_) => methods::MEMORY_ENTITY,
+            Self::MemorySearch(_) => methods::MEMORY_SEARCH,
+            Self::MemoryLoad(_) => methods::MEMORY_LOAD,
+            Self::MemoryIngest(_) => methods::MEMORY_INGEST,
             Self::CronList(_) => methods::CRON_LIST,
             Self::CronToggle(_) => methods::CRON_TOGGLE,
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
@@ -4117,6 +4237,9 @@ impl UiCommand {
             Self::ContentBulkDelete(params) => serde_json::to_value(params),
             Self::MemoryOverview(params) => serde_json::to_value(params),
             Self::MemoryEntity(params) => serde_json::to_value(params),
+            Self::MemorySearch(params) => serde_json::to_value(params),
+            Self::MemoryLoad(params) => serde_json::to_value(params),
+            Self::MemoryIngest(params) => serde_json::to_value(params),
             Self::CronList(params) => serde_json::to_value(params),
             Self::CronToggle(params) => serde_json::to_value(params),
             Self::RouterSetMode(params) => serde_json::to_value(params),
@@ -4216,6 +4339,9 @@ impl UiCommand {
                 method, params,
             )?)),
             methods::MEMORY_ENTITY => Ok(Self::MemoryEntity(decode_params(method, params)?)),
+            methods::MEMORY_SEARCH => Ok(Self::MemorySearch(decode_params(method, params)?)),
+            methods::MEMORY_LOAD => Ok(Self::MemoryLoad(decode_params(method, params)?)),
+            methods::MEMORY_INGEST => Ok(Self::MemoryIngest(decode_params(method, params)?)),
             methods::CRON_LIST => Ok(Self::CronList(decode_optional_params(method, params)?)),
             methods::CRON_TOGGLE => Ok(Self::CronToggle(decode_params(method, params)?)),
             methods::ROUTER_SET_MODE => Ok(Self::RouterSetMode(decode_params(method, params)?)),

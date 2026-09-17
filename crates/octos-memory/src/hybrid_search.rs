@@ -36,6 +36,14 @@ pub struct HybridIndex {
     dimension_mismatches: usize,
     /// Whether the first mismatch has already been logged.
     mismatch_logged: bool,
+    /// Vector-bearing entries tombstoned by [`Self::remove`]. Their HNSW
+    /// points stay in the graph (hnsw_rs cannot delete), so capacity checks
+    /// count `hnsw_points - tombstoned_vectors` and the owner compacts by
+    /// rebuilding once tombstones pile up.
+    tombstoned_vectors: usize,
+    /// All entries tombstoned by [`Self::remove`] (with or without a vector);
+    /// their BM25 postings stay until a rebuild.
+    tombstoned_docs: usize,
 }
 
 /// How much of the index is actually reachable by vector search.
@@ -205,6 +213,8 @@ impl HybridIndex {
             bm25_weight: DEFAULT_BM25_WEIGHT,
             dimension_mismatches: 0,
             mismatch_logged: false,
+            tombstoned_vectors: 0,
+            tombstoned_docs: 0,
         }
     }
 
@@ -265,11 +275,10 @@ impl HybridIndex {
         // docs occupy `ids` without occupying HNSW slots, so a doc-count gate
         // would silently stop vectorizing every new episode once the store
         // passes 10k docs even with an empty vector index.
-        let hnsw_points = self
-            .hnsw
-            .as_ref()
-            .map(|hnsw| hnsw.get_nb_point())
-            .unwrap_or(0);
+        // Live points only: a tombstoned entry's point stays in the graph
+        // but must not count against the budget, or every update of an
+        // existing record would burn a slot for good.
+        let hnsw_points = self.live_vector_points();
         let at_capacity = hnsw_points >= HNSW_CAPACITY;
         // Capacity warnings only concern inserts that would actually touch
         // HNSW — a BM25-only insert neither consumes nor is affected by
@@ -353,11 +362,125 @@ impl HybridIndex {
         }
     }
 
+    /// Whether `id` is indexed (not tombstoned) and carries a vector.
+    pub fn has_vector(&self, id: &str) -> bool {
+        self.ids
+            .iter()
+            .position(|x| x == id)
+            .is_some_and(|i| self.has_embedding[i])
+    }
+
+    /// Points currently held by the HNSW graph (tombstones included).
+    pub fn hnsw_points(&self) -> usize {
+        self.hnsw.as_ref().map(|h| h.get_nb_point()).unwrap_or(0)
+    }
+
+    /// Graph points that still belong to a live (non-tombstoned) entry.
+    pub fn live_vector_points(&self) -> usize {
+        self.hnsw_points().saturating_sub(self.tombstoned_vectors)
+    }
+
+    /// Vector-bearing entries removed since this index was built.
+    pub fn tombstoned_vectors(&self) -> usize {
+        self.tombstoned_vectors
+    }
+
+    /// Entries removed since this index was built (BM25 postings retained).
+    pub fn tombstoned_docs(&self) -> usize {
+        self.tombstoned_docs
+    }
+
+    /// Entries that are not tombstoned.
+    pub fn live_docs(&self) -> usize {
+        self.ids.len().saturating_sub(self.tombstoned_docs)
+    }
+
+    /// Insertion-ordered `(id, has_vector)` pairs, tombstones as empty ids.
+    /// This is the manifest a persisted graph needs: HNSW point ids are the
+    /// positions in this list.
+    pub fn layout(&self) -> Vec<(String, bool)> {
+        self.ids
+            .iter()
+            .cloned()
+            .zip(self.has_embedding.iter().copied())
+            .collect()
+    }
+
+    /// Write the HNSW graph and its vectors to `dir/<basename>.hnsw.{graph,data}`.
+    /// Returns `false` when the index holds no vectors (nothing written).
+    pub fn dump_hnsw(&self, dir: &std::path::Path, basename: &str) -> eyre::Result<bool> {
+        let Some(hnsw) = &self.hnsw else {
+            return Ok(false);
+        };
+        std::fs::create_dir_all(dir)?;
+        hnsw.file_dump(dir, basename)
+            .map_err(|e| eyre::eyre!("hnsw dump failed: {e}"))?;
+        Ok(true)
+    }
+
+    /// Reload a graph written by [`Self::dump_hnsw`].
+    ///
+    /// `hnsw_rs` ties the reloaded graph's lifetime to its loader, so the
+    /// loader is leaked once per open; a store opens once per process.
+    pub fn load_hnsw(
+        dir: &std::path::Path,
+        basename: &str,
+    ) -> eyre::Result<Hnsw<'static, f32, DistCosine>> {
+        let io: &'static mut hnsw_rs::hnswio::HnswIo =
+            Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(dir, basename)));
+        io.load_hnsw::<f32, DistCosine>()
+            .map_err(|e| eyre::eyre!("hnsw reload failed: {e}"))
+    }
+
+    /// Adopt a reloaded graph for an index rebuilt (BM25 side) in the same
+    /// layout: `layout` must be the exact `(id, has_vector)` sequence the
+    /// graph was dumped with, so point ids line up with positions. The index
+    /// must be empty.
+    pub fn attach_hnsw(
+        &mut self,
+        hnsw: Hnsw<'static, f32, DistCosine>,
+        layout: &[(String, bool)],
+        text_of: impl Fn(&str) -> Option<String>,
+    ) -> eyre::Result<()> {
+        if !self.ids.is_empty() {
+            eyre::bail!("attach_hnsw requires an empty index");
+        }
+        for (id, has_vector) in layout {
+            if id.is_empty() {
+                // Tombstone: keep the slot so later positions still line up,
+                // and keep counting its graph point as dead capacity.
+                self.ids.push(String::new());
+                self.doc_lengths.push(0);
+                self.has_embedding.push(*has_vector);
+                self.tombstoned_docs += 1;
+                if *has_vector {
+                    self.tombstoned_vectors += 1;
+                }
+                continue;
+            }
+            let text = text_of(id).unwrap_or_default();
+            self.insert(id, &text, None);
+            let idx = self.ids.len() - 1;
+            self.has_embedding[idx] = *has_vector;
+        }
+        self.avg_dl = if self.doc_lengths.is_empty() {
+            0.0
+        } else {
+            self.total_len as f64 / self.doc_lengths.len() as f64
+        };
+        self.hnsw = Some(hnsw);
+        Ok(())
+    }
+
     /// Tombstone an entry by clearing its ID so search skips it.
     /// Returns true if the episode was found and removed.
     pub fn remove(&mut self, episode_id: &str) -> bool {
         if let Some(pos) = self.ids.iter().position(|id| id == episode_id) {
             self.ids[pos].clear(); // tombstone — HNSW indices stay stable
+            self.tombstoned_docs += 1;
+            if self.has_embedding[pos] {
+                self.tombstoned_vectors += 1;
+            }
             true
         } else {
             false
@@ -399,11 +522,7 @@ impl HybridIndex {
         // fetch would silently omit them. The strict cap restores the
         // invariant `hnsw.get_nb_point() <= HNSW_CAPACITY` so the
         // saturation rule is correct.
-        let hnsw_full = self
-            .hnsw
-            .as_ref()
-            .map(|h| h.get_nb_point() >= HNSW_CAPACITY)
-            .unwrap_or(false);
+        let hnsw_full = self.live_vector_points() >= HNSW_CAPACITY;
         if hnsw_full {
             tracing::warn!(
                 "HNSW index at capacity ({HNSW_CAPACITY}), skipping vector insert for {episode_id} (BM25 retained)"

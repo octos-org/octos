@@ -12,7 +12,10 @@
 //! * [`Config`] / [`Brief`] — inputs (uniffi records → dictionaries/data classes).
 //! * [`TaskResult`] / [`TokenUsage`] — outputs.
 //! * [`OctosError`] — a structured error enum.
-//! * [`Runtime`] — an opaque object (`Arc`-shared) with `new`, `run_task`, `embed`.
+//! * [`Runtime`] — an opaque object (`Arc`-shared) with `new`, `run_task`,
+//!   `embed`, and the Recall memory seam `memory_upsert` / `memory_search` /
+//!   `memory_load` / `memory_stats` (JSON strings in and out, same contracts as
+//!   the C-ABI's `octos_memory_*` — see the `octos-ffi` README).
 //!
 //! Methods are synchronous: the async agent loop is driven by a `block_on`
 //! inside the core, so the foreign caller sees plain blocking calls (call them
@@ -26,13 +29,14 @@
 //!
 //! ## Note on scratch cleanup
 //!
-//! The core keeps a tiny episodic-memory scratch dir under the OS temp dir. It
-//! is owned by an RAII guard in the shared core (`octos-ffi`) that removes it
-//! when the last [`Runtime`] is dropped — the guard is the final struct field,
-//! so it runs AFTER the episodic store releases its redb lock. Both facades
-//! share this: the C-ABI's `octos_runtime_free` and a native/uniffi drop reclaim
-//! the dir identically, so a long-lived Python/Swift/Kotlin host does not
-//! accumulate scratch dirs.
+//! Without a `data_dir`, the core keeps its episodic + Recall memory stores in
+//! a tiny scratch dir under the OS temp dir. It is owned by an RAII guard in
+//! the shared core (`octos-ffi`) that removes it when the last [`Runtime`] is
+//! dropped — the guard is the final struct field, so it runs AFTER the stores
+//! release their redb locks. Both facades share this: the C-ABI's
+//! `octos_runtime_free` and a native/uniffi drop reclaim the dir identically,
+//! so a long-lived Python/Swift/Kotlin host does not accumulate scratch dirs.
+//! With a `data_dir` the stores are persistent and caller-owned.
 
 use std::sync::Arc;
 
@@ -67,6 +71,22 @@ pub struct Config {
     pub max_iterations: Option<u32>,
     #[uniffi(default = None)]
     pub embedding_model_path: Option<String>,
+    /// Persistent data directory for the episode + Recall memory stores. When
+    /// unset they live in a scratch dir removed when the runtime is dropped.
+    #[uniffi(default = None)]
+    pub data_dir: Option<String>,
+    /// Recall vector width (default 256; clamped to the embedder's dimension).
+    #[uniffi(default = None)]
+    pub recall_dimension: Option<u32>,
+    /// Whether an `embed-llama` build may download the default embedding
+    /// model (EmbeddingGemma-300M, 334 MB, once, into `<data_dir>/models/`)
+    /// when `embedding_model_path` is unset and the file is not on disk.
+    /// Default `true` (`OCTOS_NO_MODEL_DOWNLOAD=1` in the environment forces
+    /// `false`). The download blocks [`Runtime::new`]; hosts that want to
+    /// control it call [`embedding_model_ensure`] first. With `false` and no
+    /// model the runtime is keyword-only (`embed` raises `NoEmbedder`).
+    #[uniffi(default = None)]
+    pub embedding_auto_download: Option<bool>,
 }
 
 impl From<Config> for octos_ffi::RuntimeConfig {
@@ -82,8 +102,39 @@ impl From<Config> for octos_ffi::RuntimeConfig {
             allow_shell: c.allow_shell,
             max_iterations: c.max_iterations,
             embedding_model_path: c.embedding_model_path,
+            data_dir: c.data_dir,
+            recall_dimension: c.recall_dimension.map(|d| d as usize),
+            embedding_auto_download: c.embedding_auto_download,
         }
     }
+}
+
+/// What is on disk for the default embedding model under `data_dir` (the same
+/// directory a [`Config::data_dir`] names), as JSON `{"path", "present",
+/// "bytes", "complete", "url", "license_url", "sha256"}` — exactly the C-ABI's
+/// `octos_embedding_model_status`. Needs no [`Runtime`] and never touches the
+/// network; `license_url` points at the Gemma Terms of Use that apply to the
+/// weights.
+#[uniffi::export]
+pub fn embedding_model_status(data_dir: String) -> Result<String, OctosError> {
+    Ok(octos_ffi::embedding_model_status(std::path::Path::new(
+        &data_dir,
+    ))?)
+}
+
+/// Make sure the default embedding model is complete under `data_dir`,
+/// downloading and verifying it (334 MB, once) when `download` is true, and
+/// return JSON `{"path"}` — exactly the C-ABI's `octos_embedding_model_ensure`.
+/// Blocks for the whole transfer, so call it from a plain thread before
+/// [`Runtime::new`] when the host wants to own the timing. Raises
+/// [`OctosError::Embed`] when the file is absent and `download` is false (or
+/// `OCTOS_NO_MODEL_DOWNLOAD` is set), or the download fails to verify.
+#[uniffi::export]
+pub fn embedding_model_ensure(data_dir: String, download: bool) -> Result<String, OctosError> {
+    Ok(octos_ffi::embedding_model_ensure(
+        std::path::Path::new(&data_dir),
+        download,
+    )?)
 }
 
 /// A one-shot task brief. Maps onto [`octos_ffi::TaskBrief`].
@@ -161,6 +212,10 @@ pub enum OctosError {
     /// Provider output was truncated. This remains a failure; partial output
     /// and consumed usage are available separately from the short diagnostic.
     Incomplete { partial: TaskResult },
+    /// Recall-memory failure (`memory_*`): malformed request, rejected record,
+    /// "no such record", or a store error. Appended after `Incomplete` to keep
+    /// existing variant ordinals stable.
+    Memory { msg: String },
 }
 
 impl std::fmt::Display for OctosError {
@@ -169,7 +224,8 @@ impl std::fmt::Display for OctosError {
             OctosError::Config { msg }
             | OctosError::Provider { msg }
             | OctosError::Run { msg }
-            | OctosError::Embed { msg } => f.write_str(msg),
+            | OctosError::Embed { msg }
+            | OctosError::Memory { msg } => f.write_str(msg),
             OctosError::NoEmbedder => f.write_str("no embedder configured"),
             OctosError::Incomplete { .. } => f.write_str(octos_ffi::INCOMPLETE_RESPONSE_MESSAGE),
         }
@@ -197,6 +253,7 @@ impl From<octos_ffi::CoreError> for OctosError {
             CoreError::Incomplete { partial } => OctosError::Incomplete {
                 partial: partial.into(),
             },
+            CoreError::Memory(msg) => OctosError::Memory { msg: redact(&msg) },
         }
     }
 }
@@ -238,13 +295,43 @@ impl Runtime {
     pub fn embed(&self, text: String) -> Result<Vec<f32>, OctosError> {
         Ok(self.inner.embed(&text)?)
     }
+
+    /// Push app records into the Recall memory index. `json` is
+    /// `{"records": [Record…], "vectors"?: [[f32…]|null…], "embed"?: bool}`;
+    /// returns `{"inserted", "updated", "unchanged", "vectors_stored",
+    /// "embedded"}`. At most 500 records per call; `kind: "knowledge"` is
+    /// rejected; `trust` is forced to untrusted. See
+    /// [`octos_ffi::OctosRuntime::memory_upsert`].
+    pub fn memory_upsert(&self, json: String) -> Result<String, OctosError> {
+        Ok(self.inner.memory_upsert(&json)?)
+    }
+
+    /// Search the Recall index. `json` is `{"query", "kinds"?, "sources"?,
+    /// "since"?, "until"?, "limit"?}`; returns `{"hits": [Hit…]}`. See
+    /// [`octos_ffi::OctosRuntime::memory_search`].
+    pub fn memory_search(&self, json: String) -> Result<String, OctosError> {
+        Ok(self.inner.memory_search(&json)?)
+    }
+
+    /// Load one Recall record by id (counting the visit). Returns
+    /// `{"record": Record}`; [`OctosError::Memory`] "no such record" when the
+    /// id is unknown.
+    pub fn memory_load(&self, id: String) -> Result<String, OctosError> {
+        Ok(self.inner.memory_load(&id)?)
+    }
+
+    /// Recall index statistics as JSON (`RecallStats`).
+    pub fn memory_stats(&self) -> Result<String, OctosError> {
+        Ok(self.inner.memory_stats()?)
+    }
 }
 
 // Compile-time proof that the uniffi Object is `Send + Sync` — required for a
 // handle shared as `Arc<Runtime>` across foreign threads. It holds because
 // `octos_ffi::OctosRuntime` is `Send + Sync` (a tokio runtime, `Arc<dyn
-// LlmProvider>` whose trait is `Send + Sync`, `Arc<EpisodeStore>`, and plain
-// data). `#[derive(uniffi::Object)]` also requires this; the assertion just
+// LlmProvider>` whose trait is `Send + Sync`, `Arc<EpisodeStore>`, the
+// `RwLock`-guarded `Arc<RecallStore>`, and plain data).
+// `#[derive(uniffi::Object)]` also requires this; the assertion just
 // gives a direct, readable error if the core ever regresses.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -267,6 +354,10 @@ mod tests {
             allow_shell: false,
             max_iterations: Some(3),
             embedding_model_path: None,
+            data_dir: None,
+            recall_dimension: None,
+            // Never fetch the default model in tests.
+            embedding_auto_download: Some(false),
         }
     }
 
@@ -283,6 +374,159 @@ mod tests {
         assert_eq!(native.embedding_model_path, None);
         // Unset api_type maps through as None.
         assert_eq!(native.api_type, None);
+        assert_eq!(native.data_dir, None);
+        assert_eq!(native.recall_dimension, None);
+        assert_eq!(native.embedding_auto_download, Some(false));
+    }
+
+    #[test]
+    fn embedding_model_status_reports_absent_model_for_empty_dir() {
+        let dir = tempfile_dir("status");
+        let status: serde_json::Value = serde_json::from_str(
+            &embedding_model_status(dir.to_string_lossy().into_owned()).expect("status ok"),
+        )
+        .unwrap();
+        assert_eq!(status["present"], false);
+        assert_eq!(status["complete"], false);
+        assert_eq!(status["bytes"], 0);
+        assert!(status["path"].as_str().unwrap().ends_with(".gguf"));
+        assert!(status["url"].as_str().unwrap().starts_with("https://"));
+        assert!(
+            status["license_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://")
+        );
+        assert_eq!(status["sha256"].as_str().unwrap().len(), 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedding_model_ensure_without_download_raises_embed_error() {
+        let dir = tempfile_dir("ensure");
+        match embedding_model_ensure(dir.to_string_lossy().into_owned(), false) {
+            Err(OctosError::Embed { msg }) => {
+                assert!(msg.contains("automatic download is disabled"), "got: {msg}");
+            }
+            other => panic!("expected Embed error, got {other:?}"),
+        }
+        assert!(!dir.join("models").exists(), "nothing downloaded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_without_model_and_download_opted_out_is_keyword_only() {
+        let dir = tempfile_dir("runtime");
+        let rt = Runtime::new(Config {
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            embedding_auto_download: Some(false),
+            ..sample_config()
+        })
+        .unwrap_or_else(|e| panic!("build failed: {e}"));
+        assert!(!rt.inner.embedding_configured);
+        assert!(matches!(
+            rt.embed("hello".to_string()),
+            Err(OctosError::NoEmbedder)
+        ));
+        rt.memory_upsert(
+            r#"{"records":[{"id":"doc:mail:1","kind":"document","source":"mail",
+                "timestamp":"2026-09-01T10:00:00Z","title":"Dentist appointment",
+                "abstract":"Sunrise Dental on the 24th"}]}"#
+                .to_string(),
+        )
+        .expect("upsert ok");
+        let hits: serde_json::Value = serde_json::from_str(
+            &rt.memory_search(r#"{"query":"dentist"}"#.to_string())
+                .expect("keyword-only search works"),
+        )
+        .unwrap();
+        assert_eq!(hits["hits"][0]["id"], "doc:mail:1");
+        let stats: serde_json::Value = serde_json::from_str(&rt.memory_stats().unwrap()).unwrap();
+        assert_eq!(stats["embedder_id"], "");
+        assert!(!dir.join("models").exists(), "no download attempted");
+        drop(rt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unique caller-owned dir under the OS temp dir (removed by the test).
+    fn tempfile_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "octos-uniffi-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn config_maps_memory_fields_through() {
+        let cfg = Config {
+            data_dir: Some("/tmp/octos-data".to_string()),
+            recall_dimension: Some(128),
+            ..sample_config()
+        };
+        let native: octos_ffi::RuntimeConfig = cfg.into();
+        assert_eq!(native.data_dir.as_deref(), Some("/tmp/octos-data"));
+        assert_eq!(native.recall_dimension, Some(128));
+    }
+
+    #[test]
+    fn memory_error_maps_and_redacts() {
+        use octos_ffi::CoreError;
+        let err: OctosError = CoreError::Memory("no such record".into()).into();
+        assert!(matches!(&err, OctosError::Memory { msg } if msg == "no such record"));
+        assert_eq!(err.to_string(), "no such record");
+        let leaked = "sk-abc123DEF456ghijkLMNOP789";
+        let err: OctosError = CoreError::Memory(format!("store said {leaked}")).into();
+        let OctosError::Memory { msg } = err else {
+            panic!("expected Memory");
+        };
+        assert!(
+            msg.contains("<redacted>") && !msg.contains(leaked),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn memory_round_trip_bm25_only_through_uniffi_surface() {
+        // No embedder: the Recall index is BM25-only and still fully usable.
+        let rt = Runtime::new(sample_config()).unwrap_or_else(|e| panic!("build failed: {e}"));
+        let report: serde_json::Value = serde_json::from_str(
+            &rt.memory_upsert(
+                r#"{"records":[{"id":"doc:mail:1","kind":"document","source":"mail",
+                    "timestamp":"2026-09-01T10:00:00Z","title":"Dentist appointment",
+                    "abstract":"Sunrise Dental on the 24th"}]}"#
+                    .to_string(),
+            )
+            .expect("upsert ok"),
+        )
+        .unwrap();
+        assert_eq!(report["inserted"], 1);
+        assert_eq!(report["embedded"], 0);
+
+        let hits: serde_json::Value = serde_json::from_str(
+            &rt.memory_search(r#"{"query":"dentist","sources":["mail"]}"#.to_string())
+                .expect("search ok"),
+        )
+        .unwrap();
+        assert_eq!(hits["hits"][0]["id"], "doc:mail:1");
+        assert_eq!(hits["hits"][0]["trust"], "untrusted");
+
+        let loaded: serde_json::Value =
+            serde_json::from_str(&rt.memory_load("doc:mail:1".to_string()).expect("load ok"))
+                .unwrap();
+        assert_eq!(loaded["record"]["visits"], 1);
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&rt.memory_stats().expect("stats ok")).unwrap();
+        assert_eq!(stats["records"], 1);
+
+        match rt.memory_load("doc:mail:none".to_string()) {
+            Err(OctosError::Memory { msg }) => assert_eq!(msg, "no such record"),
+            other => panic!("expected Memory error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -468,6 +712,9 @@ mod tests {
             allow_shell: false,
             max_iterations: Some(3),
             embedding_model_path: None,
+            data_dir: None,
+            recall_dimension: None,
+            embedding_auto_download: Some(false),
         };
         let rt = Runtime::new(cfg).expect("runtime built");
         let result = rt

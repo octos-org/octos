@@ -917,8 +917,41 @@ pub(crate) fn resolve_provider_policy(
 }
 
 /// Create an embedding provider from config, if configured.
+///
+/// With the default build (feature `embed-llama`) and no `embedding` section,
+/// the bundled in-process embedder is used: EmbeddingGemma-300M under
+/// `<data_dir>/models/`, fetched on first use unless downloads are disabled
+/// (`embedding.auto_download = false` / `OCTOS_NO_MODEL_DOWNLOAD`). Without
+/// the model the runtime stays keyword-only.
 pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvider>> {
-    let cfg = config.embedding.as_ref()?;
+    let data_dir = octos_services::config_context::resolve_config_context(None).data_dir;
+    create_embedder_in(config, &data_dir)
+}
+
+/// [`create_embedder`] for an explicit data dir (where the default model lives).
+pub(crate) fn create_embedder_in(
+    config: &Config,
+    data_dir: &std::path::Path,
+) -> Option<Arc<dyn EmbeddingProvider>> {
+    let bundled_default;
+    let cfg = match config.embedding.as_ref() {
+        Some(cfg) => cfg,
+        None => {
+            if !cfg!(feature = "embed-llama") {
+                return None;
+            }
+            bundled_default = crate::config::EmbeddingConfig {
+                provider: "llamacpp".to_string(),
+                api_key_env: None,
+                base_url: None,
+                model: None,
+                dimensions: None,
+                model_path: None,
+                auto_download: None,
+            };
+            &bundled_default
+        }
+    };
 
     // In-process llama.cpp GGUF provider (every platform, feature `embed-llama`).
     // `provider = "llamacpp"` + `model_path = "<file.gguf>"`; `dimensions`
@@ -929,13 +962,26 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
     if cfg.provider.eq_ignore_ascii_case("llamacpp") || cfg.provider.eq_ignore_ascii_case("llama") {
         #[cfg(feature = "embed-llama")]
         {
-            let path = cfg.model_path.as_deref().or(cfg.model.as_deref());
-            let Some(path) = path else {
-                tracing::error!(
-                    "embedding.provider=\"llamacpp\" requires `model_path` (the .gguf file)"
-                );
-                return None;
+            // Explicit path wins; otherwise the bundled default model,
+            // provisioned under the data dir on first use.
+            let configured = cfg.model_path.as_deref().or(cfg.model.as_deref());
+            let resolved: String = match configured {
+                Some(p) => p.to_string(),
+                None => {
+                    let download = crate::embed_model::downloads_allowed(cfg.auto_download);
+                    match crate::embed_model::ensure_default_model(data_dir, download) {
+                        Ok(p) => p.to_string_lossy().into_owned(),
+                        Err(err) => {
+                            tracing::warn!(
+                                %err,
+                                "default embedding model unavailable; memory search runs keyword-only"
+                            );
+                            return None;
+                        }
+                    }
+                }
             };
+            let path = resolved.as_str();
             // Offload everything when built with an accelerator; the CPU build
             // ignores this.
             let n_gpu_layers = if cfg!(any(
@@ -967,6 +1013,7 @@ pub(crate) fn create_embedder(config: &Config) -> Option<Arc<dyn EmbeddingProvid
         }
         #[cfg(not(feature = "embed-llama"))]
         {
+            let _ = data_dir;
             tracing::warn!(
                 "embedding.provider=\"llamacpp\" needs a build with `--features embed-llama`; \
                  ignoring and disabling embeddings"

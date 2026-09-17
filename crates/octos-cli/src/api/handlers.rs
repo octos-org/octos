@@ -566,6 +566,82 @@ pub struct SessionInfo {
     /// no user message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prompt: Option<String>,
+    /// Does this session have a live (non-terminal) turn RIGHT NOW?
+    ///
+    /// Sourced from the process-global active-turn registry, not from disk —
+    /// so it is honest about sessions the asking connection never opened,
+    /// which is the point: two UI Protocol clients (the TUI and the browser
+    /// client) can attach to one `octos serve`, and this is how one learns the
+    /// other is mid-turn before it tries a `turn/start` that would be refused.
+    ///
+    /// Always serialized (unlike the `Option` fields above, where absence
+    /// means "unknown"): `false` is a real, useful answer. Additive and
+    /// ungated — `session/list` itself is already behind
+    /// `auxiliary.rest_to_ws.v1`, and the sibling additive fields on this
+    /// struct carry no capability of their own. `#[serde(default)]` keeps the
+    /// gateway-merge deserialization below working against an older peer that
+    /// does not emit the field.
+    #[serde(default)]
+    pub active_turn: bool,
+}
+
+/// Does a listing entry correspond to a session with a live turn?
+///
+/// The active-turn registry is keyed by the WIRE [`SessionKey`]
+/// (`<profile>:api:<chat>` — what `turn/start` carries), while a per-profile
+/// or per-project store lists chat-BARE ids, so reconstruct the wire key for
+/// the listing's effective profile. An id that is ALREADY a full key (it
+/// carries the `:` channel separator, as legacy flat-layout entries can) is
+/// also matched verbatim; a chat-bare id is deliberately NOT, or profile A's
+/// live turn on `A:api:web-1` would light up profile B's own `web-1` row.
+/// Callers still holding the full key (the process-wide walk) match it
+/// exactly instead of going through here.
+fn session_id_has_active_turn(
+    active_turns: &std::collections::HashSet<SessionKey>,
+    effective_profile_id: &str,
+    listed_id: &str,
+) -> bool {
+    active_turns
+        .iter()
+        .any(|key| active_turn_key_matches(key, effective_profile_id, listed_id))
+}
+
+/// Does one active-turn registry key denote the session a listing row names?
+///
+/// The registry is keyed by the session id EXACTLY as it arrived on the wire,
+/// which is whatever shape the client chose: a bare handle (`web-1`), a
+/// channel-qualified key (`api:web-1`) or a fully profiled one
+/// (`coding:api:web-1`). The listing stores, meanwhile, hand back either the
+/// full key (the process-wide walk) or the chat id alone (per-profile and
+/// per-project stores). Reconstructing a key from the row would have to guess
+/// both the profile and the CHANNEL, so this inverts the mapping instead and
+/// decomposes the registry key, which needs no guessing.
+///
+/// A profiled key matches only its own profile's rows — profile A's turn on
+/// `A:api:web-1` must never light up profile B's `web-1`. An unprofiled key
+/// carries no tenant dimension to check, so a bare row in another profile's
+/// listing could in principle match it; that ambiguity is inherent to a
+/// client that opened an unprofiled session and is not introduced here.
+/// Topics are folded away by `chat_id`/`base_key`: a turn in `…#research` does
+/// make the session busy.
+fn active_turn_key_matches(key: &SessionKey, effective_profile_id: &str, listed_id: &str) -> bool {
+    // The row carried the whole key (or the client used a colon-less handle
+    // and the store listed it unchanged).
+    if key.0 == listed_id {
+        return true;
+    }
+    // A colon-less key has no chat-id component to compare — `chat_id()`
+    // returns empty for it — so the verbatim check above was its only chance.
+    if !key.base_key().contains(':') {
+        return false;
+    }
+    if key.chat_id() != listed_id {
+        return false;
+    }
+    match key.profile_id() {
+        Some(profile_id) => profile_id == effective_profile_id,
+        None => true,
+    }
 }
 
 fn is_internal_api_session_id(id: &str) -> bool {
@@ -594,6 +670,12 @@ pub async fn list_sessions(
     // `None` (the default, and always when the flag is off) → byte-identical
     // legacy behavior.
     cwd_sessions_root: Option<std::path::PathBuf>,
+    // Sessions with a live (non-terminal) turn, snapshotted from the
+    // process-global active-turn registry by the WS handler BEFORE this call
+    // (never while holding a sessions lock). Stamps `SessionInfo.active_turn`.
+    // The id shapes differ per store, so the mapping back onto the registry's
+    // wire keys happens here, where the effective profile is known.
+    active_turns: &std::collections::HashSet<SessionKey>,
 ) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
@@ -608,13 +690,27 @@ pub async fn list_sessions(
         Err(response) => return response,
     };
 
+    // Effective profile scope for this listing. Resolved up here (it used to
+    // sit below the cwd short-circuit) so the per-project branch can stamp
+    // `active_turn` against the same profile as every other scope. Both reads
+    // are pure functions of the state + headers, so hoisting them changes
+    // nothing else.
+    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
+    // A localhost / stdio UI Protocol connection has no routed profile
+    // header, but its authenticated profile is frozen onto the connection.
+    // Use that scope for every legacy fallback below; defaulting to `_main`
+    // here leaks solo/admin session metadata into an ordinary user's list.
+    let connection_scoped_profile_id =
+        connection_profile_id.filter(|_| routed_profile_id.is_none());
+    let effective_profile_id = connection_scoped_profile_id.unwrap_or(&profile_id);
+
     // Per-project listing short-circuit (`appui.sessions_in_cwd`). The
     // authorization gate above still runs (the connection must be allowed to
     // list at all); we then scope the listing to the cwd's `<cwd>/.octos`
     // store instead of the profile/global stores. Runs BEFORE the legacy
     // merge so a project session list never bleeds in another scope's rows.
     if let Some(cwd_root) = cwd_sessions_root {
-        let cwd_sessions = list_profile_sessions(&cwd_root);
+        let cwd_sessions = list_profile_sessions(&cwd_root, active_turns, effective_profile_id);
         return Json(cwd_sessions).into_response();
     }
 
@@ -660,14 +756,6 @@ pub async fn list_sessions(
     // keep the existing header + identity authorized resolution unchanged
     // — Layer-2 authorization still applies, and a parent viewing a
     // sub-account subdomain still lists the routed profile's sessions.
-    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
-    // A localhost / stdio UI Protocol connection has no routed profile
-    // header, but its authenticated profile is frozen onto the connection.
-    // Use that scope for every legacy fallback below; defaulting to `_main`
-    // here leaks solo/admin session metadata into an ordinary user's list.
-    let connection_scoped_profile_id =
-        connection_profile_id.filter(|_| routed_profile_id.is_none());
-    let effective_profile_id = connection_scoped_profile_id.unwrap_or(&profile_id);
     let profile_data_dir = match connection_profile_id {
         Some(pid) if routed_profile_id.is_none() => {
             resolve_profile_data_dir_by_id(&state, pid).ok()
@@ -677,7 +765,8 @@ pub async fn list_sessions(
             .ok(),
     };
     if let Some(profile_data_dir) = profile_data_dir {
-        let profile_sessions = list_profile_sessions(&profile_data_dir);
+        let profile_sessions =
+            list_profile_sessions(&profile_data_dir, active_turns, effective_profile_id);
         let existing: std::collections::HashSet<String> =
             all.iter().map(|s| s.id.clone()).collect();
         all.extend(
@@ -709,12 +798,17 @@ pub async fn list_sessions(
                     if existing.contains(chat_id) {
                         return None;
                     }
+                    // The process-wide store hands us the FULL wire key
+                    // before the prefix strip, so match the registry exactly
+                    // rather than reconstructing it.
+                    let active_turn = active_turns.contains(&SessionKey(id.clone()));
                     Some(SessionInfo {
                         id: chat_id.to_string(),
                         message_count: count,
                         title,
                         updated_at: updated_at.map(|dt| dt.to_rfc3339()),
                         last_prompt,
+                        active_turn,
                     })
                 }),
         );
@@ -749,9 +843,25 @@ pub async fn list_sessions(
                     // Merge, dedup by id (per-profile / standalone wins).
                     let existing: std::collections::HashSet<String> =
                         all.iter().map(|s| s.id.clone()).collect();
-                    all.extend(gateway_sessions.into_iter().filter(|s| {
-                        !existing.contains(&s.id) && !is_internal_api_session_id(&s.id)
-                    }));
+                    all.extend(
+                        gateway_sessions
+                            .into_iter()
+                            .filter(|s| {
+                                !existing.contains(&s.id) && !is_internal_api_session_id(&s.id)
+                            })
+                            // The gateway is a separate process with its own
+                            // registry, so trust its flag when it sets one and
+                            // otherwise fall back to ours.
+                            .map(|mut s| {
+                                s.active_turn = s.active_turn
+                                    || session_id_has_active_turn(
+                                        active_turns,
+                                        effective_profile_id,
+                                        &s.id,
+                                    );
+                                s
+                            }),
+                    );
                 }
             }
         }
@@ -789,7 +899,11 @@ pub async fn list_sessions(
 /// is needed inside this helper. The caller (`list_sessions`) handles
 /// header/identity authorization via [`resolve_profile_data_dir`]
 /// before invoking us.
-fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo> {
+fn list_profile_sessions(
+    profile_data_dir: &std::path::Path,
+    active_turns: &std::collections::HashSet<SessionKey>,
+    effective_profile_id: &str,
+) -> Vec<SessionInfo> {
     let Ok(mgr) = octos_bus::SessionManager::open(profile_data_dir) else {
         return Vec::new();
     };
@@ -799,12 +913,14 @@ fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo>
             if is_internal_api_session_id(&id) {
                 return None;
             }
+            let active_turn = session_id_has_active_turn(active_turns, effective_profile_id, &id);
             Some(SessionInfo {
                 id,
                 message_count: count,
                 title,
                 updated_at: updated_at.map(|dt| dt.to_rfc3339()),
                 last_prompt,
+                active_turn,
             })
         })
         .collect()
@@ -4366,6 +4482,7 @@ mod tests {
             title: None,
             updated_at: None,
             last_prompt: None,
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "test-session");
@@ -4392,6 +4509,7 @@ mod tests {
             title: Some("My Pinned Chat".into()),
             updated_at: None,
             last_prompt: None,
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["title"], "My Pinned Chat");
@@ -4405,6 +4523,7 @@ mod tests {
             title: None,
             updated_at: Some("2026-07-02T12:00:00+00:00".into()),
             last_prompt: None,
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["updated_at"], "2026-07-02T12:00:00+00:00");
@@ -4418,6 +4537,7 @@ mod tests {
             title: None,
             updated_at: None,
             last_prompt: Some("what is the capital of France?".into()),
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["last_prompt"], "what is the capital of France?");
@@ -4740,7 +4860,8 @@ mod tests {
             .unwrap();
         }
 
-        let mut sessions = list_profile_sessions(profile_data_dir);
+        let mut sessions =
+            list_profile_sessions(profile_data_dir, &Default::default(), MAIN_PROFILE_ID);
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
 
@@ -4800,7 +4921,8 @@ mod tests {
             .unwrap();
         }
 
-        let sessions = list_profile_sessions(profile_data_dir);
+        let sessions =
+            list_profile_sessions(profile_data_dir, &Default::default(), MAIN_PROFILE_ID);
         let session = sessions
             .iter()
             .find(|s| s.id == "web-501")
@@ -4818,7 +4940,7 @@ mod tests {
     #[tokio::test]
     async fn list_profile_sessions_returns_empty_when_dir_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let sessions = list_profile_sessions(tmp.path());
+        let sessions = list_profile_sessions(tmp.path(), &Default::default(), MAIN_PROFILE_ID);
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
         assert!(
             sessions.is_empty(),
@@ -4876,7 +4998,8 @@ mod tests {
         // call site, where `resolve_profile_data_dir` runs the
         // identity check FIRST and only hands us a path the
         // request is authorized to read.
-        let sessions = list_profile_sessions(profile_data_dir);
+        let sessions =
+            list_profile_sessions(profile_data_dir, &Default::default(), MAIN_PROFILE_ID);
         assert_eq!(sessions.len(), 2, "expected dspfac's two web chats");
         let ids: std::collections::HashSet<_> = sessions.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains("web-1779100000001-aa"));
@@ -4918,6 +5041,7 @@ mod tests {
             Some(Extension(AuthIdentity::Admin)),
             None,
             None,
+            &Default::default(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -5005,6 +5129,7 @@ mod tests {
             })),
             Some("tenant-user"),
             None,
+            &Default::default(),
         )
         .await;
 
@@ -5090,7 +5215,15 @@ mod tests {
 
         // connection_profile_id = "dev", empty headers, no identity — the
         // frozen scope a solo stdio connection carries.
-        let response = list_sessions(State(state), HeaderMap::new(), None, Some("dev"), None).await;
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            None,
+            Some("dev"),
+            None,
+            &Default::default(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -6007,7 +6140,15 @@ mod tests {
             ..AppState::empty_for_tests()
         });
 
-        let response = list_sessions(State(state), HeaderMap::new(), None, None, None).await;
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            None,
+            None,
+            None,
+            &Default::default(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -6065,7 +6206,15 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let response = list_sessions(State(state), HeaderMap::new(), None, None, None).await;
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            None,
+            None,
+            None,
+            &Default::default(),
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -6902,5 +7051,52 @@ mod tests {
         let err = decide_resolved_profile_id(&state, Some(&identity), None, None)
             .expect_err("must signal missing context");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The registry is keyed by the session id AS SENT, and clients send three
+    /// different shapes. A live run against a real server caught the original
+    /// mapping reconstructing `<profile>:api:<row>` and therefore reporting a
+    /// colon-less session as idle while a turn was demonstrably running in it.
+    #[test]
+    fn should_match_every_wire_key_shape_when_listing_reports_a_session() {
+        let bare = SessionKey("shared-session".to_owned());
+        let channelled = SessionKey("api:web-1".to_owned());
+        let profiled = SessionKey("coding:api:web-1".to_owned());
+        let topicked = SessionKey("coding:api:web-1#research".to_owned());
+
+        // A colon-less handle is listed unchanged and must match itself.
+        assert!(active_turn_key_matches(&bare, "main", "shared-session"));
+        assert!(!active_turn_key_matches(&bare, "main", "other"));
+
+        // Per-profile stores list the chat id alone.
+        assert!(active_turn_key_matches(&channelled, "main", "web-1"));
+        assert!(active_turn_key_matches(&profiled, "coding", "web-1"));
+        // The process-wide walk lists the whole key.
+        assert!(active_turn_key_matches(
+            &profiled,
+            "coding",
+            "coding:api:web-1"
+        ));
+        // A turn in a topic bucket still makes the session busy.
+        assert!(active_turn_key_matches(&topicked, "coding", "web-1"));
+
+        // Cross-tenant: profile A's turn must not light up profile B's row.
+        assert!(!active_turn_key_matches(
+            &profiled,
+            "other-profile",
+            "web-1"
+        ));
+        // A different conversation in the same profile is not this row.
+        assert!(!active_turn_key_matches(&profiled, "coding", "web-2"));
+    }
+
+    #[test]
+    fn should_report_no_active_turn_when_the_registry_is_empty() {
+        let empty = std::collections::HashSet::new();
+        assert!(!session_id_has_active_turn(
+            &empty,
+            "main",
+            "shared-session"
+        ));
     }
 }

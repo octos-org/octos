@@ -460,7 +460,19 @@ def _uniffi_check_contract_api_version(lib):
         raise InternalError("UniFFI contract version mismatch: try cleaning and rebuilding your project")
 
 def _uniffi_check_api_checksums(lib):
+    if lib.uniffi_octos_uniffi_checksum_func_embedding_model_ensure() != 45224:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_octos_uniffi_checksum_func_embedding_model_status() != 15934:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_octos_uniffi_checksum_method_runtime_embed() != 8927:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_octos_uniffi_checksum_method_runtime_memory_load() != 55125:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_octos_uniffi_checksum_method_runtime_memory_search() != 36497:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_octos_uniffi_checksum_method_runtime_memory_stats() != 2345:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_octos_uniffi_checksum_method_runtime_memory_upsert() != 4504:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_octos_uniffi_checksum_method_runtime_run_task() != 132:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -593,12 +605,46 @@ _UniffiLib.uniffi_octos_uniffi_fn_method_runtime_embed.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_octos_uniffi_fn_method_runtime_embed.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_load.argtypes = (
+    ctypes.c_void_p,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_load.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_search.argtypes = (
+    ctypes.c_void_p,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_search.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_stats.argtypes = (
+    ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_stats.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_upsert.argtypes = (
+    ctypes.c_void_p,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_upsert.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_octos_uniffi_fn_method_runtime_run_task.argtypes = (
     ctypes.c_void_p,
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_octos_uniffi_fn_method_runtime_run_task.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_octos_uniffi_fn_func_embedding_model_ensure.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.c_int8,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_octos_uniffi_fn_func_embedding_model_ensure.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_octos_uniffi_fn_func_embedding_model_status.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_octos_uniffi_fn_func_embedding_model_status.restype = _UniffiRustBuffer
 _UniffiLib.ffi_octos_uniffi_rustbuffer_alloc.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -867,9 +913,27 @@ _UniffiLib.ffi_octos_uniffi_rust_future_complete_void.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_octos_uniffi_rust_future_complete_void.restype = None
+_UniffiLib.uniffi_octos_uniffi_checksum_func_embedding_model_ensure.argtypes = (
+)
+_UniffiLib.uniffi_octos_uniffi_checksum_func_embedding_model_ensure.restype = ctypes.c_uint16
+_UniffiLib.uniffi_octos_uniffi_checksum_func_embedding_model_status.argtypes = (
+)
+_UniffiLib.uniffi_octos_uniffi_checksum_func_embedding_model_status.restype = ctypes.c_uint16
 _UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_embed.argtypes = (
 )
 _UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_embed.restype = ctypes.c_uint16
+_UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_memory_load.argtypes = (
+)
+_UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_memory_load.restype = ctypes.c_uint16
+_UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_memory_search.argtypes = (
+)
+_UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_memory_search.restype = ctypes.c_uint16
+_UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_memory_stats.argtypes = (
+)
+_UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_memory_stats.restype = ctypes.c_uint16
+_UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_memory_upsert.argtypes = (
+)
+_UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_memory_upsert.restype = ctypes.c_uint16
 _UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_run_task.argtypes = (
 )
 _UniffiLib.uniffi_octos_uniffi_checksum_method_runtime_run_task.restype = ctypes.c_uint16
@@ -1046,7 +1110,29 @@ class Config:
     allow_shell: "bool"
     max_iterations: "typing.Optional[int]"
     embedding_model_path: "typing.Optional[str]"
-    def __init__(self, *, provider: "str", model: "str", api_key: "typing.Optional[str]" = _DEFAULT, api_key_env: "typing.Optional[str]" = _DEFAULT, base_url: "typing.Optional[str]" = _DEFAULT, api_type: "typing.Optional[str]" = _DEFAULT, cwd: "typing.Optional[str]" = _DEFAULT, allow_shell: "bool" = _DEFAULT, max_iterations: "typing.Optional[int]" = _DEFAULT, embedding_model_path: "typing.Optional[str]" = _DEFAULT):
+    data_dir: "typing.Optional[str]"
+    """
+    Persistent data directory for the episode + Recall memory stores. When
+    unset they live in a scratch dir removed when the runtime is dropped.
+    """
+
+    recall_dimension: "typing.Optional[int]"
+    """
+    Recall vector width (default 256; clamped to the embedder's dimension).
+    """
+
+    embedding_auto_download: "typing.Optional[bool]"
+    """
+    Whether an `embed-llama` build may download the default embedding
+    model (EmbeddingGemma-300M, 334 MB, once, into `<data_dir>/models/`)
+    when `embedding_model_path` is unset and the file is not on disk.
+    Default `true` (`OCTOS_NO_MODEL_DOWNLOAD=1` in the environment forces
+    `false`). The download blocks [`Runtime::new`]; hosts that want to
+    control it call [`embedding_model_ensure`] first. With `false` and no
+    model the runtime is keyword-only (`embed` raises `NoEmbedder`).
+    """
+
+    def __init__(self, *, provider: "str", model: "str", api_key: "typing.Optional[str]" = _DEFAULT, api_key_env: "typing.Optional[str]" = _DEFAULT, base_url: "typing.Optional[str]" = _DEFAULT, api_type: "typing.Optional[str]" = _DEFAULT, cwd: "typing.Optional[str]" = _DEFAULT, allow_shell: "bool" = _DEFAULT, max_iterations: "typing.Optional[int]" = _DEFAULT, embedding_model_path: "typing.Optional[str]" = _DEFAULT, data_dir: "typing.Optional[str]" = _DEFAULT, recall_dimension: "typing.Optional[int]" = _DEFAULT, embedding_auto_download: "typing.Optional[bool]" = _DEFAULT):
         self.provider = provider
         self.model = model
         if api_key is _DEFAULT:
@@ -1081,9 +1167,21 @@ class Config:
             self.embedding_model_path = None
         else:
             self.embedding_model_path = embedding_model_path
+        if data_dir is _DEFAULT:
+            self.data_dir = None
+        else:
+            self.data_dir = data_dir
+        if recall_dimension is _DEFAULT:
+            self.recall_dimension = None
+        else:
+            self.recall_dimension = recall_dimension
+        if embedding_auto_download is _DEFAULT:
+            self.embedding_auto_download = None
+        else:
+            self.embedding_auto_download = embedding_auto_download
 
     def __str__(self):
-        return "Config(provider={}, model={}, api_key={}, api_key_env={}, base_url={}, api_type={}, cwd={}, allow_shell={}, max_iterations={}, embedding_model_path={})".format(self.provider, self.model, self.api_key, self.api_key_env, self.base_url, self.api_type, self.cwd, self.allow_shell, self.max_iterations, self.embedding_model_path)
+        return "Config(provider={}, model={}, api_key={}, api_key_env={}, base_url={}, api_type={}, cwd={}, allow_shell={}, max_iterations={}, embedding_model_path={}, data_dir={}, recall_dimension={}, embedding_auto_download={})".format(self.provider, self.model, self.api_key, self.api_key_env, self.base_url, self.api_type, self.cwd, self.allow_shell, self.max_iterations, self.embedding_model_path, self.data_dir, self.recall_dimension, self.embedding_auto_download)
 
     def __eq__(self, other):
         if self.provider != other.provider:
@@ -1106,6 +1204,12 @@ class Config:
             return False
         if self.embedding_model_path != other.embedding_model_path:
             return False
+        if self.data_dir != other.data_dir:
+            return False
+        if self.recall_dimension != other.recall_dimension:
+            return False
+        if self.embedding_auto_download != other.embedding_auto_download:
+            return False
         return True
 
 class _UniffiConverterTypeConfig(_UniffiConverterRustBuffer):
@@ -1122,6 +1226,9 @@ class _UniffiConverterTypeConfig(_UniffiConverterRustBuffer):
             allow_shell=_UniffiConverterBool.read(buf),
             max_iterations=_UniffiConverterOptionalUInt32.read(buf),
             embedding_model_path=_UniffiConverterOptionalString.read(buf),
+            data_dir=_UniffiConverterOptionalString.read(buf),
+            recall_dimension=_UniffiConverterOptionalUInt32.read(buf),
+            embedding_auto_download=_UniffiConverterOptionalBool.read(buf),
         )
 
     @staticmethod
@@ -1136,6 +1243,9 @@ class _UniffiConverterTypeConfig(_UniffiConverterRustBuffer):
         _UniffiConverterBool.check_lower(value.allow_shell)
         _UniffiConverterOptionalUInt32.check_lower(value.max_iterations)
         _UniffiConverterOptionalString.check_lower(value.embedding_model_path)
+        _UniffiConverterOptionalString.check_lower(value.data_dir)
+        _UniffiConverterOptionalUInt32.check_lower(value.recall_dimension)
+        _UniffiConverterOptionalBool.check_lower(value.embedding_auto_download)
 
     @staticmethod
     def write(value, buf):
@@ -1149,6 +1259,9 @@ class _UniffiConverterTypeConfig(_UniffiConverterRustBuffer):
         _UniffiConverterBool.write(value.allow_shell, buf)
         _UniffiConverterOptionalUInt32.write(value.max_iterations, buf)
         _UniffiConverterOptionalString.write(value.embedding_model_path, buf)
+        _UniffiConverterOptionalString.write(value.data_dir, buf)
+        _UniffiConverterOptionalUInt32.write(value.recall_dimension, buf)
+        _UniffiConverterOptionalBool.write(value.embedding_auto_download, buf)
 
 
 class TaskResult:
@@ -1364,6 +1477,22 @@ class OctosError:  # type: ignore
         def __repr__(self):
             return "OctosError.Incomplete({})".format(str(self))
     _UniffiTempOctosError.Incomplete = Incomplete # type: ignore
+    class Memory(_UniffiTempOctosError):
+        """
+        Recall-memory failure (`memory_*`): malformed request, rejected record,
+        "no such record", or a store error. Appended after `Incomplete` to keep
+        existing variant ordinals stable.
+        """
+
+        def __init__(self, msg):
+            super().__init__(", ".join([
+                "msg={!r}".format(msg),
+            ]))
+            self.msg = msg
+
+        def __repr__(self):
+            return "OctosError.Memory({})".format(str(self))
+    _UniffiTempOctosError.Memory = Memory # type: ignore
 
 OctosError = _UniffiTempOctosError # type: ignore
 del _UniffiTempOctosError
@@ -1396,6 +1525,10 @@ class _UniffiConverterTypeOctosError(_UniffiConverterRustBuffer):
             return OctosError.Incomplete(
                 _UniffiConverterTypeTaskResult.read(buf),
             )
+        if variant == 7:
+            return OctosError.Memory(
+                _UniffiConverterString.read(buf),
+            )
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -1417,6 +1550,9 @@ class _UniffiConverterTypeOctosError(_UniffiConverterRustBuffer):
         if isinstance(value, OctosError.Incomplete):
             _UniffiConverterTypeTaskResult.check_lower(value.partial)
             return
+        if isinstance(value, OctosError.Memory):
+            _UniffiConverterString.check_lower(value.msg)
+            return
 
     @staticmethod
     def write(value, buf):
@@ -1437,6 +1573,9 @@ class _UniffiConverterTypeOctosError(_UniffiConverterRustBuffer):
         if isinstance(value, OctosError.Incomplete):
             buf.write_i32(6)
             _UniffiConverterTypeTaskResult.write(value.partial, buf)
+        if isinstance(value, OctosError.Memory):
+            buf.write_i32(7)
+            _UniffiConverterString.write(value.msg, buf)
 
 
 
@@ -1462,6 +1601,33 @@ class _UniffiConverterOptionalUInt32(_UniffiConverterRustBuffer):
             return None
         elif flag == 1:
             return _UniffiConverterUInt32.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+
+class _UniffiConverterOptionalBool(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiConverterBool.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiConverterBool.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiConverterBool.read(buf)
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
@@ -1539,6 +1705,39 @@ class RuntimeProtocol(typing.Protocol):
         """
 
         raise NotImplementedError
+    def memory_load(self, id: "str"):
+        """
+        Load one Recall record by id (counting the visit). Returns
+        `{"record": Record}`; [`OctosError::Memory`] "no such record" when the
+        id is unknown.
+        """
+
+        raise NotImplementedError
+    def memory_search(self, json: "str"):
+        """
+        Search the Recall index. `json` is `{"query", "kinds"?, "sources"?,
+        "since"?, "until"?, "limit"?}`; returns `{"hits": [Hit…]}`. See
+        [`octos_ffi::OctosRuntime::memory_search`].
+        """
+
+        raise NotImplementedError
+    def memory_stats(self, ):
+        """
+        Recall index statistics as JSON (`RecallStats`).
+        """
+
+        raise NotImplementedError
+    def memory_upsert(self, json: "str"):
+        """
+        Push app records into the Recall memory index. `json` is
+        `{"records": [Record…], "vectors"?: [[f32…]|null…], "embed"?: bool}`;
+        returns `{"inserted", "updated", "unchanged", "vectors_stored",
+        "embedded"}`. At most 500 records per call; `kind: "knowledge"` is
+        rejected; `trust` is forced to untrusted. See
+        [`octos_ffi::OctosRuntime::memory_upsert`].
+        """
+
+        raise NotImplementedError
     def run_task(self, brief: "Brief"):
         """
         Run a one-shot task and return its output + token usage.
@@ -1608,6 +1807,76 @@ class Runtime():
 
 
 
+    def memory_load(self, id: "str") -> "str":
+        """
+        Load one Recall record by id (counting the visit). Returns
+        `{"record": Record}`; [`OctosError::Memory`] "no such record" when the
+        id is unknown.
+        """
+
+        _UniffiConverterString.check_lower(id)
+
+        return _UniffiConverterString.lift(
+            _uniffi_rust_call_with_error(_UniffiConverterTypeOctosError,_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_load,self._uniffi_clone_pointer(),
+        _UniffiConverterString.lower(id))
+        )
+
+
+
+
+
+    def memory_search(self, json: "str") -> "str":
+        """
+        Search the Recall index. `json` is `{"query", "kinds"?, "sources"?,
+        "since"?, "until"?, "limit"?}`; returns `{"hits": [Hit…]}`. See
+        [`octos_ffi::OctosRuntime::memory_search`].
+        """
+
+        _UniffiConverterString.check_lower(json)
+
+        return _UniffiConverterString.lift(
+            _uniffi_rust_call_with_error(_UniffiConverterTypeOctosError,_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_search,self._uniffi_clone_pointer(),
+        _UniffiConverterString.lower(json))
+        )
+
+
+
+
+
+    def memory_stats(self, ) -> "str":
+        """
+        Recall index statistics as JSON (`RecallStats`).
+        """
+
+        return _UniffiConverterString.lift(
+            _uniffi_rust_call_with_error(_UniffiConverterTypeOctosError,_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_stats,self._uniffi_clone_pointer(),)
+        )
+
+
+
+
+
+    def memory_upsert(self, json: "str") -> "str":
+        """
+        Push app records into the Recall memory index. `json` is
+        `{"records": [Record…], "vectors"?: [[f32…]|null…], "embed"?: bool}`;
+        returns `{"inserted", "updated", "unchanged", "vectors_stored",
+        "embedded"}`. At most 500 records per call; `kind: "knowledge"` is
+        rejected; `trust` is forced to untrusted. See
+        [`octos_ffi::OctosRuntime::memory_upsert`].
+        """
+
+        _UniffiConverterString.check_lower(json)
+
+        return _UniffiConverterString.lift(
+            _uniffi_rust_call_with_error(_UniffiConverterTypeOctosError,_UniffiLib.uniffi_octos_uniffi_fn_method_runtime_memory_upsert,self._uniffi_clone_pointer(),
+        _UniffiConverterString.lower(json))
+        )
+
+
+
+
+
     def run_task(self, brief: "Brief") -> "TaskResult":
         """
         Run a one-shot task and return its output + token usage.
@@ -1655,6 +1924,42 @@ class _UniffiConverterTypeRuntime:
 
 # Async support
 
+def embedding_model_ensure(data_dir: "str",download: "bool") -> "str":
+    """
+    Make sure the default embedding model is complete under `data_dir`,
+    downloading and verifying it (334 MB, once) when `download` is true, and
+    return JSON `{"path"}` — exactly the C-ABI's `octos_embedding_model_ensure`.
+    Blocks for the whole transfer, so call it from a plain thread before
+    [`Runtime::new`] when the host wants to own the timing. Raises
+    [`OctosError::Embed`] when the file is absent and `download` is false (or
+    `OCTOS_NO_MODEL_DOWNLOAD` is set), or the download fails to verify.
+    """
+
+    _UniffiConverterString.check_lower(data_dir)
+
+    _UniffiConverterBool.check_lower(download)
+
+    return _UniffiConverterString.lift(_uniffi_rust_call_with_error(_UniffiConverterTypeOctosError,_UniffiLib.uniffi_octos_uniffi_fn_func_embedding_model_ensure,
+        _UniffiConverterString.lower(data_dir),
+        _UniffiConverterBool.lower(download)))
+
+
+def embedding_model_status(data_dir: "str") -> "str":
+    """
+    What is on disk for the default embedding model under `data_dir` (the same
+    directory a [`Config::data_dir`] names), as JSON `{"path", "present",
+    "bytes", "complete", "url", "license_url", "sha256"}` — exactly the C-ABI's
+    `octos_embedding_model_status`. Needs no [`Runtime`] and never touches the
+    network; `license_url` points at the Gemma Terms of Use that apply to the
+    weights.
+    """
+
+    _UniffiConverterString.check_lower(data_dir)
+
+    return _UniffiConverterString.lift(_uniffi_rust_call_with_error(_UniffiConverterTypeOctosError,_UniffiLib.uniffi_octos_uniffi_fn_func_embedding_model_status,
+        _UniffiConverterString.lower(data_dir)))
+
+
 __all__ = [
     "InternalError",
     "OctosError",
@@ -1662,5 +1967,7 @@ __all__ = [
     "Config",
     "TaskResult",
     "TokenUsage",
+    "embedding_model_ensure",
+    "embedding_model_status",
     "Runtime",
 ]

@@ -32,14 +32,22 @@ octos-embed-llama = { workspace = true, optional = true }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `since`/`until` parsing for `octos_memory_search` (RFC3339 or YYYY-MM-DD).
+chrono = { workspace = true }
 libc = { workspace = true }
+# Only for the "default embedding model unavailable, running keyword-only"
+# warning; the host's subscriber decides whether it is shown.
+tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 eyre = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
-default = []
+# In-process embedder on by default so the embedded runtime (phone shells)
+# can search memory semantically; hosts opt out with --no-default-features.
+default = ["embed-llama"]
 # Compile the GGUF embedding backend into `octos_embed`. Without it,
 # `octos_embed` reports "embedding support not compiled in".
 embed-llama = ["dep:octos-embed-llama", "octos-embed-llama/embed-llama"]

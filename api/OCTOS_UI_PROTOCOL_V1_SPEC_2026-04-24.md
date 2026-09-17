@@ -463,6 +463,9 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
+- `memory/search`, `memory/load`, `memory/ingest` (Recall/Knowledge index —
+  `docs/adr/personal-memory-tiers.md`; auth-bound like `memory/overview`,
+  refused for session-ingress credentials)
 
 Launch (per-project session UX, gated `session.workspace_cwd.v1`):
 
@@ -1842,6 +1845,111 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
   `resource_not_found` with `data.resource_type = "memory_entity"` and
   `data.identifier = <name>` on REST 404.
+
+#### `memory/search`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: nothing — new surface (`docs/adr/personal-memory-tiers.md`,
+  phase 2). Stage one of the two-stage Recall/Knowledge retrieval: ranks
+  the caller's profile index (BM25 fused with vectors when the profile
+  has an embedder; BM25-only otherwise — never refused for lack of one)
+  and returns abstracts only. Bodies come from `memory/load`.
+- Params type: `MemorySearchParams` — `{ query: string, kinds?: string[],
+  sources?: string[], since?: string, until?: string, limit?: number }`.
+  `query` must be non-blank. `kinds` narrows to `"episode"` /
+  `"document"` / `"knowledge"` (empty = all; lenient aliases such as
+  `doc` are accepted). `sources` narrows to record sources (`mail`,
+  `calendar`, …; empty = all). `since` / `until` are RFC 3339 timestamps
+  (any offset, normalised to UTC) or bare `YYYY-MM-DD` dates — a bare
+  `since` is the start of that UTC day, a bare `until` its end (`until`
+  is inclusive). `limit` defaults to `MEMORY_SEARCH_DEFAULT_LIMIT` (10)
+  and is clamped to `1..=MEMORY_SEARCH_MAX_LIMIT` (50).
+- Result type: `MemorySearchResult` — `{ hits: Hit[] }` where each hit is
+  the JSON of `octos_memory::Hit`: `{ id: string, kind: "episode" |
+  "document" | "knowledge", source: string, title: string, abstract:
+  string, score: number, timestamp: RFC3339, trust: "trusted" |
+  "untrusted" }`, best first. App-sourced hits are `untrusted`: clients
+  and prompts must treat their text as data, never as instructions.
+- Errors: `auth_unavailable` (`-32120`) with WS close code
+  `1008 auth_expired` if the connection has no usable identity;
+  `invalid_params` for a blank query, an unknown kind, an unparseable
+  or inverted time bound; `runtime_unavailable` when the resolved
+  profile has no bootstrappable runtime (same message as session open).
+- Identity resolves to a profile exactly as `memory/overview` does
+  (`/api/my/*` host-scope rules); auth-bound — omitted from the stdio
+  capability set (see § stdio policy) and refused for session-ingress
+  credentials.
+
+#### `memory/load`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: nothing — new surface. Stage two: fetch one record by the
+  `id` a `memory/search` hit returned. Counts a visit on the record
+  (MemoryOS-style heat: hot records keep their vector and are nominated
+  for promotion into Knowledge).
+- Params type: `MemoryLoadParams` — `{ id: string }` (non-blank).
+- Result type: `MemoryLoadResult` — `{ record: Record, page?: string,
+  page_truncated: bool }`. `record` is the JSON of `octos_memory::Record`
+  (`id`, `kind`, `source`, `parent?`, `timestamp`, `title`, `abstract`,
+  `body?`, `trust`, `fingerprint?`, `visits`, `last_visit?`, `promoted`,
+  `updated_at`, `schema_version`). For Knowledge records (`id` starting
+  `bank:`) `page` carries the bank page markdown read from
+  `<data_dir>/memory/bank/entities/<slug>.md`, capped at the same
+  384 KiB JSON-ESCAPED budget as `memory/entity`; when capped it is a
+  clean UTF-8 prefix and `page_truncated` is `true`. `page` is absent
+  for Recall records (the owning app is the record of truth for bodies)
+  and for an indexed page whose file has since been removed.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `invalid_params` for a blank id; `resource_not_found` (`-32170`) with
+  `data.resource_type = "memory_record"` and `data.identifier = <id>`
+  when no record has that id; `runtime_unavailable` as for
+  `memory/search`.
+
+#### `memory/ingest`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: nothing — new surface, and the ONLY memory write on the
+  protocol. Apps (Mail, Calendar, contacts, notes) push derived records
+  into the profile's Recall index; the apps remain the record of truth.
+  Runs on the same authenticated path as `memory/overview` (identity
+  required, `/api/my/*` profile resolution); session-ingress credentials
+  are refused by the scope guard.
+- Params type: `MemoryIngestParams` — `{ records: Record[], vectors?:
+  (number[] | null)[], embed?: bool }`. Each record is an
+  `octos_memory::Record` JSON: required `id`, `kind`, `source`,
+  `timestamp` (RFC 3339), `title`, `abstract`; optional `parent`,
+  `body`, `trust`, `fingerprint` (producer-side change detector —
+  records whose fingerprint and index text are unchanged are skipped
+  and their vectors kept). Server-owned fields (`visits`, `last_visit`,
+  `promoted`, `updated_at`) are ignored on input. Validation
+  (`invalid_params`, message names `records[i]`): 1 ≤ `records.len()`
+  ≤ `MEMORY_INGEST_MAX_RECORDS` (500; over-cap carries
+  `data.max_records` / `data.requested_records`); `vectors`, when
+  present, is parallel to `records`; `kind` parses; ids are non-blank
+  and namespaced by kind — documents `doc:<source>:<key>`, episodes
+  `episode:<key>`; Knowledge (`bank:`) records are refused with
+  "knowledge pages are written through save_memory / the memory bank,
+  not ingest"; no ingested record — document or episode — can claim
+  `trust: "trusted"` (`trust` is forced `untrusted` for every record).
+  Title/abstract/body are clamped to the index caps
+  (120 B / 300 B / 16 KiB). When `embed` (default `true`) is set, no
+  `vectors` were supplied and the profile has an embedder, the server
+  first asks the store which records need a vector (new id, changed
+  fingerprint or index text, or no usable stored vector) and embeds
+  only those records' index text (title + abstract + parent) in
+  batches of 16 — re-submitting an unchanged batch embeds nothing; an
+  embedding failure fails the call (retry with `embed: false` to store
+  BM25-only). Without an embedder records are stored BM25-only.
+- Result type: `MemoryIngestResult` — `{ inserted: number, updated:
+  number, unchanged: number, vectors_stored: number, embedded: number }`
+  (the `octos_memory::UpsertReport` counts plus how many vectors the
+  server actually embedded in this call — unchanged records that kept
+  their stored vector are not counted). The HNSW graph is persisted
+  before the result is sent.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `invalid_params` per the validation above; `runtime_unavailable` as
+  for `memory/search`; `internal_error` when embedding or the index
+  write fails.
 
 #### `cron/list`
 

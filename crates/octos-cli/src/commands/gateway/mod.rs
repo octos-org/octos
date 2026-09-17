@@ -283,6 +283,13 @@ mod tests {
             effective_octos_home: project_dir.clone(),
             tool_config,
             memory,
+            recall: Arc::new(
+                octos_memory::RecallStore::open(
+                    &project_dir,
+                    octos_memory::RecallConfig::default(),
+                )
+                .unwrap(),
+            ),
             memory_store,
             agent_config: AgentConfig::default(),
             session_mgr,

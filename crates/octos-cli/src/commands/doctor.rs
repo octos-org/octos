@@ -286,6 +286,7 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
         report.extend(session_checks(&ctx.data_dir, &profiles));
         // --- Stage 3: Skills / MCP / Channels ----------------------------------
         report.push(skills_check(&ctx.data_dir));
+        report.push(embedder_check(&ctx.data_dir));
         report.extend(mcp_checks(config));
         report.push(channels_check(config));
     }
@@ -1846,6 +1847,45 @@ fn sandbox_check() -> Check {
 
 /// Installed skills: count manifests under `<data_dir>/skills/*/manifest.json`
 /// and flag unparseable ones. Read-only — no gating probes, no spawning.
+/// The bundled embedding model (docs/THIRD_PARTY_MODELS.md): present and
+/// complete, absent-but-fetchable, or disabled.
+fn embedder_check(data_dir: &Path) -> Check {
+    use crate::embed_model as em;
+    if !cfg!(feature = "embed-llama") {
+        return Check::warn(
+            CAT_STORES,
+            "embedding model",
+            "this build has no in-process embedder (feature embed-llama); memory search is keyword-only",
+            "rebuild with the default features (embed-llama) or configure a remote `embedding` provider",
+        );
+    }
+    let status = em::model_status(data_dir);
+    if status.complete {
+        return Check::pass(
+            CAT_STORES,
+            "embedding model",
+            format!("EmbeddingGemma-300M ready at {}", status.path.display()),
+        );
+    }
+    if em::downloads_allowed(None) {
+        Check::pass(
+            CAT_STORES,
+            "embedding model",
+            format!(
+                "EmbeddingGemma-300M not downloaded yet ({} MB, fetched on first use; `octos memory embedder --fetch` to do it now)",
+                em::DEFAULT_MODEL_BYTES / (1024 * 1024)
+            ),
+        )
+    } else {
+        Check::warn(
+            CAT_STORES,
+            "embedding model",
+            "absent and automatic download is disabled — memory search is keyword-only",
+            "run `octos memory embedder --fetch`, or unset OCTOS_NO_MODEL_DOWNLOAD / embedding.auto_download",
+        )
+    }
+}
+
 fn skills_check(data_dir: &Path) -> Check {
     let dir = data_dir.join("skills");
     if !dir.exists() {

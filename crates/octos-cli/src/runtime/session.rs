@@ -594,7 +594,8 @@ impl SessionRuntime {
         // session from ToolContext::parent_session_key — thread it on the
         // runtime-held agent exactly like the per-turn AppUI rebuild does.
         .with_parent_session_key(session_key.to_string())
-        .with_workspace_root(workspace_root.clone());
+        .with_workspace_root(workspace_root.clone())
+        .with_recall(profile.recall.clone());
 
         if let Some(coding_profile) = profile.agent_profile.clone() {
             let definitions = Arc::new(octos_agent::agents::AgentDefinitions::load_dir(
@@ -647,11 +648,14 @@ impl SessionRuntime {
         // at session bootstrap. Default-on makes disabled an explicit
         // opt-out.
         if profile.memory_refresh_enabled {
-            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
-                profile.memory_store.clone(),
-                profile.memory_inject_tokens,
-                true,
-            )));
+            agent.add_prompt_segment_provider(Arc::new(
+                octos_agent::MemorySegmentProvider::new(
+                    profile.memory_store.clone(),
+                    profile.memory_inject_tokens,
+                    true,
+                )
+                .with_recall(profile.recall.clone(), profile.embedder.clone()),
+            ));
         }
         // Post-memory half AFTER the named segment — the pre-refactor
         // order (memory before skills/tool guidance).
@@ -1369,6 +1373,10 @@ tools = ["read_file"]
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let recall = Arc::new(
+            octos_memory::RecallStore::open(&data_dir, octos_memory::RecallConfig::default())
+                .unwrap(),
+        );
         let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
         let base_tools =
             ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
@@ -1409,6 +1417,7 @@ tools = ["read_file"]
             system_prompt,
             memory,
             memory_store,
+            recall,
             embedder: None,
             memory_inject_tokens: 2500,
             memory_refresh_enabled: true,
@@ -2160,6 +2169,10 @@ tools = ["read_file"]
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let recall = Arc::new(
+            octos_memory::RecallStore::open(&data_dir, octos_memory::RecallConfig::default())
+                .unwrap(),
+        );
         let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
         let sandbox = SandboxConfig::default();
         let base_tools =
@@ -2201,6 +2214,7 @@ tools = ["read_file"]
             },
             memory,
             memory_store,
+            recall,
             embedder: None,
             memory_inject_tokens: 2500,
             memory_refresh_enabled: true,

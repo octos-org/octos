@@ -581,8 +581,24 @@ impl MemoryStore {
     /// but the output keeps the canonical section order. Anything dropped is
     /// disclosed in a trailing marker so the model knows memory is partial.
     pub async fn get_injectable_context(&self, max_tokens: usize) -> String {
+        self.get_injectable_context_ranked(max_tokens, &[], usize::MAX)
+            .await
+    }
+
+    /// [`Self::get_injectable_context`] with relevance-selected bank rows
+    /// (ADR personal-memory-tiers, phase 3): `preferred` slugs (best first,
+    /// from the Knowledge index for the current turn) are listed first, the
+    /// remaining pages follow alphabetically, and at most `max_rows` rows
+    /// are injected; the rest are disclosed as loadable on demand instead of
+    /// being dropped all-or-nothing when the bank outgrows the budget.
+    pub async fn get_injectable_context_ranked(
+        &self,
+        max_tokens: usize,
+        preferred: &[String],
+        max_rows: usize,
+    ) -> String {
         let mut sections = self.load_sections().await;
-        let mut bank = self.get_bank_summary().await;
+        let mut bank = self.get_bank_summary_ranked(preferred, max_rows).await;
 
         let mut budget = max_tokens;
         let mut omitted: Vec<String> = Vec::new();
@@ -783,7 +799,14 @@ impl MemoryStore {
 
     /// Build a compact bank summary for system prompt injection.
     pub async fn get_bank_summary(&self) -> String {
-        let entities = match self.list_entities().await {
+        self.get_bank_summary_ranked(&[], usize::MAX).await
+    }
+
+    /// [`Self::get_bank_summary`] with `preferred` slugs first and at most
+    /// `max_rows` rows; omitted pages are counted in a trailing line so the
+    /// model knows to `recall_memory {query}` for them.
+    pub async fn get_bank_summary_ranked(&self, preferred: &[String], max_rows: usize) -> String {
+        let mut entities = match self.list_entities().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("failed to list entities for bank summary: {e}");
@@ -793,6 +816,19 @@ impl MemoryStore {
         if entities.is_empty() {
             return String::new();
         }
+        let total = entities.len();
+        if !preferred.is_empty() {
+            // Stable: preferred in their given order, then the alphabetical rest.
+            let rank = |name: &str| {
+                preferred
+                    .iter()
+                    .position(|p| p == name)
+                    .unwrap_or(usize::MAX)
+            };
+            entities.sort_by(|a, b| rank(&a.0).cmp(&rank(&b.0)).then_with(|| a.0.cmp(&b.0)));
+        }
+        let omitted = total.saturating_sub(max_rows);
+        entities.truncate(max_rows);
 
         let mut summary = String::from(
             "## Memory Bank\n\
@@ -836,6 +872,12 @@ impl MemoryStore {
             if kept_tail.len() > ROW_TAIL {
                 kept_tail.remove(0);
             }
+        }
+        if omitted > 0 {
+            summary.push_str(&format!(
+                "_[{omitted} more memory-bank page(s) not shown; find them with \
+                 recall_memory(query=…) or memory_search]_\n"
+            ));
         }
         summary
     }

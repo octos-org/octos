@@ -59,6 +59,7 @@ pub mod content_catalog;
 #[path = "api/context_manager.rs"]
 pub(crate) mod context_manager;
 pub(crate) mod conversation_outcome;
+pub mod embed_model;
 // Interactive-contract stores (pending approvals / user questions / diff
 // previews / approval scopes). Deliberately NOT `api`-gated: they are plain
 // in-memory registries over `octos_core::ui_protocol` types with no axum /

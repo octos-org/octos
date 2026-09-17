@@ -33,8 +33,12 @@ octos-ffi = { path = "../octos-ffi" }
 # plus the proc-macros for the idiomatic surface (Record/Object/Error/export).
 uniffi = { version = "0.29", features = ["cli"] }
 
+[dev-dependencies]
+# Only to parse the JSON the `memory_*` methods return in the offline tests.
+serde_json = { workspace = true }
+
 [features]
-default = []
+default = ["embed-llama"]
 # Re-export octos-ffi's optional in-process GGUF embedder so `Runtime::embed`
 # returns real vectors instead of `NoEmbedder`. Off by default, so the plain
 # `cargo build --workspace` stays pure Rust.

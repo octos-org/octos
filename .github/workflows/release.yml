@@ -26,7 +26,9 @@ concurrency:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   RUST_VERSION: "1.97.1"
-  FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
+  # embed-llama: the bundled in-process embedder (llama.cpp, needs cmake on
+  # the runner). The macOS job adds Metal below.
+  FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3,embed-llama"
   SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p smart-home"
 
 jobs:
@@ -54,6 +56,9 @@ jobs:
     needs: check-version
     if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'macos-arm'
     runs-on: macos-14
+    env:
+      # Apple Silicon: offload the bundled embedder to Metal.
+      FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3,embed-llama-metal"
     steps:
       - uses: actions/checkout@v6
         with:

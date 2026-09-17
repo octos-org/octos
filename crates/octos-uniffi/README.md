@@ -19,8 +19,9 @@ credential handling.
 | `Config` (record) | dict / data class of provider, model, key, cwd, … |
 | `Brief` (record) | `{ prompt, max_iterations? }` |
 | `TaskResult` / `TokenUsage` (records) | outputs |
-| `OctosError` (error enum) | exception (`Config`/`Provider`/`Run`/`Embed`/`NoEmbedder`/`Incomplete`) |
-| `Runtime` (object) | `new(config)`, `run_task(brief)`, `embed(text)` |
+| `OctosError` (error enum) | exception (`Config`/`Provider`/`Run`/`Embed`/`NoEmbedder`/`Incomplete`/`Memory`) |
+| `Runtime` (object) | `new(config)`, `run_task(brief)`, `embed(text)`, `memory_upsert(json)`, `memory_search(json)`, `memory_load(id)`, `memory_stats()` |
+| `embedding_model_status(data_dir)` / `embedding_model_ensure(data_dir, download)` (free functions) | provision the default embedding model without a `Runtime` (JSON strings; same contracts as the C-ABI's `octos_embedding_model_*`) |
 
 Methods are **synchronous**: the async agent loop is driven by a `block_on`
 inside the core, so callers see plain blocking calls — call them from a normal
@@ -30,8 +31,10 @@ be shared across threads (concurrent calls contend on one internal executor).
 ## Build
 
 ```bash
-cargo build -p octos-uniffi                      # cdylib + staticlib + rlib
-cargo build -p octos-uniffi --features embed-llama  # + in-process GGUF embedder
+cargo build -p octos-uniffi                      # cdylib + staticlib + rlib, with the
+                                                 # in-process GGUF embedder (default
+                                                 # feature `embed-llama`; needs cmake)
+cargo build -p octos-uniffi --no-default-features  # pure Rust, keyword-only memory
 ```
 
 ## Generating bindings
@@ -73,13 +76,65 @@ print(rt.run_task(Brief(prompt="Reply OK")).output)
 
 Optional `Config` fields default sensibly (`api_key_env`, `base_url`,
 `api_type`, `cwd`, `allow_shell=False`, `max_iterations`,
-`embedding_model_path`), so only `provider` and `model` (plus a credential) are
-required. Set `api_type="anthropic"` (or `"responses"`) to drive a
-`provider="custom"` Anthropic-compatible endpoint onto the right protocol.
+`embedding_model_path`, `data_dir`, `recall_dimension`,
+`embedding_auto_download`), so only `provider` and `model` (plus a
+credential) are required. Set `api_type="anthropic"` (or `"responses"`) to
+drive a `provider="custom"` Anthropic-compatible endpoint onto the right
+protocol. Set `data_dir` to keep the episode + Recall memory stores — and the
+default embedding model — on disk across runtimes (otherwise they live in a
+scratch dir removed on drop).
 
 Errors surface as an `OctosError` exception; a failed provider build or run
 carries a scrubbed message, and `embed` without an embedder raises
 `OctosError.NoEmbedder`.
+
+### The default embedding model
+
+An `embed-llama` build (the default) embeds with EmbeddingGemma-300M
+(Q8_0 GGUF, 334 MB, [Gemma Terms of Use](https://ai.google.dev/gemma/terms)),
+kept at `<data_dir>/models/embeddinggemma-300M-Q8_0.gguf`. When
+`embedding_model_path` is unset, `Runtime(...)` loads it if it is there;
+otherwise it downloads it first — **blocking the constructor** — unless
+`embedding_auto_download=False` or `OCTOS_NO_MODEL_DOWNLOAD=1` is set, in
+which case the runtime is keyword-only (`embed` raises `NoEmbedder`; memory
+search still works, BM25-only). The full resolution rules are in the
+[`octos-ffi` README](../octos-ffi/README.md#the-default-embedding-model).
+To own the download (first-run screen, Wi-Fi policy), provision before
+constructing a runtime, with the two free functions:
+
+```python
+import json
+from octos import embedding_model_status, embedding_model_ensure, OctosError
+
+status = json.loads(embedding_model_status("/data/octos"))
+# {"path", "present", "bytes", "complete", "url", "license_url", "sha256"}
+if not status["complete"]:
+    try:
+        path = json.loads(embedding_model_ensure("/data/octos", download=True))["path"]
+    except OctosError.Embed as error:   # download disabled/vetoed, or failed to verify
+        ...
+rt = Runtime(Config(provider="openai", model="gpt-4o-mini", api_key="sk-...",
+                    data_dir="/data/octos", embedding_auto_download=False))
+```
+
+### Recall memory
+
+The four `memory_*` methods take and return JSON strings with exactly the
+contracts of the C-ABI's `octos_memory_*` functions (documented in the
+[`octos-ffi` README](../octos-ffi/README.md#memory-the-recall-index)); a
+failure raises `OctosError.Memory` (e.g. `no such record`). No embedder is
+needed — the index is BM25-only until one is configured:
+
+```python
+import json
+rt.memory_upsert(json.dumps({"records": [
+    {"id": "doc:mail:42", "kind": "document", "source": "mail",
+     "timestamp": "2026-09-01T10:00:00Z", "title": "Dentist appointment",
+     "abstract": "Sunrise Dental on the 24th", "fingerprint": "h42"}]}))
+hits = json.loads(rt.memory_search(json.dumps({"query": "dentist", "limit": 5})))["hits"]
+record = json.loads(rt.memory_load(hits[0]["id"]))["record"]
+stats = json.loads(rt.memory_stats())
+```
 
 A provider `max_tokens` stop raises `OctosError.Incomplete`, **not** a successful
 `TaskResult`. Its `partial` field contains the actual output, accumulated token

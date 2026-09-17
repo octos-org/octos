@@ -49,6 +49,61 @@ enum MemoryAction {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+    /// Search the Recall/Knowledge index (app records, episodes, bank
+    /// pages) the way the agent's `memory_search` tool does.
+    Search {
+        /// Words to match.
+        query: Vec<String>,
+        /// Restrict to a tier: episode, document or knowledge.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Restrict to a producer (mail, calendar, bank, episodes, …).
+        #[arg(long)]
+        source: Option<String>,
+        /// Max results (default 10).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Data directory (defaults to the resolved profile data dir).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Ingest app records into the Recall index from a JSON file
+    /// (`{"records": [...]}` or a bare array), embedding them when an
+    /// embedder is configured. Same contract as the `memory/ingest`
+    /// protocol method and the FFI `octos_memory_upsert`.
+    Ingest {
+        /// JSON file, or `-` for stdin.
+        file: PathBuf,
+        /// Data directory (defaults to the resolved profile data dir).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Nominate hot app records into the staging area with provenance so
+    /// the next consolidation can distil them into long-term memory.
+    Promote {
+        /// Minimum number of loads a record needs (default 2).
+        #[arg(long, default_value_t = 2)]
+        min_visits: u32,
+        /// Max records to nominate in one pass (default 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// List candidates without staging them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Data directory (defaults to the resolved profile data dir).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Show the bundled embedding model (EmbeddingGemma-300M) status, or
+    /// fetch it now so the first session does not have to.
+    Embedder {
+        /// Download the model if it is missing or incomplete.
+        #[arg(long)]
+        fetch: bool,
+        /// Data directory (defaults to the resolved profile data dir).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// Record a host-authored remember request (full consolidation
     /// authority — no model in the loop).
     Remember {
@@ -93,6 +148,21 @@ impl MemoryCommand {
             MemoryAction::Refresh { data_dir } => run_refresh(data_dir).await,
             MemoryAction::Status { data_dir } => run_status(data_dir).await,
             MemoryAction::Reindex { dry_run, data_dir } => run_reindex(dry_run, data_dir).await,
+            MemoryAction::Search {
+                query,
+                kind,
+                source,
+                limit,
+                data_dir,
+            } => run_search(query.join(" "), kind, source, limit, data_dir).await,
+            MemoryAction::Ingest { file, data_dir } => run_ingest(file, data_dir).await,
+            MemoryAction::Embedder { fetch, data_dir } => run_embedder(fetch, data_dir).await,
+            MemoryAction::Promote {
+                min_visits,
+                limit,
+                dry_run,
+                data_dir,
+            } => run_promote(min_visits, limit, dry_run, data_dir).await,
             MemoryAction::Remember { text, data_dir } => {
                 write_host_note(data_dir, octos_memory::NoteKind::UserRequest, text, false).await
             }
@@ -262,6 +332,290 @@ async fn run_reindex(dry_run: bool, data_dir: Option<PathBuf>) -> Result<()> {
     if failed > 0 {
         println!("  Re-run to retry the {failed} that failed.");
     }
+    Ok(())
+}
+
+/// Open the profile's Recall store the way the runtime does (dimension and
+/// embedder id from the config); strict open — stop `octos serve` first.
+async fn open_recall(
+    data_dir: &std::path::Path,
+    config: &Config,
+    embedder: Option<&dyn octos_llm::EmbeddingProvider>,
+) -> Result<Arc<octos_memory::RecallStore>> {
+    let store = crate::runtime::profile::open_recall_store_strict(data_dir, config, embedder)
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "failed to open the recall store at {} — if `octos serve` (or a gateway) is \
+                 running it holds the lock; stop it and retry",
+                data_dir.display()
+            )
+        })?;
+    Ok(Arc::new(store))
+}
+
+async fn run_search(
+    query: String,
+    kind: Option<String>,
+    source: Option<String>,
+    limit: usize,
+    data_dir: Option<PathBuf>,
+) -> Result<()> {
+    if query.trim().is_empty() {
+        eyre::bail!("empty query");
+    }
+    let (data_dir, config) = resolve(data_dir).await?;
+    let embedder = crate::commands::chat::create_embedder(&config)
+        .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+    let recall = open_recall(&data_dir, &config, embedder.as_deref()).await?;
+    let kinds = match kind.as_deref() {
+        Some(k) => vec![
+            octos_memory::RecordKind::parse(k)
+                .ok_or_else(|| eyre::eyre!("unknown kind {k:?}: episode, document or knowledge"))?,
+        ],
+        None => Vec::new(),
+    };
+    let vector = match &embedder {
+        Some(e) => e
+            .embed(&[query.as_str()])
+            .await
+            .ok()
+            .and_then(|mut v| (!v.is_empty()).then(|| v.swap_remove(0))),
+        None => None,
+    };
+    let filter = octos_memory::SearchFilter {
+        kinds,
+        sources: source.into_iter().collect(),
+        limit: limit.clamp(1, 200),
+        ..Default::default()
+    };
+    let hits = recall.search(&query, vector.as_deref(), &filter)?;
+    let stats = recall.stats();
+    println!(
+        "{} {} record(s), {} with vectors ({} resident), embedder: {}",
+        "Recall index".bold(),
+        stats.records,
+        stats.vectors_stored,
+        stats.vectors_resident,
+        if stats.embedder_id.is_empty() {
+            "none (keyword only)"
+        } else {
+            &stats.embedder_id
+        }
+    );
+    if hits.is_empty() {
+        println!("no matches for {query:?}");
+        return Ok(());
+    }
+    for (i, h) in hits.iter().enumerate() {
+        println!(
+            "{:>2}. {:.3}  {}  {}/{}  {}  [{}]",
+            i + 1,
+            h.score,
+            h.timestamp.format("%Y-%m-%d"),
+            h.kind.as_str(),
+            h.source,
+            h.title.bold(),
+            h.trust.as_str()
+        );
+        println!("      {}  ({})", h.abstract_, h.id.dimmed());
+    }
+    Ok(())
+}
+
+async fn run_embedder(fetch: bool, data_dir: Option<PathBuf>) -> Result<()> {
+    use crate::embed_model as em;
+    // The model cache is shared by every profile under the octos data root.
+    let root = match data_dir {
+        Some(d) => d,
+        None => octos_services::config_context::resolve_config_context(None).data_dir,
+    };
+    let status = em::model_status(&root);
+    println!("{}", "Bundled embedding model".bold());
+    println!(
+        "  model         EmbeddingGemma-300M Q8_0 ({})",
+        em::DEFAULT_MODEL_ID
+    );
+    println!("  path          {}", status.path.display());
+    println!(
+        "  on disk       {}",
+        if status.complete {
+            "complete".green().to_string()
+        } else if status.present {
+            format!(
+                "{} of {} bytes (incomplete)",
+                status.bytes,
+                em::DEFAULT_MODEL_BYTES
+            )
+            .yellow()
+            .to_string()
+        } else {
+            "absent".yellow().to_string()
+        }
+    );
+    println!("  source        {}", em::DEFAULT_MODEL_URL);
+    println!(
+        "  licence       {} (Gemma Terms of Use)",
+        em::DEFAULT_MODEL_LICENSE_URL
+    );
+    println!(
+        "  auto-download {}",
+        if em::downloads_allowed(None) {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if !cfg!(feature = "embed-llama") {
+        println!(
+            "  {} this build has no in-process embedder (feature embed-llama); the model is unused",
+            "note".yellow()
+        );
+    }
+    if fetch && !status.complete {
+        println!("fetching {} MB…", em::DEFAULT_MODEL_BYTES / (1024 * 1024));
+        let path = tokio::task::spawn_blocking(move || em::ensure_default_model(&root, true))
+            .await
+            .wrap_err("download task failed")??;
+        println!("{} {}", "ready".green().bold(), path.display());
+    } else if fetch {
+        println!("{} already complete", "ok".green());
+    } else if !status.complete {
+        println!(
+            "run `octos memory embedder --fetch` to download it now (otherwise the first session does)."
+        );
+    }
+    Ok(())
+}
+
+async fn run_ingest(file: PathBuf, data_dir: Option<PathBuf>) -> Result<()> {
+    let raw = if file.as_os_str() == "-" {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+        s
+    } else {
+        std::fs::read_to_string(&file).wrap_err_with(|| format!("read {}", file.display()))?
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).wrap_err("ingest file is not JSON")?;
+    let items = match value {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(mut o) => o
+            .remove("records")
+            .and_then(|v| v.as_array().cloned())
+            .ok_or_else(|| eyre::eyre!("expected {{\"records\": [...]}} or an array"))?,
+        _ => eyre::bail!("expected {{\"records\": [...]}} or an array"),
+    };
+    let mut records: Vec<octos_memory::Record> = Vec::with_capacity(items.len());
+    for item in items {
+        let mut r: octos_memory::Record =
+            serde_json::from_value(item).wrap_err("record does not match the Record schema")?;
+        if r.kind == octos_memory::RecordKind::Knowledge {
+            eyre::bail!(
+                "knowledge pages are written through save_memory / the bank, not ingest ({})",
+                r.id
+            );
+        }
+        r.trust = octos_memory::Trust::Untrusted;
+        records.push(r);
+    }
+    let (data_dir, config) = resolve(data_dir).await?;
+    let embedder = crate::commands::chat::create_embedder(&config)
+        .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+    let recall = open_recall(&data_dir, &config, embedder.as_deref()).await?;
+    let total = records.len();
+    let mut report = octos_memory::UpsertReport::default();
+    for chunk in records.chunks(REINDEX_BATCH * 4) {
+        let vectors: Vec<Option<Vec<f32>>> = match &embedder {
+            Some(e) => {
+                // Embed only what the store would actually use: new or
+                // changed records, or ones with no usable vector yet.
+                let needs = recall.needs_vectors(chunk)?;
+                let wanted: Vec<usize> = (0..chunk.len()).filter(|i| needs[*i]).collect();
+                let mut out: Vec<Option<Vec<f32>>> = vec![None; chunk.len()];
+                for batch in wanted.chunks(REINDEX_BATCH) {
+                    let texts: Vec<String> = batch.iter().map(|i| chunk[*i].index_text()).collect();
+                    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                    if let Ok(v) = e.embed(&refs).await {
+                        if v.len() == batch.len() {
+                            for (i, vec) in batch.iter().zip(v) {
+                                out[*i] = Some(vec);
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            None => vec![None; chunk.len()],
+        };
+        let r = recall.upsert(chunk.to_vec(), vectors)?;
+        report.inserted += r.inserted;
+        report.updated += r.updated;
+        report.unchanged += r.unchanged;
+        report.vectors_stored += r.vectors_stored;
+    }
+    recall.persist_index()?;
+    println!(
+        "{} {total} record(s): {} inserted, {} updated, {} unchanged, {} vector(s) stored",
+        "ingested".green().bold(),
+        report.inserted,
+        report.updated,
+        report.unchanged,
+        report.vectors_stored
+    );
+    Ok(())
+}
+
+async fn run_promote(
+    min_visits: u32,
+    limit: usize,
+    dry_run: bool,
+    data_dir: Option<PathBuf>,
+) -> Result<()> {
+    let (data_dir, config) = resolve(data_dir).await?;
+    // Same geometry as the runtime, or a narrower configured embedder would
+    // make every stored vector look foreign.
+    let embedder = crate::commands::chat::create_embedder(&config)
+        .map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+    let recall = open_recall(&data_dir, &config, embedder.as_deref()).await?;
+    let memory_store = octos_memory::MemoryStore::open(&data_dir)
+        .await
+        .wrap_err("failed to open memory store")?;
+    if dry_run {
+        let candidates = recall.nominate(min_visits, limit)?;
+        if candidates.is_empty() {
+            println!("nothing to promote (no unpromoted records with ≥{min_visits} loads)");
+        }
+        for r in candidates {
+            println!(
+                "- {}  {}  {} load(s)  {}",
+                r.id,
+                r.title.bold(),
+                r.visits,
+                r.abstract_.dimmed()
+            );
+        }
+        return Ok(());
+    }
+    let promoted = octos_agent::memory_index::nominate_for_promotion(
+        &memory_store,
+        &recall,
+        min_visits,
+        limit,
+        None,
+    )
+    .await?;
+    if promoted.is_empty() {
+        println!("nothing to promote (no unpromoted records with ≥{min_visits} loads)");
+        return Ok(());
+    }
+    for r in &promoted {
+        println!("{} {}  {}", "staged".green().bold(), r.id, r.title);
+    }
+    println!(
+        "{} note(s) staged with provenance; they are consolidated on the next pass (or run `octos memory refresh`).",
+        promoted.len()
+    );
     Ok(())
 }
 

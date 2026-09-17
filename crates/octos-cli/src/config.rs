@@ -687,11 +687,18 @@ pub struct EmbeddingConfig {
     pub dimensions: Option<u32>,
 
     /// Path to the local `.gguf` file for the in-process `llamacpp` provider
-    /// (feature `embed-llama`; add `embed-llama-metal` / `embed-llama-cuda` to
-    /// offload). Any GGUF embedding model works, e.g.
-    /// `ggml-org/embeddinggemma-300M-GGUF`. Ignored by remote providers.
+    /// (feature `embed-llama`, on by default; add `embed-llama-metal` /
+    /// `embed-llama-cuda` to offload). Any GGUF embedding model works. When
+    /// omitted, the bundled default (EmbeddingGemma-300M Q8_0 under
+    /// `<data_dir>/models/`) is used and fetched on first use. Ignored by
+    /// remote providers.
     #[serde(default)]
     pub model_path: Option<String>,
+
+    /// Allow octos to download the default embedding model when it is
+    /// missing (default true; `OCTOS_NO_MODEL_DOWNLOAD=1` also disables it).
+    #[serde(default)]
+    pub auto_download: Option<bool>,
 }
 
 fn default_embedding_provider() -> String {
@@ -712,6 +719,14 @@ pub struct MemoryConfig {
     /// Automatic memory refreshing (capture + consolidation pipeline).
     #[serde(default)]
     pub refresh: Option<MemoryRefreshConfig>,
+
+    /// Width of the vectors kept by the Recall/Knowledge index
+    /// (Matryoshka-truncated from the embedder's output, int8 at rest).
+    /// Defaults to [`octos_memory::DEFAULT_RECALL_DIMENSION`] (256); never
+    /// wider than the configured embedder. See
+    /// docs/adr/personal-memory-tiers.md.
+    #[serde(default)]
+    pub recall_dimension: Option<usize>,
 }
 
 /// Automatic memory-refresh settings. Default OFF: when disabled there is

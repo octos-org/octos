@@ -6268,6 +6268,7 @@ mod tests {
             memory: Some(crate::config::MemoryConfig {
                 max_inject_tokens: Some(4242),
                 refresh: None,
+                recall_dimension: None,
             }),
             approval_policy: Some(crate::config::ApprovalPolicyConfig::default()),
             plugins: crate::config::PluginsConfig {
@@ -6350,6 +6351,7 @@ mod tests {
             memory: Some(crate::config::MemoryConfig {
                 max_inject_tokens: Some(1),
                 refresh: None,
+                recall_dimension: None,
             }),
             approval_policy: Some(crate::config::ApprovalPolicyConfig::default()),
             // Non-default sandbox: workspace_write=false differs from the
@@ -6368,6 +6370,7 @@ mod tests {
         profile.config.memory = Some(crate::config::MemoryConfig {
             max_inject_tokens: Some(999),
             refresh: None,
+            recall_dimension: None,
         });
         profile.config.approval_policy = None; // will inherit
         // The profile sets ONE sandbox field (allow_network) and turns signing

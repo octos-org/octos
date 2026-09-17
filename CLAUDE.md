@@ -17,6 +17,14 @@ cargo install --path crates/octos-cli \
                                           # Install CLI locally with the
                                           # canonical feature default
                                           # (matches scripts/milestone-ci.sh).
+                                          # Default features include
+                                          # `embed-llama` (the bundled
+                                          # llama.cpp embedder): building
+                                          # needs cmake + a C++ toolchain;
+                                          # add `embed-llama-metal` on Apple
+                                          # Silicon, or use
+                                          # `--no-default-features --features api`
+                                          # to skip it.
                                           # `api` is required for `octos serve`.
                                           # `audio_mp3` is required for the
                                           # `podcast_generate` workspace

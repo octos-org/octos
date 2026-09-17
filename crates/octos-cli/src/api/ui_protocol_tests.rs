@@ -3603,6 +3603,19 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         methods::CONTENT_DELETE => json!({ "id": "content-1" }),
         methods::CONTENT_BULK_DELETE => json!({ "ids": ["content-1"] }),
         methods::MEMORY_ENTITY => json!({ "name": "probe-entity" }),
+        methods::MEMORY_SEARCH => json!({ "query": "probe" }),
+        methods::MEMORY_LOAD => json!({ "id": "doc:probe:1" }),
+        methods::MEMORY_INGEST => json!({
+            "records": [{
+                "id": "doc:probe:1",
+                "kind": "document",
+                "source": "probe",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "title": "probe",
+                "abstract": "probe record",
+            }],
+            "embed": false,
+        }),
         methods::CRON_TOGGLE => json!({ "job_id": "probe-job", "enabled": false }),
         methods::ROUTER_SET_MODE => json!({
             "session_id": session_id,
@@ -8225,6 +8238,57 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
     .await;
     let frame = recv_rpc_json(&mut rx).await;
     assert_eq!(frame["id"], json!("memory-entity-unauth"));
+    assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+    handle_memory_search(
+        &ws,
+        &state,
+        &headers,
+        None,
+        false,
+        "memory-search-unauth".into(),
+        MemorySearchParams {
+            query: "dentist".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["id"], json!("memory-search-unauth"));
+    assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+    handle_memory_load(
+        &ws,
+        &state,
+        &headers,
+        None,
+        false,
+        "memory-load-unauth".into(),
+        MemoryLoadParams {
+            id: "doc:mail:1".into(),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["id"], json!("memory-load-unauth"));
+    assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+    handle_memory_ingest(
+        &ws,
+        &state,
+        &headers,
+        None,
+        false,
+        "memory-ingest-unauth".into(),
+        MemoryIngestParams {
+            records: vec![json!({ "id": "doc:mail:1" })],
+            vectors: None,
+            embed: Some(false),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["id"], json!("memory-ingest-unauth"));
     assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
 
     handle_cron_list(
@@ -20372,6 +20436,9 @@ fn session_ingress_callable_method_matches_the_deny_surfaces() {
         octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
         octos_core::ui_protocol::methods::MEMORY_OVERVIEW,
         octos_core::ui_protocol::methods::MEMORY_ENTITY,
+        octos_core::ui_protocol::methods::MEMORY_SEARCH,
+        octos_core::ui_protocol::methods::MEMORY_LOAD,
+        octos_core::ui_protocol::methods::MEMORY_INGEST,
         octos_core::ui_protocol::methods::CRON_LIST,
         octos_core::ui_protocol::methods::CRON_TOGGLE,
         octos_core::ui_protocol::methods::SESSION_FORK,
@@ -29809,6 +29876,10 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         data_dir,
         octos_agent::create_sandbox(&sandbox),
     );
+    let recall = Arc::new(
+        octos_memory::RecallStore::open(data_dir, octos_memory::RecallConfig::default())
+            .expect("recall store"),
+    );
     Arc::new(crate::runtime::ProfileRuntime {
         profile_id: profile_id.to_string(),
         data_dir: data_dir.to_path_buf(),
@@ -29846,6 +29917,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         },
         memory,
         memory_store,
+        recall,
         embedder: None,
         memory_inject_tokens: 2500,
         memory_refresh_enabled: false,
@@ -39107,6 +39179,163 @@ async fn turn_start_still_rejects_when_turn_already_running() {
     );
 }
 
+/// Same refusal, now MACHINE-READABLE. Two UI Protocol clients (the TUI and
+/// the browser client) can attach to one `octos serve` and open the same
+/// session; the loser of the `turn/start` race used to get untyped prose it
+/// could not branch on. The refusal keeps that human string byte-for-byte and
+/// adds the `turn_in_progress` discriminator already used by the
+/// `session/rollback` guard, plus the id of the turn that actually holds the
+/// session so the client can address it (`turn/interrupt`, "the other window
+/// is busy on turn X").
+#[tokio::test(flavor = "current_thread")]
+async fn should_refuse_with_typed_turn_in_progress_when_turn_start_collides() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let provider = Arc::new(AppuiContinuationLlm::new("unused"));
+    let (state, _profile_runtime) =
+        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider).await;
+    let session_id = SessionKey::new("api", "typed-occupied");
+    let running_turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (entry, _) = synthetic_active_turn(&running_turn_id, true);
+    active_turns.lock().await.insert(session_id.clone(), entry);
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(32);
+
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "start-typed-busy".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: TurnId::new(),
+            input: vec![InputItem::Text {
+                text: "second turn".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+        },
+    )
+    .await;
+
+    let frame = recv_rpc_response_with_id(&mut rx, "start-typed-busy").await;
+    // Byte-for-byte unchanged human message — existing clients and tests
+    // match on it.
+    assert_eq!(
+        frame["error"]["message"],
+        json!("a turn is already running for this session"),
+        "frame: {frame}"
+    );
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!("turn_in_progress"),
+        "frame: {frame}"
+    );
+    assert_eq!(
+        frame["error"]["data"]["turn_id"],
+        json!(running_turn_id),
+        "the refusal must name the turn that actually holds the session: {frame}"
+    );
+}
+
+/// `session/list` must disclose per-session busy state. The active-turn
+/// registry is PROCESS-global, so the flag is honest for a session this
+/// connection never opened — that is the whole point: it is how the browser
+/// client learns the TUI is mid-turn in a session it can see but has not
+/// attached to.
+#[tokio::test(flavor = "current_thread")]
+async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
+    use octos_core::ui_protocol::SessionListParams;
+
+    let busy = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "list-busy");
+    let idle = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "list-idle");
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let manager = octos_bus::SessionManager::open(temp.path()).expect("session manager open");
+    let manager = Arc::new(TokioMutex::new(manager));
+    {
+        let mut guard = manager.lock().await;
+        for key in [&busy, &idle] {
+            guard
+                .add_message(
+                    key,
+                    Message {
+                        role: MessageRole::User,
+                        content: "hello".into(),
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        client_message_id: None,
+                        thread_id: None,
+                        timestamp: Utc::now(),
+                    },
+                )
+                .await
+                .expect("persist user message");
+        }
+    }
+    let state = Arc::new(AppState {
+        sessions: Some(manager),
+        ..AppState::empty_for_tests()
+    });
+
+    // A turn owned by ANOTHER connection, registered exactly as
+    // `handle_turn_start` does, in the process-global registry.
+    let registry = active_turns_registry();
+    let (entry, _) = synthetic_active_turn(&TurnId::new(), true);
+    registry.lock().await.insert(busy.clone(), entry);
+
+    let (ws, mut rx) = ws_connection_for_test(32);
+    handle_session_list(
+        &ws,
+        &state,
+        &HeaderMap::new(),
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "list-busy-flag".into(),
+        SessionListParams { cwd: None },
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut rx, "list-busy-flag").await;
+    registry.lock().await.remove(&busy);
+
+    let sessions = frame["result"]["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("session/list must return an array: {frame}"));
+    let find = |id: &str| {
+        sessions
+            .iter()
+            .find(|entry| entry["id"] == json!(id))
+            .unwrap_or_else(|| panic!("{id} missing from {frame}"))
+            .clone()
+    };
+    assert_eq!(
+        find("list-busy")["active_turn"],
+        json!(true),
+        "a session with a live turn must be flagged: {frame}"
+    );
+    assert_eq!(
+        find("list-idle")["active_turn"],
+        json!(false),
+        "an idle session must report false, not absent: {frame}"
+    );
+}
+
 /// LLM stub for the end-to-end mid-turn steer test. Call 0 announces it
 /// entered (so the test can steer while the model is "streaming"), waits
 /// for the go-signal, then returns a FINAL answer; the pending steer must
@@ -43152,4 +43381,371 @@ async fn interactive_sentinel_failure_warning_plain_session_unchanged() {
         panic!("warning")
     };
     assert_eq!(event.session_id, plain, "plain session id unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// Recall index methods: `memory/search` filter + `memory/ingest` validation
+// (docs/adr/personal-memory-tiers.md). Pure helpers; the handlers add only
+// the identity → runtime resolution shared with `memory/overview`.
+// ---------------------------------------------------------------------------
+
+fn ingest_doc_record(id: &str) -> Value {
+    json!({
+        "id": id,
+        "kind": "document",
+        "source": "mail",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "Hike on Saturday",
+        "abstract": "Sam proposes the ridge trail at 8am.",
+        "parent": "thread-7",
+        "fingerprint": "v1",
+    })
+}
+
+fn ingest_params(records: Vec<Value>) -> MemoryIngestParams {
+    MemoryIngestParams {
+        records,
+        vectors: None,
+        embed: None,
+    }
+}
+
+#[test]
+fn memory_search_filter_defaults_limit_and_leaves_filters_open() {
+    let filter = memory_search_filter(&MemorySearchParams {
+        query: "  dentist ".into(),
+        ..Default::default()
+    })
+    .expect("valid params");
+    assert_eq!(filter.limit, MEMORY_SEARCH_DEFAULT_LIMIT);
+    assert!(filter.kinds.is_empty());
+    assert!(filter.sources.is_empty());
+    assert_eq!(filter.since, None);
+    assert_eq!(filter.until, None);
+}
+
+#[test]
+fn memory_search_filter_clamps_limit_to_one_through_max() {
+    let over = memory_search_filter(&MemorySearchParams {
+        query: "q".into(),
+        limit: Some(MEMORY_SEARCH_MAX_LIMIT * 10),
+        ..Default::default()
+    })
+    .expect("valid params");
+    assert_eq!(over.limit, MEMORY_SEARCH_MAX_LIMIT);
+    let zero = memory_search_filter(&MemorySearchParams {
+        query: "q".into(),
+        limit: Some(0),
+        ..Default::default()
+    })
+    .expect("valid params");
+    assert_eq!(zero.limit, 1);
+}
+
+#[test]
+fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
+    let filter = memory_search_filter(&MemorySearchParams {
+        query: "hike".into(),
+        kinds: vec!["document".into(), "doc".into(), "knowledge".into()],
+        sources: vec![" mail ".into(), "".into(), "calendar".into()],
+        since: Some("2026-01-01".into()),
+        until: Some("2026-02-01".into()),
+        limit: Some(5),
+    })
+    .expect("valid params");
+    assert_eq!(
+        filter.kinds,
+        vec![
+            octos_memory::RecordKind::Document,
+            octos_memory::RecordKind::Knowledge
+        ],
+        "kinds parse leniently and de-duplicate"
+    );
+    assert_eq!(
+        filter.sources,
+        vec!["mail".to_string(), "calendar".to_string()]
+    );
+    assert_eq!(
+        filter.since.map(|t| t.to_rfc3339()),
+        Some("2026-01-01T00:00:00+00:00".to_string()),
+        "a bare `since` date is the start of that UTC day"
+    );
+    assert_eq!(
+        filter
+            .until
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)),
+        Some("2026-02-01T23:59:59.999999Z".to_string()),
+        "a bare `until` date covers the whole day (RecallStore applies it inclusively)"
+    );
+    assert_eq!(filter.limit, 5);
+
+    let rfc3339 = memory_search_filter(&MemorySearchParams {
+        query: "hike".into(),
+        since: Some("2026-01-01T10:00:00+02:00".into()),
+        ..Default::default()
+    })
+    .expect("valid params");
+    assert_eq!(
+        rfc3339.since.map(|t| t.to_rfc3339()),
+        Some("2026-01-01T08:00:00+00:00".to_string()),
+        "offsets are normalised to UTC"
+    );
+}
+
+#[test]
+fn memory_search_filter_rejects_bad_input_with_invalid_params() {
+    let empty = memory_search_filter(&MemorySearchParams {
+        query: "   ".into(),
+        ..Default::default()
+    })
+    .expect_err("empty query");
+    assert_eq!(empty.code, rpc_error_codes::INVALID_PARAMS);
+
+    let kind = memory_search_filter(&MemorySearchParams {
+        query: "q".into(),
+        kinds: vec!["mail".into()],
+        ..Default::default()
+    })
+    .expect_err("unknown kind");
+    assert_eq!(kind.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(kind.message.contains("unknown kind"), "{}", kind.message);
+
+    let date = memory_search_filter(&MemorySearchParams {
+        query: "q".into(),
+        since: Some("yesterday".into()),
+        ..Default::default()
+    })
+    .expect_err("unparseable since");
+    assert_eq!(date.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(date.message.contains("`since`"), "{}", date.message);
+
+    let ordered = memory_search_filter(&MemorySearchParams {
+        query: "q".into(),
+        since: Some("2026-03-01".into()),
+        until: Some("2026-02-01".into()),
+        ..Default::default()
+    })
+    .expect_err("since after until");
+    assert_eq!(ordered.code, rpc_error_codes::INVALID_PARAMS);
+}
+
+#[test]
+fn memory_ingest_decodes_document_records_and_forces_untrusted() {
+    let mut trusted = ingest_doc_record("doc:mail:42");
+    trusted["trust"] = json!("trusted");
+    trusted["visits"] = json!(99);
+    trusted["promoted"] = json!(true);
+    let validated = validate_memory_ingest(ingest_params(vec![
+        trusted,
+        json!({
+            "id": "episode:sess-1:7",
+            "kind": "episode",
+            "source": "episodes",
+            "timestamp": "2026-03-04T05:06:07Z",
+            "title": "Fixed the build",
+            "abstract": "Bumped rustls and re-ran CI.",
+        }),
+    ]))
+    .expect("valid records");
+    assert_eq!(validated.records.len(), 2);
+    assert!(validated.vectors.is_none());
+    let doc = &validated.records[0];
+    assert_eq!(doc.id, "doc:mail:42");
+    assert_eq!(doc.kind, octos_memory::RecordKind::Document);
+    assert_eq!(
+        doc.trust,
+        octos_memory::Trust::Untrusted,
+        "documents can never claim trusted"
+    );
+    assert_eq!(doc.visits, 0, "usage counters are server-owned");
+    assert!(!doc.promoted);
+    assert_eq!(doc.parent.as_deref(), Some("thread-7"));
+    assert_eq!(doc.fingerprint, "v1");
+    assert_eq!(validated.records[1].kind, octos_memory::RecordKind::Episode);
+}
+
+#[test]
+fn memory_ingest_forces_untrusted_on_episode_records_too() {
+    // Every externally ingested record is data, never instructions: an
+    // `episode:` record claiming `trust: "trusted"` comes out untrusted
+    // exactly like a document does (only the kernel's own episode
+    // mirroring may write trusted episodes).
+    let validated = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "episode:sess-1:7",
+        "kind": "episode",
+        "source": "episodes",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "Fixed the build",
+        "abstract": "Bumped rustls and re-ran CI.",
+        "trust": "trusted",
+        "promoted": true,
+        "visits": 12,
+    })]))
+    .expect("valid episode record");
+    assert_eq!(validated.records.len(), 1);
+    let episode = &validated.records[0];
+    assert_eq!(episode.kind, octos_memory::RecordKind::Episode);
+    assert_eq!(
+        episode.trust,
+        octos_memory::Trust::Untrusted,
+        "ingested episodes can never claim trusted"
+    );
+    assert_eq!(episode.visits, 0);
+    assert!(!episode.promoted);
+}
+
+#[test]
+fn memory_ingest_rejects_knowledge_records() {
+    let error = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "bank:acme-corp",
+        "kind": "knowledge",
+        "source": "bank",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "Acme Corp",
+        "abstract": "Customer since 2024.",
+    })]))
+    .expect_err("knowledge refused");
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(
+        error.message.contains(MEMORY_INGEST_KNOWLEDGE_REFUSAL),
+        "{}",
+        error.message
+    );
+    // The lenient kind aliases are refused too — `bank` is knowledge.
+    let alias = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "bank:acme-corp",
+        "kind": "bank",
+        "source": "bank",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "Acme Corp",
+        "abstract": "Customer since 2024.",
+    })]))
+    .expect_err("knowledge alias refused");
+    assert_eq!(alias.code, rpc_error_codes::INVALID_PARAMS);
+}
+
+#[test]
+fn memory_ingest_rejects_malformed_records() {
+    let empty = validate_memory_ingest(ingest_params(vec![])).expect_err("no records");
+    assert_eq!(empty.code, rpc_error_codes::INVALID_PARAMS);
+
+    let over: Vec<Value> = (0..=MEMORY_INGEST_MAX_RECORDS)
+        .map(|i| ingest_doc_record(&format!("doc:mail:{i}")))
+        .collect();
+    let too_many = validate_memory_ingest(ingest_params(over)).expect_err("over cap");
+    assert_eq!(too_many.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        too_many.data.as_ref().and_then(|d| d.get("max_records")),
+        Some(&json!(MEMORY_INGEST_MAX_RECORDS))
+    );
+    assert_eq!(
+        too_many
+            .data
+            .as_ref()
+            .and_then(|d| d.get("requested_records")),
+        Some(&json!(MEMORY_INGEST_MAX_RECORDS + 1))
+    );
+
+    let blank_id = validate_memory_ingest(ingest_params(vec![ingest_doc_record("   ")]))
+        .expect_err("blank id");
+    assert_eq!(blank_id.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(
+        blank_id.message.contains("records[0]"),
+        "{}",
+        blank_id.message
+    );
+
+    let wrong_ns = validate_memory_ingest(ingest_params(vec![ingest_doc_record("mail-42")]))
+        .expect_err("document id outside doc:<source>:");
+    assert_eq!(wrong_ns.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(
+        wrong_ns.message.contains("doc:mail:<key>"),
+        "{}",
+        wrong_ns.message
+    );
+
+    let other_source =
+        validate_memory_ingest(ingest_params(vec![ingest_doc_record("doc:calendar:42")]))
+            .expect_err("document id must carry its own source");
+    assert_eq!(other_source.code, rpc_error_codes::INVALID_PARAMS);
+
+    let no_kind = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "doc:mail:1",
+        "source": "mail",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "t",
+        "abstract": "a",
+    })]))
+    .expect_err("kind required");
+    assert_eq!(no_kind.code, rpc_error_codes::INVALID_PARAMS);
+
+    let bad_kind = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "doc:mail:1",
+        "kind": "mailbox",
+        "source": "mail",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "t",
+        "abstract": "a",
+    })]))
+    .expect_err("unknown kind");
+    assert_eq!(bad_kind.code, rpc_error_codes::INVALID_PARAMS);
+
+    let missing_field = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "doc:mail:1",
+        "kind": "document",
+        "source": "mail",
+        "title": "t",
+        "abstract": "a",
+    })]))
+    .expect_err("timestamp required");
+    assert_eq!(missing_field.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(
+        missing_field.message.contains("timestamp"),
+        "{}",
+        missing_field.message
+    );
+
+    let not_object = validate_memory_ingest(ingest_params(vec![json!("doc:mail:1")]))
+        .expect_err("record must be an object");
+    assert_eq!(not_object.code, rpc_error_codes::INVALID_PARAMS);
+
+    let episode_ns = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "doc:episodes:1",
+        "kind": "episode",
+        "source": "episodes",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "t",
+        "abstract": "a",
+    })]))
+    .expect_err("episode id must start with episode:");
+    assert_eq!(episode_ns.code, rpc_error_codes::INVALID_PARAMS);
+}
+
+#[test]
+fn memory_ingest_requires_vectors_parallel_to_records() {
+    let mismatch = validate_memory_ingest(MemoryIngestParams {
+        records: vec![
+            ingest_doc_record("doc:mail:1"),
+            ingest_doc_record("doc:mail:2"),
+        ],
+        vectors: Some(vec![Some(vec![0.1, 0.2])]),
+        embed: None,
+    })
+    .expect_err("vector count mismatch");
+    assert_eq!(mismatch.code, rpc_error_codes::INVALID_PARAMS);
+
+    let parallel = validate_memory_ingest(MemoryIngestParams {
+        records: vec![
+            ingest_doc_record("doc:mail:1"),
+            ingest_doc_record("doc:mail:2"),
+        ],
+        vectors: Some(vec![Some(vec![0.1, 0.2]), None]),
+        embed: None,
+    })
+    .expect("parallel vectors accepted");
+    assert_eq!(
+        parallel.vectors,
+        Some(vec![Some(vec![0.1, 0.2]), None]),
+        "supplied vectors pass through untouched"
+    );
 }

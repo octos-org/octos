@@ -562,6 +562,18 @@ impl GatewayRuntime {
             eprintln!("[gateway] memory store opened");
             store
         };
+        let recall: Arc<octos_memory::RecallStore> = if let Some(rt) = profile_runtime.as_ref() {
+            rt.recall.clone()
+        } else {
+            let embedder_for_recall = create_embedder(&config);
+            crate::runtime::profile::open_recall_store(
+                &data_dir,
+                &config,
+                embedder_for_recall.as_deref(),
+            )
+            .await
+            .wrap_err("failed to open recall store")?
+        };
 
         // Derive project_dir from octos_home (when launched by process_manager)
         // or fall back to cwd/.octos (standalone octos gateway / octos chat mode).
@@ -1185,7 +1197,18 @@ impl GatewayRuntime {
             }
 
             // Memory bank tools
-            tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
+            tools.register(
+                octos_agent::RecallMemoryTool::new(memory_store.clone())
+                    .with_recall(recall.clone(), gateway_embedder.clone()),
+            );
+            tools.register(octos_agent::MemorySearchTool::new(
+                recall.clone(),
+                gateway_embedder.clone(),
+            ));
+            tools.register(octos_agent::MemoryLoadTool::new(
+                recall.clone(),
+                memory_store.clone(),
+            ));
             tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
             tools.register(octos_agent::RecordMemoryUseTool::new(memory_store.clone()));
             if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
@@ -1424,6 +1447,7 @@ impl GatewayRuntime {
             // threads the profile's `lane_routing` field.
             lane_routing: None,
             memory_store: Some(memory_store.clone()),
+            recall: Some(recall.clone()),
             // Codex round-2 MAJOR 3 (PR #1327 review): the top-level
             // gateway actor factory is the "admin" path that dispatches
             // by detected profile through `profile_factory.rs`. It
@@ -1465,6 +1489,7 @@ impl GatewayRuntime {
                     tool_config: tool_config.clone(),
                     memory: memory.clone(),
                     memory_store: memory_store.clone(),
+                    recall: recall.clone(),
                     agent_config: actor_factory.agent_config.clone(),
                     session_mgr: session_mgr.clone(),
                     out_tx: out_tx.clone(),

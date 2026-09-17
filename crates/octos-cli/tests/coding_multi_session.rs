@@ -192,6 +192,10 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
         data_dir,
         octos_agent::create_sandbox(&sandbox),
     );
+    let recall = Arc::new(
+        octos_memory::RecallStore::open(data_dir, octos_memory::RecallConfig::default())
+            .expect("recall store"),
+    );
     Arc::new(ProfileRuntime {
         profile_id: profile_id.to_string(),
         data_dir: data_dir.to_path_buf(),
@@ -230,6 +234,7 @@ async fn make_m11g_profile(profile_id: &str, data_dir: &std::path::Path) -> Arc<
         voice: octos_cli::config::VoiceConfig::default(),
         memory,
         memory_store,
+        recall,
         embedder: None,
         memory_inject_tokens: 2500,
         memory_refresh_enabled: false,

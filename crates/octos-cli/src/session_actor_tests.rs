@@ -6379,6 +6379,7 @@ async fn build_minimal_actor_factory(
         adaptive_router: None,
         lane_routing: None,
         memory_store: None,
+        recall: None,
         profile_id,
         plugin_dirs: Vec::new(),
         plugin_extra_env: Vec::new(),

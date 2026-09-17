@@ -243,6 +243,8 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
             "save_memory",
             "memory_note",
             "record_memory_use",
+            "memory_search",
+            "memory_load",
         ],
     },
     ToolGroupInfo {

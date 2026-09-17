@@ -760,6 +760,10 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let recall = Arc::new(
+            octos_memory::RecallStore::open(&data_dir, octos_memory::RecallConfig::default())
+                .unwrap(),
+        );
         let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
         let sandbox = SandboxConfig::default();
         let base_tools =
@@ -801,6 +805,7 @@ mod tests {
             },
             memory,
             memory_store,
+            recall,
             embedder: None,
             memory_inject_tokens: 2500,
             memory_refresh_enabled: false,
