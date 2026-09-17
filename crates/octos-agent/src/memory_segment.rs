@@ -102,10 +102,11 @@ pub struct MemorySegmentProvider {
     recall: Option<Arc<RecallStore>>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     last: tokio::sync::Mutex<Option<Fingerprint>>,
-    /// `bank/entities/` mtime at the last index sync; a change (save_memory,
-    /// consolidation, a manual edit) re-syncs the Knowledge index before
-    /// ranking, so newly saved pages are searchable within the same session.
-    last_bank_sync: tokio::sync::Mutex<Option<Option<SystemTime>>>,
+    /// Bank stamp (page count + newest page mtime) at the last index sync; a
+    /// change (save_memory, consolidation, an in-place edit) re-syncs the
+    /// Knowledge index before ranking, so saved pages are searchable within
+    /// the same session.
+    last_bank_sync: tokio::sync::Mutex<Option<(usize, Option<SystemTime>)>>,
 }
 
 impl MemorySegmentProvider {
@@ -142,12 +143,23 @@ impl MemorySegmentProvider {
     /// sync (cheap stat otherwise).
     async fn resync_bank_if_changed(&self) {
         let Some(recall) = &self.recall else { return };
-        let bank_dir = tokio::fs::metadata(self.store.bank_entities_dir())
-            .await
-            .ok()
-            .and_then(|m| m.modified().ok());
+        // Directory mtime misses in-place edits, so stamp the pages
+        // themselves: count + newest modification time.
+        let mut stamp: (usize, Option<SystemTime>) = (0, None);
+        if let Ok(mut entries) = tokio::fs::read_dir(self.store.bank_entities_dir()).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.path().extension().is_some_and(|e| e == "md") {
+                    stamp.0 += 1;
+                    if let Ok(m) = entry.metadata().await {
+                        if let Ok(t) = m.modified() {
+                            stamp.1 = Some(stamp.1.map_or(t, |prev| prev.max(t)));
+                        }
+                    }
+                }
+            }
+        }
         let mut last = self.last_bank_sync.lock().await;
-        if last.as_ref() == Some(&bank_dir) {
+        if last.as_ref() == Some(&stamp) {
             return;
         }
         if let Err(e) =
@@ -155,7 +167,7 @@ impl MemorySegmentProvider {
         {
             tracing::warn!(error = %e, "memory segment: bank index sync failed");
         }
-        *last = Some(bank_dir);
+        *last = Some(stamp);
     }
 
     async fn rank_for(&self, query: Option<&str>) -> Vec<String> {

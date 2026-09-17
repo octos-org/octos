@@ -462,16 +462,28 @@ impl RecallStore {
         std::fs::write(&tmp, serde_json::to_vec(&manifest)?)?;
         std::fs::rename(&tmp, dir.join(MANIFEST_FILE))?;
         // The generation and embedder also live in redb so a manifest from
-        // a stale copy of the directory cannot pass.
+        // a stale copy of the directory cannot pass. A mutation that committed
+        // a NEWER generation between the dump and this write must win: then
+        // the manifest describes a stale graph and the mismatch forces a
+        // rebuild on the next open, which is the correct outcome.
         let txn = self.db.begin_write()?;
+        let mut stale = false;
         {
             let mut mt = txn.open_table(META_TABLE)?;
-            mt.insert("embedder", self.config.embedder_id.as_str())?;
-            mt.insert("dimension", self.config.dimension.to_string().as_str())?;
-            mt.insert("generation", generation.to_string().as_str())?;
+            let stored: u64 = mt
+                .get("generation")?
+                .and_then(|v| v.value().parse().ok())
+                .unwrap_or(0);
+            if stored > generation {
+                stale = true;
+            } else {
+                mt.insert("embedder", self.config.embedder_id.as_str())?;
+                mt.insert("dimension", self.config.dimension.to_string().as_str())?;
+                mt.insert("generation", generation.to_string().as_str())?;
+            }
         }
         txn.commit()?;
-        *self.graph_persisted.write().unwrap() = true;
+        *self.graph_persisted.write().unwrap() = !stale;
         Ok(())
     }
 
@@ -497,11 +509,19 @@ impl RecallStore {
 
     /// Rebuild when tombstoned vectors outgrow a quarter of the live graph.
     fn compact_if_needed(&self) -> Result<()> {
-        let (tomb, live) = {
+        let (tomb_vec, live_vec, tomb_docs, live_docs) = {
             let index = self.index.read().unwrap();
-            (index.tombstoned_vectors(), index.live_vector_points())
+            (
+                index.tombstoned_vectors(),
+                index.live_vector_points(),
+                index.tombstoned_docs(),
+                index.live_docs(),
+            )
         };
-        if tomb >= COMPACT_MIN_TOMBSTONES && tomb * 4 > live.max(1) {
+        let vectors_bloated = tomb_vec >= COMPACT_MIN_TOMBSTONES && tomb_vec * 4 > live_vec.max(1);
+        let postings_bloated =
+            tomb_docs >= COMPACT_MIN_TOMBSTONES && tomb_docs * 4 > live_docs.max(1);
+        if vectors_bloated || postings_bloated {
             self.rebuild()?;
         }
         Ok(())
@@ -654,7 +674,7 @@ impl RecallStore {
             }
         }
         txn.commit()?;
-        if vector_changes {
+        if report.inserted + report.updated > 0 {
             self.compact_if_needed()?;
         }
         Ok(report)
@@ -705,14 +725,20 @@ impl RecallStore {
     /// Count a load: visits + 1, last_visit = now, and make the vector
     /// resident again if it had aged out of the graph.
     pub fn touch(&self, id: &str) -> Result<bool> {
-        let Some(mut record) = self.get(id)? else {
-            return Ok(false);
-        };
-        record.visits = record.visits.saturating_add(1);
-        record.last_visit = Some(Utc::now());
         let txn = self.db.begin_write()?;
         {
             let mut rt = txn.open_table(RECORDS_TABLE)?;
+            // Read-modify-write inside ONE write transaction: redb serialises
+            // writers, so a concurrent ingest can neither be overwritten by
+            // this bump nor lose it.
+            let Some(mut record) = rt
+                .get(id)?
+                .and_then(|v| serde_json::from_str::<Record>(v.value()).ok())
+            else {
+                return Ok(false);
+            };
+            record.visits = record.visits.saturating_add(1);
+            record.last_visit = Some(Utc::now());
             rt.insert(id, serde_json::to_string(&record)?.as_str())?;
             let vt = txn.open_table(VECTORS_TABLE)?;
             // Lock order everywhere: index, then meta.
@@ -787,23 +813,49 @@ impl RecallStore {
             }
         }
         report.records_deleted = self.delete(&to_delete)?;
-        // Global resident-vector budget: evict the coldest resident vectors.
-        let mut resident: Vec<(String, f32)> = by_source
-            .values()
-            .flatten()
-            .filter(|(_, _, r)| *r)
-            .map(|(id, heat, _)| (id.clone(), *heat))
+        // Residency by heat: the hottest `max_resident_vectors` records that
+        // have a stored vector belong in the graph; colder residents leave it
+        // and hotter non-residents (new ingests that found the graph full,
+        // aged-out records that were visited) enter it.
+        let (desired, resident_now): (Vec<String>, Vec<String>) = {
+            let meta = self.meta.read().unwrap();
+            let mut with_vectors: Vec<(String, f32)> = by_source
+                .values()
+                .flatten()
+                .filter(|(id, _, _)| meta.get(id).is_some_and(|m| m.stored_vector))
+                .map(|(id, heat, _)| (id.clone(), *heat))
+                .collect();
+            with_vectors.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            with_vectors.truncate(self.config.max_resident_vectors);
+            let desired: Vec<String> = with_vectors.into_iter().map(|(id, _)| id).collect();
+            let resident_now: Vec<String> = meta
+                .iter()
+                .filter(|(_, m)| m.resident)
+                .map(|(id, _)| id.clone())
+                .collect();
+            (desired, resident_now)
+        };
+        let desired_set: std::collections::HashSet<&String> = desired.iter().collect();
+        let evict: Vec<String> = resident_now
+            .iter()
+            .filter(|id| !desired_set.contains(id))
+            .cloned()
             .collect();
-        if resident.len() > self.config.max_resident_vectors {
-            resident.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            let excess = resident.len() - self.config.max_resident_vectors;
-            let evict: Vec<String> = resident.drain(..excess).map(|(id, _)| id).collect();
-            let records = self.records_by_ids(&evict)?;
+        let resident_set: std::collections::HashSet<&String> = resident_now.iter().collect();
+        let admit: Vec<String> = desired
+            .iter()
+            .filter(|id| !resident_set.contains(id))
+            .cloned()
+            .collect();
+        let mut vectors_admitted = 0usize;
+        if !evict.is_empty() || !admit.is_empty() {
+            let evict_records = self.records_by_ids(&evict)?;
             let txn = self.db.begin_write()?;
             {
+                let vt = txn.open_table(VECTORS_TABLE)?;
                 let mut index = self.index.write().unwrap();
                 let mut meta = self.meta.write().unwrap();
-                for r in records {
+                for r in evict_records {
                     index.remove(&r.id);
                     index.insert(&r.id, &r.index_text(), None);
                     if let Some(m) = meta.get_mut(&r.id) {
@@ -811,12 +863,28 @@ impl RecallStore {
                     }
                     report.vectors_evicted += 1;
                 }
+                for id in &admit {
+                    if index.live_vector_points() >= self.config.max_resident_vectors {
+                        break;
+                    }
+                    if let Some(q) = vt
+                        .get(id.as_str())?
+                        .and_then(|b| QuantizedVector::from_bytes(b.value()))
+                    {
+                        if index.add_embedding(id, &q.to_f32()) {
+                            if let Some(m) = meta.get_mut(id) {
+                                m.resident = true;
+                            }
+                            vectors_admitted += 1;
+                        }
+                    }
+                }
                 let generation = self.next_generation();
                 self.write_meta(&txn, generation)?;
             }
             txn.commit()?;
         }
-        if report.vectors_evicted > 0 {
+        if report.vectors_evicted > 0 || vectors_admitted > 0 {
             self.compact_if_needed()?;
         }
         Ok(report)
@@ -825,7 +893,21 @@ impl RecallStore {
     /// Rebuild the graph from stored vectors (after aging, an embedder
     /// change or a crash) and persist it.
     pub fn rebuild(&self) -> Result<()> {
+        for _attempt in 0..4 {
+            if self.try_rebuild()? {
+                return Ok(());
+            }
+        }
+        tracing::warn!("recall: rebuild kept racing with ingest; keeping the live index");
+        Ok(())
+    }
+
+    /// One rebuild attempt: snapshot, build, then install only if no
+    /// mutation landed meanwhile (generation unchanged). Returns `false`
+    /// when a concurrent mutation won and the caller should retry.
+    fn try_rebuild(&self) -> Result<bool> {
         let now = Utc::now();
+        let started_at = *self.generation.read().unwrap();
         let records = self.all_records()?;
         let vectors: HashMap<String, QuantizedVector> = {
             let txn = self.db.begin_read()?;
@@ -861,10 +943,14 @@ impl RecallStore {
         drop(meta);
         {
             let mut slot = self.index.write().unwrap();
+            if *self.generation.read().unwrap() != started_at {
+                return Ok(false);
+            }
             *slot = index;
             let _ = self.next_generation();
         }
-        self.persist_index()
+        self.persist_index()?;
+        Ok(true)
     }
 
     // ------------------------------------------------------------ read
@@ -1137,6 +1223,11 @@ pub fn record_from_episode(ep: &crate::Episode) -> Record {
         summary,
     );
     r.parent = Some(ep.working_dir.to_string_lossy().to_string());
+    // The abstract is capped; keep the whole summary so `memory_load` returns
+    // more than the search row already showed.
+    if summary.len() > r.abstract_.len() {
+        r.body = Some(summary.to_string());
+    }
     r.fingerprint = format!("{:x}", md5_like(summary));
     r
 }
@@ -1397,6 +1488,134 @@ mod tests {
             1,
             "a foreign open must not destroy vectors"
         );
+    }
+
+    #[test]
+    fn should_keep_hottest_records_resident_when_aging() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(4);
+        c.max_resident_vectors = 2;
+        c.hot_days = 30;
+        let store = RecallStore::open(dir.path(), c).unwrap();
+        // Two old-but-resident records fill the graph first…
+        store
+            .upsert(
+                vec![
+                    doc("old1", "old one", "x", 400),
+                    doc("old2", "old two", "y", 400),
+                ],
+                vec![
+                    Some(vec![1.0, 0.0, 0.0, 0.0]),
+                    Some(vec![0.0, 1.0, 0.0, 0.0]),
+                ],
+            )
+            .unwrap();
+        store.touch("doc:mail:old1").unwrap();
+        store.touch("doc:mail:old2").unwrap();
+        assert_eq!(store.stats().vectors_resident, 2);
+        // …so a fresh, hot record cannot enter on insert.
+        store
+            .upsert(
+                vec![doc("new", "fresh", "z", 0)],
+                vec![Some(vec![0.0, 0.0, 1.0, 0.0])],
+            )
+            .unwrap();
+        assert_eq!(store.stats().vectors_resident, 2);
+        // Aging re-selects residents by heat: the fresh record replaces the
+        // coldest of the two.
+        let far_future = Utc::now() + Duration::days(200);
+        store.age(far_future).unwrap();
+        assert_eq!(store.stats().vectors_resident, 2);
+        let hits = store
+            .search(
+                "fresh",
+                Some(&[0.0, 0.0, 1.0, 0.0]),
+                &SearchFilter {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits[0].id, "doc:mail:new");
+    }
+
+    #[test]
+    fn should_not_roll_back_generation_when_persisting_a_stale_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+            store
+                .upsert(
+                    vec![doc("a", "alpha", "x", 1)],
+                    vec![Some(vec![1.0, 0.0, 0.0, 0.0])],
+                )
+                .unwrap();
+            store.persist_index().unwrap();
+            // Simulate a mutation that committed a newer generation than the
+            // snapshot about to be written: bump the database generation
+            // behind the store's back.
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut mt = txn.open_table(META_TABLE).unwrap();
+                mt.insert("generation", "999").unwrap();
+            }
+            txn.commit().unwrap();
+            store.persist_index().unwrap();
+            assert!(
+                !store.stats().graph_persisted,
+                "a stale snapshot must not claim persistence"
+            );
+        }
+        let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+        assert!(!store.stats().graph_persisted || store.stats().vectors_resident == 1);
+    }
+
+    #[test]
+    fn should_restore_tombstone_accounting_from_a_persisted_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cfg(4);
+        c.max_resident_vectors = 2;
+        {
+            let store = RecallStore::open(dir.path(), c.clone()).unwrap();
+            store
+                .upsert(
+                    vec![doc("a", "alpha", "x", 1), doc("b", "beta", "y", 1)],
+                    vec![
+                        Some(vec![1.0, 0.0, 0.0, 0.0]),
+                        Some(vec![0.0, 1.0, 0.0, 0.0]),
+                    ],
+                )
+                .unwrap();
+            // Update a → its old point becomes a tombstone in the graph.
+            let mut a2 = doc("a", "alpha again", "x", 1);
+            a2.fingerprint = "fp-a2".into();
+            store
+                .upsert(vec![a2], vec![Some(vec![1.0, 0.0, 0.0, 0.0])])
+                .unwrap();
+            store.persist_index().unwrap();
+        }
+        let store = RecallStore::open(dir.path(), c).unwrap();
+        // With tombstones counted, a further update still keeps both resident.
+        let mut b2 = doc("b", "beta again", "y", 1);
+        b2.fingerprint = "fp-b2".into();
+        store
+            .upsert(vec![b2], vec![Some(vec![0.0, 1.0, 0.0, 0.0])])
+            .unwrap();
+        assert_eq!(store.stats().vectors_resident, 2);
+    }
+
+    #[test]
+    fn should_keep_the_full_episode_summary_as_body() {
+        let ep = crate::Episode::new(
+            octos_core::TaskId::new(),
+            octos_core::AgentId::new("a"),
+            std::path::PathBuf::from("/tmp"),
+            "Fixed the parser.\n".to_string() + &"More detail. ".repeat(40),
+            crate::EpisodeOutcome::Success,
+        );
+        let r = record_from_episode(&ep);
+        assert_eq!(r.title, "Fixed the parser.");
+        assert!(r.body.as_ref().is_some_and(|b| b.len() > r.abstract_.len()));
     }
 
     #[test]

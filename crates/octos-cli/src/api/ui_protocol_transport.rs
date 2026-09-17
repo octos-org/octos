@@ -34398,7 +34398,11 @@ async fn run_standalone_turn(
     // Same refresh-before-snapshot rule as the review path: the cached
     // agent's memory segment must be current before the per-turn agent
     // clones its prompt.
-    session_runtime.agent.refresh_prompt_segments().await;
+    // The turn's prompt lets the memory segment rank bank pages for it.
+    session_runtime
+        .agent
+        .refresh_prompt_segments_for(Some(prompt.as_str()))
+        .await;
     let combined_memory_segment = session_runtime
         .agent
         .prompt_segment_snapshot(octos_agent::MEMORY_SEGMENT_NAME)

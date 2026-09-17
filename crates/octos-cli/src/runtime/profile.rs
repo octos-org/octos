@@ -1851,9 +1851,14 @@ pub(crate) fn recall_config_for(
     if let Some(e) = embedder {
         recall_config.dimension = recall_config.dimension.min(e.dimension());
     }
+    // The embedder id is only claimed when an embedder actually loaded: a
+    // non-empty id lets the store adopt a new geometry (purging foreign
+    // vectors), which must never happen because credentials or a model file
+    // were merely unavailable this run.
     recall_config.embedder_id = config
         .embedding
         .as_ref()
+        .filter(|_| embedder.is_some())
         .map(|e| {
             format!(
                 "{}/{}",
@@ -1882,14 +1887,21 @@ pub(crate) fn spawn_recall_maintenance(
             tracing::warn!(profile = %profile_id, error = %e, "recall: bank sync failed");
         }
         if let Some(e) = embedder.as_deref() {
-            match octos_agent::memory_index::backfill_vectors(&recall, e, 2_000).await {
-                Ok(n) if n > 0 => {
-                    tracing::info!(profile = %profile_id, vectors = n, "recall: backfilled vectors")
+            // Drain the whole backlog in bounded batches (an embedder change
+            // on a large store) instead of stopping after the first batch.
+            let mut total = 0usize;
+            loop {
+                match octos_agent::memory_index::backfill_vectors(&recall, e, 512).await {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(err) => {
+                        tracing::warn!(profile = %profile_id, error = %err, "recall: vector backfill failed");
+                        break;
+                    }
                 }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(profile = %profile_id, error = %err, "recall: vector backfill failed")
-                }
+            }
+            if total > 0 {
+                tracing::info!(profile = %profile_id, vectors = total, "recall: backfilled vectors");
             }
         }
         let aged = {

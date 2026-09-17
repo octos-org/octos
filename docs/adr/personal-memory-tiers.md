@@ -119,7 +119,8 @@ What landed with this record (phase 1 in Octoscript-AppCard, phases 2–3 here):
 - One tool and one index to reason about; the bank keeps its editable, auditable form.
 - The embedder becomes optional rather than a precondition for recall.
 - Costs: a persisted graph and quantised vectors add code in `octos-memory`; ingestion adds a write API the kernel deliberately lacked — it must inherit the guard and the viewer-only routes' authentication.
-- Open questions: llama.cpp embedder build for Android arm64; retrieval quality at 256 d on real mail (measure before committing); the pane-model vs kernel-agent tool split in the phone shell (skills reach the kernel, module tools do not).
+- Measured on the OnePlus 6 (Snapdragon 845, Android 15, EmbeddingGemma-300M Q8_0 via llama.cpp cross-built for arm64 without dotprod, 4 threads): model load ≈ 2 s; prompt processing ≈ 139 tok/s (`llama-bench pp128`), ≈ 115 tok/s on real batched records; 64 real mail/calendar records (≈ 6.8k tokens) embedded in 57 s ≈ 0.9 s per record; a batch of four short queries ≈ 0.5 s after load, ≈ 120 ms per query; peak RSS ≈ 636 MB (weights 312 MiB + context). Q4_0 was slower here (75 s for the same records, 581 MB): without dotprod the Q8 kernels win on this CPU. Consequence: query-time embedding is fine on the phone; bulk ingest must run in the background at ≈ 1 record/s, which the design already allows because BM25 answers immediately and vectors backfill in bounded batches. Retrieval quality at 256 d was checked on real data (Mac): semantic queries with no keyword overlap rank the right record first.
+- Open questions: the pane-model vs kernel-agent tool split in the phone shell (skills reach the kernel, module tools do not); the embedder's memory footprint on the phone (≈ 600 MB resident while loaded) argues for loading it on demand and unloading after ingest.
 
 ## References
 

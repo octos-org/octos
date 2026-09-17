@@ -41,6 +41,9 @@ pub struct HybridIndex {
     /// count `hnsw_points - tombstoned_vectors` and the owner compacts by
     /// rebuilding once tombstones pile up.
     tombstoned_vectors: usize,
+    /// All entries tombstoned by [`Self::remove`] (with or without a vector);
+    /// their BM25 postings stay until a rebuild.
+    tombstoned_docs: usize,
 }
 
 /// How much of the index is actually reachable by vector search.
@@ -211,6 +214,7 @@ impl HybridIndex {
             dimension_mismatches: 0,
             mismatch_logged: false,
             tombstoned_vectors: 0,
+            tombstoned_docs: 0,
         }
     }
 
@@ -381,6 +385,16 @@ impl HybridIndex {
         self.tombstoned_vectors
     }
 
+    /// Entries removed since this index was built (BM25 postings retained).
+    pub fn tombstoned_docs(&self) -> usize {
+        self.tombstoned_docs
+    }
+
+    /// Entries that are not tombstoned.
+    pub fn live_docs(&self) -> usize {
+        self.ids.len().saturating_sub(self.tombstoned_docs)
+    }
+
     /// Insertion-ordered `(id, has_vector)` pairs, tombstones as empty ids.
     /// This is the manifest a persisted graph needs: HNSW point ids are the
     /// positions in this list.
@@ -433,10 +447,15 @@ impl HybridIndex {
         }
         for (id, has_vector) in layout {
             if id.is_empty() {
-                // Tombstone: keep the slot so later positions still line up.
+                // Tombstone: keep the slot so later positions still line up,
+                // and keep counting its graph point as dead capacity.
                 self.ids.push(String::new());
                 self.doc_lengths.push(0);
-                self.has_embedding.push(false);
+                self.has_embedding.push(*has_vector);
+                self.tombstoned_docs += 1;
+                if *has_vector {
+                    self.tombstoned_vectors += 1;
+                }
                 continue;
             }
             let text = text_of(id).unwrap_or_default();
@@ -458,6 +477,7 @@ impl HybridIndex {
     pub fn remove(&mut self, episode_id: &str) -> bool {
         if let Some(pos) = self.ids.iter().position(|id| id == episode_id) {
             self.ids[pos].clear(); // tombstone — HNSW indices stay stable
+            self.tombstoned_docs += 1;
             if self.has_embedding[pos] {
                 self.tombstoned_vectors += 1;
             }
