@@ -19387,9 +19387,11 @@ fn ledger_event_matches_topic_scope(
 /// `send_notification_durable` dispatch and all of them carry tenant text
 /// (goal objective, loop prompt, monitor argv/name).
 ///
-/// `MonitorFired` and `BackgroundActivity` are the exceptions to "stamped by
-/// `resolve_autonomy_profile_id`": both are emitted off the continuation drain
-/// from a stored record, and that record's profile is the TURN's
+/// `MonitorFired`, `MonitorExpired` and `BackgroundActivity` are the
+/// exceptions to "stamped by
+/// `resolve_autonomy_profile_id`": all three are emitted off runtime sites
+/// from a stored record (the continuation drain for a fire, the expiry
+/// transition for an expiry), and that record's profile is the TURN's
 /// `ProfileRuntime` id whenever the monitor or fleet was created by a model
 /// tool. Filtering them is safe only because
 /// [`connection_filterable_profile_scope`] refuses to filter on a scope that
@@ -19412,8 +19414,7 @@ fn ledger_event_matches_topic_scope(
 /// (`connection_profile_id.or(routed_profile_id)` — `validate_session_scope`
 /// never consults the routed id). Filtering them before that divergence is
 /// closed would starve exactly the reconnect-replay path they exist for. See
-/// issue #2081. `LoopCompleted` / `MonitorExpired` have no producer at all
-/// (issue #2080).
+/// issue #2081.
 ///
 /// Every arm below prefers the event's top-level stamp and falls back to the
 /// profile on the record it carries. The fallback is not cosmetic: the
@@ -19522,6 +19523,19 @@ fn ledger_event_matches_profile_scope(
         UiNotification::MonitorFired(fired) => {
             optional_profile_scope_matches(fired.profile_id.as_deref(), profile_id)
         }
+        // #2080 — `monitor/expired` is stamped at the expiry transition from
+        // the STORED record (same turn-derived profile as `MonitorFired`), and
+        // the nested `monitor` snapshot carries it too; top-level first, then
+        // the nested fallback, mirroring every other monitor arm.
+        UiNotification::MonitorExpired(expired) => optional_profile_scope_matches(
+            expired.profile_id.as_deref().or_else(|| {
+                expired
+                    .monitor_state
+                    .as_ref()
+                    .and_then(|monitor| monitor.profile_id.as_deref())
+            }),
+            profile_id,
+        ),
         // `session/open` is appended for BROADCAST — the emit site tags it with
         // the opening connection id specifically so OTHER connections observe
         // it — and it carries `workspace_root`, the context snapshot and pane
@@ -19547,8 +19561,9 @@ fn ledger_event_matches_profile_scope(
         // always the TURN's `ProfileRuntime` id; the monitor origin is likewise
         // `ProfileRuntime`-derived whenever the monitor came from
         // `monitor_create` rather than the `monitor/create` RPC. Together with
-        // `MonitorFired` below, these are the only two arms here whose stamp can
-        // come from the turn rather than from `resolve_autonomy_profile_id` —
+        // `MonitorFired` and `MonitorExpired` above, these are the only arms
+        // here whose stamp can come from the turn rather than from
+        // `resolve_autonomy_profile_id` —
         // which is exactly why filtering is gated on
         // `connection_filterable_profile_scope`, under which the two resolutions
         // provably agree.
@@ -24113,6 +24128,49 @@ pub(crate) fn spawn_background_activity_sink(state: Arc<AppState>) {
         while let Some(event) = rx.recv().await {
             let _ =
                 send_notification_durable(&ws, &ledger, UiNotification::BackgroundActivity(event));
+        }
+    });
+}
+
+/// #2080 — install the process-global `monitor/expired` sink and spawn its
+/// drain task. The producers (the reconcile sweep's expiry pass and the
+/// watcher's own deadline report, both in
+/// [`crate::autonomy::agent_orchestrator`]) run connection-independently, so
+/// — exactly like the `background/activity` human sink above — the sink is a
+/// bounded-channel `try_send` and the drain appends each event to the durable
+/// per-session ledger via [`send_notification_durable`] over a DETACHED
+/// connection. Connected clients receive the frame on their session's live
+/// forwarder; disconnected clients replay it by cursor on reconnect. Both
+/// boundaries apply the receiver's own `coding.monitor_runtime.v1` capability
+/// gate and profile-scope filter.
+pub(crate) fn spawn_monitor_expired_sink(state: Arc<AppState>) {
+    let (tx, mut rx) = mpsc::channel::<octos_core::ui_protocol::MonitorExpiredEvent>(
+        BACKGROUND_ACTIVITY_QUEUE_CAPACITY,
+    );
+    // Best-effort, non-blocking producer side — one caller is a watcher task.
+    crate::autonomy::agent_orchestrator::set_monitor_expired_sink(std::sync::Arc::new(
+        move |event: octos_core::ui_protocol::MonitorExpiredEvent| {
+            if let Err(err) = tx.try_send(event) {
+                metrics::counter!("ws.monitor_expired.drop").increment(1);
+                tracing::debug!(
+                    target: "octos::ui_protocol::ws",
+                    reason = %err,
+                    "monitor/expired dropped: sink queue full or closed"
+                );
+            }
+        },
+    ));
+    tokio::spawn(async move {
+        // Detached connection: there is no live peer. Outbound frames are
+        // discarded by a drain task (the durable record is the ledger); keep
+        // the receiver alive so sends never backpressure-fail.
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
+        tokio::spawn(async move { while writer_rx.recv().await.is_some() {} });
+        let ws = WsConnection::new(writer_tx);
+        let ledger = event_ledger(&state).await;
+        info!("monitor/expired sink started (#2080)");
+        while let Some(event) = rx.recv().await {
+            let _ = send_notification_durable(&ws, &ledger, UiNotification::MonitorExpired(event));
         }
     });
 }
@@ -42955,7 +43013,6 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::SessionGoalCleared(_)
             | UiNotification::LoopUpdated(_)
             | UiNotification::LoopFired(_)
-            | UiNotification::LoopCompleted(_)
             // #1977 monitor notifications are stateless lifecycle pushes
             // (no durable cursor of their own), like the loop family.
             | UiNotification::MonitorUpdated(_)

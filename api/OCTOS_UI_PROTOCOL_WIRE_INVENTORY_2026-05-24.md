@@ -176,7 +176,6 @@ spec and UPCR documents. The authoritative source remains code:
 | `session/goal/cleared` | shipped, UPCR-2026-021 |
 | `loop/updated` | shipped, UPCR-2026-021 |
 | `loop/fired` | shipped, UPCR-2026-021 |
-| `loop/completed` | shipped, UPCR-2026-021 |
 | `monitor/fired` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `monitor/updated` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `monitor/expired` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |

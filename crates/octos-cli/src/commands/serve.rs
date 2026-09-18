@@ -1762,6 +1762,16 @@ impl ServeCommand {
         // it changes nothing about how or when the model is woken.
         crate::api::ui_protocol_transport::spawn_background_activity_sink(state.clone());
 
+        // #2080 — install the `monitor/expired` sink: the expiry transitions
+        // (reconcile sweep + watcher deadline) are connection-independent, so
+        // the sink and its ledger drain live here next to the human sink, for
+        // both `serve --stdio` and the HTTP serve. Ordering: the sweep that
+        // could expire a monitor is only reachable from the global drain
+        // spawned above, whose first tick is skipped — a boot-time reconcile
+        // before this install would drop frames (best-effort tap, trace-log
+        // only). Keep this install ahead of any future eager boot reconcile.
+        crate::api::ui_protocol_transport::spawn_monitor_expired_sink(state.clone());
+
         if self.stdio {
             crate::api::ui_protocol_transport::stdio_connection(state).await?;
             tracing::info!("stopping all gateway child processes");

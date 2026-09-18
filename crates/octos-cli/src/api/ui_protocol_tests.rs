@@ -15920,6 +15920,291 @@ fn monitor_updated_notification(
     })
 }
 
+/// A durable `monitor/expired`. `top_profile_id` models the emit-site stamp,
+/// `record_profile_id` the nested `monitor` snapshot's owner (#2080).
+fn monitor_expired_notification(
+    session_id: &SessionKey,
+    top_profile_id: Option<&str>,
+    record_profile_id: Option<&str>,
+    monitor_id: &str,
+) -> UiNotification {
+    UiNotification::MonitorExpired(octos_core::ui_protocol::MonitorExpiredEvent {
+        session_id: session_id.clone(),
+        profile_id: top_profile_id.map(ToOwned::to_owned),
+        monitor_id: monitor_id.to_owned(),
+        monitor_state: Some(octos_core::ui_protocol::UiMonitorRecord {
+            monitor_id: monitor_id.to_owned(),
+            session_id: session_id.clone(),
+            profile_id: record_profile_id.map(ToOwned::to_owned),
+            name: monitor_id.to_owned(),
+            argv: vec![
+                "tail".to_owned(),
+                "-f".to_owned(),
+                "/var/log/secret".to_owned(),
+            ],
+            filter_regex: None,
+            mode: "poll".to_owned(),
+            interval_seconds: Some(3),
+            batch_ms: 250,
+            max_events_per_hour: 60,
+            persistent: false,
+            status: "expired".to_owned(),
+            pause_reason: None,
+            goal_id: None,
+            last_fired_at_ms: None,
+            fires_used: 0,
+            expires_at_ms: Some(1),
+            created_at_ms: 0,
+            updated_at_ms: 1,
+        }),
+        status: Some("expired".to_owned()),
+        expired_at_ms: Some(1),
+        reason: Some("timeout".to_owned()),
+    })
+}
+
+/// #2080 — `monitor/expired` is scoped like every other monitor frame:
+/// the top-level stamp first, the nested `monitor` record as the fallback.
+/// The frame carries tenant text (monitor name + argv), so a foreign profile
+/// must never see it on ANY delivery boundary.
+#[test]
+fn monitor_expired_frames_are_visible_only_to_their_profile() {
+    let session_id = SessionKey("web-shared".into());
+    let stamped = monitor_expired_notification(&session_id, Some("alpha"), Some("alpha"), "m-1");
+    assert!(ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(stamped),
+        Some("alpha")
+    ));
+    let stamped = monitor_expired_notification(&session_id, Some("alpha"), Some("alpha"), "m-1");
+    assert!(!ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(stamped),
+        Some("beta")
+    ));
+    // The nested-fallback shape: no top-level stamp, only the `monitor`
+    // record names the owner.
+    let nested_only = monitor_expired_notification(&session_id, None, Some("alpha"), "m-1");
+    assert!(ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(nested_only),
+        Some("alpha")
+    ));
+    let nested_only = monitor_expired_notification(&session_id, None, Some("alpha"), "m-1");
+    assert!(!ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(nested_only),
+        Some("beta")
+    ));
+}
+
+/// #2080 acceptance — a monitor's expiry transition flows through the REAL
+/// production sink wiring (the same [`spawn_monitor_expired_sink`] serve
+/// installs at boot) onto the OWNING session's durable stream, from which a
+/// disconnected client replays it; the profile-scope filter then gates it
+/// exactly like the other monitor frames.
+///
+/// Sync shell over a current-thread runtime: the process-global sink test
+/// guard (a std `MutexGuard`, mirroring the `background/activity` guard
+/// discipline) must be held across the emission, and holding it across an
+/// `.await` is (rightly) denied by `await_holding_lock`.
+#[test]
+fn should_deliver_monitor_expired_through_the_production_sink_to_the_owning_session() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, InProcessAgentOrchestrator, MonitorCreateRequest,
+    };
+
+    let _guard = crate::autonomy::agent_orchestrator::monitor_expired_test_guard();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let state = Arc::new(AppState::empty_for_tests());
+        spawn_monitor_expired_sink(state.clone());
+        // The same process-wide ledger the drain task resolves.
+        let ledger = event_ledger(&state).await;
+        let owner = SessionKey("local:mon-expiry-owner".into());
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let created = orchestrator
+            .create_monitor(MonitorCreateRequest {
+                session_id: owner.clone(),
+                profile_id: "alpha".to_owned(),
+                spec: crate::autonomy::monitor_runtime::MonitorSpec {
+                    name: "wire-watch".to_owned(),
+                    argv: vec!["sh".to_owned(), "-c".to_owned(), "true".to_owned()],
+                    filter_regex: None,
+                    batch_ms: crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
+                    mode: crate::autonomy::monitor_runtime::MonitorMode::Poll { interval_secs: 3 },
+                    timeout_secs: None,
+                    persistent: false,
+                    max_events_per_hour: 5,
+                    goal_id: None,
+                    cwd: None,
+                },
+                data_dir: None,
+            })
+            .expect("create monitor");
+        let monitor_id = created["monitor_id"]
+            .as_str()
+            .expect("monitor id")
+            .to_owned();
+
+        // The watcher-deadline transition — one of the two production emit sites.
+        orchestrator.expire_monitor(&monitor_id, "timeout");
+
+        // The drain is a spawned task over a bounded channel: await the frame.
+        let resume_from = UiCursor {
+            stream: owner.0.clone(),
+            seq: 0,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (replay, position) = loop {
+            let replay = ledger
+                .replay_after(&owner, Some(&resume_from))
+                .unwrap_or_default();
+            if let Some(position) = replay.iter().position(|entry| {
+                matches!(
+                    &entry.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(_))
+                )
+            }) {
+                break (replay, position);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "monitor/expired never reached the owning session's durable stream"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        let frame = &replay[position].event;
+        let UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(event)) = frame
+        else {
+            unreachable!("position matched a MonitorExpired frame")
+        };
+        assert_eq!(event.monitor_id, monitor_id);
+        assert_eq!(event.session_id, owner);
+        assert_eq!(event.profile_id.as_deref(), Some("alpha"));
+        assert_eq!(event.status.as_deref(), Some("expired"));
+        assert_eq!(event.reason.as_deref(), Some("timeout"));
+        assert_eq!(
+            event.monitor_state.as_ref().map(|m| m.status.as_str()),
+            Some("expired"),
+            "the nested snapshot is the post-transition record"
+        );
+        // The tenant boundary the issue exists for: the owning profile passes,
+        // a foreign one is refused.
+        assert!(ledger_event_matches_profile_scope(frame, Some("alpha")));
+        assert!(!ledger_event_matches_profile_scope(frame, Some("beta")));
+        // ROUTING: a sibling session's stream stays empty.
+        let sibling = SessionKey("local:mon-expiry-sibling".into());
+        let sibling_replay = ledger
+            .replay_after(
+                &sibling,
+                Some(&UiCursor {
+                    stream: sibling.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .unwrap_or_default();
+        assert!(
+            sibling_replay.is_empty(),
+            "monitor/expired must never land on a session that did not own the monitor"
+        );
+    });
+}
+
+/// #2080 — the reconcile-sweep twin of the production-sink acceptance test
+/// above: the OTHER emit site ([`InProcessAgentOrchestrator::
+/// monitor_reconcile_pass`]) must also flow through the real sink wiring
+/// onto the owning session's durable stream. Same guard discipline: the
+/// std guard is held across a current-thread `block_on`.
+#[test]
+fn should_deliver_monitor_expired_from_the_reconcile_sweep_through_the_production_sink() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, InProcessAgentOrchestrator, MonitorCreateRequest,
+    };
+
+    let _guard = crate::autonomy::agent_orchestrator::monitor_expired_test_guard();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let state = Arc::new(AppState::empty_for_tests());
+        spawn_monitor_expired_sink(state.clone());
+        let ledger = event_ledger(&state).await;
+        let owner = SessionKey("local:mon-expiry-sweep-owner".into());
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let created = orchestrator
+            .create_monitor(MonitorCreateRequest {
+                session_id: owner.clone(),
+                profile_id: "alpha".to_owned(),
+                spec: crate::autonomy::monitor_runtime::MonitorSpec {
+                    name: "sweep-watch".to_owned(),
+                    argv: vec!["sh".to_owned(), "-c".to_owned(), "true".to_owned()],
+                    filter_regex: None,
+                    batch_ms: crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
+                    mode: crate::autonomy::monitor_runtime::MonitorMode::Poll { interval_secs: 3 },
+                    // One-second TTL: the next sweep after it lapses performs
+                    // the active→expired transition.
+                    timeout_secs: Some(1),
+                    persistent: false,
+                    max_events_per_hour: 5,
+                    goal_id: None,
+                    cwd: None,
+                },
+                data_dir: None,
+            })
+            .expect("create monitor");
+        let monitor_id = created["monitor_id"]
+            .as_str()
+            .expect("monitor id")
+            .to_owned();
+
+        // Let the TTL lapse, then run the sweep — the production emit site.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        orchestrator.monitor_reconcile_pass();
+
+        let resume_from = UiCursor {
+            stream: owner.0.clone(),
+            seq: 0,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let replay = ledger
+                .replay_after(&owner, Some(&resume_from))
+                .unwrap_or_default();
+            if let Some(entry) = replay.iter().find(|entry| {
+                matches!(
+                    &entry.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(_))
+                )
+            }) {
+                let UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(event)) =
+                    &entry.event
+                else {
+                    unreachable!("find matched a MonitorExpired frame")
+                };
+                assert_eq!(event.monitor_id, monitor_id);
+                assert_eq!(event.session_id, owner);
+                assert_eq!(event.profile_id.as_deref(), Some("alpha"));
+                assert_eq!(event.reason.as_deref(), Some("timeout"));
+                assert!(ledger_event_matches_profile_scope(
+                    &entry.event,
+                    Some("alpha")
+                ));
+                assert!(!ledger_event_matches_profile_scope(
+                    &entry.event,
+                    Some("beta")
+                ));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sweep-driven monitor/expired never reached the owning session's durable stream"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    });
+}
+
 /// #2067 — the `loop/*` and `monitor/*` frames ride the SAME durable dispatch
 /// as the goal frames (`record_autonomy_rpc_evidence` ->
 /// `send_notification_durable`) and carry the same class of tenant text (loop
@@ -17711,6 +17996,17 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
             line_count: Some(1),
             fired_at_ms: Some(0),
         }));
+    let expired = UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(
+        octos_core::ui_protocol::MonitorExpiredEvent {
+            session_id: SessionKey("local:test".into()),
+            profile_id: Some("main".into()),
+            monitor_id: "monitor_01".into(),
+            monitor_state: None,
+            status: Some("expired".into()),
+            expired_at_ms: Some(1),
+            reason: Some("timeout".into()),
+        },
+    ));
 
     // A header-present connection WITHOUT monitor runtime is denied.
     let denied = ConnectionUiFeatures {
@@ -17727,6 +18023,10 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
         !live_event_passes_capability_filter(&fired, denied),
         "monitor/fired must be filtered from a non-negotiating connection"
     );
+    assert!(
+        !live_event_passes_capability_filter(&expired, denied),
+        "monitor/expired must be filtered from a non-negotiating connection"
+    );
 
     // A negotiated connection receives them.
     let negotiated = ConnectionUiFeatures {
@@ -17737,6 +18037,7 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
     };
     assert!(live_event_passes_capability_filter(&updated, negotiated));
     assert!(live_event_passes_capability_filter(&fired, negotiated));
+    assert!(live_event_passes_capability_filter(&expired, negotiated));
 }
 
 /// #1977 blocker 6 — an unknown `mode` in `monitor/create` is a typed
