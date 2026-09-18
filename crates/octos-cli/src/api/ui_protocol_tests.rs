@@ -3863,8 +3863,37 @@ async fn stdio_ndjson_reader_rejects_oversized_frame_before_newline() {
     }
 }
 
-#[tokio::test]
-async fn stdio_connection_stops_dispatch_after_writer_failure() {
+/// The stdio loop's deep dispatch path needs more stack than a test thread is
+/// guaranteed. `#[tokio::test]` drives its future on the test thread itself, and
+/// a real request (unlike the unknown-method one the isolation test below sends)
+/// recurses deep enough through dispatch that a Windows debug build overflows —
+/// which aborts the whole test binary, taking every other test's result with
+/// it. Boxing the future does not help: the cost is the depth of the poll call
+/// chain, not the size of the stored state. Reproducible on any platform by
+/// running the test binary under `RUST_MIN_STACK=1048576`.
+///
+/// So run it the way production runs deep agent futures — on a thread with an
+/// 8 MiB stack, matching `thread_stack_size(8 * 1024 * 1024)` in the chat, ACP,
+/// gateway and MCP runtimes — rather than on whatever stack the harness hands
+/// out.
+#[test]
+fn stdio_connection_stops_dispatch_after_writer_failure() {
+    std::thread::Builder::new()
+        .name("stdio-writer-failure".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(stdio_connection_stops_dispatch_after_writer_failure_body());
+        })
+        .expect("spawn big-stack test thread")
+        .join()
+        .expect("stdio writer-failure test body panicked");
+}
+
+async fn stdio_connection_stops_dispatch_after_writer_failure_body() {
     let dispatch_count = new_stdio_dispatch_count_for_test();
     let write_failed = Arc::new(tokio::sync::Notify::new());
     let (mut input_tx, input_rx) = tokio::io::duplex(4096);
