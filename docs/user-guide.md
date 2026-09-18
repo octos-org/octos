@@ -532,7 +532,7 @@ When multiple fallback models are configured, enable adaptive routing to dynamic
 {
   "adaptive_routing": {
     "enabled": true,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -2114,7 +2114,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   // Adaptive routing
   "adaptive_routing": {
     "enabled": false,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
