@@ -622,12 +622,48 @@ async fn bind_http_listener(
 
     let listener = tokio::net::TcpListener::bind((host, requested_port))
         .await
-        .wrap_err_with(|| format!("failed to bind octos API server to {host}:{requested_port}"))?;
+        .map_err(|error| bind_listener_error(host, requested_port, error))?;
     let actual_port = listener
         .local_addr()
         .wrap_err("failed to inspect bound octos API listener")?
         .port();
     Ok((Some(listener), actual_port))
+}
+
+/// Wrap a listener bind failure. An occupied port gets the remediation the
+/// data-dir lock error already sets the bar for (#2385): how to find the
+/// holder and the `--port` escape hatch. Every other failure keeps the bare
+/// wrap — the io error stays as the `Caused by:` source either way.
+fn bind_listener_error(host: &str, requested_port: u16, error: std::io::Error) -> eyre::Report {
+    let target = format!("{host}:{requested_port}");
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        eyre::Report::new(error).wrap_err(format!(
+            "failed to bind octos API server to {target}: the port is already in use. \
+             Find the holder with `{}`, or pass `--port` to choose another.",
+            port_holder_hint(requested_port)
+        ))
+    } else {
+        eyre::Report::new(error).wrap_err(format!("failed to bind octos API server to {target}"))
+    }
+}
+
+/// Platform-appropriate command for finding which process holds `port`
+/// (the issue's "or your platform equivalent").
+#[cfg(target_os = "linux")]
+fn port_holder_hint(port: u16) -> String {
+    // iproute2's `ss` ships with the base system on essentially every distro
+    // (minimal container images included); `lsof` frequently does not.
+    format!("ss -ltnp 'sport = :{port}'")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn port_holder_hint(port: u16) -> String {
+    format!("lsof -i :{port}")
+}
+
+#[cfg(windows)]
+fn port_holder_hint(port: u16) -> String {
+    format!("netstat -ano | findstr :{port}")
 }
 
 /// Stable, machine-greppable marker embedded in the "data directory is already
@@ -2302,6 +2338,77 @@ mod tests {
         // to the auto-generated-token path for non-loopback binds.
         assert_eq!(resolve_auth_token(None, None, Some("")), None);
         assert_eq!(resolve_auth_token(None, None, None), None);
+    }
+
+    /// #2385: an occupied port is the one bind failure a user can fix from
+    /// the message alone, so it must say the port is taken, how to find the
+    /// holder, and the `--port` escape hatch — while keeping the io error as
+    /// the source.
+    #[test]
+    fn bind_error_on_addr_in_use_carries_remediation() {
+        let report = bind_listener_error(
+            "127.0.0.1",
+            8080,
+            std::io::Error::from(std::io::ErrorKind::AddrInUse),
+        );
+        let rendered = format!("{report}");
+        assert!(rendered.contains("already in use"), "actual: {rendered}");
+        assert!(rendered.contains("--port"), "actual: {rendered}");
+        #[cfg(target_os = "linux")]
+        assert!(
+            rendered.contains("ss -ltnp 'sport = :8080'"),
+            "actual: {rendered}"
+        );
+        #[cfg(all(unix, not(target_os = "linux")))]
+        assert!(rendered.contains("lsof -i :8080"), "actual: {rendered}");
+        #[cfg(windows)]
+        assert!(
+            rendered.contains("netstat -ano | findstr :8080"),
+            "actual: {rendered}"
+        );
+        assert!(report.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        }));
+    }
+
+    #[test]
+    fn bind_error_other_kinds_keep_the_bare_wrap() {
+        let report = bind_listener_error(
+            "127.0.0.1",
+            8080,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(
+            format!("{report}"),
+            "failed to bind octos API server to 127.0.0.1:8080"
+        );
+        assert!(report.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        }));
+    }
+
+    /// The remediation path must key off the REAL OS error, not just the
+    /// synthesized kind: hold a socket and drive the production bind through
+    /// it.
+    #[tokio::test]
+    async fn bind_http_listener_reports_remediation_for_occupied_port() {
+        let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let error = bind_http_listener(false, "127.0.0.1", port)
+            .await
+            .unwrap_err();
+        let rendered = format!("{error}");
+        assert!(rendered.contains("already in use"), "actual: {rendered}");
+        assert!(rendered.contains("--port"), "actual: {rendered}");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        }));
     }
 
     /// #2371 tripwire: the repo's own service generators must never place
