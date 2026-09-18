@@ -305,6 +305,12 @@ async fn work_secret_ws_rejects_removed_query_token_aliases() {
                     axum::http::StatusCode::UNAUTHORIZED,
                     "?{alias}= must be rejected with 401"
                 );
+                let body = response.body().as_deref().unwrap_or_default();
+                let body = std::str::from_utf8(body).unwrap_or_default();
+                assert!(
+                    body.contains("removed"),
+                    "?{alias}= 401 must name the removed parameter, got {body:?}"
+                );
             }
             other => panic!("?{alias}= must be refused, got {other:?}"),
         }

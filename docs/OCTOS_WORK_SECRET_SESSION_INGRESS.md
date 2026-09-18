@@ -80,6 +80,8 @@ async def main():
         "?ui_feature=auxiliary.rest_to_ws.v1"
     )
     headers = {"Authorization": f"Bearer {secret['session_ingress_token']}"}
+    # `additional_headers` needs websockets >= 14; older releases take
+    # the same dict as `extra_headers=`.
     async with websockets.connect(url, additional_headers=headers) as ws:
         await ws.send(json.dumps({
             "jsonrpc": "2.0",
