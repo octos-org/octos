@@ -269,8 +269,10 @@ fn looks_like_api_key(s: &str) -> bool {
 /// says "NAME ... not the key value itself"; an empty answer keeps
 /// `default`, and an invalid name is explained and re-asked. The retry
 /// loop is bounded so piped/automated stdin cannot hang the wizard:
-/// after 3 invalid answers the input is accepted with a warning (the
-/// old single-shot behavior).
+/// after 3 invalid answers it **fails closed** and falls back to the
+/// default name — an invalid `api_key_env` can never work at runtime,
+/// and accepting one would reintroduce the #1510 failure mode through
+/// the automated path.
 fn prompt_api_key_env(default: &str) -> Result<String> {
     const MAX_INVALID_ATTEMPTS: usize = 3;
 
@@ -293,8 +295,16 @@ fn prompt_api_key_env(default: &str) -> Result<String> {
         }
 
         invalid_attempts += 1;
+        // Echo untrusted input escaped ({:?}) so ANSI escapes from a piped
+        // or typed line cannot redraw the prompt, and mask key-shaped input
+        // so a freshly pasted secret never lands in scrollback (#1510).
+        let echoed = if looks_like_api_key(trimmed) {
+            "«pasted value masked»".to_string()
+        } else {
+            format!("{trimmed:?}")
+        };
         println!(
-            "{} '{trimmed}' is not a valid environment variable name; \
+            "{} {echoed} is not a valid environment variable name; \
              enter the NAME (e.g. {default}), not the key value itself",
             "Invalid environment variable name:".yellow()
         );
@@ -307,10 +317,10 @@ fn prompt_api_key_env(default: &str) -> Result<String> {
         }
         if invalid_attempts >= MAX_INVALID_ATTEMPTS {
             println!(
-                "{} accepting '{trimmed}' after {invalid_attempts} invalid attempts",
+                "{} falling back to the default after {invalid_attempts} invalid attempts",
                 "Warning:".yellow()
             );
-            return Ok(trimmed.to_string());
+            return Ok(default.to_string());
         }
     }
 }
