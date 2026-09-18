@@ -452,7 +452,7 @@ octos auth logout --provider openai
 {
   "adaptive_routing": {
     "enabled": true,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -2019,7 +2019,7 @@ chmod +x .octos/skills/translator/main
   // 自适应路由
   "adaptive_routing": {
     "enabled": false,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
