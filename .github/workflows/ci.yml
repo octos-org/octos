@@ -766,7 +766,13 @@ jobs:
     # `#[cfg(unix)]` over re-muting the whole job — a check that cannot fail
     # tells you nothing.
     runs-on: windows-latest
-    timeout-minutes: 90
+    # The full Windows suite runs ~82 min when it passes (octos-cli integration
+    # ~19 min and lib ~13 min, two builds ~20 min, doc tests ~6 min), so 90 left
+    # almost no headroom: once the stack-overflow abort that used to end the
+    # octos-cli lib step early was fixed, runner variance tipped main past the
+    # cap and the job was cancelled rather than failed. Splitting octos-cli into
+    # its own Windows job would cut the wall-clock; this only stops the kill.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v6
 
