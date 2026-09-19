@@ -537,8 +537,13 @@ const SERVE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// ends, but tokio keeps the handler installed for the process lifetime, so
 /// a second signal during the bounded drain is captured-but-unobserved: it
 /// cannot kill the serve before `stop_all()` runs.
-fn spawn_serve_shutdown_signal_watcher() -> tokio::sync::watch::Receiver<bool> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+fn spawn_serve_shutdown_signal_watcher(
+    shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
+) -> tokio::sync::watch::Receiver<bool> {
+    // One channel for every stop request: this watcher (SIGINT/SIGTERM) and
+    // the `server/shutdown` UI Protocol method hold the same sender, so a stop
+    // from a client takes exactly the drain path a signal takes.
+    let shutdown_rx = shutdown_tx.subscribe();
     #[cfg(unix)]
     let sigterm = {
         use tokio::signal::unix::{SignalKind, signal};
@@ -572,7 +577,7 @@ fn spawn_serve_shutdown_signal_watcher() -> tokio::sync::watch::Receiver<bool> {
         {
             let _ = tokio::signal::ctrl_c().await;
         }
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.send_replace(true);
     });
     shutdown_rx
 }
@@ -1660,6 +1665,9 @@ impl ServeCommand {
         )
         .wrap_err("invalid AppUI browser-origin configuration")?;
 
+        // The stop switch exists before AppState so the `server/shutdown`
+        // method and the signal watcher (installed further down) share it.
+        let serve_shutdown_tx = Arc::new(tokio::sync::watch::channel(false).0);
         let state = Arc::new(AppState {
             ui_protocol: crate::api::UiProtocolRuntimeResources::default(),
             profiles: profile_runtimes,
@@ -1716,6 +1724,8 @@ impl ServeCommand {
             host_memory: config.memory.clone(),
             pairing: pairing.clone(),
             solo_login_enabled: solo_login_enabled_flag,
+            // Only the HTTP serve has a loop to stop; see AppState::serve_shutdown.
+            serve_shutdown: (!self.stdio).then(|| serve_shutdown_tx.clone()),
             dangerous_default_permissions: dangerous_default_permissions_flag,
             default_network_denied: default_network_denied_flag,
             llm_compaction: self.llm_compaction,
@@ -1812,7 +1822,7 @@ impl ServeCommand {
         // disposition and orphans every gateway (#2086). The stdio path above
         // returns before this point and keeps its existing behavior — it
         // spawns no gateways, so there is nothing to orphan.
-        let shutdown_rx = spawn_serve_shutdown_signal_watcher();
+        let shutdown_rx = spawn_serve_shutdown_signal_watcher(serve_shutdown_tx.clone());
 
         // Auto-start enabled profiles
         let profiles = profile_store.list().unwrap_or_default();
