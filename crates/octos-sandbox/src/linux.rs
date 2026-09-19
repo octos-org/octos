@@ -65,7 +65,9 @@ fn filter(allow_entry: bool) -> Result<BpfProgram> {
     calls.extend([libc::SYS_arch_prctl, libc::SYS_poll, libc::SYS_epoll_wait,
         libc::SYS_dup2, libc::SYS_setrlimit]);
     if allow_entry {
-        calls.extend([libc::SYS_execve, libc::SYS_execveat,
+        // Bubblewrap's PID-namespace init reaps the already-created worker.
+        // Waiting grants no ability to create processes or access host PIDs.
+        calls.extend([libc::SYS_execve, libc::SYS_execveat, libc::SYS_wait4, libc::SYS_waitid,
             libc::SYS_newfstatat, libc::SYS_statx, libc::SYS_readlinkat, libc::SYS_getdents64]);
         #[cfg(target_arch = "x86_64")]
         calls.extend([libc::SYS_stat, libc::SYS_lstat, libc::SYS_access, libc::SYS_readlink]);

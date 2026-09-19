@@ -57,7 +57,7 @@ fn run() {
         let result = child.wait_with_output().unwrap();
         assert!(result.status.success(), "{mode} probe failed: status={} stdout={} stderr={}",
             result.status, String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
-        assert_eq!(result.stdout, b"confined IPC output\n");
+        assert_eq!(result.stdout, b"confined IPC output\n", "{mode} probe lost its IPC output");
     }
     // The probe must leave its host's files and listener intact.
     let mut contents = String::new();
@@ -86,6 +86,9 @@ fn probe(args: &[String]) {
     assert!(std::net::UdpSocket::bind("127.0.0.1:0").is_err(), "UDP escaped");
     assert!(std::os::unix::net::UnixStream::connect(&args[2]).is_err(), "Unix socket escaped");
     assert!(std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).status().is_err(), "subprocess escaped");
+    let executable = if cfg!(target_os = "linux") && args[0] != "standalone" { "/app/octos" } else { &args[6] };
+    assert!(std::process::Command::new(executable).arg("--escaped").status().is_err(),
+        "same-executable subprocess escaped");
     check_parent_memory(parent);
 
     // Thread creation and Tokio stdio must still work after confinement.
@@ -96,8 +99,9 @@ fn probe(args: &[String]) {
         let mut input = String::new();
         tokio::io::stdin().read_to_string(&mut input).await.unwrap();
         assert_eq!(input, "host IPC input\n");
-        tokio::io::stdout().write_all(b"confined IPC output\n").await.unwrap();
-        tokio::io::stdout().flush().await.unwrap();
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all(b"confined IPC output\n").await.unwrap();
+        stdout.flush().await.unwrap();
     });
     if args[0] == "standalone" || (args[0] == "worker" && cfg!(target_os = "linux")) {
         // No self-reexec loophole remains after the child's second restriction.
