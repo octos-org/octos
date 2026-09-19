@@ -55,10 +55,13 @@ filesystem is inaccessible; Landlock alone would not provide that property.
 
 The child adds Landlock and a stricter syscall filter before processing input.
 Only shared-address-space pthread clones are allowed; process clones, exec,
-sockets, io_uring, ptrace/process-memory APIs, device ioctl, keyrings, namespaces,
+sockets to other processes, io_uring, ptrace/process-memory APIs, device ioctl, keyrings, namespaces,
 and unknown syscalls are denied. `clone3` returns ENOSYS so libc can use the
 checked clone path. No filter is removed or weakened. Startup is single-threaded
 by contract; all subsequently created threads inherit both restriction layers.
+Anonymous Unix stream pairs remain available for Tokio's internal signal
+self-pipe; socket creation/connect/bind/accept, datagram pairs and FD passing are
+denied, so those pairs cannot communicate with another process.
 
 ## Validation
 

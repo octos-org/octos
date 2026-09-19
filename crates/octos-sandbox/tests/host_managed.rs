@@ -85,6 +85,8 @@ fn probe(args: &[String]) {
     assert!(std::net::TcpStream::connect(&args[3]).is_err(), "TCP escaped");
     assert!(std::net::UdpSocket::bind("127.0.0.1:0").is_err(), "UDP escaped");
     assert!(std::os::unix::net::UnixStream::connect(&args[2]).is_err(), "Unix socket escaped");
+    #[cfg(target_os = "linux")]
+    assert!(std::os::unix::net::UnixDatagram::pair().is_err(), "addressable datagram pair escaped");
     assert!(std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).status().is_err(), "subprocess escaped");
     let executable = if cfg!(target_os = "linux") && args[0] != "standalone" { "/app/octos" } else { &args[6] };
     assert!(std::process::Command::new(executable).arg("--escaped").status().is_err(),

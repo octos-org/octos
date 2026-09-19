@@ -292,8 +292,13 @@ impl Executable for AcpCommand {
         } else {
             None
         };
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
+        let mut runtime = tokio::runtime::Builder::new_multi_thread();
+        if confinement.is_some() {
+            // Each confined process serves one broker-backed agent. One async
+            // worker is enough; retain blocking capacity for stdio and memory.
+            runtime.worker_threads(1).max_blocking_threads(4);
+        }
+        runtime.enable_all()
             .thread_stack_size(8 * 1024 * 1024) // deep agent futures need a big stack
             .build()
             .wrap_err("failed to create tokio runtime")?

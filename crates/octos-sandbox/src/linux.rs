@@ -37,6 +37,7 @@ fn filter(allow_entry: bool) -> Result<BpfProgram> {
     // modules, mounts and namespaces are absent. Unknown syscalls fail closed.
     let mut calls = vec![
         libc::SYS_read, libc::SYS_write, libc::SYS_readv, libc::SYS_writev,
+        libc::SYS_recvfrom, libc::SYS_sendto,
         libc::SYS_pread64, libc::SYS_pwrite64, libc::SYS_close, libc::SYS_close_range,
         libc::SYS_fstat, libc::SYS_lseek,
         libc::SYS_fcntl, libc::SYS_dup, libc::SYS_dup3, libc::SYS_pipe2,
@@ -73,6 +74,16 @@ fn filter(allow_entry: bool) -> Result<BpfProgram> {
         calls.extend([libc::SYS_stat, libc::SYS_lstat, libc::SYS_access, libc::SYS_readlink]);
     }
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = calls.into_iter().map(|n| (n, vec![])).collect();
+    // Tokio's signal driver uses an anonymous connected Unix stream pair as
+    // its self-pipe. Neither endpoint can reach another process: socket,
+    // connect, bind, accept, and FD-passing syscalls remain denied. Datagram
+    // pairs are excluded because sendto could address an unrelated endpoint.
+    rules.insert(libc::SYS_socketpair, vec![SeccompRule::new(vec![
+        SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, libc::AF_UNIX as u64)?,
+        SeccompCondition::new(1, SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(!(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK) as u32 as u64), libc::SOCK_STREAM as u64)?,
+        SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 0)?,
+    ])?]);
     if allow_entry {
         // Bootstrap may open runtime files and O_PATH ruleset handles, but
         // never request write access, including to the entropy devices.
