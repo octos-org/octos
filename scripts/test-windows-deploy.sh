@@ -32,6 +32,10 @@ require_grep 'SERVICE_AUTO_START' "$SCRIPT" "deploy.ps1 must configure auto-star
 require_grep 'OCTOS_HOME=' "$SCRIPT" "deploy.ps1 must set the remote Octos data path"
 require_grep 'C:\\octos' "$SCRIPT" "deploy.ps1 must document the default Windows install root"
 
+if grep -q -- '--auth-token' "$SCRIPT"; then
+    fail "deploy.ps1 must not pass the bearer token via service argv (#2380)"
+fi
+
 if command -v pwsh >/dev/null 2>&1; then
     out="$(pwsh -NoProfile -ExecutionPolicy Bypass -File "$SCRIPT" \
         -HostName win.example.invalid \
@@ -53,8 +57,13 @@ if command -v pwsh >/dev/null 2>&1; then
         || fail "dry run should include the requested remote root"
     grep -q 'OctosServeTest' <<<"$out" \
         || fail "dry run should include the requested service name"
-    grep -q -- '--auth-token' <<<"$out" \
-        || fail "dry run should include auth-token serve argument"
+    if grep -q -- '--auth-token' <<<"$out"; then
+        fail "dry run must not pass the bearer token via service argv (#2380)"
+    fi
+    grep -q 'AppEnvironmentExtra' <<<"$out" \
+        || fail "dry run should deliver the token via AppEnvironmentExtra"
+    grep -q 'OCTOS_AUTH_TOKEN=' <<<"$out" \
+        || fail "dry run should deliver the token via OCTOS_AUTH_TOKEN"
     grep -q 'test-token' <<<"$out" \
         || fail "dry run should include the requested auth token"
     grep -q 'ssh -p 2222' <<<"$out" \

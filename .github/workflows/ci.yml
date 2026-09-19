@@ -175,6 +175,12 @@ jobs:
           if ($deployText -notmatch '\$nssmExe install') {
             throw 'deploy dry run did not include NSSM service registration'
           }
+          if ($deployText -match '--auth-token') {
+            throw 'deploy dry run must not pass the bearer token via service argv (#2380)'
+          }
+          if ($deployText -notmatch 'AppEnvironmentExtra') {
+            throw 'deploy dry run did not deliver the token via AppEnvironmentExtra'
+          }
           if ($deployText -notmatch 'C:\\octos-ci') {
             throw 'deploy dry run did not include the requested remote root'
           }

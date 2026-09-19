@@ -2414,12 +2414,16 @@ mod tests {
     /// #2371 tripwire: the repo's own service generators must never place
     /// the dashboard bearer token in argv — it is readable by any local
     /// process via ps / systemctl cat. The OCTOS_AUTH_TOKEN env var carries
-    /// it instead. (deploy.ps1's NSSM path is the known remaining exception;
-    /// NSSM needs AppEnvironmentExtra for env injection, tracked separately.)
+    /// it instead (NSSM's AppEnvironmentExtra is the deploy.ps1 equivalent).
     #[test]
     fn service_templates_never_pass_auth_token_via_argv() {
         let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
-        for name in ["install.sh", "install.ps1", "local-tenant-deploy.sh"] {
+        for name in [
+            "install.sh",
+            "install.ps1",
+            "local-tenant-deploy.sh",
+            "deploy.ps1",
+        ] {
             let body = std::fs::read_to_string(scripts.join(name))
                 .unwrap_or_else(|e| panic!("read {name}: {e}"));
             assert!(
@@ -2429,6 +2433,8 @@ mod tests {
             for line in body.lines() {
                 let service_argv_line = line.contains("ExecStart=")
                     || line.contains("\"$octosBin\" serve")
+                    || line.contains("$nssmExe install")
+                    || line.contains("AppParameters")
                     || line.trim() == "<string>--auth-token</string>";
                 assert!(
                     !(service_argv_line && line.contains("--auth-token")),
