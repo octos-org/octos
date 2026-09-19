@@ -148,6 +148,7 @@ fn smoke_real_octos(binary: &std::path::Path) {
             (&mut stderr).take(8192).read_to_end(&mut output).await.unwrap();
             String::from_utf8_lossy(&output).into_owned()
         });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
             "protocolVersion":1,"clientCapabilities":{"_meta":{"octos.hostManaged":{
                 "version":1,"model":{"model_id":"smoke","provider_name":"host",
@@ -155,31 +156,98 @@ fn smoke_real_octos(binary: &std::path::Path) {
             }}}
         }});
         stdin.write_all(format!("{initialize}\n").as_bytes()).await.unwrap();
-        let line = tokio::time::timeout(std::time::Duration::from_secs(15), lines.next_line()).await.unwrap().unwrap();
-        let Some(line) = line else { panic!("Octos startup failed: {}", diagnostic.await.unwrap()); };
+        let line = tokio::time::timeout_at(deadline, lines.next_line()).await.unwrap().unwrap();
+        let Some(line) = line else { panic!("Octos startup failed: {}", tokio::time::timeout_at(deadline, diagnostic).await.unwrap().unwrap()); };
         let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], 1, "unexpected initialize response: {response}");
         assert_eq!(response["result"]["agentCapabilities"]["_meta"]["octos.hostManaged"]["confined"], true,
             "Octos did not confirm confinement: {response}");
         let session = json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/","mcpServers":[]}});
         stdin.write_all(format!("{session}\n").as_bytes()).await.unwrap();
-        loop {
-            let line = tokio::time::timeout(std::time::Duration::from_secs(15), lines.next_line()).await.unwrap().unwrap();
-            let Some(line) = line else { panic!("Octos session failed: {}", diagnostic.await.unwrap()); };
+        let line = tokio::time::timeout_at(deadline, lines.next_line()).await.unwrap().unwrap();
+        let Some(line) = line else { panic!("Octos session failed: {}", tokio::time::timeout_at(deadline, diagnostic).await.unwrap().unwrap()); };
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], 2, "unexpected session response: {response}");
+        let session_id = response["result"]["sessionId"].as_str().expect("Octos session failed").to_owned();
+        let prompt = json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{
+            "sessionId":session_id,"prompt":[{"type":"text","text":"Synthetic host tool request."}]
+        }});
+        stdin.write_all(format!("{prompt}\n").as_bytes()).await.unwrap();
+        let mut model_calls = 0;
+        let mut tool_calls = 0;
+        let mut tool_lists = 0;
+        let mut completed = false;
+        // Bound both elapsed time and unsolicited frames from a broken worker.
+        for _ in 0..64 {
+            let line = tokio::time::timeout_at(deadline, lines.next_line()).await.unwrap().unwrap();
+            let Some(line) = line else { panic!("Octos prompt failed: {}", tokio::time::timeout_at(deadline, diagnostic).await.unwrap().unwrap()); };
             let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
-            if frame["method"] == "_octos/host/tools/list" {
-                let response = json!({"jsonrpc":"2.0","id":frame["id"],"result":{"tools":[]}});
-                stdin.write_all(format!("{response}\n").as_bytes()).await.unwrap();
-            } else {
-                assert_eq!(frame["id"], 2, "unexpected Octos frame: {frame}");
-                assert!(frame["result"]["sessionId"].is_string(), "Octos session failed: {frame}");
-                break;
-            }
+            let result = match frame["method"].as_str() {
+                Some("_octos/host/tools/list") => {
+                    tool_lists += 1;
+                    assert_eq!(tool_lists, 1, "unexpected tool catalog refresh");
+                    json!({"tools":[{"name":"echo","description":"Synthetic host tool.",
+                        "input_schema":{"type":"object","properties":{"text":{"type":"string"}},
+                            "required":["text"],"additionalProperties":false}}]})
+                }
+                Some("_octos/host/model") => {
+                    model_calls += 1;
+                    assert_eq!(frame["params"]["tools"].as_array().unwrap().len(), 1,
+                        "worker must expose only the host's tools");
+                    assert_eq!(frame["params"]["tools"][0]["name"], "echo");
+                    assert_eq!(frame["params"]["config"]["max_tokens"], 1024);
+                    let mut result = json!({"content":"Synthetic completion.","tool_calls":[],
+                        "stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}});
+                    match model_calls {
+                        1 => {
+                            assert_eq!(tool_calls, 0);
+                            assert!(frame["params"]["messages"].as_array().unwrap().iter().any(|message|
+                                message["role"] == "user" && message["content"].as_str().unwrap_or("").contains("Synthetic host tool request.")));
+                            result["stop_reason"] = json!("tool_use");
+                            result["tool_calls"] = json!([{"id":"smoke-tool-1","name":"echo",
+                                "arguments":{"text":"Synthetic tool input."}}]);
+                        }
+                        2 => {
+                            assert_eq!(tool_calls, 1);
+                            assert!(frame["params"]["messages"].as_array().unwrap().iter().any(|message|
+                                message["role"] == "tool" && message["content"].as_str().unwrap_or("").contains("Synthetic host feedback.")),
+                                "host tool feedback must reach the subsequent model call");
+                        }
+                        _ => panic!("unexpected model call: {frame}"),
+                    }
+                    result
+                }
+                Some("_octos/host/tools/call") => {
+                    tool_calls += 1;
+                    assert_eq!((model_calls, tool_calls), (1, 1));
+                    assert_eq!(frame["params"]["name"], "echo");
+                    assert_eq!(frame["params"]["arguments"], json!({"text":"Synthetic tool input."}));
+                    json!({"content":"Synthetic host feedback.","is_error":false})
+                }
+                Some("session/update") => {
+                    assert!(frame.get("id").is_none(), "session update must be a notification");
+                    assert_eq!(frame["params"]["sessionId"], session_id);
+                    continue;
+                }
+                None => {
+                    assert_eq!(frame["id"], 3, "unexpected Octos response: {frame}");
+                    assert_eq!(frame["result"]["stopReason"], "end_turn", "Octos prompt failed: {frame}");
+                    completed = true;
+                    break;
+                }
+                _ => panic!("unexpected Octos request: {frame}"),
+            };
+            assert!(frame.get("id").is_some(), "host operation must be a request");
+            let response = json!({"jsonrpc":"2.0","id":frame["id"],"result":result});
+            stdin.write_all(format!("{response}\n").as_bytes()).await.unwrap();
         }
+        assert!(completed, "Octos exceeded the smoke test's frame limit");
+        assert_eq!((tool_lists, model_calls, tool_calls), (1, 2, 1));
         child.kill().await.unwrap();
         child.wait().await.unwrap();
         diagnostic.await.unwrap();
     });
-    println!("real confined Octos handshake and memory-only session passed");
+    println!("real confined Octos handshake, memory-only session, and host model/tool round trip passed");
 }
 
 #[cfg(target_os = "linux")]
