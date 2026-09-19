@@ -288,7 +288,9 @@ Section "Registering Windows service"
 & $nssmExe stop $serviceName 2>$null | Out-Null
 & $nssmExe remove $serviceName confirm 2>$null | Out-Null
 
-& $nssmExe install $serviceName $octosExe "serve" "--host" "0.0.0.0" "--port" "$servePort" "--data-dir" $dataDir "--auth-token" $authToken
+# #2380: the token travels via AppEnvironmentExtra below, never argv —
+# the NSSM service command line is readable by any local user via Win32_Process.
+& $nssmExe install $serviceName $octosExe "serve" "--host" "0.0.0.0" "--port" "$servePort" "--data-dir" $dataDir
 if ($LASTEXITCODE -ne 0) {
     throw "nssm.exe install failed"
 }
@@ -299,6 +301,9 @@ if ($LASTEXITCODE -ne 0) {
 & $nssmExe set $serviceName AppRotateFiles 1 | Out-Null
 & $nssmExe set $serviceName Start SERVICE_AUTO_START | Out-Null
 & $nssmExe set $serviceName AppEnvironmentExtra "OCTOS_HOME=$dataDir" "OCTOS_DATA_DIR=$dataDir" "OCTOS_AUTH_TOKEN=$authToken" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "nssm.exe failed to set the service environment"
+}
 
 & $nssmExe start $serviceName
 if ($LASTEXITCODE -ne 0) {
