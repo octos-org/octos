@@ -115,6 +115,8 @@ use octos_core::SessionKey;
 use super::Executable;
 use crate::config::Config;
 
+mod host_managed;
+
 /// Cap on event lines retained by the `if_busy: "fold"` queue. Mirrors
 /// Robrix's own bounded queued-prompt cap: a busy agent is mid-turn on older
 /// context, so stale notifications beyond this are worse than none — the
@@ -217,6 +219,11 @@ const CLIENT_MCP_TOOL_CALL_TIMEOUT_SECS: u64 = 600;
 /// ACP agent resolves an LLM the same way.
 #[derive(Debug, Args)]
 pub struct AcpCommand {
+    /// Require a cooperating host to broker every model request and tool call.
+    /// Enters OS confinement before starting the runtime; reads no Octos config.
+    #[arg(long, conflicts_with_all = ["cwd", "data_dir", "config", "provider", "model", "base_url", "profile"])]
+    pub host_managed: bool,
+
     /// Working directory the agent's tools are rooted at (defaults to the
     /// current directory). Note: ACP clients also send a `cwd` with
     /// `session/new`; that per-session value takes precedence when present.
@@ -265,6 +272,7 @@ impl Default for AcpCommand {
     /// silently make it 0.
     fn default() -> Self {
         Self {
+            host_managed: false,
             cwd: None,
             data_dir: None,
             config: None,
@@ -279,12 +287,24 @@ impl Default for AcpCommand {
 
 impl Executable for AcpCommand {
     fn execute(self) -> Result<()> {
+        let confinement = if self.host_managed {
+            Some(octos_sandbox::confine_host_managed()?)
+        } else {
+            None
+        };
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_stack_size(8 * 1024 * 1024) // deep agent futures need a big stack
             .build()
             .wrap_err("failed to create tokio runtime")?
-            .block_on(self.run_async())
+            .block_on(async move {
+                if let Some(confinement) = confinement {
+                    host_managed::serve(self.max_iterations, confinement.platform, Stdio::new())
+                        .await.map_err(|e| eyre::eyre!("host-managed ACP connection failed: {e}"))
+                } else {
+                    self.run_async().await
+                }
+            })
     }
 }
 
@@ -1326,6 +1346,7 @@ impl AcpCommand {
     /// let (agent, shutdown) = factory.build(workspace).await?;
     /// ```
     pub fn factory(&self) -> Result<Arc<dyn SessionAgentFactory>> {
+        eyre::ensure!(!self.host_managed, "host-managed mode requires the confined ACP broker transport");
         // Resolve config the same way `octos chat` does.
         let cwd = match &self.cwd {
             Some(c) => c.clone(),

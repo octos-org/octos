@@ -32,6 +32,7 @@ pub mod vision;
 pub mod catalog;
 pub mod error;
 pub mod high_level;
+pub mod host;
 pub mod middleware;
 
 pub mod anthropic;
