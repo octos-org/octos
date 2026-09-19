@@ -22356,6 +22356,12 @@ async fn handle_review_start(
             return;
         }
     };
+    // UPCR-2026-031: a client-chosen review turn id is being admitted from
+    // here until the registry insert below.
+    let _admission = params
+        .turn_id
+        .as_ref()
+        .map(|turn_id| TurnAdmission::enter(&params.session_id, turn_id));
     let scoped_profile_id = match validate_session_scope(
         &params.session_id,
         params.profile_id.as_deref(),
@@ -22878,6 +22884,12 @@ async fn handle_turn_start_with_accept(
     accept_result: Value,
     pre_admitted_voice: Option<PreAdmittedVoice>,
 ) -> bool {
+    // UPCR-2026-031: while this start is being admitted (it is not in the
+    // registry yet), `turn/state/get` must not report the turn as certainly
+    // not running. Keyed by the ids exactly as the client sent them, which is
+    // how it later asks about the turn.
+    let _admission = TurnAdmission::enter(&params.session_id, &params.turn_id);
+    let raw_session_id = params.session_id.clone();
     // UPCR-2026-015 (M9-β-1): if the client carried a `topic` field
     // alongside the session_id, fold it into the resolved SessionKey
     // BEFORE scope validation. The rest of the turn pipeline keys
@@ -22903,6 +22915,12 @@ async fn handle_turn_start_with_accept(
         let base = params.session_id.base_key().to_owned();
         params.session_id = SessionKey(format!("{base}#{topic}"));
     }
+    // UPCR-2026-031: `turn/state/get` takes no topic, so a topic client asks
+    // by the FOLDED id the registry uses — mark that key as admitting too.
+    let _folded_admission = (params.session_id.0 != raw_session_id.0)
+        .then(|| TurnAdmission::enter(&params.session_id, &params.turn_id));
+    #[cfg(test)]
+    turn_admission_test_pause(&params.turn_id).await;
 
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
         send_scope_error(ws, id, error);
@@ -23187,6 +23205,78 @@ async fn handle_turn_start_with_accept(
     }
     let _ = start_tx.send(());
     true
+}
+
+/// Turn starts currently being admitted in this process (`turn/start`,
+/// `review/start`, goal continuations), keyed `(session_id, turn_id)` — for a
+/// topic turn under both the raw and the folded session id. Between request
+/// receipt and the active-turn registry insert a turn is in no registry and no
+/// ledger; this set keeps `turn/state/get` (UPCR-2026-031) from calling such a
+/// turn "certainly not running". The certainty is per process: a restarted
+/// process starts with this set and the registry empty, which is exactly why
+/// it may say a turn lost across the restart is not running.
+static TURN_ADMISSIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String), usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Test seam: lets a test hold a real `turn/start` inside its admission
+/// window (after the marker is set, before the registry insert).
+/// `turn_id` -> (reached, release) for [`turn_admission_test_pause`].
+#[cfg(test)]
+pub(crate) type TurnAdmissionTestPauses = std::sync::Mutex<
+    std::collections::HashMap<String, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+>;
+
+#[cfg(test)]
+pub(crate) static TURN_ADMISSION_TEST_PAUSES: std::sync::LazyLock<TurnAdmissionTestPauses> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+async fn turn_admission_test_pause(turn_id: &TurnId) {
+    let pause = TURN_ADMISSION_TEST_PAUSES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&turn_id.0.to_string());
+    if let Some((reached, release)) = pause {
+        reached.notify_one();
+        release.notified().await;
+    }
+}
+
+/// RAII marker for one in-flight `turn/start` admission.
+pub(crate) struct TurnAdmission {
+    key: (String, String),
+}
+
+impl TurnAdmission {
+    pub(crate) fn enter(session_id: &SessionKey, turn_id: &TurnId) -> Self {
+        let key = (session_id.0.clone(), turn_id.0.to_string());
+        *TURN_ADMISSIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(key.clone())
+            .or_default() += 1;
+        Self { key }
+    }
+
+    pub(crate) fn in_progress(session_id: &SessionKey, turn_id: &TurnId) -> bool {
+        TURN_ADMISSIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&(session_id.0.clone(), turn_id.0.to_string()))
+    }
+}
+
+impl Drop for TurnAdmission {
+    fn drop(&mut self) {
+        let mut admissions = TURN_ADMISSIONS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = admissions.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                admissions.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// Outcome of the `turn/steer` registry decision (computed under the
@@ -23590,6 +23680,8 @@ async fn maybe_spawn_appui_master_continuation_runner(
     }
 
     let turn_id = TurnId::new();
+    // UPCR-2026-031: admitted from here until the registry insert below.
+    let _admission = TurnAdmission::enter(&session_id, &turn_id);
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
     let interrupt_tx = Arc::new(TokioMutex::new(Some(interrupt_tx)));
@@ -26599,10 +26691,15 @@ async fn handle_turn_state_get(
         }
     }
 
-    // Look up in the active-turn registry first.
-    let registry_state = {
+    // Look up in the active-turn registry first. UPCR-2026-031: whether a
+    // start for this turn is mid-admission is read under the SAME registry
+    // lock — an admission inserts under this lock before dropping its marker,
+    // so a start that finishes on another connection is seen either as
+    // admitting or as registered, never as neither.
+    let (registry_state, admitting) = {
         let registry = active_turns.lock().await;
-        if let Some(entry) = registry.get(&params.session_id) {
+        let admitting = TurnAdmission::in_progress(&params.session_id, &params.turn_id);
+        let registry_state = if let Some(entry) = registry.get(&params.session_id) {
             if entry.turn_id == params.turn_id {
                 let state = entry.state.lock().await;
                 Some(turn_state_to_lifecycle(&state))
@@ -26611,7 +26708,8 @@ async fn handle_turn_state_get(
             }
         } else {
             None
-        }
+        };
+        (registry_state, admitting)
     };
 
     // Pull the ledger projection so we can backfill thread_id /
@@ -26679,6 +26777,18 @@ async fn handle_turn_state_get(
             (None, None) => (TurnLifecycleState::Unknown, None, None, None),
         };
 
+    // UPCR-2026-031: a turn this process neither holds, nor recorded, nor is
+    // admitting right now is certainly not running here. Only claimed when
+    // the session manager could vouch for the session (headless callers keep
+    // the plain UPCR-2026-011 `unknown`).
+    // A failed ledger read leaves `projection` as `None`: that is not proof of
+    // "no record", so the certainty is withheld.
+    let running = (sessions.is_some()
+        && registry_state.is_none()
+        && projection.as_ref().is_some_and(|p| p.state.is_none())
+        && !admitting)
+        .then_some(false);
+
     let result = TurnStateGetResult {
         session_id: params.session_id,
         turn_id: params.turn_id,
@@ -26689,6 +26799,7 @@ async fn handle_turn_state_get(
         completed_at,
         thread_id,
         committed_seqs,
+        running,
     };
     send_serialized_rpc_result(
         ws,

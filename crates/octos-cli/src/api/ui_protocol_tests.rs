@@ -26764,6 +26764,70 @@ async fn turn_state_get_returns_unknown_for_missing() {
     // NOT an error.
     assert!(frame.get("result").is_some(), "missing turn must succeed");
     assert_eq!(frame["result"]["state"], "unknown");
+    // UPCR-2026-031: nothing in this process holds or is admitting the turn,
+    // so the server can say for certain it is not running it.
+    assert_eq!(frame["result"]["running"], false);
+}
+
+async fn turn_state_frame(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_turns: &SharedActiveTurns,
+    turn_id: TurnId,
+) -> Value {
+    let ledger = event_ledger(state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_turn_state_get(
+        &ws,
+        state,
+        &ledger,
+        active_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "ts".into(),
+        TurnStateGetParams {
+            session_id: session_id.clone(),
+            turn_id,
+        },
+    )
+    .await;
+    recv_rpc_json(&mut rx).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_not_claim_a_turn_is_stopped_while_its_start_is_still_being_admitted() {
+    // A slow `turn/start` has not reached the registry yet. A lookup in that
+    // window must stay a plain `unknown`: the turn may be about to run.
+    let session_id = SessionKey("local:turn-admitting".into());
+    let state = prg_state_with_session(&session_id, |_| {});
+    let active_turns = active_turns_registry();
+    let turn_id = TurnId::new();
+    let _admitting = TurnAdmission::enter(&session_id, &turn_id);
+
+    let frame = turn_state_frame(&state, &session_id, &active_turns, turn_id).await;
+
+    assert_eq!(frame["result"]["state"], "unknown");
+    assert!(
+        frame["result"].get("running").is_none(),
+        "no certainty while the start is in flight: {frame}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_say_a_turn_is_not_running_once_its_admission_has_ended_without_a_record() {
+    // The admission ended without registering the turn (refused, or its
+    // requester vanished before the accept). Now the answer is certain.
+    let session_id = SessionKey("local:turn-admission-ended".into());
+    let state = prg_state_with_session(&session_id, |_| {});
+    let active_turns = active_turns_registry();
+    let turn_id = TurnId::new();
+    drop(TurnAdmission::enter(&session_id, &turn_id));
+
+    let frame = turn_state_frame(&state, &session_id, &active_turns, turn_id).await;
+
+    assert_eq!(frame["result"]["state"], "unknown");
+    assert_eq!(frame["result"]["running"], false);
 }
 
 /// Serialise tests that mutate the process-global message-commit
@@ -44052,4 +44116,122 @@ fn should_bar_session_scoped_connections_from_server_shutdown() {
     assert!(!session_ingress_callable_method(
         APPUI_METHOD_SERVER_SHUTDOWN
     ));
+}
+
+// UPCR-2026-031 wiring: a REAL `turn/start` held inside its admission window
+// (after the marker, before the registry insert) must not be reported as
+// certainly not running — under the raw id and, for a topic turn, the folded
+// id the registry keys on. Deleting the marker wiring fails these.
+async fn state_get_during_held_admission(topic: Option<&str>) -> (Value, Value, Value) {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let provider = Arc::new(AppuiContinuationLlm::new("done"));
+    let (state, _profile_runtime) =
+        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider).await;
+    let session_id = SessionKey::new("api", "admission-wired");
+    let folded = topic.map(|t| SessionKey(format!("{}#{t}", session_id.base_key())));
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, _rx) = ws_connection_for_test(256);
+    // Make the session known to the same manager `turn/state/get` consults,
+    // as any open session is.
+    for sid in std::iter::once(&session_id).chain(folded.as_ref()) {
+        let sessions = resolve_sessions_for_lookup(&state, None, None, sid)
+            .await
+            .expect("session manager for the test profile");
+        sessions.lock().await.get_or_create(sid).await;
+    }
+
+    let query = |sid: SessionKey, turn_id: TurnId| {
+        let state = state.clone();
+        let ledger = ledger.clone();
+        let active_turns = active_turns.clone();
+        async move {
+            let (ws, mut rx) = ws_connection_for_test(8);
+            handle_turn_state_get(
+                &ws,
+                &state,
+                &ledger,
+                &active_turns,
+                None,
+                None,
+                ConnectionUiFeatures::stdio_defaults(),
+                "probe".into(),
+                TurnStateGetParams {
+                    session_id: sid,
+                    turn_id,
+                },
+            )
+            .await;
+            recv_rpc_json(&mut rx).await
+        }
+    };
+
+    // Control: a turn nobody is admitting IS reported as not running here,
+    // so the assertions below can fail.
+    let control = query(folded.clone().unwrap_or(session_id.clone()), TurnId::new()).await;
+
+    let turn_id = TurnId::new();
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    TURN_ADMISSION_TEST_PAUSES
+        .lock()
+        .unwrap()
+        .insert(turn_id.0.to_string(), (reached.clone(), release.clone()));
+    let start = handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "held-start".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            input: vec![InputItem::Text {
+                text: "held in admission".into(),
+            }],
+            media: Vec::new(),
+            topic: topic.map(str::to_owned),
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+        },
+    );
+    let probe = async {
+        reached.notified().await;
+        let raw = query(session_id.clone(), turn_id.clone()).await;
+        let folded_frame = match folded.clone() {
+            Some(f) => query(f, turn_id.clone()).await,
+            None => raw.clone(),
+        };
+        release.notify_one();
+        (raw, folded_frame)
+    };
+    let (_, (raw, folded_frame)) = tokio::join!(start, probe);
+    (control, raw, folded_frame)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_withhold_not_running_while_a_real_turn_start_is_mid_admission() {
+    let (control, raw, _) = state_get_during_held_admission(None).await;
+    assert_eq!(control["result"]["running"], false, "control: {control}");
+    assert_eq!(raw["result"]["state"], "unknown", "held: {raw}");
+    assert!(raw["result"].get("running").is_none(), "held: {raw}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_withhold_not_running_for_a_topic_turn_asked_by_its_folded_id() {
+    let (control, raw, folded) = state_get_during_held_admission(Some("t1")).await;
+    assert_eq!(control["result"]["running"], false, "control: {control}");
+    for frame in [&raw, &folded] {
+        assert_eq!(frame["result"]["state"], "unknown", "held: {frame}");
+        assert!(frame["result"].get("running").is_none(), "held: {frame}");
+    }
 }

@@ -420,7 +420,8 @@ Session, turn, and approval core:
   returns `steered: false` + the NEW turn id. Raw server-handled method
   — session-ingress credentials cannot call it, and steering is NOT an
   interrupt: `turn/interrupt` stays the separate cancel op)
-- `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
+- `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`;
+  additive `running` certainty field `UPCR-2026-031`)
 - `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)
 - `approval/respond`
 - `approval/scopes/list` (approval-scope discovery; first-server slice)
@@ -787,6 +788,10 @@ Purpose:
 - return deterministic lifecycle state for one turn using the active-turn
   registry plus the durable ledger projection
 - return `state = "unknown"` rather than an error for a missing turn
+- with `state = "unknown"`, return `running = false` when the server is certain
+  it is not executing the turn (no registry entry, no ledger record, no
+  admission in flight), so a client can stop holding for a turn lost across a
+  restart ([UPCR-2026-031](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_031_TURN_STATE_NOT_RUNNING.md))
 
 Gate:
 
