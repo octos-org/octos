@@ -22,6 +22,41 @@ loading and client-specified MCP servers are rejected. `cwd` does not grant file
 access. Session state stays in memory, including the required episode-store
 handle; all of it disappears when the worker exits.
 
+## Execution mode boundary
+
+Host-managed execution is a distinct, opt-in mode. It does not replace ordinary
+ACP execution or its configured runtime. Upstream moved ordinary ACP turns into
+the OUP dispatcher in [#2265](https://github.com/octos-org/octos/pull/2265);
+this branch still uses the earlier ACP session and turn helpers and has not yet
+been adapted to that dispatcher.
+
+| Operation | Host-managed worker | Ordinary ACP on upstream after #2265 |
+|---|---|---|
+| Prompt, progress, cancellation | ACP handlers drive the confined agent loop and cancel outstanding broker waits. | The ACP adapter submits turns to the OUP runtime and translates its events. |
+| Model inference, including compaction | `HostProvider` sends `_octos/host/model`; the parent authorizes and performs provider I/O. | The configured runtime resolves and invokes providers. |
+| Tool discovery and execution | `_octos/host/tools/list` and `_octos/host/tools/call`; the parent rechecks every call. No native tool registry is populated. | The configured runtime resolves tools and applies its execution policy. |
+| Credentials, configuration, history | No worker credential/configuration lookup; one memory-only session, with persistent session loading rejected. | Owned by the configured runtime and its stores. |
+
+No host-managed model or tool request is forwarded to an ordinary local
+dispatcher as a fallback. A future integration may reuse OUP turn orchestration
+only if it accepts the explicit host provider, broker-only tools, and memory-only
+session without bootstrapping ordinary configuration or stores. A trusted parent
+can choose its own implementation behind the broker; that does not grant the
+worker direct access to it. Compartment identity and authorization remain with
+the parent regardless of which turn orchestrator the worker uses.
+Host-managed mode also retains the `session/notify` extension for host-triggered
+turns; ordinary upstream ACP does not currently expose that extension.
+
+This is enforced at two layers. The worker constructs only broker-backed
+providers/tools and rejects persistent history and external MCP servers. The
+parent launcher also enforces OS restrictions before executable entry: default-deny
+Seatbelt on macOS, and bubblewrap namespaces plus a syscall allowlist on Linux,
+followed by the worker's Landlock and stricter seccomp initialization. Missing or
+partial confinement terminates startup. These restrictions are independent of
+ordinary tool-sandbox configuration; they do not rely on tool names, prompts,
+or a worker's self-reported `confined` flag. See the
+[platform restrictions and escape probes](../crates/octos-sandbox/HOST_MANAGED.md).
+
 ## Negotiation
 
 The parent advertises `initialize.clientCapabilities._meta["octos.hostManaged"]`:
@@ -88,3 +123,27 @@ The broker reader must continue processing while a model or tool request is
 pending. Execute requests on a bounded worker queue rather than blocking the
 ACP reader; otherwise replies, cancellation and notifications can deadlock.
 All diagnostics containing private content belong to the parent's policy domain.
+
+## Reviewing an upstream integration
+
+The existing implementation is validated on its pre-#2265 base. An upstream
+integration must preserve these boundaries and revalidate the resolved code:
+
+| Boundary to review | Current implementation | Invariant across conflict resolution |
+|---|---|---|
+| Process entry and confinement | `octos-cli/src/main.rs`, `commands/acp.rs`, `octos-sandbox/src/{lib,macos,linux}.rs` | Select host-managed mode before configuration, logging workers, runtime threads, or host input. Launcher or worker confinement failure must terminate, never select ordinary ACP/OUP execution. |
+| Model and tool authority | `commands/acp/host_managed.rs`, `octos-llm/src/host.rs` | Retain broker-only provider/tool construction, bounded protocol messages, per-turn tool refresh, and cancellation. Compaction, retries, and notification turns must use the same parent authority. |
+| Session and storage lifecycle | `commands/acp/host_managed.rs`, `octos-memory/src/store.rs` | Keep one compartment per process, RAM-only history/episodes, no session loading, and no external MCP servers. An OUP repository or episode-store default must not introduce disk access during construction. |
+
+Paths in the table are under `crates/`, with `commands/` under `octos-cli/src/`.
+The known upstream conflicts in `commands/acp.rs`,
+`octos-agent/src/agent/execution.rs`, and `octos-llm/src/registry/mod.rs` are not
+the complete boundary: the latter two also contain prerequisite ACP-branch
+changes. Review all three together with the entry point, broker construction,
+and memory-only store, even where Git merges those files automatically.
+
+Keep the protocol, confinement launcher, and in-memory store as independently
+reviewable seams; adapt turn/session wiring separately. After integration, run
+ordinary ACP regressions, the host-managed protocol/cancellation tests, native
+Linux/macOS escape probes, and the real confined worker model/tool turn. Tests
+on the old base do not establish that a resolved upstream merge is safe.
