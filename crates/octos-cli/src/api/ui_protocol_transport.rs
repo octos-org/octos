@@ -3768,8 +3768,17 @@ fn appui_context_open_snapshot(
         None => Vec::new(),
     };
     publish_appui_context_status(session_id, &manager);
-    if let Err(error) =
-        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+    // Rewriting the snapshot costs a full serialize + fsync of a ledger that
+    // reaches tens of MB on a long session. A ledger that loaded clean, took
+    // no compaction and learned nothing new is byte-identical to what is
+    // already on disk, so opening a Session does not rewrite it.
+    let snapshot_is_worth_writing = ledger_status
+        != crate::context_manager::ContextLedgerLoadStatus::Loaded
+        || !lifecycle_notifications.is_empty()
+        || manager.source_history_adopted();
+    if snapshot_is_worth_writing
+        && let Err(error) =
+            persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
     {
         warn!(
             session = %session_id.0,
