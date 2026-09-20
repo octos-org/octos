@@ -541,7 +541,7 @@ When multiple fallback models are configured, enable adaptive routing to dynamic
 }
 ```
 
-- **`latency_threshold_ms`** — Providers with average latency above this are penalized (default: 30s)
+- **`latency_threshold_ms`** — Providers with average latency above this are penalized (default: 10s)
 - **`error_rate_threshold`** — Providers with error rates above this are deprioritized (default: 30%)
 - **`probe_probability`** — Fraction of requests sent to non-primary providers as health probes (default: 10%)
 - **`probe_interval_secs`** — Minimum time between probes to the same provider (default: 60s)
