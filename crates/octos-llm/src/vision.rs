@@ -37,6 +37,39 @@ pub fn is_image(path: &str) -> bool {
         || lower.ends_with(".webp")
 }
 
+/// Check if a file path looks like a video file a multimodal model can take
+/// inline (MP4, MOV, MKV, WebM). Which providers actually accept one is
+/// decided per wire protocol: OpenAI-compatible endpoints take a
+/// `video_url` part (GLM, Kimi), Gemini takes inline data, Anthropic's
+/// protocol has no video block, and a text-only model rejects the part —
+/// see the retry in each provider.
+pub fn is_video(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".mp4")
+        || lower.ends_with(".m4v")
+        || lower.ends_with(".mov")
+        || lower.ends_with(".mkv")
+        || lower.ends_with(".webm")
+}
+
+/// Encode a video file as base64 and return (mime_type, base64_data).
+pub fn encode_video(path: &str) -> Result<(String, String)> {
+    let bytes = std::fs::read(path).wrap_err_with(|| format!("failed to read video: {path}"))?;
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        _ => "video/mp4",
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok((mime.to_string(), encoded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +157,35 @@ mod tests {
     fn test_encode_image_nonexistent_file() {
         let result = encode_image("/nonexistent/path/image.png");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn should_recognise_video_containers_and_nothing_else() {
+        for p in ["clip.mp4", "clip.M4V", "clip.mov", "clip.mkv", "clip.webm"] {
+            assert!(is_video(p), "{p}");
+            assert!(!is_image(p), "{p} is not an image");
+        }
+        for p in ["photo.png", "notes.txt", "song.mp3", "clip.avi"] {
+            assert!(!is_video(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn should_encode_video_with_the_container_mime() {
+        let dir = tempfile::tempdir().unwrap();
+        for (ext, mime) in [
+            ("mp4", "video/mp4"),
+            ("m4v", "video/mp4"),
+            ("mov", "video/quicktime"),
+            ("mkv", "video/x-matroska"),
+            ("webm", "video/webm"),
+        ] {
+            let path = dir.path().join(format!("clip.{ext}"));
+            std::fs::write(&path, b"\x00\x00\x00\x18ftypisom").unwrap();
+            let (got, data) = encode_video(path.to_str().unwrap()).unwrap();
+            assert_eq!(got, mime, ".{ext}");
+            assert!(!data.is_empty());
+        }
+        assert!(encode_video("/nonexistent/clip.mp4").is_err());
     }
 }

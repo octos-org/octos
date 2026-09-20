@@ -41,6 +41,13 @@ pub struct ModelHints {
     #[serde(default)]
     pub lacks_vision: bool,
 
+    /// Model takes images but not video (`video_url` parts stripped, the
+    /// file named in a note instead). Not inferred from the model name, for
+    /// the same reason as `lacks_vision`: the graceful fallback learns it
+    /// from the endpoint's refusal. Config-overridable to skip that attempt.
+    #[serde(default)]
+    pub lacks_video: bool,
+
     /// Merge consecutive system messages into one (some providers reject multiples).
     #[serde(default = "default_true")]
     pub merge_system_messages: bool,
@@ -63,6 +70,7 @@ impl Default for ModelHints {
             uses_completion_tokens: false,
             fixed_temperature: false,
             lacks_vision: false,
+            lacks_video: false,
             merge_system_messages: true,
             reasoning_style: ReasoningStyle::None,
         }
@@ -173,6 +181,7 @@ impl ModelHints {
             uses_completion_tokens,
             fixed_temperature,
             lacks_vision,
+            lacks_video: false,
             merge_system_messages: true,
             reasoning_style,
         }
@@ -496,10 +505,26 @@ impl OpenAIProvider {
         config: &'a ChatConfig,
         force_text_only: bool,
     ) -> OpenAIRequest<'a> {
-        // Effective content hints: honour the configured `lacks_vision`, and
-        // additionally strip images on the text-only retry leg.
+        self.build_request_stripping(messages, tools, config, force_text_only, false)
+    }
+
+    /// `build_request` with the retry legs spelled out: `force_text_only`
+    /// strips images (and video), `force_no_video` strips only the video
+    /// parts — the leg for an endpoint that takes images but answered a
+    /// `video_url` part with a refusal.
+    fn build_request_stripping<'a>(
+        &'a self,
+        messages: &'a [Message],
+        tools: &'a [ToolSpec],
+        config: &'a ChatConfig,
+        force_text_only: bool,
+        force_no_video: bool,
+    ) -> OpenAIRequest<'a> {
+        // Effective content hints: honour the configured `lacks_vision` /
+        // `lacks_video`, and additionally strip on the retry legs.
         let mut content_hints = self.hints.clone();
         content_hints.lacks_vision = content_hints.lacks_vision || force_text_only;
+        content_hints.lacks_video = content_hints.lacks_video || force_text_only || force_no_video;
         let openai_messages: Vec<OpenAIMessage> = messages
             .iter()
             .filter(|m| {
@@ -842,28 +867,53 @@ impl LlmProvider for OpenAIProvider {
         // so the turn proceeds instead of erroring — the agent can still
         // `read_file` the attachment via the media note. See
         // `is_image_modality_error` / `ModelHints::detect`.
-        if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
+        // The same for video: an image-capable endpoint that does not take
+        // `video_url` (DeepSeek answers 422 naming the part) gets the request
+        // again with the video parts replaced by a note, so the turn proceeds
+        // and the model is told what it did not get to see.
+        let status = response.status().as_u16();
+        if (status == 400 || status == 422) && request_has_user_media(messages, &self.hints) {
             let body = response.text().await.unwrap_or_default();
-            if is_image_modality_error(&body)
-                && crate::current_llm_call_policy() != crate::LlmCallPolicy::FailFast
+            let fail_fast = crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+            let retry = if !fail_fast
+                && request_has_user_videos(messages, &self.hints)
+                && is_video_modality_error(&body)
+            {
+                tracing::warn!(
+                    provider = %self.provider_label,
+                    model = %self.model,
+                    status,
+                    "endpoint rejected video content; retrying without video"
+                );
+                Some(self.build_request_stripping(messages, tools, config, false, true))
+            } else if !fail_fast
+                && request_has_user_images(messages, &self.hints)
+                && is_image_modality_error(&body)
             {
                 tracing::warn!(
                     provider = %self.provider_label,
                     model = %self.model,
                     "endpoint rejected image content (400); retrying text-only"
                 );
-                let retry = self.build_request(messages, tools, config, true);
-                self.trace_prompt_cache_input(&retry, config);
-                response = self.post_chat(&retry).await?;
+                Some(self.build_request(messages, tools, config, true))
             } else {
-                let body = crate::provider::truncate_error_body(&body);
-                return Err(crate::error::LlmError::from_status_with_label(
-                    400,
-                    &body,
-                    format!("{}/{}", self.provider_label, self.model),
-                )
-                .with_api_style(crate::provider::ApiStyle::OpenAiChatCompletions)
-                .into());
+                None
+            };
+            match retry {
+                Some(retry) => {
+                    self.trace_prompt_cache_input(&retry, config);
+                    response = self.post_chat(&retry).await?;
+                }
+                None => {
+                    let body = crate::provider::truncate_error_body(&body);
+                    return Err(crate::error::LlmError::from_status_with_label(
+                        status,
+                        &body,
+                        format!("{}/{}", self.provider_label, self.model),
+                    )
+                    .with_api_style(crate::provider::ApiStyle::OpenAiChatCompletions)
+                    .into());
+                }
             }
         }
 
@@ -997,17 +1047,35 @@ impl LlmProvider for OpenAIProvider {
 
         // Graceful image-modality fallback (see `chat()`): retry once
         // text-only if the endpoint rejected the image content parts.
-        if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
+        let status = response.status().as_u16();
+        if (status == 400 || status == 422) && request_has_user_media(messages, &self.hints) {
             let text = response.text().await.unwrap_or_default();
-            if is_image_modality_error(&text)
-                && crate::current_llm_call_policy() != crate::LlmCallPolicy::FailFast
+            let fail_fast = crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+            let retry = if !fail_fast
+                && request_has_user_videos(messages, &self.hints)
+                && is_video_modality_error(&text)
+            {
+                tracing::warn!(
+                    provider = %self.provider_label,
+                    model = %self.model,
+                    status,
+                    "endpoint rejected video content; retrying without video (stream)"
+                );
+                Some(self.build_request_stripping(messages, tools, config, false, true))
+            } else if !fail_fast
+                && request_has_user_images(messages, &self.hints)
+                && is_image_modality_error(&text)
             {
                 tracing::warn!(
                     provider = %self.provider_label,
                     model = %self.model,
                     "endpoint rejected image content (400); retrying text-only (stream)"
                 );
-                let retry = self.build_request(messages, tools, config, true);
+                Some(self.build_request(messages, tools, config, true))
+            } else {
+                None
+            };
+            if let Some(retry) = retry {
                 self.trace_prompt_cache_input(&retry, config);
                 response = self.post_chat_stream(&retry).await?;
             } else {
@@ -1136,10 +1204,21 @@ enum OpenAIContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: OpenAIImageUrl },
+    /// A video as a data URL. The part the multimodal OpenAI-compatible
+    /// endpoints take (GLM's coding endpoint, Kimi); a text-or-image-only
+    /// endpoint rejects the request naming `video_url`, and the retry in
+    /// `chat()` / `chat_stream()` then resends without it.
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: OpenAIVideoUrl },
 }
 
 #[derive(Serialize)]
 struct OpenAIImageUrl {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct OpenAIVideoUrl {
     url: String,
 }
 
@@ -1203,6 +1282,30 @@ fn request_has_user_images(messages: &[Message], hints: &ModelHints) -> bool {
             .any(|m| m.role == MessageRole::User && m.media.iter().any(|p| vision::is_image(p)))
 }
 
+/// Whether the request carries a user-row video we would have sent as a
+/// `video_url` part. Decides whether a refusal is worth retrying without it.
+fn request_has_user_videos(messages: &[Message], hints: &ModelHints) -> bool {
+    !hints.lacks_video
+        && !hints.lacks_vision
+        && messages
+            .iter()
+            .any(|m| m.role == MessageRole::User && m.media.iter().any(|p| vision::is_video(p)))
+}
+
+fn request_has_user_media(messages: &[Message], hints: &ModelHints) -> bool {
+    request_has_user_images(messages, hints) || request_has_user_videos(messages, hints)
+}
+
+/// A refusal of the `video_url` part specifically. DeepSeek: 422 `unknown
+/// variant `video_url`, expected one of `text`, `image_url`, `file``; other
+/// endpoints say the modality or the part is not supported.
+fn is_video_modality_error(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    b.contains("video_url")
+        || (b.contains("video")
+            && (b.contains("not support") || b.contains("modal") || b.contains("unsupported")))
+}
+
 fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIContent> {
     // Only inline images on USER messages. Tool outputs (Assistant/Tool
     // role with `media`) are previous-turn artifacts the agent emitted —
@@ -1216,19 +1319,39 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
     //
     // The `read_file` text path still works: the assistant can read the
     // image's bytes if it really needs to inspect them, but the file is
-    // not pushed unsolicited into vision content.
+    // not pushed unsolicited into vision content. A tool that wants the
+    // model to look at something hands it over as `model_media`, which the
+    // agent loop turns into a user row (see `execute_tools`).
     let images: Vec<_> = if hints.lacks_vision || msg.role != MessageRole::User {
         vec![]
     } else {
         msg.media.iter().filter(|p| vision::is_image(p)).collect()
     };
+    // Video rides on the same user rows as a `video_url` part, for the
+    // endpoints that take one (GLM's coding endpoint, Kimi). An endpoint
+    // that does not answers with a refusal naming the part and the retry
+    // leg rebuilds with `lacks_video`, which lands here as a note.
+    let videos: Vec<_> = if hints.lacks_vision || hints.lacks_video || msg.role != MessageRole::User
+    {
+        vec![]
+    } else {
+        msg.media.iter().filter(|p| vision::is_video(p)).collect()
+    };
 
-    if images.is_empty() {
+    if images.is_empty() && videos.is_empty() {
         // Build a note for any media the LLM won't see inline:
         // - Non-image files (CSV, PDF, etc.) → include full path so agent can read_file
         // - Images stripped because model lacks vision → include filename
-        let non_image_files: Vec<_> = msg.media.iter().filter(|p| !vision::is_image(p)).collect();
+        // - Videos stripped because the model takes no video → include filename
+        let non_image_files: Vec<_> = msg
+            .media
+            .iter()
+            .filter(|p| !vision::is_image(p) && !vision::is_video(p))
+            .collect();
         let stripped_images = hints.lacks_vision && msg.media.iter().any(|p| vision::is_image(p));
+        let stripped_videos = msg.role == MessageRole::User
+            && (hints.lacks_vision || hints.lacks_video)
+            && msg.media.iter().any(|p| vision::is_video(p));
 
         let media_note = if !non_image_files.is_empty() || stripped_images {
             let mut parts = Vec::new();
@@ -1259,6 +1382,31 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
         } else {
             None
         };
+        // A video the model cannot view is named, not silently dropped: the
+        // model should say it could not watch it rather than guess.
+        let video_note = if stripped_videos {
+            let names: Vec<String> = msg
+                .media
+                .iter()
+                .filter(|p| vision::is_video(p))
+                .map(|p| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| p.clone())
+                })
+                .collect();
+            Some(format!(
+                "[video attachments this model cannot view: {}. Say so if asked about them; do not guess their contents.]",
+                names.join(", ")
+            ))
+        } else {
+            None
+        };
+        let media_note = match (media_note, video_note) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (a, b) => a.or(b),
+        };
 
         if msg.content.is_empty() && media_note.is_none() {
             // Tool messages require a content string (OpenAI spec).
@@ -1285,6 +1433,15 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
         if let Ok((mime, data)) = vision::encode_image(path) {
             parts.push(OpenAIContentPart::ImageUrl {
                 image_url: OpenAIImageUrl {
+                    url: format!("data:{mime};base64,{data}"),
+                },
+            });
+        }
+    }
+    for path in videos {
+        if let Ok((mime, data)) = vision::encode_video(path) {
+            parts.push(OpenAIContentPart::VideoUrl {
+                video_url: OpenAIVideoUrl {
                     url: format!("data:{mime};base64,{data}"),
                 },
             });
@@ -1798,6 +1955,7 @@ mod tests {
             uses_completion_tokens: true,
             fixed_temperature: false,
             lacks_vision: true,
+            lacks_video: false,
             merge_system_messages: false,
             reasoning_style: ReasoningStyle::EffortAndThinkingToggle,
         };
@@ -2506,6 +2664,7 @@ mod tests {
             uses_completion_tokens: true,
             fixed_temperature: true,
             lacks_vision: true,
+            lacks_video: false,
             merge_system_messages: false,
             reasoning_style: ReasoningStyle::None,
         });
@@ -2573,6 +2732,126 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    fn msg_with_user_video(dir: &std::path::Path) -> Message {
+        let clip = dir.join("clip.mp4");
+        std::fs::write(&clip, b"\x00\x00\x00\x18ftypisom").unwrap();
+        Message {
+            role: MessageRole::User,
+            content: "what happens in this clip".to_string(),
+            media: vec![clip.to_string_lossy().into_owned()],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn should_send_a_user_video_as_a_video_url_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = OpenAIProvider::new("key", "glm-5.3-flash");
+        let msgs = [msg_with_user_video(dir.path())];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let parts = v["messages"][0]["content"]
+            .as_array()
+            .expect("multipart user content");
+        assert_eq!(parts[0]["type"], "video_url");
+        assert!(
+            parts[0]["video_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:video/mp4;base64,"),
+            "{}",
+            parts[0]
+        );
+        assert_eq!(parts[1]["type"], "text");
+    }
+
+    #[test]
+    fn should_replace_the_video_with_a_note_when_the_model_lacks_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = OpenAIProvider::new("key", "deepseek-v4-flash").with_hints(ModelHints {
+            lacks_video: true,
+            ..ModelHints::default()
+        });
+        let msgs = [msg_with_user_video(dir.path())];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let content = v["messages"][0]["content"]
+            .as_str()
+            .expect("text content, no parts");
+        assert!(
+            content.starts_with("what happens in this clip"),
+            "{content}"
+        );
+        assert!(
+            content.contains("video attachments this model cannot view: clip.mp4"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("read_file"),
+            "a video is not for read_file: {content}"
+        );
+    }
+
+    /// DeepSeek's actual refusal of a `video_url` part.
+    const VIDEO_PART_422_BODY: &str = r#"{"error":{"message":"Failed to deserialize the JSON body into the target type: messages[0]: unknown variant `video_url`, expected one of `text`, `image_url`, `file` at line 1 column 6377","type":"invalid_request_error"}}"#;
+
+    #[tokio::test]
+    async fn should_retry_without_video_when_the_endpoint_refuses_the_video_part() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        // The first request carries the video part and is refused; the
+        // retry, without it, is answered.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("video_url"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_string(VIDEO_PART_422_BODY)
+                    .append_header("Content-Type", "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "I could not watch it."}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAIProvider::new("test-key", "deepseek-v4-flash").with_base_url(server.uri());
+        let messages = vec![msg_with_user_video(dir.path())];
+        let response = provider
+            .chat(&messages, &[], &ChatConfig::default())
+            .await
+            .expect("the retry without video succeeds");
+        assert_eq!(response.content.as_deref(), Some("I could not watch it."));
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let second = String::from_utf8_lossy(&requests[1].body);
+        assert!(
+            !second.contains("video_url"),
+            "retry must carry no video part"
+        );
+        assert!(
+            second.contains("video attachments this model cannot view"),
+            "retry names the video it dropped: {second}"
+        );
     }
 
     /// The body string that `is_image_modality_error` recognises as an image-

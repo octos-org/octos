@@ -1015,10 +1015,39 @@ fn build_anthropic_content(msg: &Message) -> AnthropicContent {
     };
 
     if images.is_empty() {
-        // Include non-image file paths so the agent can use read_file
-        let non_image: Vec<_> = msg.media.iter().filter(|p| !vision::is_image(p)).collect();
-        if non_image.is_empty() {
+        // Include non-image file paths so the agent can use read_file. A
+        // video is named separately: the Messages protocol has no video
+        // block, and `read_file` on an MP4 helps nobody, so the model is
+        // told it cannot watch it rather than sent to read the bytes.
+        let videos: Vec<_> = msg.media.iter().filter(|p| vision::is_video(p)).collect();
+        let non_image: Vec<_> = msg
+            .media
+            .iter()
+            .filter(|p| !vision::is_image(p) && !vision::is_video(p))
+            .collect();
+        if non_image.is_empty() && videos.is_empty() {
             return AnthropicContent::Text(msg.content.clone());
+        }
+        if non_image.is_empty() {
+            let names: Vec<String> = videos
+                .iter()
+                .map(|p| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| (*p).clone())
+                })
+                .collect();
+            let note = format!(
+                "[video attachments this model cannot view: {}. Say so if asked about them; do not guess their contents.]",
+                names.join(", ")
+            );
+            let text = if msg.content.is_empty() {
+                note
+            } else {
+                format!("{}\n{note}", msg.content)
+            };
+            return AnthropicContent::Text(text);
         }
         // Mini5 2026-05-12: the prior note ("Use read_file to access them.")
         // caused DeepSeek/Anthropic to refuse paths under /private/var/...

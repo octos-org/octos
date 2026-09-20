@@ -740,8 +740,11 @@ fn parts_compatible(existing: &[GeminiPart], new: &[GeminiPart]) -> bool {
 
 fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
     let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
+    // Gemini takes video the same way it takes images: inline data with
+    // the container's MIME type.
+    let videos: Vec<_> = msg.media.iter().filter(|p| vision::is_video(p)).collect();
 
-    if images.is_empty() {
+    if images.is_empty() && videos.is_empty() {
         return vec![GeminiPart::Text {
             text: msg.content.clone(),
             thought: None,
@@ -751,6 +754,16 @@ fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
     let mut parts = Vec::new();
     for path in images {
         if let Ok((mime, data)) = vision::encode_image(path) {
+            parts.push(GeminiPart::InlineData {
+                inline_data: GeminiInlineData {
+                    mime_type: mime,
+                    data,
+                },
+            });
+        }
+    }
+    for path in videos {
+        if let Ok((mime, data)) = vision::encode_video(path) {
             parts.push(GeminiPart::InlineData {
                 inline_data: GeminiInlineData {
                     mime_type: mime,
