@@ -5261,6 +5261,64 @@ const STATUS_WORD_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// free.
 const APPUI_IN_FLIGHT_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Bounds for how often a connection renews the session-runtime cache entry
+/// of every Session it holds open.
+///
+/// The cache evicts a runtime once it has been idle for its `idle_ttl` (30
+/// minutes under `octos serve`). Rebuilding is correct but slow — a long
+/// session costs seconds to reload from disk, which the UI pays on its next
+/// `session/open`, close to the client's 30 s request timeout, and which shows
+/// up as a stalled "restoring session" in the web client. A client with the
+/// Session OPEN means it is not idle, so renew a quarter of the way into that
+/// window: often enough to survive a missed tick, rare enough to be free.
+const APPUI_SESSION_KEEPALIVE_MIN: std::time::Duration = std::time::Duration::from_secs(5);
+const APPUI_SESSION_KEEPALIVE_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Renewal cadence for a cache holding entries for `idle_ttl`.
+fn appui_session_keepalive_interval(idle_ttl: std::time::Duration) -> std::time::Duration {
+    (idle_ttl / 4).clamp(APPUI_SESSION_KEEPALIVE_MIN, APPUI_SESSION_KEEPALIVE_MAX)
+}
+
+/// Whether a keep-alive round is due, recording the tick when it is.
+fn appui_keepalive_due(
+    last: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    match *last {
+        // First tick after the connection opens: the runtime was just used by
+        // session/open, so wait a full interval before the first renewal.
+        None => {
+            *last = Some(now);
+            false
+        }
+        Some(previous) if now.duration_since(previous) >= interval => {
+            *last = Some(now);
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+/// Renew every Session this connection holds open (see
+/// [`appui_session_keepalive_interval`]).
+async fn appui_keep_open_sessions_alive(
+    state: &Arc<AppState>,
+    open_sessions: &std::collections::HashSet<SessionKey>,
+) {
+    let mut renewed = 0usize;
+    for session_id in open_sessions {
+        renewed += state.session_cache.keep_session_alive(session_id).await;
+    }
+    if renewed > 0 {
+        tracing::debug!(
+            target: "octos::ui_protocol::ws",
+            sessions = renewed,
+            "renewed cached session runtimes held open by this connection"
+        );
+    }
+}
+
 /// CJK code-point check shared with `status_indicator::has_cjk` — kept
 /// inline here to avoid pulling the channel-aware status_indicator
 /// module into the WS turn path.
@@ -6697,6 +6755,7 @@ async fn ui_protocol_connection(
     // forever — the cleanup path only ran when the next client frame
     // arrived, leaving subscribers and ledger fan-out registered.
     let failed_notify = ws.failed_notify();
+    let mut last_session_keepalive: Option<std::time::Instant> = None;
     let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
     appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -6733,6 +6792,13 @@ async fn ui_protocol_connection(
                     .or(session_open_profile_id.as_deref());
                 let open_sessions: std::collections::HashSet<SessionKey> =
                     live_forwarders.lock().await.keys().cloned().collect();
+                if appui_keepalive_due(
+                    &mut last_session_keepalive,
+                    std::time::Instant::now(),
+                    appui_session_keepalive_interval(state.session_cache.idle_ttl()),
+                ) {
+                    appui_keep_open_sessions_alive(&state, &open_sessions).await;
+                }
                 drain_appui_due_master_continuations(
                     &ws,
                     &state,
@@ -7624,6 +7690,7 @@ where
     let connection_headers = HeaderMap::new();
     let mut connection_profile_id_owned: Option<String> = None;
     let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
+    let mut last_session_keepalive: Option<std::time::Instant> = None;
     let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
     appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let failed_notify = ws.failed_notify();
@@ -7652,6 +7719,13 @@ where
                     }
                     let open_sessions: std::collections::HashSet<SessionKey> =
                         live_forwarders.lock().await.keys().cloned().collect();
+                    if appui_keepalive_due(
+                        &mut last_session_keepalive,
+                        std::time::Instant::now(),
+                        appui_session_keepalive_interval(state.session_cache.idle_ttl()),
+                    ) {
+                        appui_keep_open_sessions_alive(&state, &open_sessions).await;
+                    }
                     drain_appui_due_master_continuations(
                         &ws,
                         &state,

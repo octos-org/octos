@@ -44235,3 +44235,66 @@ async fn should_withhold_not_running_for_a_topic_turn_asked_by_its_folded_id() {
         assert!(frame["result"].get("running").is_none(), "held: {frame}");
     }
 }
+
+// --- session keep-alive: an open Session must not age out of the runtime
+// cache under a client that is simply reading (see
+// APPUI_SESSION_KEEPALIVE_INTERVAL).
+
+#[test]
+fn should_pace_session_keepalive_inside_the_cache_idle_window() {
+    use std::time::Duration;
+    // A quarter of the window, so one missed tick still cannot age a Session out.
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(1800)),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(120)),
+        Duration::from_secs(30)
+    );
+    // Clamped: never busier than 5 s, never rarer than 5 minutes.
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(4)),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(36_000)),
+        Duration::from_secs(300)
+    );
+}
+
+#[test]
+fn should_wait_a_full_interval_before_the_first_session_keepalive() {
+    let interval = std::time::Duration::from_secs(300);
+    let start = std::time::Instant::now();
+    let mut last = None;
+    // session/open just used the runtime, so the first tick renews nothing.
+    assert!(!appui_keepalive_due(&mut last, start, interval));
+    assert!(!appui_keepalive_due(
+        &mut last,
+        start + std::time::Duration::from_secs(299),
+        interval
+    ));
+    assert!(appui_keepalive_due(&mut last, start + interval, interval));
+}
+
+#[test]
+fn should_keep_renewing_open_sessions_on_every_interval() {
+    let interval = std::time::Duration::from_secs(300);
+    let start = std::time::Instant::now();
+    let mut last = None;
+    appui_keepalive_due(&mut last, start, interval);
+    let mut renewals = 0;
+    // Two hours of an idle-but-open connection: the 30 minute idle TTL must
+    // never be reached between renewals.
+    for tick in (2..=7200).step_by(2) {
+        if appui_keepalive_due(
+            &mut last,
+            start + std::time::Duration::from_secs(tick),
+            interval,
+        ) {
+            renewals += 1;
+        }
+    }
+    assert_eq!(renewals, 24, "one renewal per interval, no drift");
+}

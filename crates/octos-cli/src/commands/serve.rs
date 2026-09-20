@@ -49,6 +49,23 @@ const FLEET_BOOT_RECONCILE_MAX_ATTEMPTS: u32 = 3;
 /// yields real isolation.
 ///
 /// [`NoSandbox`]: octos_agent::sandbox::NoSandbox
+/// Default idle lifetime of a cached per-session runtime (30 minutes).
+const SESSION_CACHE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Idle lifetime of a cached per-session runtime.
+///
+/// `OCTOS_SESSION_CACHE_IDLE_TTL_SECS` overrides it (minimum 1 s; a malformed
+/// or zero value keeps the default). Rebuilding an evicted runtime is correct
+/// but slow for a long session, so an operator on a big box may want it
+/// longer; tests want it short.
+fn session_cache_idle_ttl() -> std::time::Duration {
+    std::env::var("OCTOS_SESSION_CACHE_IDLE_TTL_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(SESSION_CACHE_IDLE_TTL, std::time::Duration::from_secs)
+}
+
 fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
     let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
     // A refusing resolution (explicit mode unhonorable on this host, or
@@ -1421,7 +1438,7 @@ impl ServeCommand {
         }
 
         let session_cache = Arc::new(
-            crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
+            crate::runtime::SessionRuntimeCache::new(64, session_cache_idle_ttl())
                 // Per-project session storage (opt-in, default off). When set,
                 // a cwd-hinted AppUi session's transcript store relocates to
                 // `<cwd>/.octos`; no-hint/gateway sessions are unaffected.
