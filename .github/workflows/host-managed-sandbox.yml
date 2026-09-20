@@ -2,7 +2,8 @@ name: Host-managed agent confinement
 
 on:
   push:
-    branches: [host-managed-confined-worker]
+    branches: [main]
+    paths: ['crates/octos-cli/**', 'crates/octos-agent/**', 'crates/octos-core/**', 'crates/octos-llm/**', 'crates/octos-memory/**', 'crates/octos-sandbox/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/host-managed-sandbox.yml']
   pull_request:
     paths: ['crates/octos-cli/**', 'crates/octos-agent/**', 'crates/octos-core/**', 'crates/octos-llm/**', 'crates/octos-memory/**', 'crates/octos-sandbox/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/host-managed-sandbox.yml']
   workflow_dispatch:
@@ -54,5 +55,5 @@ jobs:
           cargo test -p octos-cli --no-default-features --features api --test acp_integration --locked
       - name: Build actual host-managed worker
         run: cargo build -p octos-cli --no-default-features --locked
-      - name: Run confined Octos handshake and memory session
+      - name: Run confined Octos model and tool turns
         run: OCTOS_HOST_MANAGED_BINARY="$PWD/target/debug/octos" cargo test -p octos-sandbox --test host_managed --locked

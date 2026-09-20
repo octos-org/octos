@@ -1031,9 +1031,25 @@ mod tests {
         let first = EpisodeStore::in_memory().unwrap();
         let second = EpisodeStore::in_memory().unwrap();
         assert!(!first.is_degraded());
-        first.store(make_episode("private deployment details", "/room")).await.unwrap();
-        assert_eq!(first.find_relevant(Path::new("/room"), "deployment", 10).await.unwrap().len(), 1);
-        assert!(second.find_relevant(Path::new("/room"), "deployment", 10).await.unwrap().is_empty());
+        first
+            .store(make_episode("private deployment details", "/room"))
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .find_relevant(Path::new("/room"), "deployment", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            second
+                .find_relevant(Path::new("/room"), "deployment", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A 768-d embedder (in-process EmbeddingGemma) must actually reach the

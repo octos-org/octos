@@ -12,22 +12,25 @@ use agent_client_protocol::{
     on_receive_request,
 };
 use eyre::Result;
-use std::collections::HashMap;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-use tokio::sync::Mutex;
 use octos_agent::{
     Agent, AgentConfig, ConversationResponse, IncompleteResponseError, ProgressEvent,
     ProgressReporter, Tool, ToolRegistry, ToolResult,
 };
 use octos_core::{AgentId, Message, MessageRole};
-use octos_memory::EpisodeStore;
-use serde::{Deserialize, Serialize};
 use octos_llm::host::{
     self, HostConfig, ModelRequest, ToolCallRequest, ToolCallResponse, ToolsListResponse,
 };
 use octos_llm::{ChatConfig, ChatResponse, LlmProvider, ToolSpec};
-use std::sync::atomic::AtomicU64;
+use octos_memory::EpisodeStore;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
 /// Host-managed history has no disk store or workspace identity by construction.
@@ -182,7 +185,10 @@ struct Broker {
 }
 
 impl Broker {
-    async fn request<R: agent_client_protocol::JsonRpcRequest>(&self, request: R) -> Result<R::Response> {
+    async fn request<R: agent_client_protocol::JsonRpcRequest>(
+        &self,
+        request: R,
+    ) -> Result<R::Response> {
         let generation = self.generation;
         self.lifetime.check(generation)?;
         let result = tokio::select! {
@@ -208,22 +214,46 @@ struct HostProvider {
 
 #[async_trait::async_trait]
 impl LlmProvider for HostProvider {
-    async fn chat(&self, messages: &[octos_core::Message], tools: &[ToolSpec], config: &ChatConfig) -> Result<ChatResponse> {
-        let request = ModelRequest { messages: messages.to_vec(), tools: tools.to_vec(), config: config.clone() };
+    async fn chat(
+        &self,
+        messages: &[octos_core::Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        let request = ModelRequest {
+            messages: messages.to_vec(),
+            tools: tools.to_vec(),
+            config: config.clone(),
+        };
         request.validate().map_err(eyre::Report::msg)?;
         let response = self.broker.request(ModelCall(request)).await?.0;
         host::validate_payload_size(&response).map_err(eyre::Report::msg)?;
         Ok(response)
     }
 
-    async fn chat_stream(&self, messages: &[octos_core::Message], tools: &[ToolSpec], config: &ChatConfig) -> Result<octos_llm::ChatStream> {
-        Ok(host::response_stream(self.chat(messages, tools, config).await?))
+    async fn chat_stream(
+        &self,
+        messages: &[octos_core::Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<octos_llm::ChatStream> {
+        Ok(host::response_stream(
+            self.chat(messages, tools, config).await?,
+        ))
     }
 
-    fn model_id(&self) -> &str { &self.model.model_id }
-    fn provider_name(&self) -> &str { &self.model.provider_name }
-    fn context_window(&self) -> u32 { self.model.context_window }
-    fn max_output_tokens(&self) -> u32 { self.model.max_output_tokens }
+    fn model_id(&self) -> &str {
+        &self.model.model_id
+    }
+    fn provider_name(&self) -> &str {
+        &self.model.provider_name
+    }
+    fn context_window(&self) -> u32 {
+        self.model.context_window
+    }
+    fn max_output_tokens(&self) -> u32 {
+        self.model.max_output_tokens
+    }
 }
 
 struct HostTool {
@@ -233,16 +263,29 @@ struct HostTool {
 
 #[async_trait::async_trait]
 impl Tool for HostTool {
-    fn name(&self) -> &str { &self.spec.name }
-    fn description(&self) -> &str { &self.spec.description }
-    fn input_schema(&self) -> serde_json::Value { self.spec.input_schema.clone() }
+    fn name(&self) -> &str {
+        &self.spec.name
+    }
+    fn description(&self) -> &str {
+        &self.spec.description
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        self.spec.input_schema.clone()
+    }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let request = ToolCallRequest { name: self.spec.name.clone(), arguments: args.clone() };
+        let request = ToolCallRequest {
+            name: self.spec.name.clone(),
+            arguments: args.clone(),
+        };
         host::validate_payload_size(&request).map_err(eyre::Report::msg)?;
         let response = self.broker.request(CallTool(request)).await?.0;
         host::validate_payload_size(&response).map_err(eyre::Report::msg)?;
-        Ok(ToolResult { output: response.content, success: !response.is_error, ..Default::default() })
+        Ok(ToolResult {
+            output: response.content,
+            success: !response.is_error,
+            ..Default::default()
+        })
     }
 }
 
@@ -260,73 +303,146 @@ struct ManagedState {
 impl ManagedState {
     fn new(max_iterations: u32) -> Self {
         Self {
-            config: OnceLock::new(), session_created: AtomicBool::new(false),
-            turn_started: AtomicBool::new(false), lifetime: Arc::new(Lifetime::default()),
+            config: OnceLock::new(),
+            session_created: AtomicBool::new(false),
+            turn_started: AtomicBool::new(false),
+            lifetime: Arc::new(Lifetime::default()),
             agent_generation: AtomicU64::new(0),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            max_iterations: if max_iterations == 0 { DEFAULT_HOST_MAX_ITERATIONS } else { max_iterations },
+            max_iterations: if max_iterations == 0 {
+                DEFAULT_HOST_MAX_ITERATIONS
+            } else {
+                max_iterations
+            },
             session_update: Mutex::new(()),
         }
     }
 
     fn initialize(&self, request: &InitializeRequest, sandbox: &str) -> Result<InitializeResponse> {
-        let value = request.client_capabilities.meta.as_ref()
+        let value = request
+            .client_capabilities
+            .meta
+            .as_ref()
             .and_then(|meta| meta.get(host::CAPABILITY_KEY))
             .ok_or_else(|| eyre::eyre!("host-managed broker capability is required"))?;
         let config: HostConfig = serde_json::from_value(value.clone())?;
         config.validate().map_err(eyre::Report::msg)?;
-        self.config.set(config).map_err(|_| eyre::eyre!("already initialized"))?;
+        self.config
+            .set(config)
+            .map_err(|_| eyre::eyre!("already initialized"))?;
         let mut response = build_initialize_response(request);
         response.agent_capabilities.load_session = false;
-        response.agent_capabilities.meta = Some([(host::CAPABILITY_KEY.to_string(), serde_json::to_value(host::HostCapabilities {
-            version: host::VERSION, confined: true, sandbox: sandbox.into(),
-        })?)].into_iter().collect());
+        response.agent_capabilities.meta = Some(
+            [(
+                host::CAPABILITY_KEY.to_string(),
+                serde_json::to_value(host::HostCapabilities {
+                    version: host::VERSION,
+                    confined: true,
+                    sandbox: sandbox.into(),
+                })?,
+            )]
+            .into_iter()
+            .collect(),
+        );
         Ok(response)
     }
 
-    fn agent(&self, broker: Broker, specs: Vec<ToolSpec>, memory: Arc<EpisodeStore>) -> Result<Arc<Agent>> {
-        let config = self.config.get().ok_or_else(|| eyre::eyre!("initialize is required"))?;
-        let provider = Arc::new(HostProvider { broker: broker.clone(), model: config.model.clone() });
+    fn agent(
+        &self,
+        broker: Broker,
+        specs: Vec<ToolSpec>,
+        memory: Arc<EpisodeStore>,
+    ) -> Result<Arc<Agent>> {
+        let config = self
+            .config
+            .get()
+            .ok_or_else(|| eyre::eyre!("initialize is required"))?;
+        let provider = Arc::new(HostProvider {
+            broker: broker.clone(),
+            model: config.model.clone(),
+        });
         let mut tools = ToolRegistry::new();
         for spec in specs {
-            tools.register(HostTool { spec, broker: broker.clone() });
+            tools.register(HostTool {
+                spec,
+                broker: broker.clone(),
+            });
         }
         let agent_config = AgentConfig {
             max_iterations: self.max_iterations,
             chat_max_tokens: Some(config.model.max_output_tokens),
-            save_episodes: false, suppress_auto_send_files: true, format_after_edit: false,
+            save_episodes: false,
+            suppress_auto_send_files: true,
+            format_after_edit: false,
             ..Default::default()
         };
-        Ok(Arc::new(Agent::new(AgentId::new("host-managed"), provider, tools, memory)
-            .with_config(agent_config).with_shutdown(self.lifetime.shutdown.clone())
-            .with_system_prompt(config.system_prompt.clone())))
+        Ok(Arc::new(
+            Agent::new(AgentId::new("host-managed"), provider, tools, memory)
+                .with_config(agent_config)
+                .with_shutdown(self.lifetime.shutdown.clone())
+                .with_system_prompt(config.system_prompt.clone()),
+        ))
     }
 
-    async fn new_session(&self, request: NewSessionRequest, connection: ConnectionTo<Client>) -> Result<NewSessionResponse> {
+    async fn new_session(
+        &self,
+        request: NewSessionRequest,
+        connection: ConnectionTo<Client>,
+    ) -> Result<NewSessionResponse> {
         eyre::ensure!(self.config.get().is_some(), "initialize is required");
-        eyre::ensure!(request.mcp_servers.is_empty(), "host-managed sessions reject external MCP servers");
-        eyre::ensure!(self.session_created.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok(),
-            "host-managed processes allow exactly one session");
-        let broker = Broker { connection, lifetime: self.lifetime.clone(), generation: 0 };
+        eyre::ensure!(
+            request.mcp_servers.is_empty(),
+            "host-managed sessions reject external MCP servers"
+        );
+        eyre::ensure!(
+            self.session_created
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "host-managed processes allow exactly one session"
+        );
+        let broker = Broker {
+            connection,
+            lifetime: self.lifetime.clone(),
+            generation: 0,
+        };
         let agent = self.agent(broker, Vec::new(), Arc::new(EpisodeStore::in_memory()?))?;
         let session_id = new_session_id();
         let session = Arc::new(ManagedSession {
-            agent, history: Mutex::new(Vec::new()), shutdown: self.lifetime.shutdown.clone(),
+            agent,
+            history: Mutex::new(Vec::new()),
+            shutdown: self.lifetime.shutdown.clone(),
             fold_queue: Mutex::new(Vec::new()),
         });
-        self.sessions.lock().await.insert(session_id.clone(), session);
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), session);
         Ok(NewSessionResponse::new(session_id))
     }
 
     async fn session(&self, id: &SessionId) -> Result<Arc<ManagedSession>> {
-        self.sessions.lock().await.get(id).cloned().ok_or_else(|| eyre::eyre!("unknown host-managed session"))
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| eyre::eyre!("unknown host-managed session"))
     }
 
     /// Refresh the host's tool snapshot between turns. The immutable Agent
     /// registry is replaced only while idle; history and the in-memory store
     /// remain in this one session. Every call still rechecks the host registry.
-    async fn refresh(&self, id: &SessionId, connection: ConnectionTo<Client>, generation: u64) -> Result<Arc<ManagedSession>> {
-        let broker = Broker { connection, lifetime: self.lifetime.clone(), generation };
+    async fn refresh(
+        &self,
+        id: &SessionId,
+        connection: ConnectionTo<Client>,
+        generation: u64,
+    ) -> Result<Arc<ManagedSession>> {
+        let broker = Broker {
+            connection,
+            lifetime: self.lifetime.clone(),
+            generation,
+        };
         let mut specs = broker.tools().await?;
         self.lifetime.check(generation)?;
         let _update = self.session_update.lock().await;
@@ -335,9 +451,13 @@ impl ManagedState {
         specs.sort_by(|left, right| left.name.cmp(&right.name));
         current.sort_by(|left, right| left.name.cmp(&right.name));
         if self.agent_generation.load(Ordering::Acquire) == generation
-            && current.len() == specs.len() && current.iter().zip(&specs).all(|(left, right)| {
-            left.name == right.name && left.description == right.description && left.input_schema == right.input_schema
-        }) {
+            && current.len() == specs.len()
+            && current.iter().zip(&specs).all(|(left, right)| {
+                left.name == right.name
+                    && left.description == right.description
+                    && left.input_schema == right.input_schema
+            })
+        {
             return Ok(old);
         }
         let agent = self.agent(broker, specs, old.agent.memory_store().clone())?;
@@ -347,14 +467,21 @@ impl ManagedState {
             shutdown: self.lifetime.shutdown.clone(),
             fold_queue: Mutex::new(std::mem::take(&mut *old.fold_queue.lock().await)),
         });
-        self.sessions.lock().await.insert(id.clone(), session.clone());
+        self.sessions
+            .lock()
+            .await
+            .insert(id.clone(), session.clone());
         self.agent_generation.store(generation, Ordering::Release);
         Ok(session)
     }
 
     fn begin_turn(self: &Arc<Self>) -> Result<TurnGuard> {
-        eyre::ensure!(self.turn_started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok(),
-            "a host-managed turn is already running");
+        eyre::ensure!(
+            self.turn_started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "a host-managed turn is already running"
+        );
         self.lifetime.shutdown.store(false, Ordering::Release);
         Ok(TurnGuard(self.clone()))
     }
@@ -363,7 +490,9 @@ impl ManagedState {
 struct TurnGuard(Arc<ManagedState>);
 
 impl Drop for TurnGuard {
-    fn drop(&mut self) { self.0.turn_started.store(false, Ordering::Release); }
+    fn drop(&mut self) {
+        self.0.turn_started.store(false, Ordering::Release);
+    }
 }
 
 fn error(error: impl std::fmt::Display) -> AcpError {
@@ -383,100 +512,146 @@ pub(super) async fn serve(
     let prompt = state.clone();
     let notify = state.clone();
     let cancel = state.clone();
-    let result = AcpAgentRole.builder().name("octos-host-managed")
-        .on_receive_request(async move |req: InitializeRequest, responder, _cx: ConnectionTo<Client>| {
-            match init.initialize(&req, sandbox) {
+    let result = AcpAgentRole
+        .builder()
+        .name("octos-host-managed")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx: ConnectionTo<Client>| match init
+                .initialize(&req, sandbox)
+            {
                 Ok(response) => responder.respond(response),
                 Err(e) => responder.respond_with_error(error(e)),
-            }
-        }, on_receive_request!())
-        .on_receive_request(async move |req: NewSessionRequest, responder, cx: ConnectionTo<Client>| {
-            match new.new_session(req, cx).await {
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: NewSessionRequest, responder, cx: ConnectionTo<Client>| match new
+                .new_session(req, cx)
+                .await
+            {
                 Ok(response) => responder.respond(response),
                 Err(e) => responder.respond_with_error(error(e)),
-            }
-        }, on_receive_request!())
-        .on_receive_request(async move |_req: LoadSessionRequest, responder, _cx: ConnectionTo<Client>| {
-            responder.respond_with_error(error("host-managed sessions cannot load persistent history"))
-        }, on_receive_request!())
-        .on_receive_request(async move |req: PromptRequest, responder: agent_client_protocol::Responder<PromptResponse>, cx: ConnectionTo<Client>| {
-            if let Err(e) = host::validate_payload_size(&req) {
-                return responder.respond_with_error(error(e));
-            }
-            if let Err(e) = prompt.session(&req.session_id).await {
-                return responder.respond_with_error(error(e));
-            }
-            let guard = match prompt.begin_turn() {
-                Ok(guard) => guard,
-                Err(e) => return responder.respond_with_error(error(e)),
-            };
-            let generation = prompt.lifetime.generation.load(Ordering::Acquire);
-            let state = prompt.clone();
-            cx.clone().spawn(async move {
-                let _guard = guard;
-                match state.refresh(&req.session_id, cx.clone(), generation).await {
-                    Ok(session) => run_prompt_turn(session, req, cx, responder).await,
-                    Err(e) => {
-                        if state.lifetime.check(generation).is_err() {
-                            responder.respond(PromptResponse::new(StopReason::Cancelled))
-                        } else {
-                            responder.respond_with_error(error(e))
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: LoadSessionRequest, responder, _cx: ConnectionTo<Client>| {
+                responder.respond_with_error(error(
+                    "host-managed sessions cannot load persistent history",
+                ))
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder: agent_client_protocol::Responder<PromptResponse>,
+                        cx: ConnectionTo<Client>| {
+                if let Err(e) = host::validate_payload_size(&req) {
+                    return responder.respond_with_error(error(e));
+                }
+                if let Err(e) = prompt.session(&req.session_id).await {
+                    return responder.respond_with_error(error(e));
+                }
+                let guard = match prompt.begin_turn() {
+                    Ok(guard) => guard,
+                    Err(e) => return responder.respond_with_error(error(e)),
+                };
+                let generation = prompt.lifetime.generation.load(Ordering::Acquire);
+                let state = prompt.clone();
+                cx.clone().spawn(async move {
+                    let _guard = guard;
+                    match state.refresh(&req.session_id, cx.clone(), generation).await {
+                        Ok(session) => run_prompt_turn(session, req, cx, responder).await,
+                        Err(e) => {
+                            if state.lifetime.check(generation).is_err() {
+                                responder.respond(PromptResponse::new(StopReason::Cancelled))
+                            } else {
+                                responder.respond_with_error(error(e))
+                            }
                         }
                     }
+                })
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: NotifyRequest,
+                        responder: agent_client_protocol::Responder<NotifyResponse>,
+                        cx: ConnectionTo<Client>| {
+                if let Err(e) = host::validate_payload_size(&req) {
+                    return responder.respond_with_error(error(e));
                 }
-            })
-        }, on_receive_request!())
-        .on_receive_request(async move |req: NotifyRequest, responder: agent_client_protocol::Responder<NotifyResponse>, cx: ConnectionTo<Client>| {
-            if let Err(e) = host::validate_payload_size(&req) {
-                return responder.respond_with_error(error(e));
-            }
-            if req.events.is_empty() {
-                return responder.respond_with_error(error("host notification events must not be empty"));
-            }
-            let _update = notify.session_update.lock().await;
-            let session = match notify.session(&req.session_id).await {
-                Ok(session) => session,
-                Err(e) => return responder.respond_with_error(error(e)),
-            };
-            let busy = notify.turn_started.load(Ordering::Acquire);
-            if !req.auto_respond || busy {
-                // The turn guard covers tool refresh as well as inference.
-                let response = notify_context_only(&session, &req, busy).await;
-                return responder.respond(response);
-            }
-            let guard = match notify.begin_turn() {
-                Ok(guard) => guard,
-                // A prompt may have started since the idle snapshot. Apply
-                // the caller's busy policy without starting another turn.
-                Err(_) => return responder.respond(notify_context_only(&session, &req, true).await),
-            };
-            let folded = drain_fold_events(&session).await;
-            append_host_events(&session, &folded).await;
-            append_host_events(&session, &req.events).await;
-            let generation = notify.lifetime.generation.load(Ordering::Acquire);
-            let state = notify.clone();
-            responder.respond(NotifyResponse { queued: true, busy: false })?;
-            cx.clone().spawn(async move {
-                let _guard = guard;
-                if let Ok(session) = state.refresh(&req.session_id, cx.clone(), generation).await {
-                    let _ = run_turn_core(&session, &req.session_id, AUTO_RESPOND_INSTRUCTION, true, &cx).await;
+                if req.events.is_empty() {
+                    return responder
+                        .respond_with_error(error("host notification events must not be empty"));
+                }
+                let _update = notify.session_update.lock().await;
+                let session = match notify.session(&req.session_id).await {
+                    Ok(session) => session,
+                    Err(e) => return responder.respond_with_error(error(e)),
+                };
+                let busy = notify.turn_started.load(Ordering::Acquire);
+                if !req.auto_respond || busy {
+                    // The turn guard covers tool refresh as well as inference.
+                    let response = notify_context_only(&session, &req, busy).await;
+                    return responder.respond(response);
+                }
+                let guard = match notify.begin_turn() {
+                    Ok(guard) => guard,
+                    // A prompt may have started since the idle snapshot. Apply
+                    // the caller's busy policy without starting another turn.
+                    Err(_) => {
+                        return responder.respond(notify_context_only(&session, &req, true).await);
+                    }
+                };
+                let folded = drain_fold_events(&session).await;
+                append_host_events(&session, &folded).await;
+                append_host_events(&session, &req.events).await;
+                let generation = notify.lifetime.generation.load(Ordering::Acquire);
+                let state = notify.clone();
+                responder.respond(NotifyResponse {
+                    queued: true,
+                    busy: false,
+                })?;
+                cx.clone().spawn(async move {
+                    let _guard = guard;
+                    if let Ok(session) =
+                        state.refresh(&req.session_id, cx.clone(), generation).await
+                    {
+                        let _ = run_turn_core(
+                            &session,
+                            &req.session_id,
+                            AUTO_RESPOND_INSTRUCTION,
+                            true,
+                            &cx,
+                        )
+                        .await;
+                    }
+                    Ok(())
+                })
+            },
+            on_receive_request!(),
+        )
+        .on_receive_notification(
+            async move |req: CancelNotification, _cx: ConnectionTo<Client>| {
+                if cancel.session(&req.session_id).await.is_ok() {
+                    cancel.lifetime.cancel();
                 }
                 Ok(())
-            })
-        }, on_receive_request!())
-        .on_receive_notification(async move |req: CancelNotification, _cx: ConnectionTo<Client>| {
-            if cancel.session(&req.session_id).await.is_ok() {
-                cancel.lifetime.cancel();
-            }
-            Ok(())
-        }, on_receive_notification!())
-        .connect_to(transport).await;
+            },
+            on_receive_notification!(),
+        )
+        .connect_to(transport)
+        .await;
     state.lifetime.cancel();
     result
 }
 
-
-async fn notify_context_only(session: &ManagedSession, req: &NotifyRequest, busy: bool) -> NotifyResponse {
+async fn notify_context_only(
+    session: &ManagedSession,
+    req: &NotifyRequest,
+    busy: bool,
+) -> NotifyResponse {
     if busy {
         let queued = req.if_busy == NotifyIfBusy::Fold;
         if queued {
@@ -490,7 +665,10 @@ async fn notify_context_only(session: &ManagedSession, req: &NotifyRequest, busy
     let folded = drain_fold_events(session).await;
     append_host_events(session, &folded).await;
     append_host_events(session, &req.events).await;
-    NotifyResponse { queued: true, busy: false }
+    NotifyResponse {
+        queued: true,
+        busy: false,
+    }
 }
 
 async fn drain_fold_events(session: &ManagedSession) -> Vec<String> {
@@ -498,9 +676,11 @@ async fn drain_fold_events(session: &ManagedSession) -> Vec<String> {
 }
 
 async fn append_host_events(session: &ManagedSession, events: &[String]) {
-    session.history.lock().await.extend(events.iter().map(|event| {
-        Message::system(format!("[Notification] {event}"))
-    }));
+    session.history.lock().await.extend(
+        events
+            .iter()
+            .map(|event| Message::system(format!("[Notification] {event}"))),
+    );
 }
 
 enum TurnEnd {
@@ -514,7 +694,14 @@ async fn run_prompt_turn(
     cx: ConnectionTo<Client>,
     responder: agent_client_protocol::Responder<PromptResponse>,
 ) -> std::result::Result<(), AcpError> {
-    let end = run_turn_core(&session, &req.session_id, &extract_prompt_text(&req.prompt), false, &cx).await;
+    let end = run_turn_core(
+        &session,
+        &req.session_id,
+        &extract_prompt_text(&req.prompt),
+        false,
+        &cx,
+    )
+    .await;
     match end {
         TurnEnd::Done(reason) => responder.respond(PromptResponse::new(reason)),
         TurnEnd::Failed(message) => responder.respond_with_error(error(message)),
@@ -532,19 +719,37 @@ async fn run_turn_core(
     let folded = drain_fold_events(session).await;
     append_host_events(session, &folded).await;
     let history = session.history.lock().await.clone();
-    session.agent.set_reporter(Arc::new(AcpProgressReporter::new(session_id.clone(), cx.clone())));
-    let outcome = session.agent.process_message(user_text, &history, vec![]).await;
+    session
+        .agent
+        .set_reporter(Arc::new(AcpProgressReporter::new(
+            session_id.clone(),
+            cx.clone(),
+        )));
+    let outcome = session
+        .agent
+        .process_message(user_text, &history, vec![])
+        .await;
     let cancelled = session.shutdown.load(Ordering::Acquire);
     match outcome {
         Ok(response) => {
             retain_turn_rows(session, response, cancelled, synthetic_user_row).await;
-            TurnEnd::Done(if cancelled { StopReason::Cancelled } else { StopReason::EndTurn })
+            TurnEnd::Done(if cancelled {
+                StopReason::Cancelled
+            } else {
+                StopReason::EndTurn
+            })
         }
         Err(err) => {
             // Upstream carries real partial output in a typed error. Preserve
             // that context without reporting a truncated response as success.
             if let Some(incomplete) = err.downcast_ref::<IncompleteResponseError>() {
-                retain_turn_rows(session, incomplete.partial.clone(), cancelled, synthetic_user_row).await;
+                retain_turn_rows(
+                    session,
+                    incomplete.partial.clone(),
+                    cancelled,
+                    synthetic_user_row,
+                )
+                .await;
             }
             if cancelled {
                 TurnEnd::Done(StopReason::Cancelled)
@@ -622,7 +827,6 @@ fn progress_event_to_acp(event: &ProgressEvent) -> Option<SessionUpdate> {
     }
 }
 
-
 struct AcpProgressReporter {
     session_id: SessionId,
     cx: ConnectionTo<Client>,
@@ -632,7 +836,11 @@ struct AcpProgressReporter {
 
 impl AcpProgressReporter {
     fn new(session_id: SessionId, cx: ConnectionTo<Client>) -> Self {
-        Self { session_id, cx, streamed_iteration: AtomicU64::new(0) }
+        Self {
+            session_id,
+            cx,
+            streamed_iteration: AtomicU64::new(0),
+        }
     }
 }
 
@@ -647,13 +855,19 @@ impl ProgressReporter for AcpProgressReporter {
     }
 }
 
-fn project_progress_event(event: &ProgressEvent, streamed_iteration: &AtomicU64) -> Option<SessionUpdate> {
+fn project_progress_event(
+    event: &ProgressEvent,
+    streamed_iteration: &AtomicU64,
+) -> Option<SessionUpdate> {
     match event {
         ProgressEvent::StreamChunk { iteration, .. } => {
             streamed_iteration.store(u64::from(*iteration) + 1, Ordering::Relaxed);
         }
         ProgressEvent::Response { iteration, .. }
-            if streamed_iteration.load(Ordering::Relaxed) == u64::from(*iteration) + 1 => return None,
+            if streamed_iteration.load(Ordering::Relaxed) == u64::from(*iteration) + 1 =>
+        {
+            return None;
+        }
         _ => {}
     }
     progress_event_to_acp(event)
@@ -662,16 +876,19 @@ fn project_progress_event(event: &ProgressEvent, streamed_iteration: &AtomicU64)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::ProtocolVersion;
+    use agent_client_protocol::schema::v1::{ClientCapabilities, TextContent};
+    use octos_core::MessageRole;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
-    use agent_client_protocol::schema::v1::{ClientCapabilities, TextContent};
-    use agent_client_protocol::schema::ProtocolVersion;
-    use octos_core::MessageRole;
 
     struct Transport;
 
     impl agent_client_protocol::ConnectTo<Client> for Transport {
-        async fn connect_to(self, client: impl agent_client_protocol::ConnectTo<AcpAgentRole> + 'static) -> std::result::Result<(), AcpError> {
+        async fn connect_to(
+            self,
+            client: impl agent_client_protocol::ConnectTo<AcpAgentRole> + 'static,
+        ) -> std::result::Result<(), AcpError> {
             serve(4, "test-only", client).await
         }
     }
@@ -680,13 +897,22 @@ mod tests {
         let config = HostConfig {
             version: host::VERSION,
             model: host::HostModel {
-                model_id: "host-test".into(), provider_name: "broker".into(),
-                context_window: 32_000, max_output_tokens: 1024,
+                model_id: "host-test".into(),
+                provider_name: "broker".into(),
+                context_window: 32_000,
+                max_output_tokens: 1024,
             },
             system_prompt: "Use only tools supplied by the host.".into(),
         };
         let mut capabilities = ClientCapabilities::new();
-        capabilities.meta = Some([(host::CAPABILITY_KEY.into(), serde_json::to_value(config).unwrap())].into_iter().collect());
+        capabilities.meta = Some(
+            [(
+                host::CAPABILITY_KEY.into(),
+                serde_json::to_value(config).unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+        );
         InitializeRequest::new(ProtocolVersion::V1).client_capabilities(capabilities)
     }
 
@@ -696,13 +922,21 @@ mod tests {
 
     fn response(content: &str) -> ChatResponse {
         ChatResponse {
-            content: Some(content.into()), reasoning_content: None, tool_calls: Vec::new(),
-            stop_reason: octos_llm::StopReason::EndTurn, usage: Default::default(), provider_index: None,
+            content: Some(content.into()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: Default::default(),
+            provider_index: None,
         }
     }
 
     fn tool(name: &str) -> ToolSpec {
-        ToolSpec { name: name.into(), description: "Host operation".into(), input_schema: serde_json::json!({"type":"object"}) }
+        ToolSpec {
+            name: name.into(),
+            description: "Host operation".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        }
     }
 
     #[test]
@@ -722,8 +956,19 @@ mod tests {
         assert!(lifetime.check(1).is_ok());
         #[cfg(feature = "api")]
         {
-            let command = super::super::AcpCommand { host_managed: true, config: Some("/never-read-this-config".into()), ..Default::default() };
-            assert!(command.factory().err().unwrap().to_string().contains("confined ACP broker transport"));
+            let command = super::super::AcpCommand {
+                host_managed: true,
+                config: Some("/never-read-this-config".into()),
+                ..Default::default()
+            };
+            assert!(
+                command
+                    .factory()
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("confined ACP broker transport")
+            );
         }
     }
 
@@ -751,12 +996,25 @@ mod tests {
 
     #[tokio::test]
     async fn host_managed_missing_broker_fails_before_inference() {
-        Client.builder().connect_with(Transport, |cx: ConnectionTo<AcpAgentRole>| async move {
-            cx.send_request(initialize()).block_task().await?;
-            let session = cx.send_request(NewSessionRequest::new(PathBuf::from("/"))).block_task().await?.session_id;
-            assert!(cx.send_request(prompt(session, "private data")).block_task().await.is_err());
-            Ok(())
-        }).await.unwrap();
+        Client
+            .builder()
+            .connect_with(Transport, |cx: ConnectionTo<AcpAgentRole>| async move {
+                cx.send_request(initialize()).block_task().await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(PathBuf::from("/")))
+                    .block_task()
+                    .await?
+                    .session_id;
+                assert!(
+                    cx.send_request(prompt(session, "private data"))
+                        .block_task()
+                        .await
+                        .is_err()
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -767,45 +1025,103 @@ mod tests {
         let model_count = model_calls.clone();
         let tool_count = tool_calls.clone();
         let list_count = lists.clone();
-        Client.builder()
-            .on_receive_notification(async |_req: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()), on_receive_notification!())
-            .on_receive_request(async move |_req: ListTools, responder, _cx: ConnectionTo<AcpAgentRole>| {
-                let name = if list_count.fetch_add(1, Ordering::AcqRel) == 0 { "echo" } else { "changed" };
-                responder.respond(ToolsResponse(ToolsListResponse { tools: vec![tool(name)] }))
-            }, on_receive_request!())
-            .on_receive_request(async move |req: CallTool, responder, _cx: ConnectionTo<AcpAgentRole>| {
-                assert_eq!(req.0.name, "echo");
-                assert_eq!(req.0.arguments["text"], "private tool input");
-                tool_count.fetch_add(1, Ordering::AcqRel);
-                responder.respond(ToolResponse(ToolCallResponse { content: "private tool feedback".into(), is_error: false }))
-            }, on_receive_request!())
-            .on_receive_request(async move |req: ModelCall, responder, _cx: ConnectionTo<AcpAgentRole>| {
-                let index = model_count.fetch_add(1, Ordering::AcqRel);
-                assert_eq!(req.0.tools.len(), 1, "native Octos tools must not be registered");
-                assert_eq!(req.0.config.max_tokens, Some(1024));
-                let mut result = response("done");
-                if index == 0 {
-                    assert_eq!(req.0.tools[0].name, "echo");
-                    result.tool_calls.push(octos_core::ToolCall {
-                        id: "call-1".into(), name: "echo".into(),
-                        arguments: serde_json::json!({"text":"private tool input"}), metadata: None,
-                    });
-                    result.stop_reason = octos_llm::StopReason::ToolUse;
-                } else if index == 1 {
-                    assert!(req.0.messages.iter().any(|message| message.role == MessageRole::Tool && message.content.contains("private tool feedback")));
-                } else {
-                    assert_eq!(req.0.tools[0].name, "changed");
-                    assert!(req.0.messages.iter().any(|message| message.content.contains("private tool feedback")), "tool refresh must preserve history");
-                }
-                responder.respond(ModelResponse(result))
-            }, on_receive_request!())
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_req: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()),
+                on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |_req: ListTools, responder, _cx: ConnectionTo<AcpAgentRole>| {
+                    let name = if list_count.fetch_add(1, Ordering::AcqRel) == 0 {
+                        "echo"
+                    } else {
+                        "changed"
+                    };
+                    responder.respond(ToolsResponse(ToolsListResponse {
+                        tools: vec![tool(name)],
+                    }))
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: CallTool, responder, _cx: ConnectionTo<AcpAgentRole>| {
+                    assert_eq!(req.0.name, "echo");
+                    assert_eq!(req.0.arguments["text"], "private tool input");
+                    tool_count.fetch_add(1, Ordering::AcqRel);
+                    responder.respond(ToolResponse(ToolCallResponse {
+                        content: "private tool feedback".into(),
+                        is_error: false,
+                    }))
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: ModelCall, responder, _cx: ConnectionTo<AcpAgentRole>| {
+                    let index = model_count.fetch_add(1, Ordering::AcqRel);
+                    assert_eq!(
+                        req.0.tools.len(),
+                        1,
+                        "native Octos tools must not be registered"
+                    );
+                    assert_eq!(req.0.config.max_tokens, Some(1024));
+                    let mut result = response("done");
+                    if index == 0 {
+                        assert_eq!(req.0.tools[0].name, "echo");
+                        result.tool_calls.push(octos_core::ToolCall {
+                            id: "call-1".into(),
+                            name: "echo".into(),
+                            arguments: serde_json::json!({"text":"private tool input"}),
+                            metadata: None,
+                        });
+                        result.stop_reason = octos_llm::StopReason::ToolUse;
+                    } else if index == 1 {
+                        assert!(
+                            req.0
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::Tool
+                                    && message.content.contains("private tool feedback"))
+                        );
+                    } else {
+                        assert_eq!(req.0.tools[0].name, "changed");
+                        assert!(
+                            req.0
+                                .messages
+                                .iter()
+                                .any(|message| message.content.contains("private tool feedback")),
+                            "tool refresh must preserve history"
+                        );
+                    }
+                    responder.respond(ModelResponse(result))
+                },
+                on_receive_request!(),
+            )
             .connect_with(Transport, |cx: ConnectionTo<AcpAgentRole>| async move {
                 cx.send_request(initialize()).block_task().await?;
-                let session = cx.send_request(NewSessionRequest::new(PathBuf::from("/"))).block_task().await?.session_id;
-                assert_eq!(cx.send_request(prompt(session.clone(), "first")).block_task().await?.stop_reason, StopReason::EndTurn);
-                assert_eq!(cx.send_request(prompt(session, "second")).block_task().await?.stop_reason, StopReason::EndTurn);
+                let session = cx
+                    .send_request(NewSessionRequest::new(PathBuf::from("/")))
+                    .block_task()
+                    .await?
+                    .session_id;
+                assert_eq!(
+                    cx.send_request(prompt(session.clone(), "first"))
+                        .block_task()
+                        .await?
+                        .stop_reason,
+                    StopReason::EndTurn
+                );
+                assert_eq!(
+                    cx.send_request(prompt(session, "second"))
+                        .block_task()
+                        .await?
+                        .stop_reason,
+                    StopReason::EndTurn
+                );
                 Ok(())
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         assert_eq!(model_calls.load(Ordering::Acquire), 3);
         assert_eq!(tool_calls.load(Ordering::Acquire), 1);
         assert_eq!(lists.load(Ordering::Acquire), 2);
@@ -819,53 +1135,147 @@ mod tests {
         let model_calls = calls.clone();
         let pending = Arc::new(Mutex::new(None));
         let pending_model = pending.clone();
-        Client.builder()
-            .on_receive_notification(async |_req: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()), on_receive_notification!())
-            .on_receive_request(async |_req: ListTools, responder, _cx: ConnectionTo<AcpAgentRole>| {
-                responder.respond(ToolsResponse(ToolsListResponse { tools: Vec::new() }))
-            }, on_receive_request!())
-            .on_receive_request(async move |_req: ModelCall, responder, _cx: ConnectionTo<AcpAgentRole>| {
-                if model_calls.fetch_add(1, Ordering::AcqRel) == 0 {
-                    *pending_model.lock().await = Some(responder);
-                    entered_model.notify_one();
-                    Ok(())
-                } else {
-                    responder.respond(ModelResponse(response("fresh")))
-                }
-            }, on_receive_request!())
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_req: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()),
+                on_receive_notification!(),
+            )
+            .on_receive_request(
+                async |_req: ListTools, responder, _cx: ConnectionTo<AcpAgentRole>| {
+                    responder.respond(ToolsResponse(ToolsListResponse { tools: Vec::new() }))
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: ModelCall, responder, _cx: ConnectionTo<AcpAgentRole>| {
+                    if model_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        *pending_model.lock().await = Some(responder);
+                        entered_model.notify_one();
+                        Ok(())
+                    } else {
+                        responder.respond(ModelResponse(response("fresh")))
+                    }
+                },
+                on_receive_request!(),
+            )
             .connect_with(Transport, |cx: ConnectionTo<AcpAgentRole>| async move {
                 cx.send_request(initialize()).block_task().await?;
-                let session = cx.send_request(NewSessionRequest::new(PathBuf::from("/"))).block_task().await?.session_id;
+                let session = cx
+                    .send_request(NewSessionRequest::new(PathBuf::from("/")))
+                    .block_task()
+                    .await?
+                    .session_id;
                 let canceller = cx.clone();
                 let cancel_session = session.clone();
                 let task = tokio::spawn(async move {
                     entered.notified().await;
-                    assert!(canceller.send_request(prompt(cancel_session.clone(), "overlapping turn")).block_task().await.is_err());
-                    canceller.send_notification(CancelNotification::new(cancel_session)).unwrap();
+                    assert!(
+                        canceller
+                            .send_request(prompt(cancel_session.clone(), "overlapping turn"))
+                            .block_task()
+                            .await
+                            .is_err()
+                    );
+                    canceller
+                        .send_notification(CancelNotification::new(cancel_session))
+                        .unwrap();
                 });
-                let first = tokio::time::timeout(std::time::Duration::from_secs(5), cx.send_request(prompt(session.clone(), "cancel this")).block_task()).await.unwrap()?;
+                let first = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    cx.send_request(prompt(session.clone(), "cancel this"))
+                        .block_task(),
+                )
+                .await
+                .unwrap()?;
                 assert_eq!(first.stop_reason, StopReason::Cancelled);
                 task.await.unwrap();
-                assert_eq!(cx.send_request(prompt(session, "fresh turn")).block_task().await?.stop_reason, StopReason::EndTurn);
+                assert_eq!(
+                    cx.send_request(prompt(session, "fresh turn"))
+                        .block_task()
+                        .await?
+                        .stop_reason,
+                    StopReason::EndTurn
+                );
                 Ok(())
-            }).await.unwrap();
-        assert_eq!(calls.load(Ordering::Acquire), 2, "cancelled calls must not fall back to a second broker request");
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            2,
+            "cancelled calls must not fall back to a second broker request"
+        );
     }
-
 
     #[test]
     fn host_managed_progress_deduplicates_each_iteration_independently() {
         let streamed = AtomicU64::new(0);
-        assert!(project_progress_event(&ProgressEvent::Response { content: "plain".into(), iteration: 0 }, &streamed).is_some());
-        assert!(project_progress_event(&ProgressEvent::StreamChunk { text: "streamed".into(), iteration: 1 }, &streamed).is_some());
-        assert!(project_progress_event(&ProgressEvent::Response { content: "streamed".into(), iteration: 1 }, &streamed).is_none());
-        assert!(project_progress_event(&ProgressEvent::Response { content: "next answer".into(), iteration: 2 }, &streamed).is_some());
-        assert!(matches!(progress_event_to_acp(&ProgressEvent::ReasoningChunk { text: "reasoning".into(), iteration: 2 }), Some(SessionUpdate::AgentThoughtChunk(_))));
-        assert!(matches!(progress_event_to_acp(&ProgressEvent::ToolStarted { name: "host-tool".into(), tool_id: "call-1".into(), arguments: None }), Some(SessionUpdate::ToolCall(_))));
-        assert!(matches!(progress_event_to_acp(&ProgressEvent::ToolCompleted {
-            name: "host-tool".into(), tool_id: "call-1".into(), success: false,
-            output_preview: "denied".into(), duration: std::time::Duration::ZERO,
-        }), Some(SessionUpdate::ToolCallUpdate(_))));
+        assert!(
+            project_progress_event(
+                &ProgressEvent::Response {
+                    content: "plain".into(),
+                    iteration: 0
+                },
+                &streamed
+            )
+            .is_some()
+        );
+        assert!(
+            project_progress_event(
+                &ProgressEvent::StreamChunk {
+                    text: "streamed".into(),
+                    iteration: 1
+                },
+                &streamed
+            )
+            .is_some()
+        );
+        assert!(
+            project_progress_event(
+                &ProgressEvent::Response {
+                    content: "streamed".into(),
+                    iteration: 1
+                },
+                &streamed
+            )
+            .is_none()
+        );
+        assert!(
+            project_progress_event(
+                &ProgressEvent::Response {
+                    content: "next answer".into(),
+                    iteration: 2
+                },
+                &streamed
+            )
+            .is_some()
+        );
+        assert!(matches!(
+            progress_event_to_acp(&ProgressEvent::ReasoningChunk {
+                text: "reasoning".into(),
+                iteration: 2
+            }),
+            Some(SessionUpdate::AgentThoughtChunk(_))
+        ));
+        assert!(matches!(
+            progress_event_to_acp(&ProgressEvent::ToolStarted {
+                name: "host-tool".into(),
+                tool_id: "call-1".into(),
+                arguments: None
+            }),
+            Some(SessionUpdate::ToolCall(_))
+        ));
+        assert!(matches!(
+            progress_event_to_acp(&ProgressEvent::ToolCompleted {
+                name: "host-tool".into(),
+                tool_id: "call-1".into(),
+                success: false,
+                output_preview: "denied".into(),
+                duration: std::time::Duration::ZERO,
+            }),
+            Some(SessionUpdate::ToolCallUpdate(_))
+        ));
     }
 
     #[tokio::test]
@@ -876,96 +1286,214 @@ mod tests {
         let model_pending = pending.clone();
         let calls = Arc::new(AtomicUsize::new(0));
         let model_calls = calls.clone();
-        Client.builder()
-            .on_receive_notification(async |_req: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()), on_receive_notification!())
-            .on_receive_request(async |_req: ListTools, responder, _cx: ConnectionTo<AcpAgentRole>| {
-                responder.respond(ToolsResponse(ToolsListResponse { tools: Vec::new() }))
-            }, on_receive_request!())
-            .on_receive_request(async move |req: ModelCall, responder, _cx: ConnectionTo<AcpAgentRole>| {
-                if model_calls.fetch_add(1, Ordering::AcqRel) == 0 {
-                    assert!(req.0.messages.iter().any(|message| message.role == MessageRole::System && message.content.contains("[Notification] idle context")));
-                    *model_pending.lock().await = Some(responder);
-                    model_entered.notify_one();
-                    Ok(())
-                } else {
-                    // Canonical Agent normalization merges system context
-                    // into one leading system message before the model call.
-                    let notifications: Vec<_> = req.0.messages.iter()
-                        .filter(|message| message.role == MessageRole::System)
-                        .flat_map(|message| message.content.lines())
-                        .filter(|line| line.starts_with("[Notification]"))
-                        .collect();
-                    assert_eq!(notifications.len(), FOLD_QUEUE_MAX_EVENTS + 1);
-                    assert_eq!(notifications[1], "[Notification] folded 2");
-                    assert_eq!(*notifications.last().unwrap(), "[Notification] folded 17");
-                    assert!(!req.0.messages.iter().any(|message| message.content.contains("dropped event")));
-                    responder.respond(ModelResponse(response("after folded events")))
-                }
-            }, on_receive_request!())
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_req: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()),
+                on_receive_notification!(),
+            )
+            .on_receive_request(
+                async |_req: ListTools, responder, _cx: ConnectionTo<AcpAgentRole>| {
+                    responder.respond(ToolsResponse(ToolsListResponse { tools: Vec::new() }))
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: ModelCall, responder, _cx: ConnectionTo<AcpAgentRole>| {
+                    if model_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        assert!(
+                            req.0
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::System
+                                    && message.content.contains("[Notification] idle context"))
+                        );
+                        *model_pending.lock().await = Some(responder);
+                        model_entered.notify_one();
+                        Ok(())
+                    } else {
+                        // Canonical Agent normalization merges system context
+                        // into one leading system message before the model call.
+                        let notifications: Vec<_> = req
+                            .0
+                            .messages
+                            .iter()
+                            .filter(|message| message.role == MessageRole::System)
+                            .flat_map(|message| message.content.lines())
+                            .filter(|line| line.starts_with("[Notification]"))
+                            .collect();
+                        assert_eq!(notifications.len(), FOLD_QUEUE_MAX_EVENTS + 1);
+                        assert_eq!(notifications[1], "[Notification] folded 2");
+                        assert_eq!(*notifications.last().unwrap(), "[Notification] folded 17");
+                        assert!(
+                            !req.0
+                                .messages
+                                .iter()
+                                .any(|message| message.content.contains("dropped event"))
+                        );
+                        responder.respond(ModelResponse(response("after folded events")))
+                    }
+                },
+                on_receive_request!(),
+            )
             .connect_with(Transport, |cx: ConnectionTo<AcpAgentRole>| async move {
                 cx.send_request(initialize()).block_task().await?;
-                let session = cx.send_request(NewSessionRequest::new(PathBuf::from("/"))).block_task().await?.session_id;
-                let idle = cx.send_request(NotifyRequest {
-                    session_id: session.clone(), events: vec!["idle context".into()], auto_respond: false, if_busy: NotifyIfBusy::Drop,
-                }).block_task().await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(PathBuf::from("/")))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let idle = cx
+                    .send_request(NotifyRequest {
+                        session_id: session.clone(),
+                        events: vec!["idle context".into()],
+                        auto_respond: false,
+                        if_busy: NotifyIfBusy::Drop,
+                    })
+                    .block_task()
+                    .await?;
                 assert!(idle.queued && !idle.busy);
                 assert_eq!(calls.load(Ordering::Acquire), 0);
                 let notifier = cx.clone();
                 let notify_session = session.clone();
                 let task = tokio::spawn(async move {
                     entered.notified().await;
-                    let dropped = notifier.send_request(NotifyRequest {
-                        session_id: notify_session.clone(), events: vec!["dropped event".into()], auto_respond: true, if_busy: NotifyIfBusy::Drop,
-                    }).block_task().await.unwrap();
+                    let dropped = notifier
+                        .send_request(NotifyRequest {
+                            session_id: notify_session.clone(),
+                            events: vec!["dropped event".into()],
+                            auto_respond: true,
+                            if_busy: NotifyIfBusy::Drop,
+                        })
+                        .block_task()
+                        .await
+                        .unwrap();
                     assert!(!dropped.queued && dropped.busy);
-                    let folded = notifier.send_request(NotifyRequest {
-                        session_id: notify_session, events: (0..18).map(|i| format!("folded {i}")).collect(), auto_respond: true, if_busy: NotifyIfBusy::Fold,
-                    }).block_task().await.unwrap();
+                    let folded = notifier
+                        .send_request(NotifyRequest {
+                            session_id: notify_session,
+                            events: (0..18).map(|i| format!("folded {i}")).collect(),
+                            auto_respond: true,
+                            if_busy: NotifyIfBusy::Fold,
+                        })
+                        .block_task()
+                        .await
+                        .unwrap();
                     assert!(folded.queued && folded.busy);
-                    pending.lock().await.take().unwrap().respond(ModelResponse(response("first reply"))).unwrap();
+                    pending
+                        .lock()
+                        .await
+                        .take()
+                        .unwrap()
+                        .respond(ModelResponse(response("first reply")))
+                        .unwrap();
                 });
-                assert_eq!(cx.send_request(prompt(session.clone(), "first prompt")).block_task().await?.stop_reason, StopReason::EndTurn);
+                assert_eq!(
+                    cx.send_request(prompt(session.clone(), "first prompt"))
+                        .block_task()
+                        .await?
+                        .stop_reason,
+                    StopReason::EndTurn
+                );
                 task.await.unwrap();
-                assert_eq!(cx.send_request(prompt(session, "second prompt")).block_task().await?.stop_reason, StopReason::EndTurn);
+                assert_eq!(
+                    cx.send_request(prompt(session, "second prompt"))
+                        .block_task()
+                        .await?
+                        .stop_reason,
+                    StopReason::EndTurn
+                );
                 assert_eq!(calls.load(Ordering::Acquire), 2);
                 Ok(())
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn host_managed_auto_response_does_not_retain_a_synthetic_user_request() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_calls = calls.clone();
-        Client.builder()
-            .on_receive_notification(async |_req: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()), on_receive_notification!())
-            .on_receive_request(async |_req: ListTools, responder, _cx: ConnectionTo<AcpAgentRole>| {
-                responder.respond(ToolsResponse(ToolsListResponse { tools: Vec::new() }))
-            }, on_receive_request!())
-            .on_receive_request(async move |req: ModelCall, responder, _cx: ConnectionTo<AcpAgentRole>| {
-                let index = model_calls.fetch_add(1, Ordering::AcqRel);
-                let users: Vec<_> = req.0.messages.iter().filter(|message| message.role == MessageRole::User).collect();
-                assert_eq!(users.len(), 1);
-                if index == 0 {
-                    assert_eq!(users[0].content, AUTO_RESPOND_INSTRUCTION);
-                } else {
-                    assert_eq!(users[0].content, "real follow-up");
-                    assert!(req.0.messages.iter().any(|message| message.role == MessageRole::Assistant && message.content == "automatic reply"));
-                    assert!(!req.0.messages.iter().any(|message| message.content == AUTO_RESPOND_INSTRUCTION));
-                }
-                assert!(req.0.messages.iter().any(|message| message.role == MessageRole::System && message.content.contains("[Notification] task completed")));
-                responder.respond(ModelResponse(response(if index == 0 { "automatic reply" } else { "follow-up reply" })))
-            }, on_receive_request!())
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_req: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()),
+                on_receive_notification!(),
+            )
+            .on_receive_request(
+                async |_req: ListTools, responder, _cx: ConnectionTo<AcpAgentRole>| {
+                    responder.respond(ToolsResponse(ToolsListResponse { tools: Vec::new() }))
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: ModelCall, responder, _cx: ConnectionTo<AcpAgentRole>| {
+                    let index = model_calls.fetch_add(1, Ordering::AcqRel);
+                    let users: Vec<_> = req
+                        .0
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == MessageRole::User)
+                        .collect();
+                    assert_eq!(users.len(), 1);
+                    if index == 0 {
+                        assert_eq!(users[0].content, AUTO_RESPOND_INSTRUCTION);
+                    } else {
+                        assert_eq!(users[0].content, "real follow-up");
+                        assert!(
+                            req.0
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::Assistant
+                                    && message.content == "automatic reply")
+                        );
+                        assert!(
+                            !req.0
+                                .messages
+                                .iter()
+                                .any(|message| message.content == AUTO_RESPOND_INSTRUCTION)
+                        );
+                    }
+                    assert!(
+                        req.0
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::System
+                                && message.content.contains("[Notification] task completed"))
+                    );
+                    responder.respond(ModelResponse(response(if index == 0 {
+                        "automatic reply"
+                    } else {
+                        "follow-up reply"
+                    })))
+                },
+                on_receive_request!(),
+            )
             .connect_with(Transport, |cx: ConnectionTo<AcpAgentRole>| async move {
                 cx.send_request(initialize()).block_task().await?;
-                let session = cx.send_request(NewSessionRequest::new(PathBuf::from("/"))).block_task().await?.session_id;
-                let acknowledged = cx.send_request(NotifyRequest {
-                    session_id: session.clone(), events: vec!["task completed".into()], auto_respond: true, if_busy: NotifyIfBusy::Drop,
-                }).block_task().await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(PathBuf::from("/")))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let acknowledged = cx
+                    .send_request(NotifyRequest {
+                        session_id: session.clone(),
+                        events: vec!["task completed".into()],
+                        auto_respond: true,
+                        if_busy: NotifyIfBusy::Drop,
+                    })
+                    .block_task()
+                    .await?;
                 assert!(acknowledged.queued && !acknowledged.busy);
                 // The notify acknowledgement intentionally precedes its turn.
                 let follow_up = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     loop {
-                        match cx.send_request(prompt(session.clone(), "real follow-up")).block_task().await {
+                        match cx
+                            .send_request(prompt(session.clone(), "real follow-up"))
+                            .block_task()
+                            .await
+                        {
                             Ok(response) => break response,
                             Err(error) => {
                                 assert!(error.to_string().contains("already running"));
@@ -973,40 +1501,76 @@ mod tests {
                             }
                         }
                     }
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
                 assert_eq!(follow_up.stop_reason, StopReason::EndTurn);
                 assert_eq!(calls.load(Ordering::Acquire), 2);
                 Ok(())
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn host_managed_truncation_is_an_error_and_retains_actual_partial_context() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_calls = calls.clone();
-        Client.builder()
-            .on_receive_notification(async |_req: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()), on_receive_notification!())
-            .on_receive_request(async |_req: ListTools, responder, _cx: ConnectionTo<AcpAgentRole>| {
-                responder.respond(ToolsResponse(ToolsListResponse { tools: Vec::new() }))
-            }, on_receive_request!())
-            .on_receive_request(async move |req: ModelCall, responder, _cx: ConnectionTo<AcpAgentRole>| {
-                let mut result = response("partial answer");
-                if model_calls.fetch_add(1, Ordering::AcqRel) == 0 {
-                    result.stop_reason = octos_llm::StopReason::MaxTokens;
-                } else {
-                    assert!(req.0.messages.iter().any(|message| message.role == MessageRole::Assistant && message.content == "partial answer"));
-                    result.content = Some("completed later".into());
-                }
-                responder.respond(ModelResponse(result))
-            }, on_receive_request!())
+        Client
+            .builder()
+            .on_receive_notification(
+                async |_req: SessionNotification, _cx: ConnectionTo<AcpAgentRole>| Ok(()),
+                on_receive_notification!(),
+            )
+            .on_receive_request(
+                async |_req: ListTools, responder, _cx: ConnectionTo<AcpAgentRole>| {
+                    responder.respond(ToolsResponse(ToolsListResponse { tools: Vec::new() }))
+                },
+                on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: ModelCall, responder, _cx: ConnectionTo<AcpAgentRole>| {
+                    let mut result = response("partial answer");
+                    if model_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        result.stop_reason = octos_llm::StopReason::MaxTokens;
+                    } else {
+                        assert!(
+                            req.0
+                                .messages
+                                .iter()
+                                .any(|message| message.role == MessageRole::Assistant
+                                    && message.content == "partial answer")
+                        );
+                        result.content = Some("completed later".into());
+                    }
+                    responder.respond(ModelResponse(result))
+                },
+                on_receive_request!(),
+            )
             .connect_with(Transport, |cx: ConnectionTo<AcpAgentRole>| async move {
                 cx.send_request(initialize()).block_task().await?;
-                let session = cx.send_request(NewSessionRequest::new(PathBuf::from("/"))).block_task().await?.session_id;
-                let error = cx.send_request(prompt(session.clone(), "first prompt")).block_task().await.unwrap_err();
+                let session = cx
+                    .send_request(NewSessionRequest::new(PathBuf::from("/")))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let error = cx
+                    .send_request(prompt(session.clone(), "first prompt"))
+                    .block_task()
+                    .await
+                    .unwrap_err();
                 assert!(error.to_string().contains("incomplete"));
-                assert_eq!(cx.send_request(prompt(session, "continue")).block_task().await?.stop_reason, StopReason::EndTurn);
+                assert_eq!(
+                    cx.send_request(prompt(session, "continue"))
+                        .block_task()
+                        .await?
+                        .stop_reason,
+                    StopReason::EndTurn
+                );
                 assert_eq!(calls.load(Ordering::Acquire), 2);
                 Ok(())
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
     }
 }

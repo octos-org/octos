@@ -86,9 +86,9 @@ use super::Executable;
 mod host_managed;
 #[cfg(feature = "api")]
 mod oup;
-pub use host_managed::{NotifyIfBusy, NotifyRequest, NotifyResponse};
 #[cfg(feature = "api")]
 use crate::config::Config;
+pub use host_managed::{NotifyIfBusy, NotifyRequest, NotifyResponse};
 
 /// Default for [`AcpCommand::max_iterations`]. Shared by the clap default and
 /// the `Default` impl so an embedder building the command by hand gets the same

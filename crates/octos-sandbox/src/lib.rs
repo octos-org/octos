@@ -10,12 +10,12 @@ use eyre::{Result, WrapErr};
 use std::path::Path;
 use std::process::Command;
 
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-mod macos;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod linux;
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+mod macos;
 
 /// The kernel mechanisms successfully installed in this worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,15 +31,25 @@ pub struct HostSandbox {
 /// Confinement precedes the executable's entry point, so even a lying or obsolete
 /// worker cannot acquire direct network or personal-file access.
 pub fn host_managed_command(executable: &Path) -> Result<Command> {
-    eyre::ensure!(executable.is_absolute(), "host-managed executable must be an absolute path");
-    let executable = executable.canonicalize().wrap_err("resolve host-managed executable")?;
-    eyre::ensure!(executable.is_file(), "host-managed executable must be a regular file");
+    eyre::ensure!(
+        executable.is_absolute(),
+        "host-managed executable must be an absolute path"
+    );
+    let executable = executable
+        .canonicalize()
+        .wrap_err("resolve host-managed executable")?;
+    eyre::ensure!(
+        executable.is_file(),
+        "host-managed executable must be a regular file"
+    );
     #[cfg(target_os = "macos")]
     let mut command = macos::command(&executable)?;
     #[cfg(target_os = "linux")]
     let mut command = linux::command(&executable)?;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return Err(eyre::eyre!("host-managed process confinement is unsupported on this platform"));
+    return Err(eyre::eyre!(
+        "host-managed process confinement is unsupported on this platform"
+    ));
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         command.env_clear().current_dir("/");
@@ -58,9 +68,17 @@ pub fn host_managed_command(executable: &Path) -> Result<Command> {
 /// exact initial executable can reexec itself with the same restrictions.
 pub fn confine_host_managed() -> Result<HostSandbox> {
     #[cfg(target_os = "macos")]
-    { macos::confine() }
+    {
+        macos::confine()
+    }
     #[cfg(target_os = "linux")]
-    { linux::confine() }
+    {
+        linux::confine()
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    { Err(eyre::eyre!("host-managed process confinement is unsupported on this platform")) }
+    {
+        Err(eyre::eyre!(
+            "host-managed process confinement is unsupported on this platform"
+        ))
+    }
 }

@@ -42,9 +42,12 @@ impl HostConfig {
         if self.version != VERSION {
             return Err("unsupported host broker version");
         }
-        if self.model.model_id.is_empty() || self.model.model_id.len() > 1024
-            || self.model.provider_name.is_empty() || self.model.provider_name.len() > 1024
-            || self.model.context_window == 0 || self.model.max_output_tokens == 0
+        if self.model.model_id.is_empty()
+            || self.model.model_id.len() > 1024
+            || self.model.provider_name.is_empty()
+            || self.model.provider_name.len() > 1024
+            || self.model.context_window == 0
+            || self.model.max_output_tokens == 0
             || self.model.max_output_tokens > self.model.context_window
         {
             return Err("invalid host model metadata");
@@ -130,14 +133,25 @@ pub struct ToolCallResponse {
 pub fn response_stream(response: crate::ChatResponse) -> crate::ChatStream {
     use crate::StreamEvent;
     let mut events = Vec::new();
-    if let Some(index) = response.provider_index { events.push(StreamEvent::ProviderIndex(index)); }
-    if let Some(reasoning) = response.reasoning_content { events.push(StreamEvent::ReasoningDelta(reasoning)); }
-    if let Some(content) = response.content { events.push(StreamEvent::TextDelta(content)); }
+    if let Some(index) = response.provider_index {
+        events.push(StreamEvent::ProviderIndex(index));
+    }
+    if let Some(reasoning) = response.reasoning_content {
+        events.push(StreamEvent::ReasoningDelta(reasoning));
+    }
+    if let Some(content) = response.content {
+        events.push(StreamEvent::TextDelta(content));
+    }
     for (index, tool) in response.tool_calls.into_iter().enumerate() {
         events.push(StreamEvent::ToolCallDelta {
-            index, id: Some(tool.id), name: Some(tool.name), arguments_delta: tool.arguments.to_string(),
+            index,
+            id: Some(tool.id),
+            name: Some(tool.name),
+            arguments_delta: tool.arguments.to_string(),
         });
-        if let Some(metadata) = tool.metadata { events.push(StreamEvent::ToolCallMetadata { index, metadata }); }
+        if let Some(metadata) = tool.metadata {
+            events.push(StreamEvent::ToolCallMetadata { index, metadata });
+        }
     }
     events.push(StreamEvent::Usage(response.usage));
     events.push(StreamEvent::Done(response.stop_reason));
@@ -156,7 +170,9 @@ pub fn validate_payload_size(value: &impl Serialize) -> Result<(), &'static str>
             }
             Ok(buf.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     serde_json::to_writer(LimitedWriter(0), value)
         .map_err(|_| "invalid or oversized host broker payload")
@@ -176,19 +192,43 @@ mod tests {
         let config: HostConfig = serde_json::from_value(value.clone()).unwrap();
         assert!(config.validate().is_ok());
         value["version"] = serde_json::json!(VERSION + 1);
-        assert!(serde_json::from_value::<HostConfig>(value.clone()).unwrap().validate().is_err());
+        assert!(
+            serde_json::from_value::<HostConfig>(value.clone())
+                .unwrap()
+                .validate()
+                .is_err()
+        );
         value["account"] = serde_json::json!("attacker");
         assert!(serde_json::from_value::<HostConfig>(value).is_err());
-        assert!(serde_json::from_value::<ToolCallRequest>(serde_json::json!({
-            "name":"read", "arguments":{}, "labels":[]
-        })).is_err());
+        assert!(
+            serde_json::from_value::<ToolCallRequest>(serde_json::json!({
+                "name":"read", "arguments":{}, "labels":[]
+            }))
+            .is_err()
+        );
     }
 
     #[test]
     fn rejects_duplicate_tools_and_oversized_payloads() {
-        let spec = ToolSpec { name:"read".into(), description:"Read".into(), input_schema:serde_json::json!({}) };
-        assert!(ToolsListResponse { tools:vec![spec.clone()] }.validate().is_ok());
-        assert!(ToolsListResponse { tools:vec![spec.clone(), spec] }.validate().is_err());
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: "Read".into(),
+            input_schema: serde_json::json!({}),
+        };
+        assert!(
+            ToolsListResponse {
+                tools: vec![spec.clone()]
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ToolsListResponse {
+                tools: vec![spec.clone(), spec]
+            }
+            .validate()
+            .is_err()
+        );
         assert!(validate_payload_size(&"x".repeat(MAX_FRAME_BYTES)).is_err());
     }
 }
