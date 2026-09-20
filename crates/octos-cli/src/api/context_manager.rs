@@ -911,7 +911,7 @@ fn context_ledger_covers_history(manager: &ContextManager, messages: &[Message])
 /// The coverage decision, with the fast path switchable.
 ///
 /// Both answers must always agree: the fingerprint is an optimisation, never a
-/// different rule. `should_answer_coverage_exactly_as_the_replay_does` pins
+/// different rule. `should_never_claim_coverage_the_replay_would_deny` pins
 /// that by running every fixture through both.
 fn context_ledger_covers_history_with(
     manager: &ContextManager,
@@ -922,9 +922,27 @@ fn context_ledger_covers_history_with(
     // them answers the question. The slow path below replays the whole history
     // through the recorder, which costs ~0.65 s on a 2 500-message session and
     // runs on EVERY `session/open`.
-    if use_fingerprint && let Some(chain) = manager.source_history() {
-        return chain.messages == messages.len() && chain.digest == source_history_digest(messages);
+    if use_fingerprint
+        && let Some(chain) = manager.source_history()
+        && chain
+            .ledger
+            .is_none_or(|witness| witness == manager.source_ledger_witness())
+    {
+        let covered =
+            chain.messages == messages.len() && chain.digest == source_history_digest(messages);
+        if !covered {
+            // A miss pays the very replay this chain exists to avoid, so make
+            // it observable instead of a silent slowdown.
+            tracing::debug!(
+                chain_messages = chain.messages,
+                history_messages = messages.len(),
+                "context ledger chain does not match durable history; replaying"
+            );
+        }
+        return covered;
     }
+    #[cfg(test)]
+    REPLAYED_COVERAGE_CHECKS.with(|count| count.set(count.get() + 1));
     let expected = ContextManager::from_session_history(
         manager.session_id.clone(),
         manager.thread_id.clone(),
@@ -932,6 +950,14 @@ fn context_ledger_covers_history_with(
     );
     manager.source_high_watermark() == expected.source_high_watermark()
         && manager.source_head_hash() == expected.source_head_hash()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many coverage checks fell through to the replay, per test thread.
+    /// Lets a test assert the fast path was actually taken, so deleting it
+    /// fails the suite. Thread-local: the suite runs tests in parallel.
+    static REPLAYED_COVERAGE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Kill switch for the source-history fast path: set
@@ -961,6 +987,22 @@ pub(crate) struct SourceHistoryChain {
     pub(crate) messages: usize,
     /// Chain digest over exactly those messages, in order.
     pub(crate) digest: String,
+    /// The ledger shape the chain was written against. The chain is the
+    /// writer's claim; this makes the LEDGER corroborate it, so a snapshot
+    /// that lost or gained source rows without the chain noticing — a future
+    /// writer bug, an edited file — falls back to the replay instead of
+    /// loading silently. Absent on chains written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ledger: Option<SourceLedgerWitness>,
+}
+
+/// The shape of the ledger a [`SourceHistoryChain`] was written against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SourceLedgerWitness {
+    /// Rows carrying a source ref.
+    pub(crate) source_rows: usize,
+    /// Highest source seq among them, if any.
+    pub(crate) watermark: Option<usize>,
 }
 
 /// Seed of an empty chain.
@@ -988,7 +1030,7 @@ fn extend_source_history_digest(previous: &str, message: &Message) -> String {
         "reasoning_content": message.reasoning_content,
         "thread_id": message.thread_id,
     }))
-    .unwrap_or_default();
+    .expect("a Message's hashed fields always serialize");
     let mut hasher = Sha256::new();
     hasher.update(previous.as_bytes());
     hasher.update([0u8]);
@@ -1421,6 +1463,10 @@ impl ContextManager {
             source_history: Some(SourceHistoryChain {
                 messages: 0,
                 digest: EMPTY_SOURCE_HISTORY_DIGEST.to_owned(),
+                ledger: Some(SourceLedgerWitness {
+                    source_rows: 0,
+                    watermark: None,
+                }),
             }),
             source_history_adopted: false,
         }
@@ -1741,6 +1787,30 @@ impl ContextManager {
         self.source_history.clone()
     }
 
+    /// The ledger shape a chain is checked against (see [`SourceLedgerWitness`]).
+    fn source_ledger_witness(&self) -> SourceLedgerWitness {
+        SourceLedgerWitness {
+            source_rows: self
+                .ledger_items
+                .iter()
+                .filter(|item| item.source_ref.is_some())
+                .count(),
+            watermark: self.source_high_watermark(),
+        }
+    }
+
+    /// Stamp a freshly advanced chain with the ledger it now describes.
+    fn witnessed_source_history(
+        &self,
+        chain: Option<SourceHistoryChain>,
+    ) -> Option<SourceHistoryChain> {
+        let witness = self.source_ledger_witness();
+        chain.map(|chain| SourceHistoryChain {
+            ledger: Some(witness),
+            ..chain
+        })
+    }
+
     /// Adopt `messages` as this ledger's source history.
     ///
     /// Only for a caller that has just PROVEN coverage by the exact replay: a
@@ -1751,6 +1821,7 @@ impl ContextManager {
         let adopted = SourceHistoryChain {
             messages: messages.len(),
             digest: source_history_digest(messages),
+            ledger: Some(self.source_ledger_witness()),
         };
         self.source_history_adopted = self.source_history.as_ref() != Some(&adopted);
         self.source_history = Some(adopted);
@@ -1775,6 +1846,8 @@ impl ContextManager {
             .map(|chain| SourceHistoryChain {
                 messages: chain.messages + 1,
                 digest: extend_source_history_digest(&chain.digest, message),
+                // Witnessed by the caller once this message's rows are in.
+                ledger: None,
             })
     }
 
@@ -2091,7 +2164,7 @@ impl ContextManager {
                 source_event_kind: message.role.as_str().to_owned(),
             }),
         );
-        self.source_history = advanced;
+        self.source_history = self.witnessed_source_history(advanced);
         recorded
     }
 
@@ -2105,7 +2178,7 @@ impl ContextManager {
         // for every durable row, so the chain lives or dies here.
         let advanced = self.advanced_source_history(source_seq, message);
         let recorded = self.record_merged_prompt_equivalent_inner(message, source_seq);
-        self.source_history = advanced;
+        self.source_history = self.witnessed_source_history(advanced);
         recorded
     }
 
@@ -4623,7 +4696,7 @@ mod tests {
                 }
 
                 for (label, candidate) in candidates {
-                    let fast = context_ledger_covers_history(&manager, &candidate);
+                    let fast = context_ledger_covers_history_with(&manager, &candidate, true);
                     let replay = covers_by_replay(&manager, &candidate);
                     assert!(
                         !fast || replay,
@@ -4632,6 +4705,20 @@ mod tests {
                         history.len()
                     );
                     if label == "unchanged" {
+                        // Fix-sensitive: the check must be ANSWERED by the
+                        // chain, not by a replay that happens to agree.
+                        let replays = REPLAYED_COVERAGE_CHECKS.with(std::cell::Cell::get);
+                        assert!(
+                            context_ledger_covers_history_with(&manager, &candidate, true),
+                            "{recorder} recorder: unchanged history must be covered"
+                        );
+                        assert_eq!(
+                            REPLAYED_COVERAGE_CHECKS.with(std::cell::Cell::get),
+                            replays,
+                            "{recorder} recorder: an unchanged history of {} message(s) \
+                             must be answered by the chain, not by a replay",
+                            history.len()
+                        );
                         assert!(
                             fast,
                             "{recorder} recorder: an unchanged history of {} message(s) \
@@ -4698,6 +4785,91 @@ mod tests {
         assert_eq!(
             context_ledger_covers_history(&manager, &both),
             covers_by_replay(&manager, &both)
+        );
+    }
+
+    #[test]
+    fn should_replay_when_the_ledger_lost_rows_behind_the_chain_s_back() {
+        // A writer bug (or an edited snapshot) drops a source row while the
+        // chain still claims full coverage. The chain must not be believed:
+        // the ledger's own shape has to corroborate it.
+        let history = vec![
+            message(MessageRole::User, "one"),
+            message(MessageRole::Assistant, "two"),
+            message(MessageRole::User, "three"),
+        ];
+        let manager = ContextManager::from_session_history("s", None, &history);
+        let mut snapshot = manager.snapshot();
+        let dropped = snapshot
+            .items
+            .iter()
+            .position(|item| item.source_ref.as_ref().and_then(|r| r.source_seq) == Some(1))
+            .expect("a row for the middle message");
+        snapshot.items.remove(dropped);
+        snapshot.source_head_hash = Some(source_head_hash_for_items(&snapshot.items));
+        let tampered = ContextManager::from_snapshot(snapshot);
+
+        assert!(
+            tampered.source_history().is_some(),
+            "the chain survives the tamper — that is the point"
+        );
+        assert!(!context_ledger_covers_history_with(
+            &tampered, &history, true
+        ));
+        // And the replay agrees, so the caller rebuilds rather than loading
+        // a ledger that is missing a row.
+        assert!(!covers_by_replay(&tampered, &history));
+    }
+
+    #[test]
+    fn should_notice_a_history_whose_thread_ids_changed() {
+        // `thread_id` reaches the ledger through every row's source ref, so
+        // the digest must fold it: dropping it would make the fast path more
+        // permissive than the replay.
+        let mut threaded = message(MessageRole::User, "same text");
+        threaded.thread_id = Some("thread-a".to_owned());
+        let manager =
+            ContextManager::from_session_history("s", None, std::slice::from_ref(&threaded));
+
+        let mut moved = threaded.clone();
+        moved.thread_id = Some("thread-b".to_owned());
+
+        assert!(!context_ledger_covers_history_with(
+            &manager,
+            std::slice::from_ref(&moved),
+            true
+        ));
+        assert!(!covers_by_replay(&manager, std::slice::from_ref(&moved)));
+    }
+
+    #[test]
+    fn should_adopt_a_chain_for_a_ledger_persisted_before_chains_existed() {
+        // The migration path: a snapshot with no chain still loads through the
+        // replay, gains a chain at that moment, and answers cheaply after.
+        let history = vec![
+            message(MessageRole::User, "one"),
+            message(MessageRole::Assistant, "two"),
+        ];
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let built = ContextManager::from_session_history("s", None, &history);
+        let mut legacy = built.snapshot();
+        legacy.source_history = None;
+        persist_context_manager_snapshot(temp.path(), "s", &ContextManager::from_snapshot(legacy))
+            .expect("persist a chainless snapshot");
+
+        let (loaded, status) = load_or_rebuild_context_manager(temp.path(), "s", None, &history);
+        assert_eq!(status, ContextLedgerLoadStatus::Loaded);
+        assert!(loaded.source_history().is_some(), "the chain is adopted");
+
+        persist_context_manager_snapshot(temp.path(), "s", &loaded).expect("persist again");
+        let (again, status) = load_or_rebuild_context_manager(temp.path(), "s", None, &history);
+        assert_eq!(status, ContextLedgerLoadStatus::Loaded);
+        let replays = REPLAYED_COVERAGE_CHECKS.with(std::cell::Cell::get);
+        assert!(context_ledger_covers_history_with(&again, &history, true));
+        assert_eq!(
+            REPLAYED_COVERAGE_CHECKS.with(std::cell::Cell::get),
+            replays,
+            "the second load answers from the chain"
         );
     }
 
