@@ -2220,6 +2220,7 @@ impl Agent {
                 content,
                 tool_files_modified,
                 tool_files_to_send,
+                tool_model_media,
                 tool_tokens,
                 tool_success,
                 tool_structured_metadata,
@@ -2285,6 +2286,14 @@ impl Agent {
                         tool_files_modified.push(file);
                     }
                     let tool_files_to_send = tool_result.files_to_send.clone();
+                    // Images the tool wants the model to see ride on the
+                    // tool message; `execute_tools` turns them into the
+                    // user-role follow-up the providers render.
+                    let tool_model_media: Vec<String> = tool_result
+                        .model_media
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
 
                     let output_preview =
                         octos_core::truncated_utf8(&tool_result.output, 200, "...");
@@ -2302,6 +2311,7 @@ impl Agent {
                         tool_result.output,
                         tool_files_modified,
                         tool_files_to_send,
+                        tool_model_media,
                         tool_result.tokens_used,
                         success,
                         tool_result.structured_metadata,
@@ -2357,6 +2367,7 @@ impl Agent {
                         .any(|src| src.is::<crate::tools::ToolInputError>());
                     (
                         format!("Error: {e}"),
+                        Vec::new(),
                         Vec::new(),
                         Vec::new(),
                         None,
@@ -2440,7 +2451,7 @@ impl Agent {
                 Message {
                     role: MessageRole::Tool,
                     content,
-                    media: vec![],
+                    media: tool_model_media,
                     tool_calls: None,
                     tool_call_id: Some(tc_id),
                     reasoning_content: None,
@@ -2676,6 +2687,12 @@ impl Agent {
         // authoritatively decide whether the synth-ack branch fires
         // alongside a failed tool. Capacity matches the result count.
         let mut success_by_id: Vec<(String, bool)> = Vec::with_capacity(results.len());
+        // Images tools asked the model to look at (`ToolResult::model_media`).
+        // Every provider inlines images only on user-role rows, and Anthropic
+        // needs the batch's tool_result blocks to sit together right after
+        // the assistant's tool_use, so these go out as ONE user message after
+        // the whole batch rather than interleaved with the results.
+        let mut model_media_followups: Vec<Message> = Vec::new();
 
         for (
             message,
@@ -2693,6 +2710,9 @@ impl Agent {
             if let Some(id) = message.tool_call_id.clone() {
                 success_by_id.push((id, success));
             }
+            if let Some(followup) = model_media_followup(&message) {
+                model_media_followups.push(followup);
+            }
             messages.push(message);
             files_modified.extend(tool_files_modified);
             files_to_send.extend(tool_files_to_send);
@@ -2706,6 +2726,7 @@ impl Agent {
                 structured_metadata.push(meta);
             }
         }
+        messages.extend(model_media_followups);
 
         Ok((
             messages,
@@ -3009,6 +3030,32 @@ async fn join_parallel_handles(
             .map(|(r, tc)| r.unwrap_or_else(|e| panic_result(tc, &e.to_string())))
             .collect(),
     }
+}
+
+/// The user-role message that shows the model the images a tool result
+/// carries in `media` (from [`crate::tools::ToolResult::model_media`]), or
+/// None when the result has none. It names the tool call it answers so the
+/// model can tell a returned screenshot from a person's upload; it is
+/// otherwise an ordinary user row and is persisted and re-sent like one.
+fn model_media_followup(tool_message: &Message) -> Option<Message> {
+    if tool_message.role != MessageRole::Tool || tool_message.media.is_empty() {
+        return None;
+    }
+    let call = tool_message.tool_call_id.as_deref().unwrap_or("unknown");
+    Some(Message {
+        role: MessageRole::User,
+        content: format!(
+            "[image returned by tool call {call}: {}]",
+            tool_message.media.join(", ")
+        ),
+        media: tool_message.media.clone(),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+        client_message_id: None,
+        thread_id: None,
+        timestamp: chrono::Utc::now(),
+    })
 }
 
 /// Build a synthetic tool-result message for a peer that was cancelled after
@@ -3609,6 +3656,120 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    /// Returns an image for the model to look at (`model_media`), the way
+    /// `view_image` does.
+    struct SeeingTool {
+        image: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for SeeingTool {
+        fn name(&self) -> &str {
+            "seeing_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that hands the model an image"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "SEEING_TOOL_OUTPUT".to_string(),
+                success: true,
+                model_media: vec![self.image.clone()],
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn should_follow_the_batch_with_one_user_image_message_when_a_tool_returns_model_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("grab.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(SeeingTool {
+            image: image.clone(),
+        });
+        tools.register(InstantTool);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent =
+            Agent::new(AgentId::new("seeing"), provider, tools, memory).with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            });
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            // The image tool first, a plain tool second: the follow-up must
+            // come after BOTH results, never between them.
+            tool_calls: vec![
+                tool_call("call_see", "seeing_tool"),
+                tool_call("call_fast", "fast_tool"),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let (messages, ..) = agent.execute_tools(&response).await.unwrap();
+
+        let image_path = image.to_string_lossy().into_owned();
+        assert_eq!(
+            messages.len(),
+            3,
+            "two tool results and one image follow-up"
+        );
+        assert_eq!(messages[0].role, octos_core::MessageRole::Tool);
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_see"));
+        assert_eq!(messages[0].content, "SEEING_TOOL_OUTPUT");
+        assert_eq!(messages[0].media, vec![image_path.clone()]);
+        assert_eq!(messages[1].role, octos_core::MessageRole::Tool);
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_fast"));
+        assert!(messages[1].media.is_empty());
+        assert_eq!(messages[2].role, octos_core::MessageRole::User);
+        assert_eq!(messages[2].media, vec![image_path.clone()]);
+        assert!(
+            messages[2].content.contains("call_see") && messages[2].content.contains(&image_path),
+            "the follow-up names the call and the file: {}",
+            messages[2].content
+        );
+        assert!(messages[2].tool_call_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn should_add_no_follow_up_when_no_tool_returns_model_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(InstantTool);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("not-seeing"), provider, tools, memory).with_config(
+            AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            },
+        );
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![tool_call("call_fast", "fast_tool")],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let (messages, ..) = agent.execute_tools(&response).await.unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, octos_core::MessageRole::Tool);
     }
 
     /// Sleeps far past the batch ceiling so the batch timeout always fires

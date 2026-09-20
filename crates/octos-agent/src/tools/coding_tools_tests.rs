@@ -1580,6 +1580,60 @@ async fn view_image_reports_format_and_size_for_png() {
     assert_eq!(meta["format"], json!("png"));
 }
 
+/// The point of `view_image` for a model that can see: the raster file it
+/// asked about comes back as `model_media`, which the agent loop shows to
+/// the model. The text output says so, so the model knows whether it is
+/// looking at the image or only at its metadata.
+#[tokio::test]
+async fn view_image_hands_a_raster_image_to_the_model() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let png = temp.path().join("grab.png");
+    std::fs::write(&png, PNG_MAGIC).expect("write png");
+    let tool = ViewImageTool::new(temp.path());
+    let result = tool
+        .execute(&json!({ "path": "grab.png" }))
+        .await
+        .expect("view_image ok");
+    assert!(result.success, "{}", result.output);
+    let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+    assert_eq!(payload["shown_to_model"], json!(true));
+    assert_eq!(result.model_media.len(), 1, "one image for the model");
+    assert!(
+        result.model_media[0].ends_with("grab.png"),
+        "the resolved file: {}",
+        result.model_media[0].display()
+    );
+    let meta = result.structured_metadata.expect("structured metadata");
+    assert_eq!(meta["shown_to_model"], json!(true));
+}
+
+/// SVG is recognised for the UI but no vision API takes it inline: the
+/// model gets the metadata and the reason, not a request that 400s.
+#[tokio::test]
+async fn view_image_keeps_an_svg_to_metadata_and_says_why() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let svg = temp.path().join("icon.svg");
+    std::fs::write(&svg, b"<svg xmlns='http://www.w3.org/2000/svg'/>").expect("write svg");
+    let tool = ViewImageTool::new(temp.path());
+    let result = tool
+        .execute(&json!({ "path": "icon.svg" }))
+        .await
+        .expect("view_image ok");
+    assert!(result.success, "{}", result.output);
+    let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+    assert_eq!(payload["format"], json!("svg"));
+    assert_eq!(payload["shown_to_model"], json!(false));
+    assert!(
+        payload["not_shown_because"]
+            .as_str()
+            .unwrap_or("")
+            .contains("PNG or JPEG"),
+        "{}",
+        result.output
+    );
+    assert!(result.model_media.is_empty());
+}
+
 /// Codex review #1153 P2 regression: `FilesystemScope::Host` (granted via
 /// `DangerFullAccess`) lets `view_image` read images outside the
 /// workspace. Pre-fix, the helper passed `self.base_dir` as the

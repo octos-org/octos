@@ -2734,9 +2734,12 @@ struct ViewImageInput {
 /// Reads an image file from the workspace (respecting `FilesystemScope` and
 /// `FileAccessMode`), detects the format from the magic header bytes, and
 /// returns a structured metadata envelope the AppUI image-view flow can render
-/// without re-reading the file. The tool intentionally does NOT inline the raw
-/// image bytes — the host UI fetches them through the workspace artifact
-/// channel.
+/// without re-reading the file. The tool output stays text — the bytes are
+/// not inlined there, the host UI fetches them through the workspace artifact
+/// channel — but a raster image the provider can accept is handed back as
+/// `model_media`, so the model that asked actually gets to look at it. A
+/// vision-capable model that could only learn "png, 2.1 MB" from its own
+/// screenshot had to wait for a person to attach it.
 pub struct ViewImageTool {
     base_dir: PathBuf,
     filesystem_scope: FilesystemScope,
@@ -2922,14 +2925,43 @@ impl Tool for ViewImageTool {
                 });
             }
         };
+        // Shown to the model when the provider can take it: a raster format
+        // every vision API accepts, under the smallest common size ceiling,
+        // and with an extension the providers' image detection recognises
+        // (they key on the path, not the bytes). Otherwise the model gets
+        // the metadata and a reason, never a silent nothing.
+        let shown = if !VISION_FORMATS.contains(&format) {
+            Err(format!(
+                "{format} is not a format the model can view; convert it to PNG or JPEG"
+            ))
+        } else if byte_length > MAX_MODEL_IMAGE_BYTES {
+            Err(format!(
+                "{byte_length} bytes is over the {MAX_MODEL_IMAGE_BYTES}-byte limit for showing an image to the model; downscale it"
+            ))
+        } else if !octos_llm::vision::is_image(&resolved.to_string_lossy()) {
+            Err("the file needs a .png, .jpg, .jpeg, .gif or .webp extension to be shown to the model".to_string())
+        } else {
+            Ok(())
+        };
+        let mut payload = json!({
+            "path": path,
+            "format": format,
+            "mime_type": mime,
+            "byte_length": byte_length,
+        });
+        let model_media = match &shown {
+            Ok(()) => {
+                payload["shown_to_model"] = json!(true);
+                vec![resolved.clone()]
+            }
+            Err(reason) => {
+                payload["shown_to_model"] = json!(false);
+                payload["not_shown_because"] = json!(reason);
+                Vec::new()
+            }
+        };
         Ok(ToolResult {
-            output: json!({
-                "path": path,
-                "format": format,
-                "mime_type": mime,
-                "byte_length": byte_length,
-            })
-            .to_string(),
+            output: payload.to_string(),
             success: true,
             structured_metadata: Some(json!({
                 "codex_tool": "view_image",
@@ -2937,11 +2969,22 @@ impl Tool for ViewImageTool {
                 "format": format,
                 "mime_type": mime,
                 "byte_length": byte_length,
+                "shown_to_model": shown.is_ok(),
             })),
+            model_media,
             ..Default::default()
         })
     }
 }
+
+/// Formats the vision APIs take inline. SVG and BMP are recognised by
+/// [`detect_image_format`] for the UI's sake but no provider renders them.
+const VISION_FORMATS: &[&str] = &["png", "jpeg", "gif", "webp"];
+
+/// The smallest per-image ceiling among the providers (Anthropic's 5 MB);
+/// above it the request would be rejected, so the model gets a reason
+/// instead of a failed turn.
+const MAX_MODEL_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// #1148 codex P2: bounded-read helper for `view_image` that refuses
 /// to follow symlinks. Reads only the first 512 bytes for magic-byte
