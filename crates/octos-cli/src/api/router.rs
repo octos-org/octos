@@ -1498,6 +1498,10 @@ mod tests {
                 "/api/register/setup-script/{id}/{auth_token}",
                 get(|| async { StatusCode::NO_CONTENT }),
             )
+            .route(
+                "/v1/session_ingress/ws/{session_id}",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
             .layer(TraceLayer::new_for_http().make_span_with(make_http_trace_span));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1516,6 +1520,7 @@ mod tests {
                     "/api/ui-protocol/ws?token=synthetic-query-marker%21&feature=chat",
                     "/api/preview-signed/synthetic-preview-marker/assets/index.html",
                     "/api/register/setup-script/test-user/synthetic-setup-marker",
+                    "/v1/session_ingress/ws/synthetic-session?token=synthetic-ingress-marker",
                 ] {
                     let response = app
                         .clone()
@@ -1549,10 +1554,13 @@ mod tests {
         assert!(logs.contains("path=/api/ui-protocol/ws"));
         assert!(logs.contains("/api/preview-signed/{token}/{*path}"));
         assert!(logs.contains("/api/register/setup-script/{id}/{auth_token}"));
+        assert!(logs.contains("/v1/session_ingress/ws/{session_id}"));
         assert!(logs.contains("path=<unmatched>"));
         assert!(!logs.contains("synthetic-query-marker"));
         assert!(!logs.contains("synthetic-preview-marker"));
         assert!(!logs.contains("synthetic-setup-marker"));
+        assert!(!logs.contains("synthetic-ingress-marker"));
+        assert!(!logs.contains("synthetic-session"));
         assert!(!logs.contains("synthetic-unmatched-marker"));
     }
 

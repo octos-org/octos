@@ -34,10 +34,14 @@
 //!
 //! ## Bridge
 //!
-//! ACP is a transport adapter over the OUP dispatcher. Session persistence,
+//! Ordinary ACP is a transport adapter over the OUP dispatcher. Session persistence,
 //! execution, compaction, tools and cancellation belong to the shared runtime.
 //! Streaming projects typed OUP envelopes into ACP updates; tool approvals use
-//! ACP request_permission. There is no ACP-owned model loop or history.
+//! ACP request_permission. There is no ordinary ACP-owned model loop or history.
+//!
+//! `--host-managed` selects a separate, confined adapter before runtime startup.
+//! It drives the same canonical Agent with only parent-brokered model/tools and
+//! memory-only history; it does not bootstrap the ordinary OUP runtime.
 
 #[cfg(feature = "api")]
 use std::collections::HashMap;
@@ -50,7 +54,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap::Args;
 use eyre::{Result, WrapErr};
 
-#[cfg(any(feature = "api", test))]
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, ContentBlock, InitializeRequest, InitializeResponse, PromptCapabilities,
     SessionId,
@@ -80,10 +83,12 @@ use octos_bus::session::SessionManager;
 use octos_core::SessionKey;
 
 use super::Executable;
+mod host_managed;
 #[cfg(feature = "api")]
 mod oup;
 #[cfg(feature = "api")]
 use crate::config::Config;
+pub use host_managed::{NotifyIfBusy, NotifyRequest, NotifyResponse};
 
 /// Default for [`AcpCommand::max_iterations`]. Shared by the clap default and
 /// the `Default` impl so an embedder building the command by hand gets the same
@@ -97,6 +102,13 @@ pub const DEFAULT_MAX_ITERATIONS: u32 = 0;
 /// ACP agent resolves an LLM the same way.
 #[derive(Debug, Args)]
 pub struct AcpCommand {
+    /// Confine this worker and delegate all model/tool access to its ACP parent.
+    #[arg(
+        long,
+        conflicts_with_all = ["cwd", "data_dir", "config", "provider", "model", "base_url", "profile"]
+    )]
+    pub host_managed: bool,
+
     /// Working directory the agent's tools are rooted at (defaults to the
     /// current directory). Note: ACP clients also send a `cwd` with
     /// `session/new`; that per-session value takes precedence when present.
@@ -123,7 +135,8 @@ pub struct AcpCommand {
     #[arg(long)]
     pub base_url: Option<String>,
 
-    /// Maximum LLM-loop iterations per prompt turn. 0 means unlimited.
+    /// Maximum LLM-loop iterations per prompt turn. 0 means unlimited in
+    /// ordinary ACP, or the bounded 20-iteration default with --host-managed.
     #[arg(long, default_value_t = DEFAULT_MAX_ITERATIONS)]
     pub max_iterations: u32,
 
@@ -140,6 +153,7 @@ impl Default for AcpCommand {
     /// Keep the interactive unlimited sentinel identical to clap's default.
     fn default() -> Self {
         Self {
+            host_managed: false,
             cwd: None,
             data_dir: None,
             config: None,
@@ -154,6 +168,23 @@ impl Default for AcpCommand {
 
 impl Executable for AcpCommand {
     fn execute(self) -> Result<()> {
+        // Confinement must precede worker threads, config loading and ACP input.
+        if self.host_managed {
+            let confinement = octos_sandbox::confine_host_managed()?;
+            return tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(4)
+                .enable_all()
+                .thread_stack_size(8 * 1024 * 1024)
+                .build()
+                .wrap_err("failed to create confined tokio runtime")?
+                .block_on(host_managed::serve(
+                    self.max_iterations,
+                    confinement.platform,
+                    agent_client_protocol::Stdio::new(),
+                ))
+                .map_err(|e| eyre::eyre!("host-managed ACP connection ended with error: {e}"));
+        }
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_stack_size(8 * 1024 * 1024) // deep agent futures need a big stack
@@ -444,6 +475,10 @@ impl AcpCommand {
     /// ```
     #[cfg(feature = "api")]
     pub fn factory(&self) -> Result<Arc<dyn SessionAgentFactory>> {
+        eyre::ensure!(
+            !self.host_managed,
+            "host-managed mode requires the confined ACP broker transport"
+        );
         // Resolve config the same way `octos chat` does.
         let cwd = match &self.cwd {
             Some(c) => c.clone(),
@@ -521,7 +556,6 @@ impl AcpCommand {
 /// otherwise (a newer/unknown version) we reply with the latest version we do
 /// support (`ProtocolVersion::LATEST`, currently V1) rather than falsely
 /// advertising support for the requested one.
-#[cfg(any(feature = "api", test))]
 fn build_initialize_response(req: &InitializeRequest) -> InitializeResponse {
     use agent_client_protocol::schema::ProtocolVersion;
 
@@ -548,7 +582,6 @@ fn build_initialize_response(req: &InitializeRequest) -> InitializeResponse {
 
 /// Handle `session/new`: build a fresh octos agent and register it.
 /// Generate a fresh, unique ACP session id.
-#[cfg(any(feature = "api", test))]
 fn new_session_id() -> SessionId {
     SessionId::new(format!("octos-{}", uuid::Uuid::new_v4()))
 }
@@ -563,7 +596,6 @@ fn new_session_id() -> SessionId {
 /// the next line, if any) rather than dropping it. Binary non-text blocks (image,
 /// audio) are still skipped in v1 — we advertise text-only prompt capabilities at
 /// `initialize`.
-#[cfg(any(feature = "api", test))]
 fn extract_prompt_text(blocks: &[ContentBlock]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for block in blocks {
@@ -599,7 +631,6 @@ fn extract_prompt_text(blocks: &[ContentBlock]) -> String {
 
 /// Best-effort mapping from an octos tool name to an ACP [`ToolKind`] so clients
 /// can render an appropriate icon. Unknown tools fall back to `Other`.
-#[cfg(feature = "api")]
 fn tool_kind_for(name: &str) -> agent_client_protocol::schema::v1::ToolKind {
     use agent_client_protocol::schema::v1::ToolKind;
     match name {

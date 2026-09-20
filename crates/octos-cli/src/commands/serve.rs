@@ -49,6 +49,23 @@ const FLEET_BOOT_RECONCILE_MAX_ATTEMPTS: u32 = 3;
 /// yields real isolation.
 ///
 /// [`NoSandbox`]: octos_agent::sandbox::NoSandbox
+/// Default idle lifetime of a cached per-session runtime (30 minutes).
+const SESSION_CACHE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Idle lifetime of a cached per-session runtime.
+///
+/// `OCTOS_SESSION_CACHE_IDLE_TTL_SECS` overrides it (minimum 1 s; a malformed
+/// or zero value keeps the default). Rebuilding an evicted runtime is correct
+/// but slow for a long session, so an operator on a big box may want it
+/// longer; tests want it short.
+fn session_cache_idle_ttl() -> std::time::Duration {
+    std::env::var("OCTOS_SESSION_CACHE_IDLE_TTL_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(SESSION_CACHE_IDLE_TTL, std::time::Duration::from_secs)
+}
+
 fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
     let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
     // A refusing resolution (explicit mode unhonorable on this host, or
@@ -537,8 +554,13 @@ const SERVE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// ends, but tokio keeps the handler installed for the process lifetime, so
 /// a second signal during the bounded drain is captured-but-unobserved: it
 /// cannot kill the serve before `stop_all()` runs.
-fn spawn_serve_shutdown_signal_watcher() -> tokio::sync::watch::Receiver<bool> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+fn spawn_serve_shutdown_signal_watcher(
+    shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
+) -> tokio::sync::watch::Receiver<bool> {
+    // One channel for every stop request: this watcher (SIGINT/SIGTERM) and
+    // the `server/shutdown` UI Protocol method hold the same sender, so a stop
+    // from a client takes exactly the drain path a signal takes.
+    let shutdown_rx = shutdown_tx.subscribe();
     #[cfg(unix)]
     let sigterm = {
         use tokio::signal::unix::{SignalKind, signal};
@@ -572,7 +594,7 @@ fn spawn_serve_shutdown_signal_watcher() -> tokio::sync::watch::Receiver<bool> {
         {
             let _ = tokio::signal::ctrl_c().await;
         }
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.send_replace(true);
     });
     shutdown_rx
 }
@@ -622,12 +644,48 @@ async fn bind_http_listener(
 
     let listener = tokio::net::TcpListener::bind((host, requested_port))
         .await
-        .wrap_err_with(|| format!("failed to bind octos API server to {host}:{requested_port}"))?;
+        .map_err(|error| bind_listener_error(host, requested_port, error))?;
     let actual_port = listener
         .local_addr()
         .wrap_err("failed to inspect bound octos API listener")?
         .port();
     Ok((Some(listener), actual_port))
+}
+
+/// Wrap a listener bind failure. An occupied port gets the remediation the
+/// data-dir lock error already sets the bar for (#2385): how to find the
+/// holder and the `--port` escape hatch. Every other failure keeps the bare
+/// wrap — the io error stays as the `Caused by:` source either way.
+fn bind_listener_error(host: &str, requested_port: u16, error: std::io::Error) -> eyre::Report {
+    let target = format!("{host}:{requested_port}");
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        eyre::Report::new(error).wrap_err(format!(
+            "failed to bind octos API server to {target}: the port is already in use. \
+             Find the holder with `{}`, or pass `--port` to choose another.",
+            port_holder_hint(requested_port)
+        ))
+    } else {
+        eyre::Report::new(error).wrap_err(format!("failed to bind octos API server to {target}"))
+    }
+}
+
+/// Platform-appropriate command for finding which process holds `port`
+/// (the issue's "or your platform equivalent").
+#[cfg(target_os = "linux")]
+fn port_holder_hint(port: u16) -> String {
+    // iproute2's `ss` ships with the base system on essentially every distro
+    // (minimal container images included); `lsof` frequently does not.
+    format!("ss -ltnp 'sport = :{port}'")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn port_holder_hint(port: u16) -> String {
+    format!("lsof -i :{port}")
+}
+
+#[cfg(windows)]
+fn port_holder_hint(port: u16) -> String {
+    format!("netstat -ano | findstr :{port}")
 }
 
 /// Stable, machine-greppable marker embedded in the "data directory is already
@@ -1380,7 +1438,7 @@ impl ServeCommand {
         }
 
         let session_cache = Arc::new(
-            crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
+            crate::runtime::SessionRuntimeCache::new(64, session_cache_idle_ttl())
                 // Per-project session storage (opt-in, default off). When set,
                 // a cwd-hinted AppUi session's transcript store relocates to
                 // `<cwd>/.octos`; no-hint/gateway sessions are unaffected.
@@ -1624,6 +1682,9 @@ impl ServeCommand {
         )
         .wrap_err("invalid AppUI browser-origin configuration")?;
 
+        // The stop switch exists before AppState so the `server/shutdown`
+        // method and the signal watcher (installed further down) share it.
+        let serve_shutdown_tx = Arc::new(tokio::sync::watch::channel(false).0);
         let state = Arc::new(AppState {
             ui_protocol: crate::api::UiProtocolRuntimeResources::default(),
             profiles: profile_runtimes,
@@ -1680,6 +1741,8 @@ impl ServeCommand {
             host_memory: config.memory.clone(),
             pairing: pairing.clone(),
             solo_login_enabled: solo_login_enabled_flag,
+            // Only the HTTP serve has a loop to stop; see AppState::serve_shutdown.
+            serve_shutdown: (!self.stdio).then(|| serve_shutdown_tx.clone()),
             dangerous_default_permissions: dangerous_default_permissions_flag,
             default_network_denied: default_network_denied_flag,
             llm_compaction: self.llm_compaction,
@@ -1776,7 +1839,7 @@ impl ServeCommand {
         // disposition and orphans every gateway (#2086). The stdio path above
         // returns before this point and keeps its existing behavior — it
         // spawns no gateways, so there is nothing to orphan.
-        let shutdown_rx = spawn_serve_shutdown_signal_watcher();
+        let shutdown_rx = spawn_serve_shutdown_signal_watcher(serve_shutdown_tx.clone());
 
         // Auto-start enabled profiles
         let profiles = profile_store.list().unwrap_or_default();
@@ -2304,15 +2367,90 @@ mod tests {
         assert_eq!(resolve_auth_token(None, None, None), None);
     }
 
+    /// #2385: an occupied port is the one bind failure a user can fix from
+    /// the message alone, so it must say the port is taken, how to find the
+    /// holder, and the `--port` escape hatch — while keeping the io error as
+    /// the source.
+    #[test]
+    fn bind_error_on_addr_in_use_carries_remediation() {
+        let report = bind_listener_error(
+            "127.0.0.1",
+            8080,
+            std::io::Error::from(std::io::ErrorKind::AddrInUse),
+        );
+        let rendered = format!("{report}");
+        assert!(rendered.contains("already in use"), "actual: {rendered}");
+        assert!(rendered.contains("--port"), "actual: {rendered}");
+        #[cfg(target_os = "linux")]
+        assert!(
+            rendered.contains("ss -ltnp 'sport = :8080'"),
+            "actual: {rendered}"
+        );
+        #[cfg(all(unix, not(target_os = "linux")))]
+        assert!(rendered.contains("lsof -i :8080"), "actual: {rendered}");
+        #[cfg(windows)]
+        assert!(
+            rendered.contains("netstat -ano | findstr :8080"),
+            "actual: {rendered}"
+        );
+        assert!(report.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        }));
+    }
+
+    #[test]
+    fn bind_error_other_kinds_keep_the_bare_wrap() {
+        let report = bind_listener_error(
+            "127.0.0.1",
+            8080,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(
+            format!("{report}"),
+            "failed to bind octos API server to 127.0.0.1:8080"
+        );
+        assert!(report.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        }));
+    }
+
+    /// The remediation path must key off the REAL OS error, not just the
+    /// synthesized kind: hold a socket and drive the production bind through
+    /// it.
+    #[tokio::test]
+    async fn bind_http_listener_reports_remediation_for_occupied_port() {
+        let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let error = bind_http_listener(false, "127.0.0.1", port)
+            .await
+            .unwrap_err();
+        let rendered = format!("{error}");
+        assert!(rendered.contains("already in use"), "actual: {rendered}");
+        assert!(rendered.contains("--port"), "actual: {rendered}");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        }));
+    }
+
     /// #2371 tripwire: the repo's own service generators must never place
     /// the dashboard bearer token in argv — it is readable by any local
     /// process via ps / systemctl cat. The OCTOS_AUTH_TOKEN env var carries
-    /// it instead. (deploy.ps1's NSSM path is the known remaining exception;
-    /// NSSM needs AppEnvironmentExtra for env injection, tracked separately.)
+    /// it instead (NSSM's AppEnvironmentExtra is the deploy.ps1 equivalent).
     #[test]
     fn service_templates_never_pass_auth_token_via_argv() {
         let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
-        for name in ["install.sh", "install.ps1", "local-tenant-deploy.sh"] {
+        for name in [
+            "install.sh",
+            "install.ps1",
+            "local-tenant-deploy.sh",
+            "deploy.ps1",
+        ] {
             let body = std::fs::read_to_string(scripts.join(name))
                 .unwrap_or_else(|e| panic!("read {name}: {e}"));
             assert!(
@@ -2322,6 +2460,8 @@ mod tests {
             for line in body.lines() {
                 let service_argv_line = line.contains("ExecStart=")
                     || line.contains("\"$octosBin\" serve")
+                    || line.contains("$nssmExe install")
+                    || line.contains("AppParameters")
                     || line.trim() == "<string>--auth-token</string>";
                 assert!(
                     !(service_argv_line && line.contains("--auth-token")),

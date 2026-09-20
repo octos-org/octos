@@ -672,6 +672,25 @@ impl SessionRuntimeCache {
             .unwrap_or(0)
     }
 
+    /// Mark every cached runtime for `session` as used right now, so the
+    /// idle sweep does not evict a Session a client is holding open.
+    ///
+    /// Rebuilding an evicted runtime is correct but slow — a long session
+    /// costs seconds to reload from disk, which a UI client pays on its next
+    /// `session/open` (and can hit its request timeout). A connection with
+    /// the Session open calls this periodically, well inside the idle TTL.
+    /// Returns how many cached entries were refreshed (0 when the Session is
+    /// not cached, which needs no keep-alive).
+    pub async fn keep_session_alive(&self, session: &SessionKey) -> usize {
+        let mut guard = self.inner.write().await;
+        let mut refreshed = 0usize;
+        for (_, entry) in guard.iter_mut().filter(|((_, key, _), _)| key == session) {
+            entry.last_used = Instant::now();
+            refreshed += 1;
+        }
+        refreshed
+    }
+
     /// Drop every entry whose `last_used` is older than
     /// [`Self::idle_ttl`]. Exposed so tests can verify the eviction
     /// invariant without waiting for the 60 s background sweep.
@@ -1083,6 +1102,37 @@ mod tests {
         assert!(
             cache.is_empty().await,
             "idle entry should have been evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_an_open_session_cached_past_its_idle_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let cache = SessionRuntimeCache::new(8, Duration::from_millis(100));
+        let held = SessionKey::new("api", "held-open");
+        let idle = SessionKey::new("api", "idle");
+        let _a = cache
+            .get_or_init(&profile, held.clone(), None)
+            .await
+            .expect("init");
+        let _b = cache
+            .get_or_init(&profile, idle.clone(), None)
+            .await
+            .expect("init");
+
+        // A client holding `held` open keeps renewing it; `idle` is untouched.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert_eq!(cache.keep_session_alive(&held).await, 1);
+            cache.invalidate_idle().await;
+        }
+
+        assert_eq!(cache.len().await, 1, "only the renewed Session survives");
+        assert_eq!(
+            cache.keep_session_alive(&idle).await,
+            0,
+            "an evicted Session reports nothing to renew"
         );
     }
 
