@@ -317,6 +317,9 @@ jobs:
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
 
+      - name: Install Linux sandbox prerequisites
+        run: bash scripts/setup-host-managed-linux-ci.sh
+
       - name: Test octos-sandbox
         run: cargo test -p octos-sandbox
 
@@ -641,6 +644,8 @@ jobs:
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
+      - name: Install Linux sandbox prerequisites
+        run: bash scripts/setup-host-managed-linux-ci.sh
       - name: Test octos-sandbox
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
@@ -721,6 +726,8 @@ jobs:
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
+      - name: Install Linux sandbox prerequisites
+        run: bash scripts/setup-host-managed-linux-ci.sh
       - name: Test octos-sandbox
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm

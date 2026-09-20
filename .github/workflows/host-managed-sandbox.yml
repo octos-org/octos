@@ -3,9 +3,9 @@ name: Host-managed agent confinement
 on:
   push:
     branches: [main]
-    paths: ['crates/octos-cli/**', 'crates/octos-agent/**', 'crates/octos-core/**', 'crates/octos-llm/**', 'crates/octos-memory/**', 'crates/octos-sandbox/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/host-managed-sandbox.yml']
+    paths: ['crates/octos-cli/**', 'crates/octos-agent/**', 'crates/octos-core/**', 'crates/octos-llm/**', 'crates/octos-memory/**', 'crates/octos-sandbox/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/host-managed-sandbox.yml', 'scripts/setup-host-managed-linux-ci.sh']
   pull_request:
-    paths: ['crates/octos-cli/**', 'crates/octos-agent/**', 'crates/octos-core/**', 'crates/octos-llm/**', 'crates/octos-memory/**', 'crates/octos-sandbox/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/host-managed-sandbox.yml']
+    paths: ['crates/octos-cli/**', 'crates/octos-agent/**', 'crates/octos-core/**', 'crates/octos-llm/**', 'crates/octos-memory/**', 'crates/octos-sandbox/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/host-managed-sandbox.yml', 'scripts/setup-host-managed-linux-ci.sh']
   workflow_dispatch:
 
 permissions:
@@ -32,15 +32,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux sandbox prerequisites
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          # GitHub's disposable Ubuntu runner restricts unprivileged userns via
-          # AppArmor. Enable the kernel feature required by this test fixture;
-          # production launchers fail closed when the host disables it.
-          if test -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
+        run: bash scripts/setup-host-managed-linux-ci.sh
       - name: Run actual kernel escape probes
         run: cargo test -p octos-sandbox --test host_managed --locked
       - name: Validate host protocol and memory-only storage

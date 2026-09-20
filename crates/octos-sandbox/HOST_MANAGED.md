@@ -71,6 +71,13 @@ They attempt private content/metadata/directory access, writes, inherited-FD
 reads, local TCP/UDP/Unix networking, subprocesses, parent memory and macOS
 keychain access, while checking async Tokio stdin/stdout and threads still work.
 
+The native probes also run in ordinary package and workspace test suites. Linux
+test hosts must meet the requirements above; missing confinement is a test
+failure, not a skipped check. Hosted Ubuntu CI jobs use
+`scripts/setup-host-managed-linux-ci.sh` to provision their disposable runners.
+Self-hosted runners require administrator-provisioned prerequisites; their
+workflows do not change the machine's AppArmor or namespace policy.
+
 Set `OCTOS_HOST_MANAGED_BINARY` to an absolute built `octos` path to also run an
 actual confined ACP handshake and create a memory-only session using a synthetic
 host tool catalog. The dedicated CI workflow runs both checks on macOS and Linux.
