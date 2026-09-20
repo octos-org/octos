@@ -50,7 +50,7 @@ use clap::{Parser, Subcommand};
 use eyre::Result;
 
 pub use account::AccountCommand;
-pub use acp::AcpCommand;
+pub use acp::{AcpCommand, NotifyIfBusy, NotifyRequest, NotifyResponse};
 // Test-support seam for the `octos acp` bridge: the end-to-end integration test
 // in `crates/octos-cli/tests/acp_integration.rs` drives the real ACP handler
 // wiring with a `MockLlm`-backed agent over an in-process transport. Hidden

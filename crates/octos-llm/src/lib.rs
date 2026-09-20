@@ -36,6 +36,7 @@ mod cache_manifest;
 pub mod catalog;
 pub mod error;
 pub mod high_level;
+pub mod host;
 pub mod middleware;
 
 pub mod anthropic;
