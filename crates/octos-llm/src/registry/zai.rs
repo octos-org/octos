@@ -2,27 +2,39 @@ use std::sync::Arc;
 
 use eyre::Result;
 
-use crate::anthropic::AnthropicProvider;
+use crate::openai::OpenAIProvider;
 use crate::provider::LlmProvider;
 
 use super::{CreateParams, ProviderEntry};
 
-/// Z.AI uses the Anthropic Messages API protocol.
+/// Z.AI's general (pay-as-you-go) API. Speaks the OpenAI Chat Completions
+/// protocol against `https://api.z.ai/api/paas/v4`.
+///
+/// This lane used to target Z.AI's Anthropic-compatible root with explicit
+/// `cache_control` breakpoints. Z.AI's prompt cache is implicit only: the
+/// Anthropic-compatible root accepts the breakpoints and ignores them (every
+/// request answers `cache_read_input_tokens: 0`), while the OpenAI-compatible
+/// root caches the repeated prefix automatically and reports the hit in
+/// `usage.prompt_tokens_details.cached_tokens`. See `zai_coding.rs` for the
+/// measurement; the same applies to this root per Z.AI's context-caching docs.
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "zai",
     aliases: &["z.ai"],
     api_key_env: Some("ZAI_API_KEY"),
     key_env_aliases: &[],
-    default_base_url: Some("https://api.z.ai/api/anthropic"),
+    default_base_url: Some(DEFAULT_BASE_URL),
     requires_api_key: true,
     requires_base_url: false,
     requires_model: false,
     // Z.AI hosts multiple model families — no simple detect pattern.
     detect_patterns: &[],
-    model_discovery: crate::discovery::ANTHROPIC_MODELS,
+    model_discovery: crate::discovery::OPENAI_MODELS,
     model_discovery_for_model: None,
     create,
 };
+
+/// Z.AI's OpenAI-compatible root (versioned: `.../v4`).
+pub const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 
 fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let http_timeout = p.http_timeout();
@@ -38,16 +50,16 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
                 ENTRY.name
             )
         })?;
-    let url = p
-        .base_url
-        .unwrap_or_else(|| "https://api.z.ai/api/anthropic".into());
-    let mut provider = AnthropicProvider::new(&key, &model)
+    let url = p.base_url.unwrap_or_else(|| DEFAULT_BASE_URL.into());
+    // Plain OpenAI chat shape: no `cache_control` (Z.AI's OpenAI root rejects
+    // the field) and no `prompt_cache_key` affinity (not implemented by
+    // Z.AI); caching is server-side and automatic.
+    let mut provider = OpenAIProvider::new(&key, &model)
         .with_provider_label("zai")
-        .with_base_url(&url)
-        // Anthropic Messages-compatible by contract: `cache_control`
-        // breakpoints are accepted, so keep caching ON instead of the
-        // official-only default `with_base_url` applies to unknown hosts.
-        .with_prompt_caching(true);
+        .with_base_url(&url);
+    if let Some(hints) = p.model_hints {
+        provider = provider.with_hints(hints);
+    }
     if let Some((t, c)) = http_timeout {
         provider = provider.with_http_timeout(t, c);
     }
@@ -64,14 +76,14 @@ mod tests {
     use crate::config::ChatConfig;
 
     #[tokio::test]
-    async fn should_send_cache_breakpoints_when_zai_lane_is_built_from_registry() {
+    async fn should_speak_openai_chat_without_cache_control_when_zai_lane_is_built() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/messages"))
+            .and(path("/chat/completions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(
-                        r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
+                        r#"{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":75}}}"#,
                     )
                     .append_header("Content-Type", "application/json"),
             )
@@ -87,7 +99,7 @@ mod tests {
             llm_connect_timeout_secs: None,
         })
         .unwrap();
-        provider
+        let response = provider
             .chat(
                 &[Message::system("sys"), Message::user("hi")],
                 &[],
@@ -97,10 +109,21 @@ mod tests {
             .unwrap();
 
         let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "one chat completion request");
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "glm-4.7");
         assert!(
-            body.to_string().contains("cache_control"),
-            "Anthropic-compatible zai lane must keep explicit cache breakpoints: {body}"
+            !body.to_string().contains("cache_control"),
+            "Z.AI's OpenAI root rejects Anthropic cache_control; the lane must not send it: {body}"
         );
+        assert!(body.get("prompt_cache_key").is_none());
+        assert_eq!(response.usage.cache_read_tokens, 75);
+        assert_eq!(response.usage.input_tokens, 25);
+    }
+
+    #[test]
+    fn should_default_to_the_openai_compatible_root() {
+        assert_eq!(ENTRY.default_base_url, Some(DEFAULT_BASE_URL));
+        assert_eq!(ENTRY.model_discovery, crate::discovery::OPENAI_MODELS);
     }
 }

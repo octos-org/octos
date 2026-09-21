@@ -407,17 +407,19 @@ mod tests {
     // ── Strategy resolution ─────────────────────────────────────────────
 
     #[test]
-    fn should_use_native_anthropic_strategy_for_zai_family_without_literal_id_match() {
-        // The registry entry — not a `provider == "anthropic"` literal —
-        // declares the protocol, so the Anthropic-protocol zai family resolves
-        // to the Anthropic Messages strategy even though its id differs.
+    fn should_use_registry_declared_strategy_for_zai_families_without_literal_id_match() {
+        // The registry entry — not a provider-name literal — declares the
+        // protocol. Both Z.AI families now speak OpenAI Chat Completions (the
+        // only Z.AI root whose implicit prompt cache is reported), so they
+        // resolve to the OpenAI listing strategy even though their ids match
+        // neither `openai` nor `anthropic`.
         assert_eq!(
             resolve_model_discovery(Some("zai"), None, None, None).discovery,
-            ANTHROPIC_MODELS
+            OPENAI_MODELS
         );
         assert_eq!(
             resolve_model_discovery(Some("zai-coding"), None, None, None).discovery,
-            ANTHROPIC_MODELS
+            OPENAI_MODELS
         );
     }
 
@@ -487,12 +489,20 @@ mod tests {
     #[test]
     fn should_keep_native_strategy_when_api_type_is_not_the_anthropic_override() {
         // Mirrors inference: for registered families only `api_type:
-        // "anthropic"` changes protocol — "openai" on zai still constructs
-        // AnthropicProvider, so discovery must NOT take the bait either
-        // (saved AppUI routes default api_type to "openai").
+        // "anthropic"` changes protocol — "openai" on a registered family
+        // is the native protocol or ignored, so discovery must NOT take the
+        // bait either (saved AppUI routes default api_type to "openai").
+        // `minimax` is an Anthropic-protocol family whose id is not the
+        // literal `anthropic`.
+        assert_eq!(
+            resolve_model_discovery(Some("minimax"), Some("openai"), None, None).discovery,
+            crate::registry::lookup("minimax")
+                .expect("minimax registered")
+                .model_discovery
+        );
         assert_eq!(
             resolve_model_discovery(Some("zai"), Some("openai"), None, None).discovery,
-            ANTHROPIC_MODELS
+            OPENAI_MODELS
         );
         assert_eq!(
             resolve_model_discovery(Some("zhipu"), Some("openai"), None, None).discovery,
@@ -666,11 +676,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_probe_anthropic_protocol_for_zai_without_bearer_or_v1_models() {
+    async fn should_probe_openai_protocol_on_the_versioned_zai_root_without_duplicating_v4() {
         let (root, captured) =
             spawn_fixture("200 OK", r#"{"data":[{"id":"glm-4.7"},{"id":"glm-5.2"}]}"#).await;
-        // Base root exactly as the zai family spells it (no /v1 suffix).
-        let url = format!("{root}/api/anthropic");
+        // Base root exactly as the zai family spells it: the versioned
+        // OpenAI-compatible `/api/paas/v4` (the only Z.AI root that reports
+        // its implicit prompt cache).
+        let url = format!("{root}/api/paas/v4");
         let outcome = discover_models(
             &resolve_model_discovery(Some("zai"), Some("openai"), None, None),
             "zai-key-secret",
@@ -687,14 +699,14 @@ mod tests {
         let requests = captured.lock().await;
         assert_eq!(requests.len(), 1);
         let only = &requests[0];
-        // The strategy-derived path, NOT a synthesized /v1/models off the
-        // root, and Anthropic header semantics — never `Authorization: Bearer`.
-        assert_eq!(only.path, "/api/anthropic/v1/models");
-        assert!(
-            only.authorization.is_none(),
-            "zai must never get a Bearer probe"
+        // OpenAI listing off the versioned root: `/models`, not
+        // `/v4/v1/models`, with Bearer auth.
+        assert_eq!(only.path, "/api/paas/v4/models");
+        assert_eq!(
+            only.authorization.as_deref(),
+            Some("Bearer zai-key-secret"),
+            "OpenAI-protocol zai probe carries Bearer auth"
         );
-        assert_eq!(only.x_api_key.as_deref(), Some("zai-key-secret"));
     }
 
     #[tokio::test]

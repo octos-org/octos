@@ -488,6 +488,87 @@ pub struct ToolResultPlaceholder {
     pub original_byte_len: Option<u64>,
     /// Free-form reason string (e.g. `"pruned_after_turns"`).
     pub reason: String,
+    /// What the evicted call was about, from its arguments: the file path and
+    /// line range of a read, the head of a shell command, the pattern of a
+    /// grep. Without it the model sees only "a `read_file` result was removed"
+    /// and cannot tell WHICH file is gone, so a careful model re-reads
+    /// everything it might have lost. See [`describe_tool_call`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Plain-language note for the model: what was elided, that the on-disk
+    /// file is unchanged unless a later edit says otherwise, and how to get
+    /// the output back (`recall` by `tool_call_id`, or repeat the call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// One-line description of a tool call from its name and arguments, used as
+/// the `target` of a [`ToolResultPlaceholder`] so an evicted result still
+/// names what it held. Returns `None` when the arguments carry nothing
+/// recognisable.
+pub fn describe_tool_call(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    fn str_arg<'a>(args: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+        keys.iter()
+            .find_map(|k| args.get(*k).and_then(|v| v.as_str()))
+    }
+    fn int_arg(args: &serde_json::Value, keys: &[&str]) -> Option<i64> {
+        keys.iter()
+            .find_map(|k| args.get(*k).and_then(|v| v.as_i64()))
+    }
+    fn head(text: &str, max_chars: usize) -> String {
+        let one_line = text.lines().next().unwrap_or("").trim();
+        let mut out: String = one_line.chars().take(max_chars).collect();
+        if one_line.chars().count() > max_chars || text.lines().count() > 1 {
+            out.push('…');
+        }
+        out
+    }
+
+    if let Some(path) = str_arg(args, &["path", "file_path", "filePath"]) {
+        let start = int_arg(args, &["start_line", "offset"]);
+        let end = int_arg(args, &["end_line"]);
+        let limit = int_arg(args, &["limit"]);
+        let range = match (start, end, limit) {
+            (Some(s), Some(e), _) => format!(" lines {s}-{e}"),
+            (Some(s), None, Some(l)) => format!(" lines {s}-{}", s + l - 1),
+            (Some(s), None, None) => format!(" from line {s}"),
+            (None, Some(e), _) => format!(" lines 1-{e}"),
+            (None, None, Some(l)) => format!(" lines 1-{l}"),
+            (None, None, None) => String::new(),
+        };
+        return Some(format!("{tool_name} {path}{range}"));
+    }
+    if let Some(cmd) = str_arg(args, &["command", "cmd", "script"]) {
+        return Some(format!("{tool_name}: {}", head(cmd, 100)));
+    }
+    if let Some(pattern) = str_arg(args, &["pattern", "query", "regex"]) {
+        let scope = str_arg(args, &["dir", "directory", "cwd", "glob"])
+            .map(|d| format!(" in {d}"))
+            .unwrap_or_default();
+        return Some(format!("{tool_name} {}{scope}", head(pattern, 60)));
+    }
+    if let Some(url) = str_arg(args, &["url"]) {
+        return Some(format!("{tool_name} {}", head(url, 100)));
+    }
+    None
+}
+
+/// Human-readable elision note carried in the placeholder's `hint`.
+pub fn elision_hint(target: Option<&str>, original_byte_len: Option<u64>, reason: &str) -> String {
+    let what = target.unwrap_or("this tool output");
+    let size = original_byte_len
+        .map(|n| {
+            if n >= 1024 {
+                format!(" ({:.1} KB)", n as f64 / 1024.0)
+            } else {
+                format!(" ({n} B)")
+            }
+        })
+        .unwrap_or_default();
+    format!(
+        "Output of {what}{size} elided from context ({reason}); nothing on disk changed. \
+         To see it again call `recall` with this tool_call_id, or repeat the call."
+    )
 }
 
 #[derive(Debug)]
@@ -523,11 +604,11 @@ impl ToolResultPlaceholder {
             "turn_id": self.turn_id,
             "original_byte_len": self.original_byte_len,
             "reason": self.reason,
-            // #2131: the placeholder already carries `tool_call_id`, and the
-            // `recall` tool's description tells the model to restore an evicted
-            // output by exactly that id — so no in-placeholder call hint is
-            // needed. Emitting one here would also mislead the chat/acp/mcp
-            // paths, which build placeholders but register no recall tool.
+            // `target` names what the evicted call was about and `hint`
+            // tells the model how to get it back; both are optional so the
+            // v1 schema and older placeholders still round-trip.
+            "target": self.target,
+            "hint": self.hint,
         });
         format!(
             "{}{}",
@@ -868,7 +949,7 @@ impl CompactionRunner {
         // Build a map id -> (tool_name, turn_id) from assistant messages up
         // to the cutoff.
         let mut turn_counter: u32 = 0;
-        let mut id_to_meta: std::collections::HashMap<String, (String, u32)> =
+        let mut id_to_meta: std::collections::HashMap<String, (String, u32, Option<String>)> =
             std::collections::HashMap::new();
         for (idx, msg) in messages.iter().enumerate() {
             if msg.role == MessageRole::User {
@@ -880,9 +961,13 @@ impl CompactionRunner {
             if msg.role == MessageRole::Assistant {
                 if let Some(ref calls) = msg.tool_calls {
                     for call in calls {
-                        id_to_meta
-                            .entry(call.id.clone())
-                            .or_insert_with(|| (call.name.clone(), turn_counter));
+                        id_to_meta.entry(call.id.clone()).or_insert_with(|| {
+                            (
+                                call.name.clone(),
+                                turn_counter,
+                                describe_tool_call(&call.name, &call.arguments),
+                            )
+                        });
                     }
                 }
             }
@@ -900,17 +985,21 @@ impl CompactionRunner {
                 continue;
             }
             let tool_id = msg.tool_call_id.clone().unwrap_or_default();
-            let (tool_name, turn_id) = id_to_meta
+            let (tool_name, turn_id, target) = id_to_meta
                 .get(&tool_id)
                 .cloned()
-                .unwrap_or_else(|| ("unknown_tool".to_string(), 0));
+                .unwrap_or_else(|| ("unknown_tool".to_string(), 0, None));
+            let original_byte_len = Some(msg.content.len() as u64);
+            let reason = "pruned_after_turns";
             let placeholder = ToolResultPlaceholder {
                 schema_version: TOOL_RESULT_PLACEHOLDER_SCHEMA_VERSION,
                 tool_name,
                 tool_call_id: tool_id,
                 turn_id: Some(turn_id),
-                original_byte_len: Some(msg.content.len() as u64),
-                reason: "pruned_after_turns".to_string(),
+                original_byte_len,
+                reason: reason.to_string(),
+                hint: Some(elision_hint(target.as_deref(), original_byte_len, reason)),
+                target,
             };
             msg.content = placeholder.to_placeholder_content();
             replaced += 1;
@@ -2015,13 +2104,71 @@ mod tests {
             turn_id: Some(2),
             original_byte_len: Some(1234),
             reason: "pruned_after_turns".into(),
+            target: Some("shell: sed -n 1,40p lab/compile.py".into()),
+            hint: Some(elision_hint(
+                Some("shell: sed -n 1,40p lab/compile.py"),
+                Some(1234),
+                "pruned_after_turns",
+            )),
         };
         let content = p.to_placeholder_content();
         assert!(content.starts_with(TOOL_RESULT_PLACEHOLDER_PREFIX));
-        // The placeholder carries tool_call_id (the recall handle).
+        // The placeholder carries tool_call_id (the recall handle) and names
+        // what it replaced, so the model knows what is gone without guessing.
         assert!(content.contains("id1"), "{content}");
+        assert!(content.contains("lab/compile.py"), "{content}");
+        assert!(content.contains("recall"), "{content}");
         let parsed = ToolResultPlaceholder::from_placeholder_content(&content).unwrap();
         assert_eq!(parsed, p);
+    }
+
+    #[test]
+    fn tool_result_placeholder_without_target_still_parses() {
+        // Placeholders written before `target`/`hint` existed carry neither.
+        let raw = serde_json::json!({
+            "schema": TOOL_RESULT_PLACEHOLDER_SCHEMA_V1,
+            "schema_version": TOOL_RESULT_PLACEHOLDER_SCHEMA_VERSION,
+            "tool_name": "read_file",
+            "tool_call_id": "c1",
+            "reason": "tier1_oversized"
+        })
+        .to_string();
+        let parsed = ToolResultPlaceholder::from_placeholder_content(&format!(
+            "{TOOL_RESULT_PLACEHOLDER_PREFIX}{raw}"
+        ))
+        .unwrap();
+        assert_eq!(parsed.target, None);
+        assert_eq!(parsed.hint, None);
+    }
+
+    #[test]
+    fn describe_tool_call_names_the_file_range_command_or_pattern() {
+        let read = serde_json::json!({"path": "lab/compile.py", "start_line": 45, "end_line": 180});
+        assert_eq!(
+            describe_tool_call("read_file", &read).as_deref(),
+            Some("read_file lab/compile.py lines 45-180")
+        );
+        let read_limit = serde_json::json!({"filePath": "a.rs", "offset": 10, "limit": 20});
+        assert_eq!(
+            describe_tool_call("read_file", &read_limit).as_deref(),
+            Some("read_file a.rs lines 10-29")
+        );
+        let whole = serde_json::json!({"path": "a.rs"});
+        assert_eq!(
+            describe_tool_call("read_file", &whole).as_deref(),
+            Some("read_file a.rs")
+        );
+        let shell = serde_json::json!({"command": "sed -n 108,180p lab/compile.py\necho done"});
+        assert_eq!(
+            describe_tool_call("shell", &shell).as_deref(),
+            Some("shell: sed -n 108,180p lab/compile.py…")
+        );
+        let grep = serde_json::json!({"pattern": "cache_control", "dir": "crates"});
+        assert_eq!(
+            describe_tool_call("grep", &grep).as_deref(),
+            Some("grep cache_control in crates")
+        );
+        assert_eq!(describe_tool_call("shell", &serde_json::json!({})), None);
     }
 
     #[test]
@@ -2061,15 +2208,17 @@ mod tests {
         messages.push(tool_result("tc_old", &"x".repeat(8_000)));
         // 6 more modest turns so the post-prune total sits between
         // budget/2 and budget (the recent-boundary walk engages, so a
-        // stale over-budget decision WOULD summarize old turns).
+        // stale over-budget decision WOULD summarize old turns). The
+        // placeholder now carries a target and a recovery hint, so the
+        // filler is sized to leave room for it under the budget.
         for index in 0..6 {
             messages.push(user_msg(&format!(
                 "question {index} {}",
-                "detail ".repeat(30)
+                "detail ".repeat(22)
             )));
             messages.push(assistant_msg(&format!(
                 "answer {index} {}",
-                "reply ".repeat(30)
+                "reply ".repeat(22)
             )));
         }
         let message_count_before = messages.len();

@@ -327,7 +327,13 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
             .iter()
             .copied()
             .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
-            .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
+            .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1)
+            // `context.state.v1` is the same kind of strict opt-in: it adds
+            // a notification legacy clients cannot decode, so the baseline
+            // never claims it.
+            .filter(|feature| {
+                *feature != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
+            }),
     ));
 
     Ok(report)

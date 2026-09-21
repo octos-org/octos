@@ -570,6 +570,7 @@ fn session_open_result_includes_capabilities_field() {
     for feature in UI_PROTOCOL_KNOWN_FEATURES {
         if *feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2
             || *feature == UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1
+            || *feature == UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
         {
             continue;
         }
@@ -953,6 +954,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "context/compaction_completed",
             "context/compaction_started",
             "context/normalization_reported",
+            "context/state_reported",
             "session/orchestration",
             "peer/staged",
             "peer/closed",
@@ -1181,6 +1183,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "context/compaction_completed",
                 "context/compaction_started",
                 "context/normalization_reported",
+                "context/state_reported",
                 "session/orchestration",
                 "peer/staged",
                 "peer/closed",
