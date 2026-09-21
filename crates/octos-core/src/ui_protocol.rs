@@ -6250,6 +6250,11 @@ pub struct ContextNormalizationReportedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextStateReportedEvent {
     pub session_id: SessionKey,
+    /// The session's context state with `token_estimate` set to the size
+    /// of the prompt projection the model is about to receive (capped tool
+    /// outputs included as the model sees them), which is what a fullness
+    /// gauge should show; the compaction events carry the transcript
+    /// estimate instead.
     pub context_state: UiContextState,
     /// The token threshold at which the server will compact this session's
     /// context (context-window derived); lets a client render an honest

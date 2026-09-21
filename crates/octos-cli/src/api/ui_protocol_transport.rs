@@ -4540,16 +4540,25 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // here and emitted with the other lifecycle events after the scratch
         // lock drops.
         if self.context_state_updates && self.context_lifecycle_notify.is_some() {
-            let estimate = scratch.manager.state().token_estimate;
+            let estimate = frame.report.token_estimate;
             let moved = scratch
                 .last_reported_token_estimate
                 .is_none_or(|last| estimate.abs_diff(last) >= context_state_report_step(threshold));
             if moved {
                 scratch.last_reported_token_estimate = Some(estimate);
+                let mut context_state = ui_context_state_for(&self.session_id, &scratch.manager);
+                // Report the size of the prompt the model will actually be
+                // sent, not the whole transcript's estimate: capped tool
+                // outputs and spilled artifacts make the transcript several
+                // times larger than the projection (a 210k-token prompt read
+                // "ctx 1M/1M ~100%" against the transcript number), and a
+                // gauge that says full while the provider bills a fifth of
+                // that is the misleading signal this feature exists to fix.
+                context_state.token_estimate = frame.report.token_estimate;
                 lifecycle_events.push(UiNotification::ContextStateReported(
                     octos_core::ui_protocol::ContextStateReportedEvent {
                         session_id: self.session_id.clone(),
-                        context_state: ui_context_state_for(&self.session_id, &scratch.manager),
+                        context_state,
                         threshold_tokens: threshold,
                         iteration: request.iteration,
                     },
