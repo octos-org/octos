@@ -1301,6 +1301,224 @@ async fn should_remove_sealed_segments_when_a_session_is_cleared() {
     assert!(!segments_dir(&active).exists());
 }
 
+fn contents(session: &Session) -> Vec<String> {
+    session
+        .messages
+        .iter()
+        .map(|m| {
+            if m.content.len() > 32 {
+                format!("<{} bytes>", m.content.len())
+            } else {
+                m.content.clone()
+            }
+        })
+        .collect()
+}
+
+/// F1: a rewrite folds merged segments into the active file and then deletes
+/// them; if the deletion is interrupted, the leftover segment must not load a
+/// second time, and the next seal must replace it rather than chain after it.
+#[tokio::test]
+async fn should_not_read_a_merged_segment_twice_when_a_rewrite_left_it_behind() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "residue");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    let sealed = segment_path(&segments_dir(&active), 1);
+    let kept = std::fs::read(&sealed).unwrap();
+
+    mgr.rewrite(&key).await.unwrap();
+    assert!(!sealed.exists());
+    // The crash: the rewritten active file is in place, the merged segment
+    // is still on disk.
+    std::fs::write(&sealed, &kept).unwrap();
+
+    mgr.cache.pop(&key.0);
+    let loaded = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        contents(&loaded),
+        vec!["seed", "<8389632 bytes>", "after the roll"],
+        "the active meta owns zero segments, so the residue is ignored"
+    );
+    assert_eq!(loaded.sealed_segments, 0);
+    assert_eq!(loaded.next_seq(), 3);
+
+    // The rewritten active file is itself past the segment size, so the
+    // next append seals it — as 000001 again, REPLACING the residue rather
+    // than chaining after it as 000002 (which would have baked it in). The
+    // oversize row then seals once more as 000002.
+    mgr.cache.put(key.0.clone(), loaded);
+    mgr.add_message(&key, oversize_row()).await.unwrap();
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "later"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 4);
+    let first = read_segment(&segment_path(&segments_dir(&active), 1), &key).unwrap();
+    assert_eq!(
+        first.timeline.len(),
+        3,
+        "000001 holds the rewritten rows, not the residue"
+    );
+    assert!(segment_path(&segments_dir(&active), 2).is_file());
+    assert!(!segment_path(&segments_dir(&active), 3).exists());
+    mgr.cache.pop(&key.0);
+    let reloaded = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        contents(&reloaded),
+        vec![
+            "seed",
+            "<8389632 bytes>",
+            "after the roll",
+            "<8389632 bytes>",
+            "later"
+        ]
+    );
+}
+
+/// F2: a crash after the seal's rename but before the fresh meta line is
+/// durable leaves sealed segments and no usable active file. The session must
+/// not vanish, and the seq chain must continue from the sealed rows.
+#[tokio::test]
+async fn should_rebuild_the_active_file_when_a_seal_was_interrupted() {
+    for empty_rather_than_missing in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::new("cli", "torn-seal");
+        roll_once(&mut mgr, &key).await;
+        let active = mgr.session_path(&key);
+        if empty_rather_than_missing {
+            std::fs::write(&active, b"").unwrap();
+        } else {
+            std::fs::remove_file(&active).unwrap();
+        }
+        mgr.cache.pop(&key.0);
+
+        let recovered = mgr.load_from_disk(&key).await.unwrap();
+        assert_eq!(recovered.sealed_segments, 1);
+        assert_eq!(
+            recovered.next_seq(),
+            2,
+            "two visible rows are sealed; the row lost with the active file is gone"
+        );
+        assert_eq!(recovered.title.as_deref(), Some("seed"));
+        assert!(active.is_file(), "the active file is written back");
+        assert_eq!(read_session_meta(&active).unwrap().base_seq, 2);
+        assert!(
+            mgr.list_sessions().iter().any(|(k, _)| k == &key.0),
+            "the session is listed again"
+        );
+
+        mgr.cache.put(key.0.clone(), recovered);
+        let seq = mgr
+            .add_message_with_seq(&key, make_message(MessageRole::User, "resumed"))
+            .await
+            .unwrap();
+        assert_eq!(seq, 2);
+        mgr.cache.pop(&key.0);
+        let full = mgr.load_full(&key).await.unwrap();
+        assert_eq!(contents(&full), vec!["seed", "<8389632 bytes>", "resumed"]);
+    }
+}
+
+/// F3: after a rollback that reaches into a sealed segment, the seq a handle
+/// reads back from disk must reflect the rows the marker removed there.
+#[tokio::test]
+async fn should_read_back_the_right_seq_after_a_rollback_into_a_sealed_segment() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "undo-seq");
+    for content in [
+        "seed".to_owned(),
+        "u".repeat(SESSION_SEGMENT_BYTES_DEFAULT as usize + 1024),
+        "after the roll".to_owned(),
+    ] {
+        mgr.add_message(&key, make_message(MessageRole::User, &content))
+            .await
+            .unwrap();
+    }
+    assert_eq!(mgr.rollback_last_n_user_turns(&key, 2).await.unwrap(), 2);
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "again"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 1, "manager: seed is 0, the two dropped turns are gone");
+
+    // A handle's read-back folds the active file, where the marker sits;
+    // the marker's debt spills into the sealed segment, so the active file
+    // alone would over-count by the sealed row it removed.
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    assert_eq!(handle.session().next_seq(), 2);
+    let seq = handle
+        .add_message_with_seq(make_message(MessageRole::User, "handle"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 2);
+    mgr.cache.pop(&key.0);
+    let full = mgr.load_full(&key).await.unwrap();
+    assert_eq!(contents(&full), vec!["seed", "again", "handle"]);
+    assert_eq!(full.next_seq(), 3);
+}
+
+/// F5: the listing previews the last prompt from the file's tail, and falls
+/// back to the whole file only when the tail has no user row.
+#[test]
+fn should_preview_the_last_prompt_from_the_file_tail() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("s.jsonl");
+    let meta = serde_json::json!({
+        "schema_version": 1, "session_key": "cli:x",
+        "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+    });
+    let row = |role: &str, content: &str| {
+        serde_json::json!({"role": role, "content": content, "timestamp": "2026-01-01T00:00:00Z"})
+            .to_string()
+    };
+    let blob = "b".repeat(600 * 1024);
+
+    // Prompt at the end of a big file: found in the tail.
+    let lines = [
+        meta.to_string(),
+        row("user", "first question"),
+        row("assistant", &blob),
+        row("user", "last question"),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    assert_eq!(
+        last_user_prompt_from_file(&path).as_deref(),
+        Some("last question")
+    );
+
+    // Prompt buried before a big blob: the tail has no user row, so the
+    // whole file is read.
+    let lines = [
+        meta.to_string(),
+        row("user", "buried question"),
+        row("assistant", &blob),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    assert_eq!(
+        last_user_prompt_from_file(&path).as_deref(),
+        Some("buried question")
+    );
+
+    // A rollback in the tail that drops the tail's only user row: the
+    // fold over the tail yields nothing, and the full read honours it.
+    let lines = [
+        meta.to_string(),
+        row("user", "kept question"),
+        row("assistant", &blob),
+        row("user", "undone question"),
+        rollback_marker_line(1).unwrap(),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    assert_eq!(
+        last_user_prompt_from_file(&path).as_deref(),
+        Some("kept question")
+    );
+}
+
 #[test]
 fn test_truncated_session_keys_no_collision() {
     let tmp = TempDir::new().unwrap();

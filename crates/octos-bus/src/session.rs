@@ -503,18 +503,32 @@ fn parse_session_timeline<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Sessi
 /// record folds exactly as it did pre-marker (a single synthesize pass over the
 /// full transcript).
 fn fold_session_timeline(timeline: Vec<SessionTimelineItem>) -> Vec<Message> {
+    fold_session_timeline_tracking_spill(timeline).0
+}
+
+/// [`fold_session_timeline`] that also reports whether a rollback record asked
+/// for more user turns than the timeline held before it. Over a single
+/// segment that means the marker reaches into rows that live in an earlier
+/// (sealed) segment, so the segment alone cannot say how many rows are
+/// visible.
+fn fold_session_timeline_tracking_spill(
+    timeline: Vec<SessionTimelineItem>,
+) -> (Vec<Message>, bool) {
     let mut messages: Vec<Message> = Vec::new();
+    let mut spilled = false;
     for item in timeline {
         match item {
             SessionTimelineItem::Message(message) => messages.push(*message),
             SessionTimelineItem::Rollback { num_turns, .. } => {
                 synthesize_thread_ids(&mut messages);
-                crate::resume_policy::drop_last_n_user_turns(&mut messages, num_turns);
+                let dropped =
+                    crate::resume_policy::drop_last_n_user_turns(&mut messages, num_turns);
+                spilled |= dropped < num_turns;
             }
         }
     }
     synthesize_thread_ids(&mut messages);
-    messages
+    (messages, spilled)
 }
 
 /// Assemble the ordered `Message` list from a session JSONL's post-meta lines,
@@ -612,15 +626,24 @@ struct SessionWindow {
 /// the window's `base_seq` is simply that of the oldest segment loaded — no
 /// unloaded file is ever opened to find out.
 fn load_session_window(active: &Path, key: &SessionKey, budget: u64) -> Option<SessionWindow> {
-    let active_file = read_segment(active, key)?;
     let dir = segments_dir(active);
-    // The active meta is the authority on how many segments precede it; the
-    // directory scan only guards against a meta that predates a crash between
-    // the rename and the fresh meta write.
-    let sealed_total = active_file
-        .meta
-        .sealed_segments
-        .max(sealed_segment_count(&dir));
+    let active_file = match read_segment(active, key) {
+        Some(file) => file,
+        None => recover_active_after_seal(active, key, &dir)?,
+    };
+    // The active meta OWNS the sealed count. A segment file beyond it is
+    // residue — a merged segment an interrupted rewrite failed to delete —
+    // and must not load, or the rows it holds would appear twice.
+    let sealed_total = active_file.meta.sealed_segments;
+    let on_disk = sealed_segment_count(&dir);
+    if on_disk > sealed_total {
+        warn!(
+            key = %key,
+            owned = sealed_total,
+            on_disk,
+            "ignoring sealed session segments the active meta does not own"
+        );
+    }
     let mut spent = active_file.bytes;
     let mut loaded: Vec<SegmentFile> = Vec::new();
     let mut base_seq = active_file.meta.base_seq;
@@ -654,11 +677,77 @@ fn load_session_window(active: &Path, key: &SessionKey, budget: u64) -> Option<S
     })
 }
 
+/// Sealing renames the active file and then starts a fresh one; a crash in
+/// between leaves sealed segments with no (or an empty) active file. Rebuild
+/// the active file from the newest sealed segment — its meta carries the
+/// session's identity and its rows say how many are visible before the fresh
+/// file — and write it so listings see the session again and the next append
+/// continues the seq chain. Only a missing or empty active file is rebuilt:
+/// an unreadable one is left for a human, never renamed over.
+fn recover_active_after_seal(active: &Path, key: &SessionKey, dir: &Path) -> Option<SegmentFile> {
+    use std::io::Write;
+    let active_len = std::fs::metadata(active).map(|m| m.len()).ok();
+    if active_len.is_some_and(|len| len > 0) {
+        return None;
+    }
+    let sealed = sealed_segment_count(dir);
+    if sealed == 0 {
+        return None;
+    }
+    let newest = read_segment(&segment_path(dir, sealed), key)?;
+    let template = newest.meta.clone();
+    let base_seq = template.base_seq + fold_session_timeline(newest.timeline).len();
+    let meta = SessionMeta {
+        sealed_segments: sealed,
+        base_seq,
+        updated_at: Utc::now(),
+        ..template
+    };
+    let mut line = serde_json::to_string(&meta).ok()?;
+    line.push('\n');
+    let tmp_path = rewrite_tmp_path(active);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(line.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, active)?;
+        if let Some(parent) = active.parent() {
+            fsync_dir(parent);
+        }
+        Ok(())
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp_path);
+        warn!(key = %key, %error, "could not rebuild the session file after an interrupted seal");
+        return None;
+    }
+    warn!(
+        key = %key,
+        sealed,
+        base_seq,
+        "rebuilt the session file after an interrupted seal"
+    );
+    Some(SegmentFile {
+        meta,
+        timeline: Vec::new(),
+        bytes: line.len() as u64,
+    })
+}
+
 /// Visible messages in the active file plus everything before it — the seq
-/// the next row will get — read from the active file alone.
+/// the next row will get. Read from the active file alone, except when a
+/// rollback marker in it reaches into sealed rows: only the whole history
+/// can say how many of those it removed, so that (rare, and only until the
+/// next rewrite) case folds every segment.
 fn visible_len_from_active(active: &Path, key: &SessionKey) -> Option<usize> {
     let segment = read_segment(active, key)?;
-    Some(segment.meta.base_seq + fold_session_timeline(segment.timeline).len())
+    let base_seq = segment.meta.base_seq;
+    let (visible, spilled) = fold_session_timeline_tracking_spill(segment.timeline);
+    if spilled && base_seq > 0 {
+        let window = load_session_window(active, key, u64::MAX)?;
+        return Some(window.base_seq + fold_session_timeline(window.timeline).len());
+    }
+    Some(base_seq + visible.len())
 }
 
 /// Row count for the per-chat listings: rows in the active file (meta line
@@ -692,9 +781,10 @@ fn listing_message_count(active: &Path) -> usize {
 /// will have, which is what a freshly started file records as its `base_seq`.
 ///
 /// Sealing is a rename of the active file into the segments directory plus a
-/// fresh active file whose meta names the new sealed count. A crash between
-/// the two leaves no active file; the next append recreates it, and the
-/// loader's directory scan still finds the sealed one.
+/// fresh active file whose meta names the new sealed count; that meta line is
+/// fsynced so the rename and the count it implies become durable together. A
+/// crash between the two leaves sealed segments without an active file, which
+/// the loader rebuilds (see [`recover_active_after_seal`]).
 fn append_row_rolling(
     active: &Path,
     key: &str,
@@ -710,14 +800,29 @@ fn append_row_rolling(
         .open(active)?;
     let mut file_len = file.metadata()?.len();
     let dir = segments_dir(active);
-    let mut sealed = sealed_segment_count(&dir);
     let mut rolled = false;
+    // A fresh file continues whatever segments already exist (none for a new
+    // session). A file that rolls names its successor from its OWN meta: the
+    // directory may also hold residue of an interrupted rewrite, which must
+    // not shift the chain.
+    let mut sealed = sealed_segment_count(&dir);
 
     if file_len >= session_segment_bytes() {
+        let owned = read_session_meta(active)
+            .map(|meta| meta.sealed_segments)
+            .unwrap_or(sealed);
         drop(file);
         std::fs::create_dir_all(&dir)?;
-        let next_index = sealed + 1;
+        let next_index = owned + 1;
         let sealed_path = segment_path(&dir, next_index);
+        if sealed_path.exists() {
+            warn!(
+                key,
+                segment = next_index,
+                "replacing a sealed session segment the active meta did not own"
+            );
+            std::fs::remove_file(&sealed_path)?;
+        }
         std::fs::rename(active, &sealed_path)?;
         fsync_dir(&dir);
         if let Some(parent) = active.parent() {
@@ -742,6 +847,9 @@ fn append_row_rolling(
     if file_len == 0 {
         let meta = meta_for(sealed, next_seq);
         writeln!(file, "{}", serde_json::to_string(&meta)?)?;
+        if rolled {
+            file.sync_all()?;
+        }
     } else {
         seal_torn_tail(&mut file, file_len)?;
     }
@@ -788,9 +896,22 @@ fn rewrite_active_from_window(active: &Path, session: &Session, meta: SessionMet
         return write_result.map(|_| remaining_sealed);
     }
     if session.loaded_sealed > 0 {
+        // The rewritten meta already owns only `remaining_sealed` segments,
+        // so a segment this loop fails to delete is residue the loader
+        // ignores and the next seal replaces — never history read twice.
         let dir = segments_dir(active);
         for index in (remaining_sealed + 1)..=session.sealed_segments {
-            let _ = std::fs::remove_file(segment_path(&dir, index));
+            let path = segment_path(&dir, index);
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    key = %session.key,
+                    path = %path.display(),
+                    %error,
+                    "merged session segment left behind after rewrite"
+                );
+            }
         }
         fsync_dir(&dir);
     }
@@ -1182,7 +1303,7 @@ const DEFAULT_MAX_SESSIONS: usize = 1000;
 /// from listings. A session now grows without bound on disk; what is bounded
 /// is how much of it one file holds and how much a plain load pulls into
 /// memory ([`session_load_budget_bytes`]).
-const SESSION_SEGMENT_BYTES_DEFAULT: u64 = 16 * 1024 * 1024;
+const SESSION_SEGMENT_BYTES_DEFAULT: u64 = 8 * 1024 * 1024;
 
 /// How many bytes of history a plain load reads into memory: the active file
 /// plus as many sealed segments, newest first, as fit. Sealed segments beyond
@@ -1190,7 +1311,13 @@ const SESSION_SEGMENT_BYTES_DEFAULT: u64 = 16 * 1024 * 1024;
 /// they hold, so committed seqs stay global. `OCTOS_SESSION_LOAD_BUDGET_BYTES`
 /// overrides it; `0` means unlimited. Full-history callers use
 /// [`SessionManager::load_full`] / [`SessionHandle::open_full`].
-const SESSION_LOAD_BUDGET_DEFAULT: u64 = 64 * 1024 * 1024;
+///
+/// Capacity planning: this bounds the file bytes one resident session can
+/// hold, and parsed rows take roughly 1.5–3× their file size, so a process
+/// caching N long sessions needs up to `N × budget × 3` for them. The old
+/// cap put that ceiling at 10 MiB × N; the default keeps it within ~3× of
+/// that while letting a session load whole up to four segments deep.
+const SESSION_LOAD_BUDGET_DEFAULT: u64 = 32 * 1024 * 1024;
 
 fn env_bytes(name: &str) -> Option<u64> {
     std::env::var(name)
@@ -1225,6 +1352,13 @@ fn segments_dir(active: &Path) -> PathBuf {
 
 fn segment_path(dir: &Path, index: u32) -> PathBuf {
     dir.join(format!("{index:06}.jsonl"))
+}
+
+/// Whether a session exists on disk at `active`: the file itself, or sealed
+/// segments beside it (an interrupted seal can leave only the latter; see
+/// [`recover_active_after_seal`]).
+fn session_file_present(active: &Path) -> bool {
+    active.exists() || segments_dir(active).is_dir()
 }
 
 /// Number of contiguous sealed segments `000001..` present in `dir`.
@@ -1278,6 +1412,38 @@ const LAST_PROMPT_PREVIEW_BYTES: usize = 100;
 /// last line could show a prompt hydrate no longer shows (codex P2). When a
 /// rollback marker is present the timeline is folded first; the common
 /// (unrewound) case stays a cheap O(tail) reverse scan.
+/// [`last_user_prompt_from_jsonl`] over a file, reading its last 256 KiB
+/// first. The whole file is read only when that tail yields nothing — no user
+/// row in it, or a rollback marker there that dropped every user row the tail
+/// held (a marker only ever trims rows BEFORE it, so a user row found after
+/// one is final).
+fn last_user_prompt_from_file(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 256 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > TAIL_BYTES {
+        file.seek(SeekFrom::Start(len - TAIL_BYTES)).ok()?;
+        let mut tail = Vec::with_capacity(TAIL_BYTES as usize);
+        file.read_to_end(&mut tail).ok()?;
+        // Skip the line the seek landed inside; this also lands on a UTF-8
+        // boundary, since '\n' never occurs inside a multi-byte sequence.
+        let start = tail
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(tail.len(), |i| i + 1);
+        if let Ok(tail) = std::str::from_utf8(&tail[start..])
+            && let Some(prompt) = last_user_prompt_from_jsonl(tail)
+        {
+            return Some(prompt);
+        }
+        file.seek(SeekFrom::Start(0)).ok()?;
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content).ok()?;
+    last_user_prompt_from_jsonl(&content)
+}
+
 fn last_user_prompt_from_jsonl(content: &str) -> Option<String> {
     // The rollback control record serializes as `{"kind":"rollback",…}`.
     if content.contains("\"rollback\"") {
@@ -1460,18 +1626,10 @@ impl SessionManager {
             if seen.contains(&session_key) {
                 return;
             }
-            // Load the file once (the listing already pays this cost to parse
-            // the first `SessionMeta` line for the title) and reuse the same
-            // in-memory content for both the meta read and the `last_prompt`
-            // preview — no extra I/O beyond the single read.
-            let content = std::fs::read_to_string(path).ok();
-            let (title, meta_updated_at) = content
-                .as_deref()
-                .and_then(|c| {
-                    c.lines()
-                        .next()
-                        .and_then(|first| serde_json::from_str::<SessionMeta>(first).ok())
-                })
+            // Read the meta line and the tail of the file, never the whole
+            // file: a listing runs under the manager lock and a session file
+            // is now allowed to be large (#2392).
+            let (title, meta_updated_at) = read_session_meta(path)
                 .map(|meta| (meta.title, Some(meta.updated_at)))
                 .unwrap_or((None, None));
             // Recency for the `session/list` sort. `SessionMeta.updated_at` is
@@ -1489,9 +1647,9 @@ impl SessionManager {
                 (Some(only), None) | (None, Some(only)) => Some(only),
                 (None, None) => None,
             };
-            // Reuse the already-loaded `content` (no extra I/O) to preview the
-            // session's most recent user prompt for the `/resume` picker.
-            let last_prompt = content.as_deref().and_then(last_user_prompt_from_jsonl);
+            // Preview the session's most recent user prompt for the `/resume`
+            // picker from the file's tail.
+            let last_prompt = last_user_prompt_from_file(path);
             let count = Self::count_lines(path);
             seen.insert(session_key.clone());
             out.push((session_key, count, title, updated_at, last_prompt));
@@ -2104,7 +2262,7 @@ impl SessionManager {
             .join("sessions")
             .join(format!("{encoded_topic}.jsonl"));
 
-        if !flat_path.exists() && !per_user_path.exists() {
+        if !session_file_present(&flat_path) && !session_file_present(&per_user_path) {
             return None;
         }
 
@@ -2151,12 +2309,10 @@ impl SessionManager {
                 }
             }
 
-            let flat = flat_path
-                .exists()
+            let flat = session_file_present(&flat_path)
                 .then(|| parse_session_file(&flat_path, &key_clone, budget))
                 .flatten();
-            let per_user = per_user_path
-                .exists()
+            let per_user = session_file_present(&per_user_path)
                 .then(|| parse_session_file(&per_user_path, &key_clone, budget))
                 .flatten();
 
@@ -3078,12 +3234,13 @@ impl SessionHandle {
             // Case (A): marker says migration is done. The per-user file is
             // authoritative even if a stale legacy file co-exists.
             Self::load_from_file_with_budget(&new_path, key, budget)
-        } else if new_path.exists() {
+        } else if session_file_present(&new_path) {
             if legacy_path.exists() {
                 // Case (B): partial-migration leftover. Retry the legacy
                 // removal so subsequent boots take the cheap (A) path.
                 match std::fs::remove_file(&legacy_path) {
                     Ok(()) => {
+                        remove_segments(&legacy_path);
                         let _ = std::fs::write(&marker_path, b"migrated-from-flat\n");
                     }
                     Err(error) => {
@@ -3099,7 +3256,7 @@ impl SessionHandle {
             }
             // Case (C): per-user only — straight read.
             Self::load_from_file_with_budget(&new_path, key, budget)
-        } else if legacy_path.exists() {
+        } else if session_file_present(&legacy_path) {
             // Case (D): first-time migration. Persist into the per-user JSONL
             // BEFORE removing the legacy file so a subsequent incremental
             // `add_message_with_seq` (which only appends a single line) does
@@ -3123,7 +3280,11 @@ impl SessionHandle {
                         observer_root: data_dir.to_owned(),
                     };
                 }
+                // The whole legacy history now lives in the per-user file,
+                // sealed legacy segments included: remove them with it, or a
+                // merge across both layouts would read those rows twice.
                 if std::fs::remove_file(&legacy_path).is_ok() {
+                    remove_segments(&legacy_path);
                     let _ = std::fs::write(&marker_path, b"migrated-from-flat\n");
                 }
             }
