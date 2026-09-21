@@ -1081,27 +1081,224 @@ async fn test_session_handle_fork_from_parent_if_missing_links_existing_child_hi
     assert_eq!(child_session.messages[0].content, "existing-child-msg");
 }
 
+/// A row big enough that the active file passes the segment size, so the
+/// NEXT append seals it. Rolling is decided per append from the file's size,
+/// which keeps these tests free of process-global knobs.
+fn oversize_row() -> Message {
+    make_message(
+        MessageRole::Assistant,
+        &"x".repeat(SESSION_SEGMENT_BYTES_DEFAULT as usize + 1024),
+    )
+}
+
+/// Drive `mgr`'s session past the segment size: seed, one oversize row, then
+/// one small row that lands in a fresh active file. Returns the committed
+/// seqs in order.
+async fn roll_once(mgr: &mut SessionManager, key: &SessionKey) -> Vec<usize> {
+    let mut seqs = Vec::new();
+    for message in [
+        make_message(MessageRole::User, "seed"),
+        oversize_row(),
+        make_message(MessageRole::User, "after the roll"),
+    ] {
+        seqs.push(mgr.add_message_with_seq(key, message).await.unwrap());
+    }
+    seqs
+}
+
 #[tokio::test]
-async fn test_load_rejects_oversized_file() {
+async fn should_load_a_session_larger_than_the_old_ten_megabyte_cap() {
+    // The cap made a >10 MB session load as empty (and refuse appends). A
+    // large file is now simply read, line by line.
     let tmp = TempDir::new().unwrap();
     let mut mgr = SessionManager::open(tmp.path()).unwrap();
     let key = SessionKey::new("cli", "huge");
-
-    // Write a normal message so the file exists
+    let big = "y".repeat(11 * 1024 * 1024);
     mgr.add_message(&key, make_message(MessageRole::User, "seed"))
         .await
         .unwrap();
-
-    // Evict from cache so next access must load from disk
+    mgr.add_message(&key, make_message(MessageRole::Assistant, &big))
+        .await
+        .unwrap();
     mgr.cache.pop(&key.0);
 
-    // Overwrite the file with junk exceeding the size limit
-    let path = mgr.session_path(&key);
-    let junk = "x".repeat((MAX_SESSION_FILE_SIZE as usize) + 1);
-    std::fs::write(&path, junk).unwrap();
+    let loaded = mgr
+        .load_from_disk(&key)
+        .await
+        .expect("a large session still loads");
+    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(loaded.messages[1].content.len(), big.len());
+    assert!(!loaded.is_partial());
+}
 
-    // load_from_disk should return None for oversized file
-    assert!(mgr.load_from_disk(&key).await.is_none());
+#[tokio::test]
+async fn should_seal_the_active_file_into_a_segment_at_the_segment_size() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "big");
+
+    let seqs = roll_once(&mut mgr, &key).await;
+    assert_eq!(seqs, vec![0, 1, 2], "seqs stay global across the roll");
+
+    let active = mgr.session_path(&key);
+    let sealed = segment_path(&segments_dir(&active), 1);
+    assert!(
+        sealed.is_file(),
+        "the oversize file was sealed as segment 1"
+    );
+    assert!(
+        std::fs::metadata(&active).unwrap().len() < 4096,
+        "the fresh active file holds only the meta line and the last row"
+    );
+    let meta = read_session_meta(&active).unwrap();
+    assert_eq!(meta.sealed_segments, 1);
+    assert_eq!(meta.base_seq, 2, "the active file's first row is seq 2");
+
+    // A reload reproduces the whole history in order.
+    mgr.cache.pop(&key.0);
+    let loaded = mgr.load_from_disk(&key).await.unwrap();
+    assert_eq!(
+        loaded
+            .messages
+            .iter()
+            .map(|m| m.content.len())
+            .collect::<Vec<_>>(),
+        vec![
+            "seed".len(),
+            oversize_row().content.len(),
+            "after the roll".len()
+        ]
+    );
+    assert!(
+        !loaded.is_partial(),
+        "within the load budget every segment loads"
+    );
+    assert_eq!(loaded.next_seq(), 3);
+    // Listing count contract: 1 meta line + rows, now spanning segments.
+    assert_eq!(
+        mgr.list_sessions()
+            .into_iter()
+            .find(|(k, _)| k == &key.0)
+            .unwrap()
+            .1,
+        4
+    );
+}
+
+#[tokio::test]
+async fn should_load_only_the_newest_segments_within_the_budget() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "windowed");
+    roll_once(&mut mgr, &key).await;
+    mgr.cache.pop(&key.0);
+
+    // A budget smaller than the sealed segment: only the active file loads.
+    let window = mgr
+        .load_from_disk_with_budget(&key, 64 * 1024)
+        .await
+        .unwrap();
+    assert!(window.is_partial());
+    assert_eq!(
+        window.base_seq, 2,
+        "two visible rows live in the unloaded segment"
+    );
+    assert_eq!(window.messages.len(), 1);
+    assert_eq!(window.messages[0].content, "after the roll");
+    assert_eq!(window.next_seq(), 3);
+
+    // Appending through a partial window keeps seqs global.
+    mgr.cache.put(key.0.clone(), window);
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "fourth"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 3);
+
+    // A rewrite from the partial window touches only the active file: the
+    // sealed segment, and the history in it, survive.
+    mgr.rewrite(&key).await.unwrap();
+    mgr.cache.pop(&key.0);
+    let full = mgr.load_full(&key).await.unwrap();
+    assert_eq!(full.messages.len(), 4);
+    assert_eq!(full.messages[0].content, "seed");
+    assert_eq!(full.messages[3].content, "fourth");
+    assert!(!full.is_partial());
+}
+
+#[tokio::test]
+async fn should_rewrite_a_fully_loaded_rolled_session_back_into_one_file() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "collapse");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    assert!(segment_path(&segments_dir(&active), 1).is_file());
+
+    // The cached session merged the sealed segment, so a rewrite folds it
+    // back into the active file and drops the now-redundant segment file.
+    mgr.rewrite(&key).await.unwrap();
+    assert!(!segment_path(&segments_dir(&active), 1).exists());
+    assert_eq!(read_session_meta(&active).unwrap().sealed_segments, 0);
+    mgr.cache.pop(&key.0);
+    assert_eq!(mgr.load_from_disk(&key).await.unwrap().messages.len(), 3);
+}
+
+#[tokio::test]
+async fn should_roll_back_turns_that_live_in_a_sealed_segment() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "undo-across");
+    // Three user turns; the middle one is oversize, so the third lands in a
+    // fresh active file and the first two are sealed.
+    for content in [
+        "seed".to_owned(),
+        "u".repeat(SESSION_SEGMENT_BYTES_DEFAULT as usize + 1024),
+        "after the roll".to_owned(),
+    ] {
+        mgr.add_message(&key, make_message(MessageRole::User, &content))
+            .await
+            .unwrap();
+    }
+    assert!(segments_dir(&mgr.session_path(&key)).is_dir());
+    mgr.cache.pop(&key.0);
+    // Resident as a partial window, as a long-lived process would hold it.
+    let window = mgr
+        .load_from_disk_with_budget(&key, 64 * 1024)
+        .await
+        .unwrap();
+    assert!(window.is_partial());
+    assert_eq!(window.messages.len(), 1);
+    mgr.cache.put(key.0.clone(), window);
+
+    // Two turns back reaches into the sealed segment; the window alone holds
+    // one, so the manager must widen to the full history first.
+    let dropped = mgr.rollback_last_n_user_turns(&key, 2).await.unwrap();
+    assert_eq!(dropped, 2);
+    mgr.cache.pop(&key.0);
+    let reloaded = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        reloaded
+            .messages
+            .iter()
+            .map(|m| m.content.len())
+            .collect::<Vec<_>>(),
+        vec!["seed".len()],
+        "the marker replays across segments and trims the sealed turn"
+    );
+}
+
+#[tokio::test]
+async fn should_remove_sealed_segments_when_a_session_is_cleared() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "cleared");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    assert!(segments_dir(&active).is_dir());
+    mgr.clear(&key).await.unwrap();
+    assert!(!active.exists());
+    assert!(!segments_dir(&active).exists());
 }
 
 #[test]
@@ -1805,29 +2002,19 @@ fn test_validate_topic_name() {
 }
 
 #[tokio::test]
-async fn test_append_respects_file_size_limit() {
+async fn should_keep_appending_past_the_old_cap_by_rolling() {
+    // The old test pinned that an append at 10 MB was refused. It now rolls.
     let tmp = TempDir::new().unwrap();
     let mut mgr = SessionManager::open(tmp.path()).unwrap();
     let key = SessionKey::new("cli", "big");
-
-    // Write a seed message
-    mgr.add_message(&key, make_message(MessageRole::User, "seed"))
+    let seqs = roll_once(&mut mgr, &key).await;
+    assert_eq!(seqs.last(), Some(&2));
+    let more = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "and again"))
         .await
         .unwrap();
-
-    // Manually inflate the file to just under the limit
-    let path = mgr.session_path(&key);
-    let padding = "x".repeat((MAX_SESSION_FILE_SIZE as usize) - 10);
-    std::fs::write(&path, padding).unwrap();
-
-    // Append should silently skip (file is at limit)
-    mgr.add_message(&key, make_message(MessageRole::User, "should not append"))
-        .await
-        .unwrap();
-
-    // File should not have grown significantly
-    let size = std::fs::metadata(&path).unwrap().len();
-    assert!(size < MAX_SESSION_FILE_SIZE + 1000);
+    assert_eq!(more, 3);
+    assert!(segments_dir(&mgr.session_path(&key)).is_dir());
 }
 
 #[tokio::test]
@@ -3032,35 +3219,82 @@ fn session_threads_skips_system_messages() {
     assert_eq!(threads[0].responses.len(), 0);
 }
 
-/// Regression for codex retro-review BLOCKING #1: SessionHandle::append_to_disk
-/// must return Err on size-cap rejection (was returning Ok(()), letting the
-/// caller push to memory and fire message/persisted observer for a row that
-/// never committed to disk — UPCR-2026-012 contract violation).
+/// The handle path rolls too, and its seq read-back — which reads only the
+/// active file — still reports the global seq after a roll.
 #[tokio::test]
-async fn session_handle_append_returns_err_when_at_size_cap() {
+async fn session_handle_append_rolls_and_keeps_global_seqs() {
     let tmp = TempDir::new().unwrap();
-    let key = SessionKey::new("api", "web-cap-test");
+    let key = SessionKey::new("api", "web-roll-test");
     let mut handle = SessionHandle::open(tmp.path(), &key);
-
-    // Pre-fill the JSONL above MAX_SESSION_FILE_SIZE so the next
-    // append must refuse.
-    let path = handle.session_path();
-    std::fs::create_dir_all(path.parent().unwrap()).ok();
-    let oversize = vec![b'a'; (MAX_SESSION_FILE_SIZE + 1) as usize];
-    std::fs::write(&path, oversize).expect("pre-fill oversize jsonl");
-
-    let msg = make_message(MessageRole::User, "after-cap");
-    let result = handle.add_message_with_seq(msg).await;
-
-    assert!(
-        result.is_err(),
-        "add_message_with_seq must return Err when file at size cap; got {result:?}"
-    );
-    // In-memory state must NOT advance on a refused append.
     assert_eq!(
-        handle.get_history(10).len(),
-        0,
-        "no message should be in memory when disk append refused"
+        handle
+            .add_message_with_seq(make_message(MessageRole::User, "seed"))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        handle.add_message_with_seq(oversize_row()).await.unwrap(),
+        1
+    );
+    let after = handle
+        .add_message_with_seq(make_message(MessageRole::User, "after the roll"))
+        .await
+        .unwrap();
+    assert_eq!(after, 2);
+    let active = handle.session_path();
+    assert!(segment_path(&segments_dir(&active), 1).is_file());
+    assert_eq!(read_session_meta(&active).unwrap().base_seq, 2);
+
+    // A fresh handle sees the whole history; a tiny budget sees the window.
+    let reopened = SessionHandle::open(tmp.path(), &key);
+    assert_eq!(reopened.get_history(10).len(), 3);
+    let windowed = SessionHandle::open_with_budget(tmp.path(), &key, 64 * 1024);
+    assert_eq!(windowed.get_history(10).len(), 1);
+    assert!(windowed.session().is_partial());
+    assert_eq!(windowed.session().next_seq(), 3);
+}
+
+/// A system note written before the file rolled must still count as present.
+#[tokio::test]
+async fn system_note_once_finds_a_note_that_lives_in_a_sealed_segment() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "web-note-roll");
+    let first = persist_system_note_once_through_canonical_path(
+        tmp.path(),
+        &key,
+        Message::system("remember this"),
+        "note-1",
+    )
+    .await
+    .unwrap();
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    handle.add_message_with_seq(oversize_row()).await.unwrap();
+    handle
+        .add_message_with_seq(make_message(MessageRole::User, "after the roll"))
+        .await
+        .unwrap();
+    assert!(segments_dir(&handle.session_path()).is_dir());
+
+    let again = persist_system_note_once_through_canonical_path(
+        tmp.path(),
+        &key,
+        Message::system("remember this"),
+        "note-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        again.timestamp, first.timestamp,
+        "the sealed note is returned, not re-added"
+    );
+    let full = SessionHandle::open_full(tmp.path(), &key);
+    assert_eq!(
+        full.get_history(10)
+            .iter()
+            .filter(|m| m.client_message_id.as_deref() == Some("note-1"))
+            .count(),
+        1
     );
 }
 
