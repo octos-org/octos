@@ -475,9 +475,13 @@ mod tests {
             Some("moonshot-coding")
         );
 
-        // Z.AI GLM coding plan: Anthropic-compat coding endpoint.
+        // Z.AI GLM coding plan: OpenAI-compat coding endpoint (the only Z.AI
+        // root that reports its implicit prompt cache).
         let zc = lookup("zai-coding").expect("zai-coding registered");
-        assert_eq!(zc.default_base_url, Some("https://api.z.ai/api/anthropic"));
+        assert_eq!(
+            zc.default_base_url,
+            Some("https://api.z.ai/api/coding/paas/v4")
+        );
         assert_eq!(lookup("z.ai-coding").map(|e| e.name), Some("zai-coding"));
 
         // The base families are unshadowed by the coding families.
