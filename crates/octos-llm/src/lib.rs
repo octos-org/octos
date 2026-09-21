@@ -29,6 +29,7 @@ pub mod sse;
 pub mod stream_accumulator;
 mod swappable;
 mod throttle;
+pub mod tool_media;
 mod types;
 pub mod vision;
 

@@ -525,79 +525,139 @@ impl OpenAIProvider {
         let mut content_hints = self.hints.clone();
         content_hints.lacks_vision = content_hints.lacks_vision || force_text_only;
         content_hints.lacks_video = content_hints.lacks_video || force_text_only || force_no_video;
-        let openai_messages: Vec<OpenAIMessage> = messages
-            .iter()
-            .filter(|m| {
-                // Drop empty assistant messages (no content, no tool_calls) —
-                // these can appear in session history and cause 400 errors.
-                !(m.role == MessageRole::Assistant
-                    && m.content.is_empty()
-                    && m.tool_calls.as_ref().is_none_or(|tc| tc.is_empty()))
-            })
-            .map(|m| {
-                let role = m.role.as_str();
-                // Convert tool_calls from octos_core format to OpenAI format
-                let tool_calls = m.tool_calls.as_ref().map(|tcs| {
-                    tcs.iter()
-                        .map(|tc| OpenAIToolCall {
-                            id: tc.id.clone(),
-                            call_type: "function".to_string(),
-                            function: FunctionCall {
-                                name: tc.name.clone(),
-                                arguments: tool_call_arguments_to_wire(&tc.arguments),
-                            },
-                        })
-                        .collect()
-                });
-                // We do NOT re-send prior assistant reasoning_content for ordinary
-                // openai-compat models. Reasoning models re-derive their chain of
-                // thought each turn, so round-tripping the full verbose reasoning is
-                // pure context bloat (and grows unboundedly across a tool loop) —
-                // OpenAI's own API and codex both drop it.
-                //
-                // kimi-k2/k3 are the exception. With thinking enabled kimi-k2 (a)
-                // returns 400 "reasoning_content is missing in assistant tool call
-                // message" if the field is absent, AND (b) per kimi's docs preserves
-                // historical assistant reasoning for multi-step tool-use continuity
-                // (K3's quickstart likewise mandates "add the complete assistant
-                // message returned by the API to the next request. Do not keep only
-                // `content`"). So for kimi-k2/k3 we keep the REAL reasoning when
-                // present, and fall back to a minimal "." stub only to satisfy the
-                // presence check when it's absent.
-                //
-                // kimi-k2/k3 are detected via fixed_temperature + model name
-                // containing "kimi-k2"/"kimi-k3". Other models (e.g. deepseek-v4,
-                // verified live to return 200 without the field, and non-official
-                // nvidia/vllm endpoints that don't expect it) get no
-                // reasoning_content at all.
-                let model_lower = self.model.to_lowercase();
-                let needs_reasoning_stub = self.hints.fixed_temperature
-                    && (model_lower.contains("kimi-k2")
-                        || model_lower.contains("kimi-k3")
-                        // Kimi Code API ids: bare `k3`/`k3-256k` and the
-                        // K2.7 Code alias — thinking is always on for them,
-                        // so assistant tool-call messages need the stub too.
-                        || model_lower == "k3"
-                        || model_lower.starts_with("k3-")
-                        || model_lower.starts_with("kimi-for-coding"));
-                let reasoning = if role == "assistant" && needs_reasoning_stub {
-                    match m.reasoning_content.as_deref() {
-                        Some(r) if !r.is_empty() => Some(r),
-                        _ => Some("."),
-                    }
-                } else {
-                    None
-                };
-
-                OpenAIMessage {
-                    role,
-                    content: build_openai_content(m, &content_hints),
-                    reasoning_content: reasoning,
-                    tool_call_id: m.tool_call_id.as_deref(),
-                    tool_calls,
+        let mut openai_messages: Vec<OpenAIMessage> = Vec::with_capacity(messages.len() + 1);
+        // Media a tool in the current batch handed the model. The chat
+        // completions protocol takes no media in a tool message, so it goes
+        // out as ONE user turn after the batch's tool outputs — built here,
+        // on the wire only, never persisted — naming the calls it answers.
+        let mut pending_media: Vec<OpenAIContentPart> = Vec::new();
+        let mut pending_notes: Vec<String> = Vec::new();
+        for (index, m) in messages.iter().enumerate() {
+            // Drop empty assistant messages (no content, no tool_calls) —
+            // these can appear in session history and cause 400 errors.
+            if m.role == MessageRole::Assistant
+                && m.content.is_empty()
+                && m.tool_calls.as_ref().is_none_or(|tc| tc.is_empty())
+            {
+                continue;
+            }
+            if m.role != MessageRole::Tool && !pending_media.is_empty() {
+                openai_messages.push(media_turn(&mut pending_media, &mut pending_notes));
+            }
+            let role = m.role.as_str();
+            // Convert tool_calls from octos_core format to OpenAI format
+            let tool_calls = m.tool_calls.as_ref().map(|tcs| {
+                tcs.iter()
+                    .map(|tc| OpenAIToolCall {
+                        id: tc.id.clone(),
+                        call_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: tc.name.clone(),
+                            arguments: tool_call_arguments_to_wire(&tc.arguments),
+                        },
+                    })
+                    .collect()
+            });
+            // We do NOT re-send prior assistant reasoning_content for ordinary
+            // openai-compat models. Reasoning models re-derive their chain of
+            // thought each turn, so round-tripping the full verbose reasoning is
+            // pure context bloat (and grows unboundedly across a tool loop) —
+            // OpenAI's own API and codex both drop it.
+            //
+            // kimi-k2/k3 are the exception. With thinking enabled kimi-k2 (a)
+            // returns 400 "reasoning_content is missing in assistant tool call
+            // message" if the field is absent, AND (b) per kimi's docs preserves
+            // historical assistant reasoning for multi-step tool-use continuity
+            // (K3's quickstart likewise mandates "add the complete assistant
+            // message returned by the API to the next request. Do not keep only
+            // `content`"). So for kimi-k2/k3 we keep the REAL reasoning when
+            // present, and fall back to a minimal "." stub only to satisfy the
+            // presence check when it's absent.
+            //
+            // kimi-k2/k3 are detected via fixed_temperature + model name
+            // containing "kimi-k2"/"kimi-k3". Other models (e.g. deepseek-v4,
+            // verified live to return 200 without the field, and non-official
+            // nvidia/vllm endpoints that don't expect it) get no
+            // reasoning_content at all.
+            let model_lower = self.model.to_lowercase();
+            let needs_reasoning_stub = self.hints.fixed_temperature
+                && (model_lower.contains("kimi-k2")
+                    || model_lower.contains("kimi-k3")
+                    // Kimi Code API ids: bare `k3`/`k3-256k` and the
+                    // K2.7 Code alias — thinking is always on for them,
+                    // so assistant tool-call messages need the stub too.
+                    || model_lower == "k3"
+                    || model_lower.starts_with("k3-")
+                    || model_lower.starts_with("kimi-for-coding"));
+            let reasoning = if role == "assistant" && needs_reasoning_stub {
+                match m.reasoning_content.as_deref() {
+                    Some(r) if !r.is_empty() => Some(r),
+                    _ => Some("."),
                 }
-            })
-            .collect();
+            } else {
+                None
+            };
+
+            let mut content = build_openai_content(m, &content_hints);
+            if m.role == MessageRole::Tool {
+                let shown = crate::tool_media::for_tool_row(
+                    messages,
+                    index,
+                    content_hints.lacks_vision,
+                    content_hints.lacks_video,
+                );
+                if let Some(note) = shown.note.as_deref() {
+                    content = append_note(content, note);
+                }
+                let call = m.tool_call_id.as_deref().unwrap_or("unknown");
+                let mut rendered = Vec::new();
+                for path in &shown.images {
+                    match vision::encode_image(path) {
+                        Ok((mime, data)) => {
+                            pending_media.push(OpenAIContentPart::ImageUrl {
+                                image_url: OpenAIImageUrl {
+                                    url: format!("data:{mime};base64,{data}"),
+                                },
+                            });
+                            rendered.push(path.clone());
+                        }
+                        Err(_) => {
+                            content =
+                                append_note(content, &crate::tool_media::unreadable_note(path))
+                        }
+                    }
+                }
+                for path in &shown.videos {
+                    match vision::encode_video(path) {
+                        Ok((mime, data)) => {
+                            pending_media.push(OpenAIContentPart::VideoUrl {
+                                video_url: OpenAIVideoUrl {
+                                    url: format!("data:{mime};base64,{data}"),
+                                },
+                            });
+                            rendered.push(path.clone());
+                        }
+                        Err(_) => {
+                            content =
+                                append_note(content, &crate::tool_media::unreadable_note(path))
+                        }
+                    }
+                }
+                if !rendered.is_empty() {
+                    pending_notes.push(crate::tool_media::shown_note(call, &rendered));
+                }
+            }
+            openai_messages.push(OpenAIMessage {
+                role,
+                content,
+                reasoning_content: reasoning,
+                tool_call_id: m.tool_call_id.as_deref(),
+                tool_calls,
+            });
+        }
+        if !pending_media.is_empty() {
+            openai_messages.push(media_turn(&mut pending_media, &mut pending_notes));
+        }
 
         let openai_messages = if self.hints.merge_system_messages {
             merge_system_messages(openai_messages)
@@ -1276,20 +1336,22 @@ fn is_image_modality_error(body: &str) -> bool {
 /// inlined (i.e. images are not already stripped by the configured
 /// `lacks_vision`). Decides whether a 400 is worth retrying text-only.
 fn request_has_user_images(messages: &[Message], hints: &ModelHints) -> bool {
-    !hints.lacks_vision
-        && messages
-            .iter()
-            .any(|m| m.role == MessageRole::User && m.media.iter().any(|p| vision::is_image(p)))
+    !hints.lacks_vision && request_has_media(messages, vision::is_image)
+}
+
+/// A user row's media, or a current-batch tool row's: both go out inline.
+fn request_has_media(messages: &[Message], kind: fn(&str) -> bool) -> bool {
+    messages.iter().enumerate().any(|(i, m)| {
+        m.media.iter().any(|p| kind(p))
+            && (m.role == MessageRole::User
+                || (m.role == MessageRole::Tool && crate::tool_media::is_current(messages, i)))
+    })
 }
 
 /// Whether the request carries a user-row video we would have sent as a
 /// `video_url` part. Decides whether a refusal is worth retrying without it.
 fn request_has_user_videos(messages: &[Message], hints: &ModelHints) -> bool {
-    !hints.lacks_video
-        && !hints.lacks_vision
-        && messages
-            .iter()
-            .any(|m| m.role == MessageRole::User && m.media.iter().any(|p| vision::is_video(p)))
+    !hints.lacks_video && !hints.lacks_vision && request_has_media(messages, vision::is_video)
 }
 
 fn request_has_user_media(messages: &[Message], hints: &ModelHints) -> bool {
@@ -1453,6 +1515,40 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
         });
     }
     Some(OpenAIContent::Parts(parts))
+}
+
+/// Append a note line to a message's content, whatever shape it has.
+fn append_note(content: Option<OpenAIContent>, note: &str) -> Option<OpenAIContent> {
+    Some(match content {
+        Some(OpenAIContent::Parts(mut parts)) => {
+            parts.push(OpenAIContentPart::Text {
+                text: note.to_string(),
+            });
+            OpenAIContent::Parts(parts)
+        }
+        Some(OpenAIContent::Text(text)) => {
+            OpenAIContent::Text(crate::tool_media::with_note(&text, Some(note)))
+        }
+        None => OpenAIContent::Text(note.to_string()),
+    })
+}
+
+/// The user turn that carries a tool batch's media (see `build_request`).
+fn media_turn<'a>(
+    media: &mut Vec<OpenAIContentPart>,
+    notes: &mut Vec<String>,
+) -> OpenAIMessage<'a> {
+    let mut parts = std::mem::take(media);
+    parts.push(OpenAIContentPart::Text {
+        text: std::mem::take(notes).join("\n"),
+    });
+    OpenAIMessage {
+        role: "user",
+        content: Some(OpenAIContent::Parts(parts)),
+        reasoning_content: None,
+        tool_call_id: None,
+        tool_calls: None,
+    }
 }
 
 #[derive(Serialize)]
@@ -2851,6 +2947,160 @@ mod tests {
         assert!(
             second.contains("video attachments this model cannot view"),
             "retry names the video it dropped: {second}"
+        );
+    }
+
+    /// A tool loop whose tool handed the model an image: user, assistant
+    /// tool call, tool row with the PNG on its media.
+    fn media_loop(dir: &std::path::Path) -> (Vec<Message>, String) {
+        let png = dir.join("grab.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
+        let path = png.to_string_lossy().into_owned();
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_1".into(),
+            name: "view_image".into(),
+            arguments: serde_json::json!({"path": "grab.png"}),
+            metadata: None,
+        }]);
+        let mut tool = mk(MessageRole::Tool, "{\"format\":\"png\"}");
+        tool.tool_call_id = Some("call_1".into());
+        tool.media = vec![path.clone()];
+        (
+            vec![mk(MessageRole::User, "look at grab.png"), assistant, tool],
+            path,
+        )
+    }
+
+    /// The same loop continued: the model answered, the user asked again,
+    /// and a second call ran — the first row's image is now an old batch.
+    fn media_loop_continued(dir: &std::path::Path) -> Vec<Message> {
+        let (mut msgs, _) = media_loop(dir);
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        msgs.push(mk(MessageRole::Assistant, "a red circle"));
+        msgs.push(mk(MessageRole::User, "and the size?"));
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_2".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"cmd": "file grab.png"}),
+            metadata: None,
+        }]);
+        msgs.push(assistant);
+        let mut tool = mk(MessageRole::Tool, "PNG 480x320");
+        tool.tool_call_id = Some("call_2".into());
+        msgs.push(tool);
+        msgs
+    }
+
+    #[test]
+    fn should_render_tool_media_as_one_user_turn_after_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (msgs, _) = media_loop(dir.path());
+        let p = OpenAIProvider::new("key", "deepseek-v4-flash");
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let out = v["messages"].as_array().unwrap();
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "user"], "{v}");
+        assert_eq!(
+            out[2]["content"], "{\"format\":\"png\"}",
+            "tool output stays text"
+        );
+        let parts = out[3]["content"]
+            .as_array()
+            .expect("media turn is multipart");
+        assert_eq!(parts[0]["type"], "image_url");
+        assert!(
+            parts[0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        assert!(
+            parts[1]["text"].as_str().unwrap().contains("call_1"),
+            "{}",
+            parts[1]
+        );
+    }
+
+    #[test]
+    fn should_send_tool_media_once_and_name_it_afterwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = media_loop_continued(dir.path());
+        let p = OpenAIProvider::new("key", "deepseek-v4-flash");
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let out = v["messages"].as_array().unwrap();
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        // No media turn after the FIRST tool row any more; the second batch
+        // has no media, so none after it either.
+        assert_eq!(
+            roles,
+            vec![
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "user",
+                "assistant",
+                "tool"
+            ],
+            "{v}"
+        );
+        let first_tool = out[2]["content"].as_str().unwrap();
+        assert!(
+            first_tool.contains("shown to you when it ran") && first_tool.contains("grab.png"),
+            "{first_tool}"
+        );
+        assert!(
+            !v.to_string().contains("data:image/png"),
+            "the old image is not re-sent"
+        );
+    }
+
+    #[test]
+    fn a_tool_video_is_stripped_and_named_when_the_model_lacks_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut msgs, _) = media_loop(dir.path());
+        let clip = dir.path().join("clip.mp4");
+        std::fs::write(&clip, b"\x00\x00\x00\x18ftypisom").unwrap();
+        msgs[2].media = vec![clip.to_string_lossy().into_owned()];
+        let p = OpenAIProvider::new("key", "deepseek-v4-flash").with_hints(ModelHints {
+            lacks_video: true,
+            ..ModelHints::default()
+        });
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let out = v["messages"].as_array().unwrap();
+        assert_eq!(out.len(), 3, "no media turn: {v}");
+        assert!(
+            out[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be viewed by this model: clip.mp4"),
+            "{v}"
         );
     }
 

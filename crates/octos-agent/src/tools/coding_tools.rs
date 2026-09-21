@@ -3178,9 +3178,10 @@ impl Tool for ViewVideoTool {
 /// request under those limits.
 const MAX_MODEL_VIDEO_BYTES: u64 = 20 * 1024 * 1024;
 
-/// Formats the vision APIs take inline. SVG and BMP are recognised by
-/// [`detect_image_format`] for the UI's sake but no provider renders them.
-const VISION_FORMATS: &[&str] = &["png", "jpeg", "gif", "webp"];
+/// Formats every vision API takes inline. SVG and BMP are recognised by
+/// [`detect_image_format`] for the UI's sake but no provider renders them,
+/// and GIF is refused by Gemini, so it is metadata-only too.
+const VISION_FORMATS: &[&str] = &["png", "jpeg", "webp"];
 
 /// The smallest per-image ceiling among the providers (Anthropic's 5 MB);
 /// above it the request would be rejected, so the model gets a reason

@@ -5,9 +5,51 @@ use std::path::Path;
 use base64::Engine;
 use eyre::{Result, WrapErr};
 
+/// The most a media file may weigh to be encoded inline: base64 grows it by
+/// a third and every provider caps a request well under this.
+pub const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Read a media file for encoding without following a symlink and without
+/// reading past [`MAX_MEDIA_BYTES`]. A tool validates a file when it runs;
+/// this request may be built much later, and a sibling tool or a background
+/// writer could have replaced the file with a link to anything readable
+/// since — so the same refusals apply again here, at the moment the bytes
+/// leave the machine.
+pub fn read_media_no_follow(path: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let meta = std::fs::symlink_metadata(path)
+        .wrap_err_with(|| format!("failed to read media: {path}"))?;
+    if meta.file_type().is_symlink() {
+        eyre::bail!("refusing to read media through a symlink: {path}");
+    }
+    if meta.len() > MAX_MEDIA_BYTES {
+        eyre::bail!("media file is over {MAX_MEDIA_BYTES} bytes: {path}");
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .wrap_err_with(|| format!("failed to read media: {path}"))?
+    };
+    #[cfg(not(unix))]
+    let file =
+        std::fs::File::open(path).wrap_err_with(|| format!("failed to read media: {path}"))?;
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_MEDIA_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .wrap_err_with(|| format!("failed to read media: {path}"))?;
+    if bytes.len() as u64 > MAX_MEDIA_BYTES {
+        eyre::bail!("media file is over {MAX_MEDIA_BYTES} bytes: {path}");
+    }
+    Ok(bytes)
+}
+
 /// Encode an image file as base64 and return (mime_type, base64_data).
 pub fn encode_image(path: &str) -> Result<(String, String)> {
-    let bytes = std::fs::read(path).wrap_err_with(|| format!("failed to read image: {path}"))?;
+    let bytes = read_media_no_follow(path)?;
 
     let ext = Path::new(path)
         .extension()
@@ -54,7 +96,7 @@ pub fn is_video(path: &str) -> bool {
 
 /// Encode a video file as base64 and return (mime_type, base64_data).
 pub fn encode_video(path: &str) -> Result<(String, String)> {
-    let bytes = std::fs::read(path).wrap_err_with(|| format!("failed to read video: {path}"))?;
+    let bytes = read_media_no_follow(path)?;
     let ext = Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
@@ -168,6 +210,28 @@ mod tests {
         for p in ["photo.png", "notes.txt", "song.mp3", "clip.avi"] {
             assert!(!is_video(p), "{p}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_refuse_a_symlink_and_an_oversized_file_at_encode_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.png");
+        std::fs::write(&real, b"\x89PNG").unwrap();
+        let link = dir.path().join("link.png");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(
+            encode_image(link.to_str().unwrap()).is_err(),
+            "a symlink must not be read"
+        );
+        assert!(encode_image(real.to_str().unwrap()).is_ok());
+        let big = dir.path().join("big.png");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_MEDIA_BYTES + 1).unwrap();
+        assert!(
+            encode_image(big.to_str().unwrap()).is_err(),
+            "over the size cap"
+        );
     }
 
     #[test]
