@@ -565,9 +565,13 @@ pub fn elision_hint(target: Option<&str>, original_byte_len: Option<u64>, reason
             }
         })
         .unwrap_or_default();
+    // `recall` is registered by the session runtimes but not by every loop
+    // that prunes (mcp_serve, gateway, embedded agents — #2131), so the note
+    // offers it conditionally and always names the tool-free way back.
     format!(
         "Output of {what}{size} elided from context ({reason}); nothing on disk changed. \
-         To see it again call `recall` with this tool_call_id, or repeat the call."
+         To see it again, repeat the call, or call `recall` with this tool_call_id if that \
+         tool is available."
     )
 }
 
