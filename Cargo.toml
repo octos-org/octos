@@ -43,7 +43,7 @@ members = [
 [workspace.package]
 version = "2.0.3-rc.11"
 edition = "2024"
-rust-version = "1.88.0"
+rust-version = "1.85.0"
 authors = ["octos team"]
 license = "Apache-2.0"
 repository = "https://github.com/octos-org/octos"
@@ -116,6 +116,7 @@ markup5ever_rcdom = "0.35"
 # Database (pure Rust)
 redb = "2"
 # Keep the fleet ledger's checked u64/usize conversions on the 0.40 bindings.
+# This dependency requires Rust 1.88 or newer; the workspace MSRV is still stale.
 rusqlite = { version = "0.40.1", features = ["bundled", "fallible_uint"] }
 bincode = "1"
 # Vector search
