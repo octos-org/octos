@@ -4271,6 +4271,108 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
 }
 
 #[test]
+fn appui_prompt_context_bridge_reports_live_context_state_when_negotiated() {
+    use octos_core::ui_protocol::UiNotification;
+
+    let session_id = SessionKey::new("api", "context-state-reported");
+    let history = vec![
+        test_message(MessageRole::User, "old request"),
+        test_message(MessageRole::Assistant, "old answer"),
+    ];
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let dir = tempfile::tempdir().unwrap();
+    let events: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = events.clone();
+    let bridge =
+        AppUiPromptContextBridge::new(session_id.clone(), dir.path().to_path_buf(), manager, false)
+            .with_context_lifecycle_notify(Arc::new(move |notification| {
+                sink.lock().unwrap().push(notification);
+            }))
+            .with_context_state_updates(true);
+    let request = |phase: PromptContextPhase, iteration: u32| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".to_string(),
+        model_id: "large-context".to_string(),
+        context_window: 16_000,
+    };
+
+    // Turn start: the first report of the turn always goes out and carries
+    // the PROMPT estimate the bridge just built, not the transcript's.
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history.clone());
+    prompt.push(test_message(MessageRole::User, "current request"));
+    let report = bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("prepare prompt");
+    let reported: Vec<_> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            UiNotification::ContextStateReported(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reported.len(), 1, "one live state report at turn start");
+    assert_eq!(reported[0].session_id, session_id);
+    assert_eq!(reported[0].iteration, 1);
+    assert_eq!(
+        reported[0].context_state.token_estimate,
+        report
+            .token_estimate
+            .expect("bridge reports a prompt estimate"),
+        "the gauge must show the projected prompt size"
+    );
+    assert!(reported[0].threshold_tokens > 0);
+
+    // Next iteration with an unchanged prompt: no movement, no report.
+    let mut same = prompt.clone();
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut same)
+        .expect("prepare prompt");
+    let count = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, UiNotification::ContextStateReported(_)))
+        .count();
+    assert_eq!(count, 1, "an unmoved estimate is not re-reported");
+
+    // Without the negotiated feature nothing is emitted at all.
+    let quiet: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+    let quiet_sink = quiet.clone();
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let unnegotiated =
+        AppUiPromptContextBridge::new(session_id.clone(), dir.path().to_path_buf(), manager, false)
+            .with_context_lifecycle_notify(Arc::new(move |notification| {
+                quiet_sink.lock().unwrap().push(notification);
+            }));
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history);
+    prompt.push(test_message(MessageRole::User, "current request"));
+    unnegotiated
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("prepare prompt");
+    assert!(
+        !quiet
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, UiNotification::ContextStateReported(_))),
+        "context/state_reported is strictly opt-in"
+    );
+}
+
+#[test]
 fn appui_prompt_context_bridge_preserves_current_user_turn() {
     let session_id = SessionKey::new("api", "context-current-user");
     let history = vec![

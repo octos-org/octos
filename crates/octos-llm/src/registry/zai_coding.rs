@@ -58,7 +58,13 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
                 ENTRY.name
             )
         })?;
-    let url = p.base_url.unwrap_or_else(|| DEFAULT_BASE_URL.into());
+    // A saved route from before the protocol switch still names the
+    // Anthropic-compatible root; map it to the coding-plan OpenAI root (logged)
+    // instead of sending OpenAI-shaped requests to a URL that 404s them.
+    let url = p
+        .base_url
+        .map(|url| super::zai::migrate_legacy_anthropic_root(&url, DEFAULT_BASE_URL, ENTRY.name))
+        .unwrap_or_else(|| DEFAULT_BASE_URL.into());
     // Plain OpenAI chat shape: no `cache_control` (Z.AI's OpenAI root has
     // rejected the field outright — "Extra inputs are not permitted") and no
     // `prompt_cache_key` affinity, which Z.AI does not implement; caching is
@@ -139,6 +145,18 @@ mod tests {
         let usage = response.usage;
         assert_eq!(usage.cache_read_tokens, 75);
         assert_eq!(usage.input_tokens, 25);
+    }
+
+    #[test]
+    fn should_migrate_a_saved_anthropic_root_to_the_coding_plan_root() {
+        assert_eq!(
+            super::super::zai::migrate_legacy_anthropic_root(
+                "https://api.z.ai/api/anthropic",
+                DEFAULT_BASE_URL,
+                ENTRY.name
+            ),
+            DEFAULT_BASE_URL
+        );
     }
 
     #[test]

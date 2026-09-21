@@ -128,12 +128,16 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_type: None,
         api_types: MINIMAX_API_TYPES,
     },
+    // OpenAI-compatible root: the only Z.AI root that reports its implicit
+    // prompt cache. The Anthropic-compatible `/api/anthropic` root accepts
+    // `cache_control` and ignores it (cache_read 0 on every request), so an
+    // agent loop there re-bills its whole context each iteration.
     ProviderInfo {
         name: "zai",
         display: "Z.AI (GLM)",
         api_key_env: "ZAI_API_KEY",
-        base_url: Some("https://api.z.ai/api/anthropic"),
-        api_type: Some("anthropic"),
+        base_url: Some("https://api.z.ai/api/paas/v4"),
+        api_type: None,
         api_types: &[],
     },
     // Region variant of the `minimax` preset: MiniMax Token-plan keys are
@@ -1379,11 +1383,13 @@ mod tests {
     }
 
     #[test]
-    fn zai_default_selection_preserves_anthropic_api_type_and_base_url() {
+    fn zai_default_selection_uses_the_openai_compatible_root() {
+        // The init preset must not hand new users the zero-cache
+        // Anthropic-compatible lane (see the preset comment).
         let selection = default_api_type_selection(provider("zai"));
 
-        assert_eq!(selection.api_type, Some("anthropic"));
-        assert_eq!(selection.base_url, Some("https://api.z.ai/api/anthropic"));
+        assert_eq!(selection.api_type, None);
+        assert_eq!(selection.base_url, Some("https://api.z.ai/api/paas/v4"));
     }
 
     #[test]
