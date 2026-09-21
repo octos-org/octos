@@ -647,6 +647,7 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
 - `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
+- `context/state_reported` (additionally gated on `context.state.v1`: live token estimate mid-turn)
 
 Peer staging (#1801 v3, ungated):
 
@@ -2385,6 +2386,34 @@ Capability gate: `context.lifecycle.v1`.
 Required fields: `session_id`, `context_state`, `trigger`,
 `threshold_tokens`. Documented by
 [UPCR-2026-026](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_026_COMPACTION_STARTED.md).
+
+### `context/state_reported`
+
+Gate: `context.lifecycle.v1` **and** `context.state.v1` (both requested by the
+client; never implied by a missing feature header, because legacy clients cannot
+decode this notification kind).
+
+Pushed by the in-loop prompt bridge as a turn's prompt grows between
+compactions, so a client's context gauge follows the real estimate instead of
+the value from `session/open` or the last compaction. Emitted at most once per
+agent-loop iteration and only when `token_estimate` moved by at least 2% of
+`threshold_tokens` (minimum 1024 tokens).
+
+```json
+{
+  "session_id": "local:abc",
+  "context_state": { "…": "UiContextState" },
+  "threshold_tokens": 800000,
+  "iteration": 57
+}
+```
+
+- `context_state` — the same `UiContextState` shape carried by the compaction
+  events; `token_estimate` is the live estimate.
+- `threshold_tokens` — the token count at which the server will compact this
+  session (context-window derived), the honest denominator for a fullness
+  fraction.
+- `iteration` — agent-loop iteration within the current turn (0 = turn start).
 
 ### `context/normalization_reported`
 

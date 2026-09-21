@@ -221,6 +221,17 @@ pub const UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1: &str = "context.lifecycle.v1
 /// those additive fields as opaque/absent.
 pub const UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1: &str = "context.semantic_cache.v1";
 
+/// Live context fullness during a turn. When negotiated (alongside the
+/// parent context lifecycle capability) the server pushes
+/// `context/state_reported` with a fresh [`UiContextState`] as the agent
+/// loop's prompt grows between compactions, so a client's context gauge
+/// tracks the real estimate instead of the value from session open or the
+/// last compaction. Field report 21 Sep 2026: a 300-iteration single turn
+/// showed `ctx 0K/1M` the whole way because nothing carried the estimate to
+/// the client mid-turn. Strictly opt-in: older clients cannot decode the
+/// notification kind.
+pub const UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1: &str = "context.state.v1";
+
 /// #965 / UPCR-2026-019 — spec-canonical feature name for the
 /// supervised-task inspection surface (`task/list`, `task/updated`,
 /// `task/output/read`, `agent/list`, `agent/status/read`, `agent/output/read`,
@@ -317,6 +328,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_REVIEW_START_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
     UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
@@ -1309,6 +1321,8 @@ pub mod methods {
     pub const CONTEXT_COMPACTION_STARTED: &str = "context/compaction_started";
     /// M16 `context.lifecycle.v1`: prompt normalization report notification.
     pub const CONTEXT_NORMALIZATION_REPORTED: &str = "context/normalization_reported";
+    /// Live context fullness mid-turn (`context.state.v1`).
+    pub const CONTEXT_STATE_REPORTED: &str = "context/state_reported";
     /// Session-level whole-job orchestration status notification.
     pub const SESSION_ORCHESTRATION: &str = "session/orchestration";
     /// #2019 `background/activity` — the HUMAN sink over background events
@@ -1483,6 +1497,7 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::CONTEXT_COMPACTION_COMPLETED,
     methods::CONTEXT_COMPACTION_STARTED,
     methods::CONTEXT_NORMALIZATION_REPORTED,
+    methods::CONTEXT_STATE_REPORTED,
     methods::PEER_STAGED,
     methods::PEER_CLOSED,
     methods::BACKGROUND_ACTIVITY,
@@ -1641,6 +1656,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_REVIEW_START_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
             UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+            UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1,
             UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
             UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
             UI_PROTOCOL_FEATURE_SMART_HOME_V1,
@@ -1666,7 +1682,10 @@ impl UiProtocolCapabilities {
                 .iter()
                 .copied()
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
-                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1)
+                // `context.state.v1` adds a notification kind legacy clients
+                // cannot decode, so it is never claimed without a request.
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1),
         );
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
@@ -6221,6 +6240,27 @@ pub struct ContextNormalizationReportedEvent {
     pub normalization: UiContextNormalizationReport,
 }
 
+/// `context/state_reported` (`context.state.v1`): the live context state of
+/// a session while a turn is running, pushed as the prompt grows between
+/// compactions. Carries no compaction record; it exists so a client gauge
+/// can show the current `token_estimate` against `threshold_tokens` without
+/// waiting for the next compaction or a session re-hydrate. Emitted at most
+/// once per agent-loop iteration and only when the estimate moved enough to
+/// matter, so it never becomes a per-token stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextStateReportedEvent {
+    pub session_id: SessionKey,
+    pub context_state: UiContextState,
+    /// The token threshold at which the server will compact this session's
+    /// context (context-window derived); lets a client render an honest
+    /// fullness fraction with the same denominator the server uses.
+    pub threshold_tokens: usize,
+    /// Agent-loop iteration within the current turn that produced this
+    /// estimate (0 = turn start).
+    #[serde(default)]
+    pub iteration: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WarningEvent {
     pub session_id: SessionKey,
@@ -6653,6 +6693,8 @@ pub enum UiNotification {
     ContextCompactionStarted(ContextCompactionStartedEvent),
     /// M16: prompt normalization lifecycle event.
     ContextNormalizationReported(ContextNormalizationReportedEvent),
+    /// `context.state.v1`: live context fullness mid-turn.
+    ContextStateReported(ContextStateReportedEvent),
     /// Session-level whole-job orchestration status. Emitted when the session's
     /// orchestration state changes (turn active / sub-agents running / master
     /// continuation pending), so a client can render a job indicator that stays
@@ -6737,6 +6779,7 @@ impl UiNotification {
             Self::ContextCompactionCompleted(_) => methods::CONTEXT_COMPACTION_COMPLETED,
             Self::ContextCompactionStarted(_) => methods::CONTEXT_COMPACTION_STARTED,
             Self::ContextNormalizationReported(_) => methods::CONTEXT_NORMALIZATION_REPORTED,
+            Self::ContextStateReported(_) => methods::CONTEXT_STATE_REPORTED,
             Self::SessionOrchestration(_) => methods::SESSION_ORCHESTRATION,
             Self::PeerStaged(_) => methods::PEER_STAGED,
             Self::PeerClosed(_) => methods::PEER_CLOSED,
@@ -6794,6 +6837,7 @@ impl UiNotification {
             Self::ContextCompactionCompleted(event) => &event.session_id,
             Self::ContextCompactionStarted(event) => &event.session_id,
             Self::ContextNormalizationReported(event) => &event.session_id,
+            Self::ContextStateReported(event) => &event.session_id,
             Self::SessionOrchestration(event) => &event.session_id,
             Self::PeerStaged(event) => &event.session_id,
             Self::PeerClosed(event) => &event.session_id,
@@ -6958,6 +7002,7 @@ impl UiNotification {
             Self::ContextCompactionCompleted(params) => serde_json::to_value(params),
             Self::ContextCompactionStarted(params) => serde_json::to_value(params),
             Self::ContextNormalizationReported(params) => serde_json::to_value(params),
+            Self::ContextStateReported(params) => serde_json::to_value(params),
             Self::SessionOrchestration(params) => serde_json::to_value(params),
             // #1801 v3: `topic` on the payload is the staged PEER's topic
             // (`peer-<slug>`), NOT this notification's routing topic — the
@@ -7109,6 +7154,9 @@ impl UiNotification {
             methods::CONTEXT_NORMALIZATION_REPORTED => Ok(Self::ContextNormalizationReported(
                 decode_params(method, params)?,
             )),
+            methods::CONTEXT_STATE_REPORTED => {
+                Ok(Self::ContextStateReported(decode_params(method, params)?))
+            }
             methods::SESSION_ORCHESTRATION => {
                 Ok(Self::SessionOrchestration(decode_params(method, params)?))
             }
