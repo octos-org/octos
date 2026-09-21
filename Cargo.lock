@@ -4864,6 +4864,7 @@ dependencies = [
  "eyre",
  "futures",
  "jsonwebtoken",
+ "libc",
  "metrics",
  "octos-core",
  "redb",

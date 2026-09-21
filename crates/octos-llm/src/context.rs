@@ -213,6 +213,11 @@ pub fn estimate_message_tokens(msg: &Message) -> u32 {
             tokens += estimate_tokens(&call.arguments.to_string());
         }
     }
+    // Inline media is not text: a screenshot is thousands of tokens, not
+    // the twenty of its caption. Counted for every row that carries it —
+    // an older tool row's media is not re-sent, so this over-counts there,
+    // which is the safe side for a budget.
+    tokens += crate::tool_media::estimate_media_tokens(&msg.media);
     // Role/structural overhead (~4 tokens)
     tokens + 4
 }

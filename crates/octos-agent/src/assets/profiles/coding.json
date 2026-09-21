@@ -1,7 +1,7 @@
 {
   "name": "coding",
   "version": 1,
-  "description": "Default profile — the lean core-coding surface plus the loop tools it was missing. It ADDS `check`, `update_plan`, and `tool_search` (which the earlier lean list denied — a default coding session literally could not run the workspace check or track a plan) on top of files, shell (group:runtime), search, long-term memory (group:memory), and sub-agent spawn. Only `apply_patch` is dropped (edit_file/diff_edit cover it). The heavy web/research/media/messaging/pipeline tools and bundled skills stay excluded to keep per-round tool-schema overhead low; note the allow-list filter is applied to the visible registry, so those excluded tools are restored with `--profile coding-full`, not discovered at runtime. The M8.2 built-in sub-agents stay preloaded so `spawn` resolves them by id.",
+  "description": "Default profile — the lean core-coding surface plus the loop tools it was missing. It ADDS `check`, `update_plan`, `tool_search`, `view_image` and `view_video` (a coding agent that cannot look at the screenshot it just took cannot check its own work; the tool hands the model the image itself) (which the earlier lean list denied — a default coding session literally could not run the workspace check or track a plan) on top of files, shell (group:runtime), search, long-term memory (group:memory), and sub-agent spawn. Only `apply_patch` is dropped (edit_file/diff_edit cover it). The heavy web/research/media/messaging/pipeline tools and bundled skills stay excluded to keep per-round tool-schema overhead low; note the allow-list filter is applied to the visible registry, so those excluded tools are restored with `--profile coding-full`, not discovered at runtime. The M8.2 built-in sub-agents stay preloaded so `spawn` resolves them by id.",
   "tools": {
     "mode": "allow_list",
     "tools": [
@@ -16,10 +16,15 @@
       "ask_user_question",
       "check",
       "update_plan",
+      "view_image",
+      "view_video",
       "tool_search"
     ]
   },
   "mcp_servers": [],
   "permissions": "default",
-  "agents": ["research-worker", "repo-editor"]
+  "agents": [
+    "research-worker",
+    "repo-editor"
+  ]
 }
