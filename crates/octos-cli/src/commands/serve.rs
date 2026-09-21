@@ -49,6 +49,23 @@ const FLEET_BOOT_RECONCILE_MAX_ATTEMPTS: u32 = 3;
 /// yields real isolation.
 ///
 /// [`NoSandbox`]: octos_agent::sandbox::NoSandbox
+/// Default idle lifetime of a cached per-session runtime (30 minutes).
+const SESSION_CACHE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Idle lifetime of a cached per-session runtime.
+///
+/// `OCTOS_SESSION_CACHE_IDLE_TTL_SECS` overrides it (minimum 1 s; a malformed
+/// or zero value keeps the default). Rebuilding an evicted runtime is correct
+/// but slow for a long session, so an operator on a big box may want it
+/// longer; tests want it short.
+fn session_cache_idle_ttl() -> std::time::Duration {
+    std::env::var("OCTOS_SESSION_CACHE_IDLE_TTL_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(SESSION_CACHE_IDLE_TTL, std::time::Duration::from_secs)
+}
+
 fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
     let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
     // A refusing resolution (explicit mode unhonorable on this host, or
@@ -366,7 +383,8 @@ pub struct ServeCommand {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Auth token for API access (overrides config).
+    /// Auth token for API access (overrides config). Visible in the process
+    /// list (`ps`) — prefer the OCTOS_AUTH_TOKEN env var or the config file.
     #[arg(long)]
     pub auth_token: Option<String>,
 
@@ -465,6 +483,37 @@ fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTa
     stdio.then(crate::session_actor::SessionTaskQueryStore::default)
 }
 
+/// Where the effective dashboard bearer token came from. #2371: the argv
+/// source leaks the token to every local process via `ps`, so it earns a
+/// one-time warning at the call site; the env/config sources do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthTokenSource {
+    Argv,
+    Env,
+    Config,
+}
+
+/// Resolve the operator-supplied auth token with the documented precedence
+/// `--auth-token` > `OCTOS_AUTH_TOKEN` > config `auth_token` (an empty
+/// config token counts as absent). `None` means no operator source produced
+/// a token — the caller then auto-generates one for non-loopback binds.
+fn resolve_auth_token(
+    argv: Option<String>,
+    env: Option<String>,
+    config: Option<&str>,
+) -> Option<(String, AuthTokenSource)> {
+    if let Some(token) = argv {
+        return Some((token, AuthTokenSource::Argv));
+    }
+    if let Some(token) = env {
+        return Some((token, AuthTokenSource::Env));
+    }
+    match config {
+        Some(token) if !token.is_empty() => Some((token.to_string(), AuthTokenSource::Config)),
+        _ => None,
+    }
+}
+
 /// How long the serve keeps draining in-flight connections after the stop
 /// signal before it stops waiting and proceeds to `stop_all()` + exit anyway.
 /// Axum's graceful shutdown waits for open connections, and an SSE stream
@@ -505,8 +554,13 @@ const SERVE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs
 /// ends, but tokio keeps the handler installed for the process lifetime, so
 /// a second signal during the bounded drain is captured-but-unobserved: it
 /// cannot kill the serve before `stop_all()` runs.
-fn spawn_serve_shutdown_signal_watcher() -> tokio::sync::watch::Receiver<bool> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+fn spawn_serve_shutdown_signal_watcher(
+    shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
+) -> tokio::sync::watch::Receiver<bool> {
+    // One channel for every stop request: this watcher (SIGINT/SIGTERM) and
+    // the `server/shutdown` UI Protocol method hold the same sender, so a stop
+    // from a client takes exactly the drain path a signal takes.
+    let shutdown_rx = shutdown_tx.subscribe();
     #[cfg(unix)]
     let sigterm = {
         use tokio::signal::unix::{SignalKind, signal};
@@ -540,7 +594,7 @@ fn spawn_serve_shutdown_signal_watcher() -> tokio::sync::watch::Receiver<bool> {
         {
             let _ = tokio::signal::ctrl_c().await;
         }
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.send_replace(true);
     });
     shutdown_rx
 }
@@ -590,12 +644,48 @@ async fn bind_http_listener(
 
     let listener = tokio::net::TcpListener::bind((host, requested_port))
         .await
-        .wrap_err_with(|| format!("failed to bind octos API server to {host}:{requested_port}"))?;
+        .map_err(|error| bind_listener_error(host, requested_port, error))?;
     let actual_port = listener
         .local_addr()
         .wrap_err("failed to inspect bound octos API listener")?
         .port();
     Ok((Some(listener), actual_port))
+}
+
+/// Wrap a listener bind failure. An occupied port gets the remediation the
+/// data-dir lock error already sets the bar for (#2385): how to find the
+/// holder and the `--port` escape hatch. Every other failure keeps the bare
+/// wrap — the io error stays as the `Caused by:` source either way.
+fn bind_listener_error(host: &str, requested_port: u16, error: std::io::Error) -> eyre::Report {
+    let target = format!("{host}:{requested_port}");
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        eyre::Report::new(error).wrap_err(format!(
+            "failed to bind octos API server to {target}: the port is already in use. \
+             Find the holder with `{}`, or pass `--port` to choose another.",
+            port_holder_hint(requested_port)
+        ))
+    } else {
+        eyre::Report::new(error).wrap_err(format!("failed to bind octos API server to {target}"))
+    }
+}
+
+/// Platform-appropriate command for finding which process holds `port`
+/// (the issue's "or your platform equivalent").
+#[cfg(target_os = "linux")]
+fn port_holder_hint(port: u16) -> String {
+    // iproute2's `ss` ships with the base system on essentially every distro
+    // (minimal container images included); `lsof` frequently does not.
+    format!("ss -ltnp 'sport = :{port}'")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn port_holder_hint(port: u16) -> String {
+    format!("lsof -i :{port}")
+}
+
+#[cfg(windows)]
+fn port_holder_hint(port: u16) -> String {
+    format!("netstat -ano | findstr :{port}")
 }
 
 /// Stable, machine-greppable marker embedded in the "data directory is already
@@ -606,6 +696,23 @@ async fn bind_http_listener(
 /// died mid-startup opening `admin_audit.redb`. MUST stay byte-stable: the
 /// client matches it verbatim (octoscode `transport.rs` DATA_DIR_LOCKED_MARKER).
 pub(crate) const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
+
+/// Contention on the serve lock is not always a second long-lived serve: the
+/// goal operator CLI holds the same lock across an ms-scale offline append
+/// (#2181), and a serve (re)spawned inside that window must not be refused
+/// with the marker — octoscode STOPS relaunching on it, so a transient
+/// conflict would permanently kill the session until manual intervention
+/// (#2357). Wait out transient holders on this bounded budget before emitting
+/// the marker. A genuinely running serve holds the lock for its whole
+/// lifetime, so the refusal contract (and the greppable marker) is unchanged —
+/// only delayed by at most this budget in the true-conflict case. The budget
+/// assumes the goal CLI's offline hold stays well under it; its append can
+/// fsync a snapshot compaction, so this is a heuristic bound, not a guarantee.
+const SERVE_LOCK_CONTENTION_RETRY_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(2_000);
+/// Poll step for the contention retry: small next to the budget so a
+/// transient release is picked up promptly.
+const SERVE_LOCK_CONTENTION_RETRY_STEP: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Held for the serve process's whole lifetime: an exclusive OS advisory lock
 /// (flock / LockFileEx via `fs2`) on `<data_dir>/.octos-serve.lock`. redb is
@@ -634,12 +741,13 @@ impl Drop for ServeDataDirLock {
     }
 }
 
-/// Acquire the serve single-writer lock for `data_dir`, or return a clear error
-/// carrying [`DATA_DIR_LOCKED_MARKER`] when another serve already holds it.
-/// Contention is detected structurally via the platform's canonical
-/// lock-contended errno (`fs2::lock_contended_error`), never string matching.
-/// Fully-qualified `fs2::FileExt` calls: std 1.89 grew inherent methods of the
-/// same names and the workspace MSRV is 1.85.
+/// Acquire the serve single-writer lock for `data_dir`, or return a clear
+/// error carrying [`DATA_DIR_LOCKED_MARKER`] when another serve still holds it
+/// after [`SERVE_LOCK_CONTENTION_RETRY_BUDGET`] of waiting out a transient
+/// holder (#2357). Contention is detected structurally via the platform's
+/// canonical lock-contended errno (`fs2::lock_contended_error`), never string
+/// matching. Fully-qualified `fs2::FileExt` calls: std 1.89 grew inherent
+/// methods of the same names and the workspace MSRV is 1.85.
 fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDirLock> {
     std::fs::create_dir_all(data_dir)
         .wrap_err_with(|| format!("failed to create data dir: {}", data_dir.display()))?;
@@ -650,20 +758,29 @@ fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDi
         .truncate(false)
         .open(&lock_path)
         .wrap_err_with(|| format!("failed to open serve lockfile: {}", lock_path.display()))?;
-    match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(ServeDataDirLock { _file: file }),
-        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-            Err(eyre::eyre!(
-                "{DATA_DIR_LOCKED_MARKER}: another octos server is already running for this data \
-                 directory ({}). Close the other octoscode (or `octos serve`), or start this one \
-                 against a different --data-dir.",
-                data_dir.display()
-            ))
+    let deadline = std::time::Instant::now() + SERVE_LOCK_CONTENTION_RETRY_BUDGET;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(ServeDataDirLock { _file: file }),
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(eyre::eyre!(
+                        "{DATA_DIR_LOCKED_MARKER}: another octos server is already running for \
+                         this data directory ({}). Close the other octoscode (or `octos serve`), \
+                         or start this one against a different --data-dir.",
+                        data_dir.display()
+                    ));
+                }
+                std::thread::sleep(SERVE_LOCK_CONTENTION_RETRY_STEP.min(deadline - now));
+            }
+            Err(error) => {
+                return Err(eyre::Report::new(error).wrap_err(format!(
+                    "failed to acquire serve single-writer lock: {}",
+                    lock_path.display()
+                )));
+            }
         }
-        Err(error) => Err(eyre::Report::new(error).wrap_err(format!(
-            "failed to acquire serve single-writer lock: {}",
-            lock_path.display()
-        ))),
     }
 }
 
@@ -731,11 +848,15 @@ impl ServeCommand {
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
 
         // Single-writer guard: redb is single-process, so a second `octos serve`
-        // on this data dir can't coexist. Fail FAST here with one clean,
+        // on this data dir can't coexist. Fail here with one clean,
         // client-greppable refusal instead of crashing mid-startup opening
         // `admin_audit.redb` (which a stdio client silently respawned in a
-        // ~5s loop). Held for the whole process via `_data_dir_lock`; released
-        // on exit so a relaunch after the prior serve quits still starts.
+        // ~5s loop). Transient contention (the goal operator CLI's ms-scale
+        // offline-append hold, #2181) is first waited out on a short budget
+        // (#2357): octoscode stops relaunching on the marker, so a transient
+        // conflict must never produce one. Held for the whole process via
+        // `_data_dir_lock`; released on exit so a relaunch after the prior
+        // serve quits still starts.
         let _data_dir_lock = match acquire_serve_data_dir_lock(&data_dir) {
             Ok(guard) => guard,
             Err(error) => {
@@ -907,17 +1028,21 @@ impl ServeCommand {
         let metrics_handle = Some(init_metrics());
 
         // Security: warn if binding to non-localhost without auth token
-        // Check CLI arg, then OCTOS_AUTH_TOKEN env var
-        let auth_token = if self.auth_token.is_some() {
-            self.auth_token
-        } else if let Ok(env_token) = std::env::var("OCTOS_AUTH_TOKEN") {
-            Some(env_token)
-        } else if let Some(ref cfg_token) = config.auth_token {
-            if !cfg_token.is_empty() {
-                Some(cfg_token.clone())
-            } else {
-                None
+        // Precedence: CLI arg, then OCTOS_AUTH_TOKEN env var, then config
+        let auth_token = if let Some((token, source)) = resolve_auth_token(
+            self.auth_token.clone(),
+            std::env::var("OCTOS_AUTH_TOKEN").ok(),
+            config.auth_token.as_deref(),
+        ) {
+            if source == AuthTokenSource::Argv {
+                // #2371: argv is readable by any local process via `ps`;
+                // steer operators to the env var or the config file.
+                tracing::warn!(
+                    "--auth-token exposes the bearer token in the process list (ps); \
+                     prefer the OCTOS_AUTH_TOKEN env var or the config file"
+                );
             }
+            Some(token)
         } else if self.host != "127.0.0.1" && self.host != "localhost" && self.host != "::1" {
             tracing::warn!(
                 "Binding to {} without --auth-token is dangerous! \
@@ -1313,7 +1438,7 @@ impl ServeCommand {
         }
 
         let session_cache = Arc::new(
-            crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
+            crate::runtime::SessionRuntimeCache::new(64, session_cache_idle_ttl())
                 // Per-project session storage (opt-in, default off). When set,
                 // a cwd-hinted AppUi session's transcript store relocates to
                 // `<cwd>/.octos`; no-hint/gateway sessions are unaffected.
@@ -1557,6 +1682,9 @@ impl ServeCommand {
         )
         .wrap_err("invalid AppUI browser-origin configuration")?;
 
+        // The stop switch exists before AppState so the `server/shutdown`
+        // method and the signal watcher (installed further down) share it.
+        let serve_shutdown_tx = Arc::new(tokio::sync::watch::channel(false).0);
         let state = Arc::new(AppState {
             ui_protocol: crate::api::UiProtocolRuntimeResources::default(),
             profiles: profile_runtimes,
@@ -1613,6 +1741,8 @@ impl ServeCommand {
             host_memory: config.memory.clone(),
             pairing: pairing.clone(),
             solo_login_enabled: solo_login_enabled_flag,
+            // Only the HTTP serve has a loop to stop; see AppState::serve_shutdown.
+            serve_shutdown: (!self.stdio).then(|| serve_shutdown_tx.clone()),
             dangerous_default_permissions: dangerous_default_permissions_flag,
             default_network_denied: default_network_denied_flag,
             llm_compaction: self.llm_compaction,
@@ -1709,7 +1839,7 @@ impl ServeCommand {
         // disposition and orphans every gateway (#2086). The stdio path above
         // returns before this point and keeps its existing behavior — it
         // spawns no gateways, so there is nothing to orphan.
-        let shutdown_rx = spawn_serve_shutdown_signal_watcher();
+        let shutdown_rx = spawn_serve_shutdown_signal_watcher(serve_shutdown_tx.clone());
 
         // Auto-start enabled profiles
         let profiles = profile_store.list().unwrap_or_default();
@@ -2206,6 +2336,142 @@ mod tests {
     use super::*;
 
     #[test]
+    fn should_prefer_argv_auth_token_and_report_its_source() {
+        // #2371: precedence is argv > env > config, and the source must be
+        // reported so the serve can warn when the token arrives via the
+        // process list.
+        let resolved = resolve_auth_token(
+            Some("argv-token".to_string()),
+            Some("env-token".to_string()),
+            Some("config-token"),
+        );
+        assert_eq!(
+            resolved,
+            Some(("argv-token".to_string(), AuthTokenSource::Argv))
+        );
+    }
+
+    #[test]
+    fn should_fall_back_to_env_then_config_auth_token() {
+        assert_eq!(
+            resolve_auth_token(None, Some("env-token".to_string()), Some("config-token")),
+            Some(("env-token".to_string(), AuthTokenSource::Env))
+        );
+        assert_eq!(
+            resolve_auth_token(None, None, Some("config-token")),
+            Some(("config-token".to_string(), AuthTokenSource::Config))
+        );
+        // An empty config token counts as absent — the caller falls through
+        // to the auto-generated-token path for non-loopback binds.
+        assert_eq!(resolve_auth_token(None, None, Some("")), None);
+        assert_eq!(resolve_auth_token(None, None, None), None);
+    }
+
+    /// #2385: an occupied port is the one bind failure a user can fix from
+    /// the message alone, so it must say the port is taken, how to find the
+    /// holder, and the `--port` escape hatch — while keeping the io error as
+    /// the source.
+    #[test]
+    fn bind_error_on_addr_in_use_carries_remediation() {
+        let report = bind_listener_error(
+            "127.0.0.1",
+            8080,
+            std::io::Error::from(std::io::ErrorKind::AddrInUse),
+        );
+        let rendered = format!("{report}");
+        assert!(rendered.contains("already in use"), "actual: {rendered}");
+        assert!(rendered.contains("--port"), "actual: {rendered}");
+        #[cfg(target_os = "linux")]
+        assert!(
+            rendered.contains("ss -ltnp 'sport = :8080'"),
+            "actual: {rendered}"
+        );
+        #[cfg(all(unix, not(target_os = "linux")))]
+        assert!(rendered.contains("lsof -i :8080"), "actual: {rendered}");
+        #[cfg(windows)]
+        assert!(
+            rendered.contains("netstat -ano | findstr :8080"),
+            "actual: {rendered}"
+        );
+        assert!(report.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        }));
+    }
+
+    #[test]
+    fn bind_error_other_kinds_keep_the_bare_wrap() {
+        let report = bind_listener_error(
+            "127.0.0.1",
+            8080,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(
+            format!("{report}"),
+            "failed to bind octos API server to 127.0.0.1:8080"
+        );
+        assert!(report.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        }));
+    }
+
+    /// The remediation path must key off the REAL OS error, not just the
+    /// synthesized kind: hold a socket and drive the production bind through
+    /// it.
+    #[tokio::test]
+    async fn bind_http_listener_reports_remediation_for_occupied_port() {
+        let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let error = bind_http_listener(false, "127.0.0.1", port)
+            .await
+            .unwrap_err();
+        let rendered = format!("{error}");
+        assert!(rendered.contains("already in use"), "actual: {rendered}");
+        assert!(rendered.contains("--port"), "actual: {rendered}");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        }));
+    }
+
+    /// #2371 tripwire: the repo's own service generators must never place
+    /// the dashboard bearer token in argv — it is readable by any local
+    /// process via ps / systemctl cat. The OCTOS_AUTH_TOKEN env var carries
+    /// it instead (NSSM's AppEnvironmentExtra is the deploy.ps1 equivalent).
+    #[test]
+    fn service_templates_never_pass_auth_token_via_argv() {
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+        for name in [
+            "install.sh",
+            "install.ps1",
+            "local-tenant-deploy.sh",
+            "deploy.ps1",
+        ] {
+            let body = std::fs::read_to_string(scripts.join(name))
+                .unwrap_or_else(|e| panic!("read {name}: {e}"));
+            assert!(
+                body.contains("OCTOS_AUTH_TOKEN"),
+                "{name} must still deliver the token via OCTOS_AUTH_TOKEN"
+            );
+            for line in body.lines() {
+                let service_argv_line = line.contains("ExecStart=")
+                    || line.contains("\"$octosBin\" serve")
+                    || line.contains("$nssmExe install")
+                    || line.contains("AppParameters")
+                    || line.trim() == "<string>--auth-token</string>";
+                assert!(
+                    !(service_argv_line && line.contains("--auth-token")),
+                    "{name} puts --auth-token in the service argv: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stdio_serve_wires_task_query_store_for_in_process_cancel() {
         // `--stdio` runs session actors in-process with no gateway to
         // proxy `task/cancel` to, so the store must be present for the
@@ -2430,10 +2696,12 @@ mod tests {
     }
 
     /// Two `octos serve` against one data dir can't coexist (redb is
-    /// single-process). The second must be refused FAST with a stable,
+    /// single-process). The second must be refused with a stable,
     /// client-greppable marker — not crash mid-startup opening `admin_audit.redb`
     /// (which a stdio client respawned in a silent ~5s loop). Releasing the first
     /// (process exit) must free the lock so a legitimate relaunch still starts.
+    /// (The refusal is delayed by the #2357 contention budget, so this test's
+    /// wall time includes it.)
     #[test]
     fn second_serve_on_same_data_dir_is_refused_with_a_greppable_marker() {
         let dir = tempfile::tempdir().unwrap();
@@ -2457,6 +2725,77 @@ mod tests {
         drop(first);
         let _relaunch = acquire_serve_data_dir_lock(dir.path())
             .expect("after the holder exits, a fresh serve acquires the lock");
+    }
+
+    /// #2357 — the lock is no longer held only by a long-lived serve: the goal
+    /// operator CLI holds it across an ms-scale offline append (#2181). A serve
+    /// spawned inside that window must WAIT OUT the transient holder instead of
+    /// emitting the one-shot marker refusal — octoscode stops relaunching on
+    /// the marker, so a transient conflict would permanently kill the session.
+    /// The holder releases mid-budget; acquisition must retry past the first
+    /// contention and succeed. The acquirer runs on its own thread behind a
+    /// channel handshake so the hold provably overlaps the first try_lock —
+    /// a main-thread scheduling hiccup can never release the lock early and
+    /// turn this into a false pass/fail.
+    #[test]
+    fn serve_lock_acquisition_waits_out_a_transient_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".octos-serve.lock");
+        let transient = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open lockfile");
+        fs2::FileExt::try_lock_exclusive(&transient).expect("transient holder takes the lock");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let dir_path = dir.path().to_path_buf();
+        let acquirer = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce acquisition start");
+            acquire_serve_data_dir_lock(&dir_path)
+        });
+        started_rx.recv().expect("acquirer announces start");
+
+        // Release mid-budget: comfortably past the acquirer's first try_lock,
+        // comfortably inside SERVE_LOCK_CONTENTION_RETRY_BUDGET on any host.
+        let released_at = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(transient);
+
+        let guard = acquirer
+            .join()
+            .expect("acquirer thread")
+            .expect("a transient holder must be waited out, not refused");
+        assert!(
+            released_at.elapsed() >= std::time::Duration::from_millis(150),
+            "acquisition can only succeed after the release, so it must have waited"
+        );
+        drop(guard);
+    }
+
+    /// #2357 — the retry budget must not soften the true-conflict contract: a
+    /// live serve holds the lock for its whole lifetime, so a second serve is
+    /// still refused with the same greppable marker, just delayed by the
+    /// budget. (Wall time of this test grows by the budget.)
+    #[test]
+    fn serve_lock_acquisition_still_refuses_a_live_holder_after_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_serve_data_dir_lock(dir.path()).expect("first serve acquires the lock");
+
+        let started = std::time::Instant::now();
+        let err = acquire_serve_data_dir_lock(dir.path())
+            .err()
+            .expect("a live holder must still be refused after the retry budget");
+        assert!(
+            err.to_string().contains(DATA_DIR_LOCKED_MARKER),
+            "refusal must still carry the stable client-greppable marker; got: {err}"
+        );
+        assert!(
+            started.elapsed() >= SERVE_LOCK_CONTENTION_RETRY_BUDGET,
+            "the refusal must come only after the full contention budget"
+        );
+        drop(first);
     }
 
     /// Unix flock ownership follows the open file description, so a forked

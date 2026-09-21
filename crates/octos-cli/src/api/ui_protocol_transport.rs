@@ -261,6 +261,9 @@ const APPROVAL_CANCELLED_REASON_PEER_CLOSED: &str = "peer_closed";
 const APPUI_METHOD_CONFIG_CAPABILITIES_LIST: &str =
     octos_core::ui_protocol::methods::CONFIG_CAPABILITIES_LIST;
 const APPUI_METHOD_CLIENT_HELLO: &str = "client_hello";
+/// Stop this `octos serve`, exactly as Ctrl+C would. Local `--solo` HTTP
+/// servers only — see [`supports_server_shutdown`].
+const APPUI_METHOD_SERVER_SHUTDOWN: &str = "server/shutdown";
 const APPUI_METHOD_SESSION_STATUS_READ: &str =
     octos_core::ui_protocol::methods::SESSION_STATUS_READ;
 const APPUI_METHOD_PROFILE_LOCAL_CREATE: &str =
@@ -406,6 +409,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
     APPUI_METHOD_SESSION_STATUS_READ,
     APPUI_METHOD_PROFILE_LOCAL_CREATE,
+    APPUI_METHOD_SERVER_SHUTDOWN,
     APPUI_METHOD_PROFILE_LLM_LIST,
     APPUI_METHOD_PROFILE_LLM_SELECT,
     APPUI_METHOD_MCP_STATUS_LIST,
@@ -2364,6 +2368,11 @@ impl ConnectionUiFeatures {
             if *method == APPUI_METHOD_PROFILE_LOCAL_CREATE
                 && !supports_local_solo_profile_create(state)
             {
+                continue;
+            }
+            // Advertised only where it can run, so a client shows a Stop
+            // control exactly when pressing it would stop the server.
+            if *method == APPUI_METHOD_SERVER_SHUTDOWN && !supports_server_shutdown(state) {
                 continue;
             }
             // #1057: `onboarding/workspace_probe` is a local-solo onboarding
@@ -5252,6 +5261,64 @@ const STATUS_WORD_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// free.
 const APPUI_IN_FLIGHT_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Bounds for how often a connection renews the session-runtime cache entry
+/// of every Session it holds open.
+///
+/// The cache evicts a runtime once it has been idle for its `idle_ttl` (30
+/// minutes under `octos serve`). Rebuilding is correct but slow — a long
+/// session costs seconds to reload from disk, which the UI pays on its next
+/// `session/open`, close to the client's 30 s request timeout, and which shows
+/// up as a stalled "restoring session" in the web client. A client with the
+/// Session OPEN means it is not idle, so renew a quarter of the way into that
+/// window: often enough to survive a missed tick, rare enough to be free.
+const APPUI_SESSION_KEEPALIVE_MIN: std::time::Duration = std::time::Duration::from_secs(5);
+const APPUI_SESSION_KEEPALIVE_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Renewal cadence for a cache holding entries for `idle_ttl`.
+fn appui_session_keepalive_interval(idle_ttl: std::time::Duration) -> std::time::Duration {
+    (idle_ttl / 4).clamp(APPUI_SESSION_KEEPALIVE_MIN, APPUI_SESSION_KEEPALIVE_MAX)
+}
+
+/// Whether a keep-alive round is due, recording the tick when it is.
+fn appui_keepalive_due(
+    last: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    match *last {
+        // First tick after the connection opens: the runtime was just used by
+        // session/open, so wait a full interval before the first renewal.
+        None => {
+            *last = Some(now);
+            false
+        }
+        Some(previous) if now.duration_since(previous) >= interval => {
+            *last = Some(now);
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+/// Renew every Session this connection holds open (see
+/// [`appui_session_keepalive_interval`]).
+async fn appui_keep_open_sessions_alive(
+    state: &Arc<AppState>,
+    open_sessions: &std::collections::HashSet<SessionKey>,
+) {
+    let mut renewed = 0usize;
+    for session_id in open_sessions {
+        renewed += state.session_cache.keep_session_alive(session_id).await;
+    }
+    if renewed > 0 {
+        tracing::debug!(
+            target: "octos::ui_protocol::ws",
+            sessions = renewed,
+            "renewed cached session runtimes held open by this connection"
+        );
+    }
+}
+
 /// CJK code-point check shared with `status_indicator::has_cjk` — kept
 /// inline here to avoid pulling the channel-aware status_indicator
 /// module into the WS turn path.
@@ -6688,6 +6755,7 @@ async fn ui_protocol_connection(
     // forever — the cleanup path only ran when the next client frame
     // arrived, leaving subscribers and ledger fan-out registered.
     let failed_notify = ws.failed_notify();
+    let mut last_session_keepalive: Option<std::time::Instant> = None;
     let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
     appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -6724,6 +6792,13 @@ async fn ui_protocol_connection(
                     .or(session_open_profile_id.as_deref());
                 let open_sessions: std::collections::HashSet<SessionKey> =
                     live_forwarders.lock().await.keys().cloned().collect();
+                if appui_keepalive_due(
+                    &mut last_session_keepalive,
+                    std::time::Instant::now(),
+                    appui_session_keepalive_interval(state.session_cache.idle_ttl()),
+                ) {
+                    appui_keep_open_sessions_alive(&state, &open_sessions).await;
+                }
                 drain_appui_due_master_continuations(
                     &ws,
                     &state,
@@ -7615,6 +7690,7 @@ where
     let connection_headers = HeaderMap::new();
     let mut connection_profile_id_owned: Option<String> = None;
     let mut last_orchestration: HashMap<SessionKey, SessionOrchestrationEvent> = HashMap::new();
+    let mut last_session_keepalive: Option<std::time::Instant> = None;
     let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
     appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let failed_notify = ws.failed_notify();
@@ -7643,6 +7719,13 @@ where
                     }
                     let open_sessions: std::collections::HashSet<SessionKey> =
                         live_forwarders.lock().await.keys().cloned().collect();
+                    if appui_keepalive_due(
+                        &mut last_session_keepalive,
+                        std::time::Instant::now(),
+                        appui_session_keepalive_interval(state.session_cache.idle_ttl()),
+                    ) {
+                        appui_keep_open_sessions_alive(&state, &open_sessions).await;
+                    }
                     drain_appui_due_master_continuations(
                         &ws,
                         &state,
@@ -9470,6 +9553,46 @@ pub(crate) fn supports_local_solo_profile_create(state: &AppState) -> bool {
         && state.deployment_mode == crate::config::DeploymentMode::Local
         && state.profile_store.is_some()
         && state.user_store.is_some()
+}
+
+/// Whether a UI Protocol client may stop this server (`server/shutdown`).
+///
+/// Stopping ends the process for EVERY connected client and cancels their
+/// running turns, so it rides on the same keystone as the other dangerous
+/// local-only actions — an explicit `--solo` opt-in on a Local deployment
+/// ([`local_solo_danger_allowed`]) — and additionally needs a serve loop to
+/// stop: only HTTP `serve` installs [`AppState::serve_shutdown`]. A fleet or
+/// hosted server, where one client stopping the process would take everyone
+/// else down, never advertises or accepts it.
+pub(crate) fn supports_server_shutdown(state: &AppState) -> bool {
+    local_solo_danger_allowed(state) && state.serve_shutdown.is_some()
+}
+
+/// `server/shutdown`: stop this `octos serve` exactly as Ctrl+C would.
+fn handle_server_shutdown(state: &AppState) -> Result<Value, RpcError> {
+    let Some(stop) = state
+        .serve_shutdown
+        .clone()
+        .filter(|_| supports_server_shutdown(state))
+    else {
+        return Err(
+            RpcError::invalid_request("server/shutdown is not available on this server")
+                .with_data(json!({ "kind": "server_shutdown_unavailable" })),
+        );
+    };
+    tracing::warn!("server/shutdown requested by a UI Protocol client; stopping");
+    // Acknowledge first. The stop drains every connection, so flipping the
+    // switch synchronously could close this socket before the reply is
+    // written. The flip is scheduled 250 ms from handling this request, while
+    // the WS loop writes the reply after we return: if this connection's
+    // outbound queue is backed up past that, the client may never read the
+    // ack. Harmless — the server still stops, and a repeated call is
+    // idempotent.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        stop.send_replace(true);
+    });
+    Ok(json!({ "stopping": true }))
 }
 
 /// Whether this server is a genuine local single-user box that may opt into
@@ -18289,6 +18412,7 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
             Ok(json!({ "capabilities": features.advertised_capabilities(state) }))
         }
+        APPUI_METHOD_SERVER_SHUTDOWN => handle_server_shutdown(state),
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
         }
@@ -18773,6 +18897,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
     if matches!(
         method,
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+            | APPUI_METHOD_SERVER_SHUTDOWN
             | APPUI_METHOD_SESSION_STATUS_READ
             | APPUI_METHOD_PROFILE_LLM_CATALOG
             | APPUI_METHOD_PROFILE_LLM_LIST
@@ -18843,6 +18968,7 @@ fn session_ingress_callable_method(method: &str) -> bool {
     !matches!(
         method,
         APPUI_METHOD_PROFILE_LOCAL_CREATE
+            | APPUI_METHOD_SERVER_SHUTDOWN
             | octos_core::ui_protocol::methods::SESSION_LIST
             | octos_core::ui_protocol::methods::SYSTEM_STATUS_GET
             | octos_core::ui_protocol::methods::CONTENT_LIST
@@ -22304,6 +22430,12 @@ async fn handle_review_start(
             return;
         }
     };
+    // UPCR-2026-031: a client-chosen review turn id is being admitted from
+    // here until the registry insert below.
+    let _admission = params
+        .turn_id
+        .as_ref()
+        .map(|turn_id| TurnAdmission::enter(&params.session_id, turn_id));
     let scoped_profile_id = match validate_session_scope(
         &params.session_id,
         params.profile_id.as_deref(),
@@ -22826,6 +22958,12 @@ async fn handle_turn_start_with_accept(
     accept_result: Value,
     pre_admitted_voice: Option<PreAdmittedVoice>,
 ) -> bool {
+    // UPCR-2026-031: while this start is being admitted (it is not in the
+    // registry yet), `turn/state/get` must not report the turn as certainly
+    // not running. Keyed by the ids exactly as the client sent them, which is
+    // how it later asks about the turn.
+    let _admission = TurnAdmission::enter(&params.session_id, &params.turn_id);
+    let raw_session_id = params.session_id.clone();
     // UPCR-2026-015 (M9-β-1): if the client carried a `topic` field
     // alongside the session_id, fold it into the resolved SessionKey
     // BEFORE scope validation. The rest of the turn pipeline keys
@@ -22851,6 +22989,12 @@ async fn handle_turn_start_with_accept(
         let base = params.session_id.base_key().to_owned();
         params.session_id = SessionKey(format!("{base}#{topic}"));
     }
+    // UPCR-2026-031: `turn/state/get` takes no topic, so a topic client asks
+    // by the FOLDED id the registry uses — mark that key as admitting too.
+    let _folded_admission = (params.session_id.0 != raw_session_id.0)
+        .then(|| TurnAdmission::enter(&params.session_id, &params.turn_id));
+    #[cfg(test)]
+    turn_admission_test_pause(&params.turn_id).await;
 
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
         send_scope_error(ws, id, error);
@@ -23135,6 +23279,78 @@ async fn handle_turn_start_with_accept(
     }
     let _ = start_tx.send(());
     true
+}
+
+/// Turn starts currently being admitted in this process (`turn/start`,
+/// `review/start`, goal continuations), keyed `(session_id, turn_id)` — for a
+/// topic turn under both the raw and the folded session id. Between request
+/// receipt and the active-turn registry insert a turn is in no registry and no
+/// ledger; this set keeps `turn/state/get` (UPCR-2026-031) from calling such a
+/// turn "certainly not running". The certainty is per process: a restarted
+/// process starts with this set and the registry empty, which is exactly why
+/// it may say a turn lost across the restart is not running.
+static TURN_ADMISSIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String), usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Test seam: lets a test hold a real `turn/start` inside its admission
+/// window (after the marker is set, before the registry insert).
+/// `turn_id` -> (reached, release) for [`turn_admission_test_pause`].
+#[cfg(test)]
+pub(crate) type TurnAdmissionTestPauses = std::sync::Mutex<
+    std::collections::HashMap<String, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+>;
+
+#[cfg(test)]
+pub(crate) static TURN_ADMISSION_TEST_PAUSES: std::sync::LazyLock<TurnAdmissionTestPauses> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+async fn turn_admission_test_pause(turn_id: &TurnId) {
+    let pause = TURN_ADMISSION_TEST_PAUSES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&turn_id.0.to_string());
+    if let Some((reached, release)) = pause {
+        reached.notify_one();
+        release.notified().await;
+    }
+}
+
+/// RAII marker for one in-flight `turn/start` admission.
+pub(crate) struct TurnAdmission {
+    key: (String, String),
+}
+
+impl TurnAdmission {
+    pub(crate) fn enter(session_id: &SessionKey, turn_id: &TurnId) -> Self {
+        let key = (session_id.0.clone(), turn_id.0.to_string());
+        *TURN_ADMISSIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(key.clone())
+            .or_default() += 1;
+        Self { key }
+    }
+
+    pub(crate) fn in_progress(session_id: &SessionKey, turn_id: &TurnId) -> bool {
+        TURN_ADMISSIONS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&(session_id.0.clone(), turn_id.0.to_string()))
+    }
+}
+
+impl Drop for TurnAdmission {
+    fn drop(&mut self) {
+        let mut admissions = TURN_ADMISSIONS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = admissions.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                admissions.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// Outcome of the `turn/steer` registry decision (computed under the
@@ -23538,6 +23754,8 @@ async fn maybe_spawn_appui_master_continuation_runner(
     }
 
     let turn_id = TurnId::new();
+    // UPCR-2026-031: admitted from here until the registry insert below.
+    let _admission = TurnAdmission::enter(&session_id, &turn_id);
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
     let interrupt_tx = Arc::new(TokioMutex::new(Some(interrupt_tx)));
@@ -26547,10 +26765,15 @@ async fn handle_turn_state_get(
         }
     }
 
-    // Look up in the active-turn registry first.
-    let registry_state = {
+    // Look up in the active-turn registry first. UPCR-2026-031: whether a
+    // start for this turn is mid-admission is read under the SAME registry
+    // lock — an admission inserts under this lock before dropping its marker,
+    // so a start that finishes on another connection is seen either as
+    // admitting or as registered, never as neither.
+    let (registry_state, admitting) = {
         let registry = active_turns.lock().await;
-        if let Some(entry) = registry.get(&params.session_id) {
+        let admitting = TurnAdmission::in_progress(&params.session_id, &params.turn_id);
+        let registry_state = if let Some(entry) = registry.get(&params.session_id) {
             if entry.turn_id == params.turn_id {
                 let state = entry.state.lock().await;
                 Some(turn_state_to_lifecycle(&state))
@@ -26559,7 +26782,8 @@ async fn handle_turn_state_get(
             }
         } else {
             None
-        }
+        };
+        (registry_state, admitting)
     };
 
     // Pull the ledger projection so we can backfill thread_id /
@@ -26627,6 +26851,18 @@ async fn handle_turn_state_get(
             (None, None) => (TurnLifecycleState::Unknown, None, None, None),
         };
 
+    // UPCR-2026-031: a turn this process neither holds, nor recorded, nor is
+    // admitting right now is certainly not running here. Only claimed when
+    // the session manager could vouch for the session (headless callers keep
+    // the plain UPCR-2026-011 `unknown`).
+    // A failed ledger read leaves `projection` as `None`: that is not proof of
+    // "no record", so the certainty is withheld.
+    let running = (sessions.is_some()
+        && registry_state.is_none()
+        && projection.as_ref().is_some_and(|p| p.state.is_none())
+        && !admitting)
+        .then_some(false);
+
     let result = TurnStateGetResult {
         session_id: params.session_id,
         turn_id: params.turn_id,
@@ -26637,6 +26873,7 @@ async fn handle_turn_state_get(
         completed_at,
         thread_id,
         committed_seqs,
+        running,
     };
     send_serialized_rpc_result(
         ws,
@@ -40721,18 +40958,20 @@ fn frame_text_within_cap(text: String) -> Option<String> {
 ///   1. Parse the frame JSON. Parse failure -> return the original unchanged;
 ///      [`frame_text_within_cap`] then drops it (returns `None`) because it is
 ///      still over cap and cannot be rewritten.
-///   2. Find the LARGEST string field (the dominant payload) by JSON-escaped
-///      length, descending recursively into objects/arrays.
-///   3. Rewrite that field to a head+tail preview: keep the first H and last T
+///   2. Collect every string field by JSON-escaped length, tagged with a
+///      [`FieldTier`] (reasoning < tool I/O < conversation text), and cut the
+///      lowest tier first, all of its over-cap fields to one shared cap, so a
+///      reply is only shortened when reasoning and tool output cannot absorb
+///      the excess, and no field is ever blanked.
+///   3. Rewrite each cut field to a head+tail preview: keep the first H and last T
 ///      bytes (UTF-8 char-boundary safe — never split a codepoint), drop the
 ///      middle, insert `\n…… [<N> bytes truncated] ……\n` between head and
 ///      tail (N = dropped byte count of the ORIGINAL field). The field's
 ///      budget is computed by ESCAPED length so the rewritten frame is
-///      provably under the target. Already-previewed field PATHS are tracked
-///      in a `HashSet` so each is rewritten at most once (idempotent, no
-///      content-sniffing).
-///   4. Re-serialize; if still over (multiple dominant fields), truncate the
-///      next-largest field too; repeat until under cap.
+///      provably under the target. A field already carrying the marker is not
+///      collected again, so a frame is never previewed twice.
+///   4. Serialize once to verify; only if still over target fall through to
+///      the structural case.
 ///   5. STRUCTURAL case: if no string field can be further truncated but the
 ///      frame is still over target, find the LARGEST JSON array and drop its
 ///      middle/trailing elements (keeping valid JSON — elements are simply
@@ -40782,42 +41021,53 @@ fn preview_oversized_frame(text: String) -> String {
         return serde_json::to_string(&value).unwrap_or(text);
     }
 
-    // Pass 1: collect all truncatable strings, largest first.
-    let mut candidates: Vec<(Vec<PathSeg>, usize, usize)> = Vec::new();
+    // Pass 1: collect every truncatable string with its value tier, then cut
+    // tier by tier — reasoning, then tool I/O, then everything else (replies,
+    // prompts) — so a reply is only touched when the cheaper tiers cannot
+    // absorb the excess. Within a tier every field is capped at ONE shared
+    // escaped length (water-filling): fields under the cap stay whole, fields
+    // over it become head+tail previews of the cap. No field is ever blanked,
+    // which the old largest-first loop did whenever the rest of the frame was
+    // still over target (its leftover budget for the biggest field was 0).
+    let mut candidates: Vec<TruncationCandidate> = Vec::new();
     let mut path: Vec<PathSeg> = Vec::new();
-    collect_truncatable_strings(&value, &mut path, &mut candidates);
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+    collect_truncatable_strings(&value, &mut path, FieldTier::Content, &mut candidates);
 
     let mut running_len = initial_len;
-    for (path, field_escaped_len, field_raw_len) in &candidates {
+    for tier in [FieldTier::Reasoning, FieldTier::ToolIo, FieldTier::Content] {
         if running_len <= TRUNCATED_FRAME_TARGET_BYTES {
             break;
         }
-        // Overhead = current frame minus this field's escaped contribution
-        // (escaped bytes + two surrounding quote bytes).
-        let overhead = running_len.saturating_sub(field_escaped_len + 2);
-        let field_escaped_budget = TRUNCATED_FRAME_TARGET_BYTES
-            .saturating_sub(overhead)
-            .saturating_sub(2);
-        let preview = match build_head_tail_preview(
-            field_at_path(&value, path)
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-            *field_raw_len,
-            field_escaped_budget,
-        ) {
-            Some(preview) => preview,
-            None => UNPREVIEWABLE_STUB.to_owned(),
+        let excess = running_len - TRUNCATED_FRAME_TARGET_BYTES;
+        let tier_sizes: Vec<usize> = candidates
+            .iter()
+            .filter(|c| c.tier == tier)
+            .map(|c| c.escaped_len)
+            .collect();
+        let Some(cap) = shared_field_cap(&tier_sizes, excess, tier.min_preview_escaped_bytes())
+        else {
+            continue;
         };
-        // Running estimate: new field escaped length is at most the budget
-        // we handed out (marker reserve included); estimate conservatively
-        // with the actual preview's escaped length instead — one cheap
-        // scan, no serialization.
-        let new_escaped = json_escaped_len_bytes(preview.as_bytes());
-        if !set_field_at_path(&mut value, path, Value::String(preview)) {
-            return text;
+        for candidate in candidates
+            .iter()
+            .filter(|c| c.tier == tier && c.escaped_len > cap)
+        {
+            let preview = build_head_tail_preview(
+                field_at_path(&value, &candidate.path)
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                candidate.raw_len,
+                cap,
+            )
+            // Unreachable: the cap never drops below the tier's floor, which
+            // always holds the marker plus a head and a tail.
+            .unwrap_or_else(|| UNPREVIEWABLE_STUB.to_owned());
+            let new_escaped = json_escaped_len_bytes(preview.as_bytes());
+            if !set_field_at_path(&mut value, &candidate.path, Value::String(preview)) {
+                return text;
+            }
+            running_len = running_len - candidate.escaped_len + new_escaped;
         }
-        running_len = overhead + 2 + new_escaped;
     }
 
     // Structural fallback: strings alone could not fit (or did, and this
@@ -40857,34 +41107,116 @@ fn preview_oversized_frame(text: String) -> String {
     }
 }
 
-/// Single-walk collection of every truncatable string field: same
-/// eligibility rules as `collect_truncatable_strings` (large enough to be
-/// worth truncating, not already carrying the full truncation-marker
-/// sentinel) but gathers ALL candidates (path, escaped len, raw len) in
-/// one pass instead of re-walking per truncation round.
+/// How much a string field is worth keeping whole when a frame must shrink.
+/// Cut in declaration order: a model's reasoning trace first, then tool
+/// arguments/output (recoverable by re-running, and usually the bulk), and
+/// only then conversation text such as assistant replies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FieldTier {
+    Reasoning,
+    ToolIo,
+    Content,
+}
+
+impl FieldTier {
+    /// Tier of the value under `key` in an object, given the object's own tier
+    /// and whether it is a tool message (`"role": "tool"`). A nested value
+    /// never ranks above its container.
+    fn for_key(key: &str, container: FieldTier, in_tool_message: bool) -> FieldTier {
+        let own = match key {
+            "reasoning_content" | "reasoning" | "thinking" => FieldTier::Reasoning,
+            "arguments" | "output" | "stdout" | "stderr" | "tool_output" => FieldTier::ToolIo,
+            "content" if in_tool_message => FieldTier::ToolIo,
+            _ => FieldTier::Content,
+        };
+        own.min(container)
+    }
+}
+
+/// One string field that may be cut to a head+tail preview.
+struct TruncationCandidate {
+    path: Vec<PathSeg>,
+    escaped_len: usize,
+    raw_len: usize,
+    tier: FieldTier,
+}
+
+impl FieldTier {
+    /// Smallest escaped length a field of this tier is ever cut to (marker
+    /// included). Reasoning and tool I/O may shrink to a short head+tail
+    /// glimpse — a long session has hundreds of them, and a larger floor
+    /// leaves the frame over target, which drops whole messages in the
+    /// structural fallback. Conversation text keeps ~1 KiB.
+    fn min_preview_escaped_bytes(self) -> usize {
+        MARKER_ESCAPED_RESERVE_BYTES
+            + match self {
+                FieldTier::Reasoning | FieldTier::ToolIo => 256,
+                FieldTier::Content => 1024,
+            }
+    }
+}
+
+/// The largest shared escaped-length cap (at least `floor`) that, applied to
+/// every field in `sizes`, saves at least `excess` bytes. When even `floor`
+/// cannot save that much, returns `floor` (cut this tier as far as it goes and
+/// let the next tier absorb the rest). `None` when no field is over `floor`.
+fn shared_field_cap(sizes: &[usize], excess: usize, floor: usize) -> Option<usize> {
+    let savings = |cap: usize| -> usize { sizes.iter().map(|&len| len.saturating_sub(cap)).sum() };
+    let largest = sizes.iter().copied().max()?;
+    if largest <= floor {
+        return None;
+    }
+    if savings(floor) <= excess {
+        return Some(floor);
+    }
+    // savings() falls as the cap rises; find the highest cap that still saves
+    // `excess`. Invariant: savings(lo) >= excess, savings(hi) < excess.
+    let (mut lo, mut hi) = (floor, largest);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if savings(mid) >= excess {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(lo)
+}
+
+/// Single-walk collection of every truncatable string field (large enough to
+/// be worth truncating, not already carrying the full truncation-marker
+/// sentinel), tagged with its [`FieldTier`].
 fn collect_truncatable_strings(
     value: &Value,
     path: &mut Vec<PathSeg>,
-    out: &mut Vec<(Vec<PathSeg>, usize, usize)>,
+    tier: FieldTier,
+    out: &mut Vec<TruncationCandidate>,
 ) {
     match value {
         Value::String(s) => {
             let escaped = json_escaped_len_bytes(s.as_bytes());
             if escaped > MARKER_ESCAPED_RESERVE_BYTES && !contains_full_truncation_marker(s) {
-                out.push((path.clone(), escaped, s.len()));
+                out.push(TruncationCandidate {
+                    path: path.clone(),
+                    escaped_len: escaped,
+                    raw_len: s.len(),
+                    tier,
+                });
             }
         }
         Value::Array(items) => {
             for (idx, item) in items.iter().enumerate() {
                 path.push(PathSeg::Index(idx));
-                collect_truncatable_strings(item, path, out);
+                collect_truncatable_strings(item, path, tier, out);
                 path.pop();
             }
         }
         Value::Object(map) => {
+            let in_tool_message = map.get("role").and_then(Value::as_str) == Some("tool");
             for (key, item) in map {
                 path.push(PathSeg::Key(key.clone()));
-                collect_truncatable_strings(item, path, out);
+                let child_tier = FieldTier::for_key(key, tier, in_tool_message);
+                collect_truncatable_strings(item, path, child_tier, out);
                 path.pop();
             }
         }

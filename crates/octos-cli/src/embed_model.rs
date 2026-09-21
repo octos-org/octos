@@ -77,6 +77,16 @@ pub fn downloads_allowed(config_flag: Option<bool>) -> bool {
 /// `download` is true. Returns the model path. Fails when the file is absent
 /// and downloading is not allowed, or when the download does not verify.
 pub fn ensure_default_model(data_dir: &Path, download: bool) -> Result<PathBuf> {
+    ensure_default_model_with(data_dir, download, download_default_model)
+}
+
+/// [`ensure_default_model`] with the fetch injected, so the concurrency
+/// contract can be tested without downloading 300 MB.
+fn ensure_default_model_with(
+    data_dir: &Path,
+    download: bool,
+    fetch: impl FnOnce(&Path) -> Result<()>,
+) -> Result<PathBuf> {
     let status = model_status(data_dir);
     if status.complete {
         return Ok(status.path);
@@ -98,7 +108,26 @@ pub fn ensure_default_model(data_dir: &Path, download: bool) -> Result<PathBuf> 
             status.path.display()
         );
     }
-    download_default_model(&status.path)?;
+    // Serialize fetches within this process. The `.part.<pid>` suffix already
+    // keeps separate processes apart, but threads in one process share a pid,
+    // so without this lock two overlapping first-use calls — parallel tests, or
+    // a gateway starting several profiles — write the same part file, and
+    // `File::create` truncates it under the other writer. Each download still
+    // passes its own hash (it hashes what it streamed, not the file on disk),
+    // so the corrupt file is renamed into place and llama.cpp aborts the whole
+    // process loading it. A poisoned lock is recovered: the guard protects no
+    // data, only ordering.
+    static FETCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = FETCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Re-check under the lock: whoever held it may have just finished, and
+    // then there is nothing left to fetch.
+    let status = model_status(data_dir);
+    if status.complete {
+        return Ok(status.path);
+    }
+    fetch(&status.path)?;
     Ok(status.path)
 }
 
@@ -207,6 +236,52 @@ mod tests {
         assert!(
             err.to_string().contains("automatic download is disabled"),
             "{err}"
+        );
+    }
+
+    /// Parallel callers in ONE process must never fetch at the same time.
+    /// Every fetch writes the same `<model>.gguf.part.<pid>` file — the pid
+    /// separates processes, not threads — and `File::create` truncates it, so
+    /// two overlapping fetches interleave into a corrupt file. Each still passes
+    /// its own SHA-256 check (it hashes the bytes IT streamed, not the file on
+    /// disk), renames the garbage into place, and llama.cpp then aborts the
+    /// whole process loading it: `GGML_ASSERT(!key.empty())`. That is the
+    /// intermittent octos-cli CI crash, and a real first-run crash for any
+    /// process that builds two embedders at once.
+    #[test]
+    fn should_never_run_two_fetches_at_once_when_callers_race() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let data_dir = dir.path().to_path_buf();
+                let (in_flight, max_in_flight, barrier) =
+                    (in_flight.clone(), max_in_flight.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_default_model_with(&data_dir, true, |_| {
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_in_flight.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(50));
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(
+            max_in_flight.load(Ordering::SeqCst),
+            1,
+            "two fetches overlapped — they would share and corrupt one .part file"
         );
     }
 

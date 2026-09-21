@@ -631,9 +631,9 @@ write_octos_service() {
         <string>$PORT</string>
         <string>--host</string>
         <string>0.0.0.0</string>
-        <string>--auth-token</string>
-        <string>$AUTH_TOKEN</string>
     </array>
+    <!-- #2371: the token travels via OCTOS_AUTH_TOKEN below, never argv —
+         ProgramArguments are readable by any local process via ps. -->
     <!--
       UserName: prefer SUDO_USER (the operator who invoked sudo) over `whoami`.
       When this installer is run as `sudo ./install.sh`, `whoami` resolves to
@@ -699,7 +699,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$(whoami)
-ExecStart=$OCTOS_BIN serve --port $PORT --host 0.0.0.0 --auth-token $AUTH_TOKEN
+# #2371: the token travels via OCTOS_AUTH_TOKEN below, never argv —
+# ExecStart is readable by any local user via systemctl cat / ps.
+ExecStart=$OCTOS_BIN serve --port $PORT --host 0.0.0.0
 Restart=on-failure
 RestartSec=5
 Environment=HOME=$HOME
@@ -731,7 +733,7 @@ EOF
 
         *)
             warn "octos serve service setup not supported on $OS"
-            hint "Run manually: $OCTOS_BIN serve --port $PORT --host 0.0.0.0 --auth-token $AUTH_TOKEN"
+            hint "Run manually: OCTOS_AUTH_TOKEN=$AUTH_TOKEN $OCTOS_BIN serve --port $PORT --host 0.0.0.0"
             ;;
     esac
 }

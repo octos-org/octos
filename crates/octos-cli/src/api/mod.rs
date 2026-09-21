@@ -372,6 +372,13 @@ pub struct AppState {
     /// configs never set) is the primary defence; the handlers additionally
     /// reject any request carrying proxy-forwarding headers.
     pub solo_login_enabled: bool,
+    /// The HTTP serve's stop switch — the same `watch` channel the SIGINT /
+    /// SIGTERM watcher flips, so the `server/shutdown` UI Protocol method ends
+    /// the process through exactly the path Ctrl+C takes: stop accepting,
+    /// drain, stop every gateway child. `None` everywhere but HTTP `serve`: a
+    /// `--stdio` server is owned by the client that spawned it, and tests and
+    /// the gateway build no serve loop to stop.
+    pub serve_shutdown: Option<Arc<tokio::sync::watch::Sender<bool>>>,
     /// `--danger-full-access`: sessions with NO explicit `/permissions`
     /// selection default to the dangerous full-access profile (sandbox off,
     /// network allowed, approvals never) instead of the gated
@@ -529,6 +536,7 @@ impl AppState {
             deployment_mode: crate::config::DeploymentMode::Local,
             pairing: None,
             solo_login_enabled: false,
+            serve_shutdown: None,
             dangerous_default_permissions: false,
             default_network_denied: false,
             llm_compaction: false,

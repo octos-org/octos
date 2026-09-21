@@ -475,10 +475,11 @@ enum ServeLiveness {
     /// which a serve could finish starting, restore pre-append state, and
     /// overwrite the operator's transition from its stale live cache. With
     /// the guard held, a serve starting inside that window cannot take its
-    /// startup lock — serve try_locks exactly once and fails closed with
-    /// `DATA_DIR_LOCKED_MARKER` before opening any store — so it never
-    /// restores a pre-append snapshot: a one-shot startup refusal instead
-    /// of a silent overwrite.
+    /// startup lock — serve only retries contention on a short budget
+    /// (#2357) and fails closed with `DATA_DIR_LOCKED_MARKER` before opening
+    /// any store if we are still holding it — so it never restores a
+    /// pre-append snapshot: a bounded-wait startup refusal instead of a
+    /// silent overwrite.
     Offline(std::fs::File),
     Live,
 }
@@ -1379,11 +1380,13 @@ mod tests_2116_readonly {
     /// append. `serve_liveness` used to probe try_lock→unlock and the append
     /// then ran unlocked: a serve finishing startup in that ms-scale window
     /// restored pre-append state and its live cache could overwrite the
-    /// operator's transition. With the lock held, a starting serve instead
-    /// fails closed on its one-shot try_lock (`DATA_DIR_LOCKED_MARKER`)
-    /// before opening any store, so it can never restore the stale
-    /// snapshot. The probe fires at the append point and must observe the
-    /// same contention a starting serve would.
+    /// operator's transition. With the lock held, a starting serve now waits
+    /// out its short contention budget (#2357) and then either boots reading
+    /// the post-append state (the common case — the append completes before
+    /// release) or fails closed with `DATA_DIR_LOCKED_MARKER` before opening
+    /// any store, so it can never restore the stale snapshot. The probe fires
+    /// at the append point and must observe the same contention a starting
+    /// serve would.
     #[test]
     fn goal_operator_offline_append_holds_serve_lock() {
         let temp = tempfile::tempdir().expect("tempdir");

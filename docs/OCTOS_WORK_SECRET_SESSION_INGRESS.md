@@ -42,7 +42,10 @@ ws://127.0.0.1:50080/v1/session_ingress/ws/dspfac:local:tui%23coding
 ```
 
 Pass `session_ingress_token` as `Authorization: Bearer <token>`. WebSocket
-clients that cannot set headers may use `?session_ingress_token=<token>`.
+clients that cannot set headers may fall back to `?token=<token>`; this query
+form is deprecated (a bearer credential in the request line leaks into
+intermediary access logs) and its use is logged server-side. The former
+`_token` / `session_ingress_token` query aliases were removed.
 
 The socket speaks the normal UI Protocol v1 JSON-RPC frames. The server
 revalidates the grant before every client frame and rejects any method whose
@@ -74,10 +77,12 @@ async def main():
     ws_base = api.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
     url = (
         f"{ws_base}/v1/session_ingress/ws/{quote(SESSION_ID, safe=':@')}"
-        f"?session_ingress_token={quote(secret['session_ingress_token'], safe='')}"
-        "&ui_feature=auxiliary.rest_to_ws.v1"
+        "?ui_feature=auxiliary.rest_to_ws.v1"
     )
-    async with websockets.connect(url) as ws:
+    headers = {"Authorization": f"Bearer {secret['session_ingress_token']}"}
+    # `additional_headers` needs websockets >= 14; older releases take
+    # the same dict as `extra_headers=`.
+    async with websockets.connect(url, additional_headers=headers) as ws:
         await ws.send(json.dumps({
             "jsonrpc": "2.0",
             "id": "status-1",

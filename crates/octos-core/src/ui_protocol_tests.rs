@@ -4321,6 +4321,7 @@ fn golden_turn_state_get_result_serde() {
         started_at: Some(sample_persisted_at()),
         completed_at: None,
         thread_id: Some("thread-1".into()),
+        running: None,
         committed_seqs: vec![17, 18, 19],
     };
     let value = serde_json::to_value(&result).expect("serialize");
@@ -4347,6 +4348,7 @@ fn golden_turn_state_get_result_serde() {
             started_at: None,
             completed_at: None,
             thread_id: None,
+            running: None,
             committed_seqs: vec![],
         };
         let v = serde_json::to_value(&r).expect("serialize state");

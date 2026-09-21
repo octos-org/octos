@@ -331,6 +331,12 @@ pub(crate) struct ToolOutputEnvelope {
     pub(crate) model_visible_bytes: usize,
     pub(crate) truncation_reason: Option<ToolOutputTruncationReason>,
     pub(crate) policy_id: String,
+    /// Media the tool handed the model (`ToolResult::model_media`, carried
+    /// on the tool row's `media`). Re-emitted on the prompt row under the
+    /// same `supports_media` policy as user media, so the providers can
+    /// render it; without this the image was dropped on every rebuild.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) media: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2291,12 +2297,16 @@ impl ContextManager {
                     let tool_name = self
                         .tool_name_for_call_id(&tool_call_id)
                         .unwrap_or_else(|| "unknown".to_owned());
-                    ids.push(self.record_tool_output_with_source_ref(
+                    let id = self.record_tool_output_with_source_ref(
                         tool_call_id,
                         tool_name,
                         &message.content,
                         source_ref.clone(),
-                    ));
+                    );
+                    if !message.media.is_empty() {
+                        self.attach_tool_output_media(&id, &message.media);
+                    }
+                    ids.push(id);
                 }
             }
         }
@@ -2394,6 +2404,15 @@ impl ContextManager {
         Some(entry.model_visible_content.clone())
     }
 
+    /// Keep the media a tool handed the model on its recorded output.
+    fn attach_tool_output_media(&mut self, id: &TranscriptItemId, media: &[String]) {
+        if let Some(item) = self.items.iter_mut().rev().find(|item| &item.id == id) {
+            if let TranscriptItemKind::ToolOutput { envelope } = &mut item.kind {
+                envelope.media = media.to_vec();
+            }
+        }
+    }
+
     pub(crate) fn record_tool_output_with_source_ref(
         &mut self,
         tool_call_id: impl Into<String>,
@@ -2467,6 +2486,7 @@ impl ContextManager {
                     model_visible_content,
                     truncation_reason,
                     policy_id: self.tool_output_policy.policy_id.clone(),
+                    media: Vec::new(),
                 },
             },
             source,
@@ -3071,6 +3091,9 @@ impl ContextManager {
                             let mut msg =
                                 message(MessageRole::Tool, envelope.model_visible_content.clone());
                             msg.tool_call_id = Some(call_id.clone());
+                            if policy.supports_media {
+                                msg.media = envelope.media.clone();
+                            }
                             entries.push(PromptMessageEntry::tool_output(
                                 msg,
                                 tool_item_id.clone(),
@@ -5659,6 +5682,7 @@ mod tests {
                     model_visible_bytes: 0,
                     truncation_reason: None,
                     policy_id: String::new(),
+                    media: Vec::new(),
                 }
             })));
         assert!(
@@ -6317,6 +6341,37 @@ mod tests {
                 })
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn tool_output_media_survives_the_prompt_rebuild_when_the_model_takes_media() {
+        let mut manager = ContextManager::new("s", None);
+        manager.record_message(&message(MessageRole::User, "look at grab.png"));
+        manager.record_message(&assistant_tool_call("call_1"));
+        let mut tool = message(MessageRole::Tool, "{\"format\":\"png\"}");
+        tool.tool_call_id = Some("call_1".into());
+        tool.media = vec!["/tmp/grab.png".into()];
+        manager.record_message(&tool);
+        let with_media = manager.for_prompt(&PromptBuildPolicy {
+            supports_media: true,
+            ..PromptBuildPolicy::default()
+        });
+        let row = with_media
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("tool row");
+        assert_eq!(row.media, vec!["/tmp/grab.png".to_string()]);
+        let text_only = manager.for_prompt(&PromptBuildPolicy::default());
+        let row = text_only
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("tool row");
+        assert!(
+            row.media.is_empty(),
+            "a text-only model gets no media on the tool row"
         );
     }
 
