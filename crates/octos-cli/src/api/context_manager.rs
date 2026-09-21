@@ -2370,6 +2370,23 @@ impl ContextManager {
         })
     }
 
+    /// One-line description of what the call behind `tool_call_id` was
+    /// about (file path and line range, command head, grep pattern), from
+    /// the recorded assistant call's arguments. `None` when no call is
+    /// recorded or its arguments carry nothing recognisable.
+    fn tool_target_for_call_id(&self, tool_call_id: &str) -> Option<String> {
+        self.items.iter().rev().find_map(|item| match &item.kind {
+            TranscriptItemKind::AssistantToolCall {
+                call_id,
+                name,
+                arguments,
+            } if call_id == tool_call_id => {
+                octos_agent::compaction::describe_tool_call(name, arguments)
+            }
+            _ => None,
+        })
+    }
+
     pub(crate) fn record_tool_output(
         &mut self,
         tool_call_id: impl Into<String>,
@@ -2444,13 +2461,32 @@ impl ContextManager {
         semantic_group_id: Option<String>,
     ) -> TranscriptItemId {
         let tool_call_id = normalize_tool_call_id(&tool_call_id.into());
+        let tool_name: String = tool_name.into();
         let raw_sha256 = sha256_prefixed(raw_output.as_bytes());
         let original_bytes = raw_output.len();
-        let (model_visible_content, truncation_reason) = truncate_utf8(
+        let (mut model_visible_content, truncation_reason) = truncate_utf8(
             raw_output,
             self.tool_output_policy.model_visible_max_bytes,
             ToolOutputTruncationReason::MaxBytes,
         );
+        if truncation_reason.is_some() {
+            // The bare `[truncated]` floor told the model that something was
+            // cut but not what, how much, or how to get it back — so a careful
+            // model re-read the file in slices (the round-3 GLM pattern). Name
+            // the call, the visible/original sizes and the recall handle.
+            let target = self
+                .tool_target_for_call_id(&tool_call_id)
+                .unwrap_or_else(|| tool_name_for_note(&tool_name));
+            model_visible_content = annotate_truncation(
+                model_visible_content,
+                &truncation_note(
+                    &target,
+                    self.tool_output_policy.model_visible_max_bytes,
+                    original_bytes,
+                    &tool_call_id,
+                ),
+            );
+        }
         let raw_artifact_ref = (truncation_reason.is_some()
             || original_bytes > self.tool_output_policy.inline_raw_threshold_bytes)
             .then(|| format!("tool-output/{raw_sha256}.txt"));
@@ -2477,7 +2513,7 @@ impl ContextManager {
             TranscriptItemKind::ToolOutput {
                 envelope: ToolOutputEnvelope {
                     tool_call_id,
-                    tool_name: tool_name.into(),
+                    tool_name,
                     raw_sha256,
                     raw_artifact_ref,
                     ui_preview,
@@ -3691,13 +3727,23 @@ fn truncate_tool_outputs_for_context_pressure(
         {
             continue;
         }
+        let original_bytes = entry.message.content.len();
         let (content, reason) = truncate_utf8(
             &entry.message.content,
             max_tool_bytes,
             ToolOutputTruncationReason::ContextWindowPressure,
         );
         if reason.is_some() {
-            entry.message.content = content;
+            let call_id = entry.message.tool_call_id.clone().unwrap_or_default();
+            entry.message.content = annotate_truncation(
+                content,
+                &format!(
+                    "[cut to {} of {} for context pressure; `recall` with tool_call_id \"{call_id}\" \
+                     returns the recorded output.]",
+                    human_bytes(max_tool_bytes.min(original_bytes)),
+                    human_bytes(original_bytes),
+                ),
+            );
             for item_id in &entry.source_item_ids {
                 push_unique_item_id(truncated_item_ids, item_id.clone());
             }
@@ -3851,6 +3897,52 @@ fn truncate_utf8(
     let mut truncated = value[..end].to_owned();
     truncated.push_str("\n[truncated]");
     (truncated, Some(reason))
+}
+
+/// Insert `note` before the closing `[truncated]` marker of a
+/// [`truncate_utf8`] result, keeping the marker last so every consumer that
+/// keys on the `[truncated]` suffix still recognises a capped output.
+fn annotate_truncation(truncated: String, note: &str) -> String {
+    match truncated.strip_suffix("\n[truncated]") {
+        Some(body) => format!("{body}\n{note}\n[truncated]"),
+        None => truncated,
+    }
+}
+
+fn human_bytes(n: usize) -> String {
+    if n >= 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn tool_name_for_note(tool_name: &str) -> String {
+    if tool_name.is_empty() || tool_name == "unknown" {
+        "this tool call".to_owned()
+    } else {
+        format!("{tool_name} output")
+    }
+}
+
+/// What the model reads in place of the cut part of a tool output: which
+/// call, how much of it is shown, and the two ways back (`recall` by id,
+/// paged, or a narrower re-run). The bare `[truncated]` floor left the model
+/// guessing at all three, and a careful model answered by re-reading the
+/// whole file in slices on every iteration.
+fn truncation_note(
+    target: &str,
+    shown_bytes: usize,
+    original_bytes: usize,
+    call_id: &str,
+) -> String {
+    format!(
+        "[showing the first {} of {} of {target}. The full output is recorded: call `recall` \
+         with tool_call_id \"{call_id}\" (page=N for later pages), or repeat the call for a \
+         narrower range.]",
+        human_bytes(shown_bytes.min(original_bytes)),
+        human_bytes(original_bytes),
+    )
 }
 
 fn tool_output_preview(value: &str) -> String {
@@ -4977,7 +5069,26 @@ mod tests {
         assert_eq!(envelope.original_bytes, 16);
         assert_eq!(
             envelope.model_visible_bytes,
-            "0123456789\n[truncated]".len()
+            envelope.model_visible_content.len()
+        );
+        // The visible content is the capped prefix, then a note that names
+        // the call, the shown/original sizes and the recall handle, then the
+        // `[truncated]` marker last.
+        assert!(envelope.model_visible_content.starts_with("0123456789\n"));
+        assert!(envelope.model_visible_content.ends_with("\n[truncated]"));
+        assert!(
+            envelope
+                .model_visible_content
+                .contains("showing the first 10 B of 16 B of shell output"),
+            "{}",
+            envelope.model_visible_content
+        );
+        assert!(
+            envelope
+                .model_visible_content
+                .contains("`recall` with tool_call_id \"call_1\""),
+            "{}",
+            envelope.model_visible_content
         );
         assert_eq!(
             envelope.truncation_reason,
@@ -5533,7 +5644,13 @@ mod tests {
             .iter()
             .find(|message| message.role == MessageRole::Tool)
             .expect("tool message");
-        assert_eq!(tool_message.content, "0123456789\n[truncated]");
+        assert!(tool_message.content.starts_with("0123456789\n"));
+        assert!(tool_message.content.ends_with("\n[truncated]"));
+        assert!(
+            tool_message
+                .content
+                .contains("`recall` with tool_call_id \"call_1\"")
+        );
         assert_eq!(
             frame.report.truncated_item_ids.len(),
             1,
@@ -5565,7 +5682,11 @@ mod tests {
             .find(|message| message.role == MessageRole::Tool)
             .expect("tool output should remain");
         assert!(tool_message.content.ends_with("[truncated]"));
-        assert!(tool_message.content.len() < 200);
+        assert!(
+            tool_message.content.matches('x').count() < 200,
+            "the raw output must be cut, not merely annotated"
+        );
+        assert!(tool_message.content.contains("for context pressure"));
         assert!(
             frame.report.truncated_item_ids.contains(&tool_item_id),
             "context-pressure truncation should report the affected tool output item"
