@@ -2220,6 +2220,7 @@ impl Agent {
                 content,
                 tool_files_modified,
                 tool_files_to_send,
+                tool_model_media,
                 tool_tokens,
                 tool_success,
                 tool_structured_metadata,
@@ -2285,6 +2286,14 @@ impl Agent {
                         tool_files_modified.push(file);
                     }
                     let tool_files_to_send = tool_result.files_to_send.clone();
+                    // Media the tool wants the model to see rides on the
+                    // tool message's `media`; each provider renders it in
+                    // its own shape for the current batch (octos_llm::tool_media).
+                    let tool_model_media: Vec<String> = tool_result
+                        .model_media
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
 
                     let output_preview =
                         octos_core::truncated_utf8(&tool_result.output, 200, "...");
@@ -2302,6 +2311,7 @@ impl Agent {
                         tool_result.output,
                         tool_files_modified,
                         tool_files_to_send,
+                        tool_model_media,
                         tool_result.tokens_used,
                         success,
                         tool_result.structured_metadata,
@@ -2357,6 +2367,7 @@ impl Agent {
                         .any(|src| src.is::<crate::tools::ToolInputError>());
                     (
                         format!("Error: {e}"),
+                        Vec::new(),
                         Vec::new(),
                         Vec::new(),
                         None,
@@ -2440,7 +2451,7 @@ impl Agent {
                 Message {
                     role: MessageRole::Tool,
                     content,
-                    media: vec![],
+                    media: tool_model_media,
                     tool_calls: None,
                     tool_call_id: Some(tc_id),
                     reasoning_content: None,
@@ -2706,7 +2717,6 @@ impl Agent {
                 structured_metadata.push(meta);
             }
         }
-
         Ok((
             messages,
             files_modified,
@@ -3609,6 +3619,83 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    /// Returns an image for the model to look at (`model_media`), the way
+    /// `view_image` does.
+    struct SeeingTool {
+        image: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for SeeingTool {
+        fn name(&self) -> &str {
+            "seeing_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that hands the model an image"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "SEEING_TOOL_OUTPUT".to_string(),
+                success: true,
+                model_media: vec![self.image.clone()],
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn should_carry_model_media_on_the_tool_row_and_add_no_other_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("grab.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(SeeingTool {
+            image: image.clone(),
+        });
+        tools.register(InstantTool);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent =
+            Agent::new(AgentId::new("seeing"), provider, tools, memory).with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            });
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![
+                tool_call("call_see", "seeing_tool"),
+                tool_call("call_fast", "fast_tool"),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let (messages, ..) = agent.execute_tools(&response).await.unwrap();
+
+        // Exactly the two tool results: the media is on its row, and the
+        // providers render it from there. No synthetic user row — one
+        // would break role alternation on Anthropic and root a stray
+        // thread in the transcript.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, octos_core::MessageRole::Tool);
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_see"));
+        assert_eq!(messages[0].content, "SEEING_TOOL_OUTPUT");
+        assert_eq!(
+            messages[0].media,
+            vec![image.to_string_lossy().into_owned()]
+        );
+        assert_eq!(messages[1].role, octos_core::MessageRole::Tool);
+        assert!(messages[1].media.is_empty());
     }
 
     /// Sleeps far past the batch ceiling so the batch timeout always fires
