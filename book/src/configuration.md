@@ -81,7 +81,7 @@ The complete configuration structure with all available fields:
   // Adaptive routing
   "adaptive_routing": {
     "enabled": false,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
