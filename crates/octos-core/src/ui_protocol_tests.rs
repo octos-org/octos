@@ -6656,6 +6656,10 @@ fn monitor_error_kinds_are_registered() {
         "monitor_policy_denied"
     );
     assert_eq!(autonomy_error_kinds::MONITOR_FLOODED, "monitor_flooded");
+    assert_eq!(
+        autonomy_error_kinds::MONITOR_INVALID_STATE,
+        "monitor_invalid_state"
+    );
 }
 
 /// #1977 — the monitor notifications roundtrip through `UiNotification`
