@@ -503,18 +503,32 @@ fn parse_session_timeline<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Sessi
 /// record folds exactly as it did pre-marker (a single synthesize pass over the
 /// full transcript).
 fn fold_session_timeline(timeline: Vec<SessionTimelineItem>) -> Vec<Message> {
+    fold_session_timeline_tracking_spill(timeline).0
+}
+
+/// [`fold_session_timeline`] that also reports whether a rollback record asked
+/// for more user turns than the timeline held before it. Over a single
+/// segment that means the marker reaches into rows that live in an earlier
+/// (sealed) segment, so the segment alone cannot say how many rows are
+/// visible.
+fn fold_session_timeline_tracking_spill(
+    timeline: Vec<SessionTimelineItem>,
+) -> (Vec<Message>, bool) {
     let mut messages: Vec<Message> = Vec::new();
+    let mut spilled = false;
     for item in timeline {
         match item {
             SessionTimelineItem::Message(message) => messages.push(*message),
             SessionTimelineItem::Rollback { num_turns, .. } => {
                 synthesize_thread_ids(&mut messages);
-                crate::resume_policy::drop_last_n_user_turns(&mut messages, num_turns);
+                let dropped =
+                    crate::resume_policy::drop_last_n_user_turns(&mut messages, num_turns);
+                spilled |= dropped < num_turns;
             }
         }
     }
     synthesize_thread_ids(&mut messages);
-    messages
+    (messages, spilled)
 }
 
 /// Assemble the ordered `Message` list from a session JSONL's post-meta lines,
@@ -523,6 +537,402 @@ fn fold_session_timeline(timeline: Vec<SessionTimelineItem>) -> Vec<Message> {
 /// [`fold_session_timeline`].
 fn assemble_session_messages<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<Message> {
     fold_session_timeline(parse_session_timeline(lines))
+}
+
+/// One JSONL segment (the active file or a sealed one), read line by line.
+struct SegmentFile {
+    meta: SessionMeta,
+    timeline: Vec<SessionTimelineItem>,
+    bytes: u64,
+}
+
+/// Read a segment without slurping it: the meta line, then every row through
+/// [`parse_session_timeline`]. Returns `None` for a missing/empty file, an
+/// unparsable meta line, or a schema newer than this build understands.
+fn read_segment(path: &Path, key: &SessionKey) -> Option<SegmentFile> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    let bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut reader = BufReader::new(file);
+    let mut meta_line = String::new();
+    if reader.read_line(&mut meta_line).ok()? == 0 {
+        return None;
+    }
+    let meta: SessionMeta = match serde_json::from_str(meta_line.trim_end()) {
+        Ok(meta) => meta,
+        Err(error) => {
+            warn!(key = %key, path = %path.display(), %error, "session meta line unreadable, skipping file");
+            return None;
+        }
+    };
+    if meta.schema_version > CURRENT_SESSION_SCHEMA {
+        warn!(
+            key = %key,
+            path = %path.display(),
+            file_version = meta.schema_version,
+            current_version = CURRENT_SESSION_SCHEMA,
+            "session file has newer schema version, skipping"
+        );
+        return None;
+    }
+    let mut timeline = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim_end_matches(['\n', '\r']);
+                if trimmed.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(control) = serde_json::from_str::<SessionControlRecord>(trimmed) {
+                    let SessionControlRecord::Rollback { num_turns, at } = control;
+                    timeline.push(SessionTimelineItem::Rollback { num_turns, at });
+                } else if let Ok(message) = serde_json::from_str::<Message>(trimmed) {
+                    timeline.push(SessionTimelineItem::Message(Box::new(message)));
+                }
+            }
+            Err(error) => {
+                warn!(key = %key, path = %path.display(), %error, "session file read stopped early");
+                break;
+            }
+        }
+    }
+    Some(SegmentFile {
+        meta,
+        timeline,
+        bytes,
+    })
+}
+
+/// The part of a session's history a load brings into memory.
+struct SessionWindow {
+    /// Meta of the ACTIVE file (current title/summary/contracts).
+    meta: SessionMeta,
+    /// Timelines of the loaded segments, oldest first, ending with the active
+    /// file — ready for one positional fold.
+    timeline: Vec<SessionTimelineItem>,
+    /// Visible messages in the sealed segments that were NOT loaded.
+    base_seq: usize,
+    sealed_segments: u32,
+    loaded_sealed: u32,
+}
+
+/// Load the active file plus as many sealed segments, newest first, as fit
+/// in `budget` bytes. The active file always loads. `u64::MAX` loads all.
+///
+/// Every segment's meta records `base_seq`, the visible count before it, so
+/// the window's `base_seq` is simply that of the oldest segment loaded — no
+/// unloaded file is ever opened to find out.
+fn load_session_window(active: &Path, key: &SessionKey, budget: u64) -> Option<SessionWindow> {
+    let dir = segments_dir(active);
+    let active_file = match read_segment(active, key) {
+        Some(file) => file,
+        None => recover_active_after_seal(active, key, &dir)?,
+    };
+    // The active meta OWNS the sealed count. A segment file beyond it is
+    // residue — a merged segment an interrupted rewrite failed to delete —
+    // and must not load, or the rows it holds would appear twice.
+    let sealed_total = active_file.meta.sealed_segments;
+    let on_disk = sealed_segment_count(&dir);
+    if on_disk > sealed_total {
+        warn!(
+            key = %key,
+            owned = sealed_total,
+            on_disk,
+            "ignoring sealed session segments the active meta does not own"
+        );
+    }
+    let mut spent = active_file.bytes;
+    let mut loaded: Vec<SegmentFile> = Vec::new();
+    let mut base_seq = active_file.meta.base_seq;
+    let mut index = sealed_total;
+    while index >= 1 {
+        let path = segment_path(&dir, index);
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if spent.saturating_add(size) > budget {
+            break;
+        }
+        let Some(segment) = read_segment(&path, key) else {
+            break;
+        };
+        spent = spent.saturating_add(size);
+        base_seq = segment.meta.base_seq;
+        loaded.push(segment);
+        index -= 1;
+    }
+    let loaded_sealed = loaded.len() as u32;
+    let mut timeline = Vec::new();
+    for segment in loaded.into_iter().rev() {
+        timeline.extend(segment.timeline);
+    }
+    timeline.extend(active_file.timeline);
+    Some(SessionWindow {
+        meta: active_file.meta,
+        timeline,
+        base_seq,
+        sealed_segments: sealed_total,
+        loaded_sealed,
+    })
+}
+
+/// Sealing renames the active file and then starts a fresh one; a crash in
+/// between leaves sealed segments with no (or an empty) active file. Rebuild
+/// the active file from the newest sealed segment — its meta carries the
+/// session's identity and its rows say how many are visible before the fresh
+/// file — and write it so listings see the session again and the next append
+/// continues the seq chain. Only a missing or empty active file is rebuilt:
+/// an unreadable one is left for a human, never renamed over.
+fn recover_active_after_seal(active: &Path, key: &SessionKey, dir: &Path) -> Option<SegmentFile> {
+    use std::io::Write;
+    let active_len = std::fs::metadata(active).map(|m| m.len()).ok();
+    if active_len.is_some_and(|len| len > 0) {
+        return None;
+    }
+    let sealed = sealed_segment_count(dir);
+    if sealed == 0 {
+        return None;
+    }
+    let newest = read_segment(&segment_path(dir, sealed), key)?;
+    let template = newest.meta.clone();
+    let base_seq = template.base_seq + fold_session_timeline(newest.timeline).len();
+    let meta = SessionMeta {
+        sealed_segments: sealed,
+        base_seq,
+        updated_at: Utc::now(),
+        ..template
+    };
+    let mut line = serde_json::to_string(&meta).ok()?;
+    line.push('\n');
+    let tmp_path = rewrite_tmp_path(active);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(line.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, active)?;
+        if let Some(parent) = active.parent() {
+            fsync_dir(parent);
+        }
+        Ok(())
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp_path);
+        warn!(key = %key, %error, "could not rebuild the session file after an interrupted seal");
+        return None;
+    }
+    warn!(
+        key = %key,
+        sealed,
+        base_seq,
+        "rebuilt the session file after an interrupted seal"
+    );
+    Some(SegmentFile {
+        meta,
+        timeline: Vec::new(),
+        bytes: line.len() as u64,
+    })
+}
+
+/// Visible messages in the active file plus everything before it — the seq
+/// the next row will get. Read from the active file alone, except when a
+/// rollback marker in it reaches into sealed rows: only the whole history
+/// can say how many of those it removed, so that (rare, and only until the
+/// next rewrite) case folds every segment.
+fn visible_len_from_active(active: &Path, key: &SessionKey) -> Option<usize> {
+    let segment = read_segment(active, key)?;
+    let base_seq = segment.meta.base_seq;
+    let (visible, spilled) = fold_session_timeline_tracking_spill(segment.timeline);
+    if spilled && base_seq > 0 {
+        let window = load_session_window(active, key, u64::MAX)?;
+        return Some(window.base_seq + fold_session_timeline(window.timeline).len());
+    }
+    Some(base_seq + visible.len())
+}
+
+/// Row count for the per-chat listings: rows in the active file (meta line
+/// excluded) plus the visible rows recorded for its sealed segments, without
+/// folding — the same approximation the old per-file count made, now
+/// spanning segments.
+fn listing_message_count(active: &Path) -> usize {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = std::fs::File::open(active) else {
+        return 0;
+    };
+    let mut reader = BufReader::new(file);
+    let mut meta_line = String::new();
+    if reader.read_line(&mut meta_line).unwrap_or(0) == 0 {
+        return 0;
+    }
+    let base = serde_json::from_str::<SessionMeta>(meta_line.trim_end())
+        .map(|m| m.base_seq)
+        .unwrap_or(0);
+    let rows = reader
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    base + rows
+}
+
+/// Append one row to the active file, sealing it first when it has reached
+/// the segment size. `meta_for(sealed_segments, base_seq)` builds the meta
+/// line for a file this call creates; `next_seq` is the seq the appended row
+/// will have, which is what a freshly started file records as its `base_seq`.
+///
+/// Sealing is a rename of the active file into the segments directory plus a
+/// fresh active file whose meta names the new sealed count; that meta line is
+/// fsynced so the rename and the count it implies become durable together. A
+/// crash between the two leaves sealed segments without an active file, which
+/// the loader rebuilds (see [`recover_active_after_seal`]).
+fn append_row_rolling(
+    active: &Path,
+    key: &str,
+    next_seq: usize,
+    meta_for: impl FnOnce(u32, usize) -> SessionMeta,
+    row: &str,
+) -> Result<bool> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .create(true)
+        .append(true)
+        .open(active)?;
+    let mut file_len = file.metadata()?.len();
+    let dir = segments_dir(active);
+    let mut rolled = false;
+    // A fresh file continues whatever segments already exist (none for a new
+    // session). A file that rolls names its successor from its OWN meta: the
+    // directory may also hold residue of an interrupted rewrite, which must
+    // not shift the chain.
+    let mut sealed = sealed_segment_count(&dir);
+
+    if file_len >= session_segment_bytes() {
+        let owned = read_session_meta(active)
+            .map(|meta| meta.sealed_segments)
+            .unwrap_or(sealed);
+        drop(file);
+        std::fs::create_dir_all(&dir)?;
+        let next_index = owned + 1;
+        let sealed_path = segment_path(&dir, next_index);
+        if sealed_path.exists() {
+            warn!(
+                key,
+                segment = next_index,
+                "replacing a sealed session segment the active meta did not own"
+            );
+            std::fs::remove_file(&sealed_path)?;
+        }
+        std::fs::rename(active, &sealed_path)?;
+        fsync_dir(&dir);
+        if let Some(parent) = active.parent() {
+            fsync_dir(parent);
+        }
+        debug!(
+            key,
+            segment = next_index,
+            bytes = file_len,
+            "sealed session segment"
+        );
+        sealed = next_index;
+        rolled = true;
+        file = std::fs::OpenOptions::new()
+            .read(true)
+            .create(true)
+            .append(true)
+            .open(active)?;
+        file_len = 0;
+    }
+
+    if file_len == 0 {
+        let meta = meta_for(sealed, next_seq);
+        writeln!(file, "{}", serde_json::to_string(&meta)?)?;
+        if rolled {
+            file.sync_all()?;
+        }
+    } else {
+        seal_torn_tail(&mut file, file_len)?;
+    }
+    writeln!(file, "{row}")?;
+    Ok(rolled)
+}
+
+/// Rewrite the active file from a session's loaded window: meta plus every
+/// message in `messages`, atomically (tmp + fsync + rename + dir fsync).
+///
+/// Sealed segments the window had merged in are removed afterwards — their
+/// rows now live in the active file — and segments outside the window are
+/// never touched, so a partially loaded session cannot lose history to a
+/// rewrite. Returns the sealed count the rewritten file records.
+fn rewrite_active_from_window(active: &Path, session: &Session, meta: SessionMeta) -> Result<u32> {
+    use std::io::Write;
+    let remaining_sealed = session
+        .sealed_segments
+        .saturating_sub(session.loaded_sealed);
+    let meta = SessionMeta {
+        sealed_segments: remaining_sealed,
+        base_seq: session.base_seq,
+        ..meta
+    };
+    let mut content = serde_json::to_string(&meta)?;
+    content.push('\n');
+    for msg in &session.messages {
+        content.push_str(&serde_json::to_string(msg)?);
+        content.push('\n');
+    }
+    let tmp_path = rewrite_tmp_path(active);
+    let write_result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, active)?;
+        if let Some(dir) = active.parent() {
+            fsync_dir(dir);
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return write_result.map(|_| remaining_sealed);
+    }
+    if session.loaded_sealed > 0 {
+        // The rewritten meta already owns only `remaining_sealed` segments,
+        // so a segment this loop fails to delete is residue the loader
+        // ignores and the next seal replaces — never history read twice.
+        let dir = segments_dir(active);
+        for index in (remaining_sealed + 1)..=session.sealed_segments {
+            let path = segment_path(&dir, index);
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    key = %session.key,
+                    path = %path.display(),
+                    %error,
+                    "merged session segment left behind after rewrite"
+                );
+            }
+        }
+        fsync_dir(&dir);
+    }
+    Ok(remaining_sealed)
+}
+
+/// The meta line of a session file, read without slurping the file.
+fn read_session_meta(path: &Path) -> Option<SessionMeta> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    BufReader::new(file).read_line(&mut first).ok()?;
+    serde_json::from_str(first.trim_end()).ok()
+}
+
+/// Delete a session's sealed segments (with the directory) beside `active`.
+fn remove_segments(active: &Path) {
+    let dir = segments_dir(active);
+    if dir.is_dir() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn record_session_persist(outcome: &'static str) {
@@ -644,6 +1054,15 @@ struct SessionMeta {
     child_contracts: Vec<ChildSessionContract>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    /// How many sealed segments precede this file (see [`segments_dir`]).
+    /// Zero for a session that never rolled — and for every file written
+    /// before segments existed, which is why the field defaults.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    sealed_segments: u32,
+    /// Visible (rollback-folded) messages held by the segments before this
+    /// file: the seq of this file's first row. Zero when nothing precedes it.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    base_seq: usize,
 }
 
 /// A conversation session with message history.
@@ -664,12 +1083,34 @@ pub struct Session {
     pub title_manual: bool,
     /// Durable child-session contracts associated with this session.
     pub child_contracts: Vec<ChildSessionContract>,
+    /// The loaded window of the transcript: every visible message from seq
+    /// `base_seq` onward. Equal to the whole history unless the session is
+    /// larger than the load budget (see [`session_load_budget_bytes`]).
     pub messages: Vec<Message>,
+    /// Visible messages that precede `messages[0]` — they live in sealed
+    /// segments that were not loaded. `base_seq + i` is the committed seq of
+    /// `messages[i]`. Zero for a fully loaded session.
+    pub base_seq: usize,
+    /// Sealed segments on disk when this session was loaded, and how many of
+    /// the newest ones are merged into `messages`. A rewrite folds the merged
+    /// ones back into the active file and leaves the rest untouched.
+    pub(crate) sealed_segments: u32,
+    pub(crate) loaded_sealed: u32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 impl Session {
+    /// Whether older history exists on disk that is not in `messages`.
+    pub fn is_partial(&self) -> bool {
+        self.base_seq > 0
+    }
+
+    /// Seq the NEXT appended message will receive.
+    pub fn next_seq(&self) -> usize {
+        self.base_seq + self.messages.len()
+    }
+
     fn new(key: SessionKey) -> Self {
         let now = Utc::now();
         let topic = key.topic().map(|t| t.to_string());
@@ -682,6 +1123,9 @@ impl Session {
             title_manual: false,
             child_contracts: vec![],
             messages: vec![],
+            base_seq: 0,
+            sealed_segments: 0,
+            loaded_sealed: 0,
             created_at: now,
             updated_at: now,
         }
@@ -850,7 +1294,89 @@ pub struct Thread {
 const DEFAULT_MAX_SESSIONS: usize = 1000;
 
 /// Maximum session file size we'll load (10 MB). Prevents OOM on corrupted/adversarial files.
-const MAX_SESSION_FILE_SIZE: u64 = 10 * 1024 * 1024;
+/// Size at which the ACTIVE session file is sealed and a fresh one started
+/// (see [`segments_dir`]). Overridable with `OCTOS_SESSION_SEGMENT_BYTES`
+/// (minimum 64 KiB, so tests can roll on tiny files).
+///
+/// This replaces the old 10 MB `MAX_SESSION_FILE_SIZE` cliff, at which a
+/// session simultaneously refused every append, loaded as empty and vanished
+/// from listings. A session now grows without bound on disk; what is bounded
+/// is how much of it one file holds and how much a plain load pulls into
+/// memory ([`session_load_budget_bytes`]).
+const SESSION_SEGMENT_BYTES_DEFAULT: u64 = 8 * 1024 * 1024;
+
+/// How many bytes of history a plain load reads into memory: the active file
+/// plus as many sealed segments, newest first, as fit. Sealed segments beyond
+/// the budget stay on disk; `Session::base_seq` says how many visible messages
+/// they hold, so committed seqs stay global. `OCTOS_SESSION_LOAD_BUDGET_BYTES`
+/// overrides it; `0` means unlimited. Full-history callers use
+/// [`SessionManager::load_full`] / [`SessionHandle::open_full`].
+///
+/// Capacity planning: this bounds the file bytes one resident session can
+/// hold, and parsed rows take roughly 1.5–3× their file size, so a process
+/// caching N long sessions needs up to `N × budget × 3` for them. The old
+/// cap put that ceiling at 10 MiB × N; the default keeps it within ~3× of
+/// that while letting a session load whole up to four segments deep.
+const SESSION_LOAD_BUDGET_DEFAULT: u64 = 32 * 1024 * 1024;
+
+fn env_bytes(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+}
+
+fn session_segment_bytes() -> u64 {
+    env_bytes("OCTOS_SESSION_SEGMENT_BYTES")
+        .map(|v| v.max(64 * 1024))
+        .unwrap_or(SESSION_SEGMENT_BYTES_DEFAULT)
+}
+
+/// `u64::MAX` when unlimited.
+fn session_load_budget_bytes() -> u64 {
+    match env_bytes("OCTOS_SESSION_LOAD_BUDGET_BYTES") {
+        Some(0) => u64::MAX,
+        Some(v) => v,
+        None => SESSION_LOAD_BUDGET_DEFAULT,
+    }
+}
+
+/// Directory holding a session's SEALED segments, beside its active file:
+/// `<name>.jsonl` -> `<name>.segments/000001.jsonl`, `000002.jsonl`, …
+/// Each sealed segment is a complete JSONL file (meta line + rows) that any
+/// reader of the old single-file format can open on its own. A directory is
+/// invisible to every listing that walks `*.jsonl` files, which is what keeps
+/// segments from showing up as sessions of their own.
+fn segments_dir(active: &Path) -> PathBuf {
+    active.with_extension("segments")
+}
+
+fn segment_path(dir: &Path, index: u32) -> PathBuf {
+    dir.join(format!("{index:06}.jsonl"))
+}
+
+/// Whether a session exists on disk at `active`: the file itself, or sealed
+/// segments beside it (an interrupted seal can leave only the latter; see
+/// [`recover_active_after_seal`]).
+fn session_file_present(active: &Path) -> bool {
+    active.exists() || segments_dir(active).is_dir()
+}
+
+/// Number of contiguous sealed segments `000001..` present in `dir`.
+fn sealed_segment_count(dir: &Path) -> u32 {
+    let mut n = 0u32;
+    while segment_path(dir, n + 1).is_file() {
+        n += 1;
+    }
+    n
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
 
 /// One row of the title/recency session listing:
 /// `(session_key, message_count, title, updated_at)`. `title` and `updated_at`
@@ -886,6 +1412,38 @@ const LAST_PROMPT_PREVIEW_BYTES: usize = 100;
 /// last line could show a prompt hydrate no longer shows (codex P2). When a
 /// rollback marker is present the timeline is folded first; the common
 /// (unrewound) case stays a cheap O(tail) reverse scan.
+/// [`last_user_prompt_from_jsonl`] over a file, reading its last 256 KiB
+/// first. The whole file is read only when that tail yields nothing — no user
+/// row in it, or a rollback marker there that dropped every user row the tail
+/// held (a marker only ever trims rows BEFORE it, so a user row found after
+/// one is final).
+fn last_user_prompt_from_file(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_BYTES: u64 = 256 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len > TAIL_BYTES {
+        file.seek(SeekFrom::Start(len - TAIL_BYTES)).ok()?;
+        let mut tail = Vec::with_capacity(TAIL_BYTES as usize);
+        file.read_to_end(&mut tail).ok()?;
+        // Skip the line the seek landed inside; this also lands on a UTF-8
+        // boundary, since '\n' never occurs inside a multi-byte sequence.
+        let start = tail
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(tail.len(), |i| i + 1);
+        if let Ok(tail) = std::str::from_utf8(&tail[start..])
+            && let Some(prompt) = last_user_prompt_from_jsonl(tail)
+        {
+            return Some(prompt);
+        }
+        file.seek(SeekFrom::Start(0)).ok()?;
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content).ok()?;
+    last_user_prompt_from_jsonl(&content)
+}
+
 fn last_user_prompt_from_jsonl(content: &str) -> Option<String> {
     // The rollback control record serializes as `{"kind":"rollback",…}`.
     if content.contains("\"rollback\"") {
@@ -1068,18 +1626,10 @@ impl SessionManager {
             if seen.contains(&session_key) {
                 return;
             }
-            // Load the file once (the listing already pays this cost to parse
-            // the first `SessionMeta` line for the title) and reuse the same
-            // in-memory content for both the meta read and the `last_prompt`
-            // preview — no extra I/O beyond the single read.
-            let content = std::fs::read_to_string(path).ok();
-            let (title, meta_updated_at) = content
-                .as_deref()
-                .and_then(|c| {
-                    c.lines()
-                        .next()
-                        .and_then(|first| serde_json::from_str::<SessionMeta>(first).ok())
-                })
+            // Read the meta line and the tail of the file, never the whole
+            // file: a listing runs under the manager lock and a session file
+            // is now allowed to be large (#2392).
+            let (title, meta_updated_at) = read_session_meta(path)
                 .map(|meta| (meta.title, Some(meta.updated_at)))
                 .unwrap_or((None, None));
             // Recency for the `session/list` sort. `SessionMeta.updated_at` is
@@ -1097,9 +1647,9 @@ impl SessionManager {
                 (Some(only), None) | (None, Some(only)) => Some(only),
                 (None, None) => None,
             };
-            // Reuse the already-loaded `content` (no extra I/O) to preview the
-            // session's most recent user prompt for the `/resume` picker.
-            let last_prompt = content.as_deref().and_then(last_user_prompt_from_jsonl);
+            // Preview the session's most recent user prompt for the `/resume`
+            // picker from the file's tail.
+            let last_prompt = last_user_prompt_from_file(path);
             let count = Self::count_lines(path);
             seen.insert(session_key.clone());
             out.push((session_key, count, title, updated_at, last_prompt));
@@ -1260,22 +1810,15 @@ impl SessionManager {
             .is_some_and(|(_, topic)| Self::is_internal_session_topic(topic))
     }
 
-    /// Count lines in a JSONL session file, skipping oversized files.
+    /// Line count for the process-wide listings: meta line + rows in the
+    /// active file, plus the visible rows recorded for its sealed segments.
+    /// (The session-list API documents `message_count` as "1 meta line + N
+    /// rows", so the meta line stays counted.)
     fn count_lines(path: &Path) -> usize {
-        let too_large = path
-            .metadata()
-            .map(|m| m.len() > MAX_SESSION_FILE_SIZE)
-            .unwrap_or(false);
-        if too_large {
+        if !path.is_file() {
             return 0;
         }
-        std::fs::File::open(path)
-            .ok()
-            .map(|f| {
-                use std::io::BufRead;
-                std::io::BufReader::new(f).lines().count()
-            })
-            .unwrap_or(0)
+        1 + listing_message_count(path)
     }
 
     /// Load a session from disk (read-only). Returns None if not found.
@@ -1411,17 +1954,27 @@ impl SessionManager {
             }
         }
 
-        let _ = self.get_or_create(key).await;
-        if let Err(error) = self.append_to_disk(key, &message).await {
-            record_session_persist("failed");
-            return Err(error);
-        }
+        let next_seq = self.get_or_create(key).await.next_seq();
+        let rolled = match self.append_to_disk(key, &message, next_seq).await {
+            Ok(rolled) => rolled,
+            Err(error) => {
+                record_session_persist("failed");
+                return Err(error);
+            }
+        };
         let observer_root = self.data_dir();
         let session = self.get_or_create(key).await;
+        if rolled {
+            // The rows that were just sealed are all in memory, so the new
+            // segment counts as loaded: a later rewrite folds it back.
+            session.sealed_segments += 1;
+            session.loaded_sealed += 1;
+        }
         session.messages.push(message);
         session.updated_at = Utc::now();
         record_session_persist("committed");
-        let committed_seq = session.messages.len().saturating_sub(1);
+        // Global: rows in sealed segments that are not loaded still count.
+        let committed_seq = session.next_seq().saturating_sub(1);
         // UPCR-2026-012: post-commit observer fan-out. Fires AFTER the
         // append_to_disk above succeeded and the in-memory mirror is
         // updated, so a `message/persisted` notification reflects a row
@@ -1671,6 +2224,29 @@ impl SessionManager {
     /// Checks the legacy flat layout first, then the per-user directory layout.
     /// Uses spawn_blocking to avoid blocking the async runtime.
     async fn load_from_disk(&self, key: &SessionKey) -> Option<Session> {
+        self.load_from_disk_with_budget(key, session_load_budget_bytes())
+            .await
+    }
+
+    /// Load the WHOLE history, ignoring the load budget. For callers that
+    /// must see every message (rollback across segments, transcript export).
+    pub async fn load_full(&self, key: &SessionKey) -> Option<Session> {
+        self.load_from_disk_with_budget(key, u64::MAX).await
+    }
+
+    /// Replace the cached copy of `key` with a full-history load when the
+    /// resident one is a partial window. No-op when it is already complete.
+    pub async fn ensure_full_history(&mut self, key: &SessionKey) {
+        let partial = self.cache.peek(&key.0).is_some_and(Session::is_partial);
+        if !partial {
+            return;
+        }
+        if let Some(full) = self.load_full(key).await {
+            self.cache.put(key.0.clone(), full);
+        }
+    }
+
+    async fn load_from_disk_with_budget(&self, key: &SessionKey, budget: u64) -> Option<Session> {
         let flat_path = self.session_path(key);
         let base_key = key.base_key();
         let encoded_base = encode_path_component(base_key);
@@ -1686,7 +2262,7 @@ impl SessionManager {
             .join("sessions")
             .join(format!("{encoded_topic}.jsonl"));
 
-        if !flat_path.exists() && !per_user_path.exists() {
+        if !session_file_present(&flat_path) && !session_file_present(&per_user_path) {
             return None;
         }
 
@@ -1701,48 +2277,21 @@ impl SessionManager {
             fn parse_session_file(
                 path: &Path,
                 key: &SessionKey,
-            ) -> Option<(SessionMeta, Vec<SessionTimelineItem>)> {
-                // Guard against oversized files to prevent OOM
-                if let Ok(file_meta) = std::fs::metadata(path) {
-                    if file_meta.len() > MAX_SESSION_FILE_SIZE {
-                        warn!(
-                            key = %key,
-                            path = %path.display(),
-                            size = file_meta.len(),
-                            limit = MAX_SESSION_FILE_SIZE,
-                            "session file too large, skipping"
-                        );
-                        return None;
-                    }
-                }
-
-                let content = std::fs::read_to_string(path).ok()?;
-                let mut lines = content.lines();
-
-                let meta_line = lines.next()?;
-                let meta: SessionMeta = serde_json::from_str(meta_line).ok()?;
-
-                if meta.schema_version > CURRENT_SESSION_SCHEMA {
-                    warn!(
-                        key = %key,
-                        path = %path.display(),
-                        file_version = meta.schema_version,
-                        current_version = CURRENT_SESSION_SCHEMA,
-                        "session file has newer schema version, skipping"
-                    );
-                    return None;
-                }
-
-                Some((meta, parse_session_timeline(lines)))
+                budget: u64,
+            ) -> Option<SessionWindow> {
+                load_session_window(path, key, budget)
             }
 
             // Fold a single file's timeline into a `Session` (per-user only or
             // legacy flat only — the marker application is unambiguous).
-            fn session_from(
-                meta: SessionMeta,
-                messages: Vec<Message>,
-                key: &SessionKey,
-            ) -> Session {
+            fn session_from(window: SessionWindow, key: &SessionKey) -> Session {
+                let SessionWindow {
+                    meta,
+                    timeline,
+                    base_seq,
+                    sealed_segments,
+                    loaded_sealed,
+                } = window;
                 Session {
                     key: key.clone(),
                     parent_key: meta.parent_key.map(SessionKey),
@@ -1751,23 +2300,39 @@ impl SessionManager {
                     title: meta.title,
                     title_manual: meta.title_manual,
                     child_contracts: meta.child_contracts,
-                    messages,
+                    messages: fold_session_timeline(timeline),
+                    base_seq,
+                    sealed_segments,
+                    loaded_sealed,
                     created_at: meta.created_at,
                     updated_at: meta.updated_at,
                 }
             }
 
-            let flat = flat_path
-                .exists()
-                .then(|| parse_session_file(&flat_path, &key_clone))
+            let flat = session_file_present(&flat_path)
+                .then(|| parse_session_file(&flat_path, &key_clone, budget))
                 .flatten();
-            let per_user = per_user_path
-                .exists()
-                .then(|| parse_session_file(&per_user_path, &key_clone))
+            let per_user = session_file_present(&per_user_path)
+                .then(|| parse_session_file(&per_user_path, &key_clone, budget))
                 .flatten();
 
             let merged = match (flat, per_user) {
-                (Some((flat_meta, flat_timeline)), Some((per_user_meta, per_user_timeline))) => {
+                (Some(flat), Some(per_user)) => {
+                    // Segments only ever accrue on the layout being written
+                    // to, so the window bookkeeping comes from whichever side
+                    // has them (the canonical per-user file wins a tie).
+                    let (base_seq, sealed_segments, loaded_sealed) =
+                        if per_user.sealed_segments > 0 || flat.sealed_segments == 0 {
+                            (
+                                per_user.base_seq,
+                                per_user.sealed_segments,
+                                per_user.loaded_sealed,
+                            )
+                        } else {
+                            (flat.base_seq, flat.sealed_segments, flat.loaded_sealed)
+                        };
+                    let (flat_meta, flat_timeline) = (flat.meta, flat.timeline);
+                    let (per_user_meta, per_user_timeline) = (per_user.meta, per_user.timeline);
                     // Merge the two timelines: dedup messages by fingerprint (a
                     // message migrated into both layouts appears once), keep
                     // EVERY rollback marker, then order by timestamp so each
@@ -1856,13 +2421,14 @@ impl SessionManager {
                             per_user_meta.child_contracts,
                         ),
                         messages,
+                        base_seq,
+                        sealed_segments,
+                        loaded_sealed,
                         created_at: flat_meta.created_at.min(per_user_meta.created_at),
                         updated_at: flat_meta.updated_at.max(per_user_meta.updated_at),
                     }
                 }
-                (Some((meta, timeline)), None) | (None, Some((meta, timeline))) => {
-                    session_from(meta, fold_session_timeline(timeline), &key_clone)
-                }
+                (Some(window), None) | (None, Some(window)) => session_from(window, &key_clone),
                 (None, None) => return None,
             };
 
@@ -1881,9 +2447,16 @@ impl SessionManager {
         .flatten()
     }
 
-    /// Append a message to the JSONL file. Creates the file with metadata if new.
-    /// Uses spawn_blocking to avoid blocking the async runtime.
-    async fn append_to_disk(&self, key: &SessionKey, message: &Message) -> Result<()> {
+    /// Append a message to the active JSONL file, sealing it into a segment
+    /// first when it has reached the segment size (see [`append_row_rolling`]).
+    /// Creates the file with a meta line if new. `next_seq` is the seq the row
+    /// receives. Uses spawn_blocking to avoid blocking the async runtime.
+    async fn append_to_disk(
+        &self,
+        key: &SessionKey,
+        message: &Message,
+        next_seq: usize,
+    ) -> Result<bool> {
         let path = self.session_path(key);
 
         // Prepare metadata outside spawn_blocking (needs cache access)
@@ -1900,66 +2473,24 @@ impl SessionManager {
         let msg_json = serde_json::to_string(message)?;
 
         tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .create(true)
-                .append(true)
-                .open(&path)?;
-
-            // Check file size after open to avoid TOCTOU race with exists() check
-            let file_len = file.metadata()?.len();
-            let is_new = file_len == 0;
-
-            // Refuse to append if the file is already at the size limit.
-            // The session should be compacted before it reaches this point.
-            //
-            // Per UPCR-2026-012: the durable-commit observer fires only
-            // when this function returns Ok; previously a silent
-            // `Ok(())` here would have leaked an observer notification
-            // for a row that never reached disk. Return an error so the
-            // caller path (`add_message_with_seq`) propagates the
-            // failure and the observer is skipped.
-            if !is_new && file_len >= MAX_SESSION_FILE_SIZE {
-                warn!(
-                    key = key_str,
-                    size = file_len,
-                    limit = MAX_SESSION_FILE_SIZE,
-                    "session file at size limit, skipping append"
-                );
-                return Err(eyre::eyre!(
-                    "session file at size limit ({} >= {}), refusing append",
-                    file_len,
-                    MAX_SESSION_FILE_SIZE
-                ));
-            }
-
-            if is_new {
-                let meta = SessionMeta {
-                    schema_version: CURRENT_SESSION_SCHEMA,
-                    session_key: key_str,
-                    parent_key,
-                    topic,
-                    summary,
-                    title,
-                    title_manual,
-                    child_contracts,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                };
-                writeln!(file, "{}", serde_json::to_string(&meta)?)?;
-            } else {
-                seal_torn_tail(&mut file, file_len)?;
-            }
-
-            writeln!(file, "{msg_json}")?;
-            Ok::<_, eyre::Report>(())
+            let meta_for = |sealed_segments: u32, base_seq: usize| SessionMeta {
+                schema_version: CURRENT_SESSION_SCHEMA,
+                session_key: key_str.clone(),
+                parent_key,
+                topic,
+                summary,
+                title,
+                title_manual,
+                child_contracts,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                sealed_segments,
+                base_seq,
+            };
+            append_row_rolling(&path, &key_str, next_seq, meta_for, &msg_json)
         })
         .await
-        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
-
-        Ok(())
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?
     }
 
     /// Rewrite a session's JSONL file from the in-memory state.
@@ -1999,40 +2530,18 @@ impl SessionManager {
             child_contracts: session.child_contracts.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
+            // Set by `rewrite_active_from_window` from the session's window.
+            sealed_segments: 0,
+            base_seq: 0,
         };
-        let mut content = serde_json::to_string(&meta)?;
-        content.push('\n');
-        for msg in &session.messages {
-            content.push_str(&serde_json::to_string(msg)?);
-            content.push('\n');
-        }
-
         let msg_count = session.messages.len();
         let path = self.session_path(key);
         let key_display = key.to_string();
+        // The window rewrite needs the session across the blocking boundary.
+        let snapshot = session.clone();
 
         let rewrite_result = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let tmp_path = rewrite_tmp_path(&path);
-            let write_result = (|| -> Result<(), eyre::Report> {
-                let mut file = std::fs::File::create(&tmp_path)?;
-                file.write_all(content.as_bytes())?;
-                // `flush()` on a std File is a no-op (no userspace buffer) —
-                // `sync_all` is what actually gets the bytes to stable
-                // storage before the rename swaps the inode.
-                file.sync_all()?;
-                // Atomic rename (on same filesystem)
-                std::fs::rename(&tmp_path, &path)?;
-                if let Some(dir) = path.parent() {
-                    fsync_dir(dir);
-                }
-                Ok(())
-            })();
-            if write_result.is_err() {
-                // Best-effort tmp cleanup, same as rewrite_blocking_inner.
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-            write_result
+            rewrite_active_from_window(&path, &snapshot, meta).map(|_| ())
         })
         .await
         .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?;
@@ -2072,6 +2581,9 @@ impl SessionManager {
             title_manual: false,
             child_contracts: vec![],
             messages,
+            base_seq: 0,
+            sealed_segments: 0,
+            loaded_sealed: 0,
             created_at: now,
             updated_at: now,
         };
@@ -2111,6 +2623,7 @@ impl SessionManager {
         if flat_path.exists() {
             tokio::fs::remove_file(&flat_path).await?;
         }
+        remove_segments(&flat_path);
 
         // 2. Per-user layout JSONL
         let base_key = key.base_key();
@@ -2138,6 +2651,7 @@ impl SessionManager {
                     );
                 }
             }
+            remove_segments(&per_user_path);
         }
 
         Ok(())
@@ -2186,6 +2700,7 @@ impl SessionManager {
                 // Evict from LRU cache if present
                 self.cache.pop(&meta.session_key);
                 if std::fs::remove_file(&path).is_ok() {
+                    remove_segments(&path);
                     debug!(key = meta.session_key, "purged stale session");
                     removed += 1;
                 }
@@ -2222,8 +2737,10 @@ impl SessionManager {
         num_turns: u32,
     ) -> Result<u32> {
         // Ensure the session is resident so the trim reflects the full
-        // (merged) on-disk transcript.
+        // (merged) on-disk transcript — the WHOLE history, not the budgeted
+        // window, or a rollback reaching past the window would under-trim.
         let _ = self.get_or_create(key).await;
+        self.ensure_full_history(key).await;
         // Serialise the count-read + marker-append + trim under the per-key
         // persist lock — the SAME lock the rewrite / canonical-append paths
         // hold (#1528). Without it this read-then-append raced a concurrent
@@ -2392,6 +2909,8 @@ impl SessionManager {
                 child_contracts: vec![],
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                sealed_segments: 0,
+                base_seq: 0,
             };
             if let Ok(json) = serde_json::to_string(&meta) {
                 if let Err(e) = std::fs::write(&path, format!("{json}\n")) {
@@ -2498,7 +3017,8 @@ pub async fn persist_message_through_canonical_path(
 /// exactly one row and both receive that row.
 ///
 /// STRICT canonical read (this helper does NOT relax the legacy loader):
-/// - the file's size is bounded by `MAX_SESSION_FILE_SIZE`;
+/// - the active file is read strictly (no size cap; segments are consulted
+///   only for the idempotency scan);
 /// - the first line must be a valid `SessionMeta` with a supported schema;
 /// - every non-empty subsequent line must parse as a `Message` OR a
 ///   `SessionControlRecord` — an unparsable line, a missing trailing
@@ -2541,15 +3061,7 @@ pub async fn persist_system_note_once_through_canonical_path(
     };
     // A zero-byte regular file can remain after creation but before the
     // metadata write; the canonical append initializes it on retry.
-    if let Some(meta) = file_meta.filter(|meta| !meta.is_file() || meta.len() != 0) {
-        if meta.len() > MAX_SESSION_FILE_SIZE {
-            return Err(eyre::eyre!(
-                "session transcript exceeds size limit ({}: {} > {})",
-                canonical.display(),
-                meta.len(),
-                MAX_SESSION_FILE_SIZE
-            ));
-        }
+    if let Some(_meta) = file_meta.filter(|meta| !meta.is_file() || meta.len() != 0) {
         let bytes = std::fs::read(&canonical).map_err(|error| {
             eyre::eyre!(
                 "session transcript exists but cannot be read ({}): {error}",
@@ -2619,6 +3131,19 @@ pub async fn persist_system_note_once_through_canonical_path(
                 return Ok(message);
             }
         }
+        // A note written before the file last rolled lives in a sealed
+        // segment: check the whole history before appending a duplicate.
+        if sealed_segment_count(&segments_dir(&canonical)) > 0
+            && let Some(window) = load_session_window(&canonical, key, u64::MAX)
+        {
+            for message in fold_session_timeline(window.timeline) {
+                if message.role == MessageRole::System
+                    && message.client_message_id.as_deref() == Some(note_id)
+                {
+                    return Ok(message);
+                }
+            }
+        }
     }
 
     // Absent (or no file yet): append through the same locked canonical
@@ -2663,6 +3188,16 @@ impl SessionHandle {
     /// Uses per-user directory layout: `{data_dir}/users/{base_key}/sessions/{topic}.jsonl`.
     /// Falls back to the legacy flat layout for migration.
     pub fn open(data_dir: &Path, key: &SessionKey) -> Self {
+        Self::open_with_budget(data_dir, key, session_load_budget_bytes())
+    }
+
+    /// Like [`Self::open`], but loads the WHOLE history regardless of the
+    /// load budget. For callers that must see every message.
+    pub fn open_full(data_dir: &Path, key: &SessionKey) -> Self {
+        Self::open_with_budget(data_dir, key, u64::MAX)
+    }
+
+    fn open_with_budget(data_dir: &Path, key: &SessionKey, budget: u64) -> Self {
         let base_key = key.base_key();
         let encoded_base = Self::encode_path_component(base_key);
         let user_sessions_dir = data_dir.join("users").join(&encoded_base).join("sessions");
@@ -2698,13 +3233,14 @@ impl SessionHandle {
         let session = if marker_path.exists() {
             // Case (A): marker says migration is done. The per-user file is
             // authoritative even if a stale legacy file co-exists.
-            Self::load_from_file(&new_path, key)
-        } else if new_path.exists() {
+            Self::load_from_file_with_budget(&new_path, key, budget)
+        } else if session_file_present(&new_path) {
             if legacy_path.exists() {
                 // Case (B): partial-migration leftover. Retry the legacy
                 // removal so subsequent boots take the cheap (A) path.
                 match std::fs::remove_file(&legacy_path) {
                     Ok(()) => {
+                        remove_segments(&legacy_path);
                         let _ = std::fs::write(&marker_path, b"migrated-from-flat\n");
                     }
                     Err(error) => {
@@ -2719,14 +3255,16 @@ impl SessionHandle {
                 }
             }
             // Case (C): per-user only — straight read.
-            Self::load_from_file(&new_path, key)
-        } else if legacy_path.exists() {
+            Self::load_from_file_with_budget(&new_path, key, budget)
+        } else if session_file_present(&legacy_path) {
             // Case (D): first-time migration. Persist into the per-user JSONL
             // BEFORE removing the legacy file so a subsequent incremental
             // `add_message_with_seq` (which only appends a single line) does
             // not silently drop the pre-migration messages.
             debug!(key = %key, "migrating session from legacy flat layout");
-            let session = Self::load_from_file(&legacy_path, key);
+            // The migration rewrites the whole transcript into the per-user
+            // file, so it must hold all of it.
+            let session = Self::load_from_file_with_budget(&legacy_path, key, u64::MAX);
             if let Some(loaded) = session.as_ref() {
                 if let Err(error) = Self::rewrite_blocking(&new_path, loaded) {
                     warn!(
@@ -2742,7 +3280,11 @@ impl SessionHandle {
                         observer_root: data_dir.to_owned(),
                     };
                 }
+                // The whole legacy history now lives in the per-user file,
+                // sealed legacy segments included: remove them with it, or a
+                // merge across both layouts would read those rows twice.
                 if std::fs::remove_file(&legacy_path).is_ok() {
+                    remove_segments(&legacy_path);
                     let _ = std::fs::write(&marker_path, b"migrated-from-flat\n");
                 }
             }
@@ -3003,9 +3545,17 @@ impl SessionHandle {
         // RAM in lockstep. Previously the push happened first, which
         // would leave a row in `Session::messages` that never reached
         // disk on failure — and the observer would have fired for it.
-        if let Err(error) = self.append_to_disk(&message).await {
-            record_session_persist("failed");
-            return Err(error);
+        let next_seq = self.session.next_seq();
+        let rolled = match self.append_to_disk(&message, next_seq).await {
+            Ok(rolled) => rolled,
+            Err(error) => {
+                record_session_persist("failed");
+                return Err(error);
+            }
+        };
+        if rolled {
+            self.session.sealed_segments += 1;
+            self.session.loaded_sealed += 1;
         }
         self.session.messages.push(message.clone());
         self.session.updated_at = Utc::now();
@@ -3026,15 +3576,16 @@ impl SessionHandle {
         // read failure must not turn the call into an error.
         let path = self.session_path();
         let key = self.session.key.clone();
-        let disk_len = tokio::task::spawn_blocking(move || {
-            Self::load_from_file(&path, &key).map(|on_disk| on_disk.messages.len())
-        })
-        .await
-        .ok()
-        .flatten();
+        // Reads the ACTIVE file only: its meta carries the visible count of
+        // every sealed segment before it, so this stays O(active) however
+        // long the session gets.
+        let disk_len = tokio::task::spawn_blocking(move || visible_len_from_active(&path, &key))
+            .await
+            .ok()
+            .flatten();
         let committed_seq = match disk_len {
             Some(len) if len > 0 => len - 1,
-            _ => self.session.messages.len().saturating_sub(1),
+            _ => self.session.next_seq().saturating_sub(1),
         };
         // Post-commit observer fan-out: fires AFTER the disk write
         // returned Ok AND after the in-memory mirror was updated. A
@@ -3120,39 +3671,17 @@ impl SessionHandle {
             child_contracts: self.session.child_contracts.clone(),
             created_at: self.session.created_at,
             updated_at: self.session.updated_at,
+            // Set by `rewrite_active_from_window` from the session's window.
+            sealed_segments: 0,
+            base_seq: 0,
         };
-        let mut content = serde_json::to_string(&meta)?;
-        content.push('\n');
-        for msg in &self.session.messages {
-            content.push_str(&serde_json::to_string(msg)?);
-            content.push('\n');
-        }
-
         let msg_count = self.session.messages.len();
         let path = self.session_path();
         let key_display = self.session.key.to_string();
+        let snapshot = self.session.clone();
 
         let rewrite_result = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let tmp_path = rewrite_tmp_path(&path);
-            let write_result = (|| -> Result<(), eyre::Report> {
-                let mut file = std::fs::File::create(&tmp_path)?;
-                file.write_all(content.as_bytes())?;
-                // `flush()` on a std File is a no-op (no userspace buffer) —
-                // `sync_all` is what actually gets the bytes to stable
-                // storage before the rename swaps the inode.
-                file.sync_all()?;
-                std::fs::rename(&tmp_path, &path)?;
-                if let Some(dir) = path.parent() {
-                    fsync_dir(dir);
-                }
-                Ok(())
-            })();
-            if write_result.is_err() {
-                // Best-effort tmp cleanup, same as rewrite_blocking_inner.
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-            write_result
+            rewrite_active_from_window(&path, &snapshot, meta).map(|_| ())
         })
         .await
         .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?;
@@ -3178,6 +3707,7 @@ impl SessionHandle {
         if path.exists() {
             tokio::fs::remove_file(&path).await?;
         }
+        remove_segments(&path);
         Ok(())
     }
 
@@ -3205,7 +3735,6 @@ impl SessionHandle {
     }
 
     fn rewrite_blocking_inner(path: &Path, session: &Session) -> Result<()> {
-        use std::io::Write;
         let meta = SessionMeta {
             schema_version: CURRENT_SESSION_SCHEMA,
             session_key: session.key.0.clone(),
@@ -3217,40 +3746,16 @@ impl SessionHandle {
             child_contracts: session.child_contracts.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
+            sealed_segments: 0,
+            base_seq: 0,
         };
-        let mut content = serde_json::to_string(&meta)?;
-        content.push('\n');
-        for msg in &session.messages {
-            content.push_str(&serde_json::to_string(msg)?);
-            content.push('\n');
-        }
-        let tmp_path = rewrite_tmp_path(path);
-        let write_result = (|| -> Result<()> {
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            // `flush()` on a std File is a no-op (no userspace buffer) —
-            // `sync_all` is what actually gets the bytes to stable
-            // storage before the rename swaps the inode.
-            file.sync_all()?;
-            std::fs::rename(&tmp_path, path)?;
-            if let Some(dir) = path.parent() {
-                fsync_dir(dir);
-            }
-            Ok(())
-        })();
-        if write_result.is_err() {
-            // Best-effort tmp cleanup. If `File::create`, `write_all`, or
-            // `sync_all` fail, the tmp file may exist and must not leak.
-            // (After a successful rename the tmp path no longer exists and
-            // the removal is a harmless no-op; the trailing `fsync_dir`
-            // cannot fail the closure.)
-            let _ = std::fs::remove_file(&tmp_path);
-        }
-        write_result
+        rewrite_active_from_window(path, session, meta).map(|_| ())
     }
 
-    /// Append a single message to the JSONL file.
-    async fn append_to_disk(&self, message: &Message) -> Result<()> {
+    /// Append a single message to the active JSONL file, sealing it into a
+    /// segment first when it has reached the segment size. `next_seq` is the
+    /// seq the row receives (see [`append_row_rolling`]).
+    async fn append_to_disk(&self, message: &Message, next_seq: usize) -> Result<bool> {
         let path = self.session_path();
         let parent_key = self.session.parent_key.as_ref().map(|k| k.0.clone());
         let topic = self.session.topic.clone();
@@ -3262,92 +3767,39 @@ impl SessionHandle {
         let msg_json = serde_json::to_string(message)?;
 
         tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .create(true)
-                .append(true)
-                .open(&path)?;
-
-            let file_len = file.metadata()?.len();
-            let is_new = file_len == 0;
-
-            if !is_new && file_len >= MAX_SESSION_FILE_SIZE {
-                warn!(
-                    key = key_str,
-                    size = file_len,
-                    limit = MAX_SESSION_FILE_SIZE,
-                    "session file at size limit, refusing append"
-                );
-                // Issue: post-merge codex review of #747 found this path lied
-                // by returning Ok(()), which let SessionHandle::add_message_with_seq
-                // push to memory and fire the message/persisted observer for a
-                // row that was NEVER persisted to disk. That violates UPCR-2026-012's
-                // "must not emit message/persisted for a row that did not commit"
-                // contract and creates phantom seq advances.
-                //
-                // Mirrors the SessionManager::append_to_disk fix at line 1256.
-                return Err(eyre::eyre!(
-                    "session file at size limit ({} >= {}), refusing append",
-                    file_len,
-                    MAX_SESSION_FILE_SIZE
-                ));
-            }
-
-            if is_new {
-                let meta = SessionMeta {
-                    schema_version: CURRENT_SESSION_SCHEMA,
-                    session_key: key_str,
-                    parent_key,
-                    topic,
-                    summary,
-                    title,
-                    title_manual,
-                    child_contracts,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                };
-                writeln!(file, "{}", serde_json::to_string(&meta)?)?;
-            } else {
-                seal_torn_tail(&mut file, file_len)?;
-            }
-
-            writeln!(file, "{msg_json}")?;
-            Ok::<_, eyre::Report>(())
+            let meta_for = |sealed_segments: u32, base_seq: usize| SessionMeta {
+                schema_version: CURRENT_SESSION_SCHEMA,
+                session_key: key_str.clone(),
+                parent_key,
+                topic,
+                summary,
+                title,
+                title_manual,
+                child_contracts,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                sealed_segments,
+                base_seq,
+            };
+            append_row_rolling(&path, &key_str, next_seq, meta_for, &msg_json)
         })
         .await
-        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))??;
-
-        Ok(())
+        .map_err(|e| eyre::eyre!("spawn_blocking join error: {e}"))?
     }
 
-    /// Load a session from a specific file path.
-    fn load_from_file(path: &Path, key: &SessionKey) -> Option<Session> {
-        if let Ok(meta) = std::fs::metadata(path) {
-            if meta.len() > MAX_SESSION_FILE_SIZE {
-                warn!(key = %key, size = meta.len(), "session file too large, skipping");
-                return None;
-            }
-        }
-
-        let content = std::fs::read_to_string(path).ok()?;
-        let mut lines = content.lines();
-
-        let meta_line = lines.next()?;
-        let meta: SessionMeta = serde_json::from_str(meta_line).ok()?;
-
-        if meta.schema_version > CURRENT_SESSION_SCHEMA {
-            warn!(key = %key, file_version = meta.schema_version, "newer schema, skipping");
-            return None;
-        }
-
-        // Assemble messages, replaying any append-only rollback control
-        // records at their log position so a rewind survives a per-user
-        // reload too (this path backs the next turn's `SessionHandle::open`).
-        let messages = assemble_session_messages(lines);
-
-        debug!(key = %key, messages = messages.len(), "Loaded session from disk");
-
+    /// Load the active file at `path` plus as many of its sealed segments as
+    /// fit in `budget` (see [`load_session_window`]), replaying rollback
+    /// markers at their log position so a rewind survives a reload.
+    fn load_from_file_with_budget(path: &Path, key: &SessionKey, budget: u64) -> Option<Session> {
+        let SessionWindow {
+            meta,
+            timeline,
+            base_seq,
+            sealed_segments,
+            loaded_sealed,
+        } = load_session_window(path, key, budget)?;
+        let messages = fold_session_timeline(timeline);
+        debug!(key = %key, messages = messages.len(), base_seq, "Loaded session from disk");
         Some(Session {
             key: key.clone(),
             parent_key: meta.parent_key.map(SessionKey),
@@ -3357,6 +3809,9 @@ impl SessionHandle {
             title_manual: meta.title_manual,
             child_contracts: meta.child_contracts,
             messages,
+            base_seq,
+            sealed_segments,
+            loaded_sealed,
             created_at: meta.created_at,
             updated_at: meta.updated_at,
         })
@@ -3398,15 +3853,6 @@ impl SessionManager {
                 continue;
             };
 
-            // Skip oversized files
-            if path
-                .metadata()
-                .map(|m| m.len() > MAX_SESSION_FILE_SIZE)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
             let decoded = Self::decode_filename(name);
 
             // Check if this session belongs to the given base key
@@ -3415,20 +3861,10 @@ impl SessionManager {
                 continue;
             }
 
-            // Read first line (metadata) and count remaining lines
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            let Some(meta) = read_session_meta(&path) else {
                 continue;
             };
-            let mut lines = content.lines();
-            let Some(meta_line) = lines.next() else {
-                continue;
-            };
-            let meta: SessionMeta = match serde_json::from_str(meta_line) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let message_count = lines.filter(|l| !l.trim().is_empty()).count();
+            let message_count = listing_message_count(&path);
             let topic = decoded.split_once('#').map(|(_, t)| t.to_string());
 
             entries.push(SessionListEntry {
@@ -3512,27 +3948,10 @@ impl SessionManager {
                 continue;
             };
 
-            if path
-                .metadata()
-                .map(|m| m.len() > MAX_SESSION_FILE_SIZE)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            let Ok(content) = std::fs::read_to_string(&path) else {
+            let Some(meta) = read_session_meta(&path) else {
                 continue;
             };
-            let mut lines = content.lines();
-            let Some(meta_line) = lines.next() else {
-                continue;
-            };
-            let meta: SessionMeta = match serde_json::from_str(meta_line) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let message_count = lines.filter(|l| !l.trim().is_empty()).count();
+            let message_count = listing_message_count(&path);
             let topic = if name == "default" {
                 None
             } else {
