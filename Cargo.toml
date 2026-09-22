@@ -115,7 +115,9 @@ html5ever = "0.35"
 markup5ever_rcdom = "0.35"
 # Database (pure Rust)
 redb = "2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Keep the fleet ledger's checked u64/usize conversions on the 0.40 bindings.
+# This dependency requires Rust 1.88 or newer; the workspace MSRV is still stale.
+rusqlite = { version = "0.40.1", features = ["bundled", "fallible_uint"] }
 bincode = "1"
 # Vector search
 hnsw_rs = "0.3"

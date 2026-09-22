@@ -96,9 +96,6 @@ const DISK_WARN_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 /// Hard cap on filesystem entries visited by the disk-usage walk so a
 /// pathological tree cannot stall doctor.
 const DISK_WALK_MAX_ENTRIES: usize = 100_000;
-/// Sessions at ≥80% of `octos-bus`'s `MAX_SESSION_FILE_SIZE` (10 MiB) get
-/// flagged before writes start failing at the cap.
-const SESSION_NEAR_CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// Bytes read from a transcript's TAIL for the content-free integrity probe
 /// (parse the final line, discard it). Bounds I/O per session file.
 const SESSION_TAIL_PROBE_BYTES: u64 = 64 * 1024;
@@ -1417,9 +1414,6 @@ struct SessionInventory {
     bytes: u64,
     newest_age_secs: Option<u64>,
     oldest_age_secs: Option<u64>,
-    /// Session keys (file stems) whose size is ≥ [`SESSION_NEAR_CAP_BYTES`]
-    /// — writes fail outright at octos-bus's 10 MiB cap.
-    near_cap: Vec<String>,
     /// Session keys whose final line does not parse as JSON (a truncated /
     /// corrupt tail — the usual crash-mid-write signature).
     corrupt_tail: Vec<String>,
@@ -1529,9 +1523,6 @@ fn scan_session_dir(dir: &Path, inventory: &mut SessionInventory) {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if meta.len() >= SESSION_NEAR_CAP_BYTES {
-            inventory.near_cap.push(stem.clone());
-        }
         if meta.len() > 0 && session_tail_parses(&path, meta.len()) == Some(false) {
             inventory.corrupt_tail.push(stem);
         }
@@ -1681,7 +1672,7 @@ fn session_checks(data_dir: &Path, profiles: &[DiscoveredProfile]) -> Vec<Check>
             inventory.files,
             human_bytes(inventory.bytes)
         );
-        if inventory.corrupt_tail.is_empty() && inventory.near_cap.is_empty() {
+        if inventory.corrupt_tail.is_empty() {
             checks.push(Check::pass(
                 CAT_SESSIONS,
                 format!("sessions ({label})"),
@@ -1701,13 +1692,6 @@ fn session_checks(data_dir: &Path, profiles: &[DiscoveredProfile]) -> Vec<Check>
                     names.join(", ")
                 ));
                 fixes.push("unparseable tails break resume — back up + remove those files");
-            }
-            if !inventory.near_cap.is_empty() {
-                problems.push(format!(
-                    "{} near the 10 MiB session cap",
-                    inventory.near_cap.len()
-                ));
-                fixes.push("fork near-cap sessions (`/new`) before writes start failing");
             }
             checks.push(Check::warn(
                 CAT_SESSIONS,
@@ -2561,7 +2545,9 @@ mod tests {
     }
 
     #[test]
-    fn should_flag_sessions_near_the_write_cap() {
+    fn should_not_flag_a_large_session_now_that_files_roll_into_segments() {
+        // Session files used to hit a hard 10 MiB cap; they now roll into
+        // segments, so size alone is not a problem worth a warning.
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().to_path_buf();
         let dir = data_dir.join("sessions");
@@ -2581,12 +2567,8 @@ mod tests {
 
         let checks = session_checks(&data_dir, &[]);
         let row = &checks[0];
-        assert_eq!(row.status, CheckStatus::Warn);
-        assert!(
-            row.detail.contains("1 near the 10 MiB session cap"),
-            "{}",
-            row.detail
-        );
+        assert_eq!(row.status, CheckStatus::Pass, "{}", row.detail);
+        assert!(!row.detail.contains("cap"), "{}", row.detail);
     }
 
     #[test]
