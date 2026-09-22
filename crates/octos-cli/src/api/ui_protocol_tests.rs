@@ -3691,13 +3691,12 @@ fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
     }
 }
 
-struct FailingWriter {
-    write_failed: Arc<tokio::sync::Notify>,
-}
+#[derive(Default)]
+struct FailingWriter;
 
 impl FailingWriter {
-    fn new(write_failed: Arc<tokio::sync::Notify>) -> Self {
-        Self { write_failed }
+    fn new() -> Self {
+        Self
     }
 }
 
@@ -3707,7 +3706,14 @@ impl AsyncWrite for FailingWriter {
         _cx: &mut std::task::Context<'_>,
         _buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.write_failed.notify_waiters();
+        // A regression pin, not a timing dependency of the current tests:
+        // they inject only after the writer thread exits, so this stall no
+        // longer matters to them. But if the injection ever moves back onto
+        // the failing write itself — the ordering that raced `mark_failed`
+        // on loaded Windows runners — this stall turns that flaky 5% race
+        // back into a deterministic red. See
+        // `stdio_connection_stops_dispatch_after_writer_failure`.
+        std::thread::sleep(Duration::from_millis(1));
         std::task::Poll::Ready(Err(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "writer closed",
@@ -3787,13 +3793,12 @@ async fn stdio_writer_loop_propagates_write_errors_and_marks_failed_latch() {
         failure_notify.notified().await;
     });
     tokio::task::yield_now().await;
-    let write_failed = Arc::new(tokio::sync::Notify::new());
     tx.send(WsMessage::Text("{}".into()))
         .await
         .expect("queue stdio response");
     drop(tx);
 
-    let error = stdio_writer_loop_to(rx, FailingWriter::new(write_failed), ws.failure_signal())
+    let error = stdio_writer_loop_to(rx, FailingWriter::new(), ws.failure_signal())
         .await
         .expect_err("write failure is propagated");
 
@@ -3895,7 +3900,6 @@ fn stdio_connection_stops_dispatch_after_writer_failure() {
 
 async fn stdio_connection_stops_dispatch_after_writer_failure_body() {
     let dispatch_count = new_stdio_dispatch_count_for_test();
-    let write_failed = Arc::new(tokio::sync::Notify::new());
     let (mut input_tx, input_rx) = tokio::io::duplex(4096);
     let first = format!(
         "{}\n",
@@ -3920,9 +3924,18 @@ async fn stdio_connection_stops_dispatch_after_writer_failure_body() {
         .await
         .expect("queue first request");
 
-    let write_failed_for_input = write_failed.clone();
+    // The second request must be observable only once the writer failure is
+    // observable too. Waiting on the failing write itself would race: the
+    // connection loop learns of the failure when `mark_failed` runs, after
+    // the writer helper's error returns — and a frame read before that
+    // moment is legitimately dispatched (two main-CI `check-windows` runs
+    // failed with `left: 2, right: 1` exactly this way, 2026-09-21/22).
+    // The writer-thread exit is past `mark_failed`, so injecting there pins
+    // the real guarantee: no dispatch after the failure is latched.
+    let writer_finished = new_stdio_writer_exit_notify_for_test();
+    let writer_finished_for_input = writer_finished.clone();
     let input_task = tokio::spawn(async move {
-        write_failed_for_input.notified().await;
+        writer_finished_for_input.notified().await;
         let _ = input_tx.write_all(second.as_bytes()).await;
     });
     tokio::task::yield_now().await;
@@ -3932,14 +3945,21 @@ async fn stdio_connection_stops_dispatch_after_writer_failure_body() {
         stdio_connection_with_io(
             Arc::new(AppState::empty_for_tests()),
             input_rx,
-            FailingWriter::new(write_failed),
+            FailingWriter::new(),
             dispatch_count.clone(),
+            Some(writer_finished),
         ),
     )
     .await
     .expect("stdio loop must exit after writer failure");
 
-    input_task.await.expect("input task joins");
+    // The injection waits on the writer thread's exit notify, so this join
+    // has a real completion path; the timeout only keeps a lost wakeup from
+    // hanging the whole test binary instead of failing this one test.
+    tokio::time::timeout(Duration::from_secs(2), input_task)
+        .await
+        .expect("injection completes within the connection's shutdown budget")
+        .expect("injection task does not panic");
     let error = result.expect_err("writer failure should be returned");
     assert!(
         error.to_string().contains("AppUI stdio writer failed"),
@@ -3982,6 +4002,7 @@ async fn stdio_dispatch_count_is_isolated_per_connection() {
             input_rx,
             response_tx,
             dispatch_count,
+            None,
         )
         .await
         .expect("connection exits on EOF");
