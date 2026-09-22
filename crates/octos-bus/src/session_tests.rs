@@ -1422,6 +1422,125 @@ async fn should_rebuild_the_active_file_when_a_seal_was_interrupted() {
     }
 }
 
+/// Two sealed segments: `roll_once` seals [seed, big] as 000001, then a
+/// second oversize row makes the next append seal [after the roll, big] as
+/// 000002, leaving `third` in the active file.
+async fn roll_twice(mgr: &mut SessionManager, key: &SessionKey) {
+    roll_once(mgr, key).await;
+    mgr.add_message(key, oversize_row()).await.unwrap();
+    mgr.add_message(key, make_message(MessageRole::User, "third"))
+        .await
+        .unwrap();
+}
+
+/// Overwrite a file's first line (the meta) with garbage, keeping the rows.
+fn corrupt_meta_line(path: &std::path::Path) {
+    let content = std::fs::read_to_string(path).unwrap();
+    let rows = content.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+    std::fs::write(path, format!("{{\"schema_version\":1,\"broken\n{rows}")).unwrap();
+}
+
+/// #2468: an unreadable meta line on a sealed segment hides only that line,
+/// not the rows behind it — neither on a plain load nor during recovery.
+#[tokio::test]
+async fn should_keep_reading_a_sealed_segment_whose_meta_line_is_unreadable() {
+    for bad_index in [1u32, 2] {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::new("cli", "torn-meta");
+        roll_twice(&mut mgr, &key).await;
+        let active = mgr.session_path(&key);
+        corrupt_meta_line(&segment_path(&segments_dir(&active), bad_index));
+        mgr.cache.pop(&key.0);
+
+        let full = mgr.load_full(&key).await.unwrap();
+        assert_eq!(
+            contents(&full),
+            vec![
+                "seed",
+                "<8389632 bytes>",
+                "after the roll",
+                "<8389632 bytes>",
+                "third"
+            ],
+            "segment {bad_index} with a bad meta line still contributes its rows"
+        );
+        assert_eq!(full.base_seq, 0);
+        assert_eq!(full.next_seq(), 5);
+    }
+}
+
+#[tokio::test]
+async fn should_rebuild_after_a_seal_when_the_newest_segment_meta_is_unreadable() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "double-crash");
+    roll_twice(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    // Crash one: the fresh active file never made it. Crash two: the newest
+    // sealed segment lost its first line.
+    std::fs::remove_file(&active).unwrap();
+    corrupt_meta_line(&segment_path(&segments_dir(&active), 2));
+    mgr.cache.pop(&key.0);
+
+    let recovered = mgr.load_full(&key).await.unwrap();
+    assert_eq!(recovered.sealed_segments, 2);
+    assert_eq!(
+        recovered.next_seq(),
+        4,
+        "rows behind the bad line are counted; the chain does not restart at 0"
+    );
+    assert_eq!(
+        recovered.title.as_deref(),
+        Some("seed"),
+        "identity from 000001"
+    );
+    assert_eq!(read_session_meta(&active).unwrap().base_seq, 4);
+    assert_eq!(
+        contents(&recovered),
+        vec![
+            "seed",
+            "<8389632 bytes>",
+            "after the roll",
+            "<8389632 bytes>"
+        ]
+    );
+
+    mgr.cache.put(key.0.clone(), recovered);
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "resumed"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 4);
+}
+
+#[tokio::test]
+async fn should_rebuild_from_rows_alone_when_no_segment_meta_is_readable() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "no-meta-left");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    std::fs::remove_file(&active).unwrap();
+    corrupt_meta_line(&segment_path(&segments_dir(&active), 1));
+    mgr.cache.pop(&key.0);
+
+    let recovered = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        recovered.next_seq(),
+        2,
+        "seed and the big row are still counted"
+    );
+    assert_eq!(
+        recovered.title, None,
+        "no line on disk names the session any more"
+    );
+    assert_eq!(contents(&recovered), vec!["seed", "<8389632 bytes>"]);
+    let meta = read_session_meta(&active).unwrap();
+    assert_eq!((meta.sealed_segments, meta.base_seq), (1, 2));
+    assert_eq!(meta.session_key, key.0);
+}
+
 /// F3: after a rollback that reaches into a sealed segment, the seq a handle
 /// reads back from disk must reflect the rows the marker removed there.
 #[tokio::test]
