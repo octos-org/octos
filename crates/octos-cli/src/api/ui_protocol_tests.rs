@@ -3863,8 +3863,37 @@ async fn stdio_ndjson_reader_rejects_oversized_frame_before_newline() {
     }
 }
 
-#[tokio::test]
-async fn stdio_connection_stops_dispatch_after_writer_failure() {
+/// The stdio loop's deep dispatch path needs more stack than a test thread is
+/// guaranteed. `#[tokio::test]` drives its future on the test thread itself, and
+/// a real request (unlike the unknown-method one the isolation test below sends)
+/// recurses deep enough through dispatch that a Windows debug build overflows —
+/// which aborts the whole test binary, taking every other test's result with
+/// it. Boxing the future does not help: the cost is the depth of the poll call
+/// chain, not the size of the stored state. Reproducible on any platform by
+/// running the test binary under `RUST_MIN_STACK=1048576`.
+///
+/// So run it the way production runs deep agent futures — on a thread with an
+/// 8 MiB stack, matching `thread_stack_size(8 * 1024 * 1024)` in the chat, ACP,
+/// gateway and MCP runtimes — rather than on whatever stack the harness hands
+/// out.
+#[test]
+fn stdio_connection_stops_dispatch_after_writer_failure() {
+    std::thread::Builder::new()
+        .name("stdio-writer-failure".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(stdio_connection_stops_dispatch_after_writer_failure_body());
+        })
+        .expect("spawn big-stack test thread")
+        .join()
+        .expect("stdio writer-failure test body panicked");
+}
+
+async fn stdio_connection_stops_dispatch_after_writer_failure_body() {
     let dispatch_count = new_stdio_dispatch_count_for_test();
     let write_failed = Arc::new(tokio::sync::Notify::new());
     let (mut input_tx, input_rx) = tokio::io::duplex(4096);
@@ -20676,6 +20705,7 @@ fn raw_method_is_dispatched_covers_full_raw_surface() {
         APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
         APPUI_METHOD_ONBOARDING_WORKSPACE_LIST,
         APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE,
+        APPUI_METHOD_SERVER_SHUTDOWN,
         // Autonomy (session/goal/*, loop/*, agent/*, task/artifact/*):
         octos_core::ui_protocol::methods::SESSION_GOAL_GET,
         octos_core::ui_protocol::methods::SESSION_GOAL_SET,
@@ -27035,6 +27065,70 @@ async fn turn_state_get_returns_unknown_for_missing() {
     // NOT an error.
     assert!(frame.get("result").is_some(), "missing turn must succeed");
     assert_eq!(frame["result"]["state"], "unknown");
+    // UPCR-2026-031: nothing in this process holds or is admitting the turn,
+    // so the server can say for certain it is not running it.
+    assert_eq!(frame["result"]["running"], false);
+}
+
+async fn turn_state_frame(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_turns: &SharedActiveTurns,
+    turn_id: TurnId,
+) -> Value {
+    let ledger = event_ledger(state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_turn_state_get(
+        &ws,
+        state,
+        &ledger,
+        active_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "ts".into(),
+        TurnStateGetParams {
+            session_id: session_id.clone(),
+            turn_id,
+        },
+    )
+    .await;
+    recv_rpc_json(&mut rx).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_not_claim_a_turn_is_stopped_while_its_start_is_still_being_admitted() {
+    // A slow `turn/start` has not reached the registry yet. A lookup in that
+    // window must stay a plain `unknown`: the turn may be about to run.
+    let session_id = SessionKey("local:turn-admitting".into());
+    let state = prg_state_with_session(&session_id, |_| {});
+    let active_turns = active_turns_registry();
+    let turn_id = TurnId::new();
+    let _admitting = TurnAdmission::enter(&session_id, &turn_id);
+
+    let frame = turn_state_frame(&state, &session_id, &active_turns, turn_id).await;
+
+    assert_eq!(frame["result"]["state"], "unknown");
+    assert!(
+        frame["result"].get("running").is_none(),
+        "no certainty while the start is in flight: {frame}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_say_a_turn_is_not_running_once_its_admission_has_ended_without_a_record() {
+    // The admission ended without registering the turn (refused, or its
+    // requester vanished before the accept). Now the answer is certain.
+    let session_id = SessionKey("local:turn-admission-ended".into());
+    let state = prg_state_with_session(&session_id, |_| {});
+    let active_turns = active_turns_registry();
+    let turn_id = TurnId::new();
+    drop(TurnAdmission::enter(&session_id, &turn_id));
+
+    let frame = turn_state_frame(&state, &session_id, &active_turns, turn_id).await;
+
+    assert_eq!(frame["result"]["state"], "unknown");
+    assert_eq!(frame["result"]["running"], false);
 }
 
 /// Serialise tests that mutate the process-global message-commit
@@ -44049,4 +44143,459 @@ fn memory_ingest_requires_vectors_parallel_to_records() {
         Some(vec![Some(vec![0.1, 0.2]), None]),
         "supplied vectors pass through untouched"
     );
+}
+
+// ---------------------------------------------------------------------
+// Oversized hydrate: shrink low-value fields first, never blank a reply.
+// A long coding session's `session/hydrate` reply is several MiB, spread
+// over hundreds of reasoning / tool-output / reply strings. Truncating
+// largest-first with a leftover budget blanked the biggest fields outright
+// — often the assistant's own replies — with `[oversized field omitted]`.
+// ---------------------------------------------------------------------
+
+/// A hydrate-shaped reply: `n` turns, each with a reasoning trace, a tool
+/// call + tool output, and an assistant reply, sized per the arguments.
+fn oversized_hydrate_frame(
+    turns: usize,
+    reasoning_len: usize,
+    tool_len: usize,
+    reply_len: usize,
+) -> String {
+    let mut messages = Vec::new();
+    for turn in 0..turns {
+        messages.push(json!({ "role": "user", "content": format!("question {turn}") }));
+        messages.push(json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": format!("R{turn}:{}", "r".repeat(reasoning_len)),
+            "tool_calls": [{ "id": format!("call-{turn}"), "type": "function",
+                "function": { "name": "shell", "arguments": format!("{{\"cmd\":\"{}\"}}", "a".repeat(tool_len / 4)) } }],
+        }));
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": format!("call-{turn}"),
+            "content": format!("T{turn}:{}", "t".repeat(tool_len)),
+        }));
+        messages.push(json!({
+            "role": "assistant",
+            "content": format!("REPLY_HEAD_{turn} {} REPLY_TAIL_{turn}", "w".repeat(reply_len)),
+        }));
+    }
+    let value = json!({ "jsonrpc": "2.0", "id": 7, "result": { "session_id": "local:test", "messages": messages } });
+    app_ui_codec::to_compact_json(&value).expect("serialize hydrate frame")
+}
+
+fn hydrate_messages(out: &str) -> Vec<Value> {
+    let parsed: Value = serde_json::from_str(out).expect("rewritten frame stays valid JSON");
+    parsed["result"]["messages"]
+        .as_array()
+        .expect("messages survive")
+        .clone()
+}
+
+#[test]
+fn should_keep_every_assistant_reply_whole_when_reasoning_and_tool_output_can_absorb_the_cut() {
+    // ~3 MiB: 40 turns x (30 KiB reasoning + ~37 KiB tool call/output + 8 KiB reply).
+    let frame = oversized_hydrate_frame(40, 30 * 1024, 30 * 1024, 8 * 1024);
+    assert!(
+        frame.len() > 2 * MAX_TEXT_FRAME_BYTES,
+        "fixture must be far over the cap"
+    );
+
+    let out = preview_oversized_frame(frame);
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "deliverable, got {}",
+        out.len()
+    );
+    assert!(
+        !out.contains(UNPREVIEWABLE_STUB),
+        "no field may be blanked to the stub"
+    );
+    let messages = hydrate_messages(&out);
+    assert_eq!(messages.len(), 160, "no message is dropped");
+    for turn in 0..40 {
+        let reply = messages[turn * 4 + 3]["content"].as_str().unwrap();
+        assert!(
+            reply.starts_with(&format!("REPLY_HEAD_{turn} "))
+                && reply.ends_with(&format!(" REPLY_TAIL_{turn}")),
+            "reply {turn} must survive whole"
+        );
+        assert!(
+            !reply.contains("bytes truncated"),
+            "reply {turn} must not be cut"
+        );
+        let tool = messages[turn * 4 + 2]["content"].as_str().unwrap();
+        assert!(
+            tool.starts_with(&format!("T{turn}:")),
+            "tool output {turn} keeps its head"
+        );
+        let reasoning = messages[turn * 4 + 1]["reasoning_content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            reasoning.starts_with(&format!("R{turn}:")),
+            "reasoning {turn} keeps its head"
+        );
+    }
+}
+
+#[test]
+fn should_keep_every_message_and_reply_when_a_long_session_has_many_medium_fields() {
+    // The shape of a real long coding session: hundreds of turns, each
+    // reasoning trace and tool output only a few KiB, but ~5 MiB in total. A
+    // preview floor sized for one dominant field cannot fit this, and the
+    // structural fallback then silently drops half the message list.
+    let frame = oversized_hydrate_frame(300, 8 * 1024, 8 * 1024, 1024);
+    assert!(
+        frame.len() > 4 * MAX_TEXT_FRAME_BYTES,
+        "fixture must be far over the cap"
+    );
+
+    let out = preview_oversized_frame(frame);
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "deliverable, got {}",
+        out.len()
+    );
+    assert!(
+        !out.contains(UNPREVIEWABLE_STUB),
+        "no field may be blanked to the stub"
+    );
+    let messages = hydrate_messages(&out);
+    assert_eq!(messages.len(), 1200, "no message may be dropped");
+    for turn in 0..300 {
+        let reply = messages[turn * 4 + 3]["content"].as_str().unwrap();
+        assert!(
+            reply.starts_with(&format!("REPLY_HEAD_{turn} "))
+                && reply.ends_with(&format!(" REPLY_TAIL_{turn}"))
+                && !reply.contains("bytes truncated"),
+            "reply {turn} must survive whole"
+        );
+    }
+}
+
+#[test]
+fn should_preview_rather_than_blank_replies_when_the_replies_alone_are_over_the_cap() {
+    // Replies alone are ~2.4 MiB, so they must be cut too — but each keeps a
+    // head and a tail with a marker, never the blank stub.
+    let frame = oversized_hydrate_frame(12, 1024, 1024, 200 * 1024);
+    assert!(frame.len() > 2 * MAX_TEXT_FRAME_BYTES);
+
+    let out = preview_oversized_frame(frame);
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "deliverable, got {}",
+        out.len()
+    );
+    assert!(
+        !out.contains(UNPREVIEWABLE_STUB),
+        "no field may be blanked to the stub"
+    );
+    let messages = hydrate_messages(&out);
+    for turn in 0..12 {
+        let reply = messages[turn * 4 + 3]["content"].as_str().unwrap();
+        assert!(
+            reply.starts_with(&format!("REPLY_HEAD_{turn} ")),
+            "reply {turn} keeps its head"
+        );
+        assert!(
+            reply.ends_with(&format!(" REPLY_TAIL_{turn}")),
+            "reply {turn} keeps its tail"
+        );
+        assert!(
+            reply.contains("bytes truncated"),
+            "reply {turn} carries the marker"
+        );
+        assert!(
+            reply.len() > 16 * 1024,
+            "reply {turn} keeps a useful preview, got {}",
+            reply.len()
+        );
+    }
+}
+
+// --- server/shutdown: stop a local --solo `octos serve` from a UI client ---
+
+/// A local `--solo` state that also carries an HTTP serve's stop switch, plus
+/// a receiver watching it — what `octos serve` (not `--stdio`) builds.
+fn local_serve_state_with_stop_switch(
+    dir: &std::path::Path,
+) -> (AppState, tokio::sync::watch::Receiver<bool>) {
+    let stop = Arc::new(tokio::sync::watch::channel(false).0);
+    let watching = stop.subscribe();
+    let state = AppState {
+        serve_shutdown: Some(stop),
+        ..local_profile_state(dir)
+    };
+    (state, watching)
+}
+
+fn advertises_server_shutdown(state: &AppState) -> bool {
+    ConnectionUiFeatures::default()
+        .advertised_capabilities(state)
+        .supported_methods
+        .iter()
+        .any(|method| method == APPUI_METHOD_SERVER_SHUTDOWN)
+}
+
+#[test]
+fn should_advertise_server_shutdown_only_on_a_local_solo_http_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let (serve, _watching) = local_serve_state_with_stop_switch(dir.path());
+    assert!(
+        advertises_server_shutdown(&serve),
+        "a local --solo HTTP serve must offer server/shutdown"
+    );
+
+    // `--stdio` and non-serve states hold no stop switch: nothing to stop.
+    let no_switch = local_profile_state(dir.path());
+    assert!(!advertises_server_shutdown(&no_switch));
+
+    // Without the explicit --solo opt-in — a fleet host behind a proxy looks
+    // exactly like this — one client must never be able to stop everyone's
+    // server.
+    let (not_solo, _w) = local_serve_state_with_stop_switch(dir.path());
+    let not_solo = AppState {
+        solo_login_enabled: false,
+        ..not_solo
+    };
+    assert!(!advertises_server_shutdown(&not_solo));
+
+    let (tenant, _w) = local_serve_state_with_stop_switch(dir.path());
+    let tenant = AppState {
+        deployment_mode: crate::config::DeploymentMode::Tenant,
+        ..tenant
+    };
+    assert!(!advertises_server_shutdown(&tenant));
+}
+
+#[tokio::test]
+async fn should_flip_the_serve_stop_switch_when_server_shutdown_is_called() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut watching) = local_serve_state_with_stop_switch(dir.path());
+
+    let reply = handle_server_shutdown(&state).expect("a local solo serve accepts it");
+    assert_eq!(reply, json!({ "stopping": true }));
+
+    // The reply is written first, then the same switch Ctrl+C flips.
+    tokio::time::timeout(std::time::Duration::from_secs(2), watching.changed())
+        .await
+        .expect("the stop switch must flip shortly after the reply")
+        .expect("sender alive");
+    assert!(*watching.borrow(), "server/shutdown must request a stop");
+}
+
+#[tokio::test]
+async fn should_refuse_server_shutdown_and_stop_nothing_when_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, watching) = local_serve_state_with_stop_switch(dir.path());
+    let state = AppState {
+        solo_login_enabled: false,
+        ..state
+    };
+
+    let error = handle_server_shutdown(&state).expect_err("not available without --solo");
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("kind")),
+        Some(&json!("server_shutdown_unavailable"))
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !*watching.borrow(),
+        "a refused request must not stop the server"
+    );
+}
+
+#[test]
+fn should_bar_session_scoped_connections_from_server_shutdown() {
+    // A session-ingress connection is scoped to one session; stopping the
+    // whole server is out of its reach whatever the deployment.
+    assert!(!session_ingress_callable_method(
+        APPUI_METHOD_SERVER_SHUTDOWN
+    ));
+}
+
+// UPCR-2026-031 wiring: a REAL `turn/start` held inside its admission window
+// (after the marker, before the registry insert) must not be reported as
+// certainly not running — under the raw id and, for a topic turn, the folded
+// id the registry keys on. Deleting the marker wiring fails these.
+async fn state_get_during_held_admission(topic: Option<&str>) -> (Value, Value, Value) {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let provider = Arc::new(AppuiContinuationLlm::new("done"));
+    let (state, _profile_runtime) =
+        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider).await;
+    let session_id = SessionKey::new("api", "admission-wired");
+    let folded = topic.map(|t| SessionKey(format!("{}#{t}", session_id.base_key())));
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, _rx) = ws_connection_for_test(256);
+    // Make the session known to the same manager `turn/state/get` consults,
+    // as any open session is.
+    for sid in std::iter::once(&session_id).chain(folded.as_ref()) {
+        let sessions = resolve_sessions_for_lookup(&state, None, None, sid)
+            .await
+            .expect("session manager for the test profile");
+        sessions.lock().await.get_or_create(sid).await;
+    }
+
+    let query = |sid: SessionKey, turn_id: TurnId| {
+        let state = state.clone();
+        let ledger = ledger.clone();
+        let active_turns = active_turns.clone();
+        async move {
+            let (ws, mut rx) = ws_connection_for_test(8);
+            handle_turn_state_get(
+                &ws,
+                &state,
+                &ledger,
+                &active_turns,
+                None,
+                None,
+                ConnectionUiFeatures::stdio_defaults(),
+                "probe".into(),
+                TurnStateGetParams {
+                    session_id: sid,
+                    turn_id,
+                },
+            )
+            .await;
+            recv_rpc_json(&mut rx).await
+        }
+    };
+
+    // Control: a turn nobody is admitting IS reported as not running here,
+    // so the assertions below can fail.
+    let control = query(folded.clone().unwrap_or(session_id.clone()), TurnId::new()).await;
+
+    let turn_id = TurnId::new();
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    TURN_ADMISSION_TEST_PAUSES
+        .lock()
+        .unwrap()
+        .insert(turn_id.0.to_string(), (reached.clone(), release.clone()));
+    let start = handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "held-start".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            input: vec![InputItem::Text {
+                text: "held in admission".into(),
+            }],
+            media: Vec::new(),
+            topic: topic.map(str::to_owned),
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+        },
+    );
+    let probe = async {
+        reached.notified().await;
+        let raw = query(session_id.clone(), turn_id.clone()).await;
+        let folded_frame = match folded.clone() {
+            Some(f) => query(f, turn_id.clone()).await,
+            None => raw.clone(),
+        };
+        release.notify_one();
+        (raw, folded_frame)
+    };
+    let (_, (raw, folded_frame)) = tokio::join!(start, probe);
+    (control, raw, folded_frame)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_withhold_not_running_while_a_real_turn_start_is_mid_admission() {
+    let (control, raw, _) = state_get_during_held_admission(None).await;
+    assert_eq!(control["result"]["running"], false, "control: {control}");
+    assert_eq!(raw["result"]["state"], "unknown", "held: {raw}");
+    assert!(raw["result"].get("running").is_none(), "held: {raw}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_withhold_not_running_for_a_topic_turn_asked_by_its_folded_id() {
+    let (control, raw, folded) = state_get_during_held_admission(Some("t1")).await;
+    assert_eq!(control["result"]["running"], false, "control: {control}");
+    for frame in [&raw, &folded] {
+        assert_eq!(frame["result"]["state"], "unknown", "held: {frame}");
+        assert!(frame["result"].get("running").is_none(), "held: {frame}");
+    }
+}
+
+// --- session keep-alive: an open Session must not age out of the runtime
+// cache under a client that is simply reading (see
+// APPUI_SESSION_KEEPALIVE_INTERVAL).
+
+#[test]
+fn should_pace_session_keepalive_inside_the_cache_idle_window() {
+    use std::time::Duration;
+    // A quarter of the window, so one missed tick still cannot age a Session out.
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(1800)),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(120)),
+        Duration::from_secs(30)
+    );
+    // Clamped: never busier than 5 s, never rarer than 5 minutes.
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(4)),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(36_000)),
+        Duration::from_secs(300)
+    );
+}
+
+#[test]
+fn should_wait_a_full_interval_before_the_first_session_keepalive() {
+    let interval = std::time::Duration::from_secs(300);
+    let start = std::time::Instant::now();
+    let mut last = None;
+    // session/open just used the runtime, so the first tick renews nothing.
+    assert!(!appui_keepalive_due(&mut last, start, interval));
+    assert!(!appui_keepalive_due(
+        &mut last,
+        start + std::time::Duration::from_secs(299),
+        interval
+    ));
+    assert!(appui_keepalive_due(&mut last, start + interval, interval));
+}
+
+#[test]
+fn should_keep_renewing_open_sessions_on_every_interval() {
+    let interval = std::time::Duration::from_secs(300);
+    let start = std::time::Instant::now();
+    let mut last = None;
+    appui_keepalive_due(&mut last, start, interval);
+    let mut renewals = 0;
+    // Two hours of an idle-but-open connection: the 30 minute idle TTL must
+    // never be reached between renewals.
+    for tick in (2..=7200).step_by(2) {
+        if appui_keepalive_due(
+            &mut last,
+            start + std::time::Duration::from_secs(tick),
+            interval,
+        ) {
+            renewals += 1;
+        }
+    }
+    assert_eq!(renewals, 24, "one renewal per interval, no drift");
 }

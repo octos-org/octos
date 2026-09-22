@@ -12,7 +12,7 @@
 //!
 //! The built-in `coding` profile is the no-flag default and carries a lean
 //! core-coding allow list (files, shell, search, memory, spawn, the workspace
-//! check tool, plan tracking, user questions, and tool_search) so `octos chat`
+//! check tool, plan tracking, user questions, tool_search and view_image) so `octos chat`
 //! does not ship every tool schema to the LLM on every round. The allow-list
 //! filter narrows the VISIBLE registry, so tools it excludes (web/research/
 //! media/pipeline) are restored via the `coding-full` built-in, which
@@ -701,6 +701,8 @@ mod tests {
                     "check",
                     "update_plan",
                     "tool_search",
+                    "view_image",
+                    "view_video",
                 ] {
                     assert!(
                         tools.contains(&required.to_string()),
@@ -829,6 +831,11 @@ mod tests {
             "update_plan",
             "tool_search",
             "ask_user_question",
+            // A coding agent must be able to look at the screenshot it
+            // just took; `view_image` hands the model the image itself, and
+            // `view_video` a recording, for the models that take video.
+            "view_image",
+            "view_video",
         ] {
             assert!(
                 names.contains(included),

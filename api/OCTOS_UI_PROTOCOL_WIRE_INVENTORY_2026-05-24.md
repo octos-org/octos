@@ -37,7 +37,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `session/status/read` | shipped AppUI extra, UPCR-2026-017 |
 | `session/hydrate` | shipped, UPCR-2026-009 |
 | `thread/graph/get` | shipped, UPCR-2026-010 |
-| `turn/state/get` | shipped, UPCR-2026-011 |
+| `turn/state/get` | shipped, UPCR-2026-011; `running` field UPCR-2026-031 |
 | `turn/start` | shipped base method |
 | `turn/interrupt` | shipped base method, UPCR-2026-008 typed fields |
 | `approval/respond` | shipped base method, UPCR-2026-001 optional fields |

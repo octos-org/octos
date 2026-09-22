@@ -148,7 +148,7 @@ Key options:
 | `--stdio` | Run the AppUI JSON-RPC protocol over stdin/stdout instead of HTTP |
 | `--solo` | Enable the loopback-only no-password solo login (`POST /api/auth/solo*`); also `OCTOS_SOLO_LOGIN=1`. Never enable behind a reverse proxy |
 | `--data-dir <P>` | Data directory for episodes/memory/sessions (default `$OCTOS_HOME` or `~/.octos`) |
-| `--auth-token <T>` | Admin bearer token for API access |
+| `--auth-token <T>` | Admin bearer token for API access. Visible in the process list (`ps`) — prefer the `OCTOS_AUTH_TOKEN` env var or the config file |
 | `--config <P>` | Config file path |
 | `--swarm-backend <stdio\|http>` | Enable the `/api/swarm/*` contract-authoring endpoints (pairs with `--swarm-backend-cmd` / `--swarm-backend-url`) |
 

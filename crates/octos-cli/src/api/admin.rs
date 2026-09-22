@@ -24,8 +24,10 @@ const SERVE_LOG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 static SERVE_LOG_BEARER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9_.+/=-]{12,}").unwrap());
-static SERVE_LOG_QUERY_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)((?:[?&]|\b)(?:token|auth_token)=)[^&\s]+").unwrap());
+static SERVE_LOG_QUERY_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)((?:[?&]|\b)(?:session_ingress_token|auth_token|_token|token)=)[^&\s]+")
+        .unwrap()
+});
 static SERVE_LOG_API_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\b(?:sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]{12,}|AKIA[0-9A-Z]{16})\b",
@@ -6262,6 +6264,25 @@ mod tests {
         assert!(!redacted.contains("abcdef0123456789ABCDEF0123"));
         assert!(!redacted.contains("secret123"));
         assert!(!redacted.contains("sk-testsecret12345"));
+    }
+
+    #[test]
+    fn serve_log_redaction_masks_removed_ingress_token_aliases() {
+        // #2370 removed the `_token` / `session_ingress_token` query aliases;
+        // URLs carrying them still exist in retained logs from stale clients,
+        // so the redaction layer must recognize those spellings too.
+        let redacted = redact_serve_log_line(
+            "GET /v1/session_ingress/ws/s?session_ingress_token=secret123&_token=secret456",
+        );
+
+        assert!(redacted.contains("?session_ingress_token=[credential-redacted]"));
+        assert!(redacted.contains("&_token=[credential-redacted]"));
+        assert!(!redacted.contains("secret123"));
+        assert!(!redacted.contains("secret456"));
+
+        // Unrelated keys whose names merely contain the aliases stay intact.
+        let untouched = redact_serve_log_line("GET /x?my_token=keepme&other=keepme2");
+        assert!(untouched.contains("my_token=keepme"));
     }
 
     #[test]

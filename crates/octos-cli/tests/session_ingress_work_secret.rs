@@ -56,7 +56,7 @@ async fn work_secret_ws_round_trip_and_revocation_close() {
     let (addr, server) = spawn_api(state).await;
 
     let url = format!(
-        "ws://{addr}/v1/session_ingress/ws/{session_id}?session_ingress_token={token}&ui_feature=auxiliary.rest_to_ws.v1"
+        "ws://{addr}/v1/session_ingress/ws/{session_id}?token={token}&ui_feature=auxiliary.rest_to_ws.v1"
     );
     let (mut ws, _response) = connect_async(url).await.unwrap();
 
@@ -138,7 +138,7 @@ async fn work_secret_ws_denies_raw_surface_but_allows_typed() {
     let (addr, server) = spawn_api(state).await;
 
     let url = format!(
-        "ws://{addr}/v1/session_ingress/ws/{session_id}?session_ingress_token={token}&ui_feature=auxiliary.rest_to_ws.v1"
+        "ws://{addr}/v1/session_ingress/ws/{session_id}?token={token}&ui_feature=auxiliary.rest_to_ws.v1"
     );
     let (mut ws, _response) = connect_async(url).await.unwrap();
 
@@ -225,7 +225,7 @@ async fn work_secret_ws_client_hello_advertises_only_callable_methods() {
     let (addr, server) = spawn_api(state).await;
 
     let url = format!(
-        "ws://{addr}/v1/session_ingress/ws/{session_id}?session_ingress_token={token}&ui_feature=auxiliary.rest_to_ws.v1"
+        "ws://{addr}/v1/session_ingress/ws/{session_id}?token={token}&ui_feature=auxiliary.rest_to_ws.v1"
     );
     let (mut ws, _response) = connect_async(url).await.unwrap();
 
@@ -270,6 +270,111 @@ async fn work_secret_ws_client_hello_advertises_only_callable_methods() {
         methods.iter().any(|m| m == "session/messages_page"),
         "ingress client_hello must still advertise session-scoped methods; got {methods:?}"
     );
+
+    server.abort();
+    let _ = server.await;
+}
+
+/// #2370: the bearer credential must arrive via the `Authorization` header;
+/// `?token=` remains only as a deprecated fallback for WebSocket clients that
+/// cannot set headers. The `_token` / `session_ingress_token` query aliases
+/// were removed and must be refused outright.
+#[tokio::test]
+async fn work_secret_ws_rejects_removed_query_token_aliases() {
+    let dir = TempDir::new().unwrap();
+    let session_id = "local:work-secret";
+    let token = "guest-token";
+    let (state, store) = state_with_work_secret_store(&dir);
+    store
+        .issue(
+            session_id,
+            token,
+            "http://127.0.0.1:50080",
+            Duration::minutes(5),
+            None,
+        )
+        .unwrap();
+    let (addr, server) = spawn_api(state).await;
+
+    for alias in ["session_ingress_token", "_token"] {
+        let url = format!("ws://{addr}/v1/session_ingress/ws/{session_id}?{alias}={token}");
+        match connect_async(url).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "?{alias}= must be rejected with 401"
+                );
+                let body = response.body().as_deref().unwrap_or_default();
+                let body = std::str::from_utf8(body).unwrap_or_default();
+                assert!(
+                    body.contains("removed"),
+                    "?{alias}= 401 must name the removed parameter, got {body:?}"
+                );
+            }
+            other => panic!("?{alias}= must be refused, got {other:?}"),
+        }
+    }
+
+    server.abort();
+    let _ = server.await;
+}
+
+/// #2370: the preferred credential carrier is the `Authorization: Bearer`
+/// header — it must authenticate the upgrade without any query parameter.
+#[tokio::test]
+async fn work_secret_ws_accepts_authorization_bearer_header() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let dir = TempDir::new().unwrap();
+    let session_id = "local:work-secret";
+    let token = "guest-token";
+    let (state, store) = state_with_work_secret_store(&dir);
+    store
+        .issue(
+            session_id,
+            token,
+            "http://127.0.0.1:50080",
+            Duration::minutes(5),
+            None,
+        )
+        .unwrap();
+    let (addr, server) = spawn_api(state).await;
+
+    let mut request = format!(
+        "ws://{addr}/v1/session_ingress/ws/{session_id}?ui_feature=auxiliary.rest_to_ws.v1"
+    )
+    .into_client_request()
+    .unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (mut ws, _response) = connect_async(request).await.unwrap();
+
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "status-via-header",
+            "method": "session/status.get",
+            "params": { "session_id": session_id }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next())
+        .await
+        .expect("timed out waiting for session ingress response")
+        .expect("websocket ended before first response")
+        .expect("failed to read first response");
+    let Message::Text(body) = response else {
+        panic!("expected JSON-RPC text response, got {response:?}");
+    };
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["id"], "status-via-header");
+    assert_eq!(body["result"]["status"]["active"], false);
 
     server.abort();
     let _ = server.await;

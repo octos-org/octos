@@ -1277,6 +1277,7 @@ impl Tool for RunPipelineTool {
             files_to_send: delivery.files_to_send,
             structured_metadata,
             named_outputs: None,
+            model_media: Vec::new(),
         })
     }
 }
@@ -1579,6 +1580,7 @@ pub(crate) fn build_pipeline_timeout_result(timeout_secs: u64) -> ToolResult {
         files_to_send: Vec::new(),
         structured_metadata: None,
         named_outputs: None,
+        model_media: Vec::new(),
     }
 }
 
