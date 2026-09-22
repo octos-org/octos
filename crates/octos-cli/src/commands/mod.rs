@@ -236,6 +236,19 @@ pub fn resolve_data_dir(cli_override: Option<PathBuf>) -> eyre::Result<PathBuf> 
     Ok(ctx.data_dir)
 }
 
+/// Build the `profile '<id>' not found` message, listing the ids that do
+/// exist so a typo doesn't dead-end the user (#2414).
+pub fn profile_not_found_message(profiles: &[crate::profiles::UserProfile], id: &str) -> String {
+    if profiles.is_empty() {
+        return format!("profile '{id}' not found. No profiles are configured.");
+    }
+    let ids: Vec<&str> = profiles.iter().map(|p| p.id.as_str()).collect();
+    format!(
+        "profile '{id}' not found. Existing profiles: {}",
+        ids.join(", ")
+    )
+}
+
 /// Resolve the canonical [`ConfigContext`](crate::config_context::ConfigContext)
 /// for a command, create the data dir, and run the (idempotent, best-effort)
 /// config + auth migrations exactly once.
