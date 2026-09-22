@@ -11815,6 +11815,29 @@ impl AgentOrchestrator for InProcessAgentOrchestrator {
                 record.pause_reason = Some("user".into());
             }
             MonitorControlKind::Resume => {
+                // #2367 — a past deadline must never be re-armed: resume used
+                // to flip the record back to `active` with `expires_at_ms`
+                // still in the past, so the next reconcile pass re-expired it
+                // seconds later and the caller had already seen `ok: true`.
+                // The deadline, not the status, is what matters — only
+                // `active` records are swept to `expired`, so a monitor
+                // paused before its deadline keeps the stale deadline and
+                // resume is the one door back to `active`. Persistent
+                // monitors have no deadline and resume freely.
+                if record.expires_at_ms.is_some_and(|at| at <= now) {
+                    return Err(autonomy_error(
+                        kinds::MONITOR_INVALID_STATE,
+                        format!(
+                            "monitor `{}` ({}) expired and cannot be resumed; \
+                             re-create it if the watch is still needed",
+                            record.name, record.monitor_id
+                        ),
+                        request.session_id.as_ref().or(Some(&record.session_id)),
+                        Some(&request.profile_id),
+                        Some(("monitor_id", record.monitor_id.as_str())),
+                        true,
+                    ));
+                }
                 record.status = "active".into();
                 record.pause_reason = None;
                 // A resumed (possibly flooded) monitor restarts its flood
@@ -12726,7 +12749,8 @@ impl InProcessAgentOrchestrator {
     /// respawning a crashing probe in a loop would be a process-spawn storm,
     /// and the exit may be meaningful (the watched source ended). The
     /// durable note tells the master; `monitor/resume` re-arms a fresh
-    /// process via the reconcile pass.
+    /// process via the reconcile pass (a monitor whose deadline has already
+    /// passed is refused instead — #2367).
     pub(crate) fn pause_monitor_on_process_exit(&self, monitor_id: &str, exit_code: Option<i32>) {
         let note = {
             let mut state = self.state();
@@ -12746,7 +12770,8 @@ impl InProcessAgentOrchestrator {
                 record.session_id.clone(),
                 format!(
                     "monitor `{}` ({}) stream probe exited (code {}); monitor PAUSED. \
-                     Resume it to spawn a fresh probe.",
+                     Resume it to spawn a fresh probe (an expired monitor must be \
+                     re-created instead).",
                     record.name,
                     record.monitor_id,
                     exit_code.map_or("unknown".to_owned(), |code| code.to_string())
@@ -45918,6 +45943,145 @@ mod tests {
             notes.contains("EXPIRED"),
             "note explains the expiry: {notes}"
         );
+    }
+
+    /// #2367 — `monitor/resume` must not resurrect a monitor whose deadline
+    /// has already passed: the sweep would re-expire it on the next drain
+    /// tick, so the caller saw `ok: true` followed by a silent second death.
+    /// The refusal is typed and leaves the record expired.
+    #[test]
+    fn monitor_resume_refuses_a_past_deadline_and_leaves_the_record_expired() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session = SessionKey::new("api", "mon-resume-expired");
+        let mut spec = monitor_spec("short", MonitorMode::Poll { interval_secs: 3 });
+        spec.timeout_secs = Some(1);
+        create_monitor_for_test(
+            &orchestrator,
+            &session,
+            "tenant-a",
+            spec,
+            Some(dir.path().to_path_buf()),
+        );
+        // Force the expiry deadline into the past, then expire via the sweep.
+        {
+            let mut state = orchestrator.state();
+            let record = state.monitors.get_mut("monitor_01").unwrap();
+            record.expires_at_ms = Some(now_ms() - 1_000);
+        }
+        orchestrator.monitor_reconcile_pass();
+        assert_eq!(
+            orchestrator
+                .monitor_status_for_test("monitor_01")
+                .unwrap()
+                .0,
+            "expired"
+        );
+
+        let err = orchestrator
+            .control_monitor(MonitorControlRequest {
+                monitor_id: "monitor_01".to_owned(),
+                session_id: Some(session),
+                profile_id: "tenant-a".to_owned(),
+                kind: MonitorControlKind::Resume,
+            })
+            .expect_err("resume of an expired monitor must be refused");
+        assert_eq!(err.code, autonomy_error_code(kinds::MONITOR_INVALID_STATE));
+        assert_eq!(
+            err.data.expect("error data")["kind"],
+            json!(kinds::MONITOR_INVALID_STATE)
+        );
+        assert!(
+            err.message.contains("re-create"),
+            "refusal points at re-creating the watch: {}",
+            err.message
+        );
+        assert_eq!(
+            orchestrator
+                .monitor_status_for_test("monitor_01")
+                .unwrap()
+                .0,
+            "expired",
+            "a refused resume must leave the record expired"
+        );
+    }
+
+    /// #2367 — the same trap through the pause door: only `active` records
+    /// are swept to `expired`, so a monitor paused before its deadline keeps
+    /// the stale deadline while `paused`, and `resume` is the one path that
+    /// could re-arm it. It must refuse there too.
+    #[test]
+    fn monitor_resume_refuses_a_stale_deadline_reached_through_pause() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session = SessionKey::new("api", "mon-resume-stale");
+        let mut spec = monitor_spec("short", MonitorMode::Poll { interval_secs: 3 });
+        spec.timeout_secs = Some(1);
+        create_monitor_for_test(&orchestrator, &session, "tenant-a", spec, None);
+        orchestrator
+            .control_monitor(MonitorControlRequest {
+                monitor_id: "monitor_01".to_owned(),
+                session_id: Some(session.clone()),
+                profile_id: "tenant-a".to_owned(),
+                kind: MonitorControlKind::Pause,
+            })
+            .expect("pause");
+        // The deadline passes while paused; the sweep skips non-active
+        // records, so the record stays `paused` with a stale deadline.
+        {
+            let mut state = orchestrator.state();
+            let record = state.monitors.get_mut("monitor_01").unwrap();
+            record.expires_at_ms = Some(now_ms() - 1_000);
+        }
+        let err = orchestrator
+            .control_monitor(MonitorControlRequest {
+                monitor_id: "monitor_01".to_owned(),
+                session_id: Some(session),
+                profile_id: "tenant-a".to_owned(),
+                kind: MonitorControlKind::Resume,
+            })
+            .expect_err("resume must not re-arm a past deadline");
+        assert_eq!(
+            err.data.expect("error data")["kind"],
+            json!(kinds::MONITOR_INVALID_STATE)
+        );
+        assert_eq!(
+            orchestrator
+                .monitor_status_for_test("monitor_01")
+                .unwrap()
+                .0,
+            "paused",
+            "a refused resume must leave the record paused"
+        );
+    }
+
+    /// #2367 boundary — a paused monitor whose deadline is still in the
+    /// future resumes normally; only the stale deadline is refused.
+    #[test]
+    fn monitor_resume_of_a_paused_monitor_with_a_live_deadline_still_works() {
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session = SessionKey::new("api", "mon-resume-live");
+        let mut spec = monitor_spec("watch", MonitorMode::Poll { interval_secs: 3 });
+        spec.timeout_secs = Some(3600);
+        create_monitor_for_test(&orchestrator, &session, "tenant-a", spec, None);
+        orchestrator
+            .control_monitor(MonitorControlRequest {
+                monitor_id: "monitor_01".to_owned(),
+                session_id: Some(session.clone()),
+                profile_id: "tenant-a".to_owned(),
+                kind: MonitorControlKind::Pause,
+            })
+            .expect("pause");
+        orchestrator
+            .control_monitor(MonitorControlRequest {
+                monitor_id: "monitor_01".to_owned(),
+                session_id: Some(session),
+                profile_id: "tenant-a".to_owned(),
+                kind: MonitorControlKind::Resume,
+            })
+            .expect("a live-deadline monitor resumes");
+        let (status, pause_reason) = orchestrator.monitor_status_for_test("monitor_01").unwrap();
+        assert_eq!(status, "active");
+        assert_eq!(pause_reason, None);
     }
 
     // ---- #20c — dual-goal main-tree sovereignty install/scan wiring --------
