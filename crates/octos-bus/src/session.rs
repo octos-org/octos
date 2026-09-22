@@ -575,6 +575,21 @@ fn read_segment(path: &Path, key: &SessionKey) -> Option<SegmentFile> {
         );
         return None;
     }
+    let timeline = read_timeline_rows(&mut reader, path, key);
+    Some(SegmentFile {
+        meta,
+        timeline,
+        bytes,
+    })
+}
+
+/// Parse every remaining line of `reader` as a session row (message or
+/// control record), skipping blank and unparsable lines.
+fn read_timeline_rows(
+    reader: &mut impl std::io::BufRead,
+    path: &Path,
+    key: &SessionKey,
+) -> Vec<SessionTimelineItem> {
     let mut timeline = Vec::new();
     let mut line = String::new();
     loop {
@@ -582,15 +597,8 @@ fn read_segment(path: &Path, key: &SessionKey) -> Option<SegmentFile> {
         match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {
-                let trimmed = line.trim_end_matches(['\n', '\r']);
-                if trimmed.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(control) = serde_json::from_str::<SessionControlRecord>(trimmed) {
-                    let SessionControlRecord::Rollback { num_turns, at } = control;
-                    timeline.push(SessionTimelineItem::Rollback { num_turns, at });
-                } else if let Ok(message) = serde_json::from_str::<Message>(trimmed) {
-                    timeline.push(SessionTimelineItem::Message(Box::new(message)));
+                if let Some(item) = parse_timeline_row(&line) {
+                    timeline.push(item);
                 }
             }
             Err(error) => {
@@ -599,8 +607,44 @@ fn read_segment(path: &Path, key: &SessionKey) -> Option<SegmentFile> {
             }
         }
     }
+    timeline
+}
+
+fn parse_timeline_row(line: &str) -> Option<SessionTimelineItem> {
+    let trimmed = line.trim_end_matches(['\n', '\r']);
+    if trimmed.trim().is_empty() {
+        return None;
+    }
+    if let Ok(control) = serde_json::from_str::<SessionControlRecord>(trimmed) {
+        let SessionControlRecord::Rollback { num_turns, at } = control;
+        return Some(SessionTimelineItem::Rollback { num_turns, at });
+    }
+    serde_json::from_str::<Message>(trimmed)
+        .ok()
+        .map(|message| SessionTimelineItem::Message(Box::new(message)))
+}
+
+/// The rows of a segment whose meta line cannot be read (torn, corrupted, or
+/// missing): the first line is taken as a row if it parses as one, else
+/// skipped, and the rest is read as usual. Returns `None` only when the file
+/// cannot be opened. Used to keep counting — and showing — history that sits
+/// behind one bad line (#2468).
+fn read_segment_rows_without_meta(path: &Path, key: &SessionKey) -> Option<SegmentFile> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    let bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut reader = BufReader::new(file);
+    let mut first = String::new();
+    let mut timeline = Vec::new();
+    if reader.read_line(&mut first).ok()? > 0
+        && serde_json::from_str::<SessionMeta>(first.trim_end()).is_err()
+        && let Some(item) = parse_timeline_row(&first)
+    {
+        timeline.push(item);
+    }
+    timeline.extend(read_timeline_rows(&mut reader, path, key));
     Some(SegmentFile {
-        meta,
+        meta: SessionMeta::placeholder(key),
         timeline,
         bytes,
     })
@@ -647,6 +691,10 @@ fn load_session_window(active: &Path, key: &SessionKey, budget: u64) -> Option<S
     let mut spent = active_file.bytes;
     let mut loaded: Vec<SegmentFile> = Vec::new();
     let mut base_seq = active_file.meta.base_seq;
+    // Segments read newest-first whose meta line was unreadable: their rows
+    // are kept, but they only join the window once an older segment's meta
+    // (or index 1, which starts at zero) says how many rows precede them.
+    let mut unanchored: Vec<SegmentFile> = Vec::new();
     let mut index = sealed_total;
     while index >= 1 {
         let path = segment_path(&dir, index);
@@ -654,14 +702,38 @@ fn load_session_window(active: &Path, key: &SessionKey, budget: u64) -> Option<S
         if spent.saturating_add(size) > budget {
             break;
         }
-        let Some(segment) = read_segment(&path, key) else {
-            break;
-        };
-        spent = spent.saturating_add(size);
-        base_seq = segment.meta.base_seq;
-        loaded.push(segment);
+        match read_segment(&path, key) {
+            Some(segment) => {
+                spent = spent.saturating_add(size);
+                base_seq = segment.meta.base_seq;
+                // `loaded` is newest-first: the anchored rows precede their
+                // anchor here and follow it once the list is reversed.
+                loaded.append(&mut unanchored);
+                loaded.push(segment);
+            }
+            None => {
+                let Some(rows) = read_segment_rows_without_meta(&path, key) else {
+                    break;
+                };
+                warn!(
+                    key = %key,
+                    segment = index,
+                    rows = rows.timeline.len(),
+                    "sealed session segment has no readable meta line; using its rows"
+                );
+                spent = spent.saturating_add(size);
+                unanchored.push(rows);
+                if index == 1 {
+                    base_seq = 0;
+                    loaded.append(&mut unanchored);
+                }
+            }
+        }
         index -= 1;
     }
+    // Rows behind a bad meta line with nothing older to anchor them stay on
+    // disk, outside the window.
+    drop(unanchored);
     let loaded_sealed = loaded.len() as u32;
     let mut timeline = Vec::new();
     for segment in loaded.into_iter().rev() {
@@ -679,10 +751,10 @@ fn load_session_window(active: &Path, key: &SessionKey, budget: u64) -> Option<S
 
 /// Sealing renames the active file and then starts a fresh one; a crash in
 /// between leaves sealed segments with no (or an empty) active file. Rebuild
-/// the active file from the newest sealed segment — its meta carries the
-/// session's identity and its rows say how many are visible before the fresh
-/// file — and write it so listings see the session again and the next append
-/// continues the seq chain. Only a missing or empty active file is rebuilt:
+/// the active file from the sealed segments — the newest readable meta
+/// carries the session's identity and the rows say how many are visible
+/// before the fresh file — and write it so listings see the session again
+/// and the next append continues the seq chain. Only a missing or empty active file is rebuilt:
 /// an unreadable one is left for a human, never renamed over.
 fn recover_active_after_seal(active: &Path, key: &SessionKey, dir: &Path) -> Option<SegmentFile> {
     use std::io::Write;
@@ -694,9 +766,41 @@ fn recover_active_after_seal(active: &Path, key: &SessionKey, dir: &Path) -> Opt
     if sealed == 0 {
         return None;
     }
-    let newest = read_segment(&segment_path(dir, sealed), key)?;
-    let template = newest.meta.clone();
-    let base_seq = template.base_seq + fold_session_timeline(newest.timeline).len();
+    // Identity comes from the newest segment whose meta line reads; the rows
+    // of every segment passed on the way (unreadable meta) still count, so a
+    // second bad line never restarts the seq chain at zero (#2468). With no
+    // readable meta at all the identity is rebuilt from the key alone.
+    let mut newest_first: Vec<Vec<SessionTimelineItem>> = Vec::new();
+    let mut template: Option<SessionMeta> = None;
+    let mut index = sealed;
+    while index >= 1 {
+        let path = segment_path(dir, index);
+        if let Some(segment) = read_segment(&path, key) {
+            newest_first.push(segment.timeline);
+            template = Some(segment.meta);
+            break;
+        }
+        warn!(
+            key = %key,
+            segment = index,
+            "sealed session segment has no readable meta line; counting its rows for recovery"
+        );
+        newest_first.push(
+            read_segment_rows_without_meta(&path, key)
+                .map(|segment| segment.timeline)
+                .unwrap_or_default(),
+        );
+        index -= 1;
+    }
+    let template = template.unwrap_or_else(|| {
+        warn!(key = %key, "no sealed segment has a readable meta line; rebuilding identity from the key");
+        SessionMeta::placeholder(key)
+    });
+    let mut timeline = Vec::new();
+    for rows in newest_first.into_iter().rev() {
+        timeline.extend(rows);
+    }
+    let base_seq = template.base_seq + fold_session_timeline(timeline).len();
     let meta = SessionMeta {
         sealed_segments: sealed,
         base_seq,
@@ -1063,6 +1167,28 @@ struct SessionMeta {
     /// file: the seq of this file's first row. Zero when nothing precedes it.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     base_seq: usize,
+}
+
+impl SessionMeta {
+    /// A meta with nothing but the key: what a session file is rebuilt from
+    /// when no line on disk still says who it belonged to.
+    fn placeholder(key: &SessionKey) -> Self {
+        let now = Utc::now();
+        Self {
+            schema_version: CURRENT_SESSION_SCHEMA,
+            session_key: key.0.clone(),
+            parent_key: None,
+            topic: key.topic().map(str::to_owned),
+            summary: None,
+            title: None,
+            title_manual: false,
+            child_contracts: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            sealed_segments: 0,
+            base_seq: 0,
+        }
+    }
 }
 
 /// A conversation session with message history.
