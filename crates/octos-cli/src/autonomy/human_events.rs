@@ -96,6 +96,13 @@ pub(crate) fn set_background_activity_sink(sink: BackgroundActivitySink) {
 /// Hold the returned guard for the WHOLE test body. Poison-safe: a failing
 /// test panics while holding it, and the next test must still be able to run
 /// (it resets the state it cares about anyway).
+///
+/// The guard serializes sink INSTALLERS only. It cannot stop a NON-guarded
+/// emitter — any parallel case that reaches `emit_background_activity` (e.g.
+/// via `handle_monitor_batch`) still writes into the installed sink and the
+/// shared budget map. A test that records events MUST therefore filter its
+/// recorder to the sessions its own body produces; a count-everything
+/// recorder over-counts under a crowded test filter (#2364).
 #[cfg(test)]
 #[must_use = "hold the guard for the whole test body, or the sink races again"]
 pub(crate) fn background_activity_test_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -398,11 +405,20 @@ mod tests {
         let _guard = background_activity_test_guard();
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let recorder = seen.clone();
+        // Record only THIS test's session: the sink is process-global, so a
+        // parallel case that emits without the guard (any `handle_monitor_batch`
+        // caller) would otherwise inflate the count (#2364).
+        let owned = SessionKey("dev:local:tui".to_owned());
         set_background_activity_sink(Arc::new(move |event: BackgroundActivityEvent| {
-            recorder.lock().unwrap().push(event);
+            if event.session_id == owned {
+                recorder.lock().unwrap().push(event);
+            }
         }));
         emit_background_activity(event_for("   ", "mon-1"));
         emit_background_activity(event_for("dev:local:tui", "mon-1"));
+        // A foreign emission (the role any non-guarded emitter plays in a
+        // crowded test process) must not reach this recorder.
+        emit_background_activity(event_for("api:mon-idle", "monitor_01"));
         let captured = seen.lock().unwrap().clone();
         clear_background_activity_sink();
         assert_eq!(captured.len(), 1, "only the routable event is emitted");

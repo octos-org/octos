@@ -469,24 +469,28 @@ jobs:
         run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_sigterm -- --test-threads=1
 
       # Co-located here so they reuse this job's warm octos-cli build cache.
+      # All api-feature filter steps below go through ci-api-filter-test.sh:
+      # a bare `cargo test <filter>` reports `ok` when the filter matches
+      # nothing, so a renamed test would silently drop out of CI (#2029).
+      # The script fails the step when any filter selects zero tests.
       - name: API feature tests
-        run: cargo test -p octos-cli --features api api::auth_handlers
+        run: ./scripts/ci-api-filter-test.sh api::auth_handlers
 
       # The §6 catalog guard lives in the feature-gated `api` module, so the
       # unfeatured lib/integration runs above never compile it. Run it
       # explicitly so UI Protocol spec/impl drift actually fails CI.
       - name: UI Protocol §6 catalog guard (octos-cli)
-        run: cargo test -p octos-cli --features api spec_section6_catalog_lists_every_advertised_method -- --nocapture
+        run: ./scripts/ci-api-filter-test.sh spec_section6_catalog_lists_every_advertised_method -- --nocapture
 
       - name: gateway_runtime regression (octos-cli)
-        run: cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
+        run: ./scripts/ci-api-filter-test.sh gateway_runtime::tests -- --nocapture
 
       # Session-open context hydration lives in the `api`-gated ui_protocol
       # module (same reason as the §6 guard): the open-time snapshot must run
       # the pre-turn threshold compaction so a rebuilt ledger never publishes
       # an over-window gauge (`ctx 1.2M/1M` field report, 2026-08-07).
       - name: Session-open context compaction (octos-cli)
-        run: cargo test -p octos-cli --features api session_open_snapshot -- --nocapture
+        run: ./scripts/ci-api-filter-test.sh session_open_snapshot -- --nocapture
 
       # The session usage-status mapping lives in the `api`-gated ui_protocol
       # module, so the unfeatured runs above never compile it — same reason as
@@ -494,7 +498,7 @@ jobs:
       # (#2029), so the `cached_input_tokens`/`cache_write_input_tokens`
       # mapping had never executed in CI.
       - name: Session usage status mapping (octos-cli)
-        run: cargo test -p octos-cli --features api usage
+        run: ./scripts/ci-api-filter-test.sh usage
 
       # Peer staging/fencing lives in the `api`-gated ui_protocol module, so the
       # unfeatured runs above never compile it — same reason as the §6 guard.
@@ -502,16 +506,16 @@ jobs:
       # isolation guard (one peer's cleanup must not delete a SIBLING's
       # worktree, which a repo-global `git worktree prune` used to do).
       - name: Peer staging + worktree fencing (octos-cli)
-        run: cargo test -p octos-cli --features api peer
+        run: ./scripts/ci-api-filter-test.sh peer
 
       # `commands::serve::tests` matched NONE of the filters on this list, so
       # its guards had not executed in CI since #1728 — long enough for
       # `global_drain_spawns_before_the_stdio_early_return` to go red on main
       # unnoticed (its source-scan needle carried the pre-rename module path).
-      # A filter that matches nothing reports `ok`, so absent coverage is
-      # indistinguishable from passing coverage; see #2029 for the general fix.
+      # ci-api-filter-test.sh now fails any filter that selects zero tests,
+      # so absent coverage can no longer masquerade as passing coverage (#2029).
       - name: serve wiring guards (octos-cli)
-        run: cargo test -p octos-cli --features api commands::serve::tests
+        run: ./scripts/ci-api-filter-test.sh commands::serve::tests
 
       # The goal-completion verifier's ledger-evidence fold lives in the
       # `api`-gated goal_tool module, so the unfeatured runs above never compile
@@ -519,7 +523,7 @@ jobs:
       # goal must verify against the durable ledger findings, not the master's
       # reply alone, or the master loops until its token budget drains.
       - name: Goal completion verifier ledger evidence (octos-cli)
-        run: cargo test -p octos-cli --features api -- completion_evidence goal_update_folds_ledger --nocapture
+        run: ./scripts/ci-api-filter-test.sh completion_evidence goal_update_folds_ledger -- --nocapture
 
       # #2019 human sink: the `background/activity` capability gate and the
       # durable per-session replay both live in the `api`-gated ui_protocol
@@ -528,7 +532,7 @@ jobs:
       # non-gated `crate::autonomy` and DOES run in the unfeatured lib step;
       # this covers the two halves that cannot.
       - name: Background activity human sink (octos-cli)
-        run: cargo test -p octos-cli --features api background_activity -- --nocapture
+        run: ./scripts/ci-api-filter-test.sh background_activity -- --nocapture
 
       # #2065 goal-frame substrate: per-scope generation identities for the
       # #1959 send guard (one cwd scope's clear must not suppress a sibling
@@ -537,7 +541,7 @@ jobs:
       # `api`-gated ui_protocol module — invisible to the unfeatured runs
       # above, same reason as the §6 guard.
       - name: Goal-frame scoping + gating + forwarder (octos-cli)
-        run: cargo test -p octos-cli --features api -- goal_scope_guard session_open_goal --nocapture
+        run: ./scripts/ci-api-filter-test.sh goal_scope_guard session_open_goal -- --nocapture
 
       # The smart_home/* WS methods are `api`-gated too, so the unfeatured
       # integration run above compiles this file to zero tests. Run it

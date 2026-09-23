@@ -2487,6 +2487,27 @@ Rules:
   `data.kind = "profile_unresolved"`; it must not fabricate a runtime policy
   stamp for that profile or silently fall back to a default profile
 
+Numeric codes for method-availability errors (constants in `rpc_error_codes`
+in `crates/octos-core/src/ui_protocol.rs`; the WS/stdio dispatcher applies
+them at its supported-table and capability gates in
+`crates/octos-cli/src/api/ui_protocol_transport.rs`):
+
+- `-32601` (`method_not_found`) — JSON-RPC reserved. Emitted by the core
+  `UiCommand` parser when the method falls outside the protocol's method
+  table. The serve dispatcher answers unknown methods with `-32004`
+  instead (below), so this code is not observed on the AppUI wire today.
+- `-32004` (`method_not_supported`) — legacy server slot for "this server
+  will not run the method": a method outside the supported-method table, or
+  a capability-gated method called without negotiating the feature (see the
+  M12 Phase D section). The message echoes the requested method name and
+  `data` carries a typed `UnsupportedCapabilityReport`, giving clients one
+  machine-readable signal that the server will not run the method on this
+  slice.
+- `-32130` (`unsupported_capability`) — typed slot for the
+  capability-unavailable condition. New emitters should prefer it over the
+  legacy `-32004` slot. Like `-32601`, it is not emitted on the AppUI wire
+  today.
+
 ## 11. Relationship to REST
 
 The original migration-era split below has been **superseded by M12 Phase D**

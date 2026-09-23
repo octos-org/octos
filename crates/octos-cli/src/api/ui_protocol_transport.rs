@@ -7603,6 +7603,8 @@ pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
         tokio::io::stdout(),
         #[cfg(test)]
         new_stdio_dispatch_count_for_test(),
+        #[cfg(test)]
+        None,
     )
     .await
 }
@@ -7633,6 +7635,8 @@ where
         Some(control),
         #[cfg(test)]
         new_stdio_dispatch_count_for_test(),
+        #[cfg(test)]
+        None,
     )
     .await
 }
@@ -7642,6 +7646,7 @@ pub(crate) async fn stdio_connection_with_io<R, W>(
     stdin_reader: R,
     stdout_writer: W,
     #[cfg(test)] dispatch_count: StdioDispatchCountForTest,
+    #[cfg(test)] writer_exit: Option<StdioWriterExitNotifyForTest>,
 ) -> eyre::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -7654,6 +7659,8 @@ where
         None,
         #[cfg(test)]
         dispatch_count,
+        #[cfg(test)]
+        writer_exit,
     )
     .await
 }
@@ -7664,6 +7671,7 @@ async fn stdio_connection_with_io_policy<R, W>(
     stdout_writer: W,
     embedded: Option<EmbeddedStdioControl>,
     #[cfg(test)] dispatch_count: StdioDispatchCountForTest,
+    #[cfg(test)] writer_exit: Option<StdioWriterExitNotifyForTest>,
 ) -> eyre::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -7679,6 +7687,14 @@ where
         .spawn(move || {
             let result = stdio_writer_loop_sync_to(writer_rx, stdout_writer, writer_failure_signal);
             let _ = writer_done_tx.send(result);
+            // Tests observe the failure latch through this notify, so fire it
+            // only once the loop has fully finished: `mark_failed` (which the
+            // dispatch loop's `is_failed` checks read) has run by then, while
+            // at the failing write itself it has not.
+            #[cfg(test)]
+            if let Some(writer_exit) = writer_exit {
+                writer_exit.notify_waiters();
+            }
         })
         .map_err(|error| eyre::eyre!("failed to spawn AppUI stdio writer: {error}"))?;
     let active_turns = active_turns_registry();
@@ -8430,6 +8446,18 @@ type StdioDispatchCountForTest = Arc<std::sync::atomic::AtomicUsize>;
 #[cfg(test)]
 fn new_stdio_dispatch_count_for_test() -> StdioDispatchCountForTest {
     Arc::new(std::sync::atomic::AtomicUsize::new(0))
+}
+
+// Writer-thread exit signal: fired only after the stdio writer loop has
+// finished, so a test waiting on it knows the failure latch is visible to
+// the connection loop. The failing write itself carries no such guarantee —
+// `mark_failed` runs after the writer helper's error returns.
+#[cfg(test)]
+type StdioWriterExitNotifyForTest = Arc<tokio::sync::Notify>;
+
+#[cfg(test)]
+fn new_stdio_writer_exit_notify_for_test() -> StdioWriterExitNotifyForTest {
+    Arc::new(tokio::sync::Notify::new())
 }
 
 #[cfg(test)]
@@ -30994,16 +31022,18 @@ async fn run_m9_fixture_turn(
 
     let outcome = match fixture {
         M9ProtocolFixture::Basic => {
-            let _ = send_notification_ephemeral(
-                &ws,
-                &ledger,
-                UiNotification::MessageDelta(MessageDeltaEvent {
-                    session_id: session_id.clone(),
-                    topic: None,
-                    turn_id: turn_id.clone(),
-                    text: "OK".to_owned(),
-                }),
-            );
+            // Dual-emit like `forward_progress_event`: the raw ephemeral is
+            // suppressed for every connection by the Stage-5 filter, so the
+            // canonical envelope is the only lane that carries fixture
+            // content to clients.
+            let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: "OK".to_owned(),
+            });
+            emit_progress_envelope(&ledger, &session_id, &delta, None);
+            let _ = send_notification_ephemeral(&ws, &ledger, delta);
             if m9_fixture_delay_or_interrupt(
                 &mut interrupt_rx,
                 std::time::Duration::from_millis(20),
@@ -31016,16 +31046,14 @@ async fn run_m9_fixture_turn(
             }
         }
         M9ProtocolFixture::M19StdioHappyPath => {
-            let _ = send_notification_ephemeral(
-                &ws,
-                &ledger,
-                UiNotification::MessageDelta(MessageDeltaEvent {
-                    session_id: session_id.clone(),
-                    topic: None,
-                    turn_id: turn_id.clone(),
-                    text: "`M19_STDIO_HAPPY_PATH_FINAL_LINE`".to_owned(),
-                }),
-            );
+            let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: "`M19_STDIO_HAPPY_PATH_FINAL_LINE`".to_owned(),
+            });
+            emit_progress_envelope(&ledger, &session_id, &delta, None);
+            let _ = send_notification_ephemeral(&ws, &ledger, delta);
             if m9_fixture_delay_or_interrupt(
                 &mut interrupt_rx,
                 std::time::Duration::from_millis(20),
@@ -31044,16 +31072,14 @@ async fn run_m9_fixture_turn(
                     interrupted = true;
                     break;
                 }
-                let _ = send_notification_ephemeral(
-                    &ws,
-                    &ledger,
-                    UiNotification::MessageDelta(MessageDeltaEvent {
-                        session_id: session_id.clone(),
-                        topic: None,
-                        turn_id: turn_id.clone(),
-                        text: "OK\n".to_owned(),
-                    }),
-                );
+                let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    text: "OK\n".to_owned(),
+                });
+                emit_progress_envelope(&ledger, &session_id, &delta, None);
+                let _ = send_notification_ephemeral(&ws, &ledger, delta);
                 if m9_fixture_delay_or_interrupt(
                     &mut interrupt_rx,
                     std::time::Duration::from_millis(25),
@@ -31073,44 +31099,38 @@ async fn run_m9_fixture_turn(
         M9ProtocolFixture::ToolEvents => {
             let tool_call_id = format!("m9-tool-{}", turn_id.0);
             let topic = session_id.topic().map(ToOwned::to_owned);
-            let _ = send_notification_durable(
-                &ws,
-                &ledger,
-                UiNotification::ToolStarted(ToolStartedEvent {
-                    session_id: session_id.clone(),
-                    topic: topic.clone(),
-                    turn_id: turn_id.clone(),
-                    tool_call_id: tool_call_id.clone(),
-                    tool_name: "list_dir".to_owned(),
-                    arguments: Some(json!({ "path": "." })),
-                }),
-            );
-            let _ = send_notification_durable(
-                &ws,
-                &ledger,
-                UiNotification::ToolProgress(ToolProgressEvent {
-                    session_id: session_id.clone(),
-                    topic: topic.clone(),
-                    turn_id: turn_id.clone(),
-                    tool_call_id: tool_call_id.clone(),
-                    message: Some("listing workspace".to_owned()),
-                    progress_pct: Some(50.0),
-                }),
-            );
-            let _ = send_notification_durable(
-                &ws,
-                &ledger,
-                UiNotification::ToolCompleted(ToolCompletedEvent {
-                    session_id: session_id.clone(),
-                    topic,
-                    turn_id: turn_id.clone(),
-                    tool_call_id,
-                    tool_name: "list_dir".to_owned(),
-                    success: Some(true),
-                    output_preview: Some("deterministic fixture listing".to_owned()),
-                    duration_ms: Some(1),
-                }),
-            );
+            let started = UiNotification::ToolStarted(ToolStartedEvent {
+                session_id: session_id.clone(),
+                topic: topic.clone(),
+                turn_id: turn_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "list_dir".to_owned(),
+                arguments: Some(json!({ "path": "." })),
+            });
+            emit_progress_envelope(&ledger, &session_id, &started, None);
+            let _ = send_notification_durable(&ws, &ledger, started);
+            let progress = UiNotification::ToolProgress(ToolProgressEvent {
+                session_id: session_id.clone(),
+                topic: topic.clone(),
+                turn_id: turn_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                message: Some("listing workspace".to_owned()),
+                progress_pct: Some(50.0),
+            });
+            emit_progress_envelope(&ledger, &session_id, &progress, None);
+            let _ = send_notification_durable(&ws, &ledger, progress);
+            let completed = UiNotification::ToolCompleted(ToolCompletedEvent {
+                session_id: session_id.clone(),
+                topic,
+                turn_id: turn_id.clone(),
+                tool_call_id,
+                tool_name: "list_dir".to_owned(),
+                success: Some(true),
+                output_preview: Some("deterministic fixture listing".to_owned()),
+                duration_ms: Some(1),
+            });
+            emit_progress_envelope(&ledger, &session_id, &completed, None);
+            let _ = send_notification_durable(&ws, &ledger, completed);
             if m9_fixture_delay_or_interrupt(
                 &mut interrupt_rx,
                 std::time::Duration::from_millis(20),
@@ -31168,16 +31188,14 @@ async fn run_m9_fixture_turn(
                             ApprovalDecision::Approve => "approval approved",
                             ApprovalDecision::Deny | ApprovalDecision::Unknown(_) => "approval denied",
                         };
-                        let _ = send_notification_ephemeral(
-                            &ws,
-                            &ledger,
-                            UiNotification::MessageDelta(MessageDeltaEvent {
-                                session_id: session_id.clone(),
-                                topic: None,
-                                turn_id: turn_id.clone(),
-                                text: text.to_owned(),
-                            }),
-                        );
+                        let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                            session_id: session_id.clone(),
+                            topic: None,
+                            turn_id: turn_id.clone(),
+                            text: text.to_owned(),
+                        });
+                        emit_progress_envelope(&ledger, &session_id, &delta, None);
+                        let _ = send_notification_ephemeral(&ws, &ledger, delta);
                         M9FixtureOutcome::Completed
                     }
                 }
