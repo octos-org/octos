@@ -7,7 +7,9 @@
  * Asserts wire-level only:
  *   - `turn/start` result is `{ accepted: true }`.
  *   - The notification stream contains `turn/started`, at least one
- *     `message/delta`, and `turn/completed` for the same `turn_id`.
+ *     `assistant_delta` envelope, and the canonical `turn_terminal`
+ *     envelope for the same `turn_id` (the raw `turn/completed` /
+ *     `message/delta` frames are never delivered since #2318).
  *   - Cursors on durable notifications are strictly monotonic in seq.
  *
  * Tests are deterministic: the prompt asks for the literal token "OK" so we
@@ -17,15 +19,18 @@
 import { test, expect } from "@playwright/test";
 import {
   M9WsClient,
+  envelopePayloads,
   freshTurnId,
+  isTurnTerminal,
   liveServerEnv,
   uniqueSessionId,
+  waitForTurnTerminal,
 } from "../lib/m9-ws-client";
 
 test.describe("M9 protocol — turn/start", () => {
   test.setTimeout(60_000);
 
-  test("happy path: turn/started -> message/delta+ -> turn/completed", async () => {
+  test("happy path: turn/started -> assistant_delta+ -> turn_terminal envelope", async () => {
     const env = liveServerEnv();
     const client = new M9WsClient(env);
     const sid = uniqueSessionId("m9-turn");
@@ -48,33 +53,35 @@ test.describe("M9 protocol — turn/start", () => {
       });
       expect(accept.accepted).toBe(true);
 
-      // Wait for the terminal event before asserting the rest.
-      const completed = await client.waitForNotification("turn/completed", 45_000);
-      expect(completed.params.turn_id).toBe(turnId);
-      expect(completed.params.session_id).toBe(sid);
-      expect(completed.params.cursor).toBeTruthy();
-      expect(completed.params.cursor.stream).toBe(sid);
-      expect(completed.params.cursor.seq).toBeGreaterThan(baselineSeq);
+      // Wait for the terminal envelope before asserting the rest.
+      const terminal = await waitForTurnTerminal(client, turnId, 45_000);
+      expect(terminal.params.turn_id).toBe(turnId);
+      expect(terminal.params.session_id).toBe(sid);
+      expect(terminal.params.cursor).toBeTruthy();
+      expect(terminal.params.cursor.stream).toBe(sid);
+      expect(terminal.params.cursor.seq).toBeGreaterThan(baselineSeq);
 
       // Inspect the full notification log for the turn.
       const log = client.notificationsLog();
       const forTurn = log.filter(
         (n) => n.params?.turn_id === turnId,
       );
-      // turn/started must appear before turn/completed.
+      // turn/started must appear before the terminal envelope.
       const startedIdx = forTurn.findIndex((n) => n.method === "turn/started");
-      const completedIdx = forTurn.findIndex((n) => n.method === "turn/completed");
+      const terminalIdx = forTurn.findIndex((n) => isTurnTerminal(n));
       expect(startedIdx).toBeGreaterThanOrEqual(0);
-      expect(completedIdx).toBeGreaterThan(startedIdx);
+      expect(terminalIdx).toBeGreaterThan(startedIdx);
 
-      // At least one message/delta with non-empty text.
-      const deltas = forTurn.filter((n) => n.method === "message/delta");
+      // At least one streamed assistant fragment with non-empty text.
+      const deltas = envelopePayloads(forTurn, "assistant_delta");
       expect(deltas.length).toBeGreaterThanOrEqual(1);
-      const combined = deltas.map((d) => String(d.params.text ?? "")).join("");
+      const combined = deltas
+        .map((d) => String(d.params?.payload?.data?.text ?? ""))
+        .join("");
       expect(combined.length).toBeGreaterThan(0);
 
       // Cursor monotonicity across the durable notifications. Notifications
-      // that don't carry a cursor (e.g. ephemeral message/delta) are skipped.
+      // that don't carry a cursor (e.g. turn/started) are skipped.
       const cursored = forTurn
         .map((n) => n.params?.cursor?.seq)
         .filter((seq): seq is number => typeof seq === "number");

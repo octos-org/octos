@@ -15,6 +15,7 @@ import {
   freshTurnId,
   liveServerEnv,
   uniqueSessionId,
+  waitForTurnTerminal,
 } from "../lib/m9-ws-client";
 
 const PROGRESS_METADATA_KINDS = new Set([
@@ -45,7 +46,7 @@ test.describe("M9 protocol — progress/updated", () => {
         turn_id: turnId,
         input: [{ kind: "text", text: "Reply with the single word OK." }],
       });
-      await client.waitForNotification("turn/completed", 45_000);
+      await waitForTurnTerminal(client, turnId, 45_000);
 
       const log = client.notificationsLog();
       const progress = log.filter(

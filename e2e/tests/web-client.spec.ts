@@ -4,12 +4,21 @@
  * M9-α-7 (#836): rewritten to drive the chat turn through the M9 WebSocket
  * UI Protocol via `chatWS()` instead of the legacy `/api/chat` SSE endpoint.
  * The original SSE assertions on UTF-8 byte integrity are preserved by
- * inspecting the cumulative `content` produced from `message/delta`
- * notifications — the JSON-RPC frame layer carries text losslessly so any
- * encoding bug regressing in the LLM provider chain still surfaces.
+ * inspecting the cumulative `content` produced from the canonical
+ * `projection/envelope` assistant_delta payloads — the JSON-RPC frame layer
+ * carries text losslessly so any encoding bug regressing in the LLM provider
+ * chain still surfaces.
  *
  * Run against a live octos-serve instance:
  *   OCTOS_TEST_URL=http://localhost:3000 npx playwright test web-client
+ *
+ * NOTE: when run against the deterministic fixture protocol server
+ * (`OCTOS_M9_PROTOCOL_FIXTURES=1`, the nightly protocol lane's config), the
+ * CJK / literal-token specs (lines 104, 136, 305) fail by construction — the
+ * fixture answers "OK" to every prompt that matches no fixture marker — and
+ * `session persists across requests` fails because the aux
+ * `session/messages_page` handler is not configured on that server. Verified
+ * causes and options: #2483.
  */
 import { test, expect } from '@playwright/test';
 import {
@@ -152,14 +161,14 @@ test('WS chat handles long CJK response without garbling', async ({
 });
 
 // ---------------------------------------------------------------------------
-// Test 3: WS chat completes with a turn/completed -> synthesized done
+// Test 3: WS chat completes with a terminal envelope -> synthesized done
 //
 // Verifies the basic chat lifecycle terminates with a `done` event
-// synthesized from `turn/completed`.
+// synthesized from the canonical `turn_terminal` envelope.
 //
 // NOTE on token counts: The legacy SSE `done` event carried `tokens_in` /
-// `tokens_out`. The M9 `turn/completed` notification does NOT yet carry
-// them (deferred follow-up — α-3 punted token usage to γ-3). For now this
+// `tokens_out`. The envelope terminal carries `token_usage`, but chatWS
+// does not project it onto the synthesized `done` event yet. For now this
 // test asserts on the lifecycle terminal only; the cost-tracking spec
 // covers token math via the REST /api/sessions/:id/tasks snapshot.
 // ---------------------------------------------------------------------------
@@ -174,7 +183,7 @@ test('WS chat completes with terminal done event', async ({
 
   expect(events.length).toBeGreaterThan(0);
 
-  // Exactly one synthesized `done` event from `turn/completed`.
+  // Exactly one synthesized `done` event from the terminal envelope.
   const doneEvents = events.filter((e) => e.type === 'done');
   expect(doneEvents.length).toBe(1);
   expect(doneEvent).toBeTruthy();
