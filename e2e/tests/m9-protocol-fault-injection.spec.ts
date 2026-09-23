@@ -232,15 +232,16 @@ test.describe("M9 protocol — fault injection", () => {
     }
   });
 
-  test("unknown method returns -32601 with the method name echoed in the error message", async () => {
+  test("unknown method returns -32004 method_not_supported with the method name echoed in the error message", async () => {
     const env = liveServerEnv();
     const client = new M9WsClient(env);
     try {
       const err = await expectRpcError(
         () => client.rawRequest("session/zzz-not-real", {}),
-        RPC_ERROR_CODES.METHOD_NOT_FOUND,
+        RPC_ERROR_CODES.METHOD_NOT_SUPPORTED,
       );
       expect(err.message).toContain("session/zzz-not-real");
+      expect(err.data?.method).toBe("session/zzz-not-real");
     } finally {
       await client.close();
     }

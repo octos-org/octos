@@ -3768,8 +3768,17 @@ fn appui_context_open_snapshot(
         None => Vec::new(),
     };
     publish_appui_context_status(session_id, &manager);
-    if let Err(error) =
-        persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+    // Rewriting the snapshot costs a full serialize + fsync of a ledger that
+    // reaches tens of MB on a long session. A ledger that loaded clean, took
+    // no compaction and learned nothing new is byte-identical to what is
+    // already on disk, so opening a Session does not rewrite it.
+    let snapshot_is_worth_writing = ledger_status
+        != crate::context_manager::ContextLedgerLoadStatus::Loaded
+        || !lifecycle_notifications.is_empty()
+        || manager.source_history_adopted();
+    if snapshot_is_worth_writing
+        && let Err(error) =
+            persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
     {
         warn!(
             session = %session_id.0,
@@ -7594,6 +7603,8 @@ pub(crate) async fn stdio_connection(state: Arc<AppState>) -> eyre::Result<()> {
         tokio::io::stdout(),
         #[cfg(test)]
         new_stdio_dispatch_count_for_test(),
+        #[cfg(test)]
+        None,
     )
     .await
 }
@@ -7624,6 +7635,8 @@ where
         Some(control),
         #[cfg(test)]
         new_stdio_dispatch_count_for_test(),
+        #[cfg(test)]
+        None,
     )
     .await
 }
@@ -7633,6 +7646,7 @@ pub(crate) async fn stdio_connection_with_io<R, W>(
     stdin_reader: R,
     stdout_writer: W,
     #[cfg(test)] dispatch_count: StdioDispatchCountForTest,
+    #[cfg(test)] writer_exit: Option<StdioWriterExitNotifyForTest>,
 ) -> eyre::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -7645,6 +7659,8 @@ where
         None,
         #[cfg(test)]
         dispatch_count,
+        #[cfg(test)]
+        writer_exit,
     )
     .await
 }
@@ -7655,6 +7671,7 @@ async fn stdio_connection_with_io_policy<R, W>(
     stdout_writer: W,
     embedded: Option<EmbeddedStdioControl>,
     #[cfg(test)] dispatch_count: StdioDispatchCountForTest,
+    #[cfg(test)] writer_exit: Option<StdioWriterExitNotifyForTest>,
 ) -> eyre::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -7670,6 +7687,14 @@ where
         .spawn(move || {
             let result = stdio_writer_loop_sync_to(writer_rx, stdout_writer, writer_failure_signal);
             let _ = writer_done_tx.send(result);
+            // Tests observe the failure latch through this notify, so fire it
+            // only once the loop has fully finished: `mark_failed` (which the
+            // dispatch loop's `is_failed` checks read) has run by then, while
+            // at the failing write itself it has not.
+            #[cfg(test)]
+            if let Some(writer_exit) = writer_exit {
+                writer_exit.notify_waiters();
+            }
         })
         .map_err(|error| eyre::eyre!("failed to spawn AppUI stdio writer: {error}"))?;
     let active_turns = active_turns_registry();
@@ -8421,6 +8446,18 @@ type StdioDispatchCountForTest = Arc<std::sync::atomic::AtomicUsize>;
 #[cfg(test)]
 fn new_stdio_dispatch_count_for_test() -> StdioDispatchCountForTest {
     Arc::new(std::sync::atomic::AtomicUsize::new(0))
+}
+
+// Writer-thread exit signal: fired only after the stdio writer loop has
+// finished, so a test waiting on it knows the failure latch is visible to
+// the connection loop. The failing write itself carries no such guarantee —
+// `mark_failed` runs after the writer helper's error returns.
+#[cfg(test)]
+type StdioWriterExitNotifyForTest = Arc<tokio::sync::Notify>;
+
+#[cfg(test)]
+fn new_stdio_writer_exit_notify_for_test() -> StdioWriterExitNotifyForTest {
+    Arc::new(tokio::sync::Notify::new())
 }
 
 #[cfg(test)]

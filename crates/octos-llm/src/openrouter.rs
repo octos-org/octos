@@ -408,6 +408,7 @@ fn build_api_message<'a>(msg: &'a Message) -> ApiMessage<'a> {
         tcs.iter()
             .map(|tc| ApiToolCall {
                 id: tc.id.clone(),
+                call_type: default_tool_call_type(),
                 function: FunctionCall {
                     name: tc.name.clone(),
                     arguments: tc.arguments.to_string(),
@@ -490,7 +491,18 @@ struct ResponseMessage {
 #[derive(Serialize, Deserialize)]
 struct ApiToolCall {
     id: String,
+    /// `"function"` on every call. Required by the OpenAI chat schema and
+    /// enforced by some upstreams behind OpenRouter: Z.AI rejects a replayed
+    /// assistant `tool_calls` entry without it (`1214 Tool type cannot be
+    /// empty`), which killed every agent turn on `z-ai/*` models at the
+    /// first tool result. Defaulted on deserialize for upstreams that omit it.
+    #[serde(rename = "type", default = "default_tool_call_type")]
+    call_type: String,
     function: FunctionCall,
+}
+
+fn default_tool_call_type() -> String {
+    "function".to_owned()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -602,6 +614,32 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn replayed_assistant_tool_calls_carry_the_function_type() {
+        // Z.AI behind OpenRouter rejects a tool_calls entry without
+        // `"type":"function"` (error 1214 "Tool type cannot be empty"), which
+        // failed every agent turn on `z-ai/*` models at the first tool result.
+        let mut msg = text_msg(MessageRole::Assistant, "");
+        msg.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+            metadata: None,
+        }]);
+        let json = serde_json::to_value(build_api_message(&msg)).expect("serialises");
+        assert_eq!(json["tool_calls"][0]["type"], "function");
+        assert_eq!(json["tool_calls"][0]["id"], "call_1");
+        assert_eq!(json["tool_calls"][0]["function"]["name"], "read_file");
+
+        // Upstreams that omit the field on the way back still parse.
+        let parsed: ApiToolCall = serde_json::from_value(serde_json::json!({
+            "id": "call_2",
+            "function": {"name": "shell", "arguments": "{}"}
+        }))
+        .expect("type defaults");
+        assert_eq!(parsed.call_type, "function");
     }
 
     #[test]

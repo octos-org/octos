@@ -452,7 +452,7 @@ octos auth logout --provider openai
 {
   "adaptive_routing": {
     "enabled": true,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -461,7 +461,7 @@ octos auth logout --provider openai
 }
 ```
 
-- **`latency_threshold_ms`** — 平均延迟超过此值的提供商被降权（默认：30 秒）
+- **`latency_threshold_ms`** — 平均延迟超过此值的提供商被降权（默认：10 秒）
 - **`error_rate_threshold`** — 错误率超过此值的提供商被降低优先级（默认：30%）
 - **`probe_probability`** — 发送到非主要提供商的探测请求比例（默认：10%）
 - **`probe_interval_secs`** — 同一提供商两次探测之间的最小间隔（默认：60 秒）
@@ -2019,7 +2019,7 @@ chmod +x .octos/skills/translator/main
   // 自适应路由
   "adaptive_routing": {
     "enabled": false,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,

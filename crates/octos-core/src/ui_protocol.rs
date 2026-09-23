@@ -595,6 +595,9 @@ pub mod autonomy_error_kinds {
     pub const MONITOR_INVALID_SPEC: &str = "monitor_invalid_spec";
     pub const MONITOR_POLICY_DENIED: &str = "monitor_policy_denied";
     pub const MONITOR_FLOODED: &str = "monitor_flooded";
+    // #2367 — a control request against a terminal monitor state (resume
+    // of a monitor whose deadline has passed), mirroring `goal_invalid_state`.
+    pub const MONITOR_INVALID_STATE: &str = "monitor_invalid_state";
     pub const AUTONOMY_QUOTA_EXCEEDED: &str = "autonomy_quota_exceeded";
 }
 
