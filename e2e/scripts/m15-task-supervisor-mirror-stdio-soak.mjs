@@ -97,10 +97,15 @@ rl.on('line', (line) => {
     agentUpdated.push(params);
   } else if (frame.method === 'task/updated') {
     taskUpdated.push(params);
-  } else if (frame.method === 'turn/completed') {
-    turnCompleted = true;
-  } else if (frame.method === 'turn/error') {
-    turnErrored = params;
+  } else if (frame.method === 'projection/envelope') {
+    // Canonical v2 lane: raw `turn/completed` / `turn/error` frames are
+    // suppressed for every connection since #2318, so the turn terminal
+    // arrives as a `turn_terminal` payload.
+    const payload = params.payload || {};
+    if (payload.type === 'turn_terminal') {
+      if (payload.data?.outcome === 'completed') turnCompleted = true;
+      else turnErrored = payload.data?.error || { outcome: payload.data?.outcome ?? 'unknown' };
+    }
   }
 });
 
