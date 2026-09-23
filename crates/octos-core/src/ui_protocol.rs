@@ -502,7 +502,7 @@ pub mod rpc_error_codes {
     /// Server-defined slot for a known method this runtime slice doesn't implement.
     pub const METHOD_NOT_SUPPORTED: i64 = -32004;
 
-    /// Spec §10 `APPROVAL_NOT_PENDING`: `respond` against a non-pending approval.
+    /// Spec §10 `approval_not_pending`: `respond` against a non-pending approval.
     /// Spec pins this at `-32011`; recorded decision rides in `error.data`.
     pub const APPROVAL_NOT_PENDING: i64 = -32011;
 
@@ -890,7 +890,7 @@ impl RpcError {
         Self::new(rpc_error_codes::PERMISSION_DENIED, message)
     }
 
-    /// Spec §10 `APPROVAL_NOT_PENDING` (`-32011`). Carries the recorded
+    /// Spec §10 `approval_not_pending` (`-32011`). Carries the recorded
     /// decision in `data.recorded_decision` (snake-case form).
     pub fn approval_not_pending(decision: ApprovalDecision) -> Self {
         let recorded =
