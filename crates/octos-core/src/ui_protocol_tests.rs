@@ -910,7 +910,6 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "session/goal/cleared",
             "loop/updated",
             "loop/fired",
-            "loop/completed",
             "monitor/fired",
             "monitor/updated",
             "monitor/expired",
@@ -1134,7 +1133,6 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "session/goal/cleared",
                 "loop/updated",
                 "loop/fired",
-                "loop/completed",
                 "monitor/fired",
                 "monitor/updated",
                 "monitor/expired",
@@ -3028,19 +3026,6 @@ fn m15_autonomy_notifications_register_methods_and_round_trip() {
                 status: Some("queued".into()),
             }),
             methods::LOOP_FIRED,
-        ),
-        (
-            UiNotification::LoopCompleted(LoopCompletedEvent {
-                session_id,
-                profile_id: Some("coding".into()),
-                loop_id: "loop_01".into(),
-                loop_state: Some(loop_state),
-                status: Some("completed".into()),
-                completed_at_ms: Some(1_778_870_090_000),
-                result: Some(json!({ "message": "iteration completed" })),
-                error: None,
-            }),
-            methods::LOOP_COMPLETED,
         ),
     ];
 

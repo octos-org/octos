@@ -641,7 +641,7 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 
 - `agent/updated`, `agent/output/delta`, `agent/artifact/updated`
 - `session/goal/updated`, `session/goal/cleared`
-- `loop/updated`, `loop/fired`, `loop/completed`
+- `loop/updated`, `loop/fired`
 - `monitor/updated`, `monitor/fired`, `monitor/expired`
 
 M16 context lifecycle (gate `context.lifecycle.v1`):
@@ -3137,10 +3137,6 @@ Loop notifications:
 - `loop/fired`: params are `{ "session_id": SessionKey,
   "profile_id"?: string, "loop_id": string, "loop"?: Loop,
   "fire"?: LoopFire, "ok"?: boolean, "status"?: string }`.
-- `loop/completed`: params are `{ "session_id": SessionKey,
-  "profile_id"?: string, "loop_id": string, "loop"?: Loop,
-  "status"?: string, "completed_at_ms"?: number, "result"?: object,
-  "error"?: string }`.
 
 `Agent`, `Goal`, and `Loop` shapes match UPCR-2026-021. String status
 fields are open registries; clients must preserve unknown values. The
