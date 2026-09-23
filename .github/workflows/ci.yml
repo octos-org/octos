@@ -261,6 +261,11 @@ jobs:
           python3 scripts/lint-tool-descriptions.py --self-test
           python3 scripts/lint-tool-descriptions.py
 
+      - name: Docs source-reference lint
+        run: |
+          python3 scripts/lint-doc-references.py --self-test
+          python3 scripts/lint-doc-references.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}

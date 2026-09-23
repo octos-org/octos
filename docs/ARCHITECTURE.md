@@ -387,7 +387,7 @@ Two implementations:
 
 ### Transcription
 
-**GroqTranscriber**: Whisper `whisper-large-v3` via `https://api.groq.com/openai/v1/audio/transcriptions`. Multipart form. 60s timeout. MIME detection: ogg/opus→audio/ogg, mp3→audio/mpeg, m4a→audio/mp4, wav→audio/wav.
+**Voice platform skill** — audio is transcribed at the gateway layer, not in `octos-llm`. The gateway spawns the installed `voice` platform-skill binary (`platform-skills/voice/main` under the gateway home: `--octos-home`, else `<cwd>/.octos`) with the `voice_transcribe` subcommand, `{"audio_path", "language"?}` JSON on stdin and `{"success", "output"}` JSON on stdout; 120s timeout. Transcription is wired only when that binary exists and an ASR endpoint is available (`ASR_API_URL`, else a discovered OminiX server — audio goes to that endpoint, see OminixClient). Transcript text merges into the inbound message content (`voice_transcript` metadata), audio-only messages whose transcripts are all rejected skip agent dispatch, and the per-profile ASR language override is re-resolved per message (`octos-cli/src/commands/gateway/message_preprocessing.rs:515`, wiring at `octos-cli/src/commands/gateway/gateway_runtime.rs:613`).
 
 ### Vision
 
@@ -699,7 +699,7 @@ pub struct ToolPolicy {
 }
 ```
 
-**Groups** (`TOOL_GROUPS` in `tools/policy.rs:154-223`):
+**Groups** (`TOOL_GROUPS` in `tools/policy.rs:187-334`):
 - `group:fs` — read_file, write_file, edit_file, diff_edit
 - `group:runtime` — shell
 - `group:web` — web_search, web_fetch, browser
@@ -1054,10 +1054,10 @@ pub struct ConsoleReporter {
 
 **Duration formatting**: >1s → `{:.1}s`, ≤1s → `{N}ms`.
 
-**SseBroadcaster** (REST API, feature: `api`) — converts events to JSON and broadcasts via `tokio::sync::broadcast` channel:
+**EventBroadcaster** (feature: `api`, `octos-cli/src/api/events.rs:32`) — process-wide broadcaster that converts progress events to JSON and publishes them on a `tokio::sync::broadcast` channel. No SSE wire path remains in the chat transport; the JSON frames feed the harness/admin `/api/events/harness` endpoint, the swarm event publishers, and the UI Protocol v1 WS bridge:
 
 ```rust
-pub struct SseBroadcaster {
+pub struct EventBroadcaster {
     tx: broadcast::Sender<String>,  // JSON-serialized events
 }
 ```
@@ -1071,9 +1071,8 @@ pub struct SseBroadcaster {
 | CostUpdate | `"cost_update"` | `input_tokens`, `output_tokens`, `session_cost` |
 | Thinking | `"thinking"` | `iteration` |
 | Response | `"response"` | `iteration` |
-| (other) | `"other"` | — (logged at debug level) |
 
-Subscribers receive events via `SseBroadcaster::subscribe() -> broadcast::Receiver<String>`. Send errors (no subscribers) are silently ignored.
+Subscribers receive events via `EventBroadcaster::subscribe() -> broadcast::Receiver<String>`. Send errors (no subscribers) are silently ignored.
 
 ### Execution Environments (`exec_env.rs`)
 
@@ -1085,7 +1084,7 @@ Subscribers receive events via `SseBroadcaster::subscribe() -> broadcast::Receiv
 
 ### Typed Turns (`turn.rs`)
 
-`Turn` wraps `Message` with `TurnKind` (UserInput, AgentReply, ToolCall, ToolResult, System) and iteration number. `turns_to_messages()` converts back to `Vec<Message>` for LLM calls. Enables semantic analysis of conversation history.
+`Turn` wraps `Message` with `TurnKind` (UserInput, AssistantResponse, ToolResult, SteeringFollowUp, SystemReminder, RetrievedContext) and iteration number. `turns_to_messages()` converts back to `Vec<Message>` for LLM calls. Enables semantic analysis of conversation history.
 
 ### Event Bus (`event_bus.rs`)
 
@@ -1113,12 +1112,12 @@ Detects repetitive agent behavior (e.g., calling the same tool with same args). 
 
 ### Message Bus
 
-`create_bus() -> (AgentHandle, BusPublisher)` linked by mpsc channels (capacity 256). AgentHandle receives InboundMessages; BusPublisher dispatches OutboundMessages.
+`create_bus() -> (AgentHandle, BusPublisher)` linked by mpsc channels (capacity 256). AgentHandle receives InboundMessage; BusPublisher dispatches OutboundMessage.
 
-**Queue Modes** (configured via `gateway.queue_mode`, definition in `octos-cli/src/config.rs:649-663`):
+**Queue Modes** (configured via `gateway.queue_mode`, definition in `octos-cli/src/config.rs:1523-1544`):
 - `Followup`: FIFO — process queued messages one at a time
 - `Collect` (default): Merge queued messages by session, concatenating content before processing
-- `Steer`: Apply queued messages as a steer/redirect to the in-flight turn
+- `Latest`: Keep only the latest queued message, discarding older ones (renamed from `Steer`; the `steer` serde alias keeps old configs parsing)
 - `Interrupt`: Cancel the in-flight turn and start a new one
 - `Speculative`: Run a parallel speculative turn while the in-flight one finishes
 
@@ -1163,7 +1162,7 @@ pub trait Channel: Send + Sync {
 
 **Media**: `download_media()` helper downloads photos/voice/audio/documents to `.octos/media/`.
 
-**Transcription**: Voice/audio auto-transcribed via GroqTranscriber before agent processing.
+**Transcription**: Voice/audio auto-transcribed by the voice platform skill before agent processing (see Transcription).
 
 ### Message Coalescing
 
@@ -1440,7 +1439,7 @@ User Input → readline → Agent.process_message(input, history)
 ### Gateway Mode
 
 ```
-Channel → InboundMessage → MessageBus → [transcribe audio] → [load session]
+Channel → InboundMessage → AgentHandle → [transcribe audio] → [load session]
                                               │
                                     Agent.process_message()
                                               │
@@ -1728,7 +1727,7 @@ Highlights of the current suite:
 - **Unit**: type serde round-trips, tool arg parsing, config validation, provider detection, tool policies, compaction (incl. three-tier), coalescing, BM25 scoring, L2 normalization, SSE parsing
 - **Adaptive routing**: Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, provider racing
 - **Responsiveness**: baseline learning, degradation detection, recovery, threshold boundaries
-- **Queue modes**: Followup, Collect, Steer, Interrupt, Speculative — overflow + auto-escalation/deescalation
+- **Queue modes**: Followup, Collect, Latest, Interrupt, Speculative — overflow + auto-escalation/deescalation
 - **Session persistence**: JSONL storage, LRU eviction, fork, rewrite, timestamp sort, concurrent access, sticky thread_id binding (`crates/octos-bus/tests/jsonl_replay_thread_binding.rs`, #656)
 - **M8 runtime invariants**: `e2e/tests/m8-runtime-invariants-live.spec.ts` — sub-agent output router, structured resume, orphan reaper, supervisor caps
 - **Live progress gate**: `e2e/tests/live-progress-gate.spec.ts` — background-task UX (#655)
