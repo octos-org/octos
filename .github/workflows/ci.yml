@@ -204,6 +204,10 @@ jobs:
             throw 'uninstall dry run did not include purge behavior'
           }
 
+      - name: Test serve-launcher token handoff
+        shell: pwsh
+        run: scripts/tests/test-serve-launcher-token.ps1
+
   web-app-base-url-windows:
     runs-on: windows-latest
     steps:
@@ -265,6 +269,11 @@ jobs:
         run: |
           python3 scripts/lint-doc-references.py --self-test
           python3 scripts/lint-doc-references.py
+
+      - name: Installer token-hygiene lint
+        run: |
+          python3 scripts/lint-installer-token-hygiene.py --self-test
+          python3 scripts/lint-installer-token-hygiene.py
 
       - uses: dtolnay/rust-toolchain@stable
         with:

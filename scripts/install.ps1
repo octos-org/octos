@@ -1275,13 +1275,42 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero)
 
-# Build a wrapper script that sets env vars and launches octos serve
+# The bearer token must not be embedded in the wrapper (#2388): the
+# launcher lives in OCTOS_HOME, which keeps profile ACLs when left at its
+# default but is world-readable the moment an operator points OCTOS_HOME
+# elsewhere. Keep the token in a sibling file restricted to the invoking
+# user + SYSTEM/Administrators (SIDs, not localized group names): lock
+# down the empty file FIRST, then write into it, so no world-readable
+# copy ever exists on disk.
+$tokenPath = Join-Path $DataDir "serve-token"
+$tokenTmp = "$tokenPath.tmp"
+[System.IO.File]::WriteAllText($tokenTmp, "", [System.Text.UTF8Encoding]::new($false))
+icacls $tokenTmp /inheritance:r /grant:r "${env:USERNAME}:F" "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Remove-Item $tokenTmp -ErrorAction SilentlyContinue
+    Err "failed to restrict ACLs on $tokenPath"
+}
+[System.IO.File]::WriteAllText($tokenTmp, $AuthToken, [System.Text.UTF8Encoding]::new($false))
+try {
+    Move-Item -Force $tokenTmp $tokenPath
+} finally {
+    Remove-Item $tokenTmp -ErrorAction SilentlyContinue
+}
+
+# Build a wrapper script that sets env vars and launches octos serve.
+# The token is read from the ACL-restricted sibling file at launch time,
+# never written inline; a missing file refuses to start rather than run
+# with an empty token.
 $wrapperPath = Join-Path $DataDir "serve-launcher.cmd"
 $wrapperContent = @"
 @echo off
 set "OCTOS_HOME=$DataDir"
 set "OCTOS_DATA_DIR=$DataDir"
-set "OCTOS_AUTH_TOKEN=$AuthToken"
+set /p OCTOS_AUTH_TOKEN=<"$DataDir\serve-token"
+if not defined OCTOS_AUTH_TOKEN (
+    echo [octos] serve-token file missing or empty; re-run install.ps1 >> "$serveLog"
+    exit /b 1
+)
 "$octosBin" serve --port $Port --host 0.0.0.0 >> "$serveLog" 2>&1
 "@
 [System.IO.File]::WriteAllText($wrapperPath, $wrapperContent, [System.Text.UTF8Encoding]::new($false))
