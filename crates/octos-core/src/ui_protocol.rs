@@ -1302,7 +1302,6 @@ pub mod methods {
     /// UPCR-2026-021 M15 loop runtime notifications.
     pub const LOOP_UPDATED: &str = "loop/updated";
     pub const LOOP_FIRED: &str = "loop/fired";
-    pub const LOOP_COMPLETED: &str = "loop/completed";
     /// #1977 monitor runtime notifications, mirroring `loop/*`.
     pub const MONITOR_FIRED: &str = "monitor/fired";
     pub const MONITOR_UPDATED: &str = "monitor/updated";
@@ -1479,7 +1478,6 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::SESSION_GOAL_CLEARED,
     methods::LOOP_UPDATED,
     methods::LOOP_FIRED,
-    methods::LOOP_COMPLETED,
     methods::MONITOR_FIRED,
     methods::MONITOR_UPDATED,
     methods::MONITOR_EXPIRED,
@@ -6017,24 +6015,6 @@ pub struct LoopFiredEvent {
     pub status: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LoopCompletedEvent {
-    pub session_id: SessionKey,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile_id: Option<String>,
-    pub loop_id: String,
-    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
-    pub loop_state: Option<UiLoopRecord>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completed_at_ms: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 /// #1977 — one monitor's client-visible state, mirroring [`UiLoopRecord`].
 /// `argv` is the sandboxed probe command; `mode` is `"poll"` or `"stream"`;
 /// `status` is `active` / `paused` / `expired` / `deleted` with an optional
@@ -6106,7 +6086,7 @@ pub struct MonitorFiredEvent {
 }
 
 /// #1977 — a non-persistent monitor reached its timeout (or its stream
-/// process exited) and expired, mirroring [`LoopCompletedEvent`].
+/// process exited) and expired.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorExpiredEvent {
     pub session_id: SessionKey,
@@ -6643,8 +6623,6 @@ pub enum UiNotification {
     LoopUpdated(LoopUpdatedEvent),
     /// UPCR-2026-021 M15: loop fired and queued/attempted a continuation.
     LoopFired(LoopFiredEvent),
-    /// UPCR-2026-021 M15: loop iteration reached a terminal result.
-    LoopCompleted(LoopCompletedEvent),
     /// #1977: monitor metadata changed (create / pause / resume / delete).
     MonitorUpdated(MonitorUpdatedEvent),
     /// #1977: a monitor's filtered event batch queued a master wake.
@@ -6733,7 +6711,6 @@ impl UiNotification {
             Self::SessionGoalCleared(_) => methods::SESSION_GOAL_CLEARED,
             Self::LoopUpdated(_) => methods::LOOP_UPDATED,
             Self::LoopFired(_) => methods::LOOP_FIRED,
-            Self::LoopCompleted(_) => methods::LOOP_COMPLETED,
             Self::MonitorUpdated(_) => methods::MONITOR_UPDATED,
             Self::MonitorFired(_) => methods::MONITOR_FIRED,
             Self::MonitorExpired(_) => methods::MONITOR_EXPIRED,
@@ -6790,7 +6767,6 @@ impl UiNotification {
             Self::SessionGoalCleared(event) => &event.session_id,
             Self::LoopUpdated(event) => &event.session_id,
             Self::LoopFired(event) => &event.session_id,
-            Self::LoopCompleted(event) => &event.session_id,
             Self::MonitorUpdated(event) => &event.session_id,
             Self::MonitorFired(event) => &event.session_id,
             Self::MonitorExpired(event) => &event.session_id,
@@ -6954,7 +6930,6 @@ impl UiNotification {
             Self::SessionGoalCleared(params) => serde_json::to_value(params),
             Self::LoopUpdated(params) => serde_json::to_value(params),
             Self::LoopFired(params) => serde_json::to_value(params),
-            Self::LoopCompleted(params) => serde_json::to_value(params),
             Self::MonitorUpdated(params) => serde_json::to_value(params),
             Self::MonitorFired(params) => serde_json::to_value(params),
             Self::MonitorExpired(params) => serde_json::to_value(params),
@@ -7099,7 +7074,6 @@ impl UiNotification {
             }
             methods::LOOP_UPDATED => Ok(Self::LoopUpdated(decode_params(method, params)?)),
             methods::LOOP_FIRED => Ok(Self::LoopFired(decode_params(method, params)?)),
-            methods::LOOP_COMPLETED => Ok(Self::LoopCompleted(decode_params(method, params)?)),
             methods::MONITOR_UPDATED => Ok(Self::MonitorUpdated(decode_params(method, params)?)),
             methods::MONITOR_FIRED => Ok(Self::MonitorFired(decode_params(method, params)?)),
             methods::MONITOR_EXPIRED => Ok(Self::MonitorExpired(decode_params(method, params)?)),
