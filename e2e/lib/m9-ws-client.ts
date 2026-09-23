@@ -109,6 +109,25 @@ export interface TaskOutputReadResult {
 export interface RpcError { code: number; message: string; data?: any }
 export interface UiNotification { jsonrpc: "2.0"; method: string; params: any }
 
+/**
+ * Flattened wire params of a `projection/envelope` notification — the
+ * canonical v2 projection (`EnvelopeV2` in
+ * `crates/octos-core/src/ui_protocol.rs`). Since the Stage-5 cutover
+ * (#2318) this is the ONLY lane on which turn terminals and streamed
+ * content reach a client: raw `message/delta` / `tool/*` / `turn/completed`
+ * / `turn/error` frames are suppressed for every connection.
+ */
+export interface EnvelopeV2Params {
+  session_id: string;
+  topic?: string;
+  thread_id: string;
+  seq: number;
+  cursor?: UiCursor;
+  turn_id: string;
+  client_message_id?: string;
+  payload: { type: string; data?: any };
+}
+
 /** JSON-RPC error codes used by the M9 runtime slice. */
 export const RPC_ERROR_CODES = {
   PARSE_ERROR: -32700,
@@ -315,6 +334,37 @@ export class M9WsClient {
     });
   }
 
+  /**
+   * Resolve when a `projection/envelope` notification carrying
+   * `payloadType` arrives, optionally scoped to one turn. If a matching
+   * envelope was already seen, the first one is returned synchronously.
+   */
+  async waitForEnvelopePayload(
+    payloadType: string,
+    timeoutMs = 30_000,
+    turnId?: string,
+  ): Promise<UiNotification> {
+    const existing = this.notifications.find((n) => isEnvelopePayload(n, payloadType, turnId));
+    if (existing) return existing;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.notificationHandlers = this.notificationHandlers.filter((h) => h !== handler);
+        reject(
+          new Error(
+            `m9-ws: timeout waiting for ${payloadType} envelope${turnId ? ` for ${turnId}` : ""}`,
+          ),
+        );
+      }, timeoutMs);
+      const handler = (n: UiNotification) => {
+        if (!isEnvelopePayload(n, payloadType, turnId)) return;
+        clearTimeout(timer);
+        this.notificationHandlers = this.notificationHandlers.filter((h) => h !== handler);
+        resolve(n);
+      };
+      this.notificationHandlers.push(handler);
+    });
+  }
+
   private async request<T>(method: string, params: any, timeoutMs?: number): Promise<T> {
     if (!this.ws) await this.connect();
     if (!this.ws || this.closed) throw new Error("m9-ws: socket not open");
@@ -397,6 +447,65 @@ export function freshTurnId(): TurnId { return randomUUID(); }
 export function freshApprovalId(): ApprovalId { return randomUUID(); }
 export function freshPreviewId(): PreviewId { return randomUUID(); }
 export function freshTaskId(): TaskId { return randomUUID(); }
+
+// ---- canonical v2 envelope helpers ---------------------------------------
+
+/**
+ * True when `n` is a `projection/envelope` notification carrying
+ * `payloadType`, optionally scoped to one turn and (for the tool payloads)
+ * one `tool_call_id`. This is the post-#2318 wire contract: terminals ride
+ * `projection/envelope` with `payload.type: "turn_terminal"`; streamed
+ * content and tool events ride the same envelope with their own payload
+ * types, because the raw lifecycle frames are never delivered.
+ */
+export function isEnvelopePayload(
+  n: UiNotification,
+  payloadType: string,
+  turnId?: string,
+  toolCallId?: string,
+): boolean {
+  if (n.method !== "projection/envelope") return false;
+  const params = n.params as EnvelopeV2Params | undefined;
+  if (params?.payload?.type !== payloadType) return false;
+  if (turnId !== undefined && params.turn_id !== turnId) return false;
+  if (
+    toolCallId !== undefined &&
+    (params.payload.data as any)?.tool_call_id !== toolCallId
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/** Every envelope in `log` carrying `payloadType` (same filters as
+ *  `isEnvelopePayload`), in receive order. */
+export function envelopePayloads(
+  log: readonly UiNotification[],
+  payloadType: string,
+  turnId?: string,
+  toolCallId?: string,
+): UiNotification[] {
+  return log.filter((n) => isEnvelopePayload(n, payloadType, turnId, toolCallId));
+}
+
+/** True when `n` is the canonical `turn_terminal` envelope (optionally for
+ *  `turnId`). */
+export function isTurnTerminal(n: UiNotification, turnId?: string): boolean {
+  return isEnvelopePayload(n, "turn_terminal", turnId);
+}
+
+/**
+ * Resolve when the canonical `turn_terminal` envelope for `turnId` arrives.
+ * Drop-in replacement for the raw `turn/completed` / `turn/error` waits the
+ * specs used before the Stage-5 cutover.
+ */
+export async function waitForTurnTerminal(
+  client: M9WsClient,
+  turnId: string,
+  timeoutMs = 30_000,
+): Promise<UiNotification> {
+  return client.waitForEnvelopePayload("turn_terminal", timeoutMs, turnId);
+}
 
 /**
  * Read live-server URL + token from the standard env vars.
@@ -494,19 +603,28 @@ export class RpcErrorImpl extends Error {
 //
 // 3. WS notification -> synthesized SSE-shaped event mapping:
 //
-//      message/delta              -> { type: 'token', text }
-//      tool/started               -> { type: 'tool_start', tool, tool_call_id, arguments }
-//      tool/progress              -> { type: 'tool_progress', tool, tool_call_id, message, progress_pct }
-//      tool/completed             -> { type: 'tool_completed', tool, tool_call_id, ... }
+//      projection/envelope (canonical v2 lane, #2318):
+//        payload assistant_delta   -> { type: 'token', text }
+//        payload tool_start        -> { type: 'tool_start', tool, tool_call_id,
+//                                       arguments (truncated preview string,
+//                                       not the raw arguments object) }
+//        payload tool_progress     -> { type: 'tool_progress', tool, tool_call_id, message }
+//        payload tool_end          -> { type: 'tool_completed', tool, tool_call_id,
+//                                       ok, error (truncated output preview) }
+//        payload turn_terminal     -> { type: 'done', content, cursor } (completed)
+//                                    | { type: 'error', message } (otherwise)
 //      task/updated               -> { type: 'task_updated', task_id, status, ... }
 //      task/output/delta          -> { type: 'task_output_delta', task_id, text }
 //      progress/updated (α-4)     -> { type: 'progress_updated', ... }
 //      warning                    -> { type: 'warning', message }
 //      turn/started               -> { type: 'turn_started', turn_id }
-//      turn/completed             -> { type: 'done', content, cursor }
-//      turn/error                 -> { type: 'error', message }
 //
-//    Cumulative `content` is the concatenation of every `message/delta.text`
+//    The raw lifecycle frames (`message/delta`, `tool/*`, `turn/completed`,
+//    `turn/error`) are suppressed server-side for every connection since
+//    #2318, so the envelope payloads above are the only live source of
+//    streamed content and terminals.
+//
+//    Cumulative `content` is the concatenation of every assistant delta text
 //    for the active turn, matching what SSE callers see in `done.content`.
 // ---------------------------------------------------------------------------
 
@@ -531,7 +649,7 @@ export interface ChatWsOptions {
   sessionId: string;
   /** Optional profile id forwarded as `session/open.profile_id`. */
   profileId?: string;
-  /** Total wait budget in ms before forcing return without `turn/completed`. */
+  /** Total wait budget in ms before forcing return without a terminal. */
   maxWait?: number;
   /** Override the WS connect timeout (default 10s). */
   connectTimeoutMs?: number;
@@ -545,8 +663,8 @@ export interface ChatWsOptions {
 
 /**
  * Drive a single chat turn over the M9 WebSocket UI Protocol and collect
- * synthesized SSE-shaped events until `turn/completed` (or `turn/error`,
- * or the `maxWait` budget is exhausted).
+ * synthesized SSE-shaped events until the canonical `turn_terminal`
+ * envelope (or the `maxWait` budget is exhausted).
  *
  * The promise resolves on the first terminal event for the turn, OR when the
  * deadline elapses, whichever comes first.
@@ -572,6 +690,10 @@ export async function chatWS(opts: ChatWsOptions): Promise<ChatWsResult> {
   const terminalPromise = new Promise<void>((r) => {
     resolveTerminal = r;
   });
+  // tool_call_id -> name, tracked from tool_start envelopes so the
+  // progress/completed events synthesized from the envelope lane keep
+  // carrying the tool name (those envelope payloads omit it).
+  const toolNames = new Map<string, string>();
 
   const handler = (n: UiNotification) => {
     // Filter on turn_id when present; some notifications (warnings, status)
@@ -581,45 +703,76 @@ export async function chatWS(opts: ChatWsOptions): Promise<ChatWsResult> {
     const noteTurnId = params.turn_id;
     if (noteTurnId !== undefined && noteTurnId !== turnId) return;
     switch (n.method) {
-      case "turn/started": {
-        events.push({ type: "turn_started", turn_id: noteTurnId, raw: params });
-        break;
-      }
-      case "message/delta": {
-        const text = String(params.text ?? "");
-        if (text) {
-          content += text;
-          events.push({ type: "token", text });
+      case "projection/envelope": {
+        // Canonical v2 lane: the sole delivery shape for streamed content
+        // and turn terminals since #2318 (see the mapping table above).
+        const envelope = params as unknown as EnvelopeV2Params;
+        const payload = envelope.payload ?? { type: "", data: undefined };
+        const data = (payload.data ?? {}) as Record<string, unknown>;
+        switch (payload.type) {
+          case "assistant_delta": {
+            const text = String(data.text ?? "");
+            if (text) {
+              content += text;
+              events.push({ type: "token", text });
+            }
+            break;
+          }
+          case "tool_start": {
+            if (typeof data.tool_call_id === "string") {
+              toolNames.set(data.tool_call_id, String(data.name ?? ""));
+            }
+            events.push({
+              type: "tool_start",
+              tool: data.name,
+              tool_call_id: data.tool_call_id,
+              arguments: data.arguments_preview,
+            });
+            break;
+          }
+          case "tool_progress": {
+            events.push({
+              type: "tool_progress",
+              tool: toolNames.get(String(data.tool_call_id ?? "")),
+              tool_call_id: data.tool_call_id,
+              message: data.message,
+            });
+            break;
+          }
+          case "tool_end": {
+            events.push({
+              type: "tool_completed",
+              tool: toolNames.get(String(data.tool_call_id ?? "")),
+              tool_call_id: data.tool_call_id,
+              ok: data.status === "complete",
+              error: data.error,
+            });
+            break;
+          }
+          case "turn_terminal": {
+            const error = data.error as { code?: unknown; message?: unknown } | undefined;
+            const ev: ChatWsEvent =
+              data.outcome === "completed"
+                ? { type: "done", content, cursor: envelope.cursor, turn_id: noteTurnId }
+                : {
+                    type: "error",
+                    message: error?.message ?? error?.code ?? `turn ${String(data.outcome)}`,
+                    code: error?.code,
+                    turn_id: noteTurnId,
+                  };
+            events.push(ev);
+            doneEvent = ev;
+            terminal = true;
+            resolveTerminal();
+            break;
+          }
+          default:
+            break;
         }
         break;
       }
-      case "tool/started": {
-        events.push({
-          type: "tool_start",
-          tool: params.tool_name,
-          tool_call_id: params.tool_call_id,
-          arguments: params.arguments,
-        });
-        break;
-      }
-      case "tool/progress": {
-        events.push({
-          type: "tool_progress",
-          tool: params.tool_name,
-          tool_call_id: params.tool_call_id,
-          message: params.message,
-          progress_pct: params.progress_pct,
-        });
-        break;
-      }
-      case "tool/completed": {
-        events.push({
-          type: "tool_completed",
-          tool: params.tool_name,
-          tool_call_id: params.tool_call_id,
-          ok: params.ok,
-          error: params.error,
-        });
+      case "turn/started": {
+        events.push({ type: "turn_started", turn_id: noteTurnId, raw: params });
         break;
       }
       case "task/updated": {
@@ -646,32 +799,6 @@ export async function chatWS(opts: ChatWsOptions): Promise<ChatWsResult> {
       }
       case "warning": {
         events.push({ type: "warning", message: params.message });
-        break;
-      }
-      case "turn/completed": {
-        const ev: ChatWsEvent = {
-          type: "done",
-          content,
-          cursor: params.cursor,
-          turn_id: noteTurnId,
-        };
-        events.push(ev);
-        doneEvent = ev;
-        terminal = true;
-        resolveTerminal();
-        break;
-      }
-      case "turn/error": {
-        const ev: ChatWsEvent = {
-          type: "error",
-          message: params.message ?? params.code ?? "turn/error",
-          code: params.code,
-          turn_id: noteTurnId,
-        };
-        events.push(ev);
-        doneEvent = ev;
-        terminal = true;
-        resolveTerminal();
         break;
       }
       default:

@@ -22568,6 +22568,17 @@ async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
         UiProtocolLedgerEvent::Notification(UiNotification::TurnError(event))
             if event.turn_id == turn_id && event.code == "interrupted"
     )));
+    // The pending-interrupt check also precedes the canonical dual-emit, so
+    // the interrupted turn leaves no assistant_delta envelope behind either.
+    assert!(replay.iter().all(|entry| !matches!(
+        &entry.event,
+        UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
+            if envelope.envelope.turn_id == turn_id.0.to_string()
+                && matches!(
+                    envelope.envelope.payload,
+                    PayloadV2::AssistantDelta { .. }
+                )
+    )));
 }
 
 /// #1463 — an interrupted M9 fixture turn must drain pending user questions
