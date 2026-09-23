@@ -602,6 +602,16 @@ pub struct ToolResult {
     /// Values are restricted to strings in v1; key shape must match
     /// `[a-z][a-z0-9_]*`. Absent (`None`) when the tool emits nothing.
     pub named_outputs: Option<std::collections::HashMap<String, String>>,
+    /// Images the tool wants the MODEL to look at, as local paths.
+    ///
+    /// Distinct from `files_to_send`, which goes to the human over the chat
+    /// channel and is never shown to the model. The agent loop turns these
+    /// into a user-role message carrying the image right after the batch's
+    /// tool results, so every provider renders them the way it renders a
+    /// user upload; the tool result itself stays text. `view_image` is the
+    /// first caller: without this, a model that can see could only learn a
+    /// screenshot's byte length.
+    pub model_media: Vec<PathBuf>,
 }
 
 /// Trait for implementing tools.

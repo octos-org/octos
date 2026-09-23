@@ -112,7 +112,8 @@ impl Executable for AccountCommand {
             AccountAction::List { profile } => {
                 // Verify parent exists
                 if store.get(&profile)?.is_none() {
-                    bail!("profile '{profile}' not found");
+                    let existing = store.list()?;
+                    bail!("{}", super::profile_not_found_message(&existing, &profile));
                 }
 
                 let subs = store.list_sub_accounts(&profile)?;

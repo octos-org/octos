@@ -420,7 +420,8 @@ Session, turn, and approval core:
   returns `steered: false` + the NEW turn id. Raw server-handled method
   — session-ingress credentials cannot call it, and steering is NOT an
   interrupt: `turn/interrupt` stays the separate cancel op)
-- `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
+- `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`;
+  additive `running` certainty field `UPCR-2026-031`)
 - `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)
 - `approval/respond`
 - `approval/scopes/list` (approval-scope discovery; first-server slice)
@@ -485,6 +486,10 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `config/capabilities/list` (accepted `UPCR-2026-017`)
 - `client_hello` (accepted `UPCR-2026-016`)
 - `profile/local/create` (accepted `UPCR-2026-018`)
+- `server/shutdown` (accepted `UPCR-2026-032`; stops the serving process
+  through the same graceful path as SIGINT; advertised and callable only on a
+  local `--solo` HTTP serve, never to session-scoped connections, otherwise
+  typed `server_shutdown_unavailable`)
 - `session/status/read` (accepted `UPCR-2026-017`)
 - `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`
   (accepted `UPCR-2026-017`; `auth/me` and `auth/logout` are omitted from the
@@ -783,6 +788,10 @@ Purpose:
 - return deterministic lifecycle state for one turn using the active-turn
   registry plus the durable ledger projection
 - return `state = "unknown"` rather than an error for a missing turn
+- with `state = "unknown"`, return `running = false` when the server is certain
+  it is not executing the turn (no registry entry, no ledger record, no
+  admission in flight), so a client can stop holding for a turn lost across a
+  restart ([UPCR-2026-031](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_031_TURN_STATE_NOT_RUNNING.md))
 
 Gate:
 
@@ -2477,6 +2486,27 @@ Rules:
   must fail with JSON-RPC `INVALID_PARAMS` and
   `data.kind = "profile_unresolved"`; it must not fabricate a runtime policy
   stamp for that profile or silently fall back to a default profile
+
+Numeric codes for method-availability errors (constants in `rpc_error_codes`
+in `crates/octos-core/src/ui_protocol.rs`; the WS/stdio dispatcher applies
+them at its supported-table and capability gates in
+`crates/octos-cli/src/api/ui_protocol_transport.rs`):
+
+- `-32601` (`method_not_found`) — JSON-RPC reserved. Emitted by the core
+  `UiCommand` parser when the method falls outside the protocol's method
+  table. The serve dispatcher answers unknown methods with `-32004`
+  instead (below), so this code is not observed on the AppUI wire today.
+- `-32004` (`method_not_supported`) — legacy server slot for "this server
+  will not run the method": a method outside the supported-method table, or
+  a capability-gated method called without negotiating the feature (see the
+  M12 Phase D section). The message echoes the requested method name and
+  `data` carries a typed `UnsupportedCapabilityReport`, giving clients one
+  machine-readable signal that the server will not run the method on this
+  slice.
+- `-32130` (`unsupported_capability`) — typed slot for the
+  capability-unavailable condition. New emitters should prefer it over the
+  legacy `-32004` slot. Like `-32601`, it is not emitted on the AppUI wire
+  today.
 
 ## 11. Relationship to REST
 

@@ -72,6 +72,8 @@ jobs:
           save-if: false
       - name: Check the all-feature CLI surface
         run: cargo check -p octos-cli --features "$FEATURES" --locked
+      - name: Install Linux sandbox prerequisites
+        run: bash scripts/setup-host-managed-linux-ci.sh
       # The serve_sigterm e2e spawns real `octos serve` children that starve
       # under default test parallelism; ci.yml runs it in a dedicated serial
       # step (see the #21 outer-loop ruling there).

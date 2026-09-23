@@ -163,6 +163,26 @@ pub struct EpisodeStore {
 }
 
 impl EpisodeStore {
+    /// Create an isolated store whose database never touches the filesystem.
+    ///
+    /// Hosts use this when all persistent state belongs to their own broker.
+    /// Unlike degraded mode, this is a functional database with normal reads
+    /// and writes, discarded when the last handle is dropped.
+    pub fn in_memory() -> Result<Self> {
+        let db = Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
+        let write_txn = db.begin_write()?;
+        {
+            let _ = write_txn.open_table(EPISODES_TABLE)?;
+            let _ = write_txn.open_table(CWD_INDEX_TABLE)?;
+            let _ = write_txn.open_table(EMBEDDINGS_TABLE)?;
+        }
+        write_txn.commit()?;
+        Ok(Self {
+            db: Some(Arc::new(db)),
+            index: RwLock::new(HybridIndex::new(DEFAULT_DIMENSION)),
+        })
+    }
+
     /// Open or create an episode store at the given path.
     ///
     /// **Strict mode** — fails if the redb file lock is already held
@@ -1004,6 +1024,32 @@ mod tests {
             summary.into(),
             EpisodeOutcome::Success,
         )
+    }
+
+    #[tokio::test]
+    async fn in_memory_stores_are_functional_and_isolated() {
+        let first = EpisodeStore::in_memory().unwrap();
+        let second = EpisodeStore::in_memory().unwrap();
+        assert!(!first.is_degraded());
+        first
+            .store(make_episode("private deployment details", "/room"))
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .find_relevant(Path::new("/room"), "deployment", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            second
+                .find_relevant(Path::new("/room"), "deployment", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A 768-d embedder (in-process EmbeddingGemma) must actually reach the

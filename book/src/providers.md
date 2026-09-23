@@ -250,7 +250,7 @@ When multiple fallback models are configured, adaptive routing dynamically selec
   "adaptive_routing": {
     "mode": "hedge",
     "qos_ranking": true,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -294,7 +294,7 @@ Each provider is scored on 4 factors (lower score = better). All weights are con
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `latency_threshold_ms` | 30000 | Providers with average latency above this are penalized |
+| `latency_threshold_ms` | 10000 | Providers with average latency above this are penalized |
 | `error_rate_threshold` | 0.3 | Providers with error rates above 30% are deprioritized |
 | `probe_probability` | 0.1 | Fraction of requests sent to non-primary providers as health probes |
 | `probe_interval_secs` | 60 | Minimum seconds between probes to the same provider |

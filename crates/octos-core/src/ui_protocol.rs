@@ -595,6 +595,9 @@ pub mod autonomy_error_kinds {
     pub const MONITOR_INVALID_SPEC: &str = "monitor_invalid_spec";
     pub const MONITOR_POLICY_DENIED: &str = "monitor_policy_denied";
     pub const MONITOR_FLOODED: &str = "monitor_flooded";
+    // #2367 — a control request against a terminal monitor state (resume
+    // of a monitor whose deadline has passed), mirroring `goal_invalid_state`.
+    pub const MONITOR_INVALID_STATE: &str = "monitor_invalid_state";
     pub const AUTONOMY_QUOTA_EXCEEDED: &str = "autonomy_quota_exceeded";
 }
 
@@ -3137,6 +3140,13 @@ pub struct TurnStateGetResult {
     /// turns that have started but not yet committed a row.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub committed_seqs: Vec<u64>,
+    /// UPCR-2026-031: `Some(false)` when the server is CERTAIN it is not
+    /// executing this turn — it has no registry entry, no ledger record, and
+    /// no `turn/start` for it is being admitted. Sent with `state: unknown`
+    /// (e.g. a turn lost across a restart) so a client can stop holding for
+    /// it. Absent whenever the server cannot be certain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<bool>,
 }
 
 // ----- M12 Phase D-1 auxiliary REST → WS frames -----

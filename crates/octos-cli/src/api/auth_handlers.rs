@@ -4615,19 +4615,21 @@ mod tests {
         std::fs::create_dir_all(&clone_dir).unwrap();
         let clone_path = clone_dir.join("mine.wav");
         std::fs::write(&clone_path, b"fake").unwrap();
-        let json = format!(
-            r#"{{
-              "default_voice": "doubao",
-              "models_base_path": "{base}",
-              "voices": {{
-                "doubao": {{ "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] }},
-                "ghost":  {{ "ref_audio": "ref_audios/ghost_ref.wav", "ref_text": "y", "aliases": [] }},
-                "other-clone": {{ "ref_audio": "{clone}", "ref_text": "z", "aliases": [] }}
-              }}
-            }}"#,
-            base = dir.to_string_lossy(),
-            clone = clone_path.to_string_lossy()
-        );
+        // Built with `json!`, not `format!`: the two paths are interpolated into
+        // JSON strings, and on Windows they are `C:\Users\...\Temp\...`.
+        // Pasted raw, `\U`, `\T` and friends are invalid JSON escapes, so the
+        // parse below panicked on every Windows run while forward-slash paths on
+        // Linux and macOS parsed fine. `json!` escapes the backslashes.
+        let json = serde_json::json!({
+            "default_voice": "doubao",
+            "models_base_path": dir.to_string_lossy(),
+            "voices": {
+                "doubao": { "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] },
+                "ghost":  { "ref_audio": "ref_audios/ghost_ref.wav", "ref_text": "y", "aliases": [] },
+                "other-clone": { "ref_audio": clone_path.to_string_lossy(), "ref_text": "z", "aliases": [] }
+            }
+        })
+        .to_string();
         octos_llm::ominix::VoicesRegistry::parse(&json).unwrap()
     }
 

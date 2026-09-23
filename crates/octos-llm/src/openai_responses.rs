@@ -338,7 +338,13 @@ impl LlmProvider for OpenAIResponsesProvider {
 
 fn build_input_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     let mut input = Vec::new();
-    for msg in messages {
+    // Media a current-batch tool handed the model: a function_call_output
+    // is text only, so it goes out as one user item after the batch's
+    // outputs (the Responses API allows consecutive user items), built at
+    // wire time, never persisted.
+    let mut pending_media: Vec<serde_json::Value> = Vec::new();
+    let mut pending_notes: Vec<String> = Vec::new();
+    for (index, msg) in messages.iter().enumerate() {
         // Skip empty assistant messages with no tool calls
         if msg.role == MessageRole::Assistant
             && msg.content.is_empty()
@@ -346,9 +352,58 @@ fn build_input_messages(messages: &[Message]) -> Vec<serde_json::Value> {
         {
             continue;
         }
+        if msg.role != MessageRole::Tool && !pending_media.is_empty() {
+            input.push(media_item(&mut pending_media, &mut pending_notes));
+        }
+        if msg.role == MessageRole::Tool {
+            let raw_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
+            let call_id = normalize_call_id(raw_id);
+            // No `input_video` item exists on this API: video is named only.
+            let shown = crate::tool_media::for_tool_row(messages, index, false, true);
+            let mut output = crate::tool_media::with_note(&msg.content, shown.note.as_deref());
+            let mut rendered = Vec::new();
+            for path in &shown.images {
+                match crate::vision::encode_image(path) {
+                    Ok((mime, data)) => {
+                        pending_media.push(serde_json::json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{mime};base64,{data}"),
+                        }));
+                        rendered.push(path.clone());
+                    }
+                    Err(_) => {
+                        output = crate::tool_media::with_note(
+                            &output,
+                            Some(&crate::tool_media::unreadable_note(path)),
+                        )
+                    }
+                }
+            }
+            if !rendered.is_empty() {
+                pending_notes.push(crate::tool_media::shown_note(&call_id, &rendered));
+            }
+            input.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            }));
+            continue;
+        }
         build_input_items(msg, &mut input);
     }
+    if !pending_media.is_empty() {
+        input.push(media_item(&mut pending_media, &mut pending_notes));
+    }
     input
+}
+
+/// The user item that carries a tool batch's images (see `build_input_messages`).
+fn media_item(media: &mut Vec<serde_json::Value>, notes: &mut Vec<String>) -> serde_json::Value {
+    let mut parts = std::mem::take(media);
+    parts.push(
+        serde_json::json!({ "type": "input_text", "text": std::mem::take(notes).join("\n") }),
+    );
+    serde_json::json!({ "role": "user", "content": parts })
 }
 
 /// Normalize a tool_call_id for the OpenAI Responses API.
@@ -785,6 +840,66 @@ mod tests {
     use super::*;
     use crate::config::PromptCacheContext;
     use octos_core::{Message, MessageRole};
+
+    /// A tool loop whose tool handed the model an image: user, assistant
+    /// tool call, tool row with the PNG on its media.
+    fn media_loop(dir: &std::path::Path) -> (Vec<Message>, String) {
+        let png = dir.join("grab.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
+        let path = png.to_string_lossy().into_owned();
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_1".into(),
+            name: "view_image".into(),
+            arguments: serde_json::json!({"path": "grab.png"}),
+            metadata: None,
+        }]);
+        let mut tool = mk(MessageRole::Tool, "{\"format\":\"png\"}");
+        tool.tool_call_id = Some("call_1".into());
+        tool.media = vec![path.clone()];
+        (
+            vec![mk(MessageRole::User, "look at grab.png"), assistant, tool],
+            path,
+        )
+    }
+
+    #[test]
+    fn should_render_tool_media_as_a_user_item_after_the_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (msgs, _) = media_loop(dir.path());
+        let items = build_input_messages(&msgs);
+        let kinds: Vec<String> = items
+            .iter()
+            .map(|i| {
+                i["type"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| i["role"].as_str().unwrap().to_string())
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["user", "function_call", "function_call_output", "user"],
+            "{items:?}"
+        );
+        let parts = items[3]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "input_image");
+        assert!(
+            parts[1]["text"].as_str().unwrap().contains("fc_")
+                || parts[1]["text"].as_str().unwrap().contains("call_1")
+        );
+    }
 
     fn msg(role: MessageRole, content: &str) -> Message {
         Message {

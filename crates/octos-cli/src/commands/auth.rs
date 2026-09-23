@@ -562,7 +562,7 @@ fn remove_key(name: &str, profile_id: Option<&str>) -> Result<()> {
     let all_profiles = store.list()?;
     if let Some(id) = profile_id {
         if !all_profiles.iter().any(|p| p.id == id) {
-            eyre::bail!("profile '{id}' not found");
+            eyre::bail!("{}", super::profile_not_found_message(&all_profiles, id));
         }
     }
 
@@ -721,7 +721,12 @@ fn get_profiles(
     if let Some(id) = profile_id {
         match store.get(id)? {
             Some(p) => Ok(vec![p]),
-            None => eyre::bail!("profile '{id}' not found"),
+            // If listing the registry fails too, surface that error rather
+            // than a hint built from an unknown set of profiles.
+            None => {
+                let existing = store.list()?;
+                eyre::bail!("{}", super::profile_not_found_message(&existing, id))
+            }
         }
     } else {
         store.list()
@@ -1083,5 +1088,27 @@ mod tests {
             .validate("local:auth-test", &decoded.session_ingress_token)
             .unwrap();
         assert_eq!(grant.profile_id.as_deref(), Some("profile-a"));
+    }
+
+    /// #2414 — a mistyped profile id must list the ids that exist instead of
+    /// dead-ending (and must say so plainly when none are configured).
+    #[test]
+    fn get_profiles_not_found_lists_existing_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            crate::profiles::ProfileStore::open_unified(&tmp.path().join(".octos")).unwrap();
+
+        let error = get_profiles(&store, Some("nope")).unwrap_err();
+        assert!(
+            error.to_string().contains("No profiles are configured"),
+            "empty store must say so: {error}"
+        );
+
+        store.save(&profile_with_llm("main", None)).unwrap();
+        let error = get_profiles(&store, Some("nope")).unwrap_err();
+        assert!(
+            error.to_string().contains("Existing profiles: main"),
+            "error must list existing ids: {error}"
+        );
     }
 }

@@ -77,6 +77,11 @@ fn main() -> Result<()> {
     // `cli.<cmd>` > built-in default (see `octos_cli::config_layer`).
     let matches = Args::command().get_matches();
     let mut args = Args::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    // Protected children must enter confinement before config, credentials,
+    // tracing workers or a Tokio runtime can acquire ambient authority.
+    if matches!(&args.command, commands::Command::Acp(command) if command.host_managed) {
+        return args.command.execute();
+    }
     octos_cli::config_layer::apply(&mut args, &matches)?;
 
     // Determine log directory for serve command (enables rolling file logs)

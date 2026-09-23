@@ -466,9 +466,9 @@ if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
         <string>8080</string>
         <string>--host</string>
         <string>0.0.0.0</string>
-        <string>--auth-token</string>
-        <string>$AUTH_TOKEN</string>
     </array>
+    <!-- #2371: the token travels via OCTOS_AUTH_TOKEN below, never argv —
+         ProgramArguments are readable by any local process via ps. -->
     <key>UserName</key>
     <string>$(whoami)</string>
     <key>KeepAlive</key>
@@ -521,7 +521,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$(whoami)
-ExecStart=$OCTOS_BIN serve --port 8080 --host 0.0.0.0 --auth-token $AUTH_TOKEN
+# #2371: the token travels via OCTOS_AUTH_TOKEN below, never argv —
+# ExecStart is readable by any local user via systemctl cat / ps.
+ExecStart=$OCTOS_BIN serve --port 8080 --host 0.0.0.0
 Restart=on-failure
 RestartSec=5
 Environment=HOME=$HOME

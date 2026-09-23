@@ -15,6 +15,7 @@ default = []
 test-utils = []
 
 [dependencies]
+libc = { workspace = true }
 octos-core = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }

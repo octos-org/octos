@@ -1580,6 +1580,125 @@ async fn view_image_reports_format_and_size_for_png() {
     assert_eq!(meta["format"], json!("png"));
 }
 
+/// The point of `view_image` for a model that can see: the raster file it
+/// asked about comes back as `model_media`, which the agent loop shows to
+/// the model. The text output says so, so the model knows whether it is
+/// looking at the image or only at its metadata.
+#[tokio::test]
+async fn view_image_hands_a_raster_image_to_the_model() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let png = temp.path().join("grab.png");
+    std::fs::write(&png, PNG_MAGIC).expect("write png");
+    let tool = ViewImageTool::new(temp.path());
+    let result = tool
+        .execute(&json!({ "path": "grab.png" }))
+        .await
+        .expect("view_image ok");
+    assert!(result.success, "{}", result.output);
+    let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+    assert_eq!(payload["shown_to_model"], json!(true));
+    assert_eq!(result.model_media.len(), 1, "one image for the model");
+    assert!(
+        result.model_media[0].ends_with("grab.png"),
+        "the resolved file: {}",
+        result.model_media[0].display()
+    );
+    let meta = result.structured_metadata.expect("structured metadata");
+    assert_eq!(meta["shown_to_model"], json!(true));
+}
+
+/// `view_video`: an MP4 in the workspace is detected from its `ftyp` box and
+/// handed to the model; the output says it was shown and that a model
+/// without video will be told it could not watch it.
+#[tokio::test]
+async fn view_video_hands_an_mp4_to_the_model() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let clip = temp.path().join("clip.mp4");
+    std::fs::write(&clip, b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2").expect("write mp4");
+    let tool = ViewVideoTool::new(temp.path());
+    let result = tool
+        .execute(&json!({ "path": "clip.mp4" }))
+        .await
+        .expect("view_video ok");
+    assert!(result.success, "{}", result.output);
+    let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+    assert_eq!(payload["format"], json!("mp4"));
+    assert_eq!(payload["mime_type"], json!("video/mp4"));
+    assert_eq!(payload["shown_to_model"], json!(true));
+    assert_eq!(result.model_media.len(), 1);
+    assert!(result.model_media[0].ends_with("clip.mp4"));
+}
+
+/// A QuickTime brand is MOV; an EBML header with a webm DocType is WebM;
+/// anything else is refused rather than guessed.
+#[tokio::test]
+async fn view_video_tells_containers_apart_and_refuses_the_rest() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp.path().join("a.mov"),
+        b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  ",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("b.webm"),
+        b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\x82\x84webm",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("c.mkv"),
+        b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\x82\x88matroska",
+    )
+    .unwrap();
+    std::fs::write(temp.path().join("notes.mp4"), b"just text, not a video").unwrap();
+    let tool = ViewVideoTool::new(temp.path());
+    for (file, format, mime) in [
+        ("a.mov", "mov", "video/quicktime"),
+        ("b.webm", "webm", "video/webm"),
+        ("c.mkv", "mkv", "video/x-matroska"),
+    ] {
+        let result = tool.execute(&json!({ "path": file })).await.unwrap();
+        let payload: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(payload["format"], json!(format), "{file}");
+        assert_eq!(payload["mime_type"], json!(mime), "{file}");
+        assert_eq!(result.model_media.len(), 1, "{file}");
+    }
+    let result = tool.execute(&json!({ "path": "notes.mp4" })).await.unwrap();
+    assert!(!result.success);
+    assert!(
+        result.output.contains("recognised video container"),
+        "{}",
+        result.output
+    );
+    assert!(result.model_media.is_empty());
+}
+
+/// SVG is recognised for the UI but no vision API takes it inline: the
+/// model gets the metadata and the reason, not a request that 400s.
+#[tokio::test]
+async fn view_image_keeps_an_svg_to_metadata_and_says_why() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let svg = temp.path().join("icon.svg");
+    std::fs::write(&svg, b"<svg xmlns='http://www.w3.org/2000/svg'/>").expect("write svg");
+    let tool = ViewImageTool::new(temp.path());
+    let result = tool
+        .execute(&json!({ "path": "icon.svg" }))
+        .await
+        .expect("view_image ok");
+    assert!(result.success, "{}", result.output);
+    let payload: Value = serde_json::from_str(&result.output).expect("json payload");
+    assert_eq!(payload["format"], json!("svg"));
+    assert_eq!(payload["shown_to_model"], json!(false));
+    assert!(
+        payload["not_shown_because"]
+            .as_str()
+            .unwrap_or("")
+            .contains("PNG or JPEG"),
+        "{}",
+        result.output
+    );
+    assert!(result.model_media.is_empty());
+}
+
 /// Codex review #1153 P2 regression: `FilesystemScope::Host` (granted via
 /// `DangerFullAccess`) lets `view_image` read images outside the
 /// workspace. Pre-fix, the helper passed `self.base_dir` as the

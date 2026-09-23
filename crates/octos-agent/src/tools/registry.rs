@@ -1356,6 +1356,11 @@ impl ToolRegistry {
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_file_access(permissions.file_access),
         );
+        // `view_video`: the same scope rules, for the models that take video.
+        registry.register(
+            super::coding_tools::ViewVideoTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope),
+        );
         // #1148 codex P2: pass the LIVE shared catalog cell instead
         // of a frozen Vec snapshot. The registry refreshes the cell
         // on every mutation via `refresh_live_catalog` (called from
@@ -1462,6 +1467,7 @@ impl ToolRegistry {
         // must follow `rebind_cwd` so a session targeting a new project root
         // does not leak previously bound paths.
         "view_image",
+        "view_video",
         #[cfg(feature = "git")]
         "git",
         #[cfg(feature = "ast")]
@@ -1564,6 +1570,11 @@ impl ToolRegistry {
             ViewImageTool::new(cwd)
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_file_access(permissions.file_access),
+        );
+        // `view_video`: the same scope rules, for the models that take video.
+        registry.register(
+            super::coding_tools::ViewVideoTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope),
         );
         // #1148 codex P2: live shared catalog cell — see `with_builtins`.
         let catalog_cell = registry.live_catalog_handle();
