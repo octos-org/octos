@@ -45254,16 +45254,24 @@ mod tests {
         // teardown cannot wipe the sink this test installs (libtest runs cases
         // in parallel by default, and CI does NOT pass --test-threads=1).
         let _guard = background_activity_test_guard();
+        let session_a = SessionKey::new("api", "mon-human-a");
+        let session_b = SessionKey::new("api", "mon-human-b");
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorder = seen.clone();
+        // Record only THIS test's two sessions: the guard serializes
+        // cooperative (sink-installing) cases, but cannot stop a NON-guarded
+        // emitter — any parallel test that drives `handle_monitor_batch` to a
+        // Fired outcome writes into the installed sink, and a count-everything
+        // recorder then over-counts (#2364).
+        let (owned_a, owned_b) = (session_a.clone(), session_b.clone());
         let sink: BackgroundActivitySink = std::sync::Arc::new(move |event| {
-            recorder.lock().unwrap().push(event);
+            if event.session_id == owned_a || event.session_id == owned_b {
+                recorder.lock().unwrap().push(event);
+            }
         });
         set_background_activity_sink(sink);
 
         let orchestrator = InProcessAgentOrchestrator::default();
-        let session_a = SessionKey::new("api", "mon-human-a");
-        let session_b = SessionKey::new("api", "mon-human-b");
         create_monitor_for_test(
             &orchestrator,
             &session_a,
@@ -45293,6 +45301,23 @@ mod tests {
         assert_eq!(
             orchestrator.handle_monitor_batch(id_a, &["a2".into(), "a3".into()], 2),
             MonitorBatchOutcome::Fired { queued: true }
+        );
+
+        // A FOREIGN emission mid-flight — the role
+        // `monitor_wake_idle_gates_and_paused_monitor_wake_is_unschedulable`
+        // plays when it drives `handle_monitor_batch` in the same process
+        // without the guard — must not land in this recorder (#2364). The
+        // pin exercises the filter only while the per-origin cap admits it
+        // (40 per 60s; the map is cleared at guard acquisition).
+        crate::autonomy::human_events::emit_background_activity(
+            crate::autonomy::human_events::background_activity(
+                &SessionKey::new("api", "mon-idle"),
+                Some("tenant-a"),
+                ORIGIN_KIND_MONITOR,
+                "monitor_01",
+                Some("watch"),
+                "c",
+            ),
         );
 
         let events = seen.lock().unwrap().clone();
