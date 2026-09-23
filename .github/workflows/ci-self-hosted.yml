@@ -50,20 +50,22 @@ jobs:
       - name: Test
         run: cargo test --workspace -- --skip serve_sigterm
 
+      # ci-api-filter-test.sh fails the step when a filter selects zero
+      # tests — a bare `cargo test <filter>` would report `ok` (#2029).
       - name: API feature tests
-        run: cargo test -p octos-cli --features api api::auth_handlers
+        run: ./scripts/ci-api-filter-test.sh api::auth_handlers
 
       # Feature-gated §6 catalog guard — `cargo test --workspace` above never
       # compiles the `api` module, so run it explicitly to catch spec drift.
       - name: UI Protocol §6 catalog guard (octos-cli)
-        run: cargo test -p octos-cli --features api spec_section6_catalog_lists_every_advertised_method -- --nocapture
+        run: ./scripts/ci-api-filter-test.sh spec_section6_catalog_lists_every_advertised_method -- --nocapture
 
       - name: QoS adaptive/runtime catalog regressions
         run: |
           cargo test -p octos-llm test_qos_ranking_changes_lane_selection -- --nocapture
           cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores -- --nocapture
           cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score -- --nocapture
-          cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
+          ./scripts/ci-api-filter-test.sh gateway_runtime::tests -- --nocapture
 
   linux-arm:
     name: linux-arm
