@@ -3177,6 +3177,15 @@ pub struct SessionListParams {
     /// per-profile/global listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Optional profile whose per-project store to list. Only meaningful
+    /// together with `cwd`: the listing reads `<cwd>/.octos/<profile_id>`.
+    /// A connection authenticated as a user is frozen to its own profile
+    /// and may only restate it; an admin/token connection (no connection
+    /// profile) uses it to name the profile it opens sessions under, the
+    /// same way `session/open` accepts `profile_id`. Absent → the
+    /// connection's profile, then the server default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
 }
 
 /// Result for `session/list`. `sessions` is the JSON array the existing

@@ -1661,7 +1661,14 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/sessions`
-- Params type: `SessionListParams` (empty object).
+- Params type: `SessionListParams` — `{}` for the legacy per-profile/global
+  listing. With `session.workspace_cwd.v1` negotiated, an optional `cwd`
+  scopes the listing to that project's `<cwd>/.octos/<profile>` store, and
+  an optional `profile_id` names the profile whose store to read, under the
+  same scope rules as `session/open`: a user connection may only restate
+  its own profile (anything else is an `auth_scope_violation`), an
+  admin/token connection uses it to name the profile it opens sessions
+  under, and an unregistered profile is `cwd_runtime_unavailable`.
 - Result type: `SessionListResult` — `{ sessions: SessionInfo[] }`. The
   `sessions` field forwards the JSON body of the legacy REST handler
   verbatim (one `SessionInfo` per entry).

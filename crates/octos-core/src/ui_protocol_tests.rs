@@ -5128,6 +5128,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // new wire shape so a rename/type-flip of the field fails here.
     let with_cwd = SessionListParams {
         cwd: Some("/home/me/proj".into()),
+        profile_id: None,
     };
     assert_eq!(
         serde_json::to_value(&with_cwd).expect("serialize"),
@@ -5136,6 +5137,21 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let parsed_cwd: SessionListParams =
         serde_json::from_value(serde_json::json!({ "cwd": "/home/me/proj" })).expect("decode");
     assert_eq!(parsed_cwd, with_cwd);
+    // session/list — WITH the additive `profile_id` (names the per-project
+    // store's profile, same as session/open). Also optional and skipped
+    // when absent, so the two pins above stay byte-identical.
+    let with_profile = SessionListParams {
+        cwd: Some("/home/me/proj".into()),
+        profile_id: Some("dev".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&with_profile).expect("serialize"),
+        serde_json::json!({ "cwd": "/home/me/proj", "profile_id": "dev" }),
+    );
+    let parsed_profile: SessionListParams =
+        serde_json::from_value(serde_json::json!({ "cwd": "/home/me/proj", "profile_id": "dev" }))
+            .expect("decode");
+    assert_eq!(parsed_profile, with_profile);
 
     // session/snapshot
     let p = SessionSnapshotParams {
