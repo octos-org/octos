@@ -19,6 +19,7 @@
 //! rest:    payload (request: JSON; audio response: raw audio bytes)
 //! ```
 
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -86,6 +87,7 @@ fn ws_endpoint() -> Option<String> {
 }
 
 /// File extension for the requested audio encoding.
+#[cfg(test)]
 fn audio_ext(encoding: &str) -> &'static str {
     crate::api::voice_turn::cloud_audio_file_extension(encoding)
 }
