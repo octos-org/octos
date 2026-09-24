@@ -206,7 +206,13 @@ jobs:
 
       - name: Test serve-launcher token handoff
         shell: pwsh
-        run: scripts/tests/test-serve-launcher-token.ps1
+        run: |
+          # Windows pwsh exits -Command with the last native command's exit
+          # code; the script's refusal arm leaves it at 1 on a green run
+          # (#2388). Dot-source, then make success explicit — a throw aborts
+          # the body before the exit, so failures stay red.
+          . ./scripts/tests/test-serve-launcher-token.ps1
+          exit 0
 
   web-app-base-url-windows:
     runs-on: windows-latest
