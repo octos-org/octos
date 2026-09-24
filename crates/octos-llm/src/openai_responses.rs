@@ -641,8 +641,6 @@ struct ResponsesUsage {
     input_tokens_details: Option<InputTokensDetails>,
     #[serde(default)]
     output_tokens_details: Option<OutputTokensDetails>,
-    #[serde(default)]
-    input_tokens_details: InputTokensDetails,
 }
 
 #[derive(Default, Deserialize)]
@@ -651,12 +649,6 @@ struct InputTokensDetails {
     cached_tokens: u32,
     #[serde(default)]
     cache_write_tokens: u32,
-}
-
-#[derive(Deserialize)]
-struct InputTokensDetails {
-    #[serde(default)]
-    cached_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -1335,7 +1327,6 @@ mod tests {
             }],
             status: "completed".into(),
             usage: ResponsesUsage {
-                input_tokens_details: InputTokensDetails::default(),
                 input_tokens: 10,
                 output_tokens: 5,
                 input_tokens_details: None,
@@ -1385,7 +1376,6 @@ mod tests {
             ],
             status: "completed".into(),
             usage: ResponsesUsage {
-                input_tokens_details: InputTokensDetails::default(),
                 input_tokens: 20,
                 output_tokens: 30,
                 input_tokens_details: None,
