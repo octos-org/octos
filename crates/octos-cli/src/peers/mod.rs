@@ -889,6 +889,16 @@ pub(crate) mod peer_io {
         imp::read_peer_file(peer_dir, leaf, cap).ok().flatten()
     }
 
+    /// Control files must distinguish an absent legacy leaf from an invalid
+    /// or unreadable one; treating both as absent would disable a budget.
+    pub(crate) fn read_peer_control_file(
+        peer_dir: &Path,
+        leaf: &str,
+        cap: usize,
+    ) -> std::io::Result<Option<String>> {
+        imp::read_peer_file(peer_dir, leaf, cap)
+    }
+
     pub(crate) fn read_peer_identity_file(peer_dir: &Path, leaf: &str) -> PeerFileRead {
         match imp::read_peer_file(peer_dir, leaf, PEER_FILE_READ_CAP_SMALL) {
             Ok(None) => PeerFileRead::Missing,
@@ -952,7 +962,16 @@ pub(crate) mod peer_io {
     /// planted FIFO fails fast instead of parking the writer on the missing
     /// reader.
     pub(crate) fn append_peer_line(peer_dir: &Path, leaf: &str, line: &str) -> std::io::Result<()> {
-        imp::append_peer_line(peer_dir, leaf, line)
+        imp::append_peer_line(peer_dir, leaf, line, false)
+    }
+
+    /// Append and sync a control record before another turn may be admitted.
+    pub(crate) fn append_peer_line_durable(
+        peer_dir: &Path,
+        leaf: &str,
+        line: &str,
+    ) -> std::io::Result<()> {
+        imp::append_peer_line(peer_dir, leaf, line, true)
     }
 
     /// `true` when the peer leaf exists as a REGULAR file, resolved under the
@@ -1104,6 +1123,7 @@ pub(crate) mod peer_io {
             peer_dir: &Path,
             leaf: &str,
             line: &str,
+            durable: bool,
         ) -> std::io::Result<()> {
             let dir = open_peer_dir(peer_dir)?;
             // O_APPEND create; O_NOFOLLOW refuses a symlinked leaf; O_NONBLOCK
@@ -1130,7 +1150,11 @@ pub(crate) mod peer_io {
                     "peer leaf is not a regular file",
                 ));
             }
-            file.write_all(line.as_bytes())
+            file.write_all(line.as_bytes())?;
+            if durable {
+                file.sync_data()?;
+            }
+            Ok(())
         }
 
         pub(crate) fn peer_file_mtime(
@@ -1356,6 +1380,7 @@ pub(crate) mod peer_io {
             peer_dir: &Path,
             leaf: &str,
             line: &str,
+            durable: bool,
         ) -> std::io::Result<()> {
             if !peer_dir_ok(peer_dir) {
                 return Err(std::io::Error::new(
@@ -1376,7 +1401,11 @@ pub(crate) mod peer_io {
                 .create(true)
                 .append(true)
                 .open(&path)?;
-            file.write_all(line.as_bytes())
+            file.write_all(line.as_bytes())?;
+            if durable {
+                file.sync_data()?;
+            }
+            Ok(())
         }
 
         pub(crate) fn peer_file_mtime(
@@ -2901,6 +2930,153 @@ pub(crate) struct StagedPeer {
     pub(crate) worktree_branch: Option<String>,
 }
 
+/// A peer budget is independent of the master's goal budget. Usage is keyed
+/// by the staged slug, so reopening the peer under a new OUP session id does
+/// not reset its allowance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerTokenBudgetStatus {
+    pub(crate) limit: u64,
+    pub(crate) used: u64,
+}
+
+pub(crate) fn peer_token_budget_status(
+    peers_root: &Path,
+    slug: &str,
+) -> Result<Option<PeerTokenBudgetStatus>, String> {
+    use peer_io::PeerFileRead;
+
+    let Some(dir) = staged_peer_dir(peers_root, slug) else {
+        return Ok(None);
+    };
+    let limit = match peer_io::read_peer_identity_file(&dir, "token_budget") {
+        PeerFileRead::Missing => return Ok(None),
+        PeerFileRead::Valid(text) => text
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| format!("peer '{slug}' has an invalid token budget"))?,
+        PeerFileRead::Invalid(error) => {
+            return Err(format!("cannot read peer '{slug}' token budget: {error}"));
+        }
+    };
+    match peer_io::read_peer_control_file(&dir, "token_budget_error", 1024) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Err(format!(
+                "peer '{slug}' token budget accounting is unavailable"
+            ));
+        }
+        Err(error) => {
+            return Err(format!("cannot check peer '{slug}' token budget: {error}"));
+        }
+    }
+    let mut turns = HashMap::<String, u64>::new();
+    match peer_io::read_peer_control_file(&dir, "token_budget_usage", 1024 * 1024) {
+        Ok(None) => {}
+        Ok(Some(text)) => {
+            for line in text.lines() {
+                let mut fields = line.split_whitespace();
+                let (Some(turn_id), Some(tokens), None) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    return Err(format!("peer '{slug}' has invalid token usage records"));
+                };
+                let tokens = tokens
+                    .parse::<u64>()
+                    .map_err(|_| format!("peer '{slug}' has invalid token usage records"))?;
+                if turns
+                    .insert(turn_id.to_owned(), tokens)
+                    .is_some_and(|old| old != tokens)
+                {
+                    return Err(format!("peer '{slug}' has conflicting token usage records"));
+                }
+            }
+        }
+        Err(error) => {
+            return Err(format!("cannot read peer '{slug}' token usage: {error}"));
+        }
+    }
+    let used = turns.values().copied().fold(0_u64, u64::saturating_add);
+    Ok(Some(PeerTokenBudgetStatus { limit, used }))
+}
+
+/// Append one turn's spend. Duplicate terminal delivery is safe: the reader
+/// counts each turn id once. This is a turn-boundary budget, like goal budgets.
+pub(crate) fn charge_peer_token_budget(
+    peers_root: &Path,
+    slug: &str,
+    turn_id: &str,
+    tokens: u64,
+) -> Result<(), String> {
+    if peer_token_budget_status(peers_root, slug)?.is_none() {
+        return Ok(());
+    }
+    let dir = staged_peer_dir(peers_root, slug)
+        .ok_or_else(|| format!("peer '{slug}' is no longer staged"))?;
+    if let Err(error) = peer_io::append_peer_line_durable(
+        &dir,
+        "token_budget_usage",
+        &format!("{turn_id} {tokens}\n"),
+    ) {
+        let _ = peer_io::write_peer_file_durable(&dir, "token_budget_error", &error.to_string());
+        return Err(format!("cannot record peer '{slug}' token usage: {error}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod peer_token_budget_tests {
+    use super::*;
+
+    #[test]
+    fn budget_accumulates_by_peer_and_deduplicates_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path().join("peers");
+        let peer = peers_root.join("reviewer");
+        let other = peers_root.join("implementer");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        peer_io::write_peer_file_durable(&peer, "token_budget", "100").unwrap();
+        peer_io::write_peer_file_atomic(&peer, "brief.md", "Review the change").unwrap();
+        peer_io::write_peer_file_durable(&other, "token_budget", "50").unwrap();
+        peer_io::write_peer_file_atomic(&other, "brief.md", "Implement the change").unwrap();
+
+        assert_eq!(
+            peer_token_budget_status(&peers_root, "reviewer").unwrap(),
+            Some(PeerTokenBudgetStatus {
+                limit: 100,
+                used: 0,
+            })
+        );
+        charge_peer_token_budget(&peers_root, "reviewer", "turn-1", 75).unwrap();
+        charge_peer_token_budget(&peers_root, "reviewer", "turn-1", 75).unwrap();
+        charge_peer_token_budget(&peers_root, "reviewer", "turn-2", 30).unwrap();
+        assert_eq!(
+            peer_token_budget_status(&peers_root, "reviewer").unwrap(),
+            Some(PeerTokenBudgetStatus {
+                limit: 100,
+                used: 105,
+            })
+        );
+        assert_eq!(
+            peer_token_budget_status(&peers_root, "implementer").unwrap(),
+            Some(PeerTokenBudgetStatus { limit: 50, used: 0 })
+        );
+    }
+
+    #[test]
+    fn malformed_usage_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = tmp.path().join("bad");
+        std::fs::create_dir_all(&peer).unwrap();
+        peer_io::write_peer_file_atomic(&peer, "token_budget", "100").unwrap();
+        peer_io::write_peer_file_atomic(&peer, "brief.md", "Review").unwrap();
+        peer_io::write_peer_file_atomic(&peer, "token_budget_usage", "not-a-record").unwrap();
+        assert!(peer_token_budget_status(tmp.path(), "bad").is_err());
+    }
+}
+
 /// #1801 v3: single-peer staging core shared by the `peer/prepare` fleet
 /// loop and the `peer_handoff` tool callback. Reserves the slug dir
 /// (`reserve_peer_dir` — `create_dir` is the atomic claim), optionally
@@ -2911,6 +3087,7 @@ pub(crate) struct StagedPeer {
 /// loop keeps it off the reactor via `spawn_blocking`, while the tool
 /// callback — a sync `Fn` — runs it directly on the tool's worker.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn stage_peer(
     peers_root: &Path,
     workspace_root: &Path,
@@ -2936,6 +3113,40 @@ pub(crate) fn stage_peer(
     goal_id: Option<&str>,
     task_id: Option<&str>,
 ) -> Result<StagedPeer, RpcError> {
+    stage_peer_with_budget(
+        peers_root,
+        workspace_root,
+        seed,
+        name,
+        originator,
+        brief,
+        worktree,
+        goal_id,
+        task_id,
+        None,
+    )
+}
+
+/// Stage a peer with an optional cumulative token budget. The budget is
+/// durable before `brief.md` makes the peer visible to OUP clients.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stage_peer_with_budget(
+    peers_root: &Path,
+    workspace_root: &Path,
+    seed: &str,
+    name: Option<&str>,
+    originator: Option<&str>,
+    brief: &str,
+    worktree: bool,
+    goal_id: Option<&str>,
+    task_id: Option<&str>,
+    token_budget: Option<u64>,
+) -> Result<StagedPeer, RpcError> {
+    if token_budget == Some(0) {
+        return Err(RpcError::invalid_params(
+            "token_budget must be a positive integer",
+        ));
+    }
     // A NAMED peer reserves its EXACT (name-derived) slug and rejects
     // collisions — a name is the primary address, so it must be unique and
     // stable. An unnamed (legacy `peer/prepare`) peer keeps the auto-suffix
@@ -3061,6 +3272,23 @@ pub(crate) fn stage_peer(
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
             return Err(RpcError::internal_error(format!(
                 "failed to record peer originator: {err}"
+            )));
+        }
+    }
+
+    if let Some(limit) = token_budget {
+        if let Err(err) =
+            peer_io::write_peer_file_durable(&peer_dir, "token_budget", &limit.to_string())
+        {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::internal_error(format!(
+                "failed to record peer token budget: {err}"
+            )));
+        }
+        if let Err(err) = peer_io::write_peer_file_durable(&peer_dir, "token_budget_usage", "") {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::internal_error(format!(
+                "failed to initialize peer token usage: {err}"
             )));
         }
     }
@@ -3520,7 +3748,7 @@ pub(crate) fn build_peer_handoff_callback(
         };
         let (effective_worktree, fence_warning) =
             resolve_peer_worktree(request.worktree, &fence_reasons);
-        let staged = stage_peer(
+        let staged = stage_peer_with_budget(
             &peers_root,
             &workspace_root,
             &request.name,
@@ -3531,6 +3759,7 @@ pub(crate) fn build_peer_handoff_callback(
             // Explicit goal_id wins; else the master's active goal (auto-bind).
             resolved_goal_id.as_deref(),
             request.task_id.as_deref(),
+            request.token_budget,
         )
         .map_err(|err| err.message)?;
         // #peer-model — optional model lane. Record a VALID lane symlink-safely
@@ -3607,6 +3836,7 @@ pub(crate) fn build_peer_handoff_callback(
             cwd: staged.cwd.to_string_lossy().into_owned(),
             worktree_branch: staged.worktree_branch,
             model_note,
+            token_budget: request.token_budget,
         })
     })
 }

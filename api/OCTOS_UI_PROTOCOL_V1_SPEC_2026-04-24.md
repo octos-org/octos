@@ -512,7 +512,11 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   is bootstrapped. The client then opens the peer session and starts the
   kickoff turn through the ordinary `session/open` + `turn/start`; #1801 v2
   adds `n` (1..=8) for fleet staging — N suffixed slugs from ONE brief, the
-  scalar result fields mirror the first peer and `peers: [...]` carries all)
+  scalar result fields mirror the first peer and `peers: [...]` carries all;
+  optional positive `token_budget` sets a cumulative per-peer limit for every
+  staged member and is echoed in each result entry. The limit persists by peer
+  slug across session reconnects. Usage is charged after each turn, so one
+  turn can overshoot; later turns end with `peer_token_budget_exceeded`.)
 - `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
   latest `result.md` — written server-side on every peer-session turn
   terminal — with per-field truncation flags and `result_updated_unix`;
