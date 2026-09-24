@@ -85,8 +85,6 @@ mod serve_sigterm {
             data_dir.to_str().unwrap(),
             "--data-dir",
             data_dir.to_str().unwrap(),
-            "--solo",
-            "--danger-full-access",
             "-p",
             &port.to_string(),
         ])
