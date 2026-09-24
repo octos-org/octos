@@ -304,10 +304,6 @@ impl ScopePolicy {
 /// needs to know to render itself, plus the canonical scope wire string.
 #[derive(Debug, Clone)]
 pub(crate) struct ScopeHit {
-    /// Read only by tests today: the production lookup consumers branch on
-    /// `scope_match`/`decision`, while the kind assertions pin which scope
-    /// kind produced the hit.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) scope_kind: ApprovalScopeKind,
     pub(crate) decision: ApprovalDecision,
     pub(crate) scope_match: String,

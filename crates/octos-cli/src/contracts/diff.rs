@@ -44,8 +44,7 @@
 //!   spawn a background sweep (diff previews are fewer per session than
 //!   ledger events, so this is acceptable). Filed as a v2 follow-up.
 //!
-//! Counters (emitted via `tracing::info!` from
-//! [`PendingDiffPreviewStore::log_metrics`]):
+//! Counters (snapshotted via [`PendingDiffPreviewStore::metrics`]):
 //!
 //! - `diff_preview.entries.active`
 //! - `diff_preview.bytes.in_memory`
@@ -83,9 +82,9 @@ pub(crate) struct PendingDiffEntry {
     /// Raw unified diff captured at proposal time. `None` when the
     /// runtime did not surface a diff at all (e.g. tool emitted no
     /// `diff` and `materialize_file_mutation_diff` could not produce one).
-    /// Used by tests today and by apply-time consistency checks once the
-    /// apply path is wired in.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Used by apply-time consistency checks once the apply path is wired
+    /// in; today it is persisted to disk and measured by
+    /// `approx_entry_bytes` on every insert.
     snapshot_at_proposal: Option<String>,
 }
 
