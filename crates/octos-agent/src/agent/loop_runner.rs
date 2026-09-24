@@ -761,7 +761,18 @@ impl Agent {
     /// Build a `ChatConfig` with optional `chat_max_tokens` / `chat_temperature`
     /// overrides from `AgentConfig`. Delegates to [`build_chat_config`].
     fn chat_config(&self) -> ChatConfig {
-        build_chat_config(&self.config, self.is_local_provider())
+        let mut config = build_chat_config(&self.config, self.is_local_provider());
+        // #2480: media paths a tool validated are re-checked when the request
+        // is built, so the providers need the same workspace root the file
+        // tools enforced their symlink-ancestor walk against. Host-scope
+        // reads skipped that walk at tool time and must skip it here too.
+        if !self.tools.filesystem_scope().is_host() {
+            config.media_scope_root = self
+                .tools
+                .workspace_root()
+                .map(std::path::Path::to_path_buf);
+        }
+        config
     }
 
     /// True when the active LLM provider is the built-in local/self-hosted

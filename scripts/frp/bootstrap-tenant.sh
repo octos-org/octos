@@ -287,10 +287,29 @@ echo "    frpc config written"
 echo ""
 echo "==> Step 8: Creating services..."
 
-if [ "$REMOTE_OS" = "Darwin" ]; then
-    # --- octos serve launchd plist ---
-    ssh_cmd "mkdir -p ~/Library/LaunchAgents"
-    ssh_cmd "cat > ~/Library/LaunchAgents/${PLIST_LABEL}.plist" << EOF
+# Write the serve bearer token into the remote ${RDATA}/serve.env (mode
+# 0600) so the remote systemd unit can load it via EnvironmentFile=
+# without the secret living in the world-readable unit file (#2496).
+# launchd has no EnvironmentFile equivalent — the remote plist is
+# installed 0600 instead.
+write_serve_env_file() {
+    local token="${AUTH_TOKEN//\\/\\\\}"
+    token="${token//\"/\\\"}"
+    # printf (not a heredoc) so the escaping reaches the remote file
+    # byte-for-byte, exactly like install.sh's writer.
+    printf 'OCTOS_AUTH_TOKEN="%s"\n' "$token" |
+        ssh_cmd "umask 077 && cat > '${RDATA}/serve.env' && chmod 600 '${RDATA}/serve.env'"
+}
+
+# Write the remote octos serve + frpc service definitions. Token hygiene
+# follows #2496: the launchd plist carries the token and is chmod 600
+# over SSH; the systemd unit loads it from the 0600 serve.env via
+# EnvironmentFile.
+write_remote_services() {
+    if [ "$REMOTE_OS" = "Darwin" ]; then
+        # --- octos serve launchd plist ---
+        ssh_cmd "mkdir -p ~/Library/LaunchAgents"
+        ssh_cmd "cat > ~/Library/LaunchAgents/${PLIST_LABEL}.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -330,10 +349,14 @@ if [ "$REMOTE_OS" = "Darwin" ]; then
 </dict>
 </plist>
 EOF
-    echo "    octos serve plist written"
+        # #2496: the plist carries OCTOS_AUTH_TOKEN — install it 0600.
+        # The explicit chmod also fixes up re-runs, where cat > keeps the
+        # previous file's mode.
+        ssh_cmd "chmod 600 ~/Library/LaunchAgents/${PLIST_LABEL}.plist"
+        echo "    octos serve plist written"
 
-    # --- frpc launchd plist ---
-    ssh_cmd "cat > ~/Library/LaunchAgents/${PLIST_FRPC}.plist" << EOF
+        # --- frpc launchd plist ---
+        ssh_cmd "cat > ~/Library/LaunchAgents/${PLIST_FRPC}.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -357,20 +380,21 @@ EOF
 </dict>
 </plist>
 EOF
-    echo "    frpc plist written"
+        echo "    frpc plist written"
 
-    # --- Start services ---
-    echo "    Starting services..."
-    ssh_cmd "launchctl unload ~/Library/LaunchAgents/${PLIST_LABEL}.plist 2>/dev/null || true"
-    ssh_cmd "launchctl unload ~/Library/LaunchAgents/${PLIST_FRPC}.plist 2>/dev/null || true"
-    sleep 1
-    ssh_cmd "launchctl load ~/Library/LaunchAgents/${PLIST_FRPC}.plist"
-    ssh_cmd "launchctl load ~/Library/LaunchAgents/${PLIST_LABEL}.plist"
-    echo "    launchd services started"
+        # --- Start services ---
+        echo "    Starting services..."
+        ssh_cmd "launchctl unload ~/Library/LaunchAgents/${PLIST_LABEL}.plist 2>/dev/null || true"
+        ssh_cmd "launchctl unload ~/Library/LaunchAgents/${PLIST_FRPC}.plist 2>/dev/null || true"
+        sleep 1
+        ssh_cmd "launchctl load ~/Library/LaunchAgents/${PLIST_FRPC}.plist"
+        ssh_cmd "launchctl load ~/Library/LaunchAgents/${PLIST_LABEL}.plist"
+        echo "    launchd services started"
 
-else
-    # --- Linux: systemd ---
-    ssh_cmd "sudo tee /etc/systemd/system/octos-serve.service > /dev/null" << EOF
+    else
+        # --- Linux: systemd ---
+        write_serve_env_file
+        ssh_cmd "sudo tee /etc/systemd/system/octos-serve.service > /dev/null" << EOF
 [Unit]
 Description=octos serve dashboard
 After=network.target
@@ -381,7 +405,7 @@ User=$(echo "$SSH_TARGET" | cut -d@ -f1)
 Environment=HOME=${REMOTE_HOME}
 Environment=PATH=${RBIN}:${REMOTE_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=OCTOS_DATA_DIR=${RDATA}
-Environment=OCTOS_AUTH_TOKEN=${AUTH_TOKEN}
+EnvironmentFile=${RDATA}/serve.env
 ExecStart=${RBIN}/octos serve --port ${SERVE_PORT} --host 0.0.0.0
 Restart=always
 RestartSec=5
@@ -391,7 +415,7 @@ WorkingDirectory=${REMOTE_HOME}
 WantedBy=multi-user.target
 EOF
 
-    ssh_cmd "sudo tee /etc/systemd/system/frpc.service > /dev/null" << EOF
+        ssh_cmd "sudo tee /etc/systemd/system/frpc.service > /dev/null" << EOF
 [Unit]
 Description=frpc tunnel client
 After=network.target
@@ -406,11 +430,12 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-    ssh_cmd "sudo systemctl daemon-reload"
-    ssh_cmd "sudo systemctl enable frpc octos-serve"
-    ssh_cmd "sudo systemctl restart frpc octos-serve"
-    echo "    systemd services started"
-fi
+        ssh_cmd "sudo systemctl daemon-reload"
+        ssh_cmd "sudo systemctl enable frpc octos-serve"
+        ssh_cmd "sudo systemctl restart frpc octos-serve"
+        echo "    systemd services started"
+    fi
+}
 
 # ── Step 9: Verify ────────────────────────────────────────────────────
 echo ""

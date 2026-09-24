@@ -16500,6 +16500,7 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
         // and is never replayed, so skip prompt-cache writes.
         cache_retention: octos_llm::CacheRetention::None,
         prompt_cache_context: None,
+        media_scope_root: None,
     };
     let messages = vec![octos_core::Message::user(prompt)];
     match provider.chat(&messages, &[], &config).await {

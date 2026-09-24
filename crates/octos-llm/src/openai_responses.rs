@@ -92,7 +92,7 @@ impl OpenAIResponsesProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> serde_json::Value {
-        let input = build_input_messages(messages);
+        let input = build_input_messages(messages, config.media_scope_root.as_deref());
 
         let mut body = serde_json::json!({
             "model": &self.model,
@@ -336,7 +336,10 @@ impl LlmProvider for OpenAIResponsesProvider {
 
 // ---- Input message building ----
 
-fn build_input_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+fn build_input_messages(
+    messages: &[Message],
+    scope_root: Option<&std::path::Path>,
+) -> Vec<serde_json::Value> {
     let mut input = Vec::new();
     // Media a current-batch tool handed the model: a function_call_output
     // is text only, so it goes out as one user item after the batch's
@@ -363,7 +366,7 @@ fn build_input_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             let mut output = crate::tool_media::with_note(&msg.content, shown.note.as_deref());
             let mut rendered = Vec::new();
             for path in &shown.images {
-                match crate::vision::encode_image(path) {
+                match crate::vision::encode_image(path, scope_root) {
                     Ok((mime, data)) => {
                         pending_media.push(serde_json::json!({
                             "type": "input_image",
@@ -389,7 +392,7 @@ fn build_input_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             }));
             continue;
         }
-        build_input_items(msg, &mut input);
+        build_input_items(msg, &mut input, scope_root);
     }
     if !pending_media.is_empty() {
         input.push(media_item(&mut pending_media, &mut pending_notes));
@@ -436,7 +439,11 @@ fn normalize_call_id(id: &str) -> String {
 /// split into: an assistant message (text only) + separate function_call items.
 ///
 /// All tool_call_ids are normalized to `call_` prefix for Responses API compat.
-fn build_input_items(msg: &Message, out: &mut Vec<serde_json::Value>) {
+fn build_input_items(
+    msg: &Message,
+    out: &mut Vec<serde_json::Value>,
+    scope_root: Option<&std::path::Path>,
+) {
     match msg.role {
         MessageRole::System => {
             out.push(serde_json::json!({
@@ -447,7 +454,7 @@ fn build_input_items(msg: &Message, out: &mut Vec<serde_json::Value>) {
         MessageRole::User => {
             out.push(serde_json::json!({
                 "role": "user",
-                "content": build_user_content(msg),
+                "content": build_user_content(msg, scope_root),
             }));
         }
         MessageRole::Assistant => {
@@ -484,7 +491,7 @@ fn build_input_items(msg: &Message, out: &mut Vec<serde_json::Value>) {
     }
 }
 
-fn build_user_content(msg: &Message) -> serde_json::Value {
+fn build_user_content(msg: &Message, scope_root: Option<&std::path::Path>) -> serde_json::Value {
     let images: Vec<_> = msg
         .media
         .iter()
@@ -497,7 +504,7 @@ fn build_user_content(msg: &Message) -> serde_json::Value {
 
     let mut parts = Vec::new();
     for path in &images {
-        if let Ok((mime, data)) = crate::vision::encode_image(path) {
+        if let Ok((mime, data)) = crate::vision::encode_image(path, scope_root) {
             parts.push(serde_json::json!({
                 "type": "input_image",
                 "image_url": format!("data:{mime};base64,{data}"),
@@ -878,7 +885,7 @@ mod tests {
     fn should_render_tool_media_as_a_user_item_after_the_outputs() {
         let dir = tempfile::tempdir().unwrap();
         let (msgs, _) = media_loop(dir.path());
-        let items = build_input_messages(&msgs);
+        let items = build_input_messages(&msgs, None);
         let kinds: Vec<String> = items
             .iter()
             .map(|i| {
@@ -919,7 +926,7 @@ mod tests {
     fn test_build_input_system_message() {
         let m = msg(MessageRole::System, "be helpful");
         let mut items = Vec::new();
-        build_input_items(&m, &mut items);
+        build_input_items(&m, &mut items, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["role"].as_str(), Some("system"));
         assert_eq!(items[0]["content"].as_str(), Some("be helpful"));
@@ -929,7 +936,7 @@ mod tests {
     fn test_build_input_user_message() {
         let m = msg(MessageRole::User, "hello");
         let mut items = Vec::new();
-        build_input_items(&m, &mut items);
+        build_input_items(&m, &mut items, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["role"].as_str(), Some("user"));
         assert_eq!(items[0]["content"][0]["type"].as_str(), Some("input_text"));
@@ -950,7 +957,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
         let mut items = Vec::new();
-        build_input_items(&m, &mut items);
+        build_input_items(&m, &mut items, None);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"].as_str(), Some("function_call_output"));
         assert_eq!(items[0]["call_id"].as_str(), Some("fc_123"));
@@ -977,7 +984,7 @@ mod tests {
         };
         // Should produce two top-level items: assistant message + function_call
         let mut items = Vec::new();
-        build_input_items(&m, &mut items);
+        build_input_items(&m, &mut items, None);
         assert_eq!(items.len(), 2);
         // First: assistant message with text only
         assert_eq!(items[0]["role"].as_str(), Some("assistant"));
