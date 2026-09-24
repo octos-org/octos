@@ -118,6 +118,14 @@ pub struct ChatConfig {
     /// Internal prompt-cache affinity and semantic checkpoint metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_context: Option<PromptCacheContext>,
+    /// Workspace root the transcript's media paths were validated against at
+    /// tool time. The request build re-runs the tool's symlink-ancestor walk
+    /// at the moment the bytes leave the machine (#2480): a sibling tool or
+    /// a background writer can swap a parent directory for a symlink between
+    /// validation and render. `None` (auxiliary summarizer/verifier calls,
+    /// pipelines, history replay) keeps the leaf-only guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_scope_root: Option<std::path::PathBuf>,
 }
 
 /// Prompt-cache retention for a single request. See
@@ -195,6 +203,7 @@ impl Default for ChatConfig {
             sampling_params: None,
             cache_retention: CacheRetention::Default,
             prompt_cache_context: None,
+            media_scope_root: None,
         }
     }
 }
@@ -425,6 +434,7 @@ mod tests {
             sampling_params: None,
             cache_retention: CacheRetention::Default,
             prompt_cache_context: None,
+            media_scope_root: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ChatConfig = serde_json::from_str(&json).unwrap();
@@ -447,6 +457,7 @@ mod tests {
             sampling_params: None,
             cache_retention: CacheRetention::Default,
             prompt_cache_context: None,
+            media_scope_root: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert!(json.get("max_tokens").is_none());

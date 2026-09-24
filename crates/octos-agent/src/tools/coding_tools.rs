@@ -3249,7 +3249,10 @@ fn read_image_header_no_follow(
     // so a host symlink like `C:\tmp\link.png -> C:\secret\real.png`
     // doesn't quietly follow on Windows.
     match workspace_root {
-        Some(root) => reject_symlink_ancestors(resolved, root)?,
+        // The walk lives in `octos_llm::vision` (#2480): the request build
+        // re-runs the exact same walk on the same paths, so it must have one
+        // canonical implementation.
+        Some(root) => octos_llm::vision::reject_symlink_ancestors(resolved, root)?,
         None => reject_leaf_symlink(resolved)?,
     }
 
@@ -3293,57 +3296,6 @@ fn reject_leaf_symlink(resolved: &std::path::Path) -> std::io::Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
-}
-
-/// Walk every ancestor of `resolved` (including `resolved` itself)
-/// and refuse if any one is a symlink or Windows reparse point.
-/// Stops at `workspace_root` (inclusive) so we never recurse into
-/// system roots. Returns `Ok(())` when none of the inspected entries
-/// are symlinks; returns `PermissionDenied` with a descriptive
-/// message when any are.
-///
-/// Safety properties:
-///
-/// * Uses `symlink_metadata`, which does NOT follow the link, so a
-///   symlinked ancestor is correctly classified.
-/// * Terminates at the workspace root even if `resolved` does not
-///   actually live under it (in which case the walk runs out of
-///   ancestors and returns `Ok(())` — containment was already
-///   checked by `resolve_path_with_scope`).
-/// * Hard-bounded by `Path::ancestors`, which is finite.
-fn reject_symlink_ancestors(
-    resolved: &std::path::Path,
-    workspace_root: &std::path::Path,
-) -> std::io::Result<()> {
-    for ancestor in resolved.ancestors() {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!(
-                            "refusing to follow symlink ancestor: {}",
-                            ancestor.display()
-                        ),
-                    ));
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // The leaf may not exist yet — keep walking up so a
-                // symlinked PARENT still gets caught. The actual
-                // open below will surface NotFound for the leaf.
-            }
-            Err(err) => return Err(err),
-        }
-        // Stop walking once we hit (and have inspected) the
-        // configured workspace root. Going further would inspect
-        // system directories that the caller has no jurisdiction
-        // over.
-        if ancestor == workspace_root {
-            break;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

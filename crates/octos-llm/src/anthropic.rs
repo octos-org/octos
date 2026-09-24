@@ -187,7 +187,8 @@ impl AnthropicProvider {
         // "none"` on summarization requests).
         let cache = (self.prompt_caching && config.cache_retention != crate::CacheRetention::None)
             .then_some(EPHEMERAL_CACHE_CONTROL);
-        let mut api_messages = build_anthropic_messages(messages);
+        let mut api_messages =
+            build_anthropic_messages(messages, config.media_scope_root.as_deref());
         if cache.is_some() {
             apply_message_cache_breakpoint(&mut api_messages);
         }
@@ -864,7 +865,10 @@ struct AnthropicImageSource {
 ///   every `tool_use` id from the assistant turn to be answered in the
 ///   immediately-following message, so parallel tool results split across
 ///   two user messages would 400.
-fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'static>> {
+fn build_anthropic_messages(
+    messages: &[Message],
+    scope_root: Option<&std::path::Path>,
+) -> Vec<AnthropicMessage<'static>> {
     let mut out: Vec<AnthropicMessage> = Vec::with_capacity(messages.len());
     // True while `out.last()` is the user-role message accumulating the
     // current run of consecutive tool_result blocks.
@@ -908,7 +912,7 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
                     .tool_call_id
                     .as_deref()
                     .filter(|id| pending_tool_use_ids.contains(*id))
-                    .and_then(|_| anthropic_tool_result_block(messages, index));
+                    .and_then(|_| anthropic_tool_result_block(messages, index, scope_root));
                 match block {
                     Some(block) => {
                         // Consume the id: a duplicate result for the same
@@ -940,7 +944,7 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
                         pending_tool_use_ids.clear();
                         out.push(AnthropicMessage {
                             role: "user",
-                            content: build_anthropic_content(m),
+                            content: build_anthropic_content(m, scope_root),
                         });
                     }
                 }
@@ -950,7 +954,7 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
                 pending_tool_use_ids.clear();
                 out.push(AnthropicMessage {
                     role: "user",
-                    content: build_anthropic_content(m),
+                    content: build_anthropic_content(m, scope_root),
                 });
             }
         }
@@ -1008,6 +1012,7 @@ fn build_assistant_anthropic_content(msg: &Message) -> Option<AnthropicContent> 
 fn anthropic_tool_result_block(
     messages: &[Message],
     index: usize,
+    scope_root: Option<&std::path::Path>,
 ) -> Option<AnthropicContentBlock> {
     let msg = &messages[index];
     let tool_use_id = msg.tool_call_id.as_deref().filter(|id| !id.is_empty())?;
@@ -1017,7 +1022,7 @@ fn anthropic_tool_result_block(
     let mut text = crate::tool_media::with_note(&msg.content, shown.note.as_deref());
     let mut blocks = Vec::new();
     for path in &shown.images {
-        match vision::encode_image(path) {
+        match vision::encode_image(path, scope_root) {
             Ok((mime, data)) => blocks.push(AnthropicContentBlock::Image {
                 source: AnthropicImageSource {
                     r#type: "base64".into(),
@@ -1052,7 +1057,10 @@ fn anthropic_tool_result_block(
     })
 }
 
-fn build_anthropic_content(msg: &Message) -> AnthropicContent {
+fn build_anthropic_content(
+    msg: &Message,
+    scope_root: Option<&std::path::Path>,
+) -> AnthropicContent {
     // Mirror openai.rs: only inline vision content on USER messages.
     // Assistant/Tool media is prior-turn tool output (e.g.
     // send_file(skill-output/slides/<slug>/output/slide-NN.png)) and
@@ -1124,7 +1132,7 @@ fn build_anthropic_content(msg: &Message) -> AnthropicContent {
 
     let mut parts = Vec::new();
     for path in images {
-        if let Ok((mime, data)) = vision::encode_image(path) {
+        if let Ok((mime, data)) = vision::encode_image(path, scope_root) {
             parts.push(AnthropicContentBlock::Image {
                 source: AnthropicImageSource {
                     r#type: "base64".into(),
@@ -1451,7 +1459,7 @@ mod tests {
     #[test]
     fn test_build_content_text_only() {
         let m = msg(MessageRole::User, "hello");
-        let content = build_anthropic_content(&m);
+        let content = build_anthropic_content(&m, None);
         match content {
             AnthropicContent::Text(t) => assert_eq!(t, "hello"),
             _ => panic!("expected Text variant"),
@@ -1472,7 +1480,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
         // Non-image media should include file paths for read_file
-        let content = build_anthropic_content(&m);
+        let content = build_anthropic_content(&m, None);
         match content {
             AnthropicContent::Text(t) => {
                 assert!(t.contains("check this"));
