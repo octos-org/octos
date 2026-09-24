@@ -204,6 +204,16 @@ jobs:
             throw 'uninstall dry run did not include purge behavior'
           }
 
+      - name: Test serve-launcher token handoff
+        shell: pwsh
+        run: |
+          # Windows pwsh exits -Command with the last native command's exit
+          # code; the script's refusal arm leaves it at 1 on a green run
+          # (#2388). Dot-source, then make success explicit — a throw aborts
+          # the body before the exit, so failures stay red.
+          . ./scripts/tests/test-serve-launcher-token.ps1
+          exit 0
+
   web-app-base-url-windows:
     runs-on: windows-latest
     steps:
@@ -265,6 +275,11 @@ jobs:
         run: |
           python3 scripts/lint-doc-references.py --self-test
           python3 scripts/lint-doc-references.py
+
+      - name: Installer token-hygiene lint
+        run: |
+          python3 scripts/lint-installer-token-hygiene.py --self-test
+          python3 scripts/lint-installer-token-hygiene.py
 
       - uses: dtolnay/rust-toolchain@stable
         with:
