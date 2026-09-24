@@ -14315,6 +14315,10 @@ async fn raw_snapshot_restore(
 struct RawPeerPrepareParams {
     /// The durable task contract for the peer session.
     brief: String,
+    /// Optional cumulative token allowance for each staged peer. Omitted
+    /// preserves the existing unrestricted peer behavior.
+    #[serde(default)]
+    token_budget: Option<u64>,
     /// Fleet size (#1801 v2): stage N peers from ONE brief (identical brief
     /// files, suffixed slugs, per-peer worktrees when `worktree`). The
     /// client varies each kickoff (lens/index) — reproducible spawn
@@ -14425,6 +14429,11 @@ async fn raw_peer_prepare(
     if !(1..=8).contains(&n) {
         return Err(RpcError::invalid_params("n must be between 1 and 8"));
     }
+    if params.token_budget == Some(0) {
+        return Err(RpcError::invalid_params(
+            "token_budget must be a positive integer",
+        ));
+    }
 
     // Peer NAMES (when supplied): exactly one per fleet member, each non-empty,
     // slug-derivable, and unique within the list (case-insensitive). Uniqueness
@@ -14484,6 +14493,7 @@ async fn raw_peer_prepare(
         let member_name = names.as_ref().map(|names| names[i].clone());
         let member_brief = brief.to_owned();
         let member_worktree = params.worktree;
+        let member_token_budget = params.token_budget;
         // codex #6 — the originating session owns this member; `stage_peer`
         // records it atomically BEFORE brief.md and rolls staging back on
         // failure. Absent session_id (profile-scoped prepare) = no owner.
@@ -14492,7 +14502,7 @@ async fn raw_peer_prepare(
             .as_ref()
             .map(|session| session.to_string());
         let member = tokio::task::spawn_blocking(move || {
-            stage_peer(
+            stage_peer_with_budget(
                 &member_peers_root,
                 &member_workspace_root,
                 &member_seed,
@@ -14506,6 +14516,7 @@ async fn raw_peer_prepare(
                 // today's behaviour.
                 None,
                 None,
+                member_token_budget,
             )
         })
         .await
@@ -14538,6 +14549,7 @@ async fn raw_peer_prepare(
             "cwd": member.cwd.to_string_lossy(),
             "worktree_branch": member.worktree_branch,
             "profile_id": profile_id.clone(),
+            "token_budget": member_token_budget,
         }));
     }
 
@@ -15568,10 +15580,9 @@ fn reserve_peer_build_cache_turn(
 /// ERRORED/rate-limited turns now carry real usage: the agent loop attaches
 /// the turn total to the bailed error (`PartialTurnUsage`) and the `error`
 /// arm folds it into `final_tokens_consumed`, so a peer that burned tokens
-/// before failing charges its real spend. Residual gap: an INTERRUPTED turn
-/// aborts the agent task before it can report usage (and this path has no
-/// shared token tracker to read post-abort), so it still threads 0 and never
-/// reaches this writer — tracked as a follow-up.
+/// before failing charges its real spend. INTERRUPTED turns do not reach this
+/// writer; the caller charges their tracked partial spend separately before
+/// emitting the interrupt terminal.
 fn write_peer_result_if_peer_session(
     state: &Arc<AppState>,
     session_id: &SessionKey,
@@ -15599,6 +15610,14 @@ fn write_peer_result_if_peer_session(
     let Some(peer_dir) = staged_peer_dir(&runtime.data_dir.join("peers"), slug) else {
         return;
     };
+    if let Err(error) = charge_peer_token_budget(
+        &runtime.data_dir.join("peers"),
+        slug,
+        &turn_id.0.to_string(),
+        tokens_consumed,
+    ) {
+        tracing::warn!(slug, %error, "failed to charge peer token budget");
+    }
     // No redundant `peer_dir.is_dir()` here — `staged_peer_dir` already proved a
     // real non-symlink dir, and every write below re-anchors on the dir fd.
     const PEER_RESULT_MAX_BYTES: usize = 256 * 1024;
@@ -34384,6 +34403,53 @@ async fn run_standalone_turn(
     let hint = workspace_binding
         .as_ref()
         .and_then(|binding| binding.runtime_hint.clone());
+    // The optional OUP launch budget belongs to the peer slug, so reconnects
+    // cannot reset it by opening a different session id. A turn may overshoot
+    // the limit; its spend is charged at the terminal boundary below.
+    if let Some((_, slug)) = peer_slug_and_profile(&session_id) {
+        let peer_budget_root = profile_runtime.data_dir.join("peers");
+        match peer_token_budget_status(&peer_budget_root, slug) {
+            Ok(Some(status)) if status.used >= status.limit => {
+                let message = format!(
+                    "peer '{slug}' token budget exhausted ({} used / {} limit)",
+                    status.used, status.limit
+                );
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("peer_token_budget_exceeded", message.as_str())),
+                    None,
+                    steer_buffer.as_ref(),
+                    Some(&peer_budget_root),
+                )
+                .await;
+                contracts.scopes.evict_turn(&session_id, &turn_id);
+                return;
+            }
+            Err(message) => {
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("peer_token_budget_unavailable", message.as_str())),
+                    None,
+                    steer_buffer.as_ref(),
+                    Some(&peer_budget_root),
+                )
+                .await;
+                contracts.scopes.evict_turn(&session_id, &turn_id);
+                return;
+            }
+            Ok(_) => {}
+        }
+    }
     // #1857 PR 5a — THE LOAD-BEARING SEAM: on a goal turn, stash the resolved
     // controller workspace root on the goal record (keyed by the SCOPED
     // `goal_session_key`) BEFORE the keeper's `goal_plan` can run mid-turn. It
@@ -38396,6 +38462,17 @@ async fn run_standalone_turn(
     // completion-sentinel evaluation requires a Completed terminal.
     final_tokens_consumed =
         interrupted_goal_charge(interrupt_observed, final_tokens_consumed, &token_tracker);
+    // Completed and errored peer turns charged in the terminal writer above.
+    // An interrupted turn never reaches that writer, but the live tracker
+    // still gives us its partial spend before the interrupt terminal fires.
+    if interrupt_observed
+        && let Some((_, slug)) = peer_slug_and_profile(&session_id)
+        && let Some(root) = peers_root.as_ref()
+        && let Err(error) =
+            charge_peer_token_budget(root, slug, &turn_id.0.to_string(), final_tokens_consumed)
+    {
+        tracing::warn!(slug, %error, "failed to charge interrupted peer token budget");
+    }
 
     // #1650 — interactive goal accountant. Placed HERE — immediately
     // after the turn loop and BEFORE the voice-TTS / spawn_only
