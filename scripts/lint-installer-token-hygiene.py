@@ -22,8 +22,11 @@ don't rot:
 6. Render checks — the service-writer functions of install.sh and
    local-tenant-deploy.sh are executed for real with a stubbed `sudo`
    (system paths rewritten into a sandbox), and bootstrap-tenant.sh's
-   remote writer runs against a stubbed `ssh_cmd`; the produced unit /
-   plist / serve.env are asserted on both content and permission bits.
+   remote writer runs against a stubbed `ssh_cmd` that models the
+   remote shell. Every render gets its own sandbox, and the produced
+   unit / plist / serve.env are asserted on content and on the
+   permission bits the writers themselves produce (a writer that drops
+   its umask/chmod fails the mode assertions).
    deploy.ps1's rendered wrapper is exercised on Windows by
    scripts/tests/test-serve-launcher-token.ps1.
 
@@ -562,8 +565,11 @@ ssh_cmd() {{
             cat > "$FAKE_HOME/Library/LaunchAgents/${{PLIST_LABEL}}.plist" ;;
         *"cat > ~/Library/LaunchAgents/${{PLIST_FRPC}}.plist"*) ;;
         *"serve.env"*)
-            ( umask 077; cat > "$FAKE_RDATA/serve.env" )
-            chmod 600 "$FAKE_RDATA/serve.env" ;;
+            # Model the remote shell faithfully: RDATA is rewritten onto
+            # the sandbox at harness setup, so run the command as the
+            # remote would — its own umask/chmod decide the file's mode.
+            # Hard-coding either here would pin nothing.
+            eval "( $cmd )" ;;
         *"tee /etc/systemd/system/octos-serve.service"*)
             cat > "$FAKE_ROOT/etc/systemd/system/octos-serve.service" ;;
         *"tee /etc/systemd/system/frpc.service"*) ;;
@@ -654,9 +660,14 @@ def run_checks(repo: Path) -> list[str]:
     problems += [f"{DEPLOY_PS1}: {p}" for p in check_deploy_ps1(deploy_ps1.read_text())]
 
     with tempfile.TemporaryDirectory(prefix="token-hygiene-") as tmp:
-        sandbox = Path(tmp)
+        outer = Path(tmp)
         for os_name in ("Darwin", "Linux"):
             for frps_token in ("", "frps-shared-secret"):
+                # A fresh sandbox per render: artifacts from one writer
+                # must not pre-seed another's assertion targets (a shared
+                # data/serve.env would keep its 0600 mode across
+                # truncation and mask a writer that stopped setting it).
+                sandbox = outer / "install" / f"{os_name}-{bool(frps_token)}"
                 try:
                     artifacts = render_install_sh(install_sh.read_text(), os_name, frps_token, sandbox)
                 except subprocess.CalledProcessError as exc:
@@ -665,6 +676,7 @@ def run_checks(repo: Path) -> list[str]:
                 problems += check_rendered(os_name, frps_token, artifacts, sandbox)
 
         for os_name in ("Darwin", "Linux"):
+            sandbox = outer / "tenant" / os_name
             try:
                 artifacts = render_tenant_deploy(tenant_deploy_sh.read_text(), os_name, sandbox)
             except subprocess.CalledProcessError as exc:
@@ -673,6 +685,7 @@ def run_checks(repo: Path) -> list[str]:
             problems += check_rendered_tenant(os_name, artifacts, sandbox)
 
         for os_name in ("Darwin", "Linux"):
+            sandbox = outer / "bootstrap" / os_name
             try:
                 artifacts = render_bootstrap(bootstrap_tenant_sh.read_text(), os_name, sandbox)
             except (subprocess.CalledProcessError, AssertionError) as exc:

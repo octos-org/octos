@@ -93,10 +93,15 @@ try {
         throw "serve-launcher template not found in $deployPs1"
     }
     $deployTemplate = $m2.Groups[1].Value
+    # Raw-template guard: the unexpanded template must not carry a
+    # literal token — its vars are only filled in by ExpandString below.
     if ($deployTemplate -match "check-token-123") {
         throw "deploy launcher template embeds the token inline"
     }
 
+    # Re-create the token file for the wrapper arms. ACL construction is
+    # already exercised by the #2388 section above; these arms pin the
+    # deploy wrapper's read-and-refuse behavior.
     [System.IO.File]::WriteAllText($tokenPath, "check-token-123", [System.Text.UTF8Encoding]::new($false))
     $env:OCTOS_HOME = $dir
     $env:OCTOS_DATA_DIR = $dir

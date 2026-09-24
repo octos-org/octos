@@ -313,6 +313,25 @@ try {
     Remove-Item $tokenTmp -ErrorAction SilentlyContinue
 }
 
+# #2496: deploys before this change stored auth_token in config.json
+# (inherited world-readable ACLs). The restricted serve-token file
+# written above is now the only on-disk copy, so strip the stale one —
+# only after that file exists, so a failed deploy never leaves the
+# operator without any record. A config that is not valid JSON is left
+# untouched rather than failing the deploy.
+if (Test-Path -LiteralPath $configPath) {
+    try {
+        $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        if ($config.PSObject.Properties['auth_token']) {
+            $config.PSObject.Remove('auth_token')
+            Write-Utf8NoBom $configPath ($config | ConvertTo-Json -Depth 8)
+            Ok "removed stale auth_token from $configPath"
+        }
+    } catch {
+        Write-Host "    WARN: could not sanitize $configPath ($_)"
+    }
+}
+
 # The service runs a wrapper that reads the token from the restricted
 # file at start, never inline; a missing file refuses to start rather
 # than run with an empty token. NSSM captures stdout/stderr itself, so
@@ -329,7 +348,7 @@ if not defined OCTOS_AUTH_TOKEN (
 "$octosExe" serve --host 0.0.0.0 --port $servePort --data-dir "$dataDir"
 "@
 
-& $nssmExe install $serviceName "$env:SystemRoot\System32\cmd.exe" "/C" $wrapperPath
+& $nssmExe install $serviceName "$env:SystemRoot\System32\cmd.exe" "/C" "`"$wrapperPath`""
 if ($LASTEXITCODE -ne 0) {
     throw "nssm.exe install failed"
 }
