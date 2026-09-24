@@ -8144,6 +8144,51 @@ fn build_chat_config_threads_sampling_params() {
     );
 }
 
+// --- chat_config: render-time media scope root wiring (#2480) ---
+
+#[tokio::test]
+async fn chat_config_carries_the_registry_workspace_root_for_render_time_media_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    // `with_builtins` records the cwd as the registry's workspace root — the
+    // same root the file tools validate media paths against at tool time.
+    let agent = Agent::new(
+        AgentId::new("media-scope-root"),
+        Arc::new(TerminalScript(ScriptedProvider::new(vec![]))),
+        ToolRegistry::with_builtins(dir.path()),
+        memory.clone(),
+    );
+    assert_eq!(
+        agent.chat_config().media_scope_root.as_deref(),
+        Some(dir.path()),
+        "providers re-walk media ancestors against this root at request build"
+    );
+
+    // A registry with no workspace root keeps the leaf-only guard.
+    let agent = Agent::new(
+        AgentId::new("media-scope-none"),
+        Arc::new(TerminalScript(ScriptedProvider::new(vec![]))),
+        ToolRegistry::new(),
+        memory.clone(),
+    );
+    assert_eq!(agent.chat_config().media_scope_root, None);
+
+    // A host-scope registry never walked media ancestors at tool time
+    // (coding_tools passes no stop for `FilesystemScope::Host`); the request
+    // build must not start holding its paths to that walk.
+    let agent = Agent::new(
+        AgentId::new("media-scope-host"),
+        Arc::new(TerminalScript(ScriptedProvider::new(vec![]))),
+        ToolRegistry::with_builtins_and_permissions(
+            dir.path(),
+            Box::new(crate::sandbox::NoSandbox),
+            crate::policy::EffectivePermissions::danger_full_access(),
+        ),
+        memory,
+    );
+    assert_eq!(agent.chat_config().media_scope_root, None);
+}
+
 #[test]
 fn build_chat_config_applies_max_tokens_override_independently() {
     // Overrides compose without clobbering each other.
