@@ -124,8 +124,14 @@ pub fn is_available() -> bool {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn unsupported_store_error(op: &str) -> eyre::Report {
     // TODO(#2234): implement a native Windows secret store (keyring/windows-native).
+    // The workarounds are real today (#2415) for plain API keys: non-marker
+    // `env_vars` values pass through unresolved, and `api_key_env` reads the
+    // process environment. (Service-account JSON is different: the dashboard
+    // refuses a plaintext SA value when no store exists.)
     eyre::eyre!(
-        "secret store unsupported on {} ({op} failed)",
+        "secret store unsupported on {} ({op} failed); store plain API keys \
+         in the process environment or the profile's `env_vars` instead \
+         (both are read without the secret store; see `octos auth keys`)",
         std::env::consts::OS
     )
 }
@@ -634,6 +640,18 @@ mod tests {
         assert_eq!(backend_name(), "linux-file");
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         assert_eq!(backend_name(), "unsupported");
+    }
+
+    /// #2415 — the unsupported-store error must hand users a working
+    /// alternative instead of a dead end. Windows-only by nature: PR CI
+    /// compile-checks it, main's Windows test shard runs it.
+    #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn unsupported_store_error_names_alternatives() {
+        let err = unsupported_store_error("set_secret").to_string();
+        assert!(err.contains("unsupported on windows"), "{err}");
+        assert!(err.contains("process environment"), "{err}");
+        assert!(err.contains("env_vars"), "{err}");
     }
 
     #[test]

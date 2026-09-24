@@ -29,7 +29,7 @@ sudo systemctl restart octos-serve
 
 ## 钥匙串集成
 
-Octos 支持将 API 密钥存储在 macOS 钥匙串中，而不是以明文形式存放在配置文件的 JSON 中。这在 Apple Silicon 上提供硬件级加密和操作系统级别的访问控制。
+Octos 支持将 API 密钥存储在操作系统的密钥存储中，而不是以明文形式存放在配置文件的 JSON 中：macOS 使用钥匙串（Apple Silicon 上提供硬件级加密和操作系统级别的访问控制），Linux 使用 `~/.octos/secrets` 下的 0600 文件，Windows 暂无密钥存储——请改用环境变量或明文 `env_vars`。下图展示的是 macOS 后端。
 
 ### 架构
 
@@ -150,7 +150,8 @@ macOS 钥匙串是为桌面交互使用设计的。在无头服务器上，它�
 | **开发者笔记本** | 钥匙串（`"keychain:"`） | GUI 会话保持钥匙串解锁；ACL 弹窗可以接受 |
 | **自动登录 + GUI 的 Mac** | 钥匙串（`"keychain:"`） | 如果通过屏幕共享批准过 ACL 对话框则可用 |
 | **无头 Mac（仅 SSH）** | `env_vars` 或 launchd plist 中的明文 | 最可靠；无解锁/ACL 依赖 |
-| **Linux 服务器** | 环境变量中的明文 | 没有 macOS 钥匙串 |
+| **Linux 服务器** | 密钥存储（`~/.octos/secrets` 下的 0600 文件） | 文件存储无需解锁或 D-Bus；明文环境变量亦可 |
+| **Windows** | `env_vars` 或环境变量中的明文 | 暂无密钥存储（#2234） |
 
 **为什么钥匙串在无头服务器上不可靠：**
 

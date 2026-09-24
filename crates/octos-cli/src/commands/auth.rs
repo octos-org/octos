@@ -52,7 +52,11 @@ pub enum AuthAction {
     /// Show authentication status for all providers.
     Status,
 
-    /// Store an API key in the macOS Keychain.
+    /// Store an API key in the OS secret store.
+    ///
+    /// macOS stores it in the Keychain; Linux in a 0600 file under
+    /// `~/.octos/secrets`; Windows has no secret store yet — plain API keys
+    /// can be passed via the environment or the profile's `env_vars`.
     #[command(name = "set-key")]
     SetKey {
         /// Environment variable name (e.g. OPENAI_API_KEY).
@@ -70,7 +74,12 @@ pub enum AuthAction {
         #[arg(long, short)]
         profile: Option<String>,
     },
-    /// Remove an API key from the macOS Keychain.
+    /// Remove an API key from the OS secret store.
+    ///
+    /// macOS deletes the Keychain item; Linux the file under
+    /// `~/.octos/secrets`. Only `"keychain:"`-marker entries are removed —
+    /// plain `env_vars` values are left untouched; Windows has no secret
+    /// store.
     #[command(name = "remove-key")]
     RemoveKey {
         /// Environment variable name to remove (e.g. OPENAI_API_KEY).
@@ -80,13 +89,16 @@ pub enum AuthAction {
         profile: Option<String>,
     },
 
-    /// Unlock the macOS Keychain for SSH sessions.
+    /// Unlock the OS secret store for SSH sessions (macOS Keychain).
     ///
-    /// Required before set-key/remove-key when connected via SSH.
-    /// With auto-login enabled, this is only needed once per boot.
+    /// Required before set-key/remove-key over SSH on macOS. With
+    /// auto-login enabled, this is only needed once per boot. Linux's file
+    /// store has no lock, so this is a no-op there; Windows has no secret
+    /// store to unlock.
     #[command(name = "unlock")]
     Unlock {
-        /// macOS login password. If omitted, reads interactively.
+        /// macOS login password (unused on Linux). If omitted, reads
+        /// interactively.
         #[arg(long)]
         password: Option<String>,
     },
