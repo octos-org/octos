@@ -287,6 +287,34 @@ sys.stdout.write(json.dumps({"password": p}, indent=2))
     ok "wrote SMTP password to $target"
 }
 
+# Write the serve bearer token(s) into `{DATA_DIR}/serve.env` (mode 0600) so
+# the systemd unit can load them via `EnvironmentFile=` without the secrets
+# living in the world-readable unit file (#2388). launchd has no
+# EnvironmentFile equivalent — its plist is installed 0600 instead.
+write_serve_env_file() {
+    [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
+    local target="$DATA_DIR/serve.env"
+    local token="${AUTH_TOKEN//\\/\\\\}"
+    token="${token//\"/\\\"}"
+    local frps=""
+    if [ -n "$FRPS_TOKEN" ]; then
+        frps="${FRPS_TOKEN//\\/\\\\}"
+        frps="${frps//\"/\\\"}"
+    fi
+    # umask 077 inside the subshell so the file is created 0600 (a
+    # redirect applied to the subshell itself would use the outer umask);
+    # the chmod below stays as belt-and-braces.
+    (
+        umask 077
+        printf 'OCTOS_AUTH_TOKEN="%s"\n' "$token" > "$target"
+        if [ -n "$FRPS_TOKEN" ]; then
+            printf 'FRPS_TOKEN="%s"\n' "$frps" >> "$target"
+        fi
+    )
+    chmod 600 "$target"
+    ok "wrote serve secrets to $target (mode 0600)"
+}
+
 section() { echo ""; echo "==> $1"; }
 ok()      { echo "    OK: $1"; }
 warn()    { echo "    WARN: $1"; }
@@ -633,7 +661,9 @@ write_octos_service() {
         <string>0.0.0.0</string>
     </array>
     <!-- #2371: the token travels via OCTOS_AUTH_TOKEN below, never argv —
-         ProgramArguments are readable by any local process via ps. -->
+         ProgramArguments are readable by any local process via ps. #2388:
+         the plist holds secrets, so it is installed 0600 root:wheel —
+         launchd reads it as root, no other local user can. -->
     <!--
       UserName: prefer SUDO_USER (the operator who invoked sudo) over `whoami`.
       When this installer is run as `sudo ./install.sh`, `whoami` resolves to
@@ -681,12 +711,16 @@ EOF
             sudo launchctl unload "$plist" 2>/dev/null || true
             sudo mv "$tmp" "$plist"
             sudo chown root:wheel "$plist"
-            sudo chmod 644 "$plist"
+            sudo chmod 600 "$plist"
             sudo launchctl load "$plist"
             ok "octos serve started via launchd"
             ;;
 
         Linux)
+            # #2388: secrets must not be inlined into the unit below — it is
+            # installed world-readable (systemctl cat). They land in
+            # `{DATA_DIR}/serve.env` (0600) and load via EnvironmentFile.
+            write_serve_env_file
             local unit="/etc/systemd/system/octos-serve.service"
             local tmp
             tmp=$(mktemp /tmp/octos-serve.service.XXXXXX)
@@ -699,19 +733,20 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$(whoami)
-# #2371: the token travels via OCTOS_AUTH_TOKEN below, never argv —
-# ExecStart is readable by any local user via systemctl cat / ps.
+# #2371: the token never travels via argv — ExecStart is readable by any
+# local user via systemctl cat / ps. #2388: it does not travel inline here
+# either — the unit file is world-readable; secrets load from the 0600
+# DATA_DIR/serve.env via EnvironmentFile.
 ExecStart=$OCTOS_BIN serve --port $PORT --host 0.0.0.0
 Restart=on-failure
 RestartSec=5
+EnvironmentFile=$DATA_DIR/serve.env
 Environment=HOME=$HOME
 Environment=OCTOS_DATA_DIR=$DATA_DIR
 Environment=OCTOS_HOME=$DATA_DIR
-Environment=OCTOS_AUTH_TOKEN=$AUTH_TOKEN
 Environment=PATH=$PREFIX:/usr/local/bin:/usr/bin:/bin
 $(systemd_env_var_line "XDG_CONFIG_HOME" "${XDG_CONFIG_HOME:-}")
 $(systemd_env_var_line "OCTOS_CONFIG_DIR" "${OCTOS_CONFIG_DIR:+$CONFIG_HOME}")
-$(systemd_env_var_line "FRPS_TOKEN" "${FRPS_TOKEN:-}")
 $(systemd_env_var_line "SMTP_HOST" "${SMTP_HOST:-}")
 $(systemd_env_var_line "SMTP_PORT" "${SMTP_PORT:-}")
 $(systemd_env_var_line "SMTP_USERNAME" "${SMTP_USERNAME:-}")
@@ -782,6 +817,12 @@ detect_installed_port() {
             local plist="/Library/LaunchDaemons/io.octos.serve.plist"
             if [ -f "$plist" ]; then
                 detected=$(grep -A1 '>--port<' "$plist" 2>/dev/null | tail -1 | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
+            fi
+            # #2388: the plist is 0600 now, so non-root doctor runs can't
+            # read it. Fall back to the running process — its argv is
+            # public information (#2371).
+            if [ -z "$detected" ]; then
+                detected=$(ps -axo args= | sed -n 's/.*octos serve --port \([0-9][0-9]*\).*/\1/p' | head -1)
             fi
             ;;
         Linux)
