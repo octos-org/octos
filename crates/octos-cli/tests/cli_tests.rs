@@ -150,6 +150,67 @@ fn test_completions_fish() {
     assert!(stdout.contains("complete"));
 }
 
+/// #2415 — the auth help must not promise the macOS Keychain on every
+/// platform: each secret-store subcommand states the per-platform behavior
+/// (macOS Keychain, Linux file store, Windows unsupported).
+#[test]
+fn test_auth_help_names_platform_secret_store() {
+    for args in [
+        ["auth", "set-key"],
+        ["auth", "remove-key"],
+        ["auth", "unlock"],
+    ] {
+        let output = Command::new(octos_binary())
+            .args(args)
+            .arg("--help")
+            .output()
+            .expect("Failed to execute command");
+
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("macOS") && stdout.contains("Linux") && stdout.contains("Windows"),
+            "`{}` help must state per-platform secret-store behavior: {stdout}",
+            args.join(" ")
+        );
+        if args[1] != "unlock" {
+            // The Linux store path is the load-bearing fact of the audit.
+            assert!(
+                stdout.contains("~/.octos/secrets"),
+                "`{}` help must name the Linux store path: {stdout}",
+                args.join(" ")
+            );
+        }
+    }
+}
+
+/// #2415 — `octos status` surfaces the active secret-store backend so users
+/// can see where `auth set-key` writes on this platform (the same name the
+/// `octos auth keys` header prints).
+#[test]
+fn test_status_reports_secret_store_backend() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(octos_binary())
+        .args(["status", "--cwd"])
+        .arg(temp_dir.path())
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Secret store:"),
+        "status must name the active secret store: {stdout}"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(stdout.contains("macos-keychain"), "{stdout}");
+    #[cfg(target_os = "linux")]
+    assert!(stdout.contains("linux-file"), "{stdout}");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    assert!(stdout.contains("unsupported"), "{stdout}");
+}
+
 #[test]
 fn test_init_defaults_in_temp_dir() {
     let temp_dir = tempfile::tempdir().unwrap();

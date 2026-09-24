@@ -29,7 +29,7 @@ sudo systemctl restart octos-serve
 
 ## Keychain Integration
 
-Octos supports storing API keys in the macOS Keychain instead of plaintext in profile JSON files. This provides hardware-backed encryption on Apple Silicon and OS-level access control.
+Octos supports storing API keys in the OS secret store instead of plaintext in profile JSON files: the macOS Keychain on macOS (hardware-backed, per-user access control), a 0600 file under `~/.octos/secrets` on Linux, and no store on Windows yet — use the process environment or plain `env_vars` there. The diagram below shows the macOS backend.
 
 ### Architecture
 
@@ -150,7 +150,8 @@ The macOS Keychain was designed for interactive desktop use. On headless servers
 | **Developer laptop** | Keychain (`"keychain:"`) | GUI session keeps keychain unlocked; ACL prompts are fine |
 | **Mac with auto-login + GUI** | Keychain (`"keychain:"`) | Works if ACL dialogs were approved once via screen sharing |
 | **Headless Mac (SSH only)** | Plain text in `env_vars` or launchd plist | Most reliable; no unlock/ACL dependencies |
-| **Linux server** | Plain text in env vars | No macOS Keychain available |
+| **Linux server** | Secret store (0600 files under `~/.octos/secrets`) | File store needs no unlock or D-Bus; plain env vars also work |
+| **Windows** | Plain text in `env_vars` or env vars | No secret store yet (#2234) |
 
 **Why Keychain is unreliable on headless servers:**
 
