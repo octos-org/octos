@@ -20,20 +20,19 @@ pub const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
 /// tool time (`ChatConfig::media_scope_root`; only set for workspace-scoped
 /// tools — host-scope reads skipped the ancestor walk at tool time and get
 /// the leaf-only guard here too). Workspace paths re-walk every ancestor up
-/// to the root. Paths outside the root in a workspace-scoped transcript —
-/// upload and profile handles, which resolve to canonical paths in the
-/// data/temp dirs — were walked without a stop at tool time, so render
-/// walks them the same way: canonical paths pass by construction, a
-/// symlink-ancestor swap cannot.
+/// to the root, so a parent directory swapped for a symlink after
+/// validation is refused. Paths outside the root keep the leaf-only guard:
+/// they have no tool-time walk to mirror (user attachments never ran
+/// through a tool, and their raw temp paths are not canonical — macOS
+/// tempdirs sit under the /var symlink), and a full walk would refuse them
+/// wholesale. The remaining out-of-root swap window is narrower — per-user
+/// temp dirs, and the bytes must still pass the re-sniffed magic below.
 pub fn read_media_no_follow(path: &str, scope_root: Option<&Path>) -> Result<Vec<u8>> {
     use std::io::Read;
     if let Some(root) = scope_root {
         let resolved = Path::new(path);
         if resolved.starts_with(root) {
             reject_symlink_ancestors(resolved, root)
-                .wrap_err_with(|| format!("failed to read media: {path}"))?;
-        } else {
-            reject_symlink_ancestors(resolved, Path::new("/"))
                 .wrap_err_with(|| format!("failed to read media: {path}"))?;
         }
     }
@@ -72,22 +71,19 @@ pub fn read_media_no_follow(path: &str, scope_root: Option<&Path>) -> Result<Vec
 /// tool-time read (`coding_tools::read_image_header_no_follow`) so the
 /// render-time re-validation in [`read_media_no_follow`] enforces the exact
 /// same rule the tool enforced. Stops at `workspace_root` (inclusive) so we
-/// never recurse into system roots — pass `/` for the tool-time behaviour on
-/// paths that live outside the workspace (upload handles), where the stop
-/// never matches and the walk runs to the filesystem root. Returns `Ok(())`
-/// when none of the inspected entries are symlinks; returns
-/// `PermissionDenied` with a descriptive message when any are.
+/// never recurse into system roots. Returns `Ok(())` when none of the
+/// inspected entries are symlinks; returns `PermissionDenied` with a
+/// descriptive message when any are.
 ///
 /// Safety properties:
 ///
 /// * Uses `symlink_metadata`, which does NOT follow the link, so a
 ///   symlinked ancestor is correctly classified.
 /// * When `resolved` does not live under `workspace_root` the stop never
-///   matches and the walk runs to `/`, inspecting system directories —
-///   canonical paths (the only kind out-of-root validation produces)
-///   contain no symlinks and pass, but a non-canonical path under a
-///   symlinked system prefix (macOS `/tmp`, `/var`) would be refused.
-///   Callers choose the stop deliberately.
+///   matches and the walk runs to `/`, inspecting system directories.
+///   Non-canonical paths under a symlinked system prefix (macOS `/tmp`,
+///   `/var`) would be refused, so callers only point this at paths that
+///   genuinely live under the root.
 /// * Hard-bounded by `Path::ancestors`, which is finite.
 pub fn reject_symlink_ancestors(resolved: &Path, workspace_root: &Path) -> std::io::Result<()> {
     for ancestor in resolved.ancestors() {
@@ -404,33 +400,24 @@ mod tests {
         );
     }
 
-    /// Out-of-root paths in a workspace-scoped transcript are the canonical
-    /// upload/profile handles: tool time walked them without a stop
-    /// (canonical paths pass by construction), and render walks them the
-    /// same way, so a parent swapped for a symlink outside the root is
-    /// still caught. Host-scope transcripts pass `None` and keep the
-    /// leaf-only guard.
+    /// Out-of-root paths keep the leaf-only guard. User attachments never
+    /// ran through a tool, so there is no tool-time walk to mirror — and
+    /// their raw temp paths are NOT canonical (the scanned-PDF fallback
+    /// records `/var/folders/...` forms on macOS, where /var is a symlink),
+    /// so a full walk would drop every page image on every request. The
+    /// remaining out-of-root swap window is disclosed in #2480.
     #[cfg(unix)]
     #[test]
-    fn should_walk_out_of_root_paths_without_a_stop_like_the_tool_did() {
+    fn should_keep_the_leaf_only_guard_for_paths_outside_the_scope_root() {
         let ws = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
-        let secret = tempfile::tempdir().unwrap();
         let file = store.path().join("upload.png");
         std::fs::write(&file, tiny_png()).unwrap();
-        // Upload handles are canonical by construction (canonicalize_under);
-        // the rooted walk would never match, the full one passes it.
+        // The RAW temp form a user row carries must survive the scope root.
+        assert!(encode_image(file.to_str().unwrap(), Some(ws.path())).is_ok());
+        // ... and so must its canonical form.
         let canonical = std::fs::canonicalize(&file).unwrap();
         assert!(encode_image(canonical.to_str().unwrap(), Some(ws.path())).is_ok());
-
-        // The swap: `store` now points at the directory holding the payload.
-        std::fs::remove_dir_all(store.path()).unwrap();
-        std::fs::write(secret.path().join("upload.png"), tiny_png()).unwrap();
-        std::os::unix::fs::symlink(secret.path(), store.path()).unwrap();
-        assert!(
-            encode_image(canonical.to_str().unwrap(), Some(ws.path())).is_err(),
-            "a swapped parent outside the root must be refused too"
-        );
 
         // Leaf symlink stays refused regardless of the root.
         let link = ws.path().join("link.png");
