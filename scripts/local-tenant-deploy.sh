@@ -105,6 +105,26 @@ sys.stdout.write(json.dumps({"password": p}, indent=2))
     ok "wrote SMTP password to $target"
 }
 
+# Write the serve bearer token into `$DATA_DIR/serve.env` (mode 0600) so
+# the systemd unit can load it via `EnvironmentFile=` without the secret
+# living in the world-readable unit file (#2496). launchd has no
+# EnvironmentFile equivalent — its plist is installed 0600 instead.
+write_serve_env_file() {
+    [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
+    local target="$DATA_DIR/serve.env"
+    local token="${AUTH_TOKEN//\\/\\\\}"
+    token="${token//\"/\\\"}"
+    # umask 077 inside the subshell so the file is created 0600 (a
+    # redirect applied to the subshell itself would use the outer umask);
+    # the chmod below stays as belt-and-braces.
+    (
+        umask 077
+        printf 'OCTOS_AUTH_TOKEN="%s"\n' "$token" > "$target"
+    )
+    chmod 600 "$target"
+    ok "wrote serve secrets to $target (mode 0600)"
+}
+
 detect_provider_defaults() {
     if [ -n "${OPENAI_API_KEY:-}" ]; then
         DETECTED_PROVIDER="openai"; DETECTED_MODEL="gpt-4.1-mini"; DETECTED_ENV="OPENAI_API_KEY"
@@ -414,44 +434,27 @@ EOF
 [ ! -f "$DATA_DIR/USER.md" ]   && printf '# User Info\n\nAdd your information and preferences here.\n' > "$DATA_DIR/USER.md"
 ok "data dir ready: $DATA_DIR"
 
-# ── Service setup ─────────────────────────────────────────────────────
-if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
-    section "Setting up background service"
+# Write and load the launchd serve daemon (runs as root, survives
+# logout). The plist carries the token in EnvironmentVariables — launchd
+# has no EnvironmentFile equivalent — so it is installed 0600
+# root:wheel, never world-readable (#2496).
+write_launchd_service() {
+    # Clean up any legacy LaunchAgent before installing LaunchDaemon
+    for LEGACY_PLIST in \
+        "$HOME/Library/LaunchAgents/io.octos.octos-serve.plist" \
+        "$HOME/Library/LaunchAgents/io.octos.serve.plist" \
+        "$HOME/Library/LaunchAgents/io.ominix.crew-serve.plist"; do
+        if [ -f "$LEGACY_PLIST" ]; then
+            launchctl unload "$LEGACY_PLIST" 2>/dev/null || true
+            rm -f "$LEGACY_PLIST"
+            ok "removed legacy plist: $(basename "$LEGACY_PLIST")"
+        fi
+    done
+    PLIST_FILE="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
 
-    OCTOS_BIN="$PREFIX/octos"
-
-    # Generate auth token if not provided
-    if [ -z "$AUTH_TOKEN" ]; then
-        AUTH_TOKEN=$(openssl rand -hex 32)
-        echo "    Generated auth token: ${AUTH_TOKEN:0:8}..."
-        echo "    (save this — needed to access the dashboard)"
-    fi
-
-    PLIST_LABEL="io.octos.serve"
-
-    # Persist the SMTP password (if set) before starting the service so the
-    # fresh process can read it from `$DATA_DIR/smtp_secret.json`.
-    write_smtp_secret_file "${SMTP_PASSWORD:-}"
-
-    case "$OS" in
-        Darwin)
-            # Clean up any legacy LaunchAgent before installing LaunchDaemon
-            for LEGACY_PLIST in \
-                "$HOME/Library/LaunchAgents/io.octos.octos-serve.plist" \
-                "$HOME/Library/LaunchAgents/io.octos.serve.plist" \
-                "$HOME/Library/LaunchAgents/io.ominix.crew-serve.plist"; do
-                if [ -f "$LEGACY_PLIST" ]; then
-                    launchctl unload "$LEGACY_PLIST" 2>/dev/null || true
-                    rm -f "$LEGACY_PLIST"
-                    ok "removed legacy plist: $(basename "$LEGACY_PLIST")"
-                fi
-            done
-            # launchd daemon (runs as root, survives logout)
-            PLIST_FILE="/Library/LaunchDaemons/${PLIST_LABEL}.plist"
-
-            # Write plist to temp file first, then sudo move it
-            PLIST_TMP=$(mktemp /tmp/io.octos.serve.plist.XXXXXX)
-            cat > "$PLIST_TMP" << EOF
+    # Write plist to temp file first, then sudo move it
+    PLIST_TMP=$(mktemp /tmp/io.octos.serve.plist.XXXXXX)
+    cat > "$PLIST_TMP" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -495,24 +498,26 @@ if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
 </dict>
 </plist>
 EOF
-            echo "    (sudo is needed to install and start the system service)"
-            sudo launchctl unload "$PLIST_FILE" 2>/dev/null || true
-            sudo mv "$PLIST_TMP" "$PLIST_FILE"
-            sudo chown root:wheel "$PLIST_FILE"
-            sudo chmod 644 "$PLIST_FILE"
-            ok "LaunchDaemon plist written to $PLIST_FILE"
+    echo "    (sudo is needed to install and start the system service)"
+    sudo launchctl unload "$PLIST_FILE" 2>/dev/null || true
+    sudo mv "$PLIST_TMP" "$PLIST_FILE"
+    sudo chown root:wheel "$PLIST_FILE"
+    sudo chmod 600 "$PLIST_FILE"
+    ok "LaunchDaemon plist written to $PLIST_FILE"
 
-            # Start service
-            sudo launchctl load "$PLIST_FILE"
-            ok "octos serve started via launchd"
-            ;;
+    # Start service
+    sudo launchctl load "$PLIST_FILE"
+    ok "octos serve started via launchd"
+}
 
-        Linux)
-            # systemd system unit (runs as current user, survives logout)
-            UNIT_FILE="/etc/systemd/system/octos-serve.service"
+# Write and start the systemd serve unit (runs as the current user). The
+# token loads from the 0600 serve.env via EnvironmentFile so it never
+# sits in the world-readable unit file (#2496).
+write_systemd_service() {
+    UNIT_FILE="/etc/systemd/system/octos-serve.service"
 
-            UNIT_TMP=$(mktemp /tmp/octos-serve.service.XXXXXX)
-            cat > "$UNIT_TMP" << EOF
+    UNIT_TMP=$(mktemp /tmp/octos-serve.service.XXXXXX)
+    cat > "$UNIT_TMP" << EOF
 [Unit]
 Description=octos serve (dashboard + gateway)
 After=network-online.target
@@ -521,26 +526,56 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$(whoami)
-# #2371: the token travels via OCTOS_AUTH_TOKEN below, never argv —
-# ExecStart is readable by any local user via systemctl cat / ps.
+# #2371: the token never travels via argv — ExecStart is readable by any
+# local user via systemctl cat / ps. It loads from the 0600 serve.env
+# written by write_serve_env_file (#2496).
 ExecStart=$OCTOS_BIN serve --port 8080 --host 0.0.0.0
 Restart=on-failure
 RestartSec=5
 Environment=HOME=$HOME
 Environment=OCTOS_DATA_DIR=$DATA_DIR
-Environment=OCTOS_AUTH_TOKEN=$AUTH_TOKEN
+EnvironmentFile=$DATA_DIR/serve.env
 Environment=PATH=$PREFIX:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=$HOME
 
 [Install]
 WantedBy=multi-user.target
 EOF
-            echo "    (sudo is needed to install the system service)"
-            sudo mv "$UNIT_TMP" "$UNIT_FILE"
-            sudo systemctl daemon-reload
-            sudo systemctl enable octos-serve
-            sudo systemctl restart octos-serve
-            ok "octos serve started via systemd"
+    echo "    (sudo is needed to install the system service)"
+    sudo mv "$UNIT_TMP" "$UNIT_FILE"
+    sudo systemctl daemon-reload
+    sudo systemctl enable octos-serve
+    sudo systemctl restart octos-serve
+    ok "octos serve started via systemd"
+}
+
+# ── Service setup ─────────────────────────────────────────────────────
+if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
+    section "Setting up background service"
+
+    OCTOS_BIN="$PREFIX/octos"
+
+    # Generate auth token if not provided
+    if [ -z "$AUTH_TOKEN" ]; then
+        AUTH_TOKEN=$(openssl rand -hex 32)
+        echo "    Generated auth token: ${AUTH_TOKEN:0:8}..."
+        echo "    (save this — needed to access the dashboard)"
+    fi
+
+    PLIST_LABEL="io.octos.serve"
+
+    # Persist the SMTP password (if set) before starting the service so the
+    # fresh process can read it from `$DATA_DIR/smtp_secret.json`.
+    write_smtp_secret_file "${SMTP_PASSWORD:-}"
+
+    case "$OS" in
+        Darwin)
+            write_launchd_service
+            ;;
+
+        Linux)
+            write_serve_env_file
+            write_systemd_service
             ;;
     esac
 

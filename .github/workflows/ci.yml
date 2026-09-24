@@ -178,8 +178,21 @@ jobs:
           if ($deployText -match '--auth-token') {
             throw 'deploy dry run must not pass the bearer token via service argv (#2380)'
           }
-          if ($deployText -notmatch 'AppEnvironmentExtra') {
-            throw 'deploy dry run did not deliver the token via AppEnvironmentExtra'
+          if ($deployText -notmatch 'icacls \$tokenTmp /inheritance:r') {
+            throw 'deploy dry run did not restrict the serve-token file ACLs (#2496)'
+          }
+          if ($deployText -notmatch 'set /p OCTOS_AUTH_TOKEN=<') {
+            throw 'deploy dry run did not read the token from the serve-token file in the launcher (#2496)'
+          }
+          $envLines = $deployText -split "`r?`n" | Where-Object { $_ -match 'AppEnvironmentExtra' }
+          if (-not $envLines) {
+            throw 'deploy dry run lost the non-secret service environment'
+          }
+          if ($envLines -match 'OCTOS_AUTH_TOKEN=') {
+            throw 'deploy dry run still delivers the token via AppEnvironmentExtra (#2496)'
+          }
+          if ($deployText -match 'auth_token = \$authToken') {
+            throw 'deploy dry run still writes the token into config.json (#2496)'
           }
           if ($deployText -notmatch 'C:\\octos-ci') {
             throw 'deploy dry run did not include the requested remote root'

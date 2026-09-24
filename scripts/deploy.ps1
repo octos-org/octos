@@ -252,12 +252,15 @@ if (-not $restartOnly) {
 
 $configPath = Join-Path $dataDir "config.json"
 if (-not (Test-Path -LiteralPath $configPath)) {
+    # #2496: no auth_token here — config.json is created with inherited
+    # world-readable ACLs. The token lives in the ACL-restricted
+    # serve-token file and reaches serve through the launcher's
+    # OCTOS_AUTH_TOKEN env var.
     $config = [ordered]@{
         provider = "openai"
         model = "gpt-4.1-mini"
         api_key_env = "OPENAI_API_KEY"
         mode = "local"
-        auth_token = $authToken
     }
     Write-Utf8NoBom $configPath ($config | ConvertTo-Json -Depth 8)
     Ok "created $configPath"
@@ -288,9 +291,45 @@ Section "Registering Windows service"
 & $nssmExe stop $serviceName 2>$null | Out-Null
 & $nssmExe remove $serviceName confirm 2>$null | Out-Null
 
-# #2380: the token travels via AppEnvironmentExtra below, never argv —
-# the NSSM service command line is readable by any local user via Win32_Process.
-& $nssmExe install $serviceName $octosExe "serve" "--host" "0.0.0.0" "--port" "$servePort" "--data-dir" $dataDir
+# #2380: the token never travels via argv — the service command line is
+# readable by any local user via Win32_Process.
+# #2496: it must not land in AppEnvironmentExtra either — NSSM persists
+# that value under HKLM\SYSTEM\CurrentControlSet\Services\<svc>\Environment,
+# readable by local users. Mirror install.ps1 instead: lock down the
+# empty file FIRST, then write into it, so no world-readable copy ever
+# exists on disk.
+$tokenPath = Join-Path $dataDir "serve-token"
+$tokenTmp = "$tokenPath.tmp"
+[System.IO.File]::WriteAllText($tokenTmp, "", [System.Text.UTF8Encoding]::new($false))
+icacls $tokenTmp /inheritance:r /grant:r "${env:USERNAME}:F" "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Remove-Item $tokenTmp -ErrorAction SilentlyContinue
+    throw "failed to restrict ACLs on $tokenPath"
+}
+[System.IO.File]::WriteAllText($tokenTmp, $authToken, [System.Text.UTF8Encoding]::new($false))
+try {
+    Move-Item -Force $tokenTmp $tokenPath
+} finally {
+    Remove-Item $tokenTmp -ErrorAction SilentlyContinue
+}
+
+# The service runs a wrapper that reads the token from the restricted
+# file at start, never inline; a missing file refuses to start rather
+# than run with an empty token. NSSM captures stdout/stderr itself, so
+# the wrapper does not redirect, and its throttled default restart keeps
+# retrying (and logging the refusal) until the token file is restored.
+$wrapperPath = Join-Path $dataDir "serve-launcher.cmd"
+Write-Utf8NoBom $wrapperPath @"
+@echo off
+set /p OCTOS_AUTH_TOKEN=<"$dataDir\serve-token"
+if not defined OCTOS_AUTH_TOKEN (
+    echo [octos] serve-token file missing or empty; re-run deploy.ps1
+    exit /b 1
+)
+"$octosExe" serve --host 0.0.0.0 --port $servePort --data-dir "$dataDir"
+"@
+
+& $nssmExe install $serviceName "$env:SystemRoot\System32\cmd.exe" "/C" $wrapperPath
 if ($LASTEXITCODE -ne 0) {
     throw "nssm.exe install failed"
 }
@@ -300,7 +339,8 @@ if ($LASTEXITCODE -ne 0) {
 & $nssmExe set $serviceName AppStderr (Join-Path $logDir "serve.err.log") | Out-Null
 & $nssmExe set $serviceName AppRotateFiles 1 | Out-Null
 & $nssmExe set $serviceName Start SERVICE_AUTO_START | Out-Null
-& $nssmExe set $serviceName AppEnvironmentExtra "OCTOS_HOME=$dataDir" "OCTOS_DATA_DIR=$dataDir" "OCTOS_AUTH_TOKEN=$authToken" | Out-Null
+# Non-secret env only — the token arrives through the wrapper (#2496).
+& $nssmExe set $serviceName AppEnvironmentExtra "OCTOS_HOME=$dataDir" "OCTOS_DATA_DIR=$dataDir" | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "nssm.exe failed to set the service environment"
 }
