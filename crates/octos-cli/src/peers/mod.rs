@@ -353,7 +353,8 @@ pub(crate) const PEER_TASK_ID_LEAF: &str = "task-id";
 const PEER_TASK_ID_STATE_LEAF: &str = "task-id-state";
 
 /// Registration-time task-id binding; callers must handle every write failure.
-/// `true` means both file data and its directory entry have been synced.
+/// `true` means the write succeeded — file data synced and, on Unix, the
+/// directory entry too (Windows has no directory sync, #2515).
 #[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
 #[must_use]
 pub(crate) fn persist_peer_task_id_binding(peers_root: &Path, slug: &str, task_id: &str) -> bool {
@@ -946,7 +947,10 @@ pub(crate) mod peer_io {
 
     /// Identity writes require BOTH file data and the renamed directory entry
     /// to be synced. Unlike ordinary peer output, directory-sync errors must
-    /// propagate to the registration/adoption gate.
+    /// propagate to the registration/adoption gate. Unix delivers that in
+    /// full; Windows has no directory sync, so it is best-effort there — the
+    /// file data is written and the rename is atomic, but sync errors never
+    /// occur (#2515).
     #[cfg_attr(not(any(feature = "api", test)), allow(dead_code))]
     pub(crate) fn write_peer_file_durable(
         peer_dir: &Path,
@@ -966,6 +970,8 @@ pub(crate) mod peer_io {
     }
 
     /// Append and sync a control record before another turn may be admitted.
+    /// The sync is real on Unix and best-effort on Windows (#2515) — the line
+    /// is written either way.
     pub(crate) fn append_peer_line_durable(
         peer_dir: &Path,
         leaf: &str,
@@ -1369,9 +1375,14 @@ pub(crate) mod peer_io {
                 return Err(err);
             }
             if durable {
-                // Platforms unable to sync directories fail closed for new
-                // supervised staging instead of claiming false durability.
-                std::fs::File::open(peer_dir)?.sync_all()?;
+                // Windows cannot repeat this sync: a plain open of a directory
+                // is denied outright (os error 5) — only FILE_FLAG_BACKUP_
+                // SEMANTICS reaches a directory handle, and FlushFileBuffers
+                // is not a documented directory-metadata sync there. The
+                // rename above already made the record fully visible, so
+                // Windows runs best-effort durable instead of failing every
+                // budgeted stage and prepare (#2515); Unix keeps the
+                // fail-closed dir sync.
             }
             Ok(())
         }
@@ -1403,7 +1414,12 @@ pub(crate) mod peer_io {
                 .open(&path)?;
             file.write_all(line.as_bytes())?;
             if durable {
-                file.sync_data()?;
+                // Windows cannot sync an append handle either: an append-mode
+                // open holds FILE_APPEND_DATA without FILE_WRITE_DATA, and
+                // FlushFileBuffers requires the write right, so sync_data
+                // failed with os error 5 on every budgeted admission (#2515).
+                // The line is written either way, so Windows runs best-effort
+                // durable instead; Unix syncs for real.
             }
             Ok(())
         }
@@ -5538,9 +5554,6 @@ mod peer_task_registry_tests {
     use super::*;
 
     #[test]
-    // Durable peer writes fail closed off Unix (the directory sync opens the
-    // dir as a file, which Windows refuses with ERROR_ACCESS_DENIED).
-    #[cfg(unix)]
     fn should_keep_modern_peer_parked_when_legacy_result_adoption_runs() {
         for lifetime in ["pending", "running", "failed", "invalid"] {
             let data = tempfile::tempdir().unwrap();
@@ -5603,9 +5616,6 @@ mod peer_task_registry_tests {
     }
 
     #[test]
-    // Durable peer writes fail closed off Unix (the directory sync opens the
-    // dir as a file, which Windows refuses with ERROR_ACCESS_DENIED).
-    #[cfg(unix)]
     fn peer_task_durable_identity_roundtrip_and_missing_new_id_refused() {
         let data = tempfile::tempdir().unwrap();
         let peers_root = data.path().join("peers");
@@ -5765,9 +5775,6 @@ mod peer_task_registry_tests {
     }
 
     #[test]
-    // Durable peer writes fail closed off Unix (the directory sync opens the
-    // dir as a file, which Windows refuses with ERROR_ACCESS_DENIED).
-    #[cfg(unix)]
     fn peer_task_id_write_failure_stays_unadoptable_after_restart() {
         let data = tempfile::tempdir().unwrap();
         let peers_root = data.path().join("peers");
