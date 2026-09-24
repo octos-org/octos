@@ -155,7 +155,11 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: vec![],
                 stop_reason: octos_llm::StopReason::EndTurn,
-                usage: Default::default(),
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
                 provider_index: None,
             })
         }
@@ -241,5 +245,99 @@ mod tests {
             Some(SessionKey(format!("{}#peer-{}", master.0, staged.slug)))
         );
         host.close().await;
+    }
+
+    #[tokio::test]
+    async fn peer_budget_survives_oup_reopen_and_blocks_another_turn() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let model = Arc::new(Model(AtomicUsize::new(0)));
+        let factory = TestAgentFactory::new(
+            model.clone(),
+            data.path().to_owned(),
+            workspace.path().to_owned(),
+        );
+        let state = factory.oup_state().await.unwrap();
+        let peers_root = data.path().join("peers");
+        let master = SessionKey::with_profile(octos_core::MAIN_PROFILE_ID, "cli", "budget-a");
+        let staged = crate::peers::stage_peer_with_budget(
+            &peers_root,
+            workspace.path(),
+            "reviewer",
+            Some("reviewer"),
+            Some(&master.0),
+            "review this change",
+            false,
+            None,
+            None,
+            Some(10),
+        )
+        .unwrap();
+        let host = OupPeerHost::new(
+            state.clone(),
+            octos_agent::EffectivePermissions::workspace_write(),
+        );
+        host.event(&UiNotification::PeerStaged(PeerStagedEvent {
+            session_id: master.clone(),
+            topic: format!("peer-{}", staged.slug),
+            slug: staged.slug.clone(),
+            brief: "review this change".into(),
+            brief_path: staged.brief_path.to_string_lossy().into_owned(),
+            cwd: workspace.path().to_string_lossy().into_owned(),
+            worktree_branch: None,
+            profile_id: octos_core::MAIN_PROFILE_ID.into(),
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if crate::peers::peer_token_budget_status(&peers_root, &staged.slug)
+                    .unwrap()
+                    .is_some_and(|budget| budget.used >= budget.limit)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("first peer turn did not charge its budget");
+        host.close().await;
+
+        let second_master =
+            SessionKey::with_profile(octos_core::MAIN_PROFILE_ID, "cli", "budget-b");
+        let second_key = SessionKey(format!("{}#peer-{}", second_master.0, staged.slug));
+        let second = OupSession::open(
+            state,
+            second_key,
+            workspace.path(),
+            octos_agent::EffectivePermissions::workspace_write(),
+        )
+        .await
+        .unwrap();
+        let mut events = second.client.subscribe();
+        let turn_id = TurnId(uuid::Uuid::now_v7());
+        second
+            .client
+            .request(
+                methods::TURN_START,
+                serde_json::json!({
+                    "session_id": second.session_id,
+                    "turn_id": turn_id,
+                    "input": [InputItem::Text { text: "continue".into() }],
+                }),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = events.recv().await.unwrap();
+                if frame.to_string().contains("peer_token_budget_exceeded") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("OUP must report peer_token_budget_exceeded");
+        assert_eq!(model.0.load(Ordering::SeqCst), 1);
+        second.close().await.unwrap();
     }
 }

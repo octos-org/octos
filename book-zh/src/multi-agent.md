@@ -29,7 +29,7 @@ Agent 通过五个工具与对等 Agent 交互，覆盖完整生命周期 ——
 
 把工作从当前会话中提升为一个新的自治对等 Agent。
 
-- **参数：** `brief`（必填，≤ 64 KB —— 对等 Agent 的全部上下文，必须自包含）、`title`（可选，用于生成 slug）、`worktree`（可选布尔 —— 在分支 `peer/<slug>` 上用 git worktree 隔离该对等 Agent）。
+- **参数：** `name` 和 `brief`（必填）、`worktree`（可选）、`token_budget`（可选正整数，仅在用户要求限制时设置）。
 - **行为：** 完成对等 Agent 的暂存后立即返回，指向 `peers/<slug>/result.md`。**发射即忘** —— 你**不会**在本轮拿到结果。每轮限 **4 次 handoff**。
 
 ### `peer_send_input` —— 引导一个运行中的对等 Agent
@@ -64,8 +64,10 @@ Agent 通过五个工具与对等 Agent 交互，覆盖完整生命周期 ——
 
 人类通过两个服务端方法驱动对等 Agent，在 octoscode 中表现为 `/peer` 和 `/gather`：
 
-- **`peer/prepare`** —— 以编队方式暂存 1–8 个对等 Agent（全有或全无）。纯资源预留；随后由客户端打开每个会话并启动其首轮。
+- **`peer/prepare`** —— 以编队方式暂存 1–8 个对等 Agent（全有或全无）。传入 `token_budget` 可为每个 Peer 设置相同的累计 token 上限；省略则不设置 Peer 专属上限。响应会回显该值，随后由客户端打开会话并启动首轮。
 - **`peer/gather`** —— 黑板的面向人类的一侧；把各对等 Agent 的结果汇入调用方的会话。
+
+例如，`peer/prepare` 接受 `{"brief":"审查 API 改动","cwd":"/workspace/octos","token_budget":250000}`。预算保存在 Peer 目录中，OUP 重连或更换会话 ID 不会重置它。完成、失败和中断的轮次都会计入用量；累计值达到上限后，下一轮以 `peer_token_budget_exceeded` 结束。检查发生在轮次边界，因此单轮可能超出上限。若 Peer 绑定了 master goal，其用量还会计入 master 的共享 goal 预算。
 
 ## 生命周期
 

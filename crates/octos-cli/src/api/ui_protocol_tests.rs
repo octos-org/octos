@@ -34564,6 +34564,7 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
             model: None,
             goal_id: None,
             task_id: None,
+            token_budget: None,
         })
         .unwrap_or_else(|err| panic!("handoff {n} within the cap must stage: {err}"));
         assert_eq!(staged.topic, format!("peer-{}", staged.slug));
@@ -34581,6 +34582,7 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect_err("5th handoff must be rejected");
     assert_eq!(err, "peer handoff limit reached for this turn (4)");
@@ -36422,6 +36424,7 @@ fn peer_originator_recorded_by_handoff_callback() {
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("stage");
     let originator =
@@ -36446,6 +36449,7 @@ fn handoff_request(name: &str, worktree: Option<bool>) -> octos_agent::PeerHando
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     }
 }
 
@@ -36938,6 +36942,7 @@ fn stage_and_open_peer(
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("stage peer")
     .slug;
@@ -37468,6 +37473,7 @@ fn peer_respond_errors_when_peer_not_open() {
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .unwrap()
     .slug;
@@ -37607,6 +37613,7 @@ fn peer_handoff_callback_records_valid_model_lane() {
         model: Some("strong".to_owned()),
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("a valid lane still stages the peer");
 
@@ -37649,6 +37656,7 @@ fn peer_handoff_callback_notes_unknown_model_lane_but_still_stages() {
         model: Some("gpt-mega".to_owned()),
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("an unknown lane warns, it does not fail staging");
 
@@ -37785,6 +37793,7 @@ fn zai_lane_peer_handoff_hit_records_and_resolves_zai_glm52() {
         model: Some("zai".to_owned()),
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("a configured zai lane still stages the peer");
 
@@ -37872,6 +37881,7 @@ fn zai_lane_peer_handoff_miss_warns_and_falls_back_to_primary() {
         model: Some("zai".to_owned()),
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("an unknown zai lane warns, it does not fail staging");
 
@@ -38568,6 +38578,7 @@ async fn peer_prepare_stages_brief_and_worktree() {
         &request(json!({
             "brief": "Second lane.",
             "title": "CI Fix",
+            "token_budget": 250_000,
             "cwd": repo.to_string_lossy(),
             "profile_id": "dev",
         })),
@@ -38576,6 +38587,16 @@ async fn peer_prepare_stages_brief_and_worktree() {
     .await
     .expect("second prepare");
     assert_eq!(result2["slug"], "ci-fix-2");
+    assert_eq!(result2["token_budget"], 250_000);
+    assert_eq!(
+        peer_token_budget_status(&data_dir.join("peers"), "ci-fix-2")
+            .unwrap()
+            .unwrap(),
+        PeerTokenBudgetStatus {
+            limit: 250_000,
+            used: 0,
+        }
+    );
     assert!(result2["worktree_branch"].is_null());
     assert_eq!(
         std::path::PathBuf::from(result2["cwd"].as_str().unwrap()),
@@ -38619,6 +38640,20 @@ async fn peer_prepare_stages_brief_and_worktree() {
         retry["slug"], "no-repo",
         "slug released after the failed stage"
     );
+
+    let zero_budget = raw_peer_prepare(
+        &state,
+        &request(json!({
+            "brief": "Invalid budget.",
+            "token_budget": 0,
+            "cwd": repo.to_string_lossy(),
+            "profile_id": "dev",
+        })),
+        None,
+    )
+    .await
+    .expect_err("zero token budget is not runnable");
+    assert!(zero_budget.message.contains("positive integer"));
 
     // Validation: empty and oversized briefs are refused up front.
     let empty = raw_peer_prepare(
