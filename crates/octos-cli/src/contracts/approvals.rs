@@ -19,7 +19,6 @@ struct ApprovalEntry {
 
 #[derive(Debug)]
 enum ApprovalEntryState {
-    #[allow(dead_code)]
     Pending,
     Responded {
         decision: ApprovalDecision,
@@ -218,7 +217,7 @@ impl PendingApprovalStore {
         })
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn insert_pending(&self, session_id: SessionKey, approval_id: ApprovalId) {
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         entries.insert(
@@ -282,7 +281,7 @@ impl PendingApprovalStore {
             .collect()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn remove_pending(&self, session_id: &SessionKey, approval_id: &ApprovalId) -> bool {
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         let should_remove = entries.get(approval_id).is_some_and(|entry| {

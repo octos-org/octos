@@ -83,6 +83,58 @@ try {
         throw "launcher did not report the missing serve-token file"
     }
 
+    # deploy.ps1's NSSM wrapper must satisfy the same contract (#2496):
+    # token read from the restricted file, never inline. NSSM delivers
+    # the non-secret env via AppEnvironmentExtra, so simulate that here.
+    $deployPs1 = Join-Path $PSScriptRoot ".." "deploy.ps1"
+    $deployRaw = Get-Content $deployPs1 -Raw
+    $m2 = [regex]::Match($deployRaw, '(?s)Write-Utf8NoBom \$wrapperPath @"\r?\n(.*?)\r?\n"@\r?\n')
+    if (-not $m2.Success) {
+        throw "serve-launcher template not found in $deployPs1"
+    }
+    $deployTemplate = $m2.Groups[1].Value
+    # Raw-template guard: the unexpanded template must not carry a
+    # literal token — its vars are only filled in by ExpandString below.
+    if ($deployTemplate -match "check-token-123") {
+        throw "deploy launcher template embeds the token inline"
+    }
+
+    # Re-create the token file for the wrapper arms. ACL construction is
+    # already exercised by the #2388 section above; these arms pin the
+    # deploy wrapper's read-and-refuse behavior.
+    [System.IO.File]::WriteAllText($tokenPath, "check-token-123", [System.Text.UTF8Encoding]::new($false))
+    $env:OCTOS_HOME = $dir
+    $env:OCTOS_DATA_DIR = $dir
+    $octosExe = $fakeBin
+    $servePort = 8080
+    $deployContent = $ExecutionContext.InvokeCommand.ExpandString($deployTemplate)
+    $deployWrapperPath = Join-Path $dir "deploy-serve-launcher.cmd"
+    [System.IO.File]::WriteAllText($deployWrapperPath, $deployContent, [System.Text.UTF8Encoding]::new($false))
+
+    $happy = (cmd.exe /C "`"$deployWrapperPath`"" | Out-String)
+    Write-Host $happy
+    if ($LASTEXITCODE -ne 0) {
+        throw "deploy launcher exited $LASTEXITCODE with the token file present"
+    }
+    if ($happy -notmatch "TOKEN=check-token-123") {
+        throw "deploy launcher did not hand OCTOS_AUTH_TOKEN to the serve process"
+    }
+    if ($happy -notmatch [regex]::Escape("DATADIR=$dir")) {
+        throw "deploy launcher lost the service environment"
+    }
+
+    Remove-Item $tokenPath
+    $refusal = (cmd.exe /C "`"$deployWrapperPath`"" | Out-String)
+    Write-Host $refusal
+    if ($LASTEXITCODE -ne 1) {
+        throw "deploy launcher must exit 1 when the serve-token file is missing"
+    }
+    if ($refusal -notmatch "serve-token file missing or empty") {
+        throw "deploy launcher did not report the missing serve-token file"
+    }
+    Remove-Item Env:OCTOS_HOME -ErrorAction SilentlyContinue
+    Remove-Item Env:OCTOS_DATA_DIR -ErrorAction SilentlyContinue
+
     Write-Host "ok: serve-launcher token handoff"
 } finally {
     Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue

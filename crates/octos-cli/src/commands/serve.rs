@@ -2465,6 +2465,7 @@ mod tests {
             "install.sh",
             "install.ps1",
             "local-tenant-deploy.sh",
+            "frp/bootstrap-tenant.sh",
             "deploy.ps1",
         ] {
             let body = std::fs::read_to_string(scripts.join(name))
