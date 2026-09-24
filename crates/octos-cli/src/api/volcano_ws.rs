@@ -162,8 +162,10 @@ pub(crate) async fn synthesize_ws_stream(
 
 /// Collect→file wrapper over [`synthesize_ws_stream`]: buffers every chunk and
 /// writes one file under `out_dir` (drop-in for the HTTP `query` path). The
-/// streaming push-to-client path (⑤) uses `synthesize_ws_stream` directly.
-#[allow(dead_code)] // wired into synthesize_reply later.
+/// streaming push-to-client path (⑤) uses `synthesize_ws_stream` directly;
+/// this collect-to-disk variant is test-only — it pins the file-writing shape
+/// the ignored live check exercises.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn synthesize_ws(
     appid: &str,
@@ -217,7 +219,6 @@ fn encode_request_frame(payload: &[u8], gzip: bool) -> Vec<u8> {
 /// Build the JSON request body for a v1 ws `submit` (streaming) synthesis.
 /// Same shape as the HTTP `query` body, with `operation:"submit"`. `reqid` is a
 /// caller-supplied unique id (passed in so the body is deterministic to test).
-#[allow(dead_code)] // wired into the synth loop later in this change.
 #[allow(clippy::too_many_arguments)]
 fn build_submit_payload(
     appid: &str,
@@ -238,7 +239,6 @@ fn build_submit_payload(
 }
 
 /// A decoded server frame from the v1 ws_binary stream.
-#[allow(dead_code)] // wired into the synth loop later in this change.
 #[derive(Debug, PartialEq)]
 enum ServerFrame {
     /// An audio-only response chunk. `is_last` is set when the frame's sequence
@@ -250,7 +250,6 @@ enum ServerFrame {
 
 /// Parse one server binary frame. Returns `Err` on a malformed/truncated frame
 /// or an unexpected message type. Bounds-checked so a short frame can't panic.
-#[allow(dead_code)] // wired into the synth loop later in this change.
 fn parse_server_frame(bytes: &[u8]) -> Result<ServerFrame, String> {
     // Read a big-endian u32 at `off`, advancing it; error if out of range.
     fn take_u32(bytes: &[u8], off: &mut usize) -> Result<u32, String> {

@@ -44,8 +44,6 @@ impl VoiceAsrOutcome {
 
 /// 解析批量 ASR 服务基址。`ASR_API_URL` 指向独立 ASR 时优先；未设置时回退到
 /// OminiX，保留既有部署行为。
-// TODO(later-tasks): remove dead_code allow once callers are wired up.
-#[allow(dead_code)]
 fn asr_base_url() -> String {
     crate::skills_scope::discover_asr_url().unwrap_or_else(|| "http://127.0.0.1:8081".to_string())
 }
@@ -57,8 +55,6 @@ fn ominix_base_url() -> String {
 }
 
 /// 从混合媒体路径里挑出音频文件，保持原顺序。
-// TODO(later-tasks): remove dead_code allow once callers are wired up.
-#[allow(dead_code)]
 pub(crate) fn audio_paths(media: &[String]) -> Vec<String> {
     media
         .iter()
@@ -68,8 +64,6 @@ pub(crate) fn audio_paths(media: &[String]) -> Vec<String> {
 }
 
 /// 转写 turn 内全部音频媒体，并保留拒绝/失败的轮次级状态。
-// TODO(later-tasks): remove dead_code allow once callers are wired up.
-#[allow(dead_code)]
 pub(crate) async fn transcribe_audio_media(
     media: &[String],
     language: Option<&str>,
