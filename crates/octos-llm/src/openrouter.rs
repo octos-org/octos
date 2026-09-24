@@ -162,7 +162,11 @@ impl LlmProvider for OpenRouterProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
-        let api_messages: Vec<ApiMessage> = messages.iter().map(|m| build_api_message(m)).collect();
+        let scope_root = config.media_scope_root.as_deref();
+        let api_messages: Vec<ApiMessage> = messages
+            .iter()
+            .map(|m| build_api_message(m, scope_root))
+            .collect();
 
         let api_tools: Option<Vec<ApiTool>> = if tools.is_empty() {
             None
@@ -242,7 +246,11 @@ impl LlmProvider for OpenRouterProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let api_messages: Vec<ApiMessage> = messages.iter().map(|m| build_api_message(m)).collect();
+        let scope_root = config.media_scope_root.as_deref();
+        let api_messages: Vec<ApiMessage> = messages
+            .iter()
+            .map(|m| build_api_message(m, scope_root))
+            .collect();
 
         let api_tools: Option<Vec<ApiTool>> = if tools.is_empty() {
             None
@@ -401,9 +409,9 @@ struct ApiImageUrl {
     url: String,
 }
 
-fn build_api_message<'a>(msg: &'a Message) -> ApiMessage<'a> {
+fn build_api_message<'a>(msg: &'a Message, scope_root: Option<&std::path::Path>) -> ApiMessage<'a> {
     let role = msg.role.as_str();
-    let content = build_api_content(msg);
+    let content = build_api_content(msg, scope_root);
     let tool_calls = msg.tool_calls.as_ref().map(|tcs| {
         tcs.iter()
             .map(|tc| ApiToolCall {
@@ -424,7 +432,7 @@ fn build_api_message<'a>(msg: &'a Message) -> ApiMessage<'a> {
     }
 }
 
-fn build_api_content(msg: &Message) -> Option<ApiContent> {
+fn build_api_content(msg: &Message, scope_root: Option<&std::path::Path>) -> Option<ApiContent> {
     let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
 
     if images.is_empty() {
@@ -439,7 +447,7 @@ fn build_api_content(msg: &Message) -> Option<ApiContent> {
 
     let mut parts = Vec::new();
     for path in images {
-        if let Ok((mime, data)) = vision::encode_image(path) {
+        if let Ok((mime, data)) = vision::encode_image(path, scope_root) {
             parts.push(ApiContentPart::ImageUrl {
                 image_url: ApiImageUrl {
                     url: format!("data:{mime};base64,{data}"),
@@ -628,7 +636,7 @@ mod tests {
             arguments: serde_json::json!({"path": "a.rs"}),
             metadata: None,
         }]);
-        let json = serde_json::to_value(build_api_message(&msg)).expect("serialises");
+        let json = serde_json::to_value(build_api_message(&msg, None)).expect("serialises");
         assert_eq!(json["tool_calls"][0]["type"], "function");
         assert_eq!(json["tool_calls"][0]["id"], "call_1");
         assert_eq!(json["tool_calls"][0]["function"]["name"], "read_file");
@@ -645,7 +653,7 @@ mod tests {
     #[test]
     fn test_build_api_content_text_only() {
         let msg = text_msg(MessageRole::User, "hello");
-        let content = build_api_content(&msg);
+        let content = build_api_content(&msg, None);
         match content {
             Some(ApiContent::Text(t)) => assert_eq!(t, "hello"),
             other => panic!("expected Text, got {:?}", other.is_some()),
@@ -655,7 +663,7 @@ mod tests {
     #[test]
     fn test_build_api_content_empty_user_gets_placeholder() {
         let msg = text_msg(MessageRole::User, "");
-        let content = build_api_content(&msg);
+        let content = build_api_content(&msg, None);
         match content {
             Some(ApiContent::Text(t)) => assert_eq!(t, "[empty message]"),
             other => panic!("expected placeholder Text, got {:?}", other.is_some()),
@@ -665,13 +673,13 @@ mod tests {
     #[test]
     fn test_build_api_content_empty_assistant_returns_none() {
         let msg = text_msg(MessageRole::Assistant, "");
-        assert!(build_api_content(&msg).is_none());
+        assert!(build_api_content(&msg, None).is_none());
     }
 
     #[test]
     fn test_build_api_content_empty_system_returns_none() {
         let msg = text_msg(MessageRole::System, "");
-        assert!(build_api_content(&msg).is_none());
+        assert!(build_api_content(&msg, None).is_none());
     }
 
     #[test]
@@ -700,7 +708,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
 
-        let content = build_api_content(&msg);
+        let content = build_api_content(&msg, None);
         match content {
             Some(ApiContent::Parts(parts)) => {
                 assert_eq!(parts.len(), 2); // image + text

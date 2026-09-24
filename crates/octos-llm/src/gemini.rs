@@ -233,7 +233,11 @@ impl GeminiProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<GeminiRequest> {
-        let (contents, system_instruction) = build_gemini_contents_for_model(messages, &self.model);
+        let (contents, system_instruction) = build_gemini_contents_for_model(
+            messages,
+            &self.model,
+            config.media_scope_root.as_deref(),
+        );
         Ok(GeminiRequest {
             contents,
             system_instruction: system_instruction.map(|text| GeminiSystemInstruction {
@@ -598,19 +602,25 @@ fn build_gemini_generation_config(
 /// - Consecutive same-role messages are merged (Gemini rejects adjacent same-role turns)
 #[cfg(test)]
 fn build_gemini_contents(messages: &[Message]) -> (Vec<GeminiContent>, Option<String>) {
-    build_gemini_contents_with_signature_fallback(messages, false)
+    build_gemini_contents_with_signature_fallback(messages, false, None)
 }
 
 fn build_gemini_contents_for_model(
     messages: &[Message],
     model: &str,
+    scope_root: Option<&std::path::Path>,
 ) -> (Vec<GeminiContent>, Option<String>) {
-    build_gemini_contents_with_signature_fallback(messages, model.starts_with("gemini-3"))
+    build_gemini_contents_with_signature_fallback(
+        messages,
+        model.starts_with("gemini-3"),
+        scope_root,
+    )
 }
 
 fn build_gemini_contents_with_signature_fallback(
     messages: &[Message],
     synthesize_missing_thought_signature: bool,
+    scope_root: Option<&std::path::Path>,
 ) -> (Vec<GeminiContent>, Option<String>) {
     let mut contents: Vec<GeminiContent> = Vec::new();
     let mut system_instruction: Option<String> = None;
@@ -638,7 +648,7 @@ fn build_gemini_contents_with_signature_fallback(
                 }
             },
             octos_core::MessageRole::User => {
-                let parts = build_user_parts(msg);
+                let parts = build_user_parts(msg, scope_root);
                 push_or_merge(&mut contents, "user", parts);
             }
             octos_core::MessageRole::Assistant => {
@@ -703,9 +713,9 @@ fn build_gemini_contents_with_signature_fallback(
                 let mut media_parts = Vec::new();
                 for path in shown.images.iter().chain(shown.videos.iter()) {
                     let encoded = if vision::is_video(path) {
-                        vision::encode_video(path)
+                        vision::encode_video(path, scope_root)
                     } else {
-                        vision::encode_image(path)
+                        vision::encode_image(path, scope_root)
                     };
                     match encoded {
                         Ok((mime, data)) => media_parts.push(GeminiFunctionResponsePart {
@@ -778,7 +788,7 @@ fn parts_compatible(existing: &[GeminiPart], new: &[GeminiPart]) -> bool {
     !((existing_has_func_response && new_has_text) || (existing_has_text && new_has_func_response))
 }
 
-fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
+fn build_user_parts(msg: &Message, scope_root: Option<&std::path::Path>) -> Vec<GeminiPart> {
     let images: Vec<_> = msg.media.iter().filter(|p| vision::is_image(p)).collect();
     // Gemini takes video the same way it takes images: inline data with
     // the container's MIME type.
@@ -793,7 +803,7 @@ fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
 
     let mut parts = Vec::new();
     for path in images {
-        if let Ok((mime, data)) = vision::encode_image(path) {
+        if let Ok((mime, data)) = vision::encode_image(path, scope_root) {
             parts.push(GeminiPart::InlineData {
                 inline_data: GeminiInlineData {
                     mime_type: mime,
@@ -803,7 +813,7 @@ fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {
         }
     }
     for path in videos {
-        if let Ok((mime, data)) = vision::encode_video(path) {
+        if let Ok((mime, data)) = vision::encode_video(path, scope_root) {
             parts.push(GeminiPart::InlineData {
                 inline_data: GeminiInlineData {
                     mime_type: mime,
@@ -1732,7 +1742,7 @@ mod tests {
             },
         ];
 
-        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash");
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash", None);
         let serialized = serde_json::to_value(&contents[1]).expect("serialize model content");
 
         assert_eq!(
@@ -1764,7 +1774,7 @@ mod tests {
             },
         ];
 
-        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash");
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash", None);
         let serialized = serde_json::to_value(&contents[1]).expect("serialize model content");
 
         assert_eq!(serialized["parts"][0]["thoughtSignature"], "real-signature");
@@ -1806,7 +1816,7 @@ mod tests {
             tool_call("tc2", "current_call"),
         ];
 
-        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash");
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-3.6-flash", None);
         let old_step = serde_json::to_value(&contents[1]).expect("serialize old model step");
         let current_step =
             serde_json::to_value(&contents[4]).expect("serialize current model step");
@@ -1840,7 +1850,7 @@ mod tests {
             },
         ];
 
-        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-2.5-flash");
+        let (contents, _) = build_gemini_contents_for_model(&messages, "gemini-2.5-flash", None);
         let serialized = serde_json::to_value(&contents[1]).expect("serialize model content");
 
         assert!(serialized["parts"][0].get("thoughtSignature").is_none());
