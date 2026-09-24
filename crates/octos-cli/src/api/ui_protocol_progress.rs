@@ -3,8 +3,6 @@
 //! This module is deliberately independent from the WebSocket loop so the
 //! protocol mapping can be tested before the live transport adopts it.
 
-#![allow(dead_code)]
-
 use chrono::{DateTime, Utc};
 use octos_core::ui_protocol::{
     ApprovalId, ApprovalRequestedEvent, MessageDeltaEvent, PlanUpdatedEvent, ReasoningDeltaEvent,
