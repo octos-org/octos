@@ -95,8 +95,8 @@ fn audio_ext(encoding: &str) -> &'static str {
 /// Streaming core: open the v1 ws_binary connection, send the `submit`
 /// request, and invoke `on_chunk` for each audio chunk as it arrives. Returns
 /// `Some(())` on a clean end (final negative-sequence frame), `None` on any
-/// transport/protocol failure. Shared by the collect→file path ([`synthesize_ws`])
-/// and the ⑤ push-to-client path.
+/// transport/protocol failure. Shared by the collect→file path (`synthesize_ws`,
+/// test-only) and the ⑤ push-to-client path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn synthesize_ws_stream(
     appid: &str,
