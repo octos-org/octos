@@ -7,7 +7,7 @@ name: Publish Packages
 # its own Homebrew tap — `brew tap octos-org/octos https://github.com/octos-org/octos`).
 # On a stable release the homebrew job re-renders Formula/octos.rb from the
 # built bundles and opens a PR to update it (main is branch-protected, so it
-# cannot push directly). npm publishing is unchanged.
+# cannot push directly). Prereleases do not update the stable formula.
 #
 # Gated behind the repo variable PUBLISH_PACKAGES so it no-ops until the
 # maintainer opts in (avoids failing on missing tokens). To go live, set:
@@ -45,7 +45,7 @@ permissions:
 
 jobs:
   homebrew:
-    if: ${{ vars.PUBLISH_PACKAGES == 'true' }}
+    if: ${{ vars.PUBLISH_PACKAGES == 'true' && !contains(inputs.tag || github.event.release.tag_name, '-') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write        # push the formula-update branch
@@ -61,7 +61,8 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: main
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN || github.token }}
+          token: ${{ github.token }}
+          persist-credentials: false
 
       - name: Download unix bundles for the tag
         run: |
@@ -108,12 +109,7 @@ jobs:
           echo "----- rendered Formula/octos.rb -----"
           cat Formula/octos.rb
 
-      - name: Skip formula update for prereleases
-        if: ${{ contains(env.TAG, '-') }}
-        run: echo "::notice::${TAG} is a prerelease — formula rendered + validated above, but NOT committed (Formula/octos.rb tracks stable only)."
-
       - name: Open PR to update in-repo formula
-        if: ${{ !contains(env.TAG, '-') }}
         run: |
           set -euo pipefail
           # Formula/octos.rb lives in this repo (this repo is its own tap). main
@@ -128,6 +124,8 @@ jobs:
           git checkout -b "$branch"
           git add Formula/octos.rb
           git commit -m "octos ${TAG}: update Homebrew formula"
+          # Authenticate the push with the bot/PAT token so the PR triggers CI.
+          gh auth setup-git
           git push -f origin "$branch"
           # Create the PR if one isn't already open for this branch, then enable
           # auto-merge so a green formula-only change lands without babysitting.
@@ -180,6 +178,10 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN is not configured for this repository"
+            exit 1
+          fi
           version="${TAG#v}"
           # Prerelease versions (1.1.0-alpha.1, -rc.2, …) MUST NOT publish under
           # the `latest` dist-tag, or `npm i -g @octos-org/octos` would install a
