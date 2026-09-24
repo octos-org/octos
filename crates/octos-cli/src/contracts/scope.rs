@@ -232,7 +232,6 @@ impl ScopePolicy {
     /// directly from tests. The method is kept on the public-to-module
     /// surface so the future `session/close` handler can call it without
     /// further refactoring.
-    #[allow(dead_code)]
     pub(crate) fn evict_session(&self, session_id: &SessionKey) {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
         sessions.remove(session_id);
@@ -305,7 +304,10 @@ impl ScopePolicy {
 /// needs to know to render itself, plus the canonical scope wire string.
 #[derive(Debug, Clone)]
 pub(crate) struct ScopeHit {
-    #[allow(dead_code)]
+    /// Read only by tests today: the production lookup consumers branch on
+    /// `scope_match`/`decision`, while the kind assertions pin which scope
+    /// kind produced the hit.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) scope_kind: ApprovalScopeKind,
     pub(crate) decision: ApprovalDecision,
     pub(crate) scope_match: String,

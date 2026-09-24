@@ -85,7 +85,7 @@ pub(crate) struct PendingDiffEntry {
     /// `diff` and `materialize_file_mutation_diff` could not produce one).
     /// Used by tests today and by apply-time consistency checks once the
     /// apply path is wired in.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     snapshot_at_proposal: Option<String>,
 }
 
@@ -558,7 +558,9 @@ impl PendingDiffPreviewStore {
         })
     }
 
-    #[allow(dead_code)]
+    /// Convenience wrapper for tests: inserts without a proposal-time snapshot.
+    /// Production call sites go through [`PendingDiffPreviewStore::insert_with_snapshot`].
+    #[cfg(test)]
     pub(crate) fn insert(&self, preview: DiffPreview) {
         self.insert_with_snapshot(preview, None);
     }
@@ -809,24 +811,6 @@ impl PendingDiffPreviewStore {
             bytes_in_memory: in_memory_bytes,
             bytes_on_disk: inner.on_disk_bytes,
         }
-    }
-
-    /// Emit a structured tracing line with the current metrics.
-    /// Intended for periodic operator-visibility, mirroring the
-    /// ledger's sweep-tick log.
-    #[allow(dead_code)]
-    pub(crate) fn log_metrics(&self) {
-        let m = self.metrics();
-        info!(
-            target = "octos::diff_preview",
-            diff_preview.entries.active = m.entries_active,
-            diff_preview.sessions.active = m.sessions_active,
-            diff_preview.eviction.dropped = m.entries_dropped,
-            diff_preview.recovery.entries_loaded = m.recovery_entries_loaded,
-            diff_preview.bytes.in_memory = m.bytes_in_memory,
-            diff_preview.bytes.on_disk = m.bytes_on_disk,
-            "diff preview metrics tick"
-        );
     }
 
     #[cfg(test)]
