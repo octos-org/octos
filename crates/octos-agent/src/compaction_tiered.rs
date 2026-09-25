@@ -163,7 +163,7 @@ impl MicroCompactionPolicy {
 
         // ID -> tool_name, turn_id so we can build a typed placeholder even
         // after the assistant message is far behind us.
-        let mut id_to_meta: std::collections::HashMap<String, (String, u32)> =
+        let mut id_to_meta: std::collections::HashMap<String, (String, u32, Option<String>)> =
             std::collections::HashMap::new();
         let mut turn_counter: u32 = 0;
         for msg in messages.iter() {
@@ -173,9 +173,13 @@ impl MicroCompactionPolicy {
             if msg.role == MessageRole::Assistant {
                 if let Some(ref calls) = msg.tool_calls {
                     for call in calls {
-                        id_to_meta
-                            .entry(call.id.clone())
-                            .or_insert_with(|| (call.name.clone(), turn_counter));
+                        id_to_meta.entry(call.id.clone()).or_insert_with(|| {
+                            (
+                                call.name.clone(),
+                                turn_counter,
+                                crate::compaction::describe_tool_call(&call.name, &call.arguments),
+                            )
+                        });
                     }
                 }
             }
@@ -217,10 +221,10 @@ impl MicroCompactionPolicy {
                 continue;
             }
 
-            let (tool_name, turn_id) = id_to_meta
+            let (tool_name, turn_id, target) = id_to_meta
                 .get(id)
                 .cloned()
-                .unwrap_or_else(|| ("unknown_tool".to_string(), 0));
+                .unwrap_or_else(|| ("unknown_tool".to_string(), 0, None));
 
             let age = current_turn.saturating_sub(turn_id);
             let content_len = msg.content.len();
@@ -251,6 +255,12 @@ impl MicroCompactionPolicy {
                 turn_id: Some(turn_id),
                 original_byte_len: Some(content_len as u64),
                 reason: reason.to_string(),
+                hint: Some(crate::compaction::elision_hint(
+                    target.as_deref(),
+                    Some(content_len as u64),
+                    reason,
+                )),
+                target,
             };
             let replacement = placeholder.to_placeholder_content();
             bytes_reclaimed += content_len.saturating_sub(replacement.len()) as u64;

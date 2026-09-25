@@ -4292,6 +4292,108 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
 }
 
 #[test]
+fn appui_prompt_context_bridge_reports_live_context_state_when_negotiated() {
+    use octos_core::ui_protocol::UiNotification;
+
+    let session_id = SessionKey::new("api", "context-state-reported");
+    let history = vec![
+        test_message(MessageRole::User, "old request"),
+        test_message(MessageRole::Assistant, "old answer"),
+    ];
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let dir = tempfile::tempdir().unwrap();
+    let events: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = events.clone();
+    let bridge =
+        AppUiPromptContextBridge::new(session_id.clone(), dir.path().to_path_buf(), manager, false)
+            .with_context_lifecycle_notify(Arc::new(move |notification| {
+                sink.lock().unwrap().push(notification);
+            }))
+            .with_context_state_updates(true);
+    let request = |phase: PromptContextPhase, iteration: u32| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".to_string(),
+        model_id: "large-context".to_string(),
+        context_window: 16_000,
+    };
+
+    // Turn start: the first report of the turn always goes out and carries
+    // the PROMPT estimate the bridge just built, not the transcript's.
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history.clone());
+    prompt.push(test_message(MessageRole::User, "current request"));
+    let report = bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("prepare prompt");
+    let reported: Vec<_> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            UiNotification::ContextStateReported(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reported.len(), 1, "one live state report at turn start");
+    assert_eq!(reported[0].session_id, session_id);
+    assert_eq!(reported[0].iteration, 1);
+    assert_eq!(
+        reported[0].context_state.token_estimate,
+        report
+            .token_estimate
+            .expect("bridge reports a prompt estimate"),
+        "the gauge must show the projected prompt size"
+    );
+    assert!(reported[0].threshold_tokens > 0);
+
+    // Next iteration with an unchanged prompt: no movement, no report.
+    let mut same = prompt.clone();
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut same)
+        .expect("prepare prompt");
+    let count = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, UiNotification::ContextStateReported(_)))
+        .count();
+    assert_eq!(count, 1, "an unmoved estimate is not re-reported");
+
+    // Without the negotiated feature nothing is emitted at all.
+    let quiet: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+    let quiet_sink = quiet.clone();
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let unnegotiated =
+        AppUiPromptContextBridge::new(session_id.clone(), dir.path().to_path_buf(), manager, false)
+            .with_context_lifecycle_notify(Arc::new(move |notification| {
+                quiet_sink.lock().unwrap().push(notification);
+            }));
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history);
+    prompt.push(test_message(MessageRole::User, "current request"));
+    unnegotiated
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("prepare prompt");
+    assert!(
+        !quiet
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, UiNotification::ContextStateReported(_))),
+        "context/state_reported is strictly opt-in"
+    );
+}
+
+#[test]
 fn appui_prompt_context_bridge_preserves_current_user_turn() {
     let session_id = SessionKey::new("api", "context-current-user");
     let history = vec![
@@ -10645,8 +10747,11 @@ async fn profile_llm_fetch_models_zai_never_gets_a_bearer_v1_models_probe() {
     let (root, captured) =
         spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"glm-5.2"},{"id":"glm-4.7"}]}"#).await;
     let state = Arc::new(AppState::empty_for_tests());
-    // Saved AppUI routes default api_type to "openai" — exactly the shape
-    // that used to force the Bearer /v1/models probe onto zai.
+    // Saved AppUI routes default api_type to "openai". The zai family now
+    // speaks OpenAI Chat Completions on the versioned `/api/paas/v4` root
+    // (the only Z.AI root that reports its implicit prompt cache), so the
+    // probe is the OpenAI listing off THAT root — `/models`, never a
+    // synthesized `/v4/v1/models` — with Bearer auth.
     let request = RpcRequest::new(
         "1",
         APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
@@ -10655,7 +10760,7 @@ async fn profile_llm_fetch_models_zai_never_gets_a_bearer_v1_models_probe() {
                 "family_id": "zai",
                 "route": {
                     "route_id": "official",
-                    "base_url": format!("{root}/api/anthropic"),
+                    "base_url": format!("{root}/api/paas/v4"),
                     "api_type": "openai"
                 }
             },
@@ -10671,12 +10776,12 @@ async fn profile_llm_fetch_models_zai_never_gets_a_bearer_v1_models_probe() {
     assert_eq!(result["models"], json!(["glm-4.7", "glm-5.2"]));
     let requests = captured.lock().await;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].path, "/api/anthropic/v1/models");
-    assert!(
-        requests[0].authorization.is_none(),
-        "zai speaks the Anthropic Messages protocol — never a Bearer probe"
+    assert_eq!(requests[0].path, "/api/paas/v4/models");
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer zai-secret-key"),
+        "zai speaks OpenAI Chat Completions — Bearer auth on the listing probe"
     );
-    assert_eq!(requests[0].x_api_key.as_deref(), Some("zai-secret-key"));
 }
 
 #[tokio::test]
@@ -13796,6 +13901,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -13867,6 +13973,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -13983,6 +14090,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -14054,6 +14162,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -14118,6 +14227,7 @@ fn shell_approval_still_emits_risk_field() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -14225,6 +14335,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -18581,6 +18692,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -38246,12 +38358,12 @@ fn zai_lane_peer_handoff_hit_records_and_resolves_zai_glm52() {
 
     let provider = resolve_peer_lane_provider(&peers_root, &staged.slug, &config)
         .expect("a recorded zai lane resolves a provider");
-    assert_eq!(provider.provider_name(), "zai");
+    assert_eq!(provider.provider_name(), "zai@api");
     assert_eq!(provider.model_id(), "glm-5.2");
 }
 
 /// #19-S2 (zai lane config shape): the recommended zai lane selects and
-/// builds to the zai registry provider (Anthropic Messages protocol, default
+/// builds to the zai registry provider (OpenAI Chat Completions on the versioned Z.AI root, default
 /// base URL) even when the PRIMARY profile config points at another provider
 /// — the lane keeps its own `ZAI_API_KEY` credential, never borrows the
 /// primary's.
@@ -38283,7 +38395,7 @@ fn zai_lane_config_selects_and_builds_zai_glm52_provider() {
 
     let provider =
         build_peer_lane_provider(&config, "zai").expect("the zai lane builds a provider");
-    assert_eq!(provider.provider_name(), "zai");
+    assert_eq!(provider.provider_name(), "zai@api");
     assert_eq!(provider.model_id(), "glm-5.2");
 }
 
@@ -43002,6 +43114,48 @@ fn should_not_advertise_semantic_cache_before_stdio_client_hello() {
     let capabilities = ConnectionUiFeatures::stdio_defaults().negotiated_capabilities();
     assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1));
     assert!(!ConnectionUiFeatures::stdio_defaults().context_semantic_cache_available());
+}
+
+#[test]
+fn should_only_advertise_context_state_when_the_client_requested_it() {
+    use octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1;
+
+    // Stdio before `client_hello`: unknown client, never claimed.
+    let defaults = ConnectionUiFeatures::stdio_defaults();
+    assert!(!defaults.context_state_available());
+    assert!(
+        !defaults
+            .negotiated_capabilities()
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+    );
+
+    // Requested alongside the parent lifecycle feature: honoured.
+    let requested = ConnectionUiFeatures::from_requested_feature_tokens(
+        [
+            UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1,
+        ],
+        false,
+    );
+    assert!(requested.context_state_available());
+    assert!(
+        requested
+            .negotiated_capabilities()
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+    );
+
+    // Requested WITHOUT the parent lifecycle feature: not available, since
+    // the event is a lifecycle payload.
+    let orphan = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1],
+        false,
+    );
+    assert!(!orphan.context_state_available());
+    assert!(
+        !orphan
+            .negotiated_capabilities()
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+    );
 }
 
 #[test]
