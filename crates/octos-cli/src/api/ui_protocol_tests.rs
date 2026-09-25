@@ -7255,8 +7255,12 @@ async fn session_list_cwd_root_honors_flag_and_capability() {
     };
     let with_cwd = SessionListParams {
         cwd: Some(cwd.to_string_lossy().into_owned()),
+        profile_id: None,
     };
-    let no_cwd = SessionListParams { cwd: None };
+    let no_cwd = SessionListParams {
+        cwd: None,
+        profile_id: None,
+    };
 
     let state_off = {
         let mut s = AppState::empty_for_tests();
@@ -7294,15 +7298,9 @@ async fn session_list_cwd_root_honors_flag_and_capability() {
     assert!(resolve_session_list_cwd_root(&state_on, has_cap, None, &with_cwd).is_err());
 }
 
-#[tokio::test]
-async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
-    // With a registered profile runtime: a SAFE cwd resolves to the
-    // per-project, per-PROFILE store `<cwd>/.octos/<profile_id>` (so two
-    // profiles sharing a cwd can't read each other's transcripts), and a
-    // banned system path is rejected by the shared safety gate.
-    use octos_core::ui_protocol::SessionListParams;
-
-    let tmp = tempfile::tempdir().unwrap();
+/// `AppState` with `sessions_in_cwd` on and a single bootstrapped `dev`
+/// profile runtime — the shape of a local `octos serve --solo` install.
+async fn session_list_state_with_dev_runtime(tmp: &std::path::Path) -> AppState {
     let profile = crate::profiles::UserProfile {
         id: "dev".to_string(),
         name: "Dev".to_string(),
@@ -7334,7 +7332,7 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    let data_dir = tmp.path().join("data");
+    let data_dir = tmp.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let runtime = crate::runtime::ProfileRuntime::bootstrap(
         &profile,
@@ -7351,7 +7349,19 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
         crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
             .with_sessions_in_cwd(true),
     );
+    state
+}
 
+#[tokio::test]
+async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
+    // With a registered profile runtime: a SAFE cwd resolves to the
+    // per-project, per-PROFILE store `<cwd>/.octos/<profile_id>` (so two
+    // profiles sharing a cwd can't read each other's transcripts), and a
+    // banned system path is rejected by the shared safety gate.
+    use octos_core::ui_protocol::SessionListParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = session_list_state_with_dev_runtime(tmp.path()).await;
     let cap = ConnectionUiFeatures::stdio_defaults();
 
     // Safe cwd → `<cwd>/.octos/dev` (profile-namespaced).
@@ -7360,23 +7370,157 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
     let good_canon = std::fs::canonicalize(&good).unwrap();
     let good_params = SessionListParams {
         cwd: Some(good.to_string_lossy().into_owned()),
+        profile_id: None,
     };
     let resolved = resolve_session_list_cwd_root(&state, cap, Some("dev"), &good_params).unwrap();
     assert_eq!(
         resolved,
-        Some(crate::runtime::session::project_sessions_root(
-            &good_canon,
-            "dev"
-        )),
+        Some(SessionListScope {
+            workspace_root: good_canon.clone(),
+            sessions_root: crate::runtime::session::project_sessions_root(&good_canon, "dev"),
+            profile_id: "dev".to_string(),
+        }),
     );
-    assert_eq!(resolved, Some(good_canon.join(".octos").join("dev")));
+    assert_eq!(
+        resolved.map(|scope| scope.sessions_root),
+        Some(good_canon.join(".octos").join("dev"))
+    );
 
     // Banned system root (`/usr` is a real dir on Linux and macOS that
     // canonicalizes to `/usr`) → rejected by the safety gate.
     let banned = SessionListParams {
         cwd: Some("/usr".to_string()),
+        profile_id: Some("dev".to_string()),
     };
     assert!(resolve_session_list_cwd_root(&state, cap, Some("dev"), &banned).is_err());
+}
+
+#[tokio::test]
+async fn session_list_cwd_root_should_honor_requested_profile_when_connection_is_admin() {
+    // A browser paired with the admin bearer token has NO connection profile
+    // (`AuthIdentity::Admin` → `None`), yet it opens sessions as `dev` by
+    // passing `profile_id` to session/open. Before this test the cwd listing
+    // ignored `params.profile_id`, fell back to `_main`, and — on a local
+    // install with only a `dev` profile — failed with
+    // `cwd_runtime_unavailable`, so the history browser never saw the
+    // transcripts that session/open had written under `<cwd>/.octos/dev`.
+    use octos_core::ui_protocol::SessionListParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = session_list_state_with_dev_runtime(tmp.path()).await;
+    let cap = ConnectionUiFeatures::stdio_defaults();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_canon = std::fs::canonicalize(&project).unwrap();
+    let cwd = project.to_string_lossy().into_owned();
+
+    // Admin connection + explicit `profile_id` → that profile's store.
+    let requested = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: Some("dev".to_string()),
+    };
+    assert_eq!(
+        resolve_session_list_cwd_root(&state, cap, None, &requested).unwrap(),
+        Some(SessionListScope {
+            workspace_root: project_canon.clone(),
+            sessions_root: project_canon.join(".octos").join("dev"),
+            profile_id: "dev".to_string(),
+        }),
+    );
+
+    // Admin connection + no `profile_id` → unchanged: `_main` is not
+    // registered here, so the safety gate still rejects.
+    let bare = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: None,
+    };
+    assert!(resolve_session_list_cwd_root(&state, cap, None, &bare).is_err());
+
+    // Empty `profile_id` is rejected, same as session/open.
+    let empty = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: Some(String::new()),
+    };
+    assert!(resolve_session_list_cwd_root(&state, cap, None, &empty).is_err());
+
+    // A requested profile that is not registered is still rejected — the
+    // param must never open a SessionManager at a made-up namespace.
+    let unknown = SessionListParams {
+        cwd: Some(cwd),
+        profile_id: Some("ghost".to_string()),
+    };
+    assert!(resolve_session_list_cwd_root(&state, cap, None, &unknown).is_err());
+}
+
+#[tokio::test]
+async fn session_list_cwd_root_should_reject_requested_profile_outside_authenticated_scope() {
+    // An authenticated user connection is frozen to its own profile: a
+    // `profile_id` naming another profile is a scope violation (mirrors
+    // `validate_authenticated_session_scope` for session/open), while
+    // restating the connection's own profile is fine.
+    use octos_core::ui_protocol::SessionListParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = session_list_state_with_dev_runtime(tmp.path()).await;
+    let cap = ConnectionUiFeatures::stdio_defaults();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_canon = std::fs::canonicalize(&project).unwrap();
+    let cwd = project.to_string_lossy().into_owned();
+
+    let foreign = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: Some("other".to_string()),
+    };
+    let error = resolve_session_list_cwd_root(&state, cap, Some("dev"), &foreign).unwrap_err();
+    assert_eq!(error.code, RpcError::invalid_params("").code);
+    assert!(
+        error.message.contains("outside the authenticated profile"),
+        "unexpected error message: {}",
+        error.message
+    );
+
+    let own = SessionListParams {
+        cwd: Some(cwd),
+        profile_id: Some("dev".to_string()),
+    };
+    assert_eq!(
+        resolve_session_list_cwd_root(&state, cap, Some("dev"), &own).unwrap(),
+        Some(SessionListScope {
+            workspace_root: project_canon.clone(),
+            sessions_root: project_canon.join(".octos").join("dev"),
+            profile_id: "dev".to_string(),
+        }),
+    );
+}
+
+#[test]
+fn session_list_result_should_attest_scope_only_when_the_listing_was_scoped() {
+    // A client cannot otherwise tell a project-scoped listing from the
+    // legacy global one a flag-off (or older) server returns for the same
+    // `{cwd}` request — so it must never place legacy rows under a
+    // workspace. The scoped result names the canonical root and profile it
+    // read; the legacy result stays byte-identical `{ sessions }`.
+    let sessions = serde_json::json!([{ "id": "dev:api:web-1", "message_count": 2 }]);
+
+    assert_eq!(
+        session_list_result_value(sessions.clone(), None),
+        serde_json::json!({ "sessions": sessions }),
+    );
+
+    let scope = SessionListScope {
+        workspace_root: std::path::PathBuf::from("/srv/project"),
+        sessions_root: std::path::PathBuf::from("/srv/project/.octos/dev"),
+        profile_id: "dev".to_string(),
+    };
+    assert_eq!(
+        session_list_result_value(sessions.clone(), Some(&scope)),
+        serde_json::json!({
+            "sessions": sessions,
+            "workspace_root": "/srv/project",
+            "profile_id": "dev",
+        }),
+    );
 }
 
 #[tokio::test]
@@ -39876,7 +40020,10 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
         None,
         ConnectionUiFeatures::stdio_defaults(),
         "list-busy-flag".into(),
-        SessionListParams { cwd: None },
+        SessionListParams {
+            cwd: None,
+            profile_id: None,
+        },
     )
     .await;
     let frame = recv_rpc_response_with_id(&mut rx, "list-busy-flag").await;

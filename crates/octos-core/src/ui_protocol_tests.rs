@@ -4878,6 +4878,8 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
     // existing REST contract emits.
     let listing = SessionListResult {
         sessions: serde_json::json!([{ "id": "s-1", "message_count": 3 }]),
+        workspace_root: None,
+        profile_id: None,
     };
     let value = serde_json::to_value(&listing).expect("serialize");
     let decoded: SessionListResult = serde_json::from_value(value).expect("deserialize");
@@ -5128,6 +5130,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // new wire shape so a rename/type-flip of the field fails here.
     let with_cwd = SessionListParams {
         cwd: Some("/home/me/proj".into()),
+        profile_id: None,
     };
     assert_eq!(
         serde_json::to_value(&with_cwd).expect("serialize"),
@@ -5136,6 +5139,21 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let parsed_cwd: SessionListParams =
         serde_json::from_value(serde_json::json!({ "cwd": "/home/me/proj" })).expect("decode");
     assert_eq!(parsed_cwd, with_cwd);
+    // session/list — WITH the additive `profile_id` (names the per-project
+    // store's profile, same as session/open). Also optional and skipped
+    // when absent, so the two pins above stay byte-identical.
+    let with_profile = SessionListParams {
+        cwd: Some("/home/me/proj".into()),
+        profile_id: Some("dev".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&with_profile).expect("serialize"),
+        serde_json::json!({ "cwd": "/home/me/proj", "profile_id": "dev" }),
+    );
+    let parsed_profile: SessionListParams =
+        serde_json::from_value(serde_json::json!({ "cwd": "/home/me/proj", "profile_id": "dev" }))
+            .expect("decode");
+    assert_eq!(parsed_profile, with_profile);
 
     // session/snapshot
     let p = SessionSnapshotParams {
@@ -5367,14 +5385,38 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
 /// downstream client. Each `assert_eq!` is the contract.
 #[test]
 fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
-    // session/list — `{ sessions: <opaque> }`
+    // session/list — `{ sessions: <opaque> }` for a legacy (unscoped)
+    // listing: the scope fields are absent, not null, so a client can tell
+    // "not scoped" from "scoped to nothing".
     assert_eq!(
         serde_json::to_value(SessionListResult {
             sessions: serde_json::json!([{ "id": "s-1" }]),
+            workspace_root: None,
+            profile_id: None,
         })
         .expect("serialize"),
         serde_json::json!({ "sessions": [{ "id": "s-1" }] }),
     );
+    // session/list — a workspace-scoped listing attests the canonical root
+    // and profile whose `<root>/.octos/<profile>` store it read.
+    let scoped = SessionListResult {
+        sessions: serde_json::json!([{ "id": "s-1" }]),
+        workspace_root: Some("/srv/project".into()),
+        profile_id: Some("dev".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&scoped).expect("serialize"),
+        serde_json::json!({
+            "sessions": [{ "id": "s-1" }],
+            "workspace_root": "/srv/project",
+            "profile_id": "dev",
+        }),
+    );
+    // Older servers never send the scope fields; they still decode.
+    let legacy: SessionListResult =
+        serde_json::from_value(serde_json::json!({ "sessions": [] })).expect("decode");
+    assert_eq!(legacy.workspace_root, None);
+    assert_eq!(legacy.profile_id, None);
 
     // session/snapshot — `{ status, files, tasks }`
     assert_eq!(
