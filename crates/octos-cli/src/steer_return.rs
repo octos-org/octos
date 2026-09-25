@@ -9,6 +9,9 @@
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{TurnId, TurnSteerDroppedEvent, UiNotification};
 
+// No per-item allow needed: the only production reader is the allow-covered
+// `leftover_steer_notification` below, and rustc seeds liveness from
+// allow-covered items — so the consts stay quiet in no-`api` builds too.
 /// `reason` when the turn was interrupted by the client.
 pub(crate) const REASON_INTERRUPTED: &str = "interrupted";
 /// `reason` when the turn ended on its own (EndTurn / error) with input pending.
@@ -16,6 +19,10 @@ pub(crate) const REASON_TURN_ENDED: &str = "turn_ended";
 
 /// One `turn/steer_dropped` for the given leftovers, in buffer order. `None`
 /// when there is nothing to return — an empty return frame is never emitted.
+// The production drain-and-send site is `api`-gated
+// (`settle_leftover_steers` in ui_protocol_transport.rs); the shape stays
+// compiled feature-independent so plain `cargo test -p octos-cli` covers it.
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) fn leftover_steer_notification(
     session_id: &SessionKey,
     turn_id: &TurnId,
