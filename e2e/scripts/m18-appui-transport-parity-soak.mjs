@@ -71,6 +71,13 @@ const wsUiFeatures = [
   'coding.loop_runtime.v1',
   'review.start.v1',
   'context.lifecycle.v1',
+  'skill.actions.v1',
+  'skill.action_jobs.v1',
+  // Do NOT negotiate features like coding.monitor_runtime.v1, smart_home,
+  // user_question or voice.asr_admission here casually: the server then
+  // advertises monitor/*, smart_home/* and friends, which are absent from
+  // m18-route-inventory.json and fail the conformance gate below until the
+  // inventory gains them alongside real probe coverage.
 ];
 
 fs.mkdirSync(workspace, { recursive: true });
@@ -112,6 +119,11 @@ const requiredScenarioMethods = [
   'router/get_metrics',
 ];
 const liveNotificationMethods = new Set([
+  // Canonical v2 lane: the lifecycle events in this set are live traffic.
+  // Since #2318 the raw lifecycle frames below are suppressed for every
+  // connection and ride `projection/envelope` payloads instead, so the
+  // envelope method is counted here rather than in the stable list.
+  'projection/envelope',
   'turn/started',
   'turn/completed',
   'turn/error',
@@ -147,6 +159,13 @@ const stdioAuthUnavailableMethods = new Set([
   'content/bulk_delete',
   'content/delete',
   'content/list',
+  'cron/list',
+  'cron/toggle',
+  'memory/entity',
+  'memory/ingest',
+  'memory/load',
+  'memory/overview',
+  'memory/search',
 ]);
 const authContextProbeNames = new Set([
   'authMePreOpen',
@@ -155,6 +174,8 @@ const authContextProbeNames = new Set([
   'contentDeleteInvalidParams',
   'contentDeleteAuthProbe',
   'contentListAuthProbe',
+  'cronListAuthProbe',
+  'memoryOverviewAuthProbe',
 ]);
 const stdioAuthUnavailableShape = {
   code: -32120,
@@ -169,6 +190,13 @@ function unsupportedCapabilityMethods(capabilities) {
 
 function methodIsUnavailableOverStdioAuth(method) {
   return stdioAuthUnavailableMethods.has(method);
+}
+
+// server/shutdown is advertised only where pressing it would stop the server
+// (supports_server_shutdown): the spawned stdio child has no shutdown handle,
+// so the method is legitimately absent from its advertised capabilities.
+function methodAdvertisedOnlyWhereRunnable(method) {
+  return method === 'server/shutdown';
 }
 
 function appendText(file, text) {
@@ -445,18 +473,39 @@ class AppUiClient {
   }
 
   waitForNotification(method, predicate = () => true, waitMs = timeoutMs) {
-    const existing = this.notifications.find((frame) => frame.method === method && predicate(frame));
+    return this.waitForFrame(
+      (frame) => frame.method === method && predicate(frame),
+      method,
+      waitMs,
+    );
+  }
+
+  // Canonical v2 lane: raw lifecycle frames are suppressed for every
+  // connection since #2318, so terminals and streamed content arrive as
+  // `projection/envelope` payloads (e.g. `turn_terminal`, `assistant_delta`).
+  waitForEnvelopePayload(payloadType, predicate = () => true, waitMs = timeoutMs) {
+    return this.waitForFrame(
+      (frame) => frame.method === 'projection/envelope'
+        && frame.params?.payload?.type === payloadType
+        && predicate(frame),
+      `projection/envelope ${payloadType}`,
+      waitMs,
+    );
+  }
+
+  waitForFrame(matcher, label, waitMs = timeoutMs) {
+    const existing = this.notifications.find(matcher);
     if (existing) return Promise.resolve(existing);
     const deadline = Date.now() + waitMs;
     return new Promise((resolve, reject) => {
       const tick = () => {
-        const found = this.notifications.find((frame) => frame.method === method && predicate(frame));
+        const found = this.notifications.find(matcher);
         if (found) {
           resolve(found);
           return;
         }
         if (Date.now() > deadline) {
-          reject(new Error(`${this.label}: timed out waiting for ${method}`));
+          reject(new Error(`${this.label}: timed out waiting for ${label}`));
           return;
         }
         setTimeout(tick, 50);
@@ -533,6 +582,13 @@ class WsClient extends AppUiClient {
     await this.close();
     this.closed = false;
     await this.connect();
+    // Mirror the stdio reconnect's hello so both transcripts carry the same
+    // exchange sequence (the URL query already re-negotiates the features).
+    await this.request('client_hello', {
+      transport: 'websocket',
+      client: { name: 'm18-appui-transport-parity-soak' },
+      supported_features: wsUiFeatures,
+    });
     await this.request('session/open', {
       session_id: sessionId,
       profile_id: profileId,
@@ -545,7 +601,11 @@ class StdioClient extends AppUiClient {
   constructor(resetTranscript = true) {
     super('stdio', stdioTranscript, resetTranscript);
     this.stderrText = '';
-    this.child = spawn(octosBin, ['serve', '--stdio', '--data-dir', stdioDataDir, '--cwd', workspace], {
+    // #2486: profile/local/create is gated behind the local-solo opt-in, so
+    // the spawned server must enable it or the soak dies at capability
+    // negotiation. --solo is the danger-surface keystone: fine for this
+    // throwaway stdio child, but never copy it to a network-exposed serve.
+    this.child = spawn(octosBin, ['serve', '--stdio', '--solo', '--data-dir', stdioDataDir, '--cwd', workspace], {
       cwd: repoRoot,
       env: {
         ...process.env,
@@ -639,6 +699,16 @@ class StdioClient extends AppUiClient {
     await this.close();
     const next = new StdioClient(false);
     await next.waitSpawn();
+    // A fresh stdio child negotiates its connection features through
+    // client_hello — the WS reconnect re-negotiates through the URL query —
+    // so without this hello the child runs on default features and every
+    // feature-gated surface (e.g. the hydrate projection replay) diverges
+    // from the WS leg.
+    await next.request('client_hello', {
+      transport: 'stdio',
+      client: { name: 'm18-appui-transport-parity-soak' },
+      supported_features: wsUiFeatures,
+    });
     await next.request('session/open', {
       session_id: sessionId,
       profile_id: profileId,
@@ -656,6 +726,11 @@ async function startWsServer(port) {
     String(port),
     '--auth-token',
     authToken,
+    // #2486: profile/local/create is gated behind the local-solo opt-in, so
+    // the spawned server must enable it or the soak dies at capability
+    // negotiation. --solo is the danger-surface keystone: fine for this
+    // loopback-only child, but never copy it to a network-exposed serve.
+    '--solo',
     '--data-dir',
     wsDataDir,
     '--cwd',
@@ -729,16 +804,31 @@ function hasNotification(notifications, method) {
 }
 
 function summarizeLiveNotifications(notifications) {
-  const methods = notifications.map((frame) => frame.method).filter(Boolean);
+  // Canonical v2 lane: raw turn/completed, turn/error, message/delta,
+  // tool/started and tool/completed frames are suppressed for every
+  // connection since #2318, so those parity booleans read the
+  // projection/envelope payloads riding the same notifications slice. The
+  // remaining methods are still delivered raw.
+  const envelopePayloads = notifications
+    .filter((frame) => frame.method === 'projection/envelope')
+    .map((frame) => frame.params?.payload || {});
+  const methods = notifications
+    .map((frame) => frame.method)
+    .filter((method) => method && method !== 'projection/envelope');
+  const hasEnvelope = (type) => envelopePayloads.some((payload) => payload.type === type);
+  const hasTerminalOutcome = (outcome) => envelopePayloads.some(
+    (payload) => payload.type === 'turn_terminal' && payload.data?.outcome === outcome,
+  );
   return {
     methods: sortedSet(methods),
     turn_started: hasNotification(notifications, 'turn/started'),
-    turn_completed: hasNotification(notifications, 'turn/completed'),
-    turn_error: hasNotification(notifications, 'turn/error'),
-    message_delta_observed: hasNotification(notifications, 'message/delta'),
+    turn_completed: hasTerminalOutcome('completed'),
+    turn_error: hasTerminalOutcome('errored'),
+    turn_interrupted: hasTerminalOutcome('interrupted'),
+    message_delta_observed: hasEnvelope('assistant_delta'),
     message_persisted: hasNotification(notifications, 'message/persisted'),
-    tool_started: hasNotification(notifications, 'tool/started'),
-    tool_completed: hasNotification(notifications, 'tool/completed'),
+    tool_started: hasEnvelope('tool_start'),
+    tool_completed: hasEnvelope('tool_end'),
     approval_requested: hasNotification(notifications, 'approval/requested'),
     approval_decided: hasNotification(notifications, 'approval/decided'),
     approval_cancelled: hasNotification(notifications, 'approval/cancelled'),
@@ -765,13 +855,28 @@ function validateCodexToolStatus(label, capture) {
 }
 
 function codexToolCompletions(notifications) {
+  // Canonical v2 lane: raw tool/completed frames are suppressed for every
+  // connection since #2318, so the tool name comes from the matching
+  // tool_start payload (joined by tool_call_id) and the result from tool_end.
+  const namesByCallId = new Map();
+  for (const frame of notifications) {
+    const payload = frame.params?.payload || {};
+    if (frame.method === 'projection/envelope' && payload.type === 'tool_start') {
+      namesByCallId.set(payload.data?.tool_call_id, payload.data?.name);
+    }
+  }
   return notifications
-    .filter((frame) => frame.method === 'tool/completed' && codexP0RequiredTools.includes(frame.params?.tool_name))
-    .map((frame) => ({
-      tool_name: frame.params.tool_name,
-      success: frame.params.success,
-      output_preview: frame.params.output_preview || '',
-    }));
+    .filter((frame) => frame.method === 'projection/envelope'
+      && frame.params?.payload?.type === 'tool_end')
+    .map((frame) => {
+      const data = frame.params?.payload?.data || {};
+      return {
+        tool_name: namesByCallId.get(data.tool_call_id),
+        success: data.status === 'complete',
+        output_preview: data.output_preview || '',
+      };
+    })
+    .filter((entry) => codexP0RequiredTools.includes(entry.tool_name));
 }
 
 async function runCodexP0Turn(client) {
@@ -788,18 +893,22 @@ async function runCodexP0Turn(client) {
   });
   assert(accepted?.accepted === true, `${client.label}: #969 turn/start not accepted`);
 
-  const terminal = await Promise.race([
-    client.waitForNotification('turn/completed', (frame) => frame.params?.turn_id === turnId),
-    client.waitForNotification('turn/error', (frame) => frame.params?.turn_id === turnId),
-  ]);
+  const terminal = await client.waitForEnvelopePayload(
+    'turn_terminal',
+    (frame) => frame.params?.turn_id === turnId,
+  );
   const notifications = client.notifications.slice(before);
-  if (terminal.method === 'turn/error') {
-    throw new Error(`${client.label}: #969 Codex P0 fixture errored: ${terminal.params?.code} ${terminal.params?.message}`);
+  const terminalData = terminal.params?.payload?.data || {};
+  if (terminalData.outcome !== 'completed') {
+    throw new Error(
+      `${client.label}: #969 Codex P0 fixture errored: ${terminalData.outcome} ${JSON.stringify(terminalData.error || {})}`,
+    );
   }
 
   const startedTools = new Set(notifications
-    .filter((frame) => frame.method === 'tool/started')
-    .map((frame) => frame.params?.tool_name));
+    .filter((frame) => frame.method === 'projection/envelope'
+      && frame.params?.payload?.type === 'tool_start')
+    .map((frame) => frame.params?.payload?.data?.name));
   const completions = codexToolCompletions(notifications);
   const successfulTools = new Set(completions
     .filter((entry) => entry.success === true)
@@ -817,7 +926,7 @@ async function runCodexP0Turn(client) {
 
   return {
     turnId,
-    terminal: terminal.method,
+    terminal: terminalData.outcome,
     observed: summarizeLiveNotifications(notifications),
     toolCompletions: completions,
   };
@@ -848,19 +957,23 @@ async function runTurn(client, text, expect = {}) {
     assert(approvalResponse?.accepted === true, `${client.label}: approval/respond not accepted`);
   }
 
-  const terminal = await Promise.race([
-    client.waitForNotification('turn/completed', (frame) => frame.params?.turn_id === turnId),
-    client.waitForNotification('turn/error', (frame) => frame.params?.turn_id === turnId),
-  ]);
+  const terminal = await client.waitForEnvelopePayload(
+    'turn_terminal',
+    (frame) => frame.params?.turn_id === turnId,
+  );
   const notifications = client.notifications.slice(before);
   if (expect.tool) {
     assert(
-      notifications.some((frame) => frame.method === 'tool/started' && frame.params?.turn_id === turnId),
-      `${client.label}: tool/started missing`,
+      notifications.some((frame) => frame.method === 'projection/envelope'
+        && frame.params?.payload?.type === 'tool_start'
+        && frame.params?.turn_id === turnId),
+      `${client.label}: tool_start missing`,
     );
     assert(
-      notifications.some((frame) => frame.method === 'tool/completed' && frame.params?.turn_id === turnId),
-      `${client.label}: tool/completed missing`,
+      notifications.some((frame) => frame.method === 'projection/envelope'
+        && frame.params?.payload?.type === 'tool_end'
+        && frame.params?.turn_id === turnId),
+      `${client.label}: tool_end missing`,
     );
   }
   if (expect.approval) {
@@ -871,7 +984,7 @@ async function runTurn(client, text, expect = {}) {
   }
   return {
     turnId,
-    terminal: terminal.method,
+    terminal: terminal.params?.payload?.data?.outcome,
     approvalResponse: approvalResponse ? summarizeResult('approval/respond', approvalResponse) : null,
     observed: summarizeLiveNotifications(notifications),
   };
@@ -886,20 +999,20 @@ async function runInterrupt(client) {
     turn_id: turnId,
     input: [{ kind: 'text', text: 'Write 200 separate lines, one line at a time for the M18 interrupt fixture.' }],
   });
-  await client.waitForNotification('message/delta', (frame) => frame.params?.turn_id === turnId);
+  await client.waitForEnvelopePayload('assistant_delta', (frame) => frame.params?.turn_id === turnId);
   const interrupted = await client.requestCapture('turn/interrupt', {
     session_id: sessionId,
     turn_id: turnId,
   });
-  const terminal = await Promise.race([
-    client.waitForNotification('turn/completed', (frame) => frame.params?.turn_id === turnId),
-    client.waitForNotification('turn/error', (frame) => frame.params?.turn_id === turnId),
-  ]);
+  const terminal = await client.waitForEnvelopePayload(
+    'turn_terminal',
+    (frame) => frame.params?.turn_id === turnId,
+  );
   const notifications = client.notifications.slice(before);
   return {
     turnId,
     interrupted: summarizeCapture(interrupted),
-    terminal: terminal.method,
+    terminal: terminal.params?.payload?.data?.outcome,
     observed: summarizeLiveNotifications(notifications),
   };
 }
@@ -918,14 +1031,14 @@ async function runReplayProbe(client) {
     'protocol/replay_lossy',
     (frame) => frame.params?.session_id === sessionId,
   );
-  const terminal = await Promise.race([
-    client.waitForNotification('turn/completed', (frame) => frame.params?.turn_id === turnId),
-    client.waitForNotification('turn/error', (frame) => frame.params?.turn_id === turnId),
-  ]);
+  const terminal = await client.waitForEnvelopePayload(
+    'turn_terminal',
+    (frame) => frame.params?.turn_id === turnId,
+  );
   const notifications = client.notifications.slice(before);
   return {
     turnId,
-    terminal: terminal.method,
+    terminal: terminal.params?.payload?.data?.outcome,
     replayLossy: {
       dropped_count: replayLossy.params?.dropped_count,
       has_last_durable_cursor: Boolean(replayLossy.params?.last_durable_cursor),
@@ -953,10 +1066,13 @@ function assertStdioAuthUnavailableDirect(client, method, capture) {
   assert(data.recoverable === true, client.label + ": " + method + " expected recoverable auth error");
 }
 
-// Sentinel: the method is exercised by a dedicated scenario step elsewhere in
-// this soak (requiredScenarioMethods), so the inventory probe pass skips it
-// deliberately. Distinguish from truly unknown methods, which hit the switch
-// default and throw.
+// Sentinel: the method is either exercised by a dedicated scenario step
+// elsewhere in this soak (requiredScenarioMethods, the auth-bound probes), or
+// is deliberately not live-probed (the stdio-auth-bound memory/cron family is
+// pinned by the capability unsupported-reports plus the memoryOverview and
+// cronList auth probes; server/shutdown would stop the spawned server
+// mid-soak). The inventory probe pass skips these deliberately. Distinguish
+// from truly unknown methods, which hit the switch default and throw.
 const PROBED_ELSEWHERE = Symbol.for('m18.routeProbe.probedElsewhere');
 
 function routeProbeParams(method) {
@@ -983,6 +1099,39 @@ function routeProbeParams(method) {
     case 'content/delete':
     case 'router/set_mode':
     case 'router/get_metrics':
+      return PROBED_ELSEWHERE;
+    case 'session/btw':
+      // Missing question → typed invalid params; no LLM call is attempted.
+      return { session_id: sessionId };
+    case 'session/rollback':
+      // num_turns >= 1 is validated before the session lookup, so this is
+      // refused -32602 invalid_num_turns; nothing is ever dropped.
+      return { session_id: `${sessionId}:missing-rollback-probe`, num_turns: 0 };
+    case 'session/fork':
+      // '#' fails the topic-charset validation (validate_topic_name), so the
+      // fork is refused -32602 before any child session is persisted.
+      return { session_id: sessionId, new_chat_id: 'a#b' };
+    case 'session/goal/operator_transition':
+      return {
+        session_id: sessionId,
+        goal_id: `m18-missing-goal-${stamp}`,
+        action: 'pause',
+        reason: 'M18 parity route probe',
+      };
+    case 'launch/resolve':
+      // A path with no conversation resolves deterministically on both
+      // transports without touching the soak session.
+      return { cwd: path.join(workspace, 'm18-missing-launch-dir') };
+    case 'memory/entity':
+    case 'memory/ingest':
+    case 'memory/load':
+    case 'memory/overview':
+    case 'memory/search':
+    case 'cron/list':
+    case 'cron/toggle':
+      return PROBED_ELSEWHERE;
+    case 'server/shutdown':
+      // A live probe would stop the spawned server mid-soak.
       return PROBED_ELSEWHERE;
     case 'approval/scopes/list':
     case 'permission/profile/list':
@@ -1065,6 +1214,30 @@ function routeProbeParams(method) {
       return { profile_id: profileId, name: 'm18-missing-skill' };
     case 'profile/skills/remove':
       return { profile_id: profileId, name: 'm18-missing-skill' };
+    case 'profile/sub_providers/list':
+      return { session_id: sessionId, profile_id: profileId };
+    case 'profile/sub_providers/upsert':
+    case 'profile/sub_providers/remove':
+      // Missing key → typed invalid params; the profile is never mutated.
+      return { profile_id: profileId };
+    case 'snapshot/list':
+      return { session_id: sessionId };
+    case 'snapshot/restore':
+      return { session_id: sessionId, snapshot_id: `m18-missing-snapshot-${stamp}` };
+    case 'peer/prepare':
+      // Missing brief → typed invalid params; no peer is staged.
+      return {};
+    case 'peer/gather':
+      return { session_id: sessionId };
+    case 'turn/steer':
+      // Empty input → typed invalid params before the steering decision.
+      return { session_id: sessionId, input: [] };
+    case 'session/compact':
+      // Missing session_id → typed invalid params; no compaction runs.
+      return {};
+    case 'session/compact/mode/set':
+      // Invalid mode → typed invalid params before the mode is stored.
+      return { session_id: sessionId, mode: 'm18-bogus' };
     case 'skill/action/list':
       return { session_id: sessionId, profile_id: profileId };
     case 'skill/action/invoke':
@@ -1274,6 +1447,7 @@ function validateNegotiatedCapabilities(label, capabilities, routeInventory) {
   );
   const missingInventory = routeInventoryMethods(routeInventory).filter((method) => {
     if (supportedMethods.includes(method)) return false;
+    if (label === 'stdio' && methodAdvertisedOnlyWhereRunnable(method)) return false;
     return !(label === 'stdio' && methodIsUnavailableOverStdioAuth(method) && unsupportedMethods.has(method));
   });
   assert(
@@ -1388,6 +1562,10 @@ async function runScenario(client, routeInventory, uncovered) {
     ids: ["m18-missing-content-" + stamp],
   }, 5000, { parity: false });
   assertStdioAuthUnavailableDirect(client, 'content/bulk_delete', contentBulkDeleteAuthProbe);
+  const memoryOverviewAuthProbe = await captureProbe(client, probes, 'memoryOverviewAuthProbe', 'memory/overview', {}, 5000, { parity: false });
+  assertStdioAuthUnavailableDirect(client, 'memory/overview', memoryOverviewAuthProbe);
+  const cronListAuthProbe = await captureProbe(client, probes, 'cronListAuthProbe', 'cron/list', {}, 5000, { parity: false });
+  assertStdioAuthUnavailableDirect(client, 'cron/list', cronListAuthProbe);
   const authLogoutAuthProbe = await captureProbe(client, probes, 'authLogoutAuthProbe', 'auth/logout', {}, 5000, { parity: false });
   assertStdioAuthUnavailableDirect(client, 'auth/logout', authLogoutAuthProbe);
 
@@ -1397,6 +1575,7 @@ async function runScenario(client, routeInventory, uncovered) {
     supportedMethods,
     unsupportedMethods: [...unsupportedCapabilityMethods(capabilities?.capabilities)].sort(),
     probes,
+    probedRouteMethods: [...uncovered].sort(),
     profileError,
     profileCreate,
     opened,
@@ -1423,7 +1602,11 @@ function sortedSet(values) {
 }
 
 function paritySupportedMethods(methods) {
-  return sortArray((methods || []).filter((method) => !methodIsUnavailableOverStdioAuth(method)));
+  // Normalize the per-transport summary lists: stdio-auth-bound methods are
+  // only advertised over WS, and server/shutdown is advertised only where it
+  // could actually stop the server, so neither can be compared 1:1.
+  return sortArray((methods || []).filter((method) => !methodIsUnavailableOverStdioAuth(method)
+    && !methodAdvertisedOnlyWhereRunnable(method)));
 }
 
 function routeInventoryMethods(routeInventory) {
@@ -1433,8 +1616,15 @@ function routeInventoryMethods(routeInventory) {
 function scrub(value) {
   if (Array.isArray(value)) return value.map(scrub);
   if (value && typeof value === 'object') {
+    // Object KEYS can carry run-local identity too (e.g. hydrate's
+    // projection_thread_sequences map is keyed by thread uuid). Redact them
+    // in sorted order so both transports land on identical placeholders.
+    const uuidKey = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const uuidKeys = Object.keys(value).filter((key) => uuidKey.test(key)).sort();
+    const uuidKeyPlaceholders = new Map(uuidKeys.map((key, index) => [key, `<uuid-${index + 1}>`]));
     const out = {};
-    for (const [key, raw] of Object.entries(value)) {
+    for (const [rawKey, raw] of Object.entries(value)) {
+      const key = uuidKeyPlaceholders.get(rawKey) ?? rawKey;
       if (['ts', 'timestamp', 'started_at', 'completed_at', 'recorded_at_ms', 'created_at_ms', 'updated_at_ms', 'finished_at_ms', 'duration_ms'].includes(key)) {
         continue;
       }
@@ -1788,7 +1978,10 @@ function normalizeScenarioResult(result) {
 }
 
 function checkedMethodsForResult(result) {
-  const checked = new Set(requiredScenarioMethods);
+  // The inventory probe pass records every route it covered, including the
+  // PROBED_ELSEWHERE methods it deliberately skipped live-calling — those are
+  // accounted for, not missing.
+  const checked = new Set([...requiredScenarioMethods, ...(result.probedRouteMethods || [])]);
   for (const probe of Object.values(result.probes || {})) {
     if (probe?.method) checked.add(probe.method);
   }

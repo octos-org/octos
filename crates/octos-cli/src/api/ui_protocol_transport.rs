@@ -31560,18 +31560,19 @@ async fn m14_codex_tool_call(
 ) -> Result<octos_agent::ToolResult, String> {
     let tool_call_id = format!("m14-codex-p0-{index}-{tool_name}-{}", env.turn_id.0);
     let topic = env.session_id.topic().map(ToOwned::to_owned);
-    let _ = send_notification_durable(
-        env.ws,
-        env.ledger,
-        UiNotification::ToolStarted(ToolStartedEvent {
-            session_id: env.session_id.clone(),
-            topic: topic.clone(),
-            turn_id: env.turn_id.clone(),
-            tool_call_id: tool_call_id.clone(),
-            tool_name: tool_name.to_owned(),
-            arguments: Some(args.clone()),
-        }),
-    );
+    // Dual-emit like `forward_progress_event`: the raw lifecycle frames are
+    // suppressed for every connection since #2318, so the canonical envelope
+    // is the only lane that carries these tool events to clients.
+    let started = UiNotification::ToolStarted(ToolStartedEvent {
+        session_id: env.session_id.clone(),
+        topic: topic.clone(),
+        turn_id: env.turn_id.clone(),
+        tool_call_id: tool_call_id.clone(),
+        tool_name: tool_name.to_owned(),
+        arguments: Some(args.clone()),
+    });
+    emit_progress_envelope(env.ledger, env.session_id, &started, None);
+    let _ = send_notification_durable(env.ws, env.ledger, started);
     let result = env
         .registry
         .execute_with_context(env.ctx, tool_name, &args)
@@ -31580,20 +31581,18 @@ async fn m14_codex_tool_call(
     let metadata = result.structured_metadata.clone();
     let output_preview = m14_codex_tool_preview(&result.output);
     let success = result.success;
-    let _ = send_notification_durable(
-        env.ws,
-        env.ledger,
-        UiNotification::ToolCompleted(ToolCompletedEvent {
-            session_id: env.session_id.clone(),
-            topic,
-            turn_id: env.turn_id.clone(),
-            tool_call_id: tool_call_id.clone(),
-            tool_name: tool_name.to_owned(),
-            success: Some(success),
-            output_preview: Some(output_preview.clone()),
-            duration_ms: Some(1),
-        }),
-    );
+    let completed = UiNotification::ToolCompleted(ToolCompletedEvent {
+        session_id: env.session_id.clone(),
+        topic,
+        turn_id: env.turn_id.clone(),
+        tool_call_id: tool_call_id.clone(),
+        tool_name: tool_name.to_owned(),
+        success: Some(success),
+        output_preview: Some(output_preview.clone()),
+        duration_ms: Some(1),
+    });
+    emit_progress_envelope(env.ledger, env.session_id, &completed, None);
+    let _ = send_notification_durable(env.ws, env.ledger, completed);
     append_appui_evidence_jsonl(
         "task-ledger.jsonl",
         json!({
@@ -31781,6 +31780,10 @@ async fn run_m14_codex_p0_tool_parity_fixture_turn(
         .await?;
 
         let patch_path = "codex-p0-apply-patch.txt";
+        // The WS and stdio legs share one workspace, so the second leg's
+        // Add File patch would hit the first leg's file. Reset the
+        // precondition before the step.
+        let _ = std::fs::remove_file(workspace.join(patch_path));
         let _ = m14_codex_tool_call(
             &call_env,
             next_step!(),
