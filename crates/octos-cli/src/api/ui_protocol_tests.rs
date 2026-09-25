@@ -22780,6 +22780,113 @@ fn ws_connection_for_test(
     (WsConnection::new(tx), rx)
 }
 
+/// The m14 Codex P0 fixture must dual-emit every tool call: the raw durable
+/// notification (suppressed per-connection since #2318) AND the canonical
+/// projection/envelope payload that actually reaches clients. Without the
+/// envelope arm the soak's tool assertions can never fire.
+#[tokio::test]
+async fn m14_codex_tool_call_dual_emits_raw_and_envelope() {
+    let (ws, _rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let workspace = std::env::temp_dir().join(format!(
+        "m14-codex-dual-emit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&workspace).expect("temp workspace");
+    let registry = octos_agent::ToolRegistry::with_builtins(&workspace);
+    let mut ctx = octos_agent::tools::ToolContext::zero();
+    let supervisor = registry.supervisor();
+    ctx.task_supervisor = Some(supervisor);
+    let session_id = SessionKey("local:test".into());
+    let turn_id = TurnId::new();
+    let env = M14CodexToolCallEnv {
+        ws: &ws,
+        ledger: &ledger,
+        registry: &registry,
+        ctx: &ctx,
+        session_id: &session_id,
+        turn_id: &turn_id,
+    };
+
+    let result = m14_codex_tool_call(
+        &env,
+        1,
+        "update_plan",
+        serde_json::json!({
+            "explanation": "dual-emit probe",
+            "plan": [{"step": "one", "status": "pending"}]
+        }),
+        true,
+    )
+    .await
+    .expect("update_plan must succeed");
+
+    assert!(result.success);
+    std::fs::remove_dir_all(&workspace).ok();
+
+    // Direct-sends apply the per-connection capability filter (#1336), so the
+    // raw arm is asserted against the ledger (where legacy connections pick
+    // it up), not against this connection's writer.
+    let replay = ledger
+        .replay_after(
+            &session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .expect("replay after codex tool call");
+    let call_id = format!("m14-codex-p0-1-update_plan-{}", turn_id.0);
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ToolStarted(event))
+                if event.turn_id == turn_id && event.tool_call_id == call_id
+        )),
+        "raw tool/started row must still be durable-appended"
+    );
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ToolCompleted(event))
+                if event.turn_id == turn_id && event.tool_call_id == call_id
+        )),
+        "raw tool/completed row must still be durable-appended"
+    );
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
+                if envelope.envelope.turn_id == turn_id.0.to_string()
+                    && matches!(
+                        &envelope.envelope.payload,
+                        PayloadV2::ToolStart { name, .. }
+                            if name == "update_plan"
+                    )
+        )),
+        "ledger must carry the canonical tool_start envelope"
+    );
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
+                if matches!(
+                    &envelope.envelope.payload,
+                    PayloadV2::ToolEnd {
+                        tool_call_id,
+                        status: octos_core::ui_protocol::EnvelopeToolEndStatus::Complete,
+                        ..
+                    } if tool_call_id == &call_id
+                )
+        )),
+        "ledger must carry the canonical complete tool_end envelope"
+    );
+}
+
 /// #1969 — an interrupted goal/peer turn must charge its partial spend from the
 /// live tracker (the drain loop breaks before the done/error arm folds usage),
 /// while a completed/errored turn keeps the folded total.
