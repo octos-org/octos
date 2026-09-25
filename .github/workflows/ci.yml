@@ -227,6 +227,13 @@ jobs:
           . ./scripts/tests/test-serve-launcher-token.ps1
           exit 0
 
+      - name: Test installer bundle checksum verification
+        shell: pwsh
+        run: |
+          # Same dot-source discipline as above (#2388).
+          . ./scripts/tests/test-install-checksum.ps1
+          exit 0
+
   web-app-base-url-windows:
     runs-on: windows-latest
     steps:
@@ -247,6 +254,11 @@ jobs:
 
       - name: Test bundle checksum sidecar
         run: scripts/test-bundle-release.sh
+
+      - name: Test installer checksum verification
+        run: |
+          bash scripts/test-install-paths.sh
+          pwsh scripts/tests/test-install-checksum.ps1
 
   check:
     runs-on: ubuntu-latest
