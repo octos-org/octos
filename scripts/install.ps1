@@ -164,6 +164,35 @@ function Test-Command($cmd) {
     $null -ne (Get-Command $cmd -ErrorAction SilentlyContinue)
 }
 
+# Verify a downloaded bundle against its `.sha256` sidecar — the standard
+# `sha256sum` line that bundle-release.sh publishes next to every asset
+# (#2514). A mismatch aborts the install; a missing or unparseable sidecar
+# (pre-rc.12 releases, air-gapped mirrors, mirrors that answer 200 with an
+# error page) only warns — there is nothing published to verify against.
+function Test-BundleChecksum([string]$ZipPath, [string]$SidecarPath) {
+    $name = Split-Path -Leaf $ZipPath
+    if (-not (Test-Path $SidecarPath)) {
+        Warn "no $name.sha256 sidecar found — skipping checksum verification"
+        return
+    }
+    # Must parse as a sha256sum line ("<64-hex>  <filename>"). A 0-byte
+    # sidecar yields a null first line — guard that explicitly rather than
+    # relying on how the match operators treat a null LHS.
+    $firstLine = Get-Content $SidecarPath -TotalCount 1
+    if ([string]::IsNullOrEmpty($firstLine) -or $firstLine -notmatch '^[0-9a-fA-F]{64}\s+') {
+        Warn "malformed $name.sha256 sidecar — skipping checksum verification"
+        return
+    }
+    $expectedHash = ($firstLine.Trim() -split '\s+')[0]
+    # -ne is case-insensitive, so either hash case verifies — same as GNU
+    # sha256sum -c and macOS shasum -c (both accept uppercase hex).
+    $actualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash
+    if ($actualHash -ne $expectedHash) {
+        Err "Checksum MISMATCH for $name — the download does not match the published checksum. Refusing to install."
+    }
+    Ok "checksum verified: $name"
+}
+
 # Validate a value against a regex pattern; exit on mismatch.
 function Validate($name, $value, $pattern) {
     if ($value -and $value -notmatch "^${pattern}$") {
@@ -1069,10 +1098,22 @@ try {
         } catch {
             Err "Download failed. Check that release $Version has a binary for $Triple."
         }
+        # -ErrorAction Stop keeps a 404 (pre-rc.12 release) from writing an
+        # error page into the sidecar that would fail verification below.
+        try {
+            Invoke-WebRequest -Uri "$DownloadUrl.sha256" -OutFile "$zipPath.sha256" -UseBasicParsing -ErrorAction Stop
+        } catch {
+            Remove-Item "$zipPath.sha256" -ErrorAction SilentlyContinue
+        }
     } else {
         Write-Host "    Copying from $localPath..."
         Copy-Item $localPath $zipPath
+        if (Test-Path "$localPath.sha256") {
+            Copy-Item "$localPath.sha256" "$zipPath.sha256"
+        }
     }
+
+    Test-BundleChecksum $zipPath "$zipPath.sha256"
 
     # Extract
     $extractDir = Join-Path $installTmp "extracted"

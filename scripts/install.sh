@@ -840,6 +840,45 @@ detect_installed_port() {
     fi
 }
 
+# Verify the downloaded bundle against the `.sha256` sidecar that
+# bundle-release.sh publishes next to it (#2514). A mismatch aborts the
+# install; a missing or unparseable sidecar (releases older than rc.12,
+# air-gapped mirrors, mirrors that answer 200 with an error page) only
+# warns — there is nothing published we could verify against.
+# Uses globals: INSTALL_TMP, TARBALL
+verify_bundle_checksum() {
+    local sidecar="${INSTALL_TMP}/${TARBALL}.sha256"
+    if [ ! -f "$sidecar" ]; then
+        warn "no ${TARBALL}.sha256 sidecar found — skipping checksum verification"
+        return 0
+    fi
+    # The sidecar must parse as a sha256sum line ("<64-hex>  <filename>").
+    # Strip CR first — GNU sha256sum -c tolerates a CRLF sidecar, macOS
+    # shasum -c does not (it would look for a file named "...tar.gz\r") —
+    # so a text-mode mirror gets the same verdict on both platforms.
+    tr -d '\r' < "$sidecar" > "${sidecar}.norm" || true
+    if grep -Eq '^[0-9a-fA-F]{64}[[:blank:]]+' "${sidecar}.norm"; then
+        mv "${sidecar}.norm" "$sidecar"
+    else
+        warn "malformed ${TARBALL}.sha256 sidecar — skipping checksum verification"
+        rm -f "${sidecar}.norm"
+        return 0
+    fi
+    local verified=false
+    if command -v sha256sum >/dev/null 2>&1; then
+        (cd "$INSTALL_TMP" && sha256sum -c "${TARBALL}.sha256" >/dev/null) && verified=true
+    elif command -v shasum >/dev/null 2>&1; then
+        (cd "$INSTALL_TMP" && shasum -a 256 -c "${TARBALL}.sha256" >/dev/null) && verified=true
+    else
+        err "no SHA-256 tool found (sha256sum/shasum) — refusing to install an unverified bundle"
+    fi
+    if [ "$verified" = true ]; then
+        ok "checksum verified: $TARBALL"
+    else
+        err "checksum MISMATCH for $TARBALL — the download does not match the published checksum. Refusing to install."
+    fi
+}
+
 # err() exits during install but not during doctor
 if [ "$RUN_DOCTOR" = true ]; then
     DOCTOR_ISSUES=0
@@ -1554,18 +1593,29 @@ if [[ "$DOWNLOAD_URL" == file://* ]]; then
     if ! cp "$LOCAL_PATH" "${INSTALL_TMP}/${TARBALL}"; then
         err "File not found: $LOCAL_PATH"
     fi
+    cp "${LOCAL_PATH}.sha256" "${INSTALL_TMP}/${TARBALL}.sha256" 2>/dev/null || true
 else
     echo "    Downloading $TARBALL..."
     if ! curl -fsSL -o "${INSTALL_TMP}/${TARBALL}" "$DOWNLOAD_URL"; then
         err "Download failed. Check that release $VERSION has a binary for $TRIPLE."
     fi
+    # -f keeps a 404 (pre-rc.12 release) from writing an error page that
+    # would fail verification below.
+    curl -fsSL -o "${INSTALL_TMP}/${TARBALL}.sha256" "${DOWNLOAD_URL}.sha256" 2>/dev/null \
+        || rm -f "${INSTALL_TMP}/${TARBALL}.sha256"
 fi
+
+verify_bundle_checksum
 
 tar -xzf "${INSTALL_TMP}/${TARBALL}" -C "$INSTALL_TMP"
 
 mkdir -p "$PREFIX"
 for bin in "$INSTALL_TMP"/*; do
     [ -f "$bin" ] || continue
+    case "$bin" in
+        # Download artifacts are not programs — never ship them into $PREFIX.
+        *.tar.gz|*.sha256) continue ;;
+    esac
     cp "$bin" "$PREFIX/"
     chmod +x "$PREFIX/$(basename "$bin")"
 done
