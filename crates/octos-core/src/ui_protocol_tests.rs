@@ -3743,28 +3743,48 @@ fn input_item_unknown_kind_falls_through() {
 
 #[test]
 fn rpc_error_codes_partition_is_disjoint() {
-    // Application-layer codes must live in -32100..=-32199; the
-    // spec-pinned APPROVAL_NOT_PENDING is the documented exception.
-    for code in [
-        rpc_error_codes::UNKNOWN_SESSION,
-        rpc_error_codes::UNKNOWN_TURN,
-        rpc_error_codes::UNKNOWN_APPROVAL_ID,
-        rpc_error_codes::UNKNOWN_PREVIEW_ID,
-        rpc_error_codes::UNKNOWN_TASK_ID,
-        rpc_error_codes::APPROVAL_CANCELLED,
-        rpc_error_codes::CURSOR_OUT_OF_RANGE,
-        rpc_error_codes::CURSOR_INVALID,
-        rpc_error_codes::PERMISSION_DENIED,
-        rpc_error_codes::UNSUPPORTED_CAPABILITY,
-        rpc_error_codes::RUNTIME_NOT_READY,
-        rpc_error_codes::MALFORMED_RESULT,
-        rpc_error_codes::RATE_LIMITED,
-    ] {
+    // Application-layer codes must live in -32100..=-32199. The set under
+    // check is derived from the module's own constants rather than
+    // hand-copied, so a new constant is range-checked the moment it lands;
+    // only the documented out-of-band slots below are exempt, and each
+    // exemption must itself sit in its docblock band, so the exemption
+    // lists cannot silently swallow an application code.
+    let json_rpc_reserved = [
+        rpc_error_codes::PARSE_ERROR,
+        rpc_error_codes::INVALID_REQUEST,
+        rpc_error_codes::METHOD_NOT_FOUND,
+        rpc_error_codes::INVALID_PARAMS,
+        rpc_error_codes::INTERNAL_ERROR,
+    ];
+    let server_band = [
+        rpc_error_codes::METHOD_NOT_SUPPORTED,
+        rpc_error_codes::APPROVAL_NOT_PENDING,
+    ];
+    for &code in &json_rpc_reserved {
         assert!(
-            (-32199..=-32100).contains(&code),
-            "{code} outside -32100..=-32199",
+            (-32700..=-32600).contains(&code),
+            "{code} outside the JSON-RPC reserved block -32700..=-32600",
         );
     }
+    for &code in &server_band {
+        assert!(
+            (-32099..=-32000).contains(&code),
+            "{code} outside the server band -32000..=-32099",
+        );
+    }
+    let mut outside_band = Vec::new();
+    for (name, code) in parse_rpc_error_code_constants() {
+        if json_rpc_reserved.contains(&code) || server_band.contains(&code) {
+            continue;
+        }
+        if !(-32199..=-32100).contains(&code) {
+            outside_band.push(format!("{name}={code}"));
+        }
+    }
+    assert!(
+        outside_band.is_empty(),
+        "codes outside -32100..=-32199: {outside_band:?}",
+    );
     assert_eq!(rpc_error_codes::APPROVAL_NOT_PENDING, -32011);
     assert_eq!(rpc_error_codes::APPROVAL_CANCELLED, -32105);
 }
