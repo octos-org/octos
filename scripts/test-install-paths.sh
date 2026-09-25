@@ -183,15 +183,17 @@ main() {
 
     # An UPPERCASE-hash sidecar verifies too: GNU sha256sum -c and macOS
     # shasum -c both accept uppercase hex (verified on both tools), matching
-    # install.ps1's case-insensitive comparison.
+    # install.ps1's case-insensitive comparison. Uppercase the digest bytes
+    # only — the recorded filename must stay byte-identical, or a
+    # case-sensitive filesystem cannot resolve it.
     local upper_dir="$test_root/upper-sidecar"
+    local upper_sidecar="$upper_dir/octos-bundle-$(host_triple).tar.gz.sha256"
     DOWNLOAD_BASE="file://$upper_dir"
     mkdir -p "$upper_dir"
     create_fake_bundle "$upper_dir"
-    tr 'a-f' 'A-F' < "$upper_dir/octos-bundle-$(host_triple).tar.gz.sha256" \
-        > "$upper_dir/octos-bundle-$(host_triple).tar.gz.sha256.up"
-    mv "$upper_dir/octos-bundle-$(host_triple).tar.gz.sha256.up" \
-        "$upper_dir/octos-bundle-$(host_triple).tar.gz.sha256"
+    { head -c 64 "$upper_sidecar" | tr 'a-f' 'A-F'; tail -c +65 "$upper_sidecar"; } \
+        > "$upper_sidecar.up"
+    mv "$upper_sidecar.up" "$upper_sidecar"
     run_installer "$test_root" "$test_root/home-upper" "$test_root/upper-bin" \
         "$test_root/upper.out" "$mock_bin"
     [ -x "$test_root/upper-bin/octos" ] \
