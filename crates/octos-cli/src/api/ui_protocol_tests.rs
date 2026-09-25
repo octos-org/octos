@@ -44858,6 +44858,231 @@ async fn should_withhold_not_running_for_a_topic_turn_asked_by_its_folded_id() {
     }
 }
 
+/// A scripted model that keeps calling `read_file`, driving a REAL
+/// profile-capped serve session (`max_iterations = 2`) to its budget stop.
+/// #2359: the granted grace call must reach the model tools-disabled and its
+/// synthesis — not the canned budget-stop message — is what the session
+/// history ends with.
+#[tokio::test]
+async fn should_end_a_capped_serve_turn_with_the_tools_disabled_grace_synthesis() {
+    struct ScriptedToolCaller {
+        marker_a: String,
+        marker_b: String,
+        requests: Arc<StdMutex<Vec<Vec<octos_llm::ToolSpec>>>>,
+    }
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for ScriptedToolCaller {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            let mut requests = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+            requests.push(tools.to_vec());
+            let index = requests.len() - 1;
+            drop(requests);
+            let (content, tool_calls, stop_reason) = match index {
+                0 => (
+                    None,
+                    vec![octos_core::ToolCall {
+                        id: "grace-e2e-read-a".into(),
+                        name: "read_file".into(),
+                        arguments: json!({ "path": self.marker_a }),
+                        metadata: None,
+                    }],
+                    octos_llm::StopReason::ToolUse,
+                ),
+                1 => (
+                    None,
+                    vec![octos_core::ToolCall {
+                        id: "grace-e2e-read-b".into(),
+                        name: "read_file".into(),
+                        arguments: json!({ "path": self.marker_b }),
+                        metadata: None,
+                    }],
+                    octos_llm::StopReason::ToolUse,
+                ),
+                _ => (
+                    Some(
+                        "GRACE SYNTHESIS: both markers read and summarized; nothing remains."
+                            .into(),
+                    ),
+                    Vec::new(),
+                    octos_llm::StopReason::EndTurn,
+                ),
+            };
+            Ok(octos_llm::ChatResponse {
+                content,
+                reasoning_content: None,
+                tool_calls,
+                stop_reason,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "serve-grace-scripted"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = SessionKey::new("api", "grace-e2e-serve");
+    // The no-hint session workspace (`resolve_workspace_root`): it must exist
+    // BEFORE the session boots so the scope canonicalizes it and the file
+    // tools accept reads inside (the raw-vs-canonical no-hint trap).
+    let workspace = temp
+        .path()
+        .join("profiles")
+        .join(MAIN_PROFILE_ID)
+        .join("data")
+        .join("users")
+        .join(octos_bus::session::encode_path_component(
+            session_id.base_key(),
+        ))
+        .join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // Substantive bodies (>=128 chars, see `is_productive_tool_message`) so
+    // both reads count as productive and the grace call is granted.
+    let marker_body = "GRACE MARKER BODY: the abstract, the method section and the evaluation, \
+long enough to be a substantive tool result rather than a short diagnostic string.";
+    let marker_a = workspace.join("grace-marker-a.txt");
+    let marker_b = workspace.join("grace-marker-b.txt");
+    std::fs::write(&marker_a, format!("{marker_body}\nmarker: A")).unwrap();
+    std::fs::write(&marker_b, format!("{marker_body}\nmarker: B")).unwrap();
+
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedToolCaller {
+        marker_a: marker_a.display().to_string(),
+        marker_b: marker_b.display().to_string(),
+        requests: requests.clone(),
+    });
+    // NOTE: the runtime Arc is dropped here so the mutation below can take
+    // the profile's last reference via `Arc::get_mut`.
+    let (mut state, _) = state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider).await;
+    let runtime = Arc::get_mut(&mut state)
+        .unwrap()
+        .profiles
+        .get_mut(MAIN_PROFILE_ID)
+        .expect("main profile runtime");
+    Arc::get_mut(runtime).unwrap().max_iterations = Some(2);
+
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &session_id)
+        .await
+        .expect("session manager for the test profile");
+    sessions.lock().await.get_or_create(&session_id).await;
+
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(128));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(256);
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "grace-e2e".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: TurnId::new(),
+            input: vec![InputItem::Text {
+                text: "read both markers".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+        },
+    )
+    .await;
+    let response = recv_rpc_response_with_id(&mut rx, "grace-e2e").await;
+    assert!(
+        response.get("result").is_some(),
+        "the capped turn must be accepted: {response}"
+    );
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        loop {
+            let frame = recv_rpc_json(&mut rx).await;
+            let m = frame.get("method").and_then(Value::as_str);
+            let is_v2_terminal = m == Some("projection/envelope")
+                && frame
+                    .get("params")
+                    .and_then(|p| p.get("payload"))
+                    .and_then(|p| p.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("turn_terminal");
+            if m == Some("turn/completed") || m == Some("turn/error") || is_v2_terminal {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the capped turn must settle");
+
+    let synthesis = "GRACE SYNTHESIS: both markers read and summarized; nothing remains.";
+    let deadline = std::time::Instant::now() + waiting_budget(Duration::from_secs(10));
+    let final_text = loop {
+        let mut sessions_guard = sessions.lock().await;
+        let session = sessions_guard.get_or_create(&session_id).await;
+        if let Some(message) = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant && m.content.contains(synthesis))
+        {
+            break message.content.clone();
+        }
+        drop(sessions_guard);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the grace synthesis never reached the session history; got: {:?}",
+            {
+                let mut sessions_guard = sessions.lock().await;
+                let session = sessions_guard.get_or_create(&session_id).await;
+                session
+                    .messages
+                    .iter()
+                    .map(|m| (m.role.as_str().to_string(), m.content.clone()))
+                    .collect::<Vec<_>>()
+            }
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        !final_text.contains("did not complete within"),
+        "the canned budget-stop message must not be the session's final answer: {final_text}"
+    );
+    let requests = requests.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(
+        requests.len(),
+        3,
+        "two tool rounds plus the grace call, nothing after it"
+    );
+    assert!(
+        requests.iter().take(2).all(|tools| !tools.is_empty()),
+        "the action iterations still carry the full tool slice"
+    );
+    assert!(
+        requests[2].is_empty(),
+        "the grace call must reach the model tools-disabled"
+    );
+}
+
 // --- session keep-alive: an open Session must not age out of the runtime
 // cache under a client that is simply reading (see
 // APPUI_SESSION_KEEPALIVE_INTERVAL).
