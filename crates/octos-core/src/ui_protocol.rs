@@ -2006,6 +2006,8 @@ pub struct SessionOpenParams {
     pub sandbox: Option<SessionSandboxParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<UiCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_commands: Option<Vec<String>>,
 }
 
 /// Optional session-scoped sandbox narrowing requested by `session/open`.

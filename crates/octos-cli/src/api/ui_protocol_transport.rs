@@ -20414,6 +20414,9 @@ async fn open_session_result(
                 // this session's turns later append) under the per-cwd
                 // storage identity. No-op when the store wasn't relocated.
                 register_session_ledger_scope(state, ledger, &runtime);
+                if let Some(commands) = &params.client_commands {
+                    runtime.apply_client_commands(commands);
+                }
                 open_context_provider = Some(
                     peer_lane_provider_for(&params.session_id, &runtime)
                         .unwrap_or_else(|| runtime.profile.llm.clone()),

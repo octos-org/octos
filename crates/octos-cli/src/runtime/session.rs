@@ -21,6 +21,9 @@ use octos_core::{
 };
 
 use super::ProfileRuntime;
+use crate::commands::gateway::prompt::{
+    SLASH_COMMANDS_SEGMENT_NAME, render_client_commands, strip_slash_commands,
+};
 
 /// All per-session state derived from a parent [`ProfileRuntime`].
 ///
@@ -218,6 +221,16 @@ impl SessionRuntime {
             EffectivePermissions::workspace_write(),
         )
         .await
+    }
+
+    /// Tell the agent which slash commands the attached client declared on
+    /// `session/open` (octoscode#664); an empty list clears them. Per-turn
+    /// agents inherit it via the snapshot.
+    pub fn apply_client_commands(&self, commands: &[String]) {
+        self.agent.set_prompt_segment(
+            SLASH_COMMANDS_SEGMENT_NAME,
+            render_client_commands(commands),
+        );
     }
 
     /// [`Self::bootstrap`] with an explicit `sessions_in_cwd` flag. The
@@ -563,6 +576,10 @@ impl SessionRuntime {
             }
         };
 
+        // The prompt's slash commands (`/router`, `/queue`, …) are handled by
+        // bus channels only; serve sessions get the client's own commands
+        // instead, via `apply_client_commands` (octoscode#664).
+        let base_prompt = strip_slash_commands(&profile.prompt_parts.pre_memory);
         let mut agent = Agent::new_shared(
             AgentId::new("api"),
             profile.llm.clone(),
@@ -585,7 +602,7 @@ impl SessionRuntime {
         // line, the agent's prompt would fall back to the
         // `Agent::new_shared` default and the LLM would lose its
         // skill-aware routing.
-        .with_system_prompt(profile.prompt_parts.pre_memory.clone())
+        .with_system_prompt(base_prompt)
         .with_file_state_cache(file_state_cache)
         .with_subagent_output_router(subagent_output_router)
         .with_subagent_summary_generator(subagent_summary_generator)
@@ -635,6 +652,7 @@ impl SessionRuntime {
         // fabricates a "memory bank" when asked). The provider re-renders
         // the segment at each turn start when MEMORY.md / daily notes /
         // bank change on disk (one fingerprint stat per turn otherwise).
+        agent.set_prompt_segment(SLASH_COMMANDS_SEGMENT_NAME, String::new());
         let memory_ctx = profile
             .memory_store
             .get_injectable_context(profile.memory_inject_tokens)
@@ -1481,6 +1499,34 @@ tools = ["read_file"]
             prompt.contains("Friday again"),
             "read-refresh must pick up post-bootstrap consolidations: {prompt}"
         );
+    }
+
+    #[tokio::test]
+    async fn serve_sessions_drop_channel_slash_commands_and_take_client_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt =
+            "base rules\n\n## Slash Commands\n\n- `/router` — server router\n\n## Other Rules\n\nbe kind"
+                .to_string();
+        let profile = make_profile_with_prompt(dir.path().to_path_buf(), prompt).await;
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "cmds"), None)
+            .await
+            .expect("bootstrap");
+        let before = rt.agent.system_prompt_snapshot();
+        assert!(!before.contains("`/router`"));
+        assert!(!before.contains("## Slash Commands"));
+        assert!(before.contains("be kind"));
+
+        rt.apply_client_commands(&["/model".into(), "/add-model".into()]);
+        let after = rt.agent.system_prompt_snapshot();
+        assert!(!after.contains("`/router`"));
+        assert!(after.contains("`/model`"));
+        assert!(after.contains("`/add-model`"));
+        assert!(after.contains("be kind"));
+
+        rt.apply_client_commands(&[]);
+        let none = rt.agent.system_prompt_snapshot();
+        assert!(!none.contains("`/router`"));
+        assert!(!none.contains("`/model`"));
     }
 
     #[tokio::test]
