@@ -12,13 +12,13 @@
  * Run against a live octos-serve instance:
  *   OCTOS_TEST_URL=http://localhost:3000 npx playwright test web-client
  *
- * NOTE: when run against the deterministic fixture protocol server
- * (`OCTOS_M9_PROTOCOL_FIXTURES=1`, the nightly protocol lane's config), the
- * CJK / literal-token specs (lines 104, 136, 305) fail by construction — the
- * fixture answers "OK" to every prompt that matches no fixture marker — and
- * `session persists across requests` fails because the aux
- * `session/messages_page` handler is not configured on that server. Verified
- * causes and options: #2483.
+ * NOTE: on the deterministic fixture protocol server (`OCTOS_M9_PROTOCOL_FIXTURES=1`,
+ * the nightly protocol lane's config) the CJK / literal-token specs route to
+ * dedicated fixtures that echo the declared content (#2483), so their content
+ * assertions run there. The history-check half of `session persists across
+ * requests` still only runs against a live serve: fixture turns do not
+ * persist session JSONL and the aux `session/messages_page` REST backing
+ * needs the gateway/profile runtime the deterministic serve does not wire.
  */
 import { test, expect } from '@playwright/test';
 import {
@@ -198,6 +198,12 @@ test('WS chat completes with terminal done event', async ({
 // retired); the WS chat path drives the live turn.
 // ---------------------------------------------------------------------------
 test('session persists across requests', async ({ request, baseURL }) => {
+  // #2483: on the fixture lane the history-check half below cannot run —
+  // fixture turns never persist session JSONL and the deterministic serve
+  // wires no gateway/profile runtime for the `session/messages_page` REST
+  // backing — so it is gated on a live serve. The chat-turn half still runs
+  // everywhere.
+  const fixtureLane = process.env.OCTOS_M9_PROTOCOL_FIXTURES === '1';
 
   const sid = `test-persist-${Date.now()}`;
 
@@ -209,6 +215,10 @@ test('session persists across requests', async ({ request, baseURL }) => {
   );
 
   expect(content.toUpperCase()).toContain('OK');
+
+  if (fixtureLane) {
+    return;
+  }
 
   const messages = await getSessionMessages(request, baseURL!, sid, { source: 'full' });
   expect(messages.some((message: any) => message.role === 'user')).toBeTruthy();
