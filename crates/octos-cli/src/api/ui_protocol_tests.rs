@@ -22908,6 +22908,191 @@ fn interrupted_goal_charge_falls_back_to_tracker_only_when_interrupted_with_zero
     assert_eq!(interrupted_goal_charge(true, 42, &tracker), 42);
 }
 
+// #2483 — the web-client fixture arms dual-emit like Basic: the raw
+// ephemeral is suppressed per-connection (#2318), so the canonical envelope
+// lane in the ledger is what clients (and these tests) assert on.
+fn fixture_ledger_assistant_deltas(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+) -> Vec<String> {
+    ledger
+        .replay_after(
+            session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .expect("replay after fixture turn")
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                match &envelope.envelope.payload {
+                    PayloadV2::AssistantDelta { text, .. } => Some(text.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+// #2483 — the echo fixture's router arm and emitter share this extraction;
+// pin the marker's case-insensitivity and the literal's verbatim form.
+#[test]
+fn m9_fixture_echo_literal_extracts_the_declared_literal() {
+    assert_eq!(
+        m9_fixture_echo_literal("Reply with exactly: ALPHA").as_deref(),
+        Some("ALPHA")
+    );
+    assert_eq!(
+        m9_fixture_echo_literal("reply WITH EXACTLY:  BRAVO ").as_deref(),
+        Some("BRAVO")
+    );
+    // The marker search lowercases a byte-length-preserving copy, so the
+    // slice offset stays valid and non-ASCII content survives verbatim —
+    // on both sides of the marker.
+    assert_eq!(
+        m9_fixture_echo_literal("Reply with exactly: 你好世界").as_deref(),
+        Some("你好世界")
+    );
+    assert_eq!(
+        m9_fixture_echo_literal("列出城市。Reply with exactly: 广州").as_deref(),
+        Some("广州")
+    );
+    assert_eq!(m9_fixture_echo_literal("no marker here"), None);
+    assert_eq!(m9_fixture_echo_literal("Reply with exactly:   "), None);
+}
+
+#[tokio::test]
+async fn echo_literal_fixture_dual_emits_the_declared_literal() {
+    let (ws, _rx) = ws_connection_for_test(32);
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey("local:echo-alpha".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "Reply with exactly: ALPHA".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    // Sender stays alive so the trailing fixture delay completes instead of
+    // reading the closed channel as an interrupt.
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+
+    run_m9_fixture_turn(
+        ws,
+        state,
+        Arc::clone(&ledger),
+        contracts,
+        params,
+        M9ProtocolFixture::EchoLiteral,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+
+    assert_eq!(
+        fixture_ledger_assistant_deltas(&ledger, &session_id),
+        vec!["ALPHA".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn cjk_fixtures_dual_emit_multibyte_content_with_per_line_deltas() {
+    let state = Arc::new(AppState::empty_for_tests());
+    let contracts = Arc::new(UiProtocolContractStores::default());
+
+    let (ws, _rx) = ws_connection_for_test(32);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let session_id = SessionKey("local:cjk-short".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "用中文回复：你好世界。只回复这四个字，不要多说。".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    run_m9_fixture_turn(
+        ws,
+        Arc::clone(&state),
+        Arc::clone(&ledger),
+        Arc::clone(&contracts),
+        params,
+        M9ProtocolFixture::CjkUtf8Short,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+    assert_eq!(
+        fixture_ledger_assistant_deltas(&ledger, &session_id),
+        vec!["你好世界".to_owned()]
+    );
+
+    let (ws, _rx) = ws_connection_for_test(32);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let session_id = SessionKey("local:cjk-long".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "列出5个中国城市的名字，每个城市一行，只要城市名不要其他内容。".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    run_m9_fixture_turn(
+        ws,
+        state,
+        Arc::clone(&ledger),
+        contracts,
+        params,
+        M9ProtocolFixture::CjkUtf8Long,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+    // One delta per line: the client assembles the CJK content across
+    // multiple frames, the multi-delta shape the long-response spec exists
+    // to exercise.
+    assert_eq!(
+        fixture_ledger_assistant_deltas(&ledger, &session_id),
+        vec![
+            "北京\n".to_owned(),
+            "上海\n".to_owned(),
+            "广州\n".to_owned(),
+            "深圳\n".to_owned(),
+            "杭州\n".to_owned(),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
     let (ws, mut rx) = ws_connection_for_test(32);

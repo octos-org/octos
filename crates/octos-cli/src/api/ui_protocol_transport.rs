@@ -1827,6 +1827,9 @@ impl TerminalReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum M9ProtocolFixture {
     Basic,
+    EchoLiteral,
+    CjkUtf8Short,
+    CjkUtf8Long,
     M19StdioHappyPath,
     Slow,
     ToolEvents,
@@ -1882,9 +1885,28 @@ fn m9_protocol_fixture_for_prompt(prompt: &str) -> Option<M9ProtocolFixture> {
         || prompt_lower.contains("one line at a time")
     {
         Some(M9ProtocolFixture::Slow)
+    } else if m9_fixture_echo_literal(prompt).is_some() {
+        Some(M9ProtocolFixture::EchoLiteral)
+    } else if prompt.contains("你好世界") {
+        // #2483: the web-client UTF-8 integrity specs prompt in CJK; canned
+        // replies let those assertions run on the deterministic lane.
+        Some(M9ProtocolFixture::CjkUtf8Short)
+    } else if prompt.contains("中国城市") {
+        Some(M9ProtocolFixture::CjkUtf8Long)
     } else {
         Some(M9ProtocolFixture::Basic)
     }
+}
+
+/// #2483 — the web-client literal-token prompts ("Reply with exactly: X")
+/// carry their expected content inline; the fixture echoes that literal back.
+/// The marker matches case-insensitively and anywhere in the prompt (this
+/// router only runs on the fixture serve), the literal is preserved verbatim.
+fn m9_fixture_echo_literal(prompt: &str) -> Option<String> {
+    let marker = "reply with exactly:";
+    let idx = prompt.to_ascii_lowercase().find(marker)? + marker.len();
+    let literal = prompt[idx..].trim();
+    (!literal.is_empty()).then(|| literal.to_owned())
 }
 
 struct ActiveTurn {
@@ -31053,6 +31075,80 @@ async fn run_m9_fixture_turn(
             });
             emit_progress_envelope(&ledger, &session_id, &delta, None);
             let _ = send_notification_ephemeral(&ws, &ledger, delta);
+            if m9_fixture_delay_or_interrupt(
+                &mut interrupt_rx,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            {
+                M9FixtureOutcome::Interrupted
+            } else {
+                M9FixtureOutcome::Completed
+            }
+        }
+        M9ProtocolFixture::EchoLiteral => {
+            // #2483: the literal-token specs declare their expected content
+            // in the prompt; the fixture echoes it back so isolation
+            // assertions compare distinct content per session. The router
+            // only selects this fixture when the marker matched, so the
+            // fallback mirrors Basic and never fires in practice.
+            let literal = prompt_text(&params.input)
+                .as_deref()
+                .and_then(m9_fixture_echo_literal)
+                .unwrap_or_else(|| "OK".to_owned());
+            let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: literal,
+            });
+            emit_progress_envelope(&ledger, &session_id, &delta, None);
+            let _ = send_notification_ephemeral(&ws, &ledger, delta);
+            if m9_fixture_delay_or_interrupt(
+                &mut interrupt_rx,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            {
+                M9FixtureOutcome::Interrupted
+            } else {
+                M9FixtureOutcome::Completed
+            }
+        }
+        M9ProtocolFixture::CjkUtf8Short => {
+            let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                text: "你好世界".to_owned(),
+            });
+            emit_progress_envelope(&ledger, &session_id, &delta, None);
+            let _ = send_notification_ephemeral(&ws, &ledger, delta);
+            if m9_fixture_delay_or_interrupt(
+                &mut interrupt_rx,
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            {
+                M9FixtureOutcome::Interrupted
+            } else {
+                M9FixtureOutcome::Completed
+            }
+        }
+        M9ProtocolFixture::CjkUtf8Long => {
+            // One delta per line so the client assembles the CJK content
+            // across multiple frames, the multi-delta shape the
+            // long-response spec exists to exercise.
+            for city in ["北京", "上海", "广州", "深圳", "杭州"] {
+                let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    text: format!("{city}\n"),
+                });
+                emit_progress_envelope(&ledger, &session_id, &delta, None);
+                let _ = send_notification_ephemeral(&ws, &ledger, delta);
+            }
             if m9_fixture_delay_or_interrupt(
                 &mut interrupt_rx,
                 std::time::Duration::from_millis(20),
