@@ -3762,8 +3762,8 @@ fn rpc_error_codes_partition_is_disjoint() {
     ];
     for &code in &json_rpc_reserved {
         assert!(
-            (-32700..=-32603).contains(&code),
-            "{code} outside the JSON-RPC reserved block -32700..=-32603",
+            (-32700..=-32600).contains(&code),
+            "{code} outside the JSON-RPC reserved block -32700..=-32600",
         );
     }
     for &code in &server_band {
