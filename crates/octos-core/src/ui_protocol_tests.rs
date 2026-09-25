@@ -4878,6 +4878,8 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
     // existing REST contract emits.
     let listing = SessionListResult {
         sessions: serde_json::json!([{ "id": "s-1", "message_count": 3 }]),
+        workspace_root: None,
+        profile_id: None,
     };
     let value = serde_json::to_value(&listing).expect("serialize");
     let decoded: SessionListResult = serde_json::from_value(value).expect("deserialize");
@@ -5383,14 +5385,38 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
 /// downstream client. Each `assert_eq!` is the contract.
 #[test]
 fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
-    // session/list — `{ sessions: <opaque> }`
+    // session/list — `{ sessions: <opaque> }` for a legacy (unscoped)
+    // listing: the scope fields are absent, not null, so a client can tell
+    // "not scoped" from "scoped to nothing".
     assert_eq!(
         serde_json::to_value(SessionListResult {
             sessions: serde_json::json!([{ "id": "s-1" }]),
+            workspace_root: None,
+            profile_id: None,
         })
         .expect("serialize"),
         serde_json::json!({ "sessions": [{ "id": "s-1" }] }),
     );
+    // session/list — a workspace-scoped listing attests the canonical root
+    // and profile whose `<root>/.octos/<profile>` store it read.
+    let scoped = SessionListResult {
+        sessions: serde_json::json!([{ "id": "s-1" }]),
+        workspace_root: Some("/srv/project".into()),
+        profile_id: Some("dev".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&scoped).expect("serialize"),
+        serde_json::json!({
+            "sessions": [{ "id": "s-1" }],
+            "workspace_root": "/srv/project",
+            "profile_id": "dev",
+        }),
+    );
+    // Older servers never send the scope fields; they still decode.
+    let legacy: SessionListResult =
+        serde_json::from_value(serde_json::json!({ "sessions": [] })).expect("decode");
+    assert_eq!(legacy.workspace_root, None);
+    assert_eq!(legacy.profile_id, None);
 
     // session/snapshot — `{ status, files, tasks }`
     assert_eq!(

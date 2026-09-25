@@ -1671,7 +1671,13 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   under, and an unregistered profile is `cwd_runtime_unavailable`.
 - Result type: `SessionListResult` — `{ sessions: SessionInfo[] }`. The
   `sessions` field forwards the JSON body of the legacy REST handler
-  verbatim (one `SessionInfo` per entry).
+  verbatim (one `SessionInfo` per entry). When — and only when — the
+  server actually scoped the listing to a project store, the result also
+  carries `workspace_root` (the canonical root) and `profile_id` (whose
+  `<workspace_root>/.octos/<profile_id>` store was read). A `{cwd}` request
+  to a server with `appui.sessions_in_cwd` off, or one that predates it,
+  returns the legacy global listing without them; a client must not place
+  rows under a workspace unless the result attests that scope.
 - Errors: collection endpoint; an unexpected 404 surfaces as
   `resource_not_found` with `data.resource_type = "session"` rather than
   `unknown_session`.

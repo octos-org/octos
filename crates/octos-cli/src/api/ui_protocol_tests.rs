@@ -7375,13 +7375,14 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
     let resolved = resolve_session_list_cwd_root(&state, cap, Some("dev"), &good_params).unwrap();
     assert_eq!(
         resolved,
-        Some((
-            crate::runtime::session::project_sessions_root(&good_canon, "dev"),
-            "dev".to_string(),
-        )),
+        Some(SessionListScope {
+            workspace_root: good_canon.clone(),
+            sessions_root: crate::runtime::session::project_sessions_root(&good_canon, "dev"),
+            profile_id: "dev".to_string(),
+        }),
     );
     assert_eq!(
-        resolved.map(|(root, _)| root),
+        resolved.map(|scope| scope.sessions_root),
         Some(good_canon.join(".octos").join("dev"))
     );
 
@@ -7420,7 +7421,11 @@ async fn session_list_cwd_root_should_honor_requested_profile_when_connection_is
     };
     assert_eq!(
         resolve_session_list_cwd_root(&state, cap, None, &requested).unwrap(),
-        Some((project_canon.join(".octos").join("dev"), "dev".to_string())),
+        Some(SessionListScope {
+            workspace_root: project_canon.clone(),
+            sessions_root: project_canon.join(".octos").join("dev"),
+            profile_id: "dev".to_string(),
+        }),
     );
 
     // Admin connection + no `profile_id` → unchanged: `_main` is not
@@ -7481,7 +7486,40 @@ async fn session_list_cwd_root_should_reject_requested_profile_outside_authentic
     };
     assert_eq!(
         resolve_session_list_cwd_root(&state, cap, Some("dev"), &own).unwrap(),
-        Some((project_canon.join(".octos").join("dev"), "dev".to_string())),
+        Some(SessionListScope {
+            workspace_root: project_canon.clone(),
+            sessions_root: project_canon.join(".octos").join("dev"),
+            profile_id: "dev".to_string(),
+        }),
+    );
+}
+
+#[test]
+fn session_list_result_should_attest_scope_only_when_the_listing_was_scoped() {
+    // A client cannot otherwise tell a project-scoped listing from the
+    // legacy global one a flag-off (or older) server returns for the same
+    // `{cwd}` request — so it must never place legacy rows under a
+    // workspace. The scoped result names the canonical root and profile it
+    // read; the legacy result stays byte-identical `{ sessions }`.
+    let sessions = serde_json::json!([{ "id": "dev:api:web-1", "message_count": 2 }]);
+
+    assert_eq!(
+        session_list_result_value(sessions.clone(), None),
+        serde_json::json!({ "sessions": sessions }),
+    );
+
+    let scope = SessionListScope {
+        workspace_root: std::path::PathBuf::from("/srv/project"),
+        sessions_root: std::path::PathBuf::from("/srv/project/.octos/dev"),
+        profile_id: "dev".to_string(),
+    };
+    assert_eq!(
+        session_list_result_value(sessions.clone(), Some(&scope)),
+        serde_json::json!({
+            "sessions": sessions,
+            "workspace_root": "/srv/project",
+            "profile_id": "dev",
+        }),
     );
 }
 
