@@ -28067,14 +28067,22 @@ async fn handle_session_list(
     // `cwd` AND the server flag is on AND the connection negotiated
     // `session.workspace_cwd.v1`, the listing is scoped to `<cwd>/.octos`.
     // Absent cwd / flag off → `None` → byte-identical legacy listing.
-    let cwd_sessions_root =
+    let cwd_scope =
         match resolve_session_list_cwd_root(state, features, connection_profile_id, &params) {
-            Ok(root) => root,
+            Ok(scope) => scope,
             Err(error) => {
                 let _ = send_rpc_error(ws, Some(id), error);
                 return;
             }
         };
+    // When the listing is project-scoped, the effective profile is the one
+    // the store was resolved for (which may come from `params.profile_id` on
+    // an admin connection), so `active_turn` is stamped against the same
+    // wire keys session/open registers under.
+    let connection_profile_id = cwd_scope
+        .as_ref()
+        .map(|scope| scope.profile_id.as_str())
+        .or(connection_profile_id);
     let identity_ext = identity.cloned().map(Extension);
     // Per-session busy state. Read from the PROCESS-global registry, not this
     // connection's `connection_turns`, so the flag is honest about a session
@@ -28087,7 +28095,7 @@ async fn handle_session_list(
         headers.clone(),
         identity_ext,
         connection_profile_id,
-        cwd_sessions_root,
+        cwd_scope.as_ref().map(|scope| scope.sessions_root.clone()),
         &busy_sessions,
     )
     .await;
@@ -28098,7 +28106,12 @@ async fn handle_session_list(
     let context = RestResourceContext::resource("session", "");
     match rest_response_to_rpc_value(response, method, context).await {
         Ok(sessions) => {
-            send_aux_rpc_result(ws, id, method, json!({ "sessions": sessions }));
+            send_aux_rpc_result(
+                ws,
+                id,
+                method,
+                session_list_result_value(sessions, cwd_scope.as_ref()),
+            );
         }
         Err(error) => {
             let _ = send_rpc_error(ws, Some(id), error);
@@ -28126,7 +28139,12 @@ async fn handle_session_list(
 ///    `SessionManager::open` would CREATE `<cwd>/.octos/…` there and enumerate
 ///    it. On rejection we surface the typed error (consistent with
 ///    `session/open`) rather than silently degrading.
-/// 4. **Profile namespace** — the store root is
+/// 4. **Profile scope** — `params.profile_id` follows the session/open rules:
+///    a user connection may only restate its own profile (anything else is an
+///    `auth_scope_violation`), an admin/token connection may name the profile
+///    it opens sessions under, and an unregistered profile is rejected by the
+///    same runtime gate as above.
+/// 5. **Profile namespace** — the store root is
 ///    `<cwd>/.octos/<profile_id>` (via [`project_sessions_root`]), matching
 ///    the write path so two profiles that share a project cwd never read each
 ///    other's transcripts.
@@ -28137,7 +28155,7 @@ fn resolve_session_list_cwd_root(
     features: ConnectionUiFeatures,
     connection_profile_id: Option<&str>,
     params: &SessionListParams,
-) -> Result<Option<PathBuf>, RpcError> {
+) -> Result<Option<SessionListScope>, RpcError> {
     let Some(cwd) = params
         .cwd
         .as_deref()
@@ -28159,20 +28177,64 @@ fn resolve_session_list_cwd_root(
             "feature": UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
         })));
     }
+    // Profile precedence mirrors session/open (`validate_session_scope`): a
+    // user connection is frozen to its own profile and may only restate it;
+    // an admin/token connection (no connection profile) may name the profile
+    // it opens sessions under, so the listing reads the SAME
+    // `<cwd>/.octos/<profile>` store those sessions were written to.
+    let requested_profile_id = params.profile_id.as_deref();
+    if requested_profile_id.is_some_and(str::is_empty) {
+        return Err(RpcError::invalid_params("profile_id cannot be empty"));
+    }
+    let active_profile_id = match (connection_profile_id, requested_profile_id) {
+        (Some(connection), Some(requested)) if requested != connection => {
+            return Err(authenticated_scope_mismatch_error(
+                "profile_id is outside the authenticated profile",
+                connection,
+                Some(requested),
+            ));
+        }
+        (Some(connection), _) => Some(connection),
+        (None, requested) => requested,
+    };
     let workspace_root = canonical_existing_dir(cwd)?;
     // SAME safety gate as session/open — reject banned system roots (and the
     // missing-profile-runtime case) BEFORE opening a SessionManager that would
     // otherwise materialize `<cwd>/.octos` at an arbitrary path.
-    validate_session_workspace_allowed(state, connection_profile_id, &workspace_root)?;
+    validate_session_workspace_allowed(state, active_profile_id, &workspace_root)?;
     // Namespace by the SAME profile the write path uses so the listing reads
-    // exactly the connection's own project store.
-    let profile_id = resolve_session_profile_runtime(state, connection_profile_id)
+    // exactly the project store session/open writes for this scope.
+    let profile_id = resolve_session_profile_runtime(state, active_profile_id)
         .map(|runtime| runtime.profile_id.clone())
-        .unwrap_or_else(|| connection_profile_id.unwrap_or(MAIN_PROFILE_ID).to_string());
-    Ok(Some(crate::runtime::session::project_sessions_root(
-        &workspace_root,
-        &profile_id,
-    )))
+        .unwrap_or_else(|| active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_string());
+    Ok(Some(SessionListScope {
+        sessions_root: crate::runtime::session::project_sessions_root(&workspace_root, &profile_id),
+        workspace_root,
+        profile_id,
+    }))
+}
+
+/// A `session/list` that was scoped to one project store: the canonical
+/// workspace root, the `<root>/.octos/<profile>` store it read, and that
+/// profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionListScope {
+    workspace_root: PathBuf,
+    sessions_root: PathBuf,
+    profile_id: String,
+}
+
+/// The `session/list` result body. A scoped listing attests the root and
+/// profile it read (see `SessionListResult::workspace_root`); a legacy
+/// listing stays the byte-identical `{ sessions }` it always was, which is
+/// how a client tells the two apart for the same `{cwd}` request.
+fn session_list_result_value(sessions: Value, scope: Option<&SessionListScope>) -> Value {
+    serde_json::to_value(octos_core::ui_protocol::SessionListResult {
+        sessions,
+        workspace_root: scope.map(|scope| scope.workspace_root.to_string_lossy().into_owned()),
+        profile_id: scope.map(|scope| scope.profile_id.clone()),
+    })
+    .unwrap_or_else(|_| json!({}))
 }
 
 /// `launch/resolve` — the pre-session launch probe. Resolves the launching

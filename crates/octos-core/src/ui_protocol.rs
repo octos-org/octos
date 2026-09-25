@@ -3177,6 +3177,15 @@ pub struct SessionListParams {
     /// per-profile/global listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Optional profile whose per-project store to list. Only meaningful
+    /// together with `cwd`: the listing reads `<cwd>/.octos/<profile_id>`.
+    /// A connection authenticated as a user is frozen to its own profile
+    /// and may only restate it; an admin/token connection (no connection
+    /// profile) uses it to name the profile it opens sessions under, the
+    /// same way `session/open` accepts `profile_id`. Absent → the
+    /// connection's profile, then the server default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
 }
 
 /// Result for `session/list`. `sessions` is the JSON array the existing
@@ -3185,6 +3194,18 @@ pub struct SessionListParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionListResult {
     pub sessions: Value,
+    /// Present only when the server actually scoped the listing to a
+    /// project store: the canonical workspace root whose
+    /// `<root>/.octos/<profile_id>` it read. A `{cwd}` request to a server
+    /// with `appui.sessions_in_cwd` off (or one that predates it) gets the
+    /// legacy global listing with this absent, so a client must not place
+    /// rows under a workspace unless this attests the scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    /// The profile whose project store was read. Present exactly when
+    /// `workspace_root` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
 }
 
 // ----- Smart-home bridge integration -----
