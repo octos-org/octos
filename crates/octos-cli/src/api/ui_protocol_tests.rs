@@ -45388,3 +45388,25 @@ async fn should_store_a_download_copy_of_a_delivered_file_and_keep_its_original_
         Some(vec![raw])
     );
 }
+
+#[test]
+fn should_reject_unusable_ws_liveness_ping_overrides() {
+    assert_eq!(ws_liveness_ping_secs_from(None), None);
+    assert_eq!(ws_liveness_ping_secs_from(Some("")), None);
+    assert_eq!(ws_liveness_ping_secs_from(Some("soon")), None);
+    assert_eq!(ws_liveness_ping_secs_from(Some("0")), None);
+    assert_eq!(ws_liveness_ping_secs_from(Some("86401")), None);
+    assert_eq!(ws_liveness_ping_secs_from(Some("1")), Some(1));
+    assert_eq!(ws_liveness_ping_secs_from(Some("86400")), Some(86400));
+}
+
+#[test]
+fn should_close_ws_liveness_after_three_missed_pings_plus_one_interval_of_slack() {
+    // Default deployment: 20 s Pings → the deadline gives a half-open peer
+    // three missed Pings plus one interval of slack before the read loop
+    // closes it.
+    assert_eq!(
+        ws_liveness_deadline_from_ping_interval(std::time::Duration::from_secs(20)),
+        std::time::Duration::from_secs(80)
+    );
+}
