@@ -45330,3 +45330,61 @@ fn should_keep_renewing_open_sessions_on_every_interval() {
     }
     assert_eq!(renewals, 24, "one renewal per interval, no drift");
 }
+
+/// A file the agent delivers (`send_file`) must be downloadable by the
+/// browser. `/api/files` only serves paths under the tenant's data dir, so a
+/// delivery from an approved external project folder —
+/// `new-octos/editable-singlepanel-3p/_build/p20-art.png` — was `403 access
+/// denied` on every download: 56 "sent" files across three real web sessions,
+/// none reachable. The transcript keeps the original path (what a local client
+/// shows); a tenant-owned copy is stored where `/api/files` looks it up.
+#[tokio::test]
+async fn should_store_a_download_copy_of_a_delivered_file_and_keep_its_original_path() {
+    let tenant = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    // Per-project session store, as `appui.sessions_in_cwd` lays it out.
+    let store_dir = project.path().join(".octos").join("dev");
+    let sessions = Arc::new(TokioMutex::new(
+        octos_bus::SessionManager::open(&store_dir).unwrap(),
+    ));
+    let key = SessionKey::with_profile("dev", "api", "web-send-file");
+    let file = project.path().join("p20-art.png");
+    std::fs::write(&file, b"png").unwrap();
+    let raw = file.to_string_lossy().into_owned();
+    let copy = octos_bus::session_artifacts::delivered_copy_path(tenant.path(), &key, &raw);
+    assert!(!copy.exists(), "precondition: no download copy yet");
+
+    // Exactly what `SendFileTool` puts on the per-turn channel.
+    let sent = octos_core::OutboundMessage {
+        channel: "api".to_string(),
+        chat_id: key.0.clone(),
+        content: "P20 map".to_string(),
+        reply_to: None,
+        media: vec![raw.clone()],
+        metadata: serde_json::json!({}),
+    };
+    let (message, _) =
+        persist_send_file_delivery(&sessions, &store_dir, tenant.path(), &key, "thread-1", sent)
+            .await
+            .expect("the delivery must persist");
+
+    assert_eq!(
+        message.media,
+        vec![raw.clone()],
+        "the original path is recorded"
+    );
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        b"png",
+        "the download copy is stored where /api/files looks"
+    );
+    let reread = octos_bus::SessionManager::open(&store_dir)
+        .unwrap()
+        .load(&key)
+        .await
+        .expect("session exists");
+    assert_eq!(
+        reread.messages.last().map(|m| m.media.clone()),
+        Some(vec![raw])
+    );
+}
