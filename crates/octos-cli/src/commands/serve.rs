@@ -1463,9 +1463,21 @@ impl ServeCommand {
             ))
         });
 
+        // Solo AppUI sessions use this serve process's ProfileRuntime. A
+        // gateway for the same profile would open its episodes.redb again and
+        // lock session/open out of the profile after onboarding. Stdio serve
+        // already has no gateway auto-start; keep HTTP solo consistent.
+        let solo_login_enabled_flag = self.solo
+            || std::env::var("OCTOS_SOLO_LOGIN")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+        let solo_in_process =
+            solo_login_enabled_flag && config.mode == crate::config::DeploymentMode::Local;
+
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
+                .with_solo_in_process(solo_in_process)
                 .with_bridge_js(bridge_js_path)
                 .with_serve_config(effective_serve_port, auth_token.clone())
                 // Section B (codex review round-5 P1.2): every spawned
@@ -1631,12 +1643,6 @@ impl ServeCommand {
             crate::api::DEFAULT_PREVIEW_SWEEP_INTERVAL,
         );
 
-        let solo_login_enabled_flag = self.solo
-            || std::env::var("OCTOS_SOLO_LOGIN")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-        let solo_in_process =
-            solo_login_enabled_flag && config.mode == crate::config::DeploymentMode::Local;
         let dangerous_default_permissions_flag = self.danger_full_access
             || std::env::var("OCTOS_DANGER_FULL_ACCESS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1851,10 +1857,6 @@ impl ServeCommand {
         // spawns no gateways, so there is nothing to orphan.
         let shutdown_rx = spawn_serve_shutdown_signal_watcher(serve_shutdown_tx.clone());
 
-        // Solo AppUI sessions use this serve process's ProfileRuntime. A
-        // gateway for the same profile would open its episodes.redb again and
-        // lock session/open out of the profile after onboarding. Stdio serve
-        // already has no gateway auto-start; keep HTTP solo consistent.
         let gateway_auto_start_enabled = !solo_in_process;
 
         // Auto-start enabled profiles

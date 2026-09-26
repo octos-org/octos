@@ -2,7 +2,7 @@ import { createContext, useContext, useState, useEffect, useCallback, useMemo, t
 import { useParams } from 'react-router-dom'
 import { useAuth } from './AuthContext'
 import { useToast } from '../components/Toast'
-import { api, myApi, getLogStreamUrl, getAdminLogStreamUrl } from '../api'
+import { api, myApi, ensureActionOk, getLogStreamUrl, getAdminLogStreamUrl } from '../api'
 import type { ProfileConfig, ProcessStatus, PurgeReport } from '../types'
 
 const defaultConfig: ProfileConfig = {
@@ -113,8 +113,10 @@ export function ProfileProvider({ children }: Props) {
         startGateway: () => myApi.startSubGateway(profileId),
         stopGateway: () => myApi.stopSubGateway(profileId),
         restartGateway: async () => {
+          // Sub-account stop reports ok even when nothing was running, so
+          // the two-step restart fails only when the start leg is refused.
           await myApi.stopSubGateway(profileId)
-          await myApi.startSubGateway(profileId)
+          return myApi.startSubGateway(profileId)
         },
       }
     }
@@ -189,7 +191,8 @@ export function ProfileProvider({ children }: Props) {
 
   const startGateway = useCallback(async () => {
     try {
-      await adapter.startGateway()
+      const res = await adapter.startGateway()
+      ensureActionOk(res, 'Failed to start gateway')
       toast('Gateway started')
       await loadProfile()
     } catch (e: any) {
@@ -199,7 +202,8 @@ export function ProfileProvider({ children }: Props) {
 
   const stopGateway = useCallback(async () => {
     try {
-      await adapter.stopGateway()
+      const res = await adapter.stopGateway()
+      ensureActionOk(res, 'Failed to stop gateway')
       toast('Gateway stopped')
       await loadProfile()
     } catch (e: any) {
@@ -209,7 +213,8 @@ export function ProfileProvider({ children }: Props) {
 
   const restartGateway = useCallback(async () => {
     try {
-      await adapter.restartGateway()
+      const res = await adapter.restartGateway()
+      ensureActionOk(res, 'Failed to restart gateway')
       toast('Gateway restarted')
       await loadProfile()
     } catch (e: any) {

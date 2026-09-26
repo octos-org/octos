@@ -143,6 +143,14 @@ async function authedRequest<T>(path: string, opts?: RequestInit): Promise<T> {
   return res.json()
 }
 
+// The self-service gateway routes (`/my/profile/*`, sub-account start/stop)
+// report failures as HTTP 200 + `{ ok: false, message }` — only the admin
+// ones use error statuses — so callers must consume the ok flag themselves
+// instead of relying on the request helpers to throw.
+export function ensureActionOk(res: ActionResponse, fallback: string): void {
+  if (!res.ok) throw new Error(res.message || fallback)
+}
+
 function queryPath(path: string, params: Record<string, string | number | undefined | null>): string {
   const query = new URLSearchParams()
   for (const [key, value] of Object.entries(params)) {

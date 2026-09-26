@@ -503,21 +503,22 @@ jobs:
         run: cargo test -p octos-cli --lib
 
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard
 
       - name: OUP runtime and C/Python contracts
         run: ./scripts/milestone-ci.sh oup-runtime
 
       # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe),
-      # SIGTERM gateway-reap e2e (serve_sigterm), and WS half-open
-      # liveness e2e (serve_ws_liveness). These spawn real
+      # SIGTERM gateway-reap e2e (serve_sigterm), WS half-open
+      # liveness e2e (serve_ws_liveness), and solo manual-start
+      # guard e2e (serve_solo_gateway_guard). These spawn real
       # `octos serve` children that contend for model catalog / profile
       # store resources with other test binaries; under the default
       # thread-per-core parallelism the children starve and the 15s port
       # barrier times out. Dedicated serial step per the #21 outer-loop
       # ruling (2026-08-27): layer at the CI command level, never #[ignore].
-      - name: serve BrokenPipe/SIGTERM/WS-liveness process e2e (serial)
-        run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_sigterm --test serve_ws_liveness -- --test-threads=1
+      - name: serve BrokenPipe/SIGTERM/WS-liveness/solo-guard process e2e (serial)
+        run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_sigterm --test serve_ws_liveness --test serve_solo_gateway_guard -- --test-threads=1
 
       # Co-located here so they reuse this job's warm octos-cli build cache.
       # All api-feature filter steps below go through ci-api-filter-test.sh:
@@ -712,13 +713,14 @@ jobs:
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
       # Same serve-process exclusions as the test-octos-cli PR job: the
-      # serve_broken_pipe / serve_sigterm / serve_ws_liveness e2e suites
+      # serve_broken_pipe / serve_sigterm / serve_ws_liveness /
+      # serve_solo_gateway_guard e2e suites
       # spawn real `octos serve` children that starve under default
       # thread-per-core parallelism. They get their dedicated serial run in
       # test-octos-cli; skipping here keeps this manual lane's coverage
       # semantics identical to the PR lane's.
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
@@ -797,7 +799,7 @@ jobs:
       # Same serve-process exclusions as the test-octos-cli PR job (see the
       # matching comment in check-arm).
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic

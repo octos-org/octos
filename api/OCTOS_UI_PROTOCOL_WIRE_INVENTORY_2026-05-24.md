@@ -147,6 +147,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `turn/started` | shipped base notification |
 | `turn/completed` | shipped base notification |
 | `turn/error` | shipped base notification |
+| `turn/steer_dropped` | shipped steer return notification, UPCR-2026-033 |
 | `message/delta` | shipped base notification |
 | `message/reasoning_delta` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `tool/started` | shipped base notification |
@@ -189,6 +190,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `context/compaction_completed` | shipped M16 context lifecycle notification |
 | `context/compaction_started` | shipped M16 context lifecycle notification |
 | `context/normalization_reported` | shipped M16 context lifecycle notification |
+| `session/orchestration` | shipped whole-job orchestration indicator, UPCR-2026-033 |
 | `peer/staged` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `peer/closed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `background/activity` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |

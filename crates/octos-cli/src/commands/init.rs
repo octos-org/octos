@@ -804,7 +804,9 @@ fn default_model_for(provider: &str, catalog: &BTreeMap<String, Vec<String>>) ->
 /// Load models from model_catalog.json, grouped by provider — from the
 /// usual disk locations first (repo/dev flows), else the embedded
 /// compile-time copy (installed binaries ship no catalog file).
-fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
+/// Shared with the completions candidates (#2413) so both surfaces read the
+/// one catalog.
+pub(crate) fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
     let candidates = [
         std::env::current_exe()
             .ok()

@@ -111,6 +111,166 @@ fn test_completions_help() {
     assert!(stdout.contains("completions"));
 }
 
+/// The canonical `model_catalog.json`, read at compile time — the same SSOT
+/// `octos init` and the completion candidates (#2413) are held to.
+const MODEL_CATALOG: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../model_catalog.json"
+));
+
+/// Run the binary against the compiled-in catalog, not whatever catalog a
+/// developer's own `~/.octos` holds: catalog loading is disk-first, so a
+/// machine that has run octos would otherwise shadow the SSOT and break the
+/// comparisons below. Also clears the completion channel so a globally
+/// exported var can't turn the invocation into a completion answer.
+fn run_completions(args: &[&str]) -> String {
+    static CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let scratch = std::env::temp_dir().join(format!(
+        "octos-cli-tests-{}-{}",
+        std::process::id(),
+        CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&scratch).expect("scratch dir is created");
+    let mut cmd = Command::new(octos_binary());
+    cmd.args(args)
+        .current_dir(&scratch)
+        .env_remove("OCTOS_COMPLETE")
+        .env_remove("COMPLETE");
+    for home_var in ["HOME", "USERPROFILE"] {
+        cmd.env(home_var, &scratch);
+    }
+    let output = cmd.output().expect("Failed to execute command");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(output.status.success());
+    let _ = std::fs::remove_dir_all(&scratch);
+    stdout
+}
+
+#[test]
+fn test_completions_dynamic_models_match_catalog() {
+    let stdout = run_completions(&["completions", "bash", "--dynamic", "models"]);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "model completion candidates must not be empty"
+    );
+
+    // Every candidate must be a row of the model catalog — the same SSOT
+    // `octos init` offers (#2413). A hand-written list offers models the real
+    // APIs no longer accept.
+    let catalog: serde_json::Value =
+        serde_json::from_str(MODEL_CATALOG).expect("canonical model catalog parses");
+    let catalog_models: std::collections::HashSet<String> = catalog["models"]
+        .as_array()
+        .expect("catalog has a models array")
+        .iter()
+        .filter_map(|m| m["provider"].as_str())
+        .filter_map(|p| p.split_once('/').map(|(_, model)| model.to_string()))
+        .collect();
+    for model in &lines {
+        assert!(
+            catalog_models.contains(*model),
+            "completion offered '{model}' which is not in the model catalog"
+        );
+    }
+    // Candidates are sorted so shells display them predictably.
+    assert!(
+        lines.windows(2).all(|w| w[0] < w[1]),
+        "model candidates must be sorted"
+    );
+
+    // Every family-default row (the models `octos init` resolves to) must be
+    // offered — the original complaint was that these were missing.
+    let family_defaults: Vec<&str> = catalog["models"]
+        .as_array()
+        .expect("catalog has a models array")
+        .iter()
+        .filter(|m| m["default"].as_bool().unwrap_or(false))
+        .filter_map(|m| m["provider"].as_str())
+        .filter_map(|p| p.split_once('/').map(|(_, model)| model))
+        .collect();
+    assert!(
+        !family_defaults.is_empty(),
+        "catalog declares family defaults"
+    );
+    for default in family_defaults {
+        assert!(
+            lines.contains(&default),
+            "catalog family default '{default}' must be offered"
+        );
+    }
+}
+
+#[test]
+fn test_completions_dynamic_providers_match_registry() {
+    let stdout = run_completions(&["completions", "bash", "--dynamic", "providers"]);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    // The candidates must be the provider registry's canonical families — the
+    // same names `config.llm.provider` accepts (#2413) — not a drifting
+    // hand-written subset.
+    let mut expected: Vec<&str> = octos_llm::registry::all_entries()
+        .iter()
+        .map(|entry| entry.name)
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(
+        lines, expected,
+        "provider candidates must mirror the registry"
+    );
+}
+
+#[test]
+fn test_completions_env_channel_wiring() {
+    // With OCTOS_COMPLETE set the binary answers the completion request —
+    // the registration script the shell sources — and exits 0 (#2413).
+    let scratch = std::env::temp_dir().join(format!("octos-cli-tests-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).expect("scratch dir is created");
+    let answered = Command::new(octos_binary())
+        .env("OCTOS_COMPLETE", "bash")
+        .current_dir(&scratch)
+        .output()
+        .expect("Failed to execute command");
+    assert!(answered.status.success());
+    let stdout = String::from_utf8_lossy(&answered.stdout);
+    assert!(
+        stdout.contains("_clap_complete_octos"),
+        "the binary must answer the completion channel with the registration script"
+    );
+
+    // The channel is namespaced: a generic COMPLETE exported for some other
+    // tool must not turn octos invocations into completion answers, and the
+    // empty value keeps the documented off switch.
+    let unaffected = Command::new(octos_binary())
+        .env("COMPLETE", "bash")
+        .arg("--version")
+        .output()
+        .expect("Failed to execute command");
+    assert!(unaffected.status.success());
+    let stdout = String::from_utf8_lossy(&unaffected.stdout);
+    assert!(
+        !stdout.contains("_clap_complete"),
+        "another tool's COMPLETE var must not hijack octos"
+    );
+    assert!(
+        stdout.contains("octos"),
+        "--version must still print a version"
+    );
+
+    let disabled = Command::new(octos_binary())
+        .env("OCTOS_COMPLETE", "")
+        .arg("--version")
+        .output()
+        .expect("Failed to execute command");
+    assert!(disabled.status.success());
+    let stdout = String::from_utf8_lossy(&disabled.stdout);
+    assert!(
+        !stdout.contains("_clap_complete"),
+        "an empty OCTOS_COMPLETE must keep the channel off"
+    );
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 #[test]
 fn test_completions_bash() {
     let output = Command::new(octos_binary())

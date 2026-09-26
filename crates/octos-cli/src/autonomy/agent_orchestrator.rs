@@ -568,7 +568,7 @@ pub(crate) struct MonitorControlRequest {
 /// `method_not_supported` shape so wire-level callers can detect the
 /// orchestrator-not-wired condition without panicking.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired into the JSON-RPC bridge in a follow-up PR (#991)
+#[allow(dead_code)] // #991 wiring never landed: constructed only in tests, kept for the M15-B spawn surface
 pub(crate) struct SpawnAgentRequest {
     pub(crate) session_id: SessionKey,
     pub(crate) profile_id: String,
@@ -586,7 +586,7 @@ pub(crate) struct SpawnAgentRequest {
 /// (timeout, cursor) into the trait surface; M15-C will refine wait
 /// semantics with streaming once a backend implements it.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired into the JSON-RPC bridge in a follow-up PR (#991)
+#[allow(dead_code)] // #991 wiring never landed: constructed only in tests, kept for the M15-B spawn surface
 pub(crate) struct AgentInputRequest {
     pub(crate) agent_id: String,
     pub(crate) session_id: Option<SessionKey>,
@@ -599,14 +599,14 @@ pub(crate) struct AgentInputRequest {
 /// the agent record so the caller can re-wire its dispatch context
 /// without a fresh `agent_list` round-trip.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // wired into the JSON-RPC bridge in a follow-up PR (#991)
+#[allow(dead_code)] // #991 wiring never landed: constructed only in tests, kept for the M15-B spawn surface
 pub(crate) struct ResumeAgentRequest {
     pub(crate) agent_id: String,
     pub(crate) session_id: Option<SessionKey>,
     pub(crate) profile_id: String,
 }
 
-#[allow(dead_code)] // spawn/send_input/wait/resume call sites land in the JSON-RPC bridge follow-up (#991)
+#[allow(dead_code)] // spawn/send_input/wait/resume have no production dispatch caller yet (#991 never landed); exercised only by the embedded test suite
 pub(crate) trait AgentOrchestrator: Send + Sync {
     fn list_agents(&self, request: AgentListRequest) -> Result<Value, RpcError>;
     fn read_agent_status(&self, request: AgentRequest) -> Result<Value, RpcError>;
@@ -715,7 +715,6 @@ pub(crate) trait AgentOrchestrator: Send + Sync {
 /// orchestrator. Uses the spec §3 `UNSUPPORTED_CAPABILITY` slot so
 /// AppUI clients can distinguish "method exists but not wired" from
 /// the `METHOD_NOT_FOUND` JSON-RPC dispatch miss.
-#[allow(dead_code)] // bridge consumer lands in the follow-up PR (#991)
 pub(crate) fn method_not_supported_error(
     method: &str,
     capability: &str,
@@ -2228,9 +2227,9 @@ impl InProcessAgentOrchestrator {
     /// The installed fleet-kernel store, cloned out of the lock (`Arc`
     /// internals → cheap). `None` on boot paths without a fleet kernel. The
     /// symmetric read accessor to [`Self::set_fleet_store`] (mirrors the
-    /// `supervisor_store` pair); the drain loop owns its own store clone, so the
-    /// first live reader is PR 4b headless rehydration (re-seed the controller's
-    /// workspace from the installed store) — hence `allow(dead_code)` in 4a.
+    /// `supervisor_store` pair); the drain loop owns its own store clone — live
+    /// readers are the goal↔fleet binding paths below and the serve-boot
+    /// readers (PR 5a worker-pool install; PR 4b re-seed rehydration).
     pub(crate) fn fleet_store(&self) -> Option<FleetKernelStore> {
         self.state().fleet_store.clone()
     }
@@ -12304,10 +12303,8 @@ fn in_flight_marker_is_held(state: &AutonomyRuntimeState, session_id: &SessionKe
 /// aborted, panics, or returns through an early-terminal path
 /// before the post-accounting block runs.
 ///
-/// Call `disarm()` from the post-accounting block (after the
-/// orchestrator already cleared the marker explicitly) so the
-/// drop-time clear becomes a no-op. The guard is `must_use` to
-/// discourage accidental immediate drop at the dispatch site.
+/// The guard is `must_use` to discourage accidental immediate drop at the
+/// dispatch site.
 #[must_use = "GoalDispatchInFlightGuard clears the in-flight marker on drop; hold it for the duration of the goal turn"]
 pub(crate) struct GoalDispatchInFlightGuard {
     orchestrator: &'static InProcessAgentOrchestrator,
@@ -12321,15 +12318,6 @@ pub(crate) struct GoalDispatchInFlightGuard {
 }
 
 impl GoalDispatchInFlightGuard {
-    /// Mark the guard as disarmed so its `Drop` does NOT clear the
-    /// in-flight marker. Use this when the post-accounting block has
-    /// already called `clear_goal_dispatch_in_flight` explicitly,
-    /// to avoid a redundant clear.
-    #[allow(dead_code)]
-    pub(crate) fn disarm(mut self) {
-        self.disarmed = true;
-    }
-
     /// #2066 round 5 (codex fix 1) — the marker incarnation this guard owns,
     /// for generation-matched refreshes
     /// ([`InProcessAgentOrchestrator::touch_goal_dispatch_in_flight_generation`]).
