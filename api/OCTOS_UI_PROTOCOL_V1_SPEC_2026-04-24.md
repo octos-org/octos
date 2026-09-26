@@ -567,6 +567,15 @@ Session (server-pushed open-state echo for reconnect/replay):
 Turn, message, and tool lifecycle:
 
 - `turn/started`, `turn/completed`, `turn/error`
+- `turn/steer_dropped` (accepted `UPCR-2026-033`) — returned unconsumed steer
+  inputs, emitted at turn end after the turn can no longer accept steers and
+  BEFORE its terminal frame. `params` carry the `session_id`, `turn_id`,
+  optional `topic`, the still-pending steer `inputs` in buffer order, and a
+  `reason` (`interrupted` | `turn_ended`), so the client can re-queue them
+  deterministically. Delivery is unfiltered; the negotiated
+  `event.turn_steer_dropped.v1` feature licenses a client to treat a
+  terminal without a preceding `turn/steer_dropped` naming its steer as
+  consumed by the server.
 - `message/delta`
 - `message/reasoning_delta` (live LLM reasoning/thinking stream, sibling of
   `message/delta`; #1502)
@@ -651,6 +660,16 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
 - `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
+
+Session orchestration status (whole-job indicator; ungated; accepted
+`UPCR-2026-033`):
+
+- `session/orchestration` — per-connection indicator snapshot for each open
+  session: `active:true` with `running_agents`, `pending_continuations`, and
+  an optional coarse `phase` while a turn, a non-terminal sub-agent, or a
+  queued master continuation is in flight, then one final `active:false`
+  when the session drops out. Emissions are deduped to changes, so a session
+  stays active across the sub-agent-complete → master-re-entry gap.
 
 Peer staging (#1801 v3, ungated):
 
