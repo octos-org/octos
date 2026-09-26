@@ -45410,3 +45410,72 @@ fn should_close_ws_liveness_after_three_missed_pings_plus_one_interval_of_slack(
         std::time::Duration::from_secs(80)
     );
 }
+
+// #2447 review: the housekeeping tick drains the socket to refresh the
+// liveness meter while an inline dispatch runs. Those frames arrived through
+// the biased select's back door — replaying them through the per-frame path
+// is what keeps their JSON-RPC ids answerable.
+#[tokio::test]
+async fn should_queue_every_drained_frame_for_replay_not_drop_it() {
+    let (tx, mut rx) =
+        futures::channel::mpsc::unbounded::<Result<WsMessage, std::convert::Infallible>>();
+    let _ = tx.unbounded_send(Ok(WsMessage::Text("frame-1".into())));
+    let _ = tx.unbounded_send(Ok(WsMessage::Pong(Vec::new().into())));
+    let _ = tx.unbounded_send(Ok(WsMessage::Text("frame-2".into())));
+    let mut queued = std::collections::VecDeque::new();
+    let mut last_inbound = std::time::Instant::now() - std::time::Duration::from_secs(30);
+
+    // The sender stays alive: after the three buffered frames the socket is
+    // merely quiet (Pending), not gone.
+    let gone = drain_queued_ws_frames(&mut rx, &mut queued, &mut last_inbound).await;
+
+    assert!(!gone, "a stream with frames left is not gone");
+    assert_eq!(
+        queued.len(),
+        3,
+        "every drained frame must be queued, not consumed"
+    );
+    assert!(matches!(queued.pop_front(), Some(WsMessage::Text(_))));
+    assert!(matches!(queued.pop_front(), Some(WsMessage::Pong(_))));
+    assert!(matches!(queued.pop_front(), Some(WsMessage::Text(_))));
+    assert!(
+        last_inbound.elapsed() < std::time::Duration::from_secs(1),
+        "the drain must refresh the liveness meter for the frames it saw"
+    );
+}
+
+#[tokio::test]
+async fn should_report_stream_gone_when_the_drain_hits_an_error() {
+    let mut queued = std::collections::VecDeque::new();
+    let mut last_inbound = std::time::Instant::now();
+    let frames: Vec<Result<WsMessage, &str>> = vec![Err("socket gone")];
+
+    let gone = drain_queued_ws_frames(
+        &mut futures::stream::iter(frames),
+        &mut queued,
+        &mut last_inbound,
+    )
+    .await;
+
+    assert!(gone);
+    assert!(queued.is_empty());
+}
+
+#[tokio::test]
+async fn should_treat_an_idle_stream_as_alive_and_a_closed_one_as_gone() {
+    let (tx, mut rx) =
+        futures::channel::mpsc::unbounded::<Result<WsMessage, std::convert::Infallible>>();
+    let mut queued = std::collections::VecDeque::new();
+    let mut last_inbound = std::time::Instant::now();
+
+    let gone = drain_queued_ws_frames(&mut rx, &mut queued, &mut last_inbound).await;
+    assert!(!gone, "no frame yet is Pending, not gone");
+    assert!(queued.is_empty());
+
+    drop(tx);
+    let gone = drain_queued_ws_frames(&mut rx, &mut queued, &mut last_inbound).await;
+    assert!(
+        gone,
+        "a closed stream must end the connection like a read error"
+    );
+}

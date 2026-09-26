@@ -245,10 +245,6 @@ mod serve_ws_liveness {
             pings_seen >= 1,
             "the writer task must ship protocol-level Pings for the deadline to have something to miss"
         );
-        assert!(
-            pings_seen >= 1,
-            "the writer task must ship protocol-level Pings for the deadline to have something to miss"
-        );
         let elapsed = started.elapsed();
         assert!(
             elapsed >= DEADLINE - Duration::from_millis(500),
@@ -313,6 +309,66 @@ mod serve_ws_liveness {
         assert!(
             pings_seen >= 3,
             "expected the keepalive cadence to deliver several Pings past the deadline, got {pings_seen}"
+        );
+    }
+
+    /// #2447 review — frames that queue behind the housekeeping tick (the
+    /// biased select polls the tick arm before the read arm) must be
+    /// replayed through the per-frame path, never consumed: every pipelined
+    /// request id must be answered, or the client hangs on a silent frame.
+    /// A burst like this one is what a pipelining client produces; the
+    /// drain must be transparent to it.
+    #[tokio::test]
+    async fn serve_ws_liveness_answers_every_pipelined_request_id() {
+        let _guard = serial_guard().await;
+        let serve = spawn_serve();
+        wait_for_port(serve.port).await;
+        let url = format!(
+            "ws://127.0.0.1:{}/api/ui-protocol/ws?token={AUTH_TOKEN}",
+            serve.port
+        );
+        let (mut ws, _response) = connect_async(url).await.unwrap();
+
+        // Well-formed requests for an unknown method: each gets a JSON-RPC
+        // error reply echoing its id — cheap, side-effect-free, and exactly
+        // the id-echo a pipelining client depends on. (The wire contract is
+        // string ids — numeric ids are rejected at the envelope.)
+        let ids: Vec<String> = (0..8).map(|i| format!("pipeline-{i}")).collect();
+        for id in &ids {
+            let request = format!(
+                r#"{{"jsonrpc":"2.0","id":"{id}","method":"no/such/method","params":{{}}}}"#
+            );
+            ws.send(Message::Text(request.into()))
+                .await
+                .expect("failed to send pipelined request");
+        }
+
+        // Collect replies over a budget spanning several housekeeping ticks.
+        let mut answered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let budget = tokio::time::Instant::now() + Duration::from_secs(10);
+        while answered.len() < ids.len() && tokio::time::Instant::now() < budget {
+            match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+                            if ids.iter().any(|mine| mine == id) {
+                                answered.insert(id.to_string());
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => {} // pings and text heartbeats
+                Ok(Some(Err(error))) => {
+                    panic!("connection errored before every id was answered: {error}")
+                }
+                Ok(None) => panic!("server closed the connection before every id was answered"),
+                Err(_) => {} // 500 ms collection slice — keep waiting
+            }
+        }
+        let expected: std::collections::HashSet<String> = ids.iter().cloned().collect();
+        assert_eq!(
+            answered, expected,
+            "every pipelined request id must be answered — a missing id means a frame was consumed without dispatch"
         );
     }
 }

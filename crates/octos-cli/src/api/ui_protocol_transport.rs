@@ -241,6 +241,39 @@ fn ws_liveness_deadline_from_ping_interval(ping: std::time::Duration) -> std::ti
     ping.saturating_mul(WS_LIVENESS_MISSED_PINGS + 1)
 }
 
+/// Upper bound on the housekeeping tick's non-blocking socket pass, so a
+/// client flooding frames cannot starve the housekeeping — the next tick
+/// drains more.
+const WS_TICK_DRAIN_MAX_FRAMES: usize = 64;
+
+/// One bounded non-blocking pass over the socket for the housekeeping tick:
+/// every frame the kernel has already delivered refreshes the liveness meter
+/// and is QUEUED for the normal per-frame path. The drain exists so the
+/// deadline check reads a fresh meter instead of one frozen before an inline
+/// dispatch — it must never consume a frame: a swallowed Text frame's
+/// JSON-RPC id is never answered and a pipelining client hangs (#2447
+/// review). Returns `true` when the stream is gone (error or closed).
+async fn drain_queued_ws_frames<S, E>(
+    ws_rx: &mut S,
+    out: &mut std::collections::VecDeque<WsMessage>,
+    last_inbound: &mut std::time::Instant,
+) -> bool
+where
+    S: futures::Stream<Item = Result<WsMessage, E>> + Unpin,
+{
+    for _ in 0..WS_TICK_DRAIN_MAX_FRAMES {
+        match futures::poll!(ws_rx.next()) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                *last_inbound = std::time::Instant::now();
+                out.push_back(frame);
+            }
+            std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => return true,
+            std::task::Poll::Pending => return false,
+        }
+    }
+    false
+}
+
 /// #2036 — how much of a peer's result survives into the DURABLE goal-ledger
 /// finding. Since #1990 that finding is what the completion verifier reads, so
 /// this budget decides whether a multi-peer goal can ever be verified: the
@@ -6930,6 +6963,12 @@ async fn ui_protocol_connection(
     let mut last_inbound = std::time::Instant::now();
     let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
     appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Frames the housekeeping drain lifted off the socket while an inline
+    // dispatch was running. They are replayed through the per-frame path
+    // below — draining must never swallow one, or its JSON-RPC id is never
+    // answered and a pipelining client hangs (#2447 review).
+    let mut drained_frames: std::collections::VecDeque<WsMessage> =
+        std::collections::VecDeque::new();
 
     loop {
         // #924 round-2 BLOCK: close the lost-notify race. `notify_waiters`
@@ -6951,7 +6990,12 @@ async fn ui_protocol_connection(
             break;
         }
 
-        let msg = tokio::select! {
+        let msg = if let Some(frame) = drained_frames.pop_front() {
+            // Replay a frame the housekeeping drain lifted off the socket: it
+            // takes the exact per-frame path below, so its id gets answered.
+            frame
+        } else {
+            tokio::select! {
             biased;
             _ = &mut notified => {
                 // Latch arm only fires when the connection is failed; no
@@ -6960,25 +7004,17 @@ async fn ui_protocol_connection(
             }
             _ = appui_continuation_tick.tick() => {
                 // The select is `biased`: this housekeeping arm is polled
-                // before the read arm, so Pongs that queued behind a slow
+                // before the read arm, so frames that queued behind a slow
                 // inline dispatch would sit in the kernel buffer while the
                 // deadline check below reads a stale meter. Give the read
-                // side one non-blocking pass first. Bounded so a client
-                // flooding frames cannot starve the housekeeping — the next
-                // tick drains more.
-                let mut read_gone = false;
-                for _ in 0..64 {
-                    match futures::poll!(ws_rx.next()) {
-                        std::task::Poll::Ready(Some(Ok(_))) => {
-                            last_inbound = std::time::Instant::now();
-                        }
-                        std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => {
-                            read_gone = true;
-                            break;
-                        }
-                        std::task::Poll::Pending => break,
-                    }
-                }
+                // side one non-blocking pass first — queued frames go to
+                // `drained_frames` for replay, never dropped.
+                let read_gone = drain_queued_ws_frames(
+                    &mut ws_rx,
+                    &mut drained_frames,
+                    &mut last_inbound,
+                )
+                .await;
                 if read_gone {
                     break;
                 }
@@ -7034,6 +7070,7 @@ async fn ui_protocol_connection(
                 Some(Ok(msg)) => msg,
                 Some(Err(_)) | None => break,
             },
+            }
         };
         last_inbound = std::time::Instant::now();
         // #922.2: stop dispatch once a lifecycle/RPC send has been
