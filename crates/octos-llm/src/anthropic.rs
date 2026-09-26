@@ -192,9 +192,13 @@ impl AnthropicProvider {
         if cache.is_some() {
             apply_message_cache_breakpoint(&mut api_messages);
         }
-        let thinking = config
-            .reasoning_effort
-            .and_then(|effort| build_anthropic_thinking(effort, max_tokens));
+        let (thinking, output_config) = match config.reasoning_effort {
+            Some(effort) if model_uses_adaptive_thinking(&self.model) => {
+                build_adaptive_thinking(effort)
+            }
+            Some(effort) => (build_anthropic_thinking(effort, max_tokens), None),
+            None => (None, None),
+        };
         let (temperature, top_p, top_k) = self.sampling_fields(config);
         AnthropicRequest {
             model: &self.model,
@@ -246,6 +250,7 @@ impl AnthropicProvider {
                 )
             },
             thinking,
+            output_config,
             context_management: config.context_management.as_ref(),
             temperature,
             top_p,
@@ -274,7 +279,12 @@ impl AnthropicProvider {
                     .map(|(index, tool)| (format!("tool:{index}"), tool.clone())),
             );
         }
-        for key in ["thinking", "context_management", "tool_choice"] {
+        for key in [
+            "thinking",
+            "output_config",
+            "context_management",
+            "tool_choice",
+        ] {
             if let Some(value) = normalized.get(key) {
                 stable.push((format!("config:{key}"), value.clone()));
             }
@@ -654,6 +664,11 @@ struct AnthropicRequest<'a> {
     tools: Option<Vec<AnthropicTool<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
+    /// `{"effort": …}` alongside adaptive thinking; absent on the
+    /// `budget_tokens` path. Changing it invalidates Anthropic's message
+    /// cache, so it is also a manifest segment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
     /// M8.5 tier 2: forwarded from `ChatConfig.context_management`. Opaque
     /// payload (typically `{ "edits": [ { "type":
     /// "clear_tool_uses_20250919", ... } ] }`) that tells Anthropic's server
@@ -683,7 +698,77 @@ struct AnthropicRequest<'a> {
 #[derive(Serialize)]
 struct AnthropicThinking {
     r#type: &'static str,
-    budget_tokens: u32,
+    /// Only on the `"enabled"` form; `"adaptive"` takes no budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct AnthropicOutputConfig {
+    effort: &'static str,
+}
+
+/// Whether `model` takes `thinking: {type: "adaptive"}` + `output_config.effort`
+/// instead of `{type: "enabled", budget_tokens}`.
+///
+/// Opus/Sonnet 4.6+ and Fable/Mythos support adaptive thinking; Opus 4.7+,
+/// Sonnet 5 and every later model return a hard 400 on `budget_tokens`
+/// (Opus 5.5 also cannot disable thinking at all). Older Claude and every
+/// non-Claude model on this protocol keep the `budget_tokens` form.
+///
+/// Matched on the normalized last path segment, like
+/// [`model_accepts_sampling`]. A trailing date snapshot
+/// (`claude-opus-4-20250514`) is not a minor version: only a 1–2 digit
+/// segment counts.
+fn model_uses_adaptive_thinking(model: &str) -> bool {
+    let leaf = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .trim()
+        .to_ascii_lowercase();
+    let Some(rest) = leaf.strip_prefix("claude-") else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    let version = |part: Option<&str>| {
+        part.filter(|p| p.len() <= 2)
+            .and_then(|p| p.parse::<u32>().ok())
+    };
+    match parts.next() {
+        Some("fable" | "mythos") => true,
+        Some("opus" | "sonnet") => {
+            let Some(major) = version(parts.next()) else {
+                return false;
+            };
+            let minor = version(parts.next()).unwrap_or(0);
+            (major, minor) >= (4, 6)
+        }
+        _ => false,
+    }
+}
+
+/// Adaptive-thinking form of a reasoning effort. `Disabled` omits both
+/// fields: that turns thinking off on Opus 4.7/4.8 and falls back to the
+/// model default where it cannot be disabled (Opus 5.5), instead of sending
+/// a `{type: "disabled"}` those models reject.
+fn build_adaptive_thinking(
+    effort: ReasoningEffort,
+) -> (Option<AnthropicThinking>, Option<AnthropicOutputConfig>) {
+    let effort = match effort {
+        ReasoningEffort::Disabled => return (None, None),
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Max => "max",
+    };
+    (
+        Some(AnthropicThinking {
+            r#type: "adaptive",
+            budget_tokens: None,
+        }),
+        Some(AnthropicOutputConfig { effort }),
+    )
 }
 
 /// Anthropic requires `1024 <= budget_tokens < max_tokens`, and the reply still
@@ -701,7 +786,7 @@ fn build_anthropic_thinking(effort: ReasoningEffort, max_tokens: u32) -> Option<
     }
     Some(AnthropicThinking {
         r#type: "enabled",
-        budget_tokens: budget,
+        budget_tokens: Some(budget),
     })
 }
 
@@ -1970,6 +2055,110 @@ mod tests {
     }
 
     #[test]
+    fn should_classify_adaptive_thinking_models() {
+        // Opus/Sonnet 4.6+ and Fable/Mythos take `{type: "adaptive"}`; 4.7+
+        // and every 5.x 400 on `budget_tokens`. Older Claude (and every
+        // non-Claude model on this protocol, e.g. GLM via z.ai) keeps the
+        // `budget_tokens` form.
+        for adaptive in [
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "Claude-Opus-5-5",           // case-insensitive
+            "anthropic/claude-opus-5-5", // family-qualified
+            "r9s/claude-opus-4-7",       // proxied claude
+        ] {
+            assert!(
+                model_uses_adaptive_thinking(adaptive),
+                "{adaptive} must use adaptive thinking"
+            );
+        }
+        for budget in [
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-20250514", // date suffix is not a minor version
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-20250514",
+            "claude-haiku-4-5-20251001",
+            "claude-3-5-haiku-20241022",
+            "claude-test",
+            "glm-5.3",
+            "",
+        ] {
+            assert!(
+                !model_uses_adaptive_thinking(budget),
+                "{budget} must keep budget_tokens thinking"
+            );
+        }
+    }
+
+    #[test]
+    fn should_send_adaptive_thinking_and_effort_when_model_rejects_budget_tokens() {
+        let provider = AnthropicProvider::new("test-key", "claude-opus-5-5");
+        let messages = vec![msg(MessageRole::User, "hi")];
+        for (effort, wire) in [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Max, "max"),
+        ] {
+            let config = ChatConfig {
+                reasoning_effort: Some(effort),
+                // Too small for any budget_tokens ladder: adaptive thinking has
+                // no budget to clamp, so it must still be sent.
+                max_tokens: Some(1_500),
+                ..Default::default()
+            };
+            let body =
+                serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+            assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+            assert_eq!(body["output_config"], serde_json::json!({"effort": wire}));
+        }
+    }
+
+    #[test]
+    fn should_omit_thinking_and_effort_when_reasoning_disabled_on_adaptive_model() {
+        let provider = AnthropicProvider::new("test-key", "claude-opus-5-5");
+        let messages = vec![msg(MessageRole::User, "hi")];
+        for effort in [None, Some(ReasoningEffort::Disabled)] {
+            let config = ChatConfig {
+                reasoning_effort: effort,
+                ..Default::default()
+            };
+            let body =
+                serde_json::to_value(provider.build_request(&messages, &[], &config)).unwrap();
+            assert!(body.get("thinking").is_none(), "{body}");
+            assert!(body.get("output_config").is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn should_record_output_config_as_a_manifest_segment() {
+        // Changing effort invalidates Anthropic's message cache, so it must be
+        // visible in the prompt-cache manifest like `thinking` is.
+        let provider = AnthropicProvider::new("key", "claude-opus-5-5");
+        let messages = [msg(MessageRole::User, "hello")];
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+        let request = provider.build_request(&messages, &[], &config);
+        let manifest = provider.prompt_cache_input_manifest(&request, &config);
+        assert!(
+            manifest
+                .stable_segments
+                .iter()
+                .any(|segment| segment.kind == "config:output_config"),
+            "effort changes Anthropic's message cache and must be visible in the manifest"
+        );
+    }
+
+    #[test]
     fn should_parse_redacted_thinking_block() {
         // P2: a redacted_thinking block must not break deserialization; the
         // answer/tool calls still come through and it contributes no reasoning.
@@ -2963,9 +3152,10 @@ mod tests {
 
     #[test]
     fn should_not_send_any_sampling_to_opus_4_7_when_thinking_omitted_for_small_max_tokens() {
-        // H3 explicit: the small-max_tokens path drops `thinking` (no valid
-        // budget fits), which is exactly where the first cut leaked ALL
-        // sampling to Opus 4.7. The model gate must still suppress everything.
+        // H3 explicit: the small-max_tokens path is exactly where the first
+        // cut leaked ALL sampling to Opus 4.7. Opus 4.7 now takes adaptive
+        // thinking (no budget to clamp away), and the model gate must still
+        // suppress every sampler.
         let (provider, tools, messages) = claude_fixture();
         let mut sp = serde_json::Map::new();
         sp.insert("top_p".to_string(), serde_json::json!(0.9));
@@ -2978,7 +3168,7 @@ mod tests {
         };
         let body =
             serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
-        assert!(body.get("thinking").is_none(), "budget cannot fit: {body}");
+        assert_eq!(body["thinking"]["type"], "adaptive", "{body}");
         assert!(body.get("temperature").is_none(), "{body}");
         assert!(body.get("top_p").is_none(), "{body}");
         assert!(body.get("top_k").is_none(), "{body}");
@@ -3000,7 +3190,7 @@ mod tests {
         };
         let body =
             serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
-        assert_eq!(body["thinking"]["type"], "enabled", "{body}");
+        assert_eq!(body["thinking"]["type"], "adaptive", "{body}");
         assert!(body.get("top_p").is_none(), "{body}");
     }
 }
