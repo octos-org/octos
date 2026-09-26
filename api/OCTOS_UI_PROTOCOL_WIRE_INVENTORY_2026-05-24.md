@@ -2,7 +2,9 @@
 
 Status: current; the tables below are pinned to the code constants by
 `scripts/lint-ui-protocol-inventory.py` in the CI `check` job (a method added
-or removed in code without updating this file fails CI)
+to or removed from the pinned constants without updating this file fails CI;
+wire-shaped constants outside the pinned lists are reported in the lint's
+output)
 Protocol: `octos-ui/v1alpha1`
 
 This inventory reconciles the shipped AppUI/UI Protocol wire surface with the

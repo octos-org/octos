@@ -21,6 +21,14 @@ convention: a reference gets a CI-runnable verification):
 
 A method added in code without an inventory row — or a row left behind after
 the method is gone — fails the `check` job.
+
+Known blind spot: a wire notification emitted without appearing in
+`UI_PROTOCOL_NOTIFICATION_METHODS` is invisible to those equality checks
+(`turn/steer_dropped` and `session/orchestration` ship that way today; adding
+them grows the `client_hello` `supported_notifications` negotiation surface,
+so that is a code change, not a lint fix). Every wire-shaped `methods::`
+constant outside the pinned surface is therefore reported as a non-blocking
+warning, keeping the gap visible until the constants are completed.
 """
 
 from __future__ import annotations
@@ -36,9 +44,18 @@ DEFAULT_TRANSPORT = Path("crates/octos-cli/src/api/ui_protocol_transport.rs")
 
 
 def _strip_line_comments(text: str) -> str:
-    # Method-name literals never contain `//`, so line-level stripping is safe
-    # here and keeps `///` doc comments between array elements harmless.
-    return re.sub(r"^\s*//.*$", "", text, flags=re.M)
+    # Method-name literals never contain `//`, so anything from the first `//`
+    # after a line's last quote is a comment. Whole-line comments (`///` doc
+    # comments between array elements included) drop out entirely.
+    stripped = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("//"):
+            continue
+        marker = line.find("//")
+        if marker != -1 and marker > line.rfind('"'):
+            line = line[:marker]
+        stripped.append(line)
+    return "\n".join(stripped)
 
 
 def parse_method_name_constants(core: str) -> dict[str, str]:
@@ -146,8 +163,10 @@ def check(
     transport: str,
     inventory: str,
     inventory_name: str = str(DEFAULT_INVENTORY),
-) -> list[str]:
-    """Return human-readable violations; empty means the inventory is current."""
+) -> tuple[list[str], list[str]]:
+    """Return (violations, warnings); empty violations means the inventory is
+    current with the pinned constants. Warnings cover wire-shaped constants
+    the pinned lists don't name and never block."""
     names = parse_method_name_constants(core)
     names.update(parse_const_aliases(transport, names))
     commands = set(parse_str_list(core, "UI_PROTOCOL_COMMAND_METHODS", names))
@@ -185,7 +204,19 @@ def check(
             f"{inventory_name}:{inv_notifications[stale]}: notifications row "
             f"`{stale}` is no longer in the code constants"
         )
-    return violations
+
+    # Wire methods are always `namespace/name`; the methods module also holds
+    # feature gates and message fragments, which the shape excludes.
+    method_shape = re.compile(r"^[a-z][a-z0-9_]*(?:/[a-z0-9_.]+)+$")
+    warnings = [
+        f"{inventory_name}: code constant `{name}` is in no pinned method list; "
+        "if it ships on the wire, the inventory cannot see it — extend "
+        "UI_PROTOCOL_NOTIFICATION_METHODS/UI_PROTOCOL_COMMAND_METHODS first"
+        for name in sorted(
+            {v for v in names.values() if method_shape.match(v)} - surface - notifications
+        )
+    ]
+    return violations, warnings
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +230,10 @@ pub mod methods {
     pub const TURN_START: &str = "turn/start";
     pub const TURN_STOP: &str = "turn/stop";
     pub const GOAL_MOVE: &str = "session/goal/operator_transition";
+    /// Emitted on the wire but absent from every pinned list.
+    pub const ORPHAN_NOTE: &str = "turn/orphan_note";
+    /// Not wire-shaped (a feature gate): never warned about.
+    pub const ORPHAN_FEATURE: &str = "session.orphan_feature.v1";
 }
 pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::SESSION_OPEN,
@@ -221,7 +256,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PING,
     APPUI_METHOD_SHUTDOWN,
     // a comment between elements
-    crate::ui_protocol::methods::SESSION_OPEN,
+    crate::ui_protocol::methods::SESSION_OPEN, // trailing element comment
 ];
 """
 
@@ -247,12 +282,31 @@ def _self_test() -> None:
         else:
             raise AssertionError(f"expected ValueError containing {needle!r}")
 
-    # Clean sources: the lint passes with no violations.
-    clean = check(SELF_TEST_CORE, SELF_TEST_TRANSPORT, SELF_TEST_INVENTORY, "inv.md")
-    assert clean == [], clean
+    # Clean sources: no violations, and the pinned-list orphan is surfaced as
+    # a warning while the non-wire-shaped feature constant stays silent.
+    violations, warnings = check(
+        SELF_TEST_CORE, SELF_TEST_TRANSPORT, SELF_TEST_INVENTORY, "inv.md"
+    )
+    assert violations == [], violations
+    assert len(warnings) == 1 and "`turn/orphan_note`" in warnings[0], warnings
+
+    # Trailing element comments parse instead of failing the array, and a
+    # fully pinned surface produces zero warnings.
+    covered_core = (SELF_TEST_CORE
+        .replace('    /// Emitted on the wire but absent from every pinned list.\n'
+                 '    pub const ORPHAN_NOTE: &str = "turn/orphan_note";\n', '')
+        .replace('    /// Not wire-shaped (a feature gate): never warned about.\n'
+                 '    pub const ORPHAN_FEATURE: &str = "session.orphan_feature.v1";\n', ''))
+    violations, warnings = check(
+        covered_core,
+        SELF_TEST_TRANSPORT,  # carries `// trailing element comment`
+        SELF_TEST_INVENTORY,
+        "inv.md",
+    )
+    assert violations == [] and warnings == [], (violations, warnings)
 
     # A method in code without an inventory row is caught.
-    missing = check(
+    missing, _ = check(
         SELF_TEST_CORE,
         SELF_TEST_TRANSPORT,
         SELF_TEST_INVENTORY.replace("| `turn/stop` |\n", ""),
@@ -261,7 +315,7 @@ def _self_test() -> None:
     assert any("`turn/stop`" in v and "missing" in v for v in missing), missing
 
     # A stale command row for a removed method is caught.
-    stale = check(
+    stale, _ = check(
         SELF_TEST_CORE,
         SELF_TEST_TRANSPORT,
         SELF_TEST_INVENTORY.replace(
@@ -272,7 +326,7 @@ def _self_test() -> None:
     assert any("`turn/gone`" in v and "no longer" in v for v in stale), stale
 
     # Notification drift is caught on both sides.
-    notif = check(
+    notif, _ = check(
         SELF_TEST_CORE,
         SELF_TEST_TRANSPORT,
         SELF_TEST_INVENTORY.replace("| `turn/started` |", "| `turn/wrong` |"),
@@ -296,7 +350,7 @@ def _self_test() -> None:
         "pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[\n    methods::SESSION_OPEN,",
         "pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[",
     )
-    escaped = check(escaped_core, SELF_TEST_TRANSPORT, SELF_TEST_INVENTORY, "inv.md")
+    escaped, _ = check(escaped_core, SELF_TEST_TRANSPORT, SELF_TEST_INVENTORY, "inv.md")
     assert any("no longer a subset" in v for v in escaped), escaped
 
     # An unrecognized element shape fails closed instead of under-reading.
@@ -322,12 +376,14 @@ def main() -> int:
     core = DEFAULT_CORE.read_text()
     transport = DEFAULT_TRANSPORT.read_text()
     try:
-        violations = check(core, transport, inventory)
+        violations, warnings = check(core, transport, inventory)
     except ValueError as e:
         # The code shape outgrew the parser (or the inventory lost a table);
         # failing loudly beats passing vacuously.
         print(f"wire-inventory lint could not read its inputs: {e}", file=sys.stderr)
         return 1
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     if violations:
         for violation in violations:
             print(violation, file=sys.stderr)
