@@ -180,6 +180,19 @@ pub const GOAL_VERIFIER_LANE_KEY: &str = "goal_verifier";
 /// session's own provider, which is the pre-#1935 behavior unchanged (the
 /// back-compat default) — when no `goal_verifier` lane is configured or the
 /// configured lane fails to build.
+/// The LLM provider family a resolved profile config selects: the explicit
+/// `provider` (populated from `llm.primary` by `config_from_profile`), else
+/// the family detected from the model id.
+pub(crate) fn configured_provider_name(config: &Config) -> Option<String> {
+    config.provider.clone().or_else(|| {
+        config
+            .model
+            .as_deref()
+            .and_then(crate::config::detect_provider)
+            .map(String::from)
+    })
+}
+
 pub fn build_goal_verifier_provider(config: &Config) -> Option<Arc<dyn LlmProvider>> {
     let sp = config
         .sub_providers
@@ -1016,18 +1029,9 @@ impl ProfileRuntime {
         // else falls back to `detect_provider(model)`.
         let model = config.model.clone();
         let base_url = config.base_url.clone();
-        let provider_name = config
-            .provider
-            .clone()
-            .or_else(|| {
-                model
-                    .as_deref()
-                    .and_then(crate::config::detect_provider)
-                    .map(String::from)
-            })
-            .ok_or_else(|| {
-                eyre::eyre!("profile '{}' has no LLM provider configured", profile.id)
-            })?;
+        let provider_name = configured_provider_name(&config).ok_or_else(|| {
+            eyre::eyre!("profile '{}' has no LLM provider configured", profile.id)
+        })?;
 
         // Step 3: build the LLM provider chain.
         let base_provider = match provider_override {

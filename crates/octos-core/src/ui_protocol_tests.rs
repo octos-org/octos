@@ -3287,6 +3287,7 @@ fn resumable_notifications_carry_event_ledger_cursors() {
         tokens_in: None,
         tokens_out: None,
         session_result: None,
+        token_usage: None,
     });
     let completed_wire = completed
         .clone()

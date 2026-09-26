@@ -2207,6 +2207,14 @@ Optional fields from accepted `UPCR-2026-014` (M9-α-9):
   `session_result` frame so a WS client can stamp authoritative seq
   onto an optimistic bubble without an extra REST roundtrip. Absent
   when the turn ended without a final assistant row.
+- `token_usage`
+  Exact measured usage for this turn as `EnvelopeTokenUsage` counters
+  (input, output, reasoning, cache-read, cache-write), the same shape
+  `turn/error` carries. Additive and optional: omitted when the producer
+  has no typed total, and never session-cumulative. The v2
+  `projection/envelope` `turn_terminal` with `outcome: "completed"` carries
+  these counters verbatim; without it the projection keeps deriving
+  input/output from `tokens_in` / `tokens_out`.
 
 ### `turn/started`
 

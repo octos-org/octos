@@ -126,6 +126,7 @@ mod tests {
             tokens_in: None,
             tokens_out: None,
             session_result: None,
+            token_usage: None,
         })
         .into_rpc_notification()
         .expect("serialize turn/completed");

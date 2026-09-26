@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use eyre::Result;
 
+use crate::local_context_probe::LocalContextProbe;
 use crate::openai::OpenAIProvider;
 use crate::openai_responses::{OpenAIResponsesProvider, is_responses_capable};
 use crate::provider::LlmProvider;
@@ -49,6 +50,14 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
         return Ok(Arc::new(provider));
     }
 
+    // OpenAI-compatible servers are also configured under the `openai`
+    // family. Their loaded window can differ from both the model catalog
+    // and its broad family aliases (e.g. qwen3.8-27b matching qwen3).
+    let probe_url = p
+        .base_url
+        .as_deref()
+        .filter(|url| Some(url.trim_end_matches('/')) != ENTRY.default_base_url)
+        .map(str::to_owned);
     let mut provider = OpenAIProvider::new(&key, &model);
     if let Some(url) = p.base_url {
         provider = provider.with_base_url(&url);
@@ -59,5 +68,14 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     if let Some((t, c)) = http_timeout {
         provider = provider.with_http_timeout(t, c);
     }
-    Ok(Arc::new(provider))
+    let provider: Arc<dyn LlmProvider> = Arc::new(provider);
+    if let Some(url) = probe_url {
+        return Ok(LocalContextProbe::new(
+            provider,
+            &url,
+            Some(key),
+            http_timeout,
+        ));
+    }
+    Ok(provider)
 }

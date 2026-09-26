@@ -111,6 +111,7 @@ pub(super) fn emit_turn_completed_full(
         tokens_in,
         tokens_out,
         session_result,
+        token_usage: None,
     });
     // The canonical `turn_completed` terminal reaches the client as a native
     // v2 `TurnTerminal`, projected from this lifecycle notification (see

@@ -20246,13 +20246,18 @@ fn project_lifecycle_event_to_v2_wire(
                     payload: PayloadV2::TurnTerminal {
                         outcome: TurnTerminalOutcome::Completed,
                         error: None,
-                        token_usage: Some(EnvelopeTokenUsage {
-                            input_tokens: completed.tokens_in.map(u64::from).unwrap_or(0),
-                            output_tokens: completed.tokens_out.map(u64::from).unwrap_or(0),
-                            reasoning_tokens: 0,
-                            cache_read_tokens: 0,
-                            cache_write_tokens: 0,
-                        }),
+                        // Prefer the producer's exact usage; rows without
+                        // it (legacy ledgers, non-LLM paths) keep the
+                        // input/output-only projection.
+                        token_usage: Some(completed.token_usage.clone().unwrap_or_else(|| {
+                            EnvelopeTokenUsage {
+                                input_tokens: completed.tokens_in.map(u64::from).unwrap_or(0),
+                                output_tokens: completed.tokens_out.map(u64::from).unwrap_or(0),
+                                reasoning_tokens: 0,
+                                cache_read_tokens: 0,
+                                cache_write_tokens: 0,
+                            }
+                        })),
                     },
                 },
             }
@@ -20779,6 +20784,11 @@ async fn open_session_result(
     else {
         return Err(runtime_unavailable_error("Sessions not available"));
     };
+    // Opening a saved session can compact its history before the first turn.
+    // Resolve the runtime window before reading history or taking writer locks.
+    if let Some(provider) = open_context_provider.as_ref() {
+        provider.ensure_ready().await;
+    }
     let (data_dir, history) = {
         let mut sessions = sessions.lock().await;
         let data_dir = sessions.data_dir();
@@ -22317,6 +22327,17 @@ pub(crate) fn session_workspace_root_for_state(
 /// wording — the SPA's reducer matches on it heuristically and must
 /// not change.
 fn append_workspace_root_hint(mut prompt: String, workspace_root: Option<&Path>) -> String {
+    // Prompt-cache stability opt-out: the per-session workspace path embeds
+    // the session id, so this hint is the ONLY volatile byte in an otherwise
+    // byte-identical system prompt across sessions — it single-handedly
+    // breaks KV-cache prefix reuse for every new session (measured on the
+    // appui card-generation path: 35% shared prefix with the hint, ~99%
+    // without). Hosts whose agents never do file work (the phone's
+    // card-generation appui) set OCTOS_OMIT_WORKSPACE_HINT=1 in the kernel's
+    // spawn env to drop it; every other surface keeps today's bytes.
+    if std::env::var_os("OCTOS_OMIT_WORKSPACE_HINT").is_some_and(|v| v == "1") {
+        return prompt;
+    }
     if let Some(workspace_root) = workspace_root {
         prompt.push_str("\n\nAppUi session workspace root: ");
         prompt.push_str(&workspace_root.to_string_lossy());
@@ -38224,6 +38245,13 @@ async fn run_standalone_turn(
                     // meaning for every other consumer of this event.
                     "tokens_cache": (response.token_usage.cache_read_tokens as u64)
                         + (response.token_usage.cache_write_tokens as u64),
+                    "token_usage": EnvelopeTokenUsage {
+                        input_tokens: u64::from(response.token_usage.input_tokens),
+                        output_tokens: u64::from(response.token_usage.output_tokens),
+                        reasoning_tokens: u64::from(response.token_usage.reasoning_tokens),
+                        cache_read_tokens: u64::from(response.token_usage.cache_read_tokens),
+                        cache_write_tokens: u64::from(response.token_usage.cache_write_tokens),
+                    },
                     "cursor": cursor,
                     "message_id": final_assistant_message_id,
                     "final_assistant_committed_seq": final_assistant_committed_seq,
@@ -38541,7 +38569,9 @@ async fn run_standalone_turn(
                     tokens_out: Some(u32::try_from(tokens_out).unwrap_or(u32::MAX)),
                     session_result,
                     outcome: Some(TurnTerminalOutcome::Completed),
-                    token_usage: None,
+                    token_usage: event
+                        .get("token_usage")
+                        .and_then(|usage| serde_json::from_value(usage.clone()).ok()),
                     partial_result: None,
                 };
                 // #1801 v2: a peer session's terminal leaves its result on
@@ -40155,7 +40185,8 @@ struct TurnCompletionDetails {
     // combinations that project the terminal outcome into the lifecycle emit.
     #[allow(dead_code)]
     outcome: Option<TurnTerminalOutcome>,
-    /// Exact failed-turn usage, not the input/output session cost snapshot.
+    /// Exact usage of this turn (completed or failed), not the input/output
+    /// session cost snapshot.
     token_usage: Option<EnvelopeTokenUsage>,
     partial_result: Option<TurnErrorPartialResult>,
 }
@@ -40167,7 +40198,8 @@ struct TurnCompletionDetails {
 /// `completion_details` is consulted only when `expected_reason` is
 /// `Completed`, except `token_usage`, which also accompanies an error.
 /// Populated on the standalone-turn path
-/// from `done` (input/output tokens + cursor + per-row identity); left as
+/// from `done` (input/output tokens + structured token usage + cursor +
+/// per-row identity); left as
 /// `None` for paths that do not run the LLM (slash command, review/start
 /// scatter-join, M9 fixture replays).
 #[allow(clippy::too_many_arguments)]
@@ -40244,6 +40276,10 @@ async fn try_emit_terminal(
                     tokens_in,
                     tokens_out,
                     session_result: details.session_result,
+                    // The provider's structured usage for this turn, so the
+                    // v2 `TurnTerminal` projection carries reasoning and
+                    // cache tokens instead of zeros.
+                    token_usage: details.token_usage,
                 }),
             );
             // The canonical `turn_completed` terminal reaches the client as a
@@ -40406,6 +40442,7 @@ async fn try_emit_completed_terminal_with_forced_backpressure(
             tokens_in: None,
             tokens_out: None,
             session_result: None,
+            token_usage: None,
         }),
     );
 

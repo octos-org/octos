@@ -12,6 +12,8 @@ pub use octos_store::admin_audit_store;
 pub use octos_store::admin_token_store;
 #[cfg(feature = "api")]
 pub mod api;
+#[cfg(feature = "api")]
+pub mod embedded;
 pub use octos_store::approvals_audit;
 pub mod auth;
 // Build-cache pool (outer-loop #3, design docs/build-cache-pool.md):

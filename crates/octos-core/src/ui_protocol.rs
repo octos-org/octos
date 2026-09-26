@@ -6256,6 +6256,12 @@ pub struct TurnCompletedEvent {
     /// `session_result` frame's role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_result: Option<TurnSessionResult>,
+    /// Exact usage of this completed turn as the provider reported it,
+    /// keeping reasoning, cache-read and cache-write tokens distinct. Absent
+    /// when the producer has no typed total (legacy rows, non-LLM paths);
+    /// consumers then fall back to `tokens_in` / `tokens_out`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<EnvelopeTokenUsage>,
 }
 
 /// UPCR-2026-014 (M9-α-9) `turn/completed.session_result` payload.

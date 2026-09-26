@@ -4134,6 +4134,7 @@ mod tests {
                 tokens_in: None,
                 tokens_out: None,
                 session_result: None,
+                token_usage: None,
             }));
 
         assert!(matches!(

@@ -192,9 +192,21 @@ impl AnthropicProvider {
         if cache.is_some() {
             apply_message_cache_breakpoint(&mut api_messages);
         }
-        let thinking = config
-            .reasoning_effort
-            .and_then(|effort| build_anthropic_thinking(effort, max_tokens));
+        // GLM enables reasoning when this field is absent. An explicit fast
+        // mode must reach its compatible endpoint, rather than inheriting that
+        // default. Preserve the existing request shape for other models.
+        let thinking = if self.model.to_ascii_lowercase().starts_with("glm-")
+            && config.reasoning_effort == Some(ReasoningEffort::Disabled)
+        {
+            Some(AnthropicThinking {
+                r#type: "disabled",
+                budget_tokens: 0,
+            })
+        } else {
+            config
+                .reasoning_effort
+                .and_then(|effort| build_anthropic_thinking(effort, max_tokens))
+        };
         let (temperature, top_p, top_k) = self.sampling_fields(config);
         AnthropicRequest {
             model: &self.model,
@@ -683,7 +695,12 @@ struct AnthropicRequest<'a> {
 #[derive(Serialize)]
 struct AnthropicThinking {
     r#type: &'static str,
+    #[serde(skip_serializing_if = "is_zero_budget")]
     budget_tokens: u32,
+}
+
+fn is_zero_budget(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Anthropic requires `1024 <= budget_tokens < max_tokens`, and the reply still
@@ -1916,6 +1933,23 @@ mod tests {
         let body = serde_json::to_value(&request).unwrap();
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 8_192);
+    }
+
+    #[test]
+    fn glm_fast_mode_explicitly_disables_provider_default_thinking() {
+        let provider = AnthropicProvider::new("test-key", "glm-5.3-flash")
+            .with_base_url("https://api.z.ai/api/anthropic");
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::Disabled),
+            ..ChatConfig::default()
+        };
+        let body = serde_json::to_value(provider.build_request(
+            &[msg(MessageRole::User, "weather")],
+            &[],
+            &config,
+        ))
+        .unwrap();
+        assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
     }
 
     #[test]
