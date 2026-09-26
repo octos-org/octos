@@ -70,6 +70,16 @@ fn main() -> Result<()> {
         panic!("__test_panic__: intentional panic for production hook verification");
     }
 
+    // Answer shell completion requests before argument parsing (#2413): with
+    // `OCTOS_COMPLETE=<shell>` set the shell sources the registration script
+    // and calls back into this binary on every tab; without it this is a
+    // no-op. The var is namespaced — a generic `COMPLETE` exported for some
+    // other tool must not brick every octos invocation. Must precede parsing —
+    // mid-edit arguments don't parse cleanly.
+    clap_complete::CompleteEnv::with_factory(<Args as clap::CommandFactory>::command)
+        .var("OCTOS_COMPLETE")
+        .complete();
+
     // Parse into ArgMatches first (this preserves clap's --help/--version/error
     // handling exactly as `Args::parse()` did), materialize the typed Args, then
     // merge the layered `cli.<cmd>` startup defaults BEFORE any downstream reads
