@@ -1,7 +1,8 @@
 # Octos UI Protocol Wire Inventory
 
-Status: current inventory for Octos issue #716
-Date: 2026-05-24
+Status: current; the tables below are pinned to the code constants by
+`scripts/lint-ui-protocol-inventory.py` in the CI `check` job (a method added
+or removed in code without updating this file fails CI)
 Protocol: `octos-ui/v1alpha1`
 
 This inventory reconciles the shipped AppUI/UI Protocol wire surface with the
@@ -24,6 +25,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `client_hello` | shipped AppUI extra, stdio/websocket negotiation |
 | `config/capabilities/list` | shipped AppUI extra, UPCR-2026-017 |
 | `profile/local/create` | shipped, UPCR-2026-018 |
+| `server/shutdown` | shipped local-solo AppUI extra, UPCR-2026-032; stops this `octos serve` exactly as Ctrl+C would |
 | `session/open` | shipped base method |
 | `session/list` | shipped REST-to-WS method |
 | `session/snapshot` | shipped REST-to-WS method |
@@ -61,6 +63,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `session/goal/get` | shipped, UPCR-2026-021 |
 | `session/goal/set` | shipped, UPCR-2026-021 |
 | `session/goal/clear` | shipped, UPCR-2026-021 |
+| `session/goal/operator_transition` | shipped, UPCR-2026-021 |
 | `loop/create` | shipped, UPCR-2026-021 |
 | `loop/list` | shipped, UPCR-2026-021 |
 | `loop/delete` | shipped, UPCR-2026-021 |
@@ -96,6 +99,8 @@ spec and UPCR documents. The authoritative source remains code:
 | `skill/action/invoke` | shipped AppUI extra, UPCR-2026-026 |
 | `skill/action/job/list` | shipped AppUI extra, UPCR-2026-027 |
 | `skill/action/job/read` | shipped AppUI extra, UPCR-2026-027 |
+| `voice/admit` | shipped AppUI extra, gate `voice.asr_admission.v1`; ASR-only preflight for uploaded audio, never starts an LLM turn |
+| `voice/commit_admission` | shipped AppUI extra, gate `voice.asr_admission.v1`; consumes a speech admission and starts the admitted turn |
 | `onboarding/workspace_probe` | shipped local-solo AppUI extra |
 | `onboarding/workspace_list` | shipped local-solo AppUI extra, gate `onboarding.workspace_browse.v1` (WEB-WORKSPACE-BROWSER-CONTRACT-5000) |
 | `onboarding/workspace_create` | shipped local-solo AppUI extra, gate `onboarding.workspace_browse.v1` (WEB-WORKSPACE-BROWSER-CONTRACT-5000) |
