@@ -908,6 +908,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "turn/started",
             "turn/completed",
             "turn/error",
+            "turn/steer_dropped",
             "message/delta",
             "message/reasoning_delta",
             "tool/started",
@@ -950,6 +951,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "context/compaction_completed",
             "context/compaction_started",
             "context/normalization_reported",
+            "session/orchestration",
             "peer/staged",
             "peer/closed",
             "background/activity",
@@ -1131,6 +1133,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "turn/started",
                 "turn/completed",
                 "turn/error",
+                "turn/steer_dropped",
                 "message/delta",
                 "message/reasoning_delta",
                 "tool/started",
@@ -1173,6 +1176,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "context/compaction_completed",
                 "context/compaction_started",
                 "context/normalization_reported",
+                "session/orchestration",
                 "peer/staged",
                 "peer/closed",
                 "background/activity"
@@ -6870,6 +6874,30 @@ fn turn_steer_dropped_topic_routing_matches_other_turn_events() {
         .into_rpc_notification()
         .expect("serialize with explicit topic");
     assert_eq!(rpc.params["topic"], json!("explicit"));
+}
+
+// #2540: both notifications ship on the wire — `turn/steer_dropped` from the
+// steer path (negotiated `event.turn_steer_dropped.v1`, delivery unfiltered)
+// and `session/orchestration` from the whole-job indicator — but neither sat
+// in `UI_PROTOCOL_NOTIFICATION_METHODS`, so `client_hello` never advertised
+// them and a strict client validating frames against the advertised set
+// would reject legitimate ones.
+#[test]
+fn wire_shipped_steer_dropped_and_orchestration_notifications_are_advertised() {
+    let capabilities = UiProtocolCapabilities::first_server_slice();
+    for method in [methods::TURN_STEER_DROPPED, methods::SESSION_ORCHESTRATION] {
+        assert!(
+            UI_PROTOCOL_NOTIFICATION_METHODS.contains(&method),
+            "{method} ships on the wire and must be advertised"
+        );
+        assert!(
+            capabilities
+                .supported_notifications
+                .iter()
+                .any(|advertised| advertised == method),
+            "first_server_slice must advertise {method}"
+        );
+    }
 }
 
 #[test]
