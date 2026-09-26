@@ -93,6 +93,19 @@
       "max_output": 128000
     },
     {
+      "provider": "anthropic/claude-opus-5-5",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 4.0,
+      "cost_out": 20.0,
+      "context_window": 1000000,
+      "max_output": 128000
+    },
+    {
       "provider": "anthropic/claude-sonnet-4-20250514",
       "type": "strong",
       "default": true,
