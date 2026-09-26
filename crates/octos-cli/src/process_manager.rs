@@ -65,6 +65,11 @@ pub struct ProcessManager {
     /// Host-level `voice.asr_language` forwarded to spawned profile gateways.
     /// `None` preserves automatic language detection.
     host_asr_language: Option<String>,
+    /// Solo in-process serve hosts profiles itself, so a gateway child for
+    /// the same profile would open its episodes.redb a second time and lock
+    /// `session/open` out of the profile. Mirrors the `!solo_in_process`
+    /// gate on serve's auto-start loop for the manual start/restart routes.
+    solo_in_process: bool,
 }
 
 struct GatewayProcess {
@@ -259,6 +264,7 @@ impl ProcessManager {
             // serve overwrites from the resolved host config.
             host_memory_refresh_enabled: true,
             host_asr_language: None,
+            solo_in_process: false,
         }
     }
 
@@ -294,6 +300,15 @@ impl ProcessManager {
         self
     }
 
+    /// Mark this manager as belonging to a solo in-process serve: every
+    /// gateway start is refused (see the field docs). Covers the manual
+    /// admin/self-service start and restart routes the same way serve's
+    /// auto-start loop is already gated.
+    pub fn with_solo_in_process(mut self, solo_in_process: bool) -> Self {
+        self.solo_in_process = solo_in_process;
+        self
+    }
+
     /// Store a weak self-reference for auto-restart from spawned monitor tasks.
     /// Must be called after wrapping in `Arc`.
     pub fn set_self_ref(self: &Arc<Self>) {
@@ -325,9 +340,27 @@ impl ProcessManager {
 
     // ── Gateway lifecycle ──────────────────────────────────────────────
 
+    /// The solo in-process refusal shared by the manual gateway lifecycle
+    /// entries: a gateway child would open the profile's episodes.redb a
+    /// second time and lock `session/open` out of the profile.
+    fn ensure_gateway_start_allowed(&self, profile: &UserProfile) -> Result<()> {
+        if self.solo_in_process {
+            bail!(
+                "gateway start refused for profile '{}': this solo serve hosts profiles \
+                 in-process — a gateway child would open the same data dir and lock \
+                 session/open out of the profile; restart the serve without --solo to \
+                 run profile gateways",
+                profile.id
+            );
+        }
+        Ok(())
+    }
+
     /// Start the gateway for a profile. Returns an error if already running.
     /// If the profile has a managed WhatsApp channel, the bridge is started first.
     pub async fn start(&self, profile: &UserProfile) -> Result<()> {
+        self.ensure_gateway_start_allowed(profile)?;
+
         self.clear_configuration_error(&profile.id).await;
 
         // Hold the write lock for the entire operation to prevent TOCTOU races.
@@ -846,6 +879,9 @@ impl ProcessManager {
 
     /// Restart a gateway (stop then start).
     pub async fn restart(&self, profile: &UserProfile) -> Result<()> {
+        // Refuse before the stop/drain: a solo serve has nothing to stop and
+        // should not pay the restart delay just to reach the guard.
+        self.ensure_gateway_start_allowed(profile)?;
         let _ = self.stop(&profile.id).await;
         // Small delay to let the process clean up
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1521,6 +1557,47 @@ mod tests {
         let (_dir, pm) = make_pm();
         let pm = pm.with_host_asr_language(Some("English".to_string()));
         assert_eq!(pm.host_asr_language.as_deref(), Some("English"));
+    }
+
+    // ── solo in-process gateway-start guard ───────────────────────────
+
+    #[test]
+    fn should_default_to_gateway_starts_allowed_outside_solo_serve() {
+        let (_dir, pm) = make_pm();
+        assert!(!pm.solo_in_process);
+    }
+
+    #[tokio::test]
+    async fn should_refuse_gateway_start_when_solo_serve_hosts_profiles_in_process() {
+        let (_dir, pm) = make_pm();
+        let pm = pm.with_solo_in_process(true);
+        let profile = test_profile("solo-profile", vec![]);
+        let err = pm
+            .start(&profile)
+            .await
+            .expect_err("solo in-process serve must refuse gateway starts");
+        let message = err.to_string();
+        assert!(
+            message.contains("solo-profile")
+                && message.contains("solo serve hosts profiles in-process"),
+            "refusal must name the profile and the in-process ownership, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_refuse_gateway_restart_when_solo_serve_hosts_profiles_in_process() {
+        let (_dir, pm) = make_pm();
+        let pm = pm.with_solo_in_process(true);
+        let profile = test_profile("solo-profile", vec![]);
+        let err = pm
+            .restart(&profile)
+            .await
+            .expect_err("restart delegates to start, so the solo guard must fire");
+        assert!(
+            err.to_string()
+                .contains("solo serve hosts profiles in-process"),
+            "got: {err}"
+        );
     }
 
     // ── port_available ────────────────────────────────────────────────
