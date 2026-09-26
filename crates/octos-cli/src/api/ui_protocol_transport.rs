@@ -186,6 +186,94 @@ const INTERRUPT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// callers from the actual socket so a slow client cannot wedge unrelated
 /// traffic. Tunable per session size.
 const WS_WRITER_CHANNEL_CAPACITY: usize = 1024;
+/// Keepalive cadence of the WS writer task: each tick ships a protocol-level
+/// binary `Ping` plus the text `server/heartbeat` notification. The two ride
+/// the same tick because they feed different meters — the text frame is what
+/// the SPA bridge's JS-land idle timer sees (control frames never reach
+/// `onmessage`), while the binary Ping is answered by every conforming client
+/// at the WebSocket layer (browsers auto-Pong; octoscode's transport replies
+/// with an explicit Pong). That Pong is the inbound evidence the read-side
+/// liveness deadline needs; a text-only heartbeat can never be answered by an
+/// idle client. `OCTOS_WS_LIVENESS_PING_SECS` overrides the cadence in
+/// seconds (protocol e2e shortens it; deployments can tune it against proxy
+/// idle timeouts).
+const WS_LIVENESS_PING_SECS_DEFAULT: u64 = 20;
+/// Close a connection once this many ping intervals pass with zero inbound
+/// frames (#2447). Three missed Pings mean the peer is half-open (NAT
+/// timeout, killed client that never got to send Close); the fourth interval
+/// is slack for scheduler jitter. Without the deadline the read loop waits
+/// forever and the connection's live forwarders — plus every session the
+/// AppUI keepalive renews for them — stay pinned against the idle sweep.
+const WS_LIVENESS_MISSED_PINGS: u32 = 3;
+
+/// Resolve the keepalive cadence override: `Some(secs)` when the value is a
+/// sane positive second count, `None` when it should fall back to the default.
+fn ws_liveness_ping_secs_from(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|secs| secs.parse::<u64>().ok())
+        .filter(|secs| (1..=86400).contains(secs))
+}
+
+fn ws_liveness_ping_interval() -> std::time::Duration {
+    static PING_SECS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_secs(*PING_SECS.get_or_init(|| {
+        let raw = std::env::var("OCTOS_WS_LIVENESS_PING_SECS").ok();
+        match ws_liveness_ping_secs_from(raw.as_deref()) {
+            Some(secs) => secs,
+            None => {
+                if let Some(value) = raw {
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        value = %value,
+                        "ignoring unusable OCTOS_WS_LIVENESS_PING_SECS; using the default liveness cadence"
+                    );
+                }
+                WS_LIVENESS_PING_SECS_DEFAULT
+            }
+        }
+    }))
+}
+
+fn ws_liveness_deadline() -> std::time::Duration {
+    ws_liveness_deadline_from_ping_interval(ws_liveness_ping_interval())
+}
+
+fn ws_liveness_deadline_from_ping_interval(ping: std::time::Duration) -> std::time::Duration {
+    ping.saturating_mul(WS_LIVENESS_MISSED_PINGS + 1)
+}
+
+/// Upper bound on the housekeeping tick's non-blocking socket pass, so a
+/// client flooding frames cannot starve the housekeeping — the next tick
+/// drains more.
+const WS_TICK_DRAIN_MAX_FRAMES: usize = 64;
+
+/// One bounded non-blocking pass over the socket for the housekeeping tick:
+/// every frame the kernel has already delivered refreshes the liveness meter
+/// and is QUEUED for the normal per-frame path. The drain exists so the
+/// deadline check reads a fresh meter instead of one frozen before an inline
+/// dispatch — it must never consume a frame: a swallowed Text frame's
+/// JSON-RPC id is never answered and a pipelining client hangs (#2447
+/// review). Returns `true` when the stream is gone (error or closed).
+async fn drain_queued_ws_frames<S, E>(
+    ws_rx: &mut S,
+    out: &mut std::collections::VecDeque<WsMessage>,
+    last_inbound: &mut std::time::Instant,
+) -> bool
+where
+    S: futures::Stream<Item = Result<WsMessage, E>> + Unpin,
+{
+    for _ in 0..WS_TICK_DRAIN_MAX_FRAMES {
+        match futures::poll!(ws_rx.next()) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                *last_inbound = std::time::Instant::now();
+                out.push_back(frame);
+            }
+            std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => return true,
+            std::task::Poll::Pending => return false,
+        }
+    }
+    false
+}
+
 /// #2036 — how much of a peer's result survives into the DURABLE goal-ledger
 /// finding. Since #1990 that finding is what the completion verifier reads, so
 /// this budget decides whether a multi-peer goal can ever be verified: the
@@ -939,7 +1027,7 @@ impl WsConnection {
     /// We deliberately do not hold a lock across `sink.send().await` — the
     /// channel is the lock-free coordination point.
     pub(crate) async fn writer_loop(mut sink: WsSink, mut rx: mpsc::Receiver<WsMessage>) {
-        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(20));
+        let mut ping_interval = tokio::time::interval(ws_liveness_ping_interval());
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately; skip it so we don't ship a heartbeat
         // before any real frame.
@@ -981,6 +1069,19 @@ impl WsConnection {
                     // for proxies but left the bridge timer starving, so
                     // it tore the socket down after every minute of idle.
                     // A text-frame heartbeat ticks both meters at once.
+                    //
+                    // The binary Ping rides along anyway (#2447): it is the
+                    // inbound evidence the read loop's liveness deadline
+                    // needs, since a text heartbeat can never be answered by
+                    // an idle client. It stays invisible to JS `onmessage`,
+                    // so the bridge timer above still runs on the text frame.
+                    if sink
+                        .send(WsMessage::Ping(Vec::new().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                     let payload =
                         "{\"jsonrpc\":\"2.0\",\"method\":\"server/heartbeat\",\"params\":{}}";
                     if sink
@@ -6856,8 +6957,18 @@ async fn ui_protocol_connection(
     // arrived, leaving subscribers and ledger fan-out registered.
     let failed_notify = ws.failed_notify();
     let mut last_session_keepalive: Option<std::time::Instant> = None;
+    // #2447: inbound-frame liveness meter, refreshed by every frame the peer
+    // sends (the Pongs our binary Pings elicit included). The keepalive tick
+    // below closes the connection once it goes stale.
+    let mut last_inbound = std::time::Instant::now();
     let mut appui_continuation_tick = tokio::time::interval(Duration::from_secs(2));
     appui_continuation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Frames the housekeeping drain lifted off the socket while an inline
+    // dispatch was running. They are replayed through the per-frame path
+    // below — draining must never swallow one, or its JSON-RPC id is never
+    // answered and a pipelining client hangs (#2447 review).
+    let mut drained_frames: std::collections::VecDeque<WsMessage> =
+        std::collections::VecDeque::new();
 
     loop {
         // #924 round-2 BLOCK: close the lost-notify race. `notify_waiters`
@@ -6879,7 +6990,12 @@ async fn ui_protocol_connection(
             break;
         }
 
-        let msg = tokio::select! {
+        let msg = if let Some(frame) = drained_frames.pop_front() {
+            // Replay a frame the housekeeping drain lifted off the socket: it
+            // takes the exact per-frame path below, so its id gets answered.
+            frame
+        } else {
+            tokio::select! {
             biased;
             _ = &mut notified => {
                 // Latch arm only fires when the connection is failed; no
@@ -6887,6 +7003,36 @@ async fn ui_protocol_connection(
                 break;
             }
             _ = appui_continuation_tick.tick() => {
+                // The select is `biased`: this housekeeping arm is polled
+                // before the read arm, so frames that queued behind a slow
+                // inline dispatch would sit in the kernel buffer while the
+                // deadline check below reads a stale meter. Give the read
+                // side one non-blocking pass first — queued frames go to
+                // `drained_frames` for replay, never dropped.
+                let read_gone = drain_queued_ws_frames(
+                    &mut ws_rx,
+                    &mut drained_frames,
+                    &mut last_inbound,
+                )
+                .await;
+                if read_gone {
+                    break;
+                }
+                // #2447: no inbound frame for the liveness deadline — the peer
+                // is half-open. Close and fall through to the normal
+                // disconnect cleanup, or the connection's live forwarders
+                // (and every session the AppUI keepalive renews for them)
+                // pin cache slots until the process dies.
+                if last_inbound.elapsed() >= ws_liveness_deadline() {
+                    metrics::counter!("ws.connection.liveness_timeout").increment(1);
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        idle_for = ?last_inbound.elapsed(),
+                        "no inbound frames within liveness deadline; closing half-open connection"
+                    );
+                    let _ = close_ws_with_code(&ws, 1001, "liveness timeout");
+                    break;
+                }
                 let profile_filter = connection_profile_id
                     .or(routed_profile_id)
                     .or(session_open_profile_id.as_deref());
@@ -6924,7 +7070,9 @@ async fn ui_protocol_connection(
                 Some(Ok(msg)) => msg,
                 Some(Err(_)) | None => break,
             },
+            }
         };
+        last_inbound = std::time::Instant::now();
         // #922.2: stop dispatch once a lifecycle/RPC send has been
         // marked fatal so we don't quietly accept further requests we
         // can never reply to. The cleanup below still appends terminal
