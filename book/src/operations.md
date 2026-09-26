@@ -231,3 +231,11 @@ sudo systemctl enable octos-serve
 sudo systemctl status octos-serve
 sudo journalctl -u octos-serve -f
 ```
+
+### Stopping via `server/shutdown` (Local Solo)
+
+The server stops three ways: Ctrl+C in the terminal running the foreground `octos serve`, the platform service manager (`launchctl` / `systemctl`, above), and the `server/shutdown` UI Protocol method described here.
+
+A UI Protocol client connected over the authenticated WebSocket (`/api/ui-protocol/ws`) can stop the server with the `server/shutdown` method. It stops the process exactly like Ctrl+C: connections drain, gateways stop, the process exits. The call is idempotent, and the stop fires ~250 ms after the request is handled so the acknowledgement still gets a chance to reach the client (under outbound backpressure the client may miss it; the stop still happens).
+
+The method is only accepted on a local deployment (`config.mode = "local"`) with solo login opted in (`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`) and only by an HTTP serve (`octos serve` without `--stdio`). One call stops the process for every connected client and cancels their running turns. Fleet/hosted servers and `--stdio` serve reject the call with `invalid_request` (-32600) and `data.kind: "server_shutdown_unavailable"` and stop nothing; session-scoped (session-ingress) connections can never call it and are refused with a plain `invalid_request`. Note the local-solo trust model: on a solo serve, any local process -- or any page on an allowed origin -- that can open the WebSocket can stop the server.

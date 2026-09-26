@@ -306,6 +306,11 @@ jobs:
           python3 scripts/lint-installer-token-hygiene.py --self-test
           python3 scripts/lint-installer-token-hygiene.py
 
+      - name: UI Protocol wire inventory lint
+        run: |
+          python3 scripts/lint-ui-protocol-inventory.py --self-test
+          python3 scripts/lint-ui-protocol-inventory.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
