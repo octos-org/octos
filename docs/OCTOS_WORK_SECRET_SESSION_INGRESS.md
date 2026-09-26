@@ -32,6 +32,21 @@ octos auth issue-work-secret \
 
 The command writes a hashed grant to `$OCTOS_HOME/work_secrets.json` (or
 `~/.octos/work_secrets.json`) and prints the encoded secret to stdout.
+Operator notes (expiry, the replacement semantics, how to revoke) go to
+stderr, so stdout stays scriptable. Re-issuing for the same session replaces
+it: the session's earlier grant is removed from the file — it will no longer
+appear in the listing rather than showing up as revoked.
+
+## List Grants
+
+```bash
+octos auth list-work-secrets
+```
+
+Lists every recorded grant, in recorded order, with its session, profile,
+token hash prefix, created/expires timestamps, ttl, and status (active /
+expired / revoked, with the revocation time). The bearer token itself is
+never stored, so only its SHA-256 hash can be shown.
 
 ## Connect
 
