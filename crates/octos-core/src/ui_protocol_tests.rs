@@ -340,6 +340,7 @@ fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
             read_allow_paths: vec!["/repo/docs".into()],
         }),
         after: None,
+        client_commands: None,
     };
 
     let wire = serde_json::to_value(&params).expect("serialize session/open params");
@@ -362,6 +363,39 @@ fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
     assert!(decoded_legacy.topic.is_none());
     assert!(decoded_legacy.cwd.is_none());
     assert!(decoded_legacy.sandbox.is_none());
+}
+
+#[test]
+fn session_open_client_commands_round_trip() {
+    let params = SessionOpenParams {
+        session_id: SessionKey("local:demo".into()),
+        topic: None,
+        profile_id: None,
+        cwd: None,
+        sandbox: None,
+        after: None,
+        client_commands: Some(vec!["/model".into(), "/add-model".into()]),
+    };
+
+    let wire = serde_json::to_value(&params).expect("serialize session/open params");
+    assert_eq!(wire["client_commands"], json!(["/model", "/add-model"]));
+    let decoded: SessionOpenParams =
+        serde_json::from_value(wire).expect("deserialize session/open params");
+    assert_eq!(decoded, params);
+}
+
+#[test]
+fn session_open_client_commands_stay_off_the_wire_when_absent() {
+    let legacy: SessionOpenParams =
+        serde_json::from_value(json!({"session_id": "local:demo"})).expect("legacy params");
+    assert!(legacy.client_commands.is_none());
+    let wire = serde_json::to_value(&legacy).expect("serialize legacy params");
+    assert!(wire.get("client_commands").is_none());
+
+    let declared_none: SessionOpenParams =
+        serde_json::from_value(json!({"session_id": "local:demo", "client_commands": []}))
+            .expect("an empty declaration is distinct from an absent one");
+    assert_eq!(declared_none.client_commands, Some(Vec::new()));
 }
 
 #[test]
