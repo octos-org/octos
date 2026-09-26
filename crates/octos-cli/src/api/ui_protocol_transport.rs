@@ -38081,6 +38081,13 @@ async fn run_standalone_turn(
                     // meaning for every other consumer of this event.
                     "tokens_cache": (response.token_usage.cache_read_tokens as u64)
                         + (response.token_usage.cache_write_tokens as u64),
+                    "token_usage": EnvelopeTokenUsage {
+                        input_tokens: u64::from(response.token_usage.input_tokens),
+                        output_tokens: u64::from(response.token_usage.output_tokens),
+                        reasoning_tokens: u64::from(response.token_usage.reasoning_tokens),
+                        cache_read_tokens: u64::from(response.token_usage.cache_read_tokens),
+                        cache_write_tokens: u64::from(response.token_usage.cache_write_tokens),
+                    },
                     "cursor": cursor,
                     "message_id": final_assistant_message_id,
                     "final_assistant_committed_seq": final_assistant_committed_seq,
@@ -38398,7 +38405,9 @@ async fn run_standalone_turn(
                     tokens_out: Some(u32::try_from(tokens_out).unwrap_or(u32::MAX)),
                     session_result,
                     outcome: Some(TurnTerminalOutcome::Completed),
-                    token_usage: None,
+                    token_usage: event
+                        .get("token_usage")
+                        .and_then(|usage| serde_json::from_value(usage.clone()).ok()),
                     partial_result: None,
                 };
                 // #1801 v2: a peer session's terminal leaves its result on
