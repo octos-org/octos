@@ -20631,6 +20631,11 @@ async fn open_session_result(
     else {
         return Err(runtime_unavailable_error("Sessions not available"));
     };
+    // Opening a saved session can compact its history before the first turn.
+    // Resolve the runtime window before reading history or taking writer locks.
+    if let Some(provider) = open_context_provider.as_ref() {
+        provider.ensure_ready().await;
+    }
     let (data_dir, history) = {
         let mut sessions = sessions.lock().await;
         let data_dir = sessions.data_dir();
