@@ -114,7 +114,7 @@ export function ProfileProvider({ children }: Props) {
         stopGateway: () => myApi.stopSubGateway(profileId),
         restartGateway: async () => {
           await myApi.stopSubGateway(profileId)
-          await myApi.startSubGateway(profileId)
+          return myApi.startSubGateway(profileId)
         },
       }
     }
@@ -187,9 +187,13 @@ export function ProfileProvider({ children }: Props) {
     }
   }, [adapter, config, profileEmail, profileId, profileName, publicSubdomain, enabled, toast])
 
+  // The self-service gateway routes report failures as 200 + `ok: false`
+  // (only the admin ones use error statuses), so the ok flag must be
+  // consumed here instead of relying on the request helpers to throw.
   const startGateway = useCallback(async () => {
     try {
-      await adapter.startGateway()
+      const res = await adapter.startGateway()
+      if (!res.ok) throw new Error(res.message || 'Failed to start gateway')
       toast('Gateway started')
       await loadProfile()
     } catch (e: any) {
@@ -199,7 +203,8 @@ export function ProfileProvider({ children }: Props) {
 
   const stopGateway = useCallback(async () => {
     try {
-      await adapter.stopGateway()
+      const res = await adapter.stopGateway()
+      if (!res.ok) throw new Error(res.message || 'Failed to stop gateway')
       toast('Gateway stopped')
       await loadProfile()
     } catch (e: any) {
@@ -209,7 +214,8 @@ export function ProfileProvider({ children }: Props) {
 
   const restartGateway = useCallback(async () => {
     try {
-      await adapter.restartGateway()
+      const res = await adapter.restartGateway()
+      if (!res.ok) throw new Error(res.message || 'Failed to restart gateway')
       toast('Gateway restarted')
       await loadProfile()
     } catch (e: any) {
