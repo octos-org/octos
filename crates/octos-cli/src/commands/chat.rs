@@ -1903,15 +1903,35 @@ pub fn create_provider_with_api_type(
                     entry.name
                 )
             })?;
-        let mut provider = octos_llm::openai_responses::OpenAIResponsesProvider::new(&key, &m);
-        if let Some(url) = base_url {
-            provider = provider.with_base_url(&url);
+        let mut provider = octos_llm::openai_responses::OpenAIResponsesProvider::new(&key, &m)
+            .with_response_continuation(true);
+        if let Some(url) = base_url.as_ref() {
+            provider = provider.with_base_url(url.as_str());
         }
         if let Some(t) = llm_timeout_secs {
             let c = llm_connect_timeout_secs.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
             provider = provider.with_http_timeout(t, c);
         }
-        return Ok(Arc::new(provider));
+        let provider: Arc<dyn LlmProvider> = Arc::new(provider);
+        if let Some(url) = base_url
+            .as_deref()
+            .filter(|url| url.trim_end_matches('/') != "https://api.openai.com/v1")
+        {
+            let timeout = match (llm_timeout_secs, llm_connect_timeout_secs) {
+                (None, None) => None,
+                (t, c) => Some((
+                    t.unwrap_or(octos_llm::DEFAULT_LLM_TIMEOUT_SECS),
+                    c.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS),
+                )),
+            };
+            return Ok(octos_llm::LocalContextProbe::new(
+                provider,
+                url,
+                Some(key),
+                timeout,
+            ));
+        }
+        return Ok(provider);
     }
 
     let params = octos_llm::registry::CreateParams {
@@ -1946,15 +1966,26 @@ fn create_custom_provider(
 
     match api_type.unwrap_or("openai") {
         "openai" => {
-            let mut provider = octos_llm::openai::OpenAIProvider::new(key, model)
+            let mut provider = octos_llm::openai::OpenAIProvider::new(&key, model)
                 .with_base_url(&base_url)
                 .with_provider_label("custom");
-            if let Some(t) = llm_timeout_secs {
-                let c =
-                    llm_connect_timeout_secs.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
+            let http_timeout = llm_timeout_secs.map(|t| {
+                (
+                    t,
+                    llm_connect_timeout_secs.unwrap_or(octos_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS),
+                )
+            });
+            if let Some((t, c)) = http_timeout {
                 provider = provider.with_http_timeout(t, c);
             }
-            Ok(Arc::new(provider))
+            // This factory bypasses the registry. Preserve the same runtime
+            // context discovery as the openai/local registry paths.
+            Ok(octos_llm::LocalContextProbe::new(
+                Arc::new(provider),
+                &base_url,
+                Some(key),
+                http_timeout,
+            ))
         }
         "anthropic" => {
             let mut provider = octos_llm::anthropic::AnthropicProvider::new(key, model)
@@ -2166,6 +2197,40 @@ mod custom_provider_tests {
             .env_vars
             .insert("CUSTOM_API_KEY".to_string(), "test-key".to_string());
         config
+    }
+
+    #[tokio::test]
+    async fn custom_openai_provider_discovers_window_before_compaction() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "qwen3.8-27b", "max_model_len": 262_144}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = create_provider_with_api_type(
+            "custom",
+            &custom_config(),
+            Some("qwen3.8-27b".into()),
+            Some(format!("{}/v1", server.uri())),
+            Some("openai"),
+        )
+        .unwrap();
+
+        provider.ensure_ready().await;
+        assert_eq!(provider.context_window(), 262_144);
+        assert_eq!(provider.provider_name(), "custom");
+        assert_eq!(provider.model_id(), "qwen3.8-27b");
+        assert_eq!(
+            provider.provider_metadata().cache_lane,
+            octos_llm::CacheLane::Residual
+        );
     }
 
     #[test]

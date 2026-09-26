@@ -20631,6 +20631,11 @@ async fn open_session_result(
     else {
         return Err(runtime_unavailable_error("Sessions not available"));
     };
+    // Opening a saved session can compact its history before the first turn.
+    // Resolve the runtime window before reading history or taking writer locks.
+    if let Some(provider) = open_context_provider.as_ref() {
+        provider.ensure_ready().await;
+    }
     let (data_dir, history) = {
         let mut sessions = sessions.lock().await;
         let data_dir = sessions.data_dir();
@@ -22169,6 +22174,17 @@ pub(crate) fn session_workspace_root_for_state(
 /// wording — the SPA's reducer matches on it heuristically and must
 /// not change.
 fn append_workspace_root_hint(mut prompt: String, workspace_root: Option<&Path>) -> String {
+    // Prompt-cache stability opt-out: the per-session workspace path embeds
+    // the session id, so this hint is the ONLY volatile byte in an otherwise
+    // byte-identical system prompt across sessions — it single-handedly
+    // breaks KV-cache prefix reuse for every new session (measured on the
+    // appui card-generation path: 35% shared prefix with the hint, ~99%
+    // without). Hosts whose agents never do file work (the phone's
+    // card-generation appui) set OCTOS_OMIT_WORKSPACE_HINT=1 in the kernel's
+    // spawn env to drop it; every other surface keeps today's bytes.
+    if std::env::var_os("OCTOS_OMIT_WORKSPACE_HINT").is_some_and(|v| v == "1") {
+        return prompt;
+    }
     if let Some(workspace_root) = workspace_root {
         prompt.push_str("\n\nAppUi session workspace root: ");
         prompt.push_str(&workspace_root.to_string_lossy());
@@ -38076,6 +38092,13 @@ async fn run_standalone_turn(
                     // meaning for every other consumer of this event.
                     "tokens_cache": (response.token_usage.cache_read_tokens as u64)
                         + (response.token_usage.cache_write_tokens as u64),
+                    "token_usage": EnvelopeTokenUsage {
+                        input_tokens: u64::from(response.token_usage.input_tokens),
+                        output_tokens: u64::from(response.token_usage.output_tokens),
+                        reasoning_tokens: u64::from(response.token_usage.reasoning_tokens),
+                        cache_read_tokens: u64::from(response.token_usage.cache_read_tokens),
+                        cache_write_tokens: u64::from(response.token_usage.cache_write_tokens),
+                    },
                     "cursor": cursor,
                     "message_id": final_assistant_message_id,
                     "final_assistant_committed_seq": final_assistant_committed_seq,
@@ -38393,7 +38416,9 @@ async fn run_standalone_turn(
                     tokens_out: Some(u32::try_from(tokens_out).unwrap_or(u32::MAX)),
                     session_result,
                     outcome: Some(TurnTerminalOutcome::Completed),
-                    token_usage: None,
+                    token_usage: event
+                        .get("token_usage")
+                        .and_then(|usage| serde_json::from_value(usage.clone()).ok()),
                     partial_result: None,
                 };
                 // #1801 v2: a peer session's terminal leaves its result on

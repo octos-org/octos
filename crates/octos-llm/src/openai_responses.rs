@@ -4,6 +4,8 @@
 //! OpenAI tools. Falls back gracefully — the registry selects this
 //! provider only for actual OpenAI endpoints with capable models.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
@@ -22,6 +24,9 @@ use crate::provider::{LlmProvider, endpoint_label_from_base_url};
 use crate::types::ProviderMetadata;
 use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
 
+mod continuation;
+use continuation::{Continuations, Pending, missing_response};
+
 /// OpenAI provider using the Responses API.
 pub struct OpenAIResponsesProvider {
     client: Client,
@@ -35,6 +40,8 @@ pub struct OpenAIResponsesProvider {
     /// Only official OpenAI Responses endpoints receive reserved prompt-cache
     /// request fields by default. Compatibility endpoints must opt in.
     prompt_cache_affinity: bool,
+    response_continuation: bool,
+    continuations: Arc<Continuations>,
 }
 
 impl OpenAIResponsesProvider {
@@ -51,6 +58,8 @@ impl OpenAIResponsesProvider {
             model: model.into(),
             base_url: "https://api.openai.com/v1".to_string(),
             prompt_cache_affinity: true,
+            response_continuation: false,
+            continuations: Arc::default(),
         }
     }
 
@@ -66,6 +75,13 @@ impl OpenAIResponsesProvider {
     /// unless their route configuration deliberately enables it.
     pub fn with_prompt_cache_affinity(mut self, enabled: bool) -> Self {
         self.prompt_cache_affinity = enabled;
+        self
+    }
+
+    /// Opt in only for a route that supports stored Responses. Anonymous
+    /// calls and one-shot compaction requests always send their full input.
+    pub fn with_response_continuation(mut self, enabled: bool) -> Self {
+        self.response_continuation = enabled;
         self
     }
 
@@ -101,6 +117,39 @@ impl OpenAIResponsesProvider {
 
         if let Some(max) = config.max_tokens {
             body["max_output_tokens"] = max.into();
+        }
+        if self.base_url != "https://api.openai.com/v1" {
+            if let Some(temperature) = config.temperature {
+                body["temperature"] = temperature.into();
+            }
+            if !config.stop_sequences.is_empty() {
+                body["stop"] = serde_json::json!(config.stop_sequences);
+            }
+            if let Some(params) = &config.sampling_params {
+                for (key, value) in params {
+                    // Sampler configuration cannot replace conversation state.
+                    if matches!(
+                        key.as_str(),
+                        "top_p"
+                            | "top_k"
+                            | "min_p"
+                            | "repetition_penalty"
+                            | "frequency_penalty"
+                            | "presence_penalty"
+                            | "chat_template_kwargs"
+                    ) {
+                        body[key] = value.clone();
+                    }
+                }
+            }
+            if self.model.to_ascii_lowercase().contains("qwen")
+                && matches!(
+                    config.reasoning_effort,
+                    Some(crate::ReasoningEffort::Disabled)
+                )
+            {
+                body["chat_template_kwargs"]["enable_thinking"] = false.into();
+            }
         }
 
         if self.prompt_cache_affinity
@@ -201,6 +250,71 @@ impl OpenAIResponsesProvider {
             self.prompt_cache_input_manifest(request, config).trace();
         }
     }
+
+    async fn send_request(
+        &self,
+        full: &serde_json::Value,
+        config: &ChatConfig,
+        streaming: bool,
+    ) -> Result<(reqwest::Response, Option<Pending>)> {
+        self.trace_prompt_cache_input(full, config);
+        let mut body = full.clone();
+        let pending = if self.response_continuation
+            && prompt_cache_features_enabled()
+            && config.cache_retention == crate::CacheRetention::Default
+        {
+            crate::current_router_context()
+                .session_id
+                .filter(|id| !id.is_empty())
+                .and_then(|session| self.continuations.prepare(session, &mut body))
+        } else {
+            None
+        };
+        let client = if streaming {
+            &self.stream_client
+        } else {
+            &self.client
+        };
+        loop {
+            tracing::info!(target: "octos.responses", continuation = body.get("previous_response_id").is_some(),
+                full_bytes = full.to_string().len(), sent_bytes = body.to_string().len(), "Responses request");
+            let response = client
+                .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
+                .bearer_auth(self.api_key.expose_secret())
+                .json(&body)
+                .send()
+                .await
+                .wrap_err_with(|| {
+                    crate::provider::transport_error_message(
+                        streaming,
+                        self.provider_name(),
+                        &self.model,
+                        crate::provider::ApiStyle::OpenAiResponses,
+                    )
+                })?;
+            if response.status().is_success() {
+                return Ok((response, pending));
+            }
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            if let Some(id) = body["previous_response_id"].as_str()
+                && missing_response(status.as_u16(), &text, id)
+            {
+                self.continuations.forget_id(id);
+                body = full.clone();
+                body["store"] = true.into();
+                tracing::info!(target: "octos.responses", "Stored response unavailable; retrying full history");
+                continue;
+            }
+            return Err(crate::error::LlmError::from_status_with_label(
+                status.as_u16(),
+                &crate::provider::truncate_error_body(&text),
+                format!("{}/{}", self.provider_name(), self.model),
+            )
+            .with_api_style(crate::provider::ApiStyle::OpenAiResponses)
+            .into());
+        }
+    }
 }
 
 #[async_trait]
@@ -212,46 +326,26 @@ impl LlmProvider for OpenAIResponsesProvider {
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
         let body = self.build_request(messages, tools, config);
-        self.trace_prompt_cache_input(&body, config);
-
-        let response = self
-            .client
-            .post(format!("{}/responses", self.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .wrap_err_with(|| {
-                crate::provider::transport_error_message(
-                    false,
-                    self.provider_name(),
-                    &self.model,
-                    crate::provider::ApiStyle::OpenAiResponses,
-                )
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let body = crate::provider::truncate_error_body(&body);
-            return Err(crate::error::LlmError::from_status_with_label(
-                status.as_u16(),
-                &body,
-                format!("{}/{}", self.provider_name(), self.model),
-            )
-            .with_api_style(crate::provider::ApiStyle::OpenAiResponses)
-            .into());
-        }
-
-        let api_response: ResponsesApiResponse = response.json().await.wrap_err_with(|| {
+        let (response, pending) = self.send_request(&body, config, false).await?;
+        let raw: serde_json::Value = response.json().await.wrap_err_with(|| {
             self.operational_message(crate::provider::OperationalStage::ParseResponse)
         })?;
-
-        Ok(parse_responses_api(api_response))
+        let api_response: ResponsesApiResponse = serde_json::from_value(raw.clone())
+            .wrap_err_with(|| {
+                self.operational_message(crate::provider::OperationalStage::ParseResponse)
+            })?;
+        if matches!(api_response.status.as_str(), "failed" | "cancelled") {
+            eyre::bail!("Responses request {}", api_response.status);
+        }
+        let completed = api_response.status == "completed";
+        let parsed = parse_responses_api(api_response);
+        if completed
+            && let Some(pending) = pending
+            && let Some(id) = raw["id"].as_str()
+        {
+            self.continuations.remember(pending, id, &parsed);
+        }
+        Ok(parsed)
     }
 
     async fn chat_stream(
@@ -262,53 +356,31 @@ impl LlmProvider for OpenAIResponsesProvider {
     ) -> Result<ChatStream> {
         let mut body = self.build_request(messages, tools, config);
         body["stream"] = true.into();
-        self.trace_prompt_cache_input(&body, config);
-
-        // Stream client: no total timeout, so a long healthy generation is not
-        // cut off. Stalls are bounded by the client's per-read timeout and the
-        // agent's stream-timeout guards (see build_streaming_http_client).
-        let response = self
-            .stream_client
-            .post(format!("{}/responses", self.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .wrap_err_with(|| {
-                crate::provider::transport_error_message(
-                    true,
-                    self.provider_name(),
-                    &self.model,
-                    crate::provider::ApiStyle::OpenAiResponses,
-                )
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            let body = crate::provider::truncate_error_body(&text);
-            return Err(crate::error::LlmError::from_status_with_label(
-                status.as_u16(),
-                &body,
-                format!("{}/{}", self.provider_name(), self.model),
-            )
-            .with_api_style(crate::provider::ApiStyle::OpenAiResponses)
-            .into());
-        }
-
-        let sse_stream = crate::sse::parse_sse_response(response);
-        let state = ResponsesStreamState::default();
+        let (response, mut pending) = self.send_request(&body, config, true).await?;
+        let continuations = Arc::clone(&self.continuations);
+        let sse_stream =
+            crate::sse::parse_sse_response(response).chain(futures::stream::once(async {
+                crate::sse::SseEvent {
+                    event: None,
+                    data: r#"{"type":"octos.stream_end"}"#.into(),
+                }
+            }));
         let event_stream = sse_stream
-            .scan(state, |state, event| {
-                let events = map_responses_sse(state, &event);
-                futures::future::ready(Some(events))
+            .scan(ResponsesStreamState::default(), move |state, event| {
+                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&event.data)
+                    && !state.terminal
+                    && data["type"] == "response.completed"
+                    && data["response"]["status"] == "completed"
+                    && let Some(pending) = pending.take()
+                    && let Some(id) = data["response"]["id"].as_str()
+                    && let Ok(response) =
+                        serde_json::from_value::<ResponsesApiResponse>(data["response"].clone())
+                {
+                    continuations.remember(pending, id, &parse_responses_api(response));
+                }
+                futures::future::ready(Some(map_responses_sse(state, &event)))
             })
             .flat_map(futures::stream::iter);
-
         Ok(Box::pin(event_stream))
     }
 
@@ -582,6 +654,8 @@ struct ResponsesUsage {
 struct InputTokensDetails {
     #[serde(default)]
     cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -601,7 +675,7 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
                 for part in parts {
                     match part {
                         ContentPart::OutputText { text } => {
-                            content = Some(text);
+                            content.get_or_insert_with(String::new).push_str(&text);
                         }
                         ContentPart::Refusal { refusal } => {
                             content = Some(format!("[Refusal] {refusal}"));
@@ -641,7 +715,9 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
                     .collect::<Vec<_>>()
                     .join("");
                 if !text.is_empty() {
-                    reasoning_content = Some(text);
+                    reasoning_content
+                        .get_or_insert_with(String::new)
+                        .push_str(&text);
                 }
             }
         }
@@ -667,6 +743,12 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
         .as_ref()
         .map(|d| d.cached_tokens)
         .unwrap_or(0);
+    let written = resp
+        .usage
+        .input_tokens_details
+        .as_ref()
+        .map(|d| d.cache_write_tokens)
+        .unwrap_or(0);
     let reasoning_tokens = resp
         .usage
         .output_tokens_details
@@ -680,7 +762,12 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
         tool_calls,
         stop_reason,
         usage: TokenUsage {
-            input_tokens: resp.usage.input_tokens.saturating_sub(cached),
+            input_tokens: resp
+                .usage
+                .input_tokens
+                .saturating_sub(cached)
+                .saturating_sub(written),
+            cache_write_tokens: written,
             output_tokens: resp.usage.output_tokens,
             reasoning_tokens,
             cache_read_tokens: cached,
@@ -696,6 +783,8 @@ fn parse_responses_api(resp: ResponsesApiResponse) -> ChatResponse {
 struct ResponsesStreamState {
     tool_calls: Vec<(String, String, String)>, // (call_id, name, args_buffer)
     input_tokens: u32,
+    terminal: bool,
+    tool_items: std::collections::HashMap<String, usize>,
 }
 
 fn map_responses_sse(
@@ -725,7 +814,9 @@ fn map_responses_sse(
         }
 
         // Reasoning deltas
-        "response.reasoning.delta" => {
+        "response.reasoning.delta"
+        | "response.reasoning_text.delta"
+        | "response.reasoning_summary_text.delta" => {
             let delta = data["delta"].as_str().unwrap_or("");
             if delta.is_empty() {
                 vec![]
@@ -734,7 +825,25 @@ fn map_responses_sse(
             }
         }
 
-        // Function call start
+        "response.output_item.added" if data["item"]["type"] == "function_call" => {
+            let item = &data["item"];
+            let id = item["call_id"].as_str().unwrap_or("").to_string();
+            let name = item["name"].as_str().unwrap_or("").to_string();
+            let index = state.tool_calls.len();
+            state
+                .tool_items
+                .insert(item["id"].as_str().unwrap_or("").into(), index);
+            state
+                .tool_calls
+                .push((id.clone(), name.clone(), String::new()));
+            vec![StreamEvent::ToolCallDelta {
+                index,
+                id: Some(id),
+                name: Some(name),
+                arguments_delta: String::new(),
+            }]
+        }
+        // Function call start (legacy compatible servers)
         "response.function_call_arguments.start" => {
             let call_id = data["call_id"]
                 .as_str()
@@ -757,10 +866,14 @@ fn map_responses_sse(
         // Function call argument deltas
         "response.function_call_arguments.delta" => {
             let delta = data["delta"].as_str().unwrap_or("").to_string();
-            if let Some(last) = state.tool_calls.last_mut() {
-                last.2.push_str(&delta);
+            let idx = data["item_id"]
+                .as_str()
+                .and_then(|id| state.tool_items.get(id))
+                .copied()
+                .unwrap_or_else(|| state.tool_calls.len().saturating_sub(1));
+            if let Some(call) = state.tool_calls.get_mut(idx) {
+                call.2.push_str(&delta);
             }
-            let idx = state.tool_calls.len().saturating_sub(1);
             vec![StreamEvent::ToolCallDelta {
                 index: idx,
                 id: None,
@@ -770,7 +883,8 @@ fn map_responses_sse(
         }
 
         // Response completed — emit usage + done
-        "response.completed" => {
+        "response.completed" | "response.incomplete" => {
+            state.terminal = true;
             let usage = &data["response"]["usage"];
             let input = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
             let output = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
@@ -783,7 +897,9 @@ fn map_responses_sse(
             let reasoning = usage["output_tokens_details"]["reasoning_tokens"]
                 .as_u64()
                 .unwrap_or(0) as u32;
-
+            let written = usage["input_tokens_details"]["cache_write_tokens"]
+                .as_u64()
+                .unwrap_or(0) as u32;
             let has_tool_calls = !state.tool_calls.is_empty();
             let status = data["response"]["status"].as_str().unwrap_or("completed");
             let stop_reason = if has_tool_calls {
@@ -798,7 +914,8 @@ fn map_responses_sse(
 
             vec![
                 StreamEvent::Usage(TokenUsage {
-                    input_tokens: input.saturating_sub(cached),
+                    input_tokens: input.saturating_sub(cached).saturating_sub(written),
+                    cache_write_tokens: written,
                     output_tokens: output,
                     reasoning_tokens: reasoning,
                     cache_read_tokens: cached,
@@ -816,6 +933,20 @@ fn map_responses_sse(
             vec![]
         }
 
+        "response.failed" | "error" => {
+            state.terminal = true;
+            vec![StreamEvent::Error(data.to_string())]
+        }
+        "octos.stream_end" if !state.terminal => {
+            state.terminal = true;
+            vec![StreamEvent::Error(
+                "Responses stream ended before a terminal event".into(),
+            )]
+        }
+        _ if data.get("error").is_some() => {
+            state.terminal = true;
+            vec![StreamEvent::Error(data.to_string())]
+        }
         _ => vec![],
     }
 }
