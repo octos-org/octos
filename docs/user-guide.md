@@ -242,6 +242,21 @@ Progress is tracked server-side via:
 
 Source: `crates/octos-cli/src/api/admin_setup.rs`, `dashboard/src/pages/wizard/`.
 
+### 2.5 Stopping the Server
+
+- **Ctrl+C** — in the terminal running the foreground `octos serve`.
+- **Service manager** — for installed services:
+
+  ```bash
+  # Linux (systemd)
+  sudo systemctl stop octos-serve
+
+  # macOS (launchd)
+  sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+  ```
+
+- **`server/shutdown` (WebSocket, local solo only)** — a UI Protocol client connected over the authenticated WebSocket at `/api/ui-protocol/ws` can stop the server the same way Ctrl+C does: connections drain, gateways stop, the process exits. The call is idempotent, and the stop fires ~250 ms after the request is handled; under outbound backpressure the client may miss the acknowledgement, but the stop still happens. It is accepted only on a local deployment (`config.mode = "local"`) with solo login opted in (`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`) and only by an HTTP serve (`octos serve` without `--stdio`); fleet/hosted servers and `--stdio` serve answer `invalid_request` (-32600) with `data.kind: "server_shutdown_unavailable"` and keep running, and session-scoped connections can never call it. One call stops the process for every connected client — their running turns are cancelled. On a solo serve this follows the local-solo trust model: any local process that can reach the WebSocket can stop the server.
+
 ---
 
 ## 3. Setting Up LLM Providers

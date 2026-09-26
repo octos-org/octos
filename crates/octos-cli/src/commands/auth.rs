@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use eyre::Result;
-use octos_agent::bridge::work_secret::{WorkSecret, WorkSecretGrantStore};
+use octos_agent::bridge::work_secret::{WorkSecret, WorkSecretGrantRecord, WorkSecretGrantStore};
 
 use super::Executable;
 use crate::auth::{AuthStore, keychain, oauth, token};
@@ -52,7 +52,11 @@ pub enum AuthAction {
     /// Show authentication status for all providers.
     Status,
 
-    /// Store an API key in the macOS Keychain.
+    /// Store an API key in the OS secret store.
+    ///
+    /// macOS stores it in the Keychain; Linux in a 0600 file under
+    /// `~/.octos/secrets`; Windows has no secret store yet — plain API keys
+    /// can be passed via the environment or the profile's `env_vars`.
     #[command(name = "set-key")]
     SetKey {
         /// Environment variable name (e.g. OPENAI_API_KEY).
@@ -70,7 +74,12 @@ pub enum AuthAction {
         #[arg(long, short)]
         profile: Option<String>,
     },
-    /// Remove an API key from the macOS Keychain.
+    /// Remove an API key from the OS secret store.
+    ///
+    /// macOS deletes the Keychain item; Linux the file under
+    /// `~/.octos/secrets`. Only `"keychain:"`-marker entries are removed —
+    /// plain `env_vars` values are left untouched; Windows has no secret
+    /// store.
     #[command(name = "remove-key")]
     RemoveKey {
         /// Environment variable name to remove (e.g. OPENAI_API_KEY).
@@ -80,18 +89,23 @@ pub enum AuthAction {
         profile: Option<String>,
     },
 
-    /// Unlock the macOS Keychain for SSH sessions.
+    /// Unlock the OS secret store for SSH sessions (macOS Keychain).
     ///
-    /// Required before set-key/remove-key when connected via SSH.
-    /// With auto-login enabled, this is only needed once per boot.
+    /// Required before set-key/remove-key over SSH on macOS. With
+    /// auto-login enabled, this is only needed once per boot. Linux's file
+    /// store has no lock, so this is a no-op there; Windows has no secret
+    /// store to unlock.
     #[command(name = "unlock")]
     Unlock {
-        /// macOS login password. If omitted, reads interactively.
+        /// macOS login password (unused on Linux). If omitted, reads
+        /// interactively.
         #[arg(long)]
         password: Option<String>,
     },
 
     /// Issue a short-lived session ingress secret for an external CLI agent.
+    ///
+    /// See docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md.
     #[command(name = "issue-work-secret")]
     IssueWorkSecret {
         /// Session id the external agent may access.
@@ -112,10 +126,22 @@ pub enum AuthAction {
     },
 
     /// Revoke a previously issued work secret.
+    ///
+    /// See docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md.
     #[command(name = "revoke-work-secret")]
     RevokeWorkSecret {
         /// Encoded work secret or raw session_ingress_token.
         token_or_secret: String,
+        /// Data directory that `octos serve` uses.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+
+    /// List issued work secret grants (hashes only; the token is never stored).
+    ///
+    /// See docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md.
+    #[command(name = "list-work-secrets")]
+    ListWorkSecrets {
         /// Data directory that `octos serve` uses.
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -159,6 +185,7 @@ impl AuthCommand {
                 token_or_secret,
                 data_dir,
             } => revoke_work_secret(&token_or_secret, data_dir),
+            AuthAction::ListWorkSecrets { data_dir } => list_work_secrets(data_dir),
         }
     }
 }
@@ -651,8 +678,16 @@ fn issue_work_secret(
     profile: Option<String>,
     data_dir: Option<PathBuf>,
 ) -> Result<()> {
-    let secret = create_work_secret(session, ttl, api_base_url, profile, data_dir)?;
+    let (secret, grant) = create_work_secret(session, ttl, api_base_url, profile, data_dir)?;
+    // stdout stays the encoded secret and nothing else (scripts and the docs
+    // both rely on that); operator-facing notes go to stderr.
     println!("{}", secret.encode()?);
+    eprintln!(
+        "Grant for session '{}' expires {} (ttl {}). Re-issuing for the same session replaces it: the earlier grant is removed, not kept as a revoked entry. Revoke early: octos auth revoke-work-secret '<secret>'. See docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md.",
+        display_id(session),
+        grant.expires_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        format_ttl(grant.expires_at - grant.created_at),
+    );
     Ok(())
 }
 
@@ -662,13 +697,13 @@ fn create_work_secret(
     api_base_url: &str,
     profile: Option<String>,
     data_dir: Option<PathBuf>,
-) -> Result<WorkSecret> {
+) -> Result<(WorkSecret, WorkSecretGrantRecord)> {
     let data_dir = super::resolve_data_dir(data_dir)?;
     let ttl = parse_ttl(ttl)?;
     let token = generate_ingress_token()?;
     let store = WorkSecretGrantStore::new(&data_dir);
-    store.issue(session, &token, api_base_url, ttl, profile)?;
-    Ok(WorkSecret::new(api_base_url, token))
+    let grant = store.issue(session, &token, api_base_url, ttl, profile)?;
+    Ok((WorkSecret::new(api_base_url, token), grant))
 }
 
 fn revoke_work_secret(token_or_secret: &str, data_dir: Option<PathBuf>) -> Result<()> {
@@ -683,6 +718,84 @@ fn revoke_work_secret(token_or_secret: &str, data_dir: Option<PathBuf>) -> Resul
         println!("No active work secret matched the provided token");
     }
     Ok(())
+}
+
+fn list_work_secrets(data_dir: Option<PathBuf>) -> Result<()> {
+    let data_dir = super::resolve_data_dir(data_dir)?;
+    let store = WorkSecretGrantStore::new(&data_dir);
+    let grants = store.list()?;
+    if grants.is_empty() {
+        println!("No work secret grants in {}.", store.path().display());
+        return Ok(());
+    }
+    let now = chrono::Utc::now();
+    println!(
+        "{}",
+        format!("Work secret grants in {}:", store.path().display()).bold()
+    );
+    for grant in &grants {
+        println!("{}", format_work_secret_grant(grant, now));
+    }
+    Ok(())
+}
+
+/// Session and profile ids are user-controlled (they end up in the grant
+/// file), so control characters are rendered inert before they reach terminal
+/// or log output — one grant line must not be able to forge another.
+fn display_id(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
+/// One line of `list-work-secrets` output, computed purely (no I/O) so it's
+/// unit-testable. Only the token hash prefix is shown — the grant store never
+/// holds the token itself.
+fn format_work_secret_grant(
+    grant: &WorkSecretGrantRecord,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let status = match grant.revoked_at {
+        Some(at) => format!("revoked {}", at.format("%Y-%m-%d %H:%M:%S UTC"))
+            .red()
+            .to_string(),
+        None if !grant.active(now) => "expired".yellow().to_string(),
+        None => "active".green().to_string(),
+    };
+    let hash_prefix = grant.token_hash.get(..12).unwrap_or(&grant.token_hash);
+    format!(
+        "  {}: {} [profile {}] hash {}… created {} expires {} ttl {}",
+        display_id(&grant.session_id).cyan(),
+        status,
+        grant
+            .profile_id
+            .as_deref()
+            .map(display_id)
+            .unwrap_or_else(|| "-".to_string()),
+        hash_prefix,
+        grant.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        grant.expires_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        format_ttl(grant.expires_at - grant.created_at),
+    )
+}
+
+/// Render a ttl the way `parse_ttl` accepts it (largest exact suffix wins).
+/// Durations outside `parse_ttl`'s domain (zero or negative, only reachable
+/// via a hand-edited grant file) render verbatim with an `s` suffix.
+fn format_ttl(ttl: chrono::Duration) -> String {
+    let seconds = ttl.num_seconds();
+    if seconds <= 0 {
+        return format!("{seconds}s");
+    }
+    if seconds % 86_400 == 0 {
+        format!("{}d", seconds / 86_400)
+    } else if seconds % 3_600 == 0 {
+        format!("{}h", seconds / 3_600)
+    } else if seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn generate_ingress_token() -> Result<String> {
@@ -1071,7 +1184,7 @@ mod tests {
     #[test]
     fn issue_work_secret_persists_decodable_grant() {
         let dir = tempfile::tempdir().unwrap();
-        let secret = create_work_secret(
+        let (secret, issued) = create_work_secret(
             "local:auth-test",
             "5m",
             "http://127.0.0.1:50080",
@@ -1088,6 +1201,73 @@ mod tests {
             .validate("local:auth-test", &decoded.session_ingress_token)
             .unwrap();
         assert_eq!(grant.profile_id.as_deref(), Some("profile-a"));
+        assert_eq!(grant.token_hash, issued.token_hash);
+    }
+
+    #[test]
+    fn format_ttl_round_trips_parse_ttl() {
+        for input in ["30s", "15m", "2h", "1d"] {
+            assert_eq!(format_ttl(parse_ttl(input).unwrap()), input);
+        }
+        assert_eq!(format_ttl(chrono::Duration::seconds(90)), "90s");
+        assert_eq!(format_ttl(chrono::Duration::seconds(5_400)), "90m");
+        // Outside parse_ttl's domain: rendered verbatim, never mis-suffixed.
+        assert_eq!(format_ttl(chrono::Duration::zero()), "0s");
+        assert_eq!(format_ttl(chrono::Duration::seconds(-90)), "-90s");
+    }
+
+    #[test]
+    fn format_work_secret_grant_shows_status_and_never_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WorkSecretGrantStore::new(dir.path());
+        store
+            .issue(
+                "local:auth-test",
+                "raw-token-abc",
+                "http://127.0.0.1:50080",
+                chrono::Duration::hours(1),
+                Some("profile-a".into()),
+            )
+            .unwrap();
+
+        let grants = store.list().unwrap();
+        let before_expiry = grants[0].created_at + chrono::Duration::seconds(1);
+        let line = format_work_secret_grant(&grants[0], before_expiry);
+        assert!(line.contains("local:auth-test"));
+        assert!(line.contains("active"));
+        assert!(line.contains(&grants[0].token_hash[..12]));
+        assert!(
+            !line.contains("raw-token-abc"),
+            "the raw token must never appear"
+        );
+
+        let after_expiry = grants[0].expires_at + chrono::Duration::seconds(1);
+        assert!(format_work_secret_grant(&grants[0], after_expiry).contains("expired"));
+
+        // Revocation wins over both, however recent the check is, and shows
+        // when it happened.
+        assert!(store.revoke_token("raw-token-abc").unwrap());
+        let grants = store.list().unwrap();
+        let revoked_line = format_work_secret_grant(&grants[0], before_expiry);
+        assert!(revoked_line.contains("revoked"));
+        assert!(
+            revoked_line.contains(
+                &grants[0]
+                    .revoked_at
+                    .unwrap()
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            )
+        );
+    }
+
+    /// Session ids land in terminal output verbatim otherwise — a control
+    /// character in one grant must not let it forge another list line.
+    #[test]
+    fn display_id_neuters_control_characters() {
+        assert_eq!(display_id("local:auth-test"), "local:auth-test");
+        assert_eq!(display_id("a\nb"), "a\u{FFFD}b");
+        assert_eq!(display_id("a\u{1b}]0;xb"), "a\u{FFFD}]0;xb");
     }
 
     /// #2414 — a mistyped profile id must list the ids that exist instead of

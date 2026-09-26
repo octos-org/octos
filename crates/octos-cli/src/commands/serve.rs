@@ -402,8 +402,9 @@ pub struct ServeCommand {
     /// local single-user install. OFF by default. Only honoured for direct
     /// loopback requests on a Local-mode host with profile/user stores, and
     /// never when the request carries reverse-proxy headers. Also settable
-    /// via `OCTOS_SOLO_LOGIN=1`. Do NOT set on a host fronted by a reverse
-    /// proxy (e.g. the Caddy-fronted fleet) — see `api::solo_auth`.
+    /// via `OCTOS_SOLO_LOGIN=1`. In Local mode profiles run in this process;
+    /// per-profile gateways are not auto-started. Do NOT set on a host fronted by a
+    /// reverse proxy (e.g. the Caddy-fronted fleet) — see `api::solo_auth`.
     #[arg(long)]
     pub solo: bool,
 
@@ -467,20 +468,22 @@ pub struct ServeCommand {
     pub swarm_backend_url: Option<String>,
 }
 
-/// Wire a `task_query_store` for `octos serve --stdio` (the in-process
-/// AppUI/TUI deployment); leave it `None` for HTTP/gateway serve.
+/// Wire a `task_query_store` when AppUI sessions run in this process: stdio
+/// and local solo HTTP. Leave it `None` when HTTP serve proxies to gateways.
 ///
-/// `--stdio` runs session turns in *this* process with no gateway to proxy
+/// These modes run session turns in *this* process with no gateway to proxy
 /// `task/cancel` to. The per-turn `tool_registry.supervisor()` self-registers
 /// into this store (see `ui_protocol.rs`, the `store.register(..)` guarded on
 /// `task_query_store.is_some()`, holding a `Weak<TaskSupervisor>` so it prunes
 /// at end of turn), which lets `handle_task_cancel` reach the live supervisor
 /// and actually cancel a running `spawn_only` background task. Without it the
 /// AppUI task commands fail `runtime_unavailable` ("task supervisor not wired
-/// for AppUI task commands"). HTTP/gateway serve must stay `None` so
-/// `handle_task_cancel` keeps proxying to the gateway via `resolve_api_port`.
-fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTaskQueryStore> {
-    stdio.then(crate::session_actor::SessionTaskQueryStore::default)
+/// for AppUI task commands"). Gateway HTTP serve must stay `None` so
+/// `handle_task_cancel` keeps proxying via `resolve_api_port`.
+fn in_process_task_query_store(
+    in_process: bool,
+) -> Option<crate::session_actor::SessionTaskQueryStore> {
+    in_process.then(crate::session_actor::SessionTaskQueryStore::default)
 }
 
 /// Where the effective dashboard bearer token came from. #2371: the argv
@@ -1632,6 +1635,8 @@ impl ServeCommand {
             || std::env::var("OCTOS_SOLO_LOGIN")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
+        let solo_in_process =
+            solo_login_enabled_flag && config.mode == crate::config::DeploymentMode::Local;
         let dangerous_default_permissions_flag = self.danger_full_access
             || std::env::var("OCTOS_DANGER_FULL_ACCESS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1764,15 +1769,10 @@ impl ServeCommand {
             harness_event_sink_path: harness_sink_init,
             credential_pool: credential_pool_init,
             content_classifier: content_classifier_init,
-            // HTTP/gateway serve: session actors live in gateway
-            // processes, so `task_query_store` stays `None` and the
-            // cancel/restart handlers proxy via `resolve_api_port` (the
-            // gateway runtime sets its own store on the embedded api
-            // channel). `--stdio` runs actors in-process with no gateway,
-            // so it wires an empty store the per-turn supervisor
-            // self-registers into — letting AppUI `task/cancel` reach live
-            // `spawn_only` tasks. See `stdio_task_query_store`.
-            task_query_store: stdio_task_query_store(self.stdio),
+            // Stdio and local solo HTTP run session actors in-process, so
+            // their supervisors self-register here. Non-solo HTTP keeps
+            // proxying task commands to each profile gateway.
+            task_query_store: in_process_task_query_store(self.stdio || solo_in_process),
             // Mirror the operator-configured Tier-2 default cwd so
             // `session_tool_registry` can distinguish "operator chose this
             // dir for sessions" from the boot fallback baked in by
@@ -1825,6 +1825,16 @@ impl ServeCommand {
         // it changes nothing about how or when the model is woken.
         crate::api::ui_protocol_transport::spawn_background_activity_sink(state.clone());
 
+        // #2080 — install the `monitor/expired` sink: the expiry transitions
+        // (reconcile sweep + watcher deadline) are connection-independent, so
+        // the sink and its ledger drain live here next to the human sink, for
+        // both `serve --stdio` and the HTTP serve. Ordering: the sweep that
+        // could expire a monitor is only reachable from the global drain
+        // spawned above, whose first tick is skipped — a boot-time reconcile
+        // before this install would drop frames (best-effort tap, trace-log
+        // only). Keep this install ahead of any future eager boot reconcile.
+        crate::api::ui_protocol_transport::spawn_monitor_expired_sink(state.clone());
+
         if self.stdio {
             crate::api::ui_protocol_transport::stdio_connection(state).await?;
             tracing::info!("stopping all gateway child processes");
@@ -1841,6 +1851,12 @@ impl ServeCommand {
         // spawns no gateways, so there is nothing to orphan.
         let shutdown_rx = spawn_serve_shutdown_signal_watcher(serve_shutdown_tx.clone());
 
+        // Solo AppUI sessions use this serve process's ProfileRuntime. A
+        // gateway for the same profile would open its episodes.redb again and
+        // lock session/open out of the profile after onboarding. Stdio serve
+        // already has no gateway auto-start; keep HTTP solo consistent.
+        let gateway_auto_start_enabled = !solo_in_process;
+
         // Auto-start enabled profiles
         let profiles = profile_store.list().unwrap_or_default();
         let enabled_count = profiles.iter().filter(|p| p.enabled).count();
@@ -1849,7 +1865,7 @@ impl ServeCommand {
             enabled = enabled_count,
             "loaded profiles"
         );
-        if enabled_count > 0 {
+        if gateway_auto_start_enabled && enabled_count > 0 {
             for p in &profiles {
                 if p.enabled {
                     if !p.config.has_llm_selection() {
@@ -1882,7 +1898,7 @@ impl ServeCommand {
         }
 
         // Profile file watcher: auto-restart gateways when profile JSON changes.
-        {
+        if gateway_auto_start_enabled {
             let ps = profile_store.clone();
             let pm = process_manager.clone();
             tokio::spawn(async move {
@@ -2096,7 +2112,7 @@ impl ServeCommand {
         tracing::info!(address = %addr, "octos API server starting");
         tracing::info!(app = %format!("http://{}/app/", addr), "web app available");
         tracing::info!(dashboard = %format!("http://{}/admin/", addr), "admin dashboard available");
-        if enabled_count > 0 {
+        if gateway_auto_start_enabled && enabled_count > 0 {
             tracing::info!(count = enabled_count, "gateway profiles auto-started");
         }
 
@@ -2109,7 +2125,7 @@ impl ServeCommand {
             "Admin dashboard".green(),
             addr
         ));
-        if enabled_count > 0 {
+        if gateway_auto_start_enabled && enabled_count > 0 {
             let _ = serve_console::print_stdout(&format!(
                 "{}: {} profiles auto-started",
                 "Gateways".green(),
@@ -2449,6 +2465,7 @@ mod tests {
             "install.sh",
             "install.ps1",
             "local-tenant-deploy.sh",
+            "frp/bootstrap-tenant.sh",
             "deploy.ps1",
         ] {
             let body = std::fs::read_to_string(scripts.join(name))
@@ -2479,7 +2496,7 @@ mod tests {
         // task commands fail `runtime_unavailable` and octoscode Esc/`x`
         // cannot cancel a spawned background task (the reported bug).
         assert!(
-            stdio_task_query_store(true).is_some(),
+            in_process_task_query_store(true).is_some(),
             "stdio serve must wire a task_query_store"
         );
     }
@@ -2535,11 +2552,11 @@ mod tests {
     }
 
     #[test]
-    fn non_stdio_serve_leaves_task_query_store_none_for_gateway_proxy() {
-        // HTTP/gateway serve must leave it `None` so `handle_task_cancel`
+    fn gateway_serve_leaves_task_query_store_none_for_gateway_proxy() {
+        // Non-solo HTTP serve must leave it `None` so `handle_task_cancel`
         // takes the gateway-proxy path; a non-`None` store would skip it.
         assert!(
-            stdio_task_query_store(false).is_none(),
+            in_process_task_query_store(false).is_none(),
             "gateway/http serve must leave task_query_store None"
         );
     }

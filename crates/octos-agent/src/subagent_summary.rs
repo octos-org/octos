@@ -559,6 +559,7 @@ async fn fetch_summary(
         // a cache write would be pure 1.25x premium.
         cache_retention: octos_llm::CacheRetention::None,
         prompt_cache_context: None,
+        media_scope_root: None,
     };
     let messages = vec![Message::user(prompt)];
     let fut = async move { provider.chat(&messages, &[], &config).await };

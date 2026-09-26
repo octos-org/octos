@@ -29,7 +29,7 @@ sudo systemctl restart octos-serve
 
 ## 钥匙串集成
 
-Octos 支持将 API 密钥存储在 macOS 钥匙串中，而不是以明文形式存放在配置文件的 JSON 中。这在 Apple Silicon 上提供硬件级加密和操作系统级别的访问控制。
+Octos 支持将 API 密钥存储在操作系统的密钥存储中，而不是以明文形式存放在配置文件的 JSON 中：macOS 使用钥匙串（Apple Silicon 上提供硬件级加密和操作系统级别的访问控制），Linux 使用 `~/.octos/secrets` 下的 0600 文件，Windows 暂无密钥存储——请改用环境变量或明文 `env_vars`。下图展示的是 macOS 后端。
 
 ### 架构
 
@@ -150,7 +150,8 @@ macOS 钥匙串是为桌面交互使用设计的。在无头服务器上，它�
 | **开发者笔记本** | 钥匙串（`"keychain:"`） | GUI 会话保持钥匙串解锁；ACL 弹窗可以接受 |
 | **自动登录 + GUI 的 Mac** | 钥匙串（`"keychain:"`） | 如果通过屏幕共享批准过 ACL 对话框则可用 |
 | **无头 Mac（仅 SSH）** | `env_vars` 或 launchd plist 中的明文 | 最可靠；无解锁/ACL 依赖 |
-| **Linux 服务器** | 环境变量中的明文 | 没有 macOS 钥匙串 |
+| **Linux 服务器** | 密钥存储（`~/.octos/secrets` 下的 0600 文件） | 文件存储无需解锁或 D-Bus；明文环境变量亦可 |
+| **Windows** | `env_vars` 或环境变量中的明文 | 暂无密钥存储（#2234） |
 
 **为什么钥匙串在无头服务器上不可靠：**
 
@@ -230,3 +231,11 @@ sudo systemctl enable octos-serve
 sudo systemctl status octos-serve
 sudo journalctl -u octos-serve -f
 ```
+
+### 通过 `server/shutdown` 停止（本地 solo）
+
+服务器有三种停止方式：前台运行 `octos serve` 的终端里按 Ctrl+C、平台服务管理器（上文的 launchd / systemd），以及此处介绍的 UI Protocol 方法 `server/shutdown`。
+
+UI Protocol 客户端可以通过已认证的 WebSocket（`/api/ui-protocol/ws`）调用 `server/shutdown` 方法停止服务器。它的效果与 Ctrl+C 完全一致：连接排空、网关停止、进程退出。该调用是幂等的，停止动作在请求被处理后约 250 ms 触发，确认通常仍能赶在排空前送达客户端（出站背压下客户端可能错过确认，但停止照常发生）。
+
+该方法只在**本地部署**（`config.mode = "local"`）且开启 solo 登录（`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`）时被接受，且仅限 HTTP serve（不带 `--stdio` 的 `octos serve`）。一次调用会停止整个进程，所有已连接客户端一起下线，其运行中的轮次一并取消。fleet/托管服务器与 `--stdio` serve 会以 `invalid_request`（-32600）携带 `data.kind: "server_shutdown_unavailable"` 拒绝该调用，什么都不停；session 级（session-ingress）连接则完全无法调用，只会收到不带 kind 的裸 `invalid_request`。注意本地 solo 的信任模型：solo serve 上，任何能打开 WebSocket 的本地进程——或白名单来源页面——都能停止服务器。

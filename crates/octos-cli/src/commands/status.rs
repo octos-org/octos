@@ -7,6 +7,7 @@ use colored::Colorize;
 use eyre::{Result, WrapErr};
 
 use super::Executable;
+use crate::auth::keychain;
 use crate::config::Config;
 
 /// Show system status.
@@ -123,6 +124,19 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
     println!();
     println!("{}", "API Keys".cyan().bold());
     println!("{}", "─".repeat(50).dimmed());
+
+    // #2415 — where `octos auth set-key` writes on this platform; the same
+    // backend name `octos auth keys` prints, so both surfaces agree.
+    println!(
+        "  {}: {} ({})",
+        "Secret store".dimmed(),
+        keychain::backend_name(),
+        if keychain::is_available() {
+            "available"
+        } else {
+            "unavailable"
+        }
+    );
 
     for (label, env_var) in PROVIDER_ENV_VARS {
         // A provider may accept more than one key env var (e.g. Moonshot declares

@@ -512,7 +512,11 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   is bootstrapped. The client then opens the peer session and starts the
   kickoff turn through the ordinary `session/open` + `turn/start`; #1801 v2
   adds `n` (1..=8) for fleet staging — N suffixed slugs from ONE brief, the
-  scalar result fields mirror the first peer and `peers: [...]` carries all)
+  scalar result fields mirror the first peer and `peers: [...]` carries all;
+  optional positive `token_budget` sets a cumulative per-peer limit for every
+  staged member and is echoed in each result entry. The limit persists by peer
+  slug across session reconnects. Usage is charged after each turn, so one
+  turn can overshoot; later turns end with `peer_token_budget_exceeded`.)
 - `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
   latest `result.md` — written server-side on every peer-session turn
   terminal — with per-field truncation flags and `result_updated_unix`;
@@ -641,7 +645,7 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 
 - `agent/updated`, `agent/output/delta`, `agent/artifact/updated`
 - `session/goal/updated`, `session/goal/cleared`
-- `loop/updated`, `loop/fired`, `loop/completed`
+- `loop/updated`, `loop/fired`
 - `monitor/updated`, `monitor/fired`, `monitor/expired`
 
 M16 context lifecycle (gate `context.lifecycle.v1`):
@@ -1657,10 +1661,23 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/sessions`
-- Params type: `SessionListParams` (empty object).
+- Params type: `SessionListParams` — `{}` for the legacy per-profile/global
+  listing. With `session.workspace_cwd.v1` negotiated, an optional `cwd`
+  scopes the listing to that project's `<cwd>/.octos/<profile>` store, and
+  an optional `profile_id` names the profile whose store to read, under the
+  same scope rules as `session/open`: a user connection may only restate
+  its own profile (anything else is an `auth_scope_violation`), an
+  admin/token connection uses it to name the profile it opens sessions
+  under, and an unregistered profile is `cwd_runtime_unavailable`.
 - Result type: `SessionListResult` — `{ sessions: SessionInfo[] }`. The
   `sessions` field forwards the JSON body of the legacy REST handler
-  verbatim (one `SessionInfo` per entry).
+  verbatim (one `SessionInfo` per entry). When — and only when — the
+  server actually scoped the listing to a project store, the result also
+  carries `workspace_root` (the canonical root) and `profile_id` (whose
+  `<workspace_root>/.octos/<profile_id>` store was read). A `{cwd}` request
+  to a server with `appui.sessions_in_cwd` off, or one that predates it,
+  returns the legacy global listing without them; a client must not place
+  rows under a workspace unless the result attests that scope.
 - Errors: collection endpoint; an unexpected 404 surfaces as
   `resource_not_found` with `data.resource_type = "session"` rather than
   `unknown_session`.
@@ -2487,15 +2504,30 @@ Rules:
   `data.kind = "profile_unresolved"`; it must not fabricate a runtime policy
   stamp for that profile or silently fall back to a default profile
 
-Numeric codes for method-availability errors (constants in `rpc_error_codes`
-in `crates/octos-core/src/ui_protocol.rs`; the WS/stdio dispatcher applies
-them at its supported-table and capability gates in
-`crates/octos-cli/src/api/ui_protocol_transport.rs`):
+Numeric error codes are pinned in this section. `rpc_error_codes` in
+`crates/octos-core/src/ui_protocol.rs` mirrors them as Rust constants, and a
+parity test (`crates/octos-core/src/ui_protocol_tests.rs`) fails when either
+side gains a code the other lacks. The WS/stdio dispatcher applies them at
+its supported-table and capability gates in
+`crates/octos-cli/src/api/ui_protocol_transport.rs`.
 
+JSON-RPC reserved range:
+
+- `-32700` (`parse_error`) — JSON-RPC reserved: the frame is not valid JSON.
+  Raised by the frame codec before any method dispatch.
+- `-32600` (`invalid_request`) — JSON-RPC reserved: valid JSON that is not a
+  valid JSON-RPC 2.0 request envelope.
 - `-32601` (`method_not_found`) — JSON-RPC reserved. Emitted by the core
   `UiCommand` parser when the method falls outside the protocol's method
   table. The serve dispatcher answers unknown methods with `-32004`
   instead (below), so this code is not observed on the AppUI wire today.
+- `-32602` (`invalid_params`) — JSON-RPC reserved: params failed schema
+  validation, including the per-method caps and validation rules listed
+  with each method.
+- `-32603` (`internal_error`) — JSON-RPC reserved: internal server error.
+
+Server-defined range:
+
 - `-32004` (`method_not_supported`) — legacy server slot for "this server
   will not run the method": a method outside the supported-method table, or
   a capability-gated method called without negotiating the feature (see the
@@ -2503,10 +2535,65 @@ them at its supported-table and capability gates in
   `data` carries a typed `UnsupportedCapabilityReport`, giving clients one
   machine-readable signal that the server will not run the method on this
   slice.
+- `-32011` (`approval_not_pending`) — `respond` against an approval that is
+  no longer pending; the already-recorded decision rides in `error.data`.
+- `-32100` (`unknown_session`) — `session_id` not known to the runtime;
+  `data` carries `session_id`.
+- `-32101` (`unknown_turn`) — `turn_id` not known for the addressed session.
+- `-32102` (`unknown_approval_id`) — `approval_id` not known to the runtime
+  (`unknown_approval` in the minimum categories above).
+- `-32103` (`unknown_preview_id`) — `preview_id` unknown (expired or never
+  issued).
+- `-32104` (`unknown_task_id`) — `task_id` not in the runtime task table.
+- `-32105` (`approval_cancelled`) — `respond` against an administratively
+  cancelled approval.
+- `-32106` (`user_question_unknown`) — `user_question/respond` against a
+  `question_id` not pending for the caller's session; mirrors
+  `unknown_approval_id` for the structured-question surface.
+- `-32107` (`user_question_stale`) — `user_question/respond` against a
+  question that was already answered or cancelled.
+- `-32108` (`user_question_invalid`) — `user_question/respond` carried
+  answers that do not match the stored request (wrong answer count, a
+  `selected_labels` value not in that question's options, more than one
+  label on a non-`multi_select` question, or free text where the question
+  disallows it). The server rejects the call without resolving the blocked
+  tool.
+- `-32110` (`cursor_out_of_range`) — stale or future cursor relative to the
+  session ledger; retry with a fresh cursor.
+- `-32111` (`cursor_invalid`) — cursor malformed or belonging to a different
+  stream; rehandshake instead of retrying.
+- `-32120` (`permission_denied`) — sandbox, approval-scope, or profile
+  policy refusal. The same numeric code carries `auth_unavailable` (with
+  `data.kind = "auth_unavailable"`) on content and auth methods called
+  without a usable identity; clients disambiguate by `data.kind`.
 - `-32130` (`unsupported_capability`) — typed slot for the
   capability-unavailable condition. New emitters should prefer it over the
   legacy `-32004` slot. Like `-32601`, it is not emitted on the AppUI wire
-  today.
+  today; the dispatcher's capability gate still answers `-32004` (see the
+  migration status below).
+- `-32140` (`runtime_not_ready`) — transient runtime unavailability
+  (`runtime_unavailable` in the minimum categories above); autonomy loop
+  runtime failures answer with it.
+- `-32150` (`malformed_result`) — a server-side result failed its own
+  schema; the result-side counterpart to `invalid_params`.
+- `-32160` (`rate_limited`) — backpressure signal; `data` may carry an
+  optional `retry_after_ms` hint (the `RpcError::rate_limited` constructor),
+  which current emitters do not set.
+- `-32170` (`resource_not_found`) — not-found for non-session-scoped
+  resources (content catalog rows, profile records); `data` carries
+  `resource_type` and `identifier`. Distinct from `unknown_session`
+  (`-32100`), which is reserved for session-scoped 404s.
+
+`-32004` → `-32130` migration status:
+
+- Current: the dispatcher's capability gate answers with `-32004`;
+  `-32130` has no emitter on the AppUI wire today.
+- Target: `-32130` becomes the canonical answer for the
+  capability-unavailable condition.
+- Switch trigger: none scheduled. Repointing the gate is a client-visible
+  wire change and requires an accepted protocol change request (§4.1);
+  until then `-32004` is the only capability-gate answer a client can
+  observe.
 
 ## 11. Relationship to REST
 
@@ -3137,10 +3224,6 @@ Loop notifications:
 - `loop/fired`: params are `{ "session_id": SessionKey,
   "profile_id"?: string, "loop_id": string, "loop"?: Loop,
   "fire"?: LoopFire, "ok"?: boolean, "status"?: string }`.
-- `loop/completed`: params are `{ "session_id": SessionKey,
-  "profile_id"?: string, "loop_id": string, "loop"?: Loop,
-  "status"?: string, "completed_at_ms"?: number, "result"?: object,
-  "error"?: string }`.
 
 `Agent`, `Goal`, and `Loop` shapes match UPCR-2026-021. String status
 fields are open registries; clients must preserve unknown values. The

@@ -32,7 +32,8 @@ use chrono::Utc;
 use octos_agent::tools::mcp_agent::DispatchContextContract;
 use octos_agent::{Agent, AgentConfig, RoleTemplate, SpawnOnlyFailureSignal, ToolRegistry};
 use octos_core::ui_protocol::{
-    OutputCursor, RpcError, autonomy_error_kinds as kinds, methods, rpc_error_codes,
+    MonitorExpiredEvent, OutputCursor, RpcError, autonomy_error_kinds as kinds, methods,
+    rpc_error_codes,
 };
 use octos_core::{AgentId, MAIN_PROFILE_ID, SessionKey, TaskId};
 use octos_fleet::{
@@ -12682,7 +12683,8 @@ impl InProcessAgentOrchestrator {
     /// precedent) and running it after a watcher death IS the self-heal.
     pub(crate) fn monitor_reconcile_pass(&self) -> Vec<MonitorWatchConfig> {
         let now = now_ms();
-        let mut expired: Vec<(Option<String>, SessionKey, String)> = Vec::new();
+        let mut expired: Vec<(Option<String>, SessionKey, String, MonitorExpiredEvent)> =
+            Vec::new();
         let mut desired = Vec::new();
         {
             let mut state = self.state();
@@ -12703,6 +12705,7 @@ impl InProcessAgentOrchestrator {
                              Re-create it if the watch is still needed.",
                             record.name, record.monitor_id
                         ),
+                        monitor_expired_event(record, "timeout"),
                     ));
                     continue;
                 }
@@ -12711,8 +12714,12 @@ impl InProcessAgentOrchestrator {
                 }
             }
         }
-        for (data_dir, session_id, note) in expired {
+        // Notes and wire frames go out AFTER the state lock is dropped: both
+        // sinks are best-effort taps over a transition that is already
+        // durable, and must never run (or fail) under the lock.
+        for (data_dir, session_id, note, event) in expired {
             self.stage_monitor_note(data_dir.as_deref(), &session_id, &note);
+            emit_monitor_expired(event);
         }
         desired
     }
@@ -12721,7 +12728,7 @@ impl InProcessAgentOrchestrator {
     /// (the in-task twin of the reconcile sweep; whichever fires first wins,
     /// the other is a no-op on the already-terminal status).
     pub(crate) fn expire_monitor(&self, monitor_id: &str, reason: &str) {
-        let note = {
+        let (note, event) = {
             let mut state = self.state();
             let supervisor_store = state.supervisor_store.clone();
             let Some(record) = state.monitors.get_mut(monitor_id) else {
@@ -12734,15 +12741,21 @@ impl InProcessAgentOrchestrator {
             record.updated_at_ms = now_ms();
             persist_monitor_state_with_store(supervisor_store.as_ref(), record);
             (
-                record.data_dir.clone(),
-                record.session_id.clone(),
-                format!(
-                    "monitor `{}` ({}) EXPIRED ({reason}) and was disarmed.",
-                    record.name, record.monitor_id
+                (
+                    record.data_dir.clone(),
+                    record.session_id.clone(),
+                    format!(
+                        "monitor `{}` ({}) EXPIRED ({reason}) and was disarmed.",
+                        record.name, record.monitor_id
+                    ),
                 ),
+                monitor_expired_event(record, reason),
             )
         };
+        // Same post-lock discipline as the reconcile sweep: the transition is
+        // already durable, the taps are best-effort.
         self.stage_monitor_note(note.0.as_deref(), &note.1, &note.2);
+        emit_monitor_expired(event);
     }
 
     /// #1977 — a STREAM probe's child process exited. Pause (not delete):
@@ -12957,6 +12970,83 @@ impl MonitorSink for OrchestratorMonitorSink {
 pub(crate) fn default_agent_orchestrator() -> &'static InProcessAgentOrchestrator {
     static ORCHESTRATOR: OnceLock<InProcessAgentOrchestrator> = OnceLock::new();
     ORCHESTRATOR.get_or_init(InProcessAgentOrchestrator::default)
+}
+
+/// #2080 — the `monitor/expired` wire tap. The two expiry transition sites
+/// ([`InProcessAgentOrchestrator::monitor_reconcile_pass`] and
+/// [`InProcessAgentOrchestrator::expire_monitor`]) sit deep in the runtime
+/// with no handle to the transport, so — same rationale as the
+/// `background/activity` human sink (#2019) and `default_agent_orchestrator`
+/// itself — the event is handed to a process-global, best-effort sink the
+/// `api` surface installs once at serve boot.
+///
+/// Invariants mirror the human sink's: emission is ADDITIVE (the durable
+/// status transition + note are already done when this runs), must NEVER
+/// block or fail the producer (a missing sink degrades to a dropped event —
+/// the durable record remains the source of truth), and fires exactly once
+/// per active→expired transition because both sites no-op on an
+/// already-terminal status. Note `monitor/resume` re-arms an expired monitor
+/// (pre-existing semantics this tap does not change — resume never touches
+/// `expires_at_ms`, so a resumed-past-due monitor re-expires on the next
+/// sweep), and that re-expiry is a NEW transition with its own frame.
+pub(crate) type MonitorExpiredSink = Arc<dyn Fn(MonitorExpiredEvent) + Send + Sync>;
+
+fn monitor_expired_sink_slot() -> &'static StdMutex<Option<MonitorExpiredSink>> {
+    static SLOT: OnceLock<StdMutex<Option<MonitorExpiredSink>>> = OnceLock::new();
+    SLOT.get_or_init(|| StdMutex::new(None))
+}
+
+/// Install the process-global `monitor/expired` sink. Called once by the
+/// `api` surface at serve boot; the implementation MUST NOT block (a
+/// bounded-channel `try_send`), since one producer is a watcher task.
+pub(crate) fn set_monitor_expired_sink(sink: MonitorExpiredSink) {
+    let mut slot = monitor_expired_sink_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = Some(sink);
+}
+
+/// Hand a `monitor/expired` event to the installed sink. Best-effort: no
+/// sink (or a poisoned slot) drops the event with a trace line — the durable
+/// status transition has already happened, so nothing is lost for the model.
+fn emit_monitor_expired(event: MonitorExpiredEvent) {
+    let sink = monitor_expired_sink_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    match sink {
+        Some(sink) => sink(event),
+        None => tracing::trace!(
+            monitor_id = %event.monitor_id,
+            "monitor/expired dropped: no sink installed"
+        ),
+    }
+}
+
+/// Serializes every test that touches the process-global `monitor/expired`
+/// sink, and resets it on acquisition — the same harness-race discipline as
+/// [`crate::autonomy::human_events::background_activity_test_guard`]. Hold
+/// the returned guard for the WHOLE test body.
+#[cfg(test)]
+#[must_use = "hold the guard for the whole test body, or the sink races again"]
+pub(crate) fn monitor_expired_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    let guard = LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clear_monitor_expired_sink();
+    guard
+}
+
+/// Remove the sink. Test-only: the slot is a `static` that cannot otherwise
+/// be reset between cases.
+#[cfg(test)]
+pub(crate) fn clear_monitor_expired_sink() {
+    let mut slot = monitor_expired_sink_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *slot = None;
 }
 
 #[derive(Debug)]
@@ -16410,6 +16500,7 @@ objective is fully met, or `NOT_DONE: <short reason>` otherwise."
         // and is never replayed, so skip prompt-cache writes.
         cache_retention: octos_llm::CacheRetention::None,
         prompt_cache_context: None,
+        media_scope_root: None,
     };
     let messages = vec![octos_core::Message::user(prompt)];
     match provider.chat(&messages, &[], &config).await {
@@ -19958,6 +20049,23 @@ fn autonomy_monitor_json(record: &AutonomyMonitorRecord) -> Value {
         "created_at_ms": record.created_at_ms,
         "updated_at_ms": record.updated_at_ms,
     })
+}
+
+/// #2080 — the `monitor/expired` frame for one record that just transitioned
+/// to its terminal `expired` status. The snapshot reuses
+/// [`autonomy_monitor_json`] so the nested `monitor` record is the exact
+/// wire shape `monitor/list` and `monitor/updated` already publish
+/// (post-transition: `status = "expired"`, `updated_at_ms` stamped).
+fn monitor_expired_event(record: &AutonomyMonitorRecord, reason: &str) -> MonitorExpiredEvent {
+    MonitorExpiredEvent {
+        session_id: record.session_id.clone(),
+        profile_id: Some(record.profile_id.clone()),
+        monitor_id: record.monitor_id.clone(),
+        monitor_state: serde_json::from_value(autonomy_monitor_json(record)).ok(),
+        status: Some(record.status.clone()),
+        expired_at_ms: Some(record.updated_at_ms),
+        reason: Some(reason.to_owned()),
+    }
 }
 
 fn ensure_monitor_scope(
@@ -45967,6 +46075,201 @@ mod tests {
         assert!(
             notes.contains("EXPIRED"),
             "note explains the expiry: {notes}"
+        );
+    }
+
+    /// #2080 — the sweep's expiry transition ALSO emits one `monitor/expired`
+    /// wire frame, carrying the post-transition record and the owning
+    /// profile; the already-terminal re-run stays silent (one frame per
+    /// active→expired transition).
+    #[test]
+    fn monitor_reconcile_pass_emits_monitor_expired_exactly_once() {
+        let _guard = monitor_expired_test_guard();
+        let events: Arc<StdMutex<Vec<MonitorExpiredEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = events.clone();
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session = SessionKey::new("api", "mon-expire-wire");
+        // The sink is process-global and only cooperative tests hold the
+        // guard: a concurrent expiry from ANOTHER test (e.g. the #1977
+        // reconcile cases, which never touch the slot) would land here too.
+        // Record only THIS test's frames — the exactly-once assertion is
+        // about this monitor's transition, not the process.
+        let own = session.clone();
+        set_monitor_expired_sink(Arc::new(move |event| {
+            if event.session_id == own {
+                recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            }
+        }));
+        let mut spec = monitor_spec("short", MonitorMode::Poll { interval_secs: 3 });
+        spec.timeout_secs = Some(1);
+        create_monitor_for_test(
+            &orchestrator,
+            &session,
+            "tenant-a",
+            spec,
+            Some(dir.path().to_path_buf()),
+        );
+        // Force the expiry deadline into the past.
+        {
+            let mut state = orchestrator.state();
+            let record = state.monitors.get_mut("monitor_01").unwrap();
+            record.expires_at_ms = Some(now_ms() - 1_000);
+        }
+        orchestrator.monitor_reconcile_pass();
+        {
+            let emitted = events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(emitted.len(), 1, "one frame per expiry transition");
+            let event = &emitted[0];
+            assert_eq!(event.monitor_id, "monitor_01");
+            assert_eq!(event.session_id, session);
+            assert_eq!(event.profile_id.as_deref(), Some("tenant-a"));
+            assert_eq!(event.status.as_deref(), Some("expired"));
+            assert_eq!(event.reason.as_deref(), Some("timeout"));
+            let snapshot = event.monitor_state.as_ref().expect("wire snapshot");
+            assert_eq!(snapshot.monitor_id, "monitor_01");
+            assert_eq!(snapshot.status, "expired");
+            assert_eq!(snapshot.profile_id.as_deref(), Some("tenant-a"));
+            assert_eq!(
+                event.expired_at_ms,
+                Some(snapshot.updated_at_ms),
+                "the frame's expiry stamp is the record's terminal transition"
+            );
+        }
+        // Terminal status is sticky: the next sweep has nothing to expire and
+        // emits nothing.
+        orchestrator.monitor_reconcile_pass();
+        assert_eq!(
+            events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "an already-expired monitor never re-emits"
+        );
+    }
+
+    /// #2080 — the watcher-deadline twin ([`InProcessAgentOrchestrator::
+    /// expire_monitor`]) emits the same frame with ITS reason, and the
+    /// already-terminal / unknown-monitor calls stay silent.
+    #[test]
+    fn expire_monitor_emits_monitor_expired_with_reason_exactly_once() {
+        let _guard = monitor_expired_test_guard();
+        let events: Arc<StdMutex<Vec<MonitorExpiredEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = events.clone();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session = SessionKey::new("api", "mon-expire-deadline");
+        // Same process-global cross-talk discipline as the sweep test above:
+        // count only THIS test's frames.
+        let own = session.clone();
+        set_monitor_expired_sink(Arc::new(move |event| {
+            if event.session_id == own {
+                recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            }
+        }));
+        create_monitor_for_test(
+            &orchestrator,
+            &session,
+            "tenant-a",
+            monitor_spec("deadline", MonitorMode::Poll { interval_secs: 3 }),
+            None,
+        );
+        orchestrator.expire_monitor("monitor_01", "timeout");
+        orchestrator.expire_monitor("monitor_01", "timeout");
+        orchestrator.expire_monitor("monitor_99", "timeout");
+        let emitted = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            emitted.len(),
+            1,
+            "only the active→expired transition emits; repeats and unknown ids are silent"
+        );
+        let event = &emitted[0];
+        assert_eq!(event.monitor_id, "monitor_01");
+        assert_eq!(event.reason.as_deref(), Some("timeout"));
+        assert_eq!(event.status.as_deref(), Some("expired"));
+        assert_eq!(
+            event.monitor_state.as_ref().map(|m| m.status.as_str()),
+            Some("expired")
+        );
+    }
+
+    /// #2080 — pins the resume door against the expiry wire tap. #2367
+    /// taught `monitor/resume` to refuse a record whose deadline has already
+    /// passed, so after the sweep's first expiry frame a refused resume must
+    /// produce nothing further: the record stays expired and the sweep has
+    /// no second active→expired transition to report.
+    #[test]
+    fn resumed_expired_monitor_is_refused_and_emits_no_second_frame() {
+        let _guard = monitor_expired_test_guard();
+        let events: Arc<StdMutex<Vec<MonitorExpiredEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = events.clone();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session = SessionKey::new("api", "mon-expire-resume");
+        let own = session.clone();
+        set_monitor_expired_sink(Arc::new(move |event| {
+            if event.session_id == own {
+                recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            }
+        }));
+        let mut spec = monitor_spec("resume-me", MonitorMode::Poll { interval_secs: 3 });
+        spec.timeout_secs = Some(1);
+        create_monitor_for_test(&orchestrator, &session, "tenant-a", spec, None);
+        {
+            let mut state = orchestrator.state();
+            let record = state.monitors.get_mut("monitor_01").unwrap();
+            record.expires_at_ms = Some(now_ms() - 1_000);
+        }
+        orchestrator.monitor_reconcile_pass();
+        assert_eq!(
+            events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "first expiry emits the first frame"
+        );
+        let err = orchestrator
+            .control_monitor(MonitorControlRequest {
+                monitor_id: "monitor_01".to_owned(),
+                session_id: Some(session.clone()),
+                profile_id: "tenant-a".to_owned(),
+                kind: MonitorControlKind::Resume,
+            })
+            .expect_err("resume of an expired monitor must be refused");
+        assert_eq!(err.code, autonomy_error_code(kinds::MONITOR_INVALID_STATE));
+        assert_eq!(
+            err.data.expect("error data")["kind"],
+            json!(kinds::MONITOR_INVALID_STATE)
+        );
+        orchestrator.monitor_reconcile_pass();
+        assert_eq!(
+            events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "a refused resume leaves nothing to re-expire, so no second frame"
+        );
+        assert_eq!(
+            orchestrator
+                .monitor_status_for_test("monitor_01")
+                .unwrap()
+                .0,
+            "expired",
+            "the refused resume leaves the record expired"
         );
     }
 

@@ -49,7 +49,7 @@ enum QuestionEntryState {
 /// cancelled wire event, so the production drain discards these; the fields
 /// are read by the store tests and by the follow-up wire-emit slice.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct CancelledQuestion {
     pub(crate) question_id: QuestionId,
     pub(crate) turn_id: TurnId,

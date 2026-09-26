@@ -29,7 +29,7 @@ sudo systemctl restart octos-serve
 
 ## Keychain Integration
 
-Octos supports storing API keys in the macOS Keychain instead of plaintext in profile JSON files. This provides hardware-backed encryption on Apple Silicon and OS-level access control.
+Octos supports storing API keys in the OS secret store instead of plaintext in profile JSON files: the macOS Keychain on macOS (hardware-backed, per-user access control), a 0600 file under `~/.octos/secrets` on Linux, and no store on Windows yet — use the process environment or plain `env_vars` there. The diagram below shows the macOS backend.
 
 ### Architecture
 
@@ -150,7 +150,8 @@ The macOS Keychain was designed for interactive desktop use. On headless servers
 | **Developer laptop** | Keychain (`"keychain:"`) | GUI session keeps keychain unlocked; ACL prompts are fine |
 | **Mac with auto-login + GUI** | Keychain (`"keychain:"`) | Works if ACL dialogs were approved once via screen sharing |
 | **Headless Mac (SSH only)** | Plain text in `env_vars` or launchd plist | Most reliable; no unlock/ACL dependencies |
-| **Linux server** | Plain text in env vars | No macOS Keychain available |
+| **Linux server** | Secret store (0600 files under `~/.octos/secrets`) | File store needs no unlock or D-Bus; plain env vars also work |
+| **Windows** | Plain text in `env_vars` or env vars | No secret store yet (#2234) |
 
 **Why Keychain is unreliable on headless servers:**
 
@@ -230,3 +231,11 @@ sudo systemctl enable octos-serve
 sudo systemctl status octos-serve
 sudo journalctl -u octos-serve -f
 ```
+
+### Stopping via `server/shutdown` (Local Solo)
+
+The server stops three ways: Ctrl+C in the terminal running the foreground `octos serve`, the platform service manager (`launchctl` / `systemctl`, above), and the `server/shutdown` UI Protocol method described here.
+
+A UI Protocol client connected over the authenticated WebSocket (`/api/ui-protocol/ws`) can stop the server with the `server/shutdown` method. It stops the process exactly like Ctrl+C: connections drain, gateways stop, the process exits. The call is idempotent, and the stop fires ~250 ms after the request is handled so the acknowledgement still gets a chance to reach the client (under outbound backpressure the client may miss it; the stop still happens).
+
+The method is only accepted on a local deployment (`config.mode = "local"`) with solo login opted in (`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`) and only by an HTTP serve (`octos serve` without `--stdio`). One call stops the process for every connected client and cancels their running turns. Fleet/hosted servers and `--stdio` serve reject the call with `invalid_request` (-32600) and `data.kind: "server_shutdown_unavailable"` and stop nothing; session-scoped (session-ingress) connections can never call it and are refused with a plain `invalid_request`. Note the local-solo trust model: on a solo serve, any local process -- or any page on an allowed origin -- that can open the WebSocket can stop the server.

@@ -7258,8 +7258,12 @@ async fn session_list_cwd_root_honors_flag_and_capability() {
     };
     let with_cwd = SessionListParams {
         cwd: Some(cwd.to_string_lossy().into_owned()),
+        profile_id: None,
     };
-    let no_cwd = SessionListParams { cwd: None };
+    let no_cwd = SessionListParams {
+        cwd: None,
+        profile_id: None,
+    };
 
     let state_off = {
         let mut s = AppState::empty_for_tests();
@@ -7297,15 +7301,9 @@ async fn session_list_cwd_root_honors_flag_and_capability() {
     assert!(resolve_session_list_cwd_root(&state_on, has_cap, None, &with_cwd).is_err());
 }
 
-#[tokio::test]
-async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
-    // With a registered profile runtime: a SAFE cwd resolves to the
-    // per-project, per-PROFILE store `<cwd>/.octos/<profile_id>` (so two
-    // profiles sharing a cwd can't read each other's transcripts), and a
-    // banned system path is rejected by the shared safety gate.
-    use octos_core::ui_protocol::SessionListParams;
-
-    let tmp = tempfile::tempdir().unwrap();
+/// `AppState` with `sessions_in_cwd` on and a single bootstrapped `dev`
+/// profile runtime — the shape of a local `octos serve --solo` install.
+async fn session_list_state_with_dev_runtime(tmp: &std::path::Path) -> AppState {
     let profile = crate::profiles::UserProfile {
         id: "dev".to_string(),
         name: "Dev".to_string(),
@@ -7337,7 +7335,7 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    let data_dir = tmp.path().join("data");
+    let data_dir = tmp.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let runtime = crate::runtime::ProfileRuntime::bootstrap(
         &profile,
@@ -7354,7 +7352,19 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
         crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
             .with_sessions_in_cwd(true),
     );
+    state
+}
 
+#[tokio::test]
+async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
+    // With a registered profile runtime: a SAFE cwd resolves to the
+    // per-project, per-PROFILE store `<cwd>/.octos/<profile_id>` (so two
+    // profiles sharing a cwd can't read each other's transcripts), and a
+    // banned system path is rejected by the shared safety gate.
+    use octos_core::ui_protocol::SessionListParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = session_list_state_with_dev_runtime(tmp.path()).await;
     let cap = ConnectionUiFeatures::stdio_defaults();
 
     // Safe cwd → `<cwd>/.octos/dev` (profile-namespaced).
@@ -7363,23 +7373,157 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
     let good_canon = std::fs::canonicalize(&good).unwrap();
     let good_params = SessionListParams {
         cwd: Some(good.to_string_lossy().into_owned()),
+        profile_id: None,
     };
     let resolved = resolve_session_list_cwd_root(&state, cap, Some("dev"), &good_params).unwrap();
     assert_eq!(
         resolved,
-        Some(crate::runtime::session::project_sessions_root(
-            &good_canon,
-            "dev"
-        )),
+        Some(SessionListScope {
+            workspace_root: good_canon.clone(),
+            sessions_root: crate::runtime::session::project_sessions_root(&good_canon, "dev"),
+            profile_id: "dev".to_string(),
+        }),
     );
-    assert_eq!(resolved, Some(good_canon.join(".octos").join("dev")));
+    assert_eq!(
+        resolved.map(|scope| scope.sessions_root),
+        Some(good_canon.join(".octos").join("dev"))
+    );
 
     // Banned system root (`/usr` is a real dir on Linux and macOS that
     // canonicalizes to `/usr`) → rejected by the safety gate.
     let banned = SessionListParams {
         cwd: Some("/usr".to_string()),
+        profile_id: Some("dev".to_string()),
     };
     assert!(resolve_session_list_cwd_root(&state, cap, Some("dev"), &banned).is_err());
+}
+
+#[tokio::test]
+async fn session_list_cwd_root_should_honor_requested_profile_when_connection_is_admin() {
+    // A browser paired with the admin bearer token has NO connection profile
+    // (`AuthIdentity::Admin` → `None`), yet it opens sessions as `dev` by
+    // passing `profile_id` to session/open. Before this test the cwd listing
+    // ignored `params.profile_id`, fell back to `_main`, and — on a local
+    // install with only a `dev` profile — failed with
+    // `cwd_runtime_unavailable`, so the history browser never saw the
+    // transcripts that session/open had written under `<cwd>/.octos/dev`.
+    use octos_core::ui_protocol::SessionListParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = session_list_state_with_dev_runtime(tmp.path()).await;
+    let cap = ConnectionUiFeatures::stdio_defaults();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_canon = std::fs::canonicalize(&project).unwrap();
+    let cwd = project.to_string_lossy().into_owned();
+
+    // Admin connection + explicit `profile_id` → that profile's store.
+    let requested = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: Some("dev".to_string()),
+    };
+    assert_eq!(
+        resolve_session_list_cwd_root(&state, cap, None, &requested).unwrap(),
+        Some(SessionListScope {
+            workspace_root: project_canon.clone(),
+            sessions_root: project_canon.join(".octos").join("dev"),
+            profile_id: "dev".to_string(),
+        }),
+    );
+
+    // Admin connection + no `profile_id` → unchanged: `_main` is not
+    // registered here, so the safety gate still rejects.
+    let bare = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: None,
+    };
+    assert!(resolve_session_list_cwd_root(&state, cap, None, &bare).is_err());
+
+    // Empty `profile_id` is rejected, same as session/open.
+    let empty = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: Some(String::new()),
+    };
+    assert!(resolve_session_list_cwd_root(&state, cap, None, &empty).is_err());
+
+    // A requested profile that is not registered is still rejected — the
+    // param must never open a SessionManager at a made-up namespace.
+    let unknown = SessionListParams {
+        cwd: Some(cwd),
+        profile_id: Some("ghost".to_string()),
+    };
+    assert!(resolve_session_list_cwd_root(&state, cap, None, &unknown).is_err());
+}
+
+#[tokio::test]
+async fn session_list_cwd_root_should_reject_requested_profile_outside_authenticated_scope() {
+    // An authenticated user connection is frozen to its own profile: a
+    // `profile_id` naming another profile is a scope violation (mirrors
+    // `validate_authenticated_session_scope` for session/open), while
+    // restating the connection's own profile is fine.
+    use octos_core::ui_protocol::SessionListParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = session_list_state_with_dev_runtime(tmp.path()).await;
+    let cap = ConnectionUiFeatures::stdio_defaults();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_canon = std::fs::canonicalize(&project).unwrap();
+    let cwd = project.to_string_lossy().into_owned();
+
+    let foreign = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: Some("other".to_string()),
+    };
+    let error = resolve_session_list_cwd_root(&state, cap, Some("dev"), &foreign).unwrap_err();
+    assert_eq!(error.code, RpcError::invalid_params("").code);
+    assert!(
+        error.message.contains("outside the authenticated profile"),
+        "unexpected error message: {}",
+        error.message
+    );
+
+    let own = SessionListParams {
+        cwd: Some(cwd),
+        profile_id: Some("dev".to_string()),
+    };
+    assert_eq!(
+        resolve_session_list_cwd_root(&state, cap, Some("dev"), &own).unwrap(),
+        Some(SessionListScope {
+            workspace_root: project_canon.clone(),
+            sessions_root: project_canon.join(".octos").join("dev"),
+            profile_id: "dev".to_string(),
+        }),
+    );
+}
+
+#[test]
+fn session_list_result_should_attest_scope_only_when_the_listing_was_scoped() {
+    // A client cannot otherwise tell a project-scoped listing from the
+    // legacy global one a flag-off (or older) server returns for the same
+    // `{cwd}` request — so it must never place legacy rows under a
+    // workspace. The scoped result names the canonical root and profile it
+    // read; the legacy result stays byte-identical `{ sessions }`.
+    let sessions = serde_json::json!([{ "id": "dev:api:web-1", "message_count": 2 }]);
+
+    assert_eq!(
+        session_list_result_value(sessions.clone(), None),
+        serde_json::json!({ "sessions": sessions }),
+    );
+
+    let scope = SessionListScope {
+        workspace_root: std::path::PathBuf::from("/srv/project"),
+        sessions_root: std::path::PathBuf::from("/srv/project/.octos/dev"),
+        profile_id: "dev".to_string(),
+    };
+    assert_eq!(
+        session_list_result_value(sessions.clone(), Some(&scope)),
+        serde_json::json!({
+            "sessions": sessions,
+            "workspace_root": "/srv/project",
+            "profile_id": "dev",
+        }),
+    );
 }
 
 #[tokio::test]
@@ -15990,6 +16134,291 @@ fn monitor_updated_notification(
     })
 }
 
+/// A durable `monitor/expired`. `top_profile_id` models the emit-site stamp,
+/// `record_profile_id` the nested `monitor` snapshot's owner (#2080).
+fn monitor_expired_notification(
+    session_id: &SessionKey,
+    top_profile_id: Option<&str>,
+    record_profile_id: Option<&str>,
+    monitor_id: &str,
+) -> UiNotification {
+    UiNotification::MonitorExpired(octos_core::ui_protocol::MonitorExpiredEvent {
+        session_id: session_id.clone(),
+        profile_id: top_profile_id.map(ToOwned::to_owned),
+        monitor_id: monitor_id.to_owned(),
+        monitor_state: Some(octos_core::ui_protocol::UiMonitorRecord {
+            monitor_id: monitor_id.to_owned(),
+            session_id: session_id.clone(),
+            profile_id: record_profile_id.map(ToOwned::to_owned),
+            name: monitor_id.to_owned(),
+            argv: vec![
+                "tail".to_owned(),
+                "-f".to_owned(),
+                "/var/log/secret".to_owned(),
+            ],
+            filter_regex: None,
+            mode: "poll".to_owned(),
+            interval_seconds: Some(3),
+            batch_ms: 250,
+            max_events_per_hour: 60,
+            persistent: false,
+            status: "expired".to_owned(),
+            pause_reason: None,
+            goal_id: None,
+            last_fired_at_ms: None,
+            fires_used: 0,
+            expires_at_ms: Some(1),
+            created_at_ms: 0,
+            updated_at_ms: 1,
+        }),
+        status: Some("expired".to_owned()),
+        expired_at_ms: Some(1),
+        reason: Some("timeout".to_owned()),
+    })
+}
+
+/// #2080 — `monitor/expired` is scoped like every other monitor frame:
+/// the top-level stamp first, the nested `monitor` record as the fallback.
+/// The frame carries tenant text (monitor name + argv), so a foreign profile
+/// must never see it on ANY delivery boundary.
+#[test]
+fn monitor_expired_frames_are_visible_only_to_their_profile() {
+    let session_id = SessionKey("web-shared".into());
+    let stamped = monitor_expired_notification(&session_id, Some("alpha"), Some("alpha"), "m-1");
+    assert!(ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(stamped),
+        Some("alpha")
+    ));
+    let stamped = monitor_expired_notification(&session_id, Some("alpha"), Some("alpha"), "m-1");
+    assert!(!ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(stamped),
+        Some("beta")
+    ));
+    // The nested-fallback shape: no top-level stamp, only the `monitor`
+    // record names the owner.
+    let nested_only = monitor_expired_notification(&session_id, None, Some("alpha"), "m-1");
+    assert!(ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(nested_only),
+        Some("alpha")
+    ));
+    let nested_only = monitor_expired_notification(&session_id, None, Some("alpha"), "m-1");
+    assert!(!ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(nested_only),
+        Some("beta")
+    ));
+}
+
+/// #2080 acceptance — a monitor's expiry transition flows through the REAL
+/// production sink wiring (the same [`spawn_monitor_expired_sink`] serve
+/// installs at boot) onto the OWNING session's durable stream, from which a
+/// disconnected client replays it; the profile-scope filter then gates it
+/// exactly like the other monitor frames.
+///
+/// Sync shell over a current-thread runtime: the process-global sink test
+/// guard (a std `MutexGuard`, mirroring the `background/activity` guard
+/// discipline) must be held across the emission, and holding it across an
+/// `.await` is (rightly) denied by `await_holding_lock`.
+#[test]
+fn should_deliver_monitor_expired_through_the_production_sink_to_the_owning_session() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, InProcessAgentOrchestrator, MonitorCreateRequest,
+    };
+
+    let _guard = crate::autonomy::agent_orchestrator::monitor_expired_test_guard();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let state = Arc::new(AppState::empty_for_tests());
+        spawn_monitor_expired_sink(state.clone());
+        // The same process-wide ledger the drain task resolves.
+        let ledger = event_ledger(&state).await;
+        let owner = SessionKey("local:mon-expiry-owner".into());
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let created = orchestrator
+            .create_monitor(MonitorCreateRequest {
+                session_id: owner.clone(),
+                profile_id: "alpha".to_owned(),
+                spec: crate::autonomy::monitor_runtime::MonitorSpec {
+                    name: "wire-watch".to_owned(),
+                    argv: vec!["sh".to_owned(), "-c".to_owned(), "true".to_owned()],
+                    filter_regex: None,
+                    batch_ms: crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
+                    mode: crate::autonomy::monitor_runtime::MonitorMode::Poll { interval_secs: 3 },
+                    timeout_secs: None,
+                    persistent: false,
+                    max_events_per_hour: 5,
+                    goal_id: None,
+                    cwd: None,
+                },
+                data_dir: None,
+            })
+            .expect("create monitor");
+        let monitor_id = created["monitor_id"]
+            .as_str()
+            .expect("monitor id")
+            .to_owned();
+
+        // The watcher-deadline transition — one of the two production emit sites.
+        orchestrator.expire_monitor(&monitor_id, "timeout");
+
+        // The drain is a spawned task over a bounded channel: await the frame.
+        let resume_from = UiCursor {
+            stream: owner.0.clone(),
+            seq: 0,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (replay, position) = loop {
+            let replay = ledger
+                .replay_after(&owner, Some(&resume_from))
+                .unwrap_or_default();
+            if let Some(position) = replay.iter().position(|entry| {
+                matches!(
+                    &entry.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(_))
+                )
+            }) {
+                break (replay, position);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "monitor/expired never reached the owning session's durable stream"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        let frame = &replay[position].event;
+        let UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(event)) = frame
+        else {
+            unreachable!("position matched a MonitorExpired frame")
+        };
+        assert_eq!(event.monitor_id, monitor_id);
+        assert_eq!(event.session_id, owner);
+        assert_eq!(event.profile_id.as_deref(), Some("alpha"));
+        assert_eq!(event.status.as_deref(), Some("expired"));
+        assert_eq!(event.reason.as_deref(), Some("timeout"));
+        assert_eq!(
+            event.monitor_state.as_ref().map(|m| m.status.as_str()),
+            Some("expired"),
+            "the nested snapshot is the post-transition record"
+        );
+        // The tenant boundary the issue exists for: the owning profile passes,
+        // a foreign one is refused.
+        assert!(ledger_event_matches_profile_scope(frame, Some("alpha")));
+        assert!(!ledger_event_matches_profile_scope(frame, Some("beta")));
+        // ROUTING: a sibling session's stream stays empty.
+        let sibling = SessionKey("local:mon-expiry-sibling".into());
+        let sibling_replay = ledger
+            .replay_after(
+                &sibling,
+                Some(&UiCursor {
+                    stream: sibling.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .unwrap_or_default();
+        assert!(
+            sibling_replay.is_empty(),
+            "monitor/expired must never land on a session that did not own the monitor"
+        );
+    });
+}
+
+/// #2080 — the reconcile-sweep twin of the production-sink acceptance test
+/// above: the OTHER emit site ([`InProcessAgentOrchestrator::
+/// monitor_reconcile_pass`]) must also flow through the real sink wiring
+/// onto the owning session's durable stream. Same guard discipline: the
+/// std guard is held across a current-thread `block_on`.
+#[test]
+fn should_deliver_monitor_expired_from_the_reconcile_sweep_through_the_production_sink() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, InProcessAgentOrchestrator, MonitorCreateRequest,
+    };
+
+    let _guard = crate::autonomy::agent_orchestrator::monitor_expired_test_guard();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let state = Arc::new(AppState::empty_for_tests());
+        spawn_monitor_expired_sink(state.clone());
+        let ledger = event_ledger(&state).await;
+        let owner = SessionKey("local:mon-expiry-sweep-owner".into());
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let created = orchestrator
+            .create_monitor(MonitorCreateRequest {
+                session_id: owner.clone(),
+                profile_id: "alpha".to_owned(),
+                spec: crate::autonomy::monitor_runtime::MonitorSpec {
+                    name: "sweep-watch".to_owned(),
+                    argv: vec!["sh".to_owned(), "-c".to_owned(), "true".to_owned()],
+                    filter_regex: None,
+                    batch_ms: crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
+                    mode: crate::autonomy::monitor_runtime::MonitorMode::Poll { interval_secs: 3 },
+                    // One-second TTL: the next sweep after it lapses performs
+                    // the active→expired transition.
+                    timeout_secs: Some(1),
+                    persistent: false,
+                    max_events_per_hour: 5,
+                    goal_id: None,
+                    cwd: None,
+                },
+                data_dir: None,
+            })
+            .expect("create monitor");
+        let monitor_id = created["monitor_id"]
+            .as_str()
+            .expect("monitor id")
+            .to_owned();
+
+        // Let the TTL lapse, then run the sweep — the production emit site.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        orchestrator.monitor_reconcile_pass();
+
+        let resume_from = UiCursor {
+            stream: owner.0.clone(),
+            seq: 0,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let replay = ledger
+                .replay_after(&owner, Some(&resume_from))
+                .unwrap_or_default();
+            if let Some(entry) = replay.iter().find(|entry| {
+                matches!(
+                    &entry.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(_))
+                )
+            }) {
+                let UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(event)) =
+                    &entry.event
+                else {
+                    unreachable!("find matched a MonitorExpired frame")
+                };
+                assert_eq!(event.monitor_id, monitor_id);
+                assert_eq!(event.session_id, owner);
+                assert_eq!(event.profile_id.as_deref(), Some("alpha"));
+                assert_eq!(event.reason.as_deref(), Some("timeout"));
+                assert!(ledger_event_matches_profile_scope(
+                    &entry.event,
+                    Some("alpha")
+                ));
+                assert!(!ledger_event_matches_profile_scope(
+                    &entry.event,
+                    Some("beta")
+                ));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sweep-driven monitor/expired never reached the owning session's durable stream"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    });
+}
+
 /// #2067 — the `loop/*` and `monitor/*` frames ride the SAME durable dispatch
 /// as the goal frames (`record_autonomy_rpc_evidence` ->
 /// `send_notification_durable`) and carry the same class of tenant text (loop
@@ -17793,6 +18222,17 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
             line_count: Some(1),
             fired_at_ms: Some(0),
         }));
+    let expired = UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(
+        octos_core::ui_protocol::MonitorExpiredEvent {
+            session_id: SessionKey("local:test".into()),
+            profile_id: Some("main".into()),
+            monitor_id: "monitor_01".into(),
+            monitor_state: None,
+            status: Some("expired".into()),
+            expired_at_ms: Some(1),
+            reason: Some("timeout".into()),
+        },
+    ));
 
     // A header-present connection WITHOUT monitor runtime is denied.
     let denied = ConnectionUiFeatures {
@@ -17809,6 +18249,10 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
         !live_event_passes_capability_filter(&fired, denied),
         "monitor/fired must be filtered from a non-negotiating connection"
     );
+    assert!(
+        !live_event_passes_capability_filter(&expired, denied),
+        "monitor/expired must be filtered from a non-negotiating connection"
+    );
 
     // A negotiated connection receives them.
     let negotiated = ConnectionUiFeatures {
@@ -17819,6 +18263,7 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
     };
     assert!(live_event_passes_capability_filter(&updated, negotiated));
     assert!(live_event_passes_capability_filter(&fired, negotiated));
+    assert!(live_event_passes_capability_filter(&expired, negotiated));
 }
 
 /// #1977 blocker 6 — an unknown `mode` in `monitor/create` is a typed
@@ -22549,6 +22994,113 @@ fn ws_connection_for_test(
     (WsConnection::new(tx), rx)
 }
 
+/// The m14 Codex P0 fixture must dual-emit every tool call: the raw durable
+/// notification (suppressed per-connection since #2318) AND the canonical
+/// projection/envelope payload that actually reaches clients. Without the
+/// envelope arm the soak's tool assertions can never fire.
+#[tokio::test]
+async fn m14_codex_tool_call_dual_emits_raw_and_envelope() {
+    let (ws, _rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let workspace = std::env::temp_dir().join(format!(
+        "m14-codex-dual-emit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&workspace).expect("temp workspace");
+    let registry = octos_agent::ToolRegistry::with_builtins(&workspace);
+    let mut ctx = octos_agent::tools::ToolContext::zero();
+    let supervisor = registry.supervisor();
+    ctx.task_supervisor = Some(supervisor);
+    let session_id = SessionKey("local:test".into());
+    let turn_id = TurnId::new();
+    let env = M14CodexToolCallEnv {
+        ws: &ws,
+        ledger: &ledger,
+        registry: &registry,
+        ctx: &ctx,
+        session_id: &session_id,
+        turn_id: &turn_id,
+    };
+
+    let result = m14_codex_tool_call(
+        &env,
+        1,
+        "update_plan",
+        serde_json::json!({
+            "explanation": "dual-emit probe",
+            "plan": [{"step": "one", "status": "pending"}]
+        }),
+        true,
+    )
+    .await
+    .expect("update_plan must succeed");
+
+    assert!(result.success);
+    std::fs::remove_dir_all(&workspace).ok();
+
+    // Direct-sends apply the per-connection capability filter (#1336), so the
+    // raw arm is asserted against the ledger (where legacy connections pick
+    // it up), not against this connection's writer.
+    let replay = ledger
+        .replay_after(
+            &session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .expect("replay after codex tool call");
+    let call_id = format!("m14-codex-p0-1-update_plan-{}", turn_id.0);
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ToolStarted(event))
+                if event.turn_id == turn_id && event.tool_call_id == call_id
+        )),
+        "raw tool/started row must still be durable-appended"
+    );
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ToolCompleted(event))
+                if event.turn_id == turn_id && event.tool_call_id == call_id
+        )),
+        "raw tool/completed row must still be durable-appended"
+    );
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
+                if envelope.envelope.turn_id == turn_id.0.to_string()
+                    && matches!(
+                        &envelope.envelope.payload,
+                        PayloadV2::ToolStart { name, .. }
+                            if name == "update_plan"
+                    )
+        )),
+        "ledger must carry the canonical tool_start envelope"
+    );
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
+                if matches!(
+                    &envelope.envelope.payload,
+                    PayloadV2::ToolEnd {
+                        tool_call_id,
+                        status: octos_core::ui_protocol::EnvelopeToolEndStatus::Complete,
+                        ..
+                    } if tool_call_id == &call_id
+                )
+        )),
+        "ledger must carry the canonical complete tool_end envelope"
+    );
+}
+
 /// #1969 — an interrupted goal/peer turn must charge its partial spend from the
 /// live tracker (the drain loop breaks before the done/error arm folds usage),
 /// while a completed/errored turn keeps the folded total.
@@ -22568,6 +23120,191 @@ fn interrupted_goal_charge_falls_back_to_tracker_only_when_interrupted_with_zero
     assert_eq!(interrupted_goal_charge(false, 0, &tracker), 0);
     // interrupted but a real total was already folded → never override it
     assert_eq!(interrupted_goal_charge(true, 42, &tracker), 42);
+}
+
+// #2483 — the web-client fixture arms dual-emit like Basic: the raw
+// ephemeral is suppressed per-connection (#2318), so the canonical envelope
+// lane in the ledger is what clients (and these tests) assert on.
+fn fixture_ledger_assistant_deltas(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+) -> Vec<String> {
+    ledger
+        .replay_after(
+            session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .expect("replay after fixture turn")
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                match &envelope.envelope.payload {
+                    PayloadV2::AssistantDelta { text, .. } => Some(text.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+// #2483 — the echo fixture's router arm and emitter share this extraction;
+// pin the marker's case-insensitivity and the literal's verbatim form.
+#[test]
+fn m9_fixture_echo_literal_extracts_the_declared_literal() {
+    assert_eq!(
+        m9_fixture_echo_literal("Reply with exactly: ALPHA").as_deref(),
+        Some("ALPHA")
+    );
+    assert_eq!(
+        m9_fixture_echo_literal("reply WITH EXACTLY:  BRAVO ").as_deref(),
+        Some("BRAVO")
+    );
+    // The marker search lowercases a byte-length-preserving copy, so the
+    // slice offset stays valid and non-ASCII content survives verbatim —
+    // on both sides of the marker.
+    assert_eq!(
+        m9_fixture_echo_literal("Reply with exactly: 你好世界").as_deref(),
+        Some("你好世界")
+    );
+    assert_eq!(
+        m9_fixture_echo_literal("列出城市。Reply with exactly: 广州").as_deref(),
+        Some("广州")
+    );
+    assert_eq!(m9_fixture_echo_literal("no marker here"), None);
+    assert_eq!(m9_fixture_echo_literal("Reply with exactly:   "), None);
+}
+
+#[tokio::test]
+async fn echo_literal_fixture_dual_emits_the_declared_literal() {
+    let (ws, _rx) = ws_connection_for_test(32);
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey("local:echo-alpha".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "Reply with exactly: ALPHA".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    // Sender stays alive so the trailing fixture delay completes instead of
+    // reading the closed channel as an interrupt.
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+
+    run_m9_fixture_turn(
+        ws,
+        state,
+        Arc::clone(&ledger),
+        contracts,
+        params,
+        M9ProtocolFixture::EchoLiteral,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+
+    assert_eq!(
+        fixture_ledger_assistant_deltas(&ledger, &session_id),
+        vec!["ALPHA".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn cjk_fixtures_dual_emit_multibyte_content_with_per_line_deltas() {
+    let state = Arc::new(AppState::empty_for_tests());
+    let contracts = Arc::new(UiProtocolContractStores::default());
+
+    let (ws, _rx) = ws_connection_for_test(32);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let session_id = SessionKey("local:cjk-short".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "用中文回复：你好世界。只回复这四个字，不要多说。".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    run_m9_fixture_turn(
+        ws,
+        Arc::clone(&state),
+        Arc::clone(&ledger),
+        Arc::clone(&contracts),
+        params,
+        M9ProtocolFixture::CjkUtf8Short,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+    assert_eq!(
+        fixture_ledger_assistant_deltas(&ledger, &session_id),
+        vec!["你好世界".to_owned()]
+    );
+
+    let (ws, _rx) = ws_connection_for_test(32);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let session_id = SessionKey("local:cjk-long".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "列出5个中国城市的名字，每个城市一行，只要城市名不要其他内容。".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    run_m9_fixture_turn(
+        ws,
+        state,
+        Arc::clone(&ledger),
+        contracts,
+        params,
+        M9ProtocolFixture::CjkUtf8Long,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+    // One delta per line: the client assembles the CJK content across
+    // multiple frames, the multi-delta shape the long-response spec exists
+    // to exercise.
+    assert_eq!(
+        fixture_ledger_assistant_deltas(&ledger, &session_id),
+        vec![
+            "北京\n".to_owned(),
+            "上海\n".to_owned(),
+            "广州\n".to_owned(),
+            "深圳\n".to_owned(),
+            "杭州\n".to_owned(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -34353,6 +35090,7 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
             model: None,
             goal_id: None,
             task_id: None,
+            token_budget: None,
         })
         .unwrap_or_else(|err| panic!("handoff {n} within the cap must stage: {err}"));
         assert_eq!(staged.topic, format!("peer-{}", staged.slug));
@@ -34370,6 +35108,7 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect_err("5th handoff must be rejected");
     assert_eq!(err, "peer handoff limit reached for this turn (4)");
@@ -36211,6 +36950,7 @@ fn peer_originator_recorded_by_handoff_callback() {
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("stage");
     let originator =
@@ -36235,6 +36975,7 @@ fn handoff_request(name: &str, worktree: Option<bool>) -> octos_agent::PeerHando
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     }
 }
 
@@ -36727,6 +37468,7 @@ fn stage_and_open_peer(
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("stage peer")
     .slug;
@@ -37257,6 +37999,7 @@ fn peer_respond_errors_when_peer_not_open() {
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .unwrap()
     .slug;
@@ -37396,6 +38139,7 @@ fn peer_handoff_callback_records_valid_model_lane() {
         model: Some("strong".to_owned()),
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("a valid lane still stages the peer");
 
@@ -37438,6 +38182,7 @@ fn peer_handoff_callback_notes_unknown_model_lane_but_still_stages() {
         model: Some("gpt-mega".to_owned()),
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("an unknown lane warns, it does not fail staging");
 
@@ -37574,6 +38319,7 @@ fn zai_lane_peer_handoff_hit_records_and_resolves_zai_glm52() {
         model: Some("zai".to_owned()),
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("a configured zai lane still stages the peer");
 
@@ -37661,6 +38407,7 @@ fn zai_lane_peer_handoff_miss_warns_and_falls_back_to_primary() {
         model: Some("zai".to_owned()),
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("an unknown zai lane warns, it does not fail staging");
 
@@ -38357,6 +39104,7 @@ async fn peer_prepare_stages_brief_and_worktree() {
         &request(json!({
             "brief": "Second lane.",
             "title": "CI Fix",
+            "token_budget": 250_000,
             "cwd": repo.to_string_lossy(),
             "profile_id": "dev",
         })),
@@ -38365,6 +39113,16 @@ async fn peer_prepare_stages_brief_and_worktree() {
     .await
     .expect("second prepare");
     assert_eq!(result2["slug"], "ci-fix-2");
+    assert_eq!(result2["token_budget"], 250_000);
+    assert_eq!(
+        peer_token_budget_status(&data_dir.join("peers"), "ci-fix-2")
+            .unwrap()
+            .unwrap(),
+        PeerTokenBudgetStatus {
+            limit: 250_000,
+            used: 0,
+        }
+    );
     assert!(result2["worktree_branch"].is_null());
     assert_eq!(
         std::path::PathBuf::from(result2["cwd"].as_str().unwrap()),
@@ -38408,6 +39166,20 @@ async fn peer_prepare_stages_brief_and_worktree() {
         retry["slug"], "no-repo",
         "slug released after the failed stage"
     );
+
+    let zero_budget = raw_peer_prepare(
+        &state,
+        &request(json!({
+            "brief": "Invalid budget.",
+            "token_budget": 0,
+            "cwd": repo.to_string_lossy(),
+            "profile_id": "dev",
+        })),
+        None,
+    )
+    .await
+    .expect_err("zero token budget is not runnable");
+    assert!(zero_budget.message.contains("positive integer"));
 
     // Validation: empty and oversized briefs are refused up front.
     let empty = raw_peer_prepare(
@@ -39523,7 +40295,10 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
         None,
         ConnectionUiFeatures::stdio_defaults(),
         "list-busy-flag".into(),
-        SessionListParams { cwd: None },
+        SessionListParams {
+            cwd: None,
+            profile_id: None,
+        },
     )
     .await;
     let frame = recv_rpc_response_with_id(&mut rx, "list-busy-flag").await;
@@ -44359,6 +45134,231 @@ async fn should_withhold_not_running_for_a_topic_turn_asked_by_its_folded_id() {
     }
 }
 
+/// A scripted model that keeps calling `read_file`, driving a REAL
+/// profile-capped serve session (`max_iterations = 2`) to its budget stop.
+/// #2359: the granted grace call must reach the model tools-disabled and its
+/// synthesis — not the canned budget-stop message — is what the session
+/// history ends with.
+#[tokio::test]
+async fn should_end_a_capped_serve_turn_with_the_tools_disabled_grace_synthesis() {
+    struct ScriptedToolCaller {
+        marker_a: String,
+        marker_b: String,
+        requests: Arc<StdMutex<Vec<Vec<octos_llm::ToolSpec>>>>,
+    }
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for ScriptedToolCaller {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            let mut requests = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+            requests.push(tools.to_vec());
+            let index = requests.len() - 1;
+            drop(requests);
+            let (content, tool_calls, stop_reason) = match index {
+                0 => (
+                    None,
+                    vec![octos_core::ToolCall {
+                        id: "grace-e2e-read-a".into(),
+                        name: "read_file".into(),
+                        arguments: json!({ "path": self.marker_a }),
+                        metadata: None,
+                    }],
+                    octos_llm::StopReason::ToolUse,
+                ),
+                1 => (
+                    None,
+                    vec![octos_core::ToolCall {
+                        id: "grace-e2e-read-b".into(),
+                        name: "read_file".into(),
+                        arguments: json!({ "path": self.marker_b }),
+                        metadata: None,
+                    }],
+                    octos_llm::StopReason::ToolUse,
+                ),
+                _ => (
+                    Some(
+                        "GRACE SYNTHESIS: both markers read and summarized; nothing remains."
+                            .into(),
+                    ),
+                    Vec::new(),
+                    octos_llm::StopReason::EndTurn,
+                ),
+            };
+            Ok(octos_llm::ChatResponse {
+                content,
+                reasoning_content: None,
+                tool_calls,
+                stop_reason,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "serve-grace-scripted"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = SessionKey::new("api", "grace-e2e-serve");
+    // The no-hint session workspace (`resolve_workspace_root`): it must exist
+    // BEFORE the session boots so the scope canonicalizes it and the file
+    // tools accept reads inside (the raw-vs-canonical no-hint trap).
+    let workspace = temp
+        .path()
+        .join("profiles")
+        .join(MAIN_PROFILE_ID)
+        .join("data")
+        .join("users")
+        .join(octos_bus::session::encode_path_component(
+            session_id.base_key(),
+        ))
+        .join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // Substantive bodies (>=128 chars, see `is_productive_tool_message`) so
+    // both reads count as productive and the grace call is granted.
+    let marker_body = "GRACE MARKER BODY: the abstract, the method section and the evaluation, \
+long enough to be a substantive tool result rather than a short diagnostic string.";
+    let marker_a = workspace.join("grace-marker-a.txt");
+    let marker_b = workspace.join("grace-marker-b.txt");
+    std::fs::write(&marker_a, format!("{marker_body}\nmarker: A")).unwrap();
+    std::fs::write(&marker_b, format!("{marker_body}\nmarker: B")).unwrap();
+
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedToolCaller {
+        marker_a: marker_a.display().to_string(),
+        marker_b: marker_b.display().to_string(),
+        requests: requests.clone(),
+    });
+    // NOTE: the runtime Arc is dropped here so the mutation below can take
+    // the profile's last reference via `Arc::get_mut`.
+    let (mut state, _) = state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider).await;
+    let runtime = Arc::get_mut(&mut state)
+        .unwrap()
+        .profiles
+        .get_mut(MAIN_PROFILE_ID)
+        .expect("main profile runtime");
+    Arc::get_mut(runtime).unwrap().max_iterations = Some(2);
+
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &session_id)
+        .await
+        .expect("session manager for the test profile");
+    sessions.lock().await.get_or_create(&session_id).await;
+
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(128));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(256);
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "grace-e2e".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: TurnId::new(),
+            input: vec![InputItem::Text {
+                text: "read both markers".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+        },
+    )
+    .await;
+    let response = recv_rpc_response_with_id(&mut rx, "grace-e2e").await;
+    assert!(
+        response.get("result").is_some(),
+        "the capped turn must be accepted: {response}"
+    );
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        loop {
+            let frame = recv_rpc_json(&mut rx).await;
+            let m = frame.get("method").and_then(Value::as_str);
+            let is_v2_terminal = m == Some("projection/envelope")
+                && frame
+                    .get("params")
+                    .and_then(|p| p.get("payload"))
+                    .and_then(|p| p.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("turn_terminal");
+            if m == Some("turn/completed") || m == Some("turn/error") || is_v2_terminal {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the capped turn must settle");
+
+    let synthesis = "GRACE SYNTHESIS: both markers read and summarized; nothing remains.";
+    let deadline = std::time::Instant::now() + waiting_budget(Duration::from_secs(10));
+    let final_text = loop {
+        let mut sessions_guard = sessions.lock().await;
+        let session = sessions_guard.get_or_create(&session_id).await;
+        if let Some(message) = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant && m.content.contains(synthesis))
+        {
+            break message.content.clone();
+        }
+        drop(sessions_guard);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the grace synthesis never reached the session history; got: {:?}",
+            {
+                let mut sessions_guard = sessions.lock().await;
+                let session = sessions_guard.get_or_create(&session_id).await;
+                session
+                    .messages
+                    .iter()
+                    .map(|m| (m.role.as_str().to_string(), m.content.clone()))
+                    .collect::<Vec<_>>()
+            }
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        !final_text.contains("did not complete within"),
+        "the canned budget-stop message must not be the session's final answer: {final_text}"
+    );
+    let requests = requests.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(
+        requests.len(),
+        3,
+        "two tool rounds plus the grace call, nothing after it"
+    );
+    assert!(
+        requests.iter().take(2).all(|tools| !tools.is_empty()),
+        "the action iterations still carry the full tool slice"
+    );
+    assert!(
+        requests[2].is_empty(),
+        "the grace call must reach the model tools-disabled"
+    );
+}
+
 // --- session keep-alive: an open Session must not age out of the runtime
 // cache under a client that is simply reading (see
 // APPUI_SESSION_KEEPALIVE_INTERVAL).
@@ -44420,4 +45420,62 @@ fn should_keep_renewing_open_sessions_on_every_interval() {
         }
     }
     assert_eq!(renewals, 24, "one renewal per interval, no drift");
+}
+
+/// A file the agent delivers (`send_file`) must be downloadable by the
+/// browser. `/api/files` only serves paths under the tenant's data dir, so a
+/// delivery from an approved external project folder —
+/// `new-octos/editable-singlepanel-3p/_build/p20-art.png` — was `403 access
+/// denied` on every download: 56 "sent" files across three real web sessions,
+/// none reachable. The transcript keeps the original path (what a local client
+/// shows); a tenant-owned copy is stored where `/api/files` looks it up.
+#[tokio::test]
+async fn should_store_a_download_copy_of_a_delivered_file_and_keep_its_original_path() {
+    let tenant = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    // Per-project session store, as `appui.sessions_in_cwd` lays it out.
+    let store_dir = project.path().join(".octos").join("dev");
+    let sessions = Arc::new(TokioMutex::new(
+        octos_bus::SessionManager::open(&store_dir).unwrap(),
+    ));
+    let key = SessionKey::with_profile("dev", "api", "web-send-file");
+    let file = project.path().join("p20-art.png");
+    std::fs::write(&file, b"png").unwrap();
+    let raw = file.to_string_lossy().into_owned();
+    let copy = octos_bus::session_artifacts::delivered_copy_path(tenant.path(), &key, &raw);
+    assert!(!copy.exists(), "precondition: no download copy yet");
+
+    // Exactly what `SendFileTool` puts on the per-turn channel.
+    let sent = octos_core::OutboundMessage {
+        channel: "api".to_string(),
+        chat_id: key.0.clone(),
+        content: "P20 map".to_string(),
+        reply_to: None,
+        media: vec![raw.clone()],
+        metadata: serde_json::json!({}),
+    };
+    let (message, _) =
+        persist_send_file_delivery(&sessions, &store_dir, tenant.path(), &key, "thread-1", sent)
+            .await
+            .expect("the delivery must persist");
+
+    assert_eq!(
+        message.media,
+        vec![raw.clone()],
+        "the original path is recorded"
+    );
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        b"png",
+        "the download copy is stored where /api/files looks"
+    );
+    let reread = octos_bus::SessionManager::open(&store_dir)
+        .unwrap()
+        .load(&key)
+        .await
+        .expect("session exists");
+    assert_eq!(
+        reread.messages.last().map(|m| m.media.clone()),
+        Some(vec![raw])
+    );
 }

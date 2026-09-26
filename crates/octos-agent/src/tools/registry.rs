@@ -9,6 +9,7 @@ use eyre::Result;
 use octos_llm::ToolSpec;
 
 use crate::policy::EffectivePermissions;
+use crate::policy::FilesystemScope;
 use crate::task_supervisor::TaskSupervisor;
 
 #[cfg(feature = "ast")]
@@ -127,6 +128,12 @@ fn estimate_json_size(value: &serde_json::Value) -> usize {
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     workspace_root: Option<PathBuf>,
+    /// The filesystem reach the cwd-bound tools were registered with. The
+    /// request build reads this (#2480) so media paths are only re-walked
+    /// against the workspace root when the tool-time validation also walked
+    /// them — a Host-scope read never got the ancestor walk and must not be
+    /// held to it at render.
+    filesystem_scope: FilesystemScope,
     /// Provider-specific policy that filters specs() output without removing tools.
     provider_policy: Option<ToolPolicy>,
     /// Context-based tag filter: only tools with matching tags appear in specs().
@@ -253,6 +260,7 @@ impl ToolRegistry {
             output_dir_hint: None,
             tool_timeout_secs: DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS,
             internal_hidden: HashSet::new(),
+            filesystem_scope: FilesystemScope::Workspace,
             // #1607: default to a no-op sandbox. Constructors that receive a
             // real sandbox (`with_builtins_and_permissions`,
             // `rebind_cwd_with_permissions`) overwrite this below.
@@ -445,6 +453,13 @@ impl ToolRegistry {
     /// Root workspace path associated with this registry, if any.
     pub fn workspace_root(&self) -> Option<&Path> {
         self.workspace_root.as_deref()
+    }
+
+    /// The filesystem reach the cwd-bound tools were registered with. The
+    /// request build consults this (#2480): media paths are re-walked only
+    /// when the tool-time validation walked them too.
+    pub fn filesystem_scope(&self) -> FilesystemScope {
+        self.filesystem_scope
     }
 
     /// Record a workspace cwd on this registry without re-creating the
@@ -1022,6 +1037,7 @@ impl ToolRegistry {
             // the original registry drops. Cheap — one Arc per server.
             mcp_services: self.mcp_services.clone(),
             workspace_root: self.workspace_root.clone(),
+            filesystem_scope: self.filesystem_scope,
             provider_policy: self.provider_policy.clone(),
             context_filter: self.context_filter.clone(),
             active_context: self.active_context.clone(),
@@ -1265,6 +1281,7 @@ impl ToolRegistry {
         // `Self::sandbox`). Kept in lockstep with the shell/exec/bash tools
         // registered just below.
         registry.sandbox = sandbox.clone();
+        registry.filesystem_scope = permissions.filesystem_scope;
         registry.register(
             ShellTool::new(cwd)
                 .with_shared_sandbox(sandbox.clone())
@@ -1502,6 +1519,7 @@ impl ToolRegistry {
         // validator path confines command validators to the same sandbox as
         // the shell/exec/bash tools re-registered just below.
         registry.sandbox = sandbox.clone();
+        registry.filesystem_scope = permissions.filesystem_scope;
         // Re-register cwd-bound tools with the new workspace
         registry.register(
             ShellTool::new(cwd)

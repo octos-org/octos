@@ -525,6 +525,9 @@ impl OpenAIProvider {
         let mut content_hints = self.hints.clone();
         content_hints.lacks_vision = content_hints.lacks_vision || force_text_only;
         content_hints.lacks_video = content_hints.lacks_video || force_text_only || force_no_video;
+        // #2480: re-run the tool's symlink-ancestor walk at request build for
+        // media paths inside the validated workspace.
+        let scope_root = config.media_scope_root.as_deref();
         let mut openai_messages: Vec<OpenAIMessage> = Vec::with_capacity(messages.len() + 1);
         // Media a tool in the current batch handed the model. The chat
         // completions protocol takes no media in a tool message, so it goes
@@ -598,7 +601,7 @@ impl OpenAIProvider {
                 None
             };
 
-            let mut content = build_openai_content(m, &content_hints);
+            let mut content = build_openai_content(m, &content_hints, scope_root);
             if m.role == MessageRole::Tool {
                 let shown = crate::tool_media::for_tool_row(
                     messages,
@@ -612,7 +615,7 @@ impl OpenAIProvider {
                 let call = m.tool_call_id.as_deref().unwrap_or("unknown");
                 let mut rendered = Vec::new();
                 for path in &shown.images {
-                    match vision::encode_image(path) {
+                    match vision::encode_image(path, scope_root) {
                         Ok((mime, data)) => {
                             pending_media.push(OpenAIContentPart::ImageUrl {
                                 image_url: OpenAIImageUrl {
@@ -628,7 +631,7 @@ impl OpenAIProvider {
                     }
                 }
                 for path in &shown.videos {
-                    match vision::encode_video(path) {
+                    match vision::encode_video(path, scope_root) {
                         Ok((mime, data)) => {
                             pending_media.push(OpenAIContentPart::VideoUrl {
                                 video_url: OpenAIVideoUrl {
@@ -1368,7 +1371,11 @@ fn is_video_modality_error(body: &str) -> bool {
             && (b.contains("not support") || b.contains("modal") || b.contains("unsupported")))
 }
 
-fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIContent> {
+fn build_openai_content(
+    msg: &Message,
+    hints: &ModelHints,
+    scope_root: Option<&std::path::Path>,
+) -> Option<OpenAIContent> {
     // Only inline images on USER messages. Tool outputs (Assistant/Tool
     // role with `media`) are previous-turn artifacts the agent emitted —
     // e.g. `send_file(skill-output/slides/<slug>/output/slide-NN.png)` —
@@ -1492,7 +1499,7 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
 
     let mut parts = Vec::new();
     for path in images {
-        if let Ok((mime, data)) = vision::encode_image(path) {
+        if let Ok((mime, data)) = vision::encode_image(path, scope_root) {
             parts.push(OpenAIContentPart::ImageUrl {
                 image_url: OpenAIImageUrl {
                     url: format!("data:{mime};base64,{data}"),
@@ -1501,7 +1508,7 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
         }
     }
     for path in videos {
-        if let Ok((mime, data)) = vision::encode_video(path) {
+        if let Ok((mime, data)) = vision::encode_video(path, scope_root) {
             parts.push(OpenAIContentPart::VideoUrl {
                 video_url: OpenAIVideoUrl {
                     url: format!("data:{mime};base64,{data}"),
@@ -2786,7 +2793,7 @@ mod tests {
         let mut assistant = msg("I delivered the deck.");
         assistant.role = MessageRole::Assistant;
         assistant.media = vec!["skill-output/slides/deck/output/slide-01.png".to_string()];
-        let content = build_openai_content(&assistant, &hints)
+        let content = build_openai_content(&assistant, &hints, None)
             .expect("assistant content should still be built");
         match content {
             OpenAIContent::Text(text) => {
@@ -3012,6 +3019,83 @@ mod tests {
         tool.tool_call_id = Some("call_2".into());
         msgs.push(tool);
         msgs
+    }
+
+    /// #2480 end to end: a tool validated `project/img.png` inside the
+    /// workspace, then a background writer swapped `project` for a symlink
+    /// to elsewhere before the request was built. The request body is the
+    /// last stop before the bytes leave the machine — it must carry the
+    /// validated image on the untouched layout and never the swapped one.
+    #[cfg(unix)]
+    #[test]
+    fn build_request_never_ships_bytes_behind_a_swapped_symlink_ancestor() {
+        let ws = tempfile::tempdir().unwrap();
+        let secret = tempfile::tempdir().unwrap();
+        let project = ws.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let legit_path = project.join("img.png");
+        let legit_bytes: Vec<u8> =
+            [b"\x89PNG\r\n\x1a\n".as_slice(), b"the-real-screenshot"].concat();
+        std::fs::write(&legit_path, &legit_bytes).unwrap();
+        let payload_path = secret.path().join("img.png");
+        let payload_bytes: Vec<u8> =
+            [b"\x89PNG\r\n\x1a\n".as_slice(), b"swapped-private-bytes"].concat();
+        std::fs::write(&payload_path, &payload_bytes).unwrap();
+
+        let b64 = |bytes: &[u8]| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_1".into(),
+            name: "view_image".into(),
+            arguments: serde_json::json!({"path": "img.png"}),
+            metadata: None,
+        }]);
+        let mut tool = mk(MessageRole::Tool, "{\"format\":\"png\"}");
+        tool.tool_call_id = Some("call_1".into());
+        tool.media = vec![legit_path.to_string_lossy().into_owned()];
+        let msgs = vec![mk(MessageRole::User, "look"), assistant, tool];
+
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let cfg = ChatConfig {
+            media_scope_root: Some(ws.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        // Untouched layout: the validated image ships.
+        let body = serde_json::to_string(&p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert!(
+            body.contains(&b64(&legit_bytes)),
+            "validated image ships: {body}"
+        );
+
+        // The swap: `project` now points at the secret directory.
+        std::fs::remove_dir_all(&project).unwrap();
+        std::os::unix::fs::symlink(secret.path(), &project).unwrap();
+        let body = serde_json::to_string(&p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert!(
+            !body.contains(&b64(&payload_bytes)),
+            "swapped bytes must never leave the machine: {body}"
+        );
+        assert!(
+            body.contains("could not be read"),
+            "the model is told the media went away: {body}"
+        );
     }
 
     #[test]

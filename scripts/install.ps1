@@ -164,6 +164,35 @@ function Test-Command($cmd) {
     $null -ne (Get-Command $cmd -ErrorAction SilentlyContinue)
 }
 
+# Verify a downloaded bundle against its `.sha256` sidecar — the standard
+# `sha256sum` line that bundle-release.sh publishes next to every asset
+# (#2514). A mismatch aborts the install; a missing or unparseable sidecar
+# (pre-rc.12 releases, air-gapped mirrors, mirrors that answer 200 with an
+# error page) only warns — there is nothing published to verify against.
+function Test-BundleChecksum([string]$ZipPath, [string]$SidecarPath) {
+    $name = Split-Path -Leaf $ZipPath
+    if (-not (Test-Path $SidecarPath)) {
+        Warn "no $name.sha256 sidecar found — skipping checksum verification"
+        return
+    }
+    # Must parse as a sha256sum line ("<64-hex>  <filename>"). A 0-byte
+    # sidecar yields a null first line — guard that explicitly rather than
+    # relying on how the match operators treat a null LHS.
+    $firstLine = Get-Content $SidecarPath -TotalCount 1
+    if ([string]::IsNullOrEmpty($firstLine) -or $firstLine -notmatch '^[0-9a-fA-F]{64}\s+') {
+        Warn "malformed $name.sha256 sidecar — skipping checksum verification"
+        return
+    }
+    $expectedHash = ($firstLine.Trim() -split '\s+')[0]
+    # -ne is case-insensitive, so either hash case verifies — same as GNU
+    # sha256sum -c and macOS shasum -c (both accept uppercase hex).
+    $actualHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash
+    if ($actualHash -ne $expectedHash) {
+        Err "Checksum MISMATCH for $name — the download does not match the published checksum. Refusing to install."
+    }
+    Ok "checksum verified: $name"
+}
+
 # Validate a value against a regex pattern; exit on mismatch.
 function Validate($name, $value, $pattern) {
     if ($value -and $value -notmatch "^${pattern}$") {
@@ -1069,10 +1098,22 @@ try {
         } catch {
             Err "Download failed. Check that release $Version has a binary for $Triple."
         }
+        # -ErrorAction Stop keeps a 404 (pre-rc.12 release) from writing an
+        # error page into the sidecar that would fail verification below.
+        try {
+            Invoke-WebRequest -Uri "$DownloadUrl.sha256" -OutFile "$zipPath.sha256" -UseBasicParsing -ErrorAction Stop
+        } catch {
+            Remove-Item "$zipPath.sha256" -ErrorAction SilentlyContinue
+        }
     } else {
         Write-Host "    Copying from $localPath..."
         Copy-Item $localPath $zipPath
+        if (Test-Path "$localPath.sha256") {
+            Copy-Item "$localPath.sha256" "$zipPath.sha256"
+        }
     }
+
+    Test-BundleChecksum $zipPath "$zipPath.sha256"
 
     # Extract
     $extractDir = Join-Path $installTmp "extracted"
@@ -1275,13 +1316,42 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero)
 
-# Build a wrapper script that sets env vars and launches octos serve
+# The bearer token must not be embedded in the wrapper (#2388): the
+# launcher lives in OCTOS_HOME, which keeps profile ACLs when left at its
+# default but is world-readable the moment an operator points OCTOS_HOME
+# elsewhere. Keep the token in a sibling file restricted to the invoking
+# user + SYSTEM/Administrators (SIDs, not localized group names): lock
+# down the empty file FIRST, then write into it, so no world-readable
+# copy ever exists on disk.
+$tokenPath = Join-Path $DataDir "serve-token"
+$tokenTmp = "$tokenPath.tmp"
+[System.IO.File]::WriteAllText($tokenTmp, "", [System.Text.UTF8Encoding]::new($false))
+icacls $tokenTmp /inheritance:r /grant:r "${env:USERNAME}:F" "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Remove-Item $tokenTmp -ErrorAction SilentlyContinue
+    Err "failed to restrict ACLs on $tokenPath"
+}
+[System.IO.File]::WriteAllText($tokenTmp, $AuthToken, [System.Text.UTF8Encoding]::new($false))
+try {
+    Move-Item -Force $tokenTmp $tokenPath
+} finally {
+    Remove-Item $tokenTmp -ErrorAction SilentlyContinue
+}
+
+# Build a wrapper script that sets env vars and launches octos serve.
+# The token is read from the ACL-restricted sibling file at launch time,
+# never written inline; a missing file refuses to start rather than run
+# with an empty token.
 $wrapperPath = Join-Path $DataDir "serve-launcher.cmd"
 $wrapperContent = @"
 @echo off
 set "OCTOS_HOME=$DataDir"
 set "OCTOS_DATA_DIR=$DataDir"
-set "OCTOS_AUTH_TOKEN=$AuthToken"
+set /p OCTOS_AUTH_TOKEN=<"$DataDir\serve-token"
+if not defined OCTOS_AUTH_TOKEN (
+    echo [octos] serve-token file missing or empty; re-run install.ps1 >> "$serveLog"
+    exit /b 1
+)
 "$octosBin" serve --port $Port --host 0.0.0.0 >> "$serveLog" 2>&1
 "@
 [System.IO.File]::WriteAllText($wrapperPath, $wrapperContent, [System.Text.UTF8Encoding]::new($false))
