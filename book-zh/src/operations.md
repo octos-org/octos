@@ -231,3 +231,11 @@ sudo systemctl enable octos-serve
 sudo systemctl status octos-serve
 sudo journalctl -u octos-serve -f
 ```
+
+### 通过 `server/shutdown` 停止（本地 solo）
+
+服务器有三种停止方式：前台运行 `octos serve` 的终端里按 Ctrl+C、平台服务管理器（上文的 launchd / systemd），以及此处介绍的 UI Protocol 方法 `server/shutdown`。
+
+UI Protocol 客户端可以通过已认证的 WebSocket（`/api/ui-protocol/ws`）调用 `server/shutdown` 方法停止服务器。它的效果与 Ctrl+C 完全一致：连接排空、网关停止、进程退出。该调用是幂等的，停止动作在请求被处理后约 250 ms 触发，确认通常仍能赶在排空前送达客户端（出站背压下客户端可能错过确认，但停止照常发生）。
+
+该方法只在**本地部署**（`config.mode = "local"`）且开启 solo 登录（`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`）时被接受，且仅限 HTTP serve（不带 `--stdio` 的 `octos serve`）。一次调用会停止整个进程，所有已连接客户端一起下线，其运行中的轮次一并取消。fleet/托管服务器与 `--stdio` serve 会以 `invalid_request`（-32600）携带 `data.kind: "server_shutdown_unavailable"` 拒绝该调用，什么都不停；session 级（session-ingress）连接则完全无法调用，只会收到不带 kind 的裸 `invalid_request`。注意本地 solo 的信任模型：solo serve 上，任何能打开 WebSocket 的本地进程——或白名单来源页面——都能停止服务器。
