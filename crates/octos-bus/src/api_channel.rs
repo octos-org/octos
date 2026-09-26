@@ -452,120 +452,12 @@ impl ApiChannel {
             .subscribe()
     }
 
-    fn session_workspace_dir(data_dir: &Path, key: &SessionKey) -> PathBuf {
-        let encoded = crate::session::encode_path_component(key.base_key());
-        data_dir.join("users").join(encoded).join("workspace")
-    }
-
     fn session_artifact_dir(data_dir: &Path, key: &SessionKey) -> PathBuf {
-        Self::session_workspace_dir(data_dir, key).join(".artifacts")
-    }
-
-    fn sanitize_artifact_name(path: &Path) -> String {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "artifact".to_string());
-        name.replace(['/', '\\', '\0'], "_")
-    }
-
-    fn find_matching_artifact_copy(
-        artifact_dir: &Path,
-        source: &Path,
-        safe_name: &str,
-    ) -> Option<PathBuf> {
-        let source_meta = std::fs::metadata(source).ok()?;
-        let source_len = source_meta.len();
-        let source_bytes = std::fs::read(source).ok()?;
-
-        std::fs::read_dir(artifact_dir)
-            .ok()?
-            .filter_map(|entry| entry.ok().map(|item| item.path()))
-            .find(|candidate| {
-                if !candidate.is_file() {
-                    return false;
-                }
-                let Some(name) = candidate.file_name().and_then(|value| value.to_str()) else {
-                    return false;
-                };
-                if name != safe_name && !name.ends_with(&format!("-{safe_name}")) {
-                    return false;
-                }
-                let Ok(candidate_meta) = std::fs::metadata(candidate) else {
-                    return false;
-                };
-                if candidate_meta.len() != source_len {
-                    return false;
-                }
-                std::fs::read(candidate)
-                    .map(|bytes| bytes == source_bytes)
-                    .unwrap_or(false)
-            })
+        crate::session_artifacts::session_artifact_dir(data_dir, key)
     }
 
     fn copy_media_into_session_artifacts(artifact_dir: &Path, media: &[String]) -> Vec<String> {
-        if let Err(error) = std::fs::create_dir_all(artifact_dir) {
-            warn!(
-                path = %artifact_dir.display(),
-                %error,
-                "failed to create session artifact directory"
-            );
-            return media.to_vec();
-        }
-
-        let canonical_artifact_dir =
-            std::fs::canonicalize(artifact_dir).unwrap_or_else(|_| artifact_dir.to_path_buf());
-
-        media
-            .iter()
-            .map(|raw| {
-                let source_path = PathBuf::from(raw);
-                if source_path.starts_with(&canonical_artifact_dir) {
-                    return raw.clone();
-                }
-
-                let canonical_source = match std::fs::canonicalize(&source_path) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        warn!(path = %raw, %error, "failed to canonicalize media source");
-                        return raw.clone();
-                    }
-                };
-
-                if canonical_source.starts_with(&canonical_artifact_dir) {
-                    return canonical_source.to_string_lossy().to_string();
-                }
-
-                let safe_name = Self::sanitize_artifact_name(&canonical_source);
-                if let Some(existing) = Self::find_matching_artifact_copy(
-                    &canonical_artifact_dir,
-                    &canonical_source,
-                    &safe_name,
-                ) {
-                    return existing.to_string_lossy().to_string();
-                }
-                let dest =
-                    canonical_artifact_dir.join(format!("{}-{safe_name}", uuid::Uuid::now_v7()));
-
-                if canonical_source == dest {
-                    return canonical_source.to_string_lossy().to_string();
-                }
-
-                match std::fs::copy(&canonical_source, &dest) {
-                    Ok(_) => dest.to_string_lossy().to_string(),
-                    Err(error) => {
-                        warn!(
-                            source = %canonical_source.display(),
-                            dest = %dest.display(),
-                            %error,
-                            "failed to materialize media into session artifacts"
-                        );
-                        raw.clone()
-                    }
-                }
-            })
-            .collect()
+        crate::session_artifacts::copy_into_artifact_dir(artifact_dir, media)
     }
 
     async fn materialize_media_for_session(
