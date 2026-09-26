@@ -13,6 +13,7 @@ pub mod markdown_html;
 pub mod media;
 pub mod resume_policy;
 pub mod session;
+pub mod session_artifacts;
 
 #[cfg(feature = "api")]
 pub mod api_channel;

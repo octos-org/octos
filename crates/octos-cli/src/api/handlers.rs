@@ -124,6 +124,29 @@ fn resolve_within_workspace(
     (candidate.is_file() && candidate.starts_with(&canon_ws)).then_some(candidate)
 }
 
+/// A file the agent delivered in `session_id` from outside the tenant root is
+/// served from the copy stored at delivery time under the caller's own
+/// profile root (`octos_bus::session_artifacts`). The copy existing is the
+/// proof the agent delivered exactly `request_path` in that session; the
+/// lookup never leaves `profile_root`, and the external file is never read.
+fn resolve_delivered_copy(
+    profile_root: &std::path::Path,
+    session_id: &str,
+    request_path: &str,
+) -> Option<std::path::PathBuf> {
+    if session_id.is_empty() || request_path.is_empty() {
+        return None;
+    }
+    let copy = octos_bus::session_artifacts::delivered_copy_path(
+        profile_root,
+        &octos_core::SessionKey(session_id.to_string()),
+        request_path,
+    );
+    let canonical = std::fs::canonicalize(copy).ok()?;
+    let root = std::fs::canonicalize(profile_root).ok()?;
+    (canonical.is_file() && canonical.starts_with(root)).then_some(canonical)
+}
+
 /// Resolve the workspace root for a download request's owning session, matching
 /// EXACTLY where the turn materialized uploads (#1377). `data_dir` is the
 /// authenticated caller's profile/tenant root, so this only reaches that
@@ -2310,13 +2333,29 @@ pub async fn serve_file_by_query(
     let session_ws = params.get("session").and_then(|s| {
         resolve_session_workspace_root(&state, &data_dir, auth_profile.as_deref(), s)
     });
+    let delivered = delivered_copy_for_request(&state, auth_profile.as_deref(), &params, filename);
     serve_file_impl(
         &data_dir,
         filename,
         auth_profile.as_deref(),
         session_ws.as_deref(),
+        delivered,
     )
     .await
+}
+
+/// The stored copy of a file the agent delivered in the request's `session`,
+/// looked up under the requester's own profile data dir — the root the
+/// session's runtime stored it under.
+fn delivered_copy_for_request(
+    state: &AppState,
+    auth_profile: Option<&str>,
+    params: &std::collections::HashMap<String, String>,
+    filename: &str,
+) -> Option<std::path::PathBuf> {
+    let session_id = params.get("session")?;
+    let profile_root = resolve_profile_data_dir_by_id(state, auth_profile?).ok()?;
+    resolve_delivered_copy(&profile_root, session_id, filename)
 }
 
 /// GET /api/files/:filename -- serve uploaded files and pipeline report files.
@@ -2336,11 +2375,13 @@ pub async fn serve_file(
     let session_ws = params.get("session").and_then(|s| {
         resolve_session_workspace_root(&state, &data_dir, auth_profile.as_deref(), s)
     });
+    let delivered = delivered_copy_for_request(&state, auth_profile.as_deref(), &params, &filename);
     serve_file_impl(
         &data_dir,
         &filename,
         auth_profile.as_deref(),
         session_ws.as_deref(),
+        delivered,
     )
     .await
 }
@@ -2383,9 +2424,11 @@ async fn serve_file_impl(
     filename: &str,
     auth_profile: Option<&str>,
     session_workspace: Option<&std::path::Path>,
+    delivered_copy: Option<std::path::PathBuf>,
 ) -> Response {
     let Some(path) =
         resolve_scoped_download_path(data_dir, filename, auth_profile, session_workspace)
+            .or(delivered_copy)
     else {
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     };
@@ -5449,6 +5492,47 @@ mod tests {
             resolve_scoped_download_path(current.path(), &other_file.to_string_lossy(), None, None)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn should_serve_a_delivered_file_only_through_its_sessions_stored_copy() {
+        // A file the agent delivered from an external project folder is not
+        // under the tenant root, so the plain rules refuse it; the copy stored
+        // at delivery time is what `/api/files` serves for that session.
+        let profile_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("p20-art.png");
+        std::fs::write(&file, b"png").unwrap();
+        let raw = file.to_string_lossy().into_owned();
+        let session = "dev:api:web-6acb";
+        let key = octos_core::SessionKey(session.to_string());
+        assert!(
+            resolve_scoped_download_path(profile_root.path(), &raw, Some("dev"), None).is_none(),
+            "precondition: the external file itself is refused"
+        );
+        assert!(
+            resolve_delivered_copy(profile_root.path(), session, &raw).is_none(),
+            "nothing is served before the agent delivers it"
+        );
+
+        octos_bus::session_artifacts::store_delivered_copies(
+            profile_root.path(),
+            &key,
+            std::slice::from_ref(&raw),
+        );
+
+        let served = resolve_delivered_copy(profile_root.path(), session, &raw)
+            .expect("the delivered copy is served");
+        assert_eq!(std::fs::read(served).unwrap(), b"png");
+        // Only for the session it was delivered in, and only that exact path.
+        assert!(resolve_delivered_copy(profile_root.path(), "dev:api:web-other", &raw).is_none());
+        let sibling = project
+            .path()
+            .join("secret.png")
+            .to_string_lossy()
+            .into_owned();
+        assert!(resolve_delivered_copy(profile_root.path(), session, &sibling).is_none());
+        assert!(resolve_delivered_copy(profile_root.path(), "", &raw).is_none());
     }
 
     #[test]
