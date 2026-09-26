@@ -209,7 +209,7 @@ def check(
     # feature gates and message fragments, which the shape excludes.
     method_shape = re.compile(r"^[a-z][a-z0-9_]*(?:/[a-z0-9_.]+)+$")
     warnings = [
-        f"{inventory_name}: code constant `{name}` is in no pinned method list; "
+        f"{DEFAULT_CORE}: code constant `{name}` is in no pinned method list; "
         "if it ships on the wire, the inventory cannot see it — extend "
         "UI_PROTOCOL_NOTIFICATION_METHODS/UI_PROTOCOL_COMMAND_METHODS first"
         for name in sorted(
