@@ -39,7 +39,9 @@ octos-swarm = { workspace = true }
 octos-plugin = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
-clap_complete = { workspace = true }
+# unstable-dynamic: `CompleteEnv` in main answers COMPLETE=<shell> callbacks so
+# sourced scripts get live completions (#2413). No-op unless that env is set.
+clap_complete = { workspace = true, features = ["unstable-dynamic"] }
 dirs = { workspace = true }
 # Strip the `\\?\` prefix std::fs::canonicalize returns on Windows; the prefix
 # breaks downstream tools (git treats it as a URL). Same use as octos-agent.

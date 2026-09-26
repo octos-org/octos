@@ -179,7 +179,41 @@ Generate shell completions.
 octos completions <shell>
 ```
 
-Supported shells: `bash`, `zsh`, `fish`, `powershell`.
+Supported shells: `bash`, `elvish`, `fish`, `powershell`, `zsh`.
+
+**Install (static).** The printed script completes flags and subcommands:
+
+```bash
+octos completions bash > ~/.local/share/bash-completion/completions/octos
+```
+
+**Install (dynamic, recommended).** Source the registration script so your shell
+calls back into `octos` for candidates on every tab — regenerating it at shell
+startup, so it stays current with the installed binary:
+
+```bash
+# bash (4+; older bash such as the macOS system bash 3.2 may not source this
+# form reliably — use the static script above there, or Homebrew's bash)
+echo 'source <(OCTOS_COMPLETE=bash octos)' >> ~/.bashrc
+# zsh
+echo 'source <(OCTOS_COMPLETE=zsh octos)' >> ~/.zshrc
+# fish
+echo 'OCTOS_COMPLETE=fish octos | source' >> ~/.config/fish/config.fish
+# elvish
+echo 'eval (E:OCTOS_COMPLETE=elvish octos | slurp)' >> ~/.elvish/rc.elv
+# powershell
+echo '$env:OCTOS_COMPLETE = "powershell"; octos | Out-String | Invoke-Expression; Remove-Item Env:\OCTOS_COMPLETE' >> $PROFILE
+```
+
+`--dynamic` prints a candidate list for one category instead of a script —
+useful for scripts and for checking what completions would offer:
+
+```bash
+octos completions bash --dynamic models     # model names from model_catalog.json
+octos completions bash --dynamic providers  # provider families from the registry
+octos completions bash --dynamic sessions   # session ids in ./.octos/sessions
+octos completions bash --dynamic skills     # skills in ./.octos/skills
+```
 
 ---
 
