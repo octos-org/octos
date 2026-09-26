@@ -9,8 +9,9 @@
 //! are treated as version 1 during reads so a future backfill can import legacy
 //! observations idempotently before a migration tightens the schema.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
@@ -324,6 +325,35 @@ pub struct PersistentUsageLedger {
     path: PathBuf,
 }
 
+/// How long an open waits out a competing holder of the ledger file before
+/// giving up, and how often it retries while waiting. The budget bounds the
+/// tail latency callers trade for not dropping their event; a long
+/// `backfill_events` or analytics scan in the holding process can consume
+/// most of it.
+const MAX_OPEN_WAIT: Duration = Duration::from_secs(5);
+const OPEN_RETRY_BACKOFF: Duration = Duration::from_millis(5);
+
+/// One open serializer per ledger file directory (see
+/// [`PersistentUsageLedger::open_database`]). Per-directory keys keep a busy
+/// profile's retry loop from queueing unrelated profiles' opens behind it;
+/// redb serializes writers per file anyway, so one waiter at a time per file
+/// costs no throughput. The map grows one entry per profile data dir.
+fn open_serializer(db_path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static OPEN_SERIALIZERS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    // The ledger file may not exist yet on first open, but its directory
+    // does (`open_sync` creates it) and every ledger file carries the same
+    // name — so the directory identifies the file.
+    let dir = db_path.parent().unwrap_or(db_path).to_path_buf();
+    let key = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let mut serializers = OPEN_SERIALIZERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    serializers.entry(key).or_default().clone()
+}
+
 impl PersistentUsageLedger {
     pub fn open_sync(data_dir: impl AsRef<Path>) -> Result<Self> {
         let data_dir = data_dir.as_ref();
@@ -456,15 +486,60 @@ impl PersistentUsageLedger {
         Ok(UsageAnalytics::from_events(&events).totals)
     }
 
+    /// Opening the ledger takes an exclusive redb file lock, and handles are
+    /// opened per call — so two overlapping operations (concurrent turn
+    /// completions in one process, or the serve daemon racing a gateway
+    /// subprocess on the same profile ledger) make the loser fail with
+    /// `DatabaseAlreadyOpen` and its caller drops the event (#2391). Wait
+    /// out the holder — even a several-second backfill or analytics scan —
+    /// and surface the error only once [`MAX_OPEN_WAIT`] is exhausted, the
+    /// trade being bounded tail latency on the waiting operation instead of
+    /// a silently lost billing event. Every other open error bubbles up
+    /// immediately.
     fn open_database(db_path: &Path) -> Result<Database> {
-        let db = Database::create(db_path).wrap_err("failed to open usage ledger database")?;
-        let write_txn = db.begin_write()?;
-        {
-            let _ = write_txn.open_table(USAGE_EVENTS_TABLE)?;
-            let _ = write_txn.open_table(USAGE_PROFILE_INDEX_TABLE)?;
-            let _ = write_txn.open_table(USAGE_SESSION_INDEX_TABLE)?;
+        // Serialize opens per file. `Database::create` uses a non-blocking
+        // lock attempt, so N concurrent openers retry on aligned wakeups and
+        // can starve while a fresh winner emerges each beat; one waiter at a
+        // time turns the burst into a queue that wins as soon as the current
+        // holder closes. (Poison-tolerant: an open that panicked while
+        // holding this must not permanently disable usage recording.)
+        let serializer = open_serializer(db_path);
+        let _open_serializer = serializer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = Instant::now() + MAX_OPEN_WAIT;
+        let db = loop {
+            match Database::create(db_path) {
+                Ok(db) => break db,
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) if Instant::now() < deadline => {
+                    std::thread::sleep(OPEN_RETRY_BACKOFF);
+                }
+                Err(e) => {
+                    return Err(
+                        eyre::Report::new(e).wrap_err("failed to open usage ledger database")
+                    );
+                }
+            }
+        };
+        // `open_table` inside a write transaction creates missing tables,
+        // which a fresh file needs exactly once; redoing that transaction on
+        // every call costs a no-op commit per record. Pay it only when the
+        // tables are not there yet.
+        let needs_init = {
+            let read_txn = db.begin_read()?;
+            read_txn.open_table(USAGE_EVENTS_TABLE).is_err()
+                || read_txn.open_table(USAGE_PROFILE_INDEX_TABLE).is_err()
+                || read_txn.open_table(USAGE_SESSION_INDEX_TABLE).is_err()
+        };
+        if needs_init {
+            let write_txn = db.begin_write()?;
+            {
+                let _ = write_txn.open_table(USAGE_EVENTS_TABLE)?;
+                let _ = write_txn.open_table(USAGE_PROFILE_INDEX_TABLE)?;
+                let _ = write_txn.open_table(USAGE_SESSION_INDEX_TABLE)?;
+            }
+            write_txn.commit()?;
         }
-        write_txn.commit()?;
         Ok(db)
     }
 
@@ -889,6 +964,111 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].schema_version, USAGE_EVENT_SCHEMA_VERSION);
         assert_eq!(events[0].input_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn record_retries_while_another_opener_holds_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A second opener mid-operation — another in-flight record in this
+        // process, or the serve daemon racing a gateway turn completion —
+        // holds the exclusive redb lock while our record wants to open the
+        // file. The record must wait it out instead of dropping the event.
+        let holder = Database::create(dir.path().join(USAGE_LEDGER_FILE)).unwrap();
+        let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
+        let recording = {
+            let ledger = ledger.clone();
+            tokio::spawn(async move {
+                ledger
+                    .record(event(
+                        "profile-a",
+                        "session-a",
+                        "run-1",
+                        "openai",
+                        "gpt-4.1",
+                        "2026-05-30",
+                        100,
+                        40,
+                        0.012,
+                        "appui",
+                    ))
+                    .await
+            })
+        };
+        // Release the lock while the record is still in flight. Wide
+        // enough that the spawned record reliably starts (and hits the
+        // held lock) even on a loaded CI runner.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        drop(holder);
+
+        recording.await.unwrap().unwrap();
+        assert_eq!(
+            ledger.session_totals("session-a").await.unwrap().run_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn open_gives_up_and_surfaces_the_error_once_the_budget_is_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        // A holder that never releases within the budget: the open must
+        // surface the lock error (and the record must be lost) instead of
+        // waiting forever — the caller's warn-and-drop contract.
+        let holder = Database::create(dir.path().join(USAGE_LEDGER_FILE)).unwrap();
+        let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
+        let error = ledger
+            .record(event(
+                "profile-a",
+                "session-a",
+                "run-1",
+                "openai",
+                "gpt-4.1",
+                "2026-05-30",
+                100,
+                40,
+                0.012,
+                "appui",
+            ))
+            .await
+            .expect_err("record must fail once the open budget is exhausted");
+        drop(holder);
+        assert!(
+            error
+                .root_cause()
+                .to_string()
+                .contains("Database already open"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(ledger.list_all().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_records_all_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..32 {
+            let ledger = ledger.clone();
+            tasks.spawn(async move {
+                ledger
+                    .record(event(
+                        "profile-a",
+                        "session-a",
+                        &format!("run-{i}"),
+                        "openai",
+                        "gpt-4.1",
+                        "2026-05-30",
+                        10,
+                        4,
+                        0.001,
+                        "appui",
+                    ))
+                    .await
+            });
+        }
+        while let Some(recording) = tasks.join_next().await {
+            recording.unwrap().unwrap();
+        }
+        assert_eq!(ledger.list_all().await.unwrap().len(), 32);
     }
 
     fn rollup<'a>(rollups: &'a [UsageRollup], key: &str) -> &'a UsageTotals {
