@@ -2,7 +2,7 @@ import { createContext, useContext, useState, useEffect, useCallback, useMemo, t
 import { useParams } from 'react-router-dom'
 import { useAuth } from './AuthContext'
 import { useToast } from '../components/Toast'
-import { api, myApi, getLogStreamUrl, getAdminLogStreamUrl } from '../api'
+import { api, myApi, ensureActionOk, getLogStreamUrl, getAdminLogStreamUrl } from '../api'
 import type { ProfileConfig, ProcessStatus, PurgeReport } from '../types'
 
 const defaultConfig: ProfileConfig = {
@@ -113,6 +113,8 @@ export function ProfileProvider({ children }: Props) {
         startGateway: () => myApi.startSubGateway(profileId),
         stopGateway: () => myApi.stopSubGateway(profileId),
         restartGateway: async () => {
+          // Sub-account stop reports ok even when nothing was running, so
+          // the two-step restart fails only when the start leg is refused.
           await myApi.stopSubGateway(profileId)
           return myApi.startSubGateway(profileId)
         },
@@ -187,13 +189,10 @@ export function ProfileProvider({ children }: Props) {
     }
   }, [adapter, config, profileEmail, profileId, profileName, publicSubdomain, enabled, toast])
 
-  // The self-service gateway routes report failures as 200 + `ok: false`
-  // (only the admin ones use error statuses), so the ok flag must be
-  // consumed here instead of relying on the request helpers to throw.
   const startGateway = useCallback(async () => {
     try {
       const res = await adapter.startGateway()
-      if (!res.ok) throw new Error(res.message || 'Failed to start gateway')
+      ensureActionOk(res, 'Failed to start gateway')
       toast('Gateway started')
       await loadProfile()
     } catch (e: any) {
@@ -204,7 +203,7 @@ export function ProfileProvider({ children }: Props) {
   const stopGateway = useCallback(async () => {
     try {
       const res = await adapter.stopGateway()
-      if (!res.ok) throw new Error(res.message || 'Failed to stop gateway')
+      ensureActionOk(res, 'Failed to stop gateway')
       toast('Gateway stopped')
       await loadProfile()
     } catch (e: any) {
@@ -215,7 +214,7 @@ export function ProfileProvider({ children }: Props) {
   const restartGateway = useCallback(async () => {
     try {
       const res = await adapter.restartGateway()
-      if (!res.ok) throw new Error(res.message || 'Failed to restart gateway')
+      ensureActionOk(res, 'Failed to restart gateway')
       toast('Gateway restarted')
       await loadProfile()
     } catch (e: any) {
