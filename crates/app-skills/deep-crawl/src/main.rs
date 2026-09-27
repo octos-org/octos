@@ -57,8 +57,15 @@ const CDP_CONNECT_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_MAX_DEPTH: u32 = 3;
 const DEFAULT_MAX_PAGES: u32 = 50;
 
-const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// Largest rendered HTML returned per page when `include_html` is set.
+const MAX_PAGE_HTML_BYTES: usize = 2 * 1024 * 1024;
+/// Cap on a robots.txt `Crawl-delay` we will honour between pages.
+const MAX_CRAWL_DELAY_SECS: u64 = 10;
+
+/// Product token appended to the browser's own User-Agent so sites can tell
+/// this is an automated octos reader (policy: no disguised automation; see
+/// SKILL.md "Automation policy").
+const UA_SUFFIX: &str = "octos-research/1.0 (+https://github.com/octos-org/octos)";
 
 /// Environment variables to block when launching Chrome.
 const BLOCKED_ENV_VARS: &[&str] = &[
@@ -95,6 +102,10 @@ struct Input {
     max_pages: u32,
     #[serde(default)]
     path_prefix: Option<String>,
+    /// Return each page's rendered HTML and final URL in `pages` (used by
+    /// `deep-search` to read JS-heavy pages it will cite).
+    #[serde(default)]
+    include_html: bool,
 }
 
 fn default_max_depth() -> u32 {
@@ -104,18 +115,31 @@ fn default_max_pages() -> u32 {
     DEFAULT_MAX_PAGES
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct Output {
     output: String,
     success: bool,
+    /// Rendered pages, only when `include_html` was requested.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pages: Vec<PageHtml>,
 }
 
+#[derive(Serialize)]
+struct PageHtml {
+    url: String,
+    final_url: String,
+    html: String,
+}
+
+#[derive(Default)]
 struct CrawledPage {
     url: String,
     depth: u32,
     text: String,
     links: Vec<String>,
     error: Option<String>,
+    final_url: String,
+    html: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +196,24 @@ fn find_free_port() -> u16 {
         .unwrap_or(9222)
 }
 
+/// Chrome command line. Deliberately no automation-hiding switches
+/// (`--disable-blink-features=AutomationControlled`, spoofed `--user-agent`,
+/// `--disable-infobars`): see SKILL.md "Automation policy".
+fn chrome_args(port: u16, user_data_dir: &std::path::Path) -> Vec<String> {
+    vec![
+        "--headless=new".to_string(),
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", user_data_dir.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-gpu".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        "--disable-extensions".to_string(),
+        "--disable-background-networking".to_string(),
+        "about:blank".to_string(),
+    ]
+}
+
 /// Launch headless Chrome with remote debugging and return the child process + debug port.
 fn launch_chrome(user_data_dir: &std::path::Path) -> Result<(Child, u16), String> {
     let chrome_bin = find_chrome_binary()
@@ -180,20 +222,7 @@ fn launch_chrome(user_data_dir: &std::path::Path) -> Result<(Child, u16), String
     let port = find_free_port();
 
     let mut cmd = Command::new(&chrome_bin);
-    cmd.arg("--headless=new")
-        .arg(format!("--remote-debugging-port={port}"))
-        .arg(format!("--user-data-dir={}", user_data_dir.display()))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--disable-gpu")
-        .arg("--disable-dev-shm-usage")
-        .arg("--disable-extensions")
-        .arg("--disable-background-networking")
-        .arg("--disable-blink-features=AutomationControlled")
-        .arg(format!("--user-agent={STEALTH_USER_AGENT}"))
-        .arg("--disable-features=AutomationControlled")
-        .arg("--disable-infobars")
-        .arg("about:blank")
+    cmd.args(chrome_args(port, user_data_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -394,12 +423,12 @@ async fn cdp_session_send(
 // Page interaction via CDP
 // ---------------------------------------------------------------------------
 
-/// JS to remove automation indicators.
-const STEALTH_JS: &str = r#"
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    window.chrome = { runtime: {} };
+/// JS returning `{href, html}` of the rendered document.
+const PAGE_HTML_JS: &str = r#"
+    JSON.stringify({
+        href: location.href,
+        html: document.documentElement ? document.documentElement.outerHTML : ''
+    })
 "#;
 
 /// JS to extract links from the page.
@@ -670,55 +699,56 @@ fn truncate_string(mut s: String, max_len: usize) -> String {
 // ---------------------------------------------------------------------------
 
 /// Crawl a single page: navigate, wait for JS render, extract text and links.
+///
+/// No automation hiding: the browser keeps its default automation signals
+/// (`navigator.webdriver`, HeadlessChrome UA plus our product token). A page
+/// that answers with a bot challenge is recorded as blocked, not bypassed.
 async fn crawl_single_page(
     ws: &mut WsStream,
     session_id: &str,
     url: &str,
     page_settle_ms: u64,
+    include_html: bool,
 ) -> CrawledPage {
-    // Inject stealth JS before navigation
-    let _ = evaluate_js(ws, session_id, STEALTH_JS).await;
-
     // Navigate
     if let Err(e) = navigate(ws, session_id, url).await {
         return CrawledPage {
             url: url.to_string(),
-            depth: 0,
-            text: String::new(),
-            links: vec![],
             error: Some(format!("Navigation failed: {e}")),
+            ..Default::default()
         };
     }
 
     // Wait for JS settle
     tokio::time::sleep(Duration::from_millis(page_settle_ms)).await;
 
-    // Re-inject stealth after navigation
-    let _ = evaluate_js(ws, session_id, STEALTH_JS).await;
-
-    // Extract text with retry for near-empty or bot-blocked pages
+    // Extract text, retrying while a slow page is still near-empty.
     let mut text = match extract_text(ws, session_id).await {
         Ok(t) => t,
         Err(e) => {
             return CrawledPage {
                 url: url.to_string(),
-                depth: 0,
-                text: String::new(),
-                links: vec![],
                 error: Some(e),
+                ..Default::default()
             };
         }
     };
 
-    // Retry if page looks empty or bot-blocked
+    if is_bot_blocked(&text) {
+        eprintln!("[deep_crawl] bot challenge, not bypassing: {url}");
+        return CrawledPage {
+            url: url.to_string(),
+            error: Some("blocked by a bot challenge (not bypassed)".to_string()),
+            ..Default::default()
+        };
+    }
+
     for _retry in 0..MAX_EMPTY_RETRIES {
         let trimmed_len = text.trim().len();
-        if trimmed_len >= MIN_USEFUL_TEXT_LEN && !is_bot_blocked(&text) {
+        if trimmed_len >= MIN_USEFUL_TEXT_LEN {
             break;
         }
-        eprintln!(
-            "[deep_crawl] page looks empty or bot-blocked (len={trimmed_len}), retrying: {url}"
-        );
+        eprintln!("[deep_crawl] page looks empty (len={trimmed_len}), waiting longer: {url}");
         tokio::time::sleep(Duration::from_millis(PAGE_SETTLE_RETRY_MS)).await;
         text = match extract_text(ws, session_id).await {
             Ok(t) => t,
@@ -729,13 +759,89 @@ async fn crawl_single_page(
     // Extract links
     let links = extract_links(ws, session_id).await;
 
+    let (final_url, html) = if include_html {
+        page_html(ws, session_id).await.unwrap_or_default()
+    } else {
+        (String::new(), String::new())
+    };
+
     CrawledPage {
         url: url.to_string(),
         depth: 0,
         text,
         links,
         error: None,
+        final_url,
+        html,
     }
+}
+
+/// Rendered `(final_url, outerHTML)`, HTML capped at [`MAX_PAGE_HTML_BYTES`].
+async fn page_html(ws: &mut WsStream, session_id: &str) -> Option<(String, String)> {
+    let raw = evaluate_js(ws, session_id, PAGE_HTML_JS).await.ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let href = v["href"].as_str().unwrap_or("").to_string();
+    let mut html = v["html"].as_str().unwrap_or("").to_string();
+    if html.len() > MAX_PAGE_HTML_BYTES {
+        let mut end = MAX_PAGE_HTML_BYTES;
+        while end > 0 && !html.is_char_boundary(end) {
+            end -= 1;
+        }
+        html.truncate(end);
+    }
+    Some((href, html))
+}
+
+/// Append our product token to the browser's own User-Agent for this tab.
+async fn set_identifiable_user_agent(ws: &mut WsStream, session_id: &str) {
+    let base = cdp_send(ws, "Browser.getVersion", serde_json::json!({}))
+        .await
+        .ok()
+        .and_then(|v| v["userAgent"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let ua = if base.is_empty() {
+        UA_SUFFIX.to_string()
+    } else {
+        format!("{base} {UA_SUFFIX}")
+    };
+    let _ = cdp_session_send(
+        ws,
+        session_id,
+        "Network.setUserAgentOverride",
+        serde_json::json!({ "userAgent": ua }),
+    )
+    .await;
+}
+
+/// robots.txt check for one URL (RFC 9309 via `octos-research`), fetched
+/// once per origin with an identifiable User-Agent.
+async fn robots_check(
+    cache: &octos_research::RobotsCache,
+    url: &str,
+) -> octos_research::robots::RobotsDecision {
+    cache
+        .check(url, octos_research::AGENT_TOKEN, |robots_url| async move {
+            let client = match reqwest::Client::builder()
+                .user_agent(octos_research::USER_AGENT)
+                .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => return (None, String::new()),
+            };
+            match client.get(&robots_url).send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    // Cap: 500 KiB is the RFC 9309 minimum a parser must handle.
+                    let body: String = body.chars().take(512 * 1024).collect();
+                    (Some(status), body)
+                }
+                Err(_) => (None, String::new()),
+            }
+        })
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -838,6 +944,7 @@ async fn run() -> Output {
         return Output {
             output: format!("Failed to read stdin: {e}"),
             success: false,
+            ..Default::default()
         };
     }
 
@@ -847,11 +954,12 @@ async fn run() -> Output {
             return Output {
                 output: format!("Invalid JSON input: {e}"),
                 success: false,
+                ..Default::default()
             };
         }
     };
 
-    let max_depth = input.max_depth.clamp(1, 10);
+    let max_depth = input.max_depth.min(10);
     let max_pages = input.max_pages.clamp(1, 200);
 
     // Validate seed URL
@@ -861,6 +969,7 @@ async fn run() -> Output {
             return Output {
                 output: "Invalid URL".to_string(),
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -870,6 +979,7 @@ async fn run() -> Output {
         return Output {
             output: format!("Only http:// and https:// URLs are allowed, got {scheme}://"),
             success: false,
+            ..Default::default()
         };
     }
 
@@ -878,6 +988,7 @@ async fn run() -> Output {
         return Output {
             output: msg,
             success: false,
+            ..Default::default()
         };
     }
 
@@ -889,6 +1000,7 @@ async fn run() -> Output {
         return Output {
             output: format!("Failed to create output directory: {e}"),
             success: false,
+            ..Default::default()
         };
     }
 
@@ -899,6 +1011,7 @@ async fn run() -> Output {
             return Output {
                 output: format!("Failed to create temp dir: {e}"),
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -912,6 +1025,7 @@ async fn run() -> Output {
             return Output {
                 output: e,
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -929,6 +1043,7 @@ async fn run() -> Output {
             return Output {
                 output: format!("Failed to connect to Chrome: {e}"),
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -940,6 +1055,7 @@ async fn run() -> Output {
             return Output {
                 output: e,
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -952,6 +1068,7 @@ async fn run() -> Output {
             return Output {
                 output: format!("Failed to create browser tab: {e}"),
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -963,6 +1080,7 @@ async fn run() -> Output {
             return Output {
                 output: format!("Failed to attach to browser tab: {e}"),
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -975,6 +1093,8 @@ async fn run() -> Output {
         serde_json::json!({}),
     )
     .await;
+    set_identifiable_user_agent(&mut ws, &session_id).await;
+    let robots = octos_research::RobotsCache::new();
 
     // BFS crawl
     let mut visited: HashSet<String> = HashSet::new();
@@ -1025,7 +1145,38 @@ async fn run() -> Output {
             progress_fraction,
         );
 
-        let mut crawled = crawl_single_page(&mut ws, &session_id, &url, PAGE_SETTLE_MS).await;
+        // robots.txt: a disallowed (or unreachable-robots) URL is recorded,
+        // never navigated. Crawl-delay is honoured between pages.
+        let decision = robots_check(&robots, &url).await;
+        if !decision.allowed {
+            eprintln!(
+                "[deep_crawl] skipped by robots.txt ({}): {url}",
+                decision.reason
+            );
+            results.push(CrawledPage {
+                url: url.clone(),
+                depth,
+                error: Some(format!("skipped: {} (robots.txt)", decision.reason)),
+                ..Default::default()
+            });
+            continue;
+        }
+        if let Some(delay) = decision.crawl_delay {
+            if !results.is_empty() {
+                let delay = delay.min(Duration::from_secs(MAX_CRAWL_DELAY_SECS));
+                tokio::time::sleep(delay.saturating_sub(Duration::from_millis(PAGE_SETTLE_MS)))
+                    .await;
+            }
+        }
+
+        let mut crawled = crawl_single_page(
+            &mut ws,
+            &session_id,
+            &url,
+            PAGE_SETTLE_MS,
+            input.include_html,
+        )
+        .await;
         crawled.depth = depth;
 
         // Enqueue discovered links
@@ -1169,9 +1320,28 @@ async fn run() -> Output {
         Some(1.0),
     );
 
+    let pages = if input.include_html {
+        results
+            .into_iter()
+            .filter(|p| p.error.is_none() && !p.html.is_empty())
+            .map(|p| PageHtml {
+                final_url: if p.final_url.is_empty() {
+                    p.url.clone()
+                } else {
+                    p.final_url
+                },
+                url: p.url,
+                html: p.html,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Output {
         output,
         success: true,
+        pages,
     }
 }
 
@@ -1269,6 +1439,19 @@ mod tests {
         // Catch any future serialization regression that would crash on
         // non-ASCII content.
         emit_v2_progress("crawling", "page 你好/世界", Some(0.5));
+    }
+
+    #[test]
+    fn should_not_hide_automation_in_chrome_args_or_scripts() {
+        let args = chrome_args(9222, std::path::Path::new("/tmp/x")).join(" ");
+        assert!(!args.contains("AutomationControlled"), "{args}");
+        assert!(!args.contains("--user-agent"), "{args}");
+        assert!(!args.contains("--disable-infobars"), "{args}");
+        let src = include_str!("main.rs");
+        // Split so this test does not match itself.
+        let needle = ["'web", "driver'"].concat();
+        assert!(!src.contains(&needle), "no webdriver-hiding script");
+        assert!(UA_SUFFIX.contains(octos_research::AGENT_TOKEN));
     }
 
     #[test]

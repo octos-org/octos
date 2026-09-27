@@ -1,0 +1,5 @@
+{"query": "climate summit", "number_of_results": 0, "results": [
+ {"url": "https://apnews.com/article/climate-summit-deal-2026", "title": "Climate summit ends with draft deal", "content": "Negotiators from nearly 200 countries agreed on a draft text late Thursday.", "engine": "bing news", "parsed_url": ["https", "apnews.com", "/article/climate-summit-deal-2026", "", "", ""], "template": "default.html", "engines": ["bing news", "duckduckgo news"], "positions": [1, 2], "publishedDate": "2026-09-25T21:40:00", "score": 2.5, "category": "news"},
+ {"url": "https://www.theguardian.com/environment/2026/sep/24/climate-summit-live", "title": "Climate summit – live", "content": "", "engine": "qwant news", "publishedDate": null, "score": 1.0, "category": "news"},
+ {"url": "javascript:void(0)", "title": "junk", "content": "", "engine": "x"}
+], "answers": [], "corrections": [], "infoboxes": [], "suggestions": [], "unresponsive_engines": []}

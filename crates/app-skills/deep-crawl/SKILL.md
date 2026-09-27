@@ -31,6 +31,7 @@ Call the `deep_crawl` tool with a starting URL. The crawler will follow same-ori
 | `max_depth`   | integer | no       | 3       | Maximum link-following depth (1-10)                      |
 | `max_pages`   | integer | no       | 50      | Maximum number of pages to crawl (1-200)                 |
 | `path_prefix` | string  | no       | --      | Only follow links whose path starts with this prefix     |
+| `include_html`| boolean | no       | false   | Also return each page's rendered HTML and final URL in `pages` |
 
 ### Example
 
@@ -65,7 +66,16 @@ Results are saved to a research directory named `crawl-<hostname>/` under the cu
 
 - Only `http://` and `https://` URLs are allowed
 - Only same-origin links are followed (no cross-domain crawling)
-- The crawler uses stealth techniques to avoid bot detection (custom user-agent, webdriver flag removal)
-- Pages that appear empty or bot-blocked are retried with longer wait times
+- robots.txt is respected for every page (RFC 9309, product token `octos-research`): disallowed URLs are recorded as `skipped` and never opened; if an origin's robots.txt is unreachable (5xx/network error) the origin is treated as disallowed; `Crawl-delay` is honoured (capped at 10s)
+- Pages that are still near-empty after the settle time get one more wait; pages that answer with a bot challenge are recorded as blocked, not retried
 - URL fragments are stripped and trailing slashes normalized to avoid duplicate visits
 - Private/internal IP addresses are blocked (SSRF protection)
+
+## Automation policy
+
+deep_crawl is a real browser for **reading** pages, not for getting around bot detection (OctoSense ADR 0002 §6: no disguised search):
+
+- The browser is not disguised. There is no `navigator.webdriver` override, no `AutomationControlled` switches, no fake plugins/languages, and no spoofed desktop User-Agent. Chrome's own User-Agent is kept and `octos-research/1.0 (+https://github.com/octos-org/octos)` is appended to it.
+- No CAPTCHA solving, no human-behaviour imitation, no fingerprint spoofing. A bot challenge ends the attempt for that page.
+- Do not use deep_crawl to scrape search-engine results pages. Use a search provider (GDELT, Google News RSS, a self-hosted SearXNG, or a search API key) and crawl the result pages instead.
+- There is no flag to turn evasion back on; adding one requires a new ADR.

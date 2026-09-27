@@ -19,6 +19,8 @@ scraper = "0.22"
 ego-tree = "0.10"
 regex = "1"
 url = "2"
+chrono = "0.4"
+octos-research = { path = "../../octos-research" }
 
 [package.metadata.release]
 release = false

@@ -19,6 +19,7 @@ scraper = "0.22"
 url = "2"
 regex = "1"
 chrono = "0.4"
+octos-research = { path = "../../octos-research", default-features = false }
 which = "7"
 futures-util = "0.3"
 tempfile = "3"

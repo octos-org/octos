@@ -10,62 +10,37 @@ always: true
 
 ## Overview
 
-The `search` tool performs deep multi-round web research. It iteratively searches from multiple angles, fetches pages in parallel, chases the most-referenced external sources, and produces a structured research report.
+The `search` tool does multi-round research: free sources first (GDELT and Google News RSS for news, a self-hosted SearXNG if configured, then any search API key you added), polite page reading (robots.txt, identifiable User-Agent, a real browser only to render JS-heavy pages), reference chasing, and a cited report plus structured items. No API key is required. This file is always in context, so it stays short; the tool's input schema lists every parameter.
 
-## Usage
+## Parameters
 
-Call `search` with a query and optional depth. The tool will:
+- **query** (required); **depth** 1-3 (default 2; 10/30/50 pages); **max_results** per provider per round (default 8).
+- **output**: `report` (default, Markdown) or `items` (structured JSON; the report is still written).
+- **lang**: BCP-47 code(s), e.g. `"en"` or `["en", "zh-CN", "es"]`. Each language is searched separately and results are kept to those languages (unknown-language results are kept).
+- **region**: ISO country, e.g. `US`, `TW` (Google News edition, Brave/Serper country).
+- **since**: ISO date or `24h` / `7d` / `2w` / `3m` / `1y`. Sent to providers that support it and applied to feed/page dates (undated results are kept). Use this instead of adding years or "latest" to the query.
+- **category**: `news`, `general` or `auto` (default: news when `since` ≤ 31 days or the query mentions news/latest/today).
+- **max_per_domain**, **domains_allow**, **domains_deny**: source limits (Google News links count against the publisher).
+- **render**: `auto` (default) or `off` (plain HTTP only).
+- **search_engine**: one provider to try first (`gdelt`, `google_news_rss`, `searxng`, `serper`, `tavily`, `perplexity`, `brave`, `you`, `duckduckgo`) or `all`.
 
-1. **Round 1**: Search the web using Perplexity Sonar (preferred) or other available engines
-2. **Rounds 2+**: Generate follow-up queries from different angles (time-qualified, subtopic-focused, controversy/analysis)
-3. **Parallel fetch**: Crawl all discovered URLs concurrently (8 connections)
-4. **Reference chasing**: Extract outbound links from crawled pages, fetch the most-cited external sources
-5. **Report**: Build a structured report with overview, source previews, and search query log
-6. **Save**: Everything saved under `./research/<query-slug>/`
+Example: `{"query": "COP31 climate summit", "lang": ["en", "es"], "since": "7d", "max_per_domain": 2, "output": "items"}`
 
-### Parameters
+## Providers and policy (OctoSense ADR 0002 §6)
 
-- **query** (required, string): The research topic or question to investigate.
-- **depth** (optional, integer, default: 2): Research depth:
-  - `1` = Quick: single search round + crawl (~1 min, up to 10 pages)
-  - `2` = Standard: 3 search rounds + reference chasing (~3 min, up to 30 pages)
-  - `3` = Thorough: 5 search rounds + aggressive link chasing (~5 min, up to 50 pages)
-- **max_results** (optional, integer, default: 8): Number of search results per round (1-10).
-- **search_engine** (optional, string): Preferred search engine. Options: `perplexity`, `duckduckgo`, `brave`, `you`. Defaults to auto-detection (prefers Perplexity).
+1. GDELT DOC 2.0 (at most one call per 5s) + Google News search RSS, for news.
+2. SearXNG when `SEARXNG_URL` is set (instance must enable the `json` format).
+3. Keyed APIs: Serper, Tavily, Perplexity, Brave, You.com.
+4. DuckDuckGo HTML as the keyless last resort.
 
-### Example
+Each tier runs only if the previous ones returned fewer than `max_results`. The headless-Chrome Bing results scrape is off: it runs only if the operator sets `OCTOS_ALLOW_BROWSER_SERP=1`. Google News article links are `news.google.com` redirects that robots.txt disallows, so they are cited as **headline-only** sources (title, publisher, date), never fetched.
 
-```json
-{
-  "query": "AI regulations worldwide 2026",
-  "depth": 2
-}
-```
+Reading: robots.txt (token `octos-research`) is checked per origin first; disallowed or unreachable-robots URLs are skipped and recorded. At least 1s between requests to a host (`Crawl-delay` honoured), 15s timeouts, 3 MB cap, private hosts blocked. Main text and metadata come from a readability extractor; pages with no main text over HTTP are rendered once by the `deep_crawl` browser (no automation hiding). 403/429 and bot challenges are not bypassed.
 
-### Output
+## Output
 
-Returns a structured research report including:
-- Overview (initial search answer)
-- Source details with inline previews (first 2000 chars of each page)
-- List of all search queries used
-- Summary with page count and save location
+- Report: synthesis with `[N]` citations (when a model is configured), then sources with title, publisher, date and language, then `Report saved to:` and `Items saved to:`.
+- Items (`schema: octos.research.items.v1`): `items[]` with `url` (canonical), `title`, `source`, `domain`, `lang`, `published` (ISO), `summary` + `summary_kind` (`extractive` | `model` | `snippet` | `none`), `snippet`, `fetched_at`, `provider`, `read`, `rendered`, `citation` (the report's `[N]`), `cited`, `file`; plus `skipped[]` (`url`, `reason`: `robots`, `domain_deny`, `per_domain_cap`, `lang`, `older_than_since`, `fetch_error: …`), `providers`, `report`, `items_file`.
+- Files under `./research/<query-slug>/`: `<slug>_report.md`, `<slug>_report.items.json`, `_search_results.md` (raw results + provider notes), `01_<domain>.md`… (page main text with url/title/source/lang/published front matter). Use `read_file` on them for detail.
 
-Use `read_file` on specific source files for full content when you need detailed synthesis.
-
-### Saved Files
-
-Results are saved to `./research/<query-slug>/`:
-
-- `_<query-slug>.md` -- structured research report (topic-named; leading `_` keeps it out of `read_sources`' source-ingestion path on subsequent synthesis runs; see issue #897)
-- `_search_results.md` -- combined raw search results from all rounds
-- `01_<domain>.md` -- full page content from first source
-- `02_<domain>.md` -- full page content from second source
-- etc.
-
-### Environment Variables
-
-- `PERPLEXITY_API_KEY` -- enables Perplexity Sonar (recommended, best for deep research)
-- `BRAVE_API_KEY` -- enables Brave Search
-- `YDC_API_KEY` -- enables You.com search
-
-Without API keys, DuckDuckGo HTML search is used as fallback.
+Environment: `SEARXNG_URL`; optional keys `SERPER_API_KEY`, `TAVILY_API_KEY`, `PERPLEXITY_API_KEY`, `BRAVE_API_KEY`, `YDC_API_KEY`; `DEEP_SEARCH_HOST_INTERVAL_MS` (default 1000); `DEEP_SEARCH_MAX_BROWSERS` (default 3); `OCTOS_ALLOW_BROWSER_SERP` (off).
