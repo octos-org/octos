@@ -2199,7 +2199,11 @@ mod tests {
         assert!(text.contains("[✓]"));
         // The #2384 bundle check is wired into the report — asserted for
         // presence only, since the status depends on the checkout's
-        // (gitignored) static/ tree.
+        // (gitignored) static/ tree. The wiring is `#[cfg(feature = "api")]`
+        // (a no-api binary serves no UI routes), so the presence guarantee
+        // only holds in api builds; the oup-minimal lane runs this suite
+        // with --no-default-features.
+        #[cfg(feature = "api")]
         assert!(
             report.checks.iter().any(|c| c.name == "web UI bundles"),
             "embedded web UI bundle check must be part of the report"
