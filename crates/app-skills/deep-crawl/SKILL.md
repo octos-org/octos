@@ -66,10 +66,10 @@ Results are saved to a research directory named `crawl-<hostname>/` under the cu
 
 - Only `http://` and `https://` URLs are allowed
 - Only same-origin links are followed (no cross-domain crawling)
-- robots.txt is respected for every page (RFC 9309, product token `octos-research`): disallowed URLs are recorded as `skipped` and never opened; if an origin's robots.txt is unreachable (5xx/network error) the origin is treated as disallowed; `Crawl-delay` is honoured (capped at 10s)
+- robots.txt is respected for every page (RFC 9309, product token `octos-research`): disallowed URLs are recorded as `skipped` and never opened; if an origin's robots.txt is unreachable (5xx/network error) the origin is treated as disallowed (re-checked after an hour); `Crawl-delay` is honoured (capped at 10s)
 - Pages that are still near-empty after the settle time get one more wait; pages that answer with a bot challenge are recorded as blocked, not retried
 - URL fragments are stripped and trailing slashes normalized to avoid duplicate visits
-- Private/internal IP addresses are blocked (SSRF protection)
+- Private/internal addresses are blocked (SSRF protection), inside the browser too: every request Chrome makes (the page, each redirect, subresources) is paused via the CDP Fetch domain and only continued if its destination is public (no loopback, RFC 1918, link-local/cloud metadata, CGNAT or reserved address; DNS fail-closed). A page that redirects (HTTP, meta or JS) to a private address is recorded as blocked and its content discarded; the final URL and every main-frame navigation are re-checked before any text is returned
 
 ## Automation policy
 

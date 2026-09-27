@@ -92,7 +92,9 @@ impl WebSearchTool {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10))
-                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+                // Identifiable, never a disguised desktop browser (ADR 0002),
+                // including for the opt-in DuckDuckGo scrape.
+                .user_agent(octos_research::USER_AGENT)
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             research_client: Client::builder()
@@ -1329,6 +1331,18 @@ pub(super) fn detect_browser_executable() -> Option<std::path::PathBuf> {
     .ok()
 }
 
+/// Keep the browser's own User-Agent (HeadlessChrome) and append the
+/// `octos-research` product token, so sites can identify the reader.
+#[cfg(feature = "browser")]
+pub(super) async fn set_identifiable_user_agent(page: &chromiumoxide::Page) {
+    use chromiumoxide::cdp::browser_protocol::network::SetUserAgentOverrideParams;
+    let base = page.user_agent().await.unwrap_or_default();
+    let ua = format!("{base} octos-research/1.0 (+https://github.com/octos-org/octos)");
+    let _ = page
+        .set_user_agent(SetUserAgentOverrideParams::new(ua.trim().to_string()))
+        .await;
+}
+
 /// Launch headless Chrome, navigate to a Bing SERP for `query`, pull the
 /// rendered HTML, and parse out result rows. Kept separate from
 /// `WebSearchTool` so the bounded-timeout wrapper owns the future and Chrome is
@@ -1379,7 +1393,13 @@ async fn render_and_parse_bing(
 
     let outcome = async {
         let page = browser
-            .new_page(search_url.as_str())
+            .new_page("about:blank")
+            .await
+            .map_err(|e| eyre::eyre!("failed to open Bing page: {e}"))?;
+        // Honest UA even on this opt-in scrape: the flag enables it, it does
+        // not license disguise.
+        set_identifiable_user_agent(&page).await;
+        page.goto(search_url.as_str())
             .await
             .map_err(|e| eyre::eyre!("failed to open Bing page: {e}"))?;
         let _ = page.wait_for_navigation().await;

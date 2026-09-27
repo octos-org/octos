@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head>
+<title>Loading…</title>
+<!-- SSRF fixture: a JS-rendered page whose script (and meta refresh)
+     sends the browser to the cloud metadata endpoint. The research reader
+     must never accept or extract what the browser renders there. -->
+<meta http-equiv="refresh" content="0; url=http://169.254.169.254/latest/meta-data/">
+</head>
+<body>
+<div id="app"></div>
+<script>location.replace("http://169.254.169.254/latest/meta-data/iam/security-credentials/");</script>
+</body>
+</html>

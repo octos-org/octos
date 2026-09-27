@@ -24,9 +24,6 @@ use crate::tools::TOOL_CTX;
 use super::web_search::WebSearchTool;
 use super::{Tool, ToolResult};
 
-/// Identifiable UA for page reads (no browser disguise).
-const DEEP_SEARCH_USER_AGENT: &str = octos_research::USER_AGENT;
-
 /// Page-fetch timeout.
 const DEEP_SEARCH_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -88,6 +85,7 @@ struct Input {
 }
 
 /// A page read for the research index.
+#[derive(Debug)]
 struct PageRead {
     /// Main text (readability), or the Markdown of the whole page when no
     /// article was found.
@@ -96,12 +94,6 @@ struct PageRead {
     meta: octos_research::extract::PageMeta,
     rendered: bool,
     fetched_at: String,
-}
-
-/// Per-call politeness state: robots.txt cache and per-host spacing.
-struct Politeness {
-    robots: octos_research::RobotsCache,
-    throttle: octos_research::HostThrottle,
 }
 
 fn default_count() -> u8 {
@@ -273,13 +265,10 @@ impl Tool for DeepSearchTool {
             ),
             Some(0.4),
         );
-        let polite = Politeness {
-            robots: octos_research::RobotsCache::new(),
-            throttle: octos_research::HostThrottle::new(HOST_INTERVAL),
-        };
+        let reader = research_reader();
         let fetches: Vec<_> = urls
             .iter()
-            .map(|url| self.fetch_page(url, max_chars, &polite))
+            .map(|url| read_page(&reader, url, max_chars))
             .collect();
 
         let pages = futures::future::join_all(fetches).await;
@@ -488,154 +477,91 @@ fn emit_deep_research_progress(phase: &str, message: &str, progress: Option<f64>
     }
 }
 
-impl DeepSearchTool {
-    async fn robots_allows(polite: &Politeness, url: &str) -> Result<Option<Duration>> {
-        let decision = polite
-            .robots
-            .check(url, octos_research::AGENT_TOKEN, |robots_url| async move {
-                let resp = super::ssrf::ssrf_safe_send(
-                    &robots_url,
-                    super::ssrf::SSRF_MAX_REDIRECTS,
-                    |b| {
-                        b.timeout(DEEP_SEARCH_FETCH_TIMEOUT)
-                            .user_agent(DEEP_SEARCH_USER_AGENT)
-                    },
-                    |client, current_url| client.get(current_url),
-                )
-                .await;
-                match resp {
-                    Ok(r) => {
-                        let status = r.status().as_u16();
-                        let body = read_capped(r, 512 * 1024).await.unwrap_or_default();
-                        (Some(status), body)
-                    }
-                    Err(_) => (None, String::new()),
-                }
+/// The shared polite reader (`octos_research::reader`): SSRF check + DNS
+/// pinning on every hop, robots.txt, per-host spacing, size caps, and
+/// post-render SSRF re-validation. The browser renderer (feature `browser`)
+/// also blocks private destinations inside Chrome.
+fn research_reader() -> octos_research::reader::Reader {
+    #[cfg(feature = "browser")]
+    let renderer: Option<octos_research::reader::Renderer> = Some(std::sync::Arc::new(
+        |url: String| -> octos_research::reader::RenderFuture {
+            Box::pin(async move {
+                render_page(&url, RENDER_BOUND)
+                    .await
+                    .map_err(|e| e.to_string())
             })
-            .await;
-        if decision.allowed {
-            Ok(decision.crawl_delay)
+        },
+    ));
+    #[cfg(not(feature = "browser"))]
+    let renderer: Option<octos_research::reader::Renderer> = None;
+    octos_research::reader::Reader::new(octos_research::reader::ReaderConfig {
+        host_interval: HOST_INTERVAL,
+        timeout: DEEP_SEARCH_FETCH_TIMEOUT,
+        max_page_bytes: MAX_PAGE_BYTES,
+        keep_html: false,
+        fallback_text: Some(html_to_markdown),
+        renderer,
+    })
+}
+
+/// Markdown of the whole page, the fallback when readability finds no
+/// article (lists, docs pages).
+fn html_to_markdown(html: &str) -> String {
+    htmd::convert(html).unwrap_or_else(|_| extract_text_simple(html))
+}
+
+/// Read one page through the shared reader. Errors (robots.txt refusals,
+/// SSRF blocks, 403/500, transport, no main text) propagate so the caller
+/// records an error artifact for the skipped source.
+async fn read_page(
+    reader: &octos_research::reader::Reader,
+    url: &str,
+    max_chars: usize,
+) -> Result<PageRead> {
+    let page = reader.read(url).await.map_err(|reason| {
+        if reason.starts_with("robots") {
+            eyre::eyre!("skipped: {reason} (robots.txt)")
         } else {
-            eyre::bail!("skipped: {} (robots.txt)", decision.reason)
+            eyre::eyre!("{reason}")
         }
-    }
-
-    async fn fetch_page(
-        &self,
-        url: &str,
-        max_chars: usize,
-        polite: &Politeness,
-    ) -> Result<PageRead> {
-        // robots.txt first (per origin, cached), then per-host spacing.
-        let crawl_delay = Self::robots_allows(polite, url).await?;
-        let host = octos_research::urls::domain_of(url).unwrap_or_default();
-        polite.throttle.wait(&host, crawl_delay).await;
-
-        // SSRF is re-validated on EVERY redirect hop (the initial-URL-only
-        // check this replaced let an allowed URL 302 to 169.254.169.254 /
-        // 10.x through). `ssrf_safe_send` disables auto-redirects, re-checks +
-        // DNS-pins each hop, and re-issues the GET.
-        //
-        // Failures (SSRF-blocked, transport error, non-2xx, body-read) return
-        // Err so the caller's save loop records an error artifact for the
-        // skipped source — collapsing them to Ok("") would silently drop
-        // 403/500 pages from the research index.
-        let response = super::ssrf::ssrf_safe_send(
-            url,
-            super::ssrf::SSRF_MAX_REDIRECTS,
-            |builder| {
-                builder
-                    .timeout(DEEP_SEARCH_FETCH_TIMEOUT)
-                    .user_agent(DEEP_SEARCH_USER_AGENT)
-            },
-            |client, current_url| client.get(current_url),
-        )
-        .await
-        .map_err(|e| eyre::eyre!("{e}"))?;
-
-        if !response.status().is_success() {
-            eyre::bail!("HTTP {}", response.status());
-        }
-        let final_url = response.url().to_string();
-        let body = read_capped(response, MAX_PAGE_BYTES)
-            .await
-            .map_err(|e| eyre::eyre!("read body failed: {e}"))?;
-        let fetched_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-        // Main text (readability); else the Markdown of the whole page.
-        let mut extracted = octos_research::extract::extract(&body, &final_url);
-        #[cfg_attr(not(feature = "browser"), allow(unused_mut))]
-        let mut page_url = final_url;
-        #[cfg_attr(not(feature = "browser"), allow(unused_mut))]
-        let mut rendered = false;
-        if extracted.is_empty_text() {
-            let markdown = htmd::convert(&body).unwrap_or_else(|_| extract_text_simple(&body));
-            if markdown.chars().filter(|c| !c.is_whitespace()).count()
-                >= octos_research::extract::MIN_MAIN_TEXT_CHARS
-            {
-                extracted.text = markdown;
-            }
-        }
-        // JS-heavy page: render it in a real browser (reading, not search).
-        #[cfg(feature = "browser")]
-        if extracted.is_empty_text() {
-            if let Ok((rurl, rhtml)) = render_page_html(&page_url, Duration::from_secs(45)).await {
-                let same_site = octos_research::urls::domain_of(&rurl)
-                    == octos_research::urls::domain_of(&page_url);
-                if same_site || Self::robots_allows(polite, &rurl).await.is_ok() {
-                    let rex = octos_research::extract::extract(&rhtml, &rurl);
-                    if !rex.is_empty_text() {
-                        extracted = rex;
-                        page_url = rurl;
-                        rendered = true;
-                    }
-                }
-            }
-        }
-
-        let mut content = extracted.text;
-        octos_core::truncate_utf8(&mut content, max_chars, "\n... (truncated)");
-
-        Ok(PageRead {
-            content,
-            final_url: page_url,
-            meta: extracted.meta,
-            rendered,
-            fetched_at,
-        })
-    }
+    })?;
+    let mut content = page.text;
+    octos_core::truncate_utf8(&mut content, max_chars, "\n... (truncated)");
+    Ok(PageRead {
+        content,
+        final_url: page.final_url,
+        meta: page.meta,
+        rendered: page.rendered,
+        fetched_at: page.fetched_at,
+    })
 }
 
-/// Read a response body up to `cap` bytes (lossy UTF-8).
-async fn read_capped(
-    mut resp: reqwest::Response,
-    cap: usize,
-) -> std::result::Result<String, String> {
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                let room = cap.saturating_sub(buf.len());
-                buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                if buf.len() >= cap {
-                    break;
-                }
-            }
-            Ok(None) => break,
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
+/// Bound for one browser render (launch + navigation + settle).
+#[cfg(feature = "browser")]
+const RENDER_BOUND: Duration = Duration::from_secs(45);
 
 /// Render one page in headless Chrome (the `browser` tool's chromiumoxide
-/// machinery) and return `(final_url, html)`. No automation hiding: the
-/// browser's own User-Agent plus the `octos-research` token.
+/// machinery) for reading. No automation hiding: the browser's own UA plus
+/// the `octos-research` token.
+///
+/// SSRF: every request Chrome makes (the document, each redirect hop,
+/// subresources) is paused via the CDP Fetch domain and only continued if
+/// its destination passes `octos_research::net::check_url` (no private,
+/// loopback, link-local/metadata or reserved address; DNS fail-closed).
+/// A blocked document request fails the render. The main-frame navigation
+/// chain is returned so the shared reader re-validates it before any HTML
+/// is extracted.
 #[cfg(feature = "browser")]
-async fn render_page_html(url: &str, bound: Duration) -> Result<(String, String)> {
+async fn render_page(url: &str, bound: Duration) -> Result<octos_research::reader::Rendered> {
     use chromiumoxide::browser::{Browser, BrowserConfig};
-    use chromiumoxide::cdp::browser_protocol::network::SetUserAgentOverrideParams;
+    use chromiumoxide::cdp::browser_protocol::fetch::{
+        ContinueRequestParams, EnableParams, EventRequestPaused, FailRequestParams, RequestPattern,
+        RequestStage,
+    };
+    use chromiumoxide::cdp::browser_protocol::network::{ErrorReason, ResourceType};
+    use chromiumoxide::cdp::browser_protocol::page::EventFrameNavigated;
     use futures::StreamExt;
+    use std::sync::{Arc, Mutex};
 
     let executable = super::web_search::detect_browser_executable()
         .ok_or_else(|| eyre::eyre!("no Chrome/Chromium executable detected"))?;
@@ -662,16 +588,75 @@ async fn render_page_html(url: &str, bound: Duration) -> Result<(String, String)
             .await
             .map_err(|e| eyre::eyre!("failed to launch Chrome: {e}"))?;
         let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+        let navigations: Arc<Mutex<Vec<String>>> = Arc::default();
+        let blocked_documents: Arc<Mutex<Vec<String>>> = Arc::default();
+        let mut tasks = Vec::new();
         let outcome = async {
             let page = browser
                 .new_page("about:blank")
                 .await
                 .map_err(|e| eyre::eyre!("failed to open page: {e}"))?;
-            let base_ua = page.user_agent().await.unwrap_or_default();
-            let ua = format!("{base_ua} octos-research/1.0 (+https://github.com/octos-org/octos)");
-            let _ = page
-                .set_user_agent(SetUserAgentOverrideParams::new(ua.trim().to_string()))
-                .await;
+            super::web_search::set_identifiable_user_agent(&page).await;
+
+            // In-browser SSRF guard: hold every request until checked.
+            let mut paused = page
+                .event_listener::<EventRequestPaused>()
+                .await
+                .map_err(|e| eyre::eyre!("failed to listen for requests: {e}"))?;
+            let guard_page = page.clone();
+            let blocked = blocked_documents.clone();
+            tasks.push(tokio::spawn(async move {
+                while let Some(ev) = paused.next().await {
+                    let url = ev.request.url.clone();
+                    if octos_research::net::check_url(&url).await.is_ok()
+                        || url.starts_with("data:")
+                        || url.starts_with("blob:")
+                    {
+                        let _ = guard_page
+                            .execute(ContinueRequestParams::new(ev.request_id.clone()))
+                            .await;
+                    } else {
+                        tracing::warn!(url = %url, "research render: blocked private/invalid request");
+                        if ev.resource_type == ResourceType::Document {
+                            blocked.lock().unwrap_or_else(|p| p.into_inner()).push(url);
+                        }
+                        let _ = guard_page
+                            .execute(FailRequestParams::new(
+                                ev.request_id.clone(),
+                                ErrorReason::BlockedByClient,
+                            ))
+                            .await;
+                    }
+                }
+            }));
+            let mut navs = page
+                .event_listener::<EventFrameNavigated>()
+                .await
+                .map_err(|e| eyre::eyre!("failed to listen for navigations: {e}"))?;
+            let nav_log = navigations.clone();
+            tasks.push(tokio::spawn(async move {
+                while let Some(ev) = navs.next().await {
+                    if ev.frame.parent_id.is_none() {
+                        nav_log
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(ev.frame.url.clone());
+                    }
+                }
+            }));
+            page.execute(
+                EnableParams::builder()
+                    .pattern(
+                        RequestPattern::builder()
+                            .url_pattern("*")
+                            .request_stage(RequestStage::Request)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await
+            .map_err(|e| eyre::eyre!("failed to enable request interception: {e}"))?;
+
             page.goto(url)
                 .await
                 .map_err(|e| eyre::eyre!("navigation failed: {e}"))?;
@@ -690,9 +675,31 @@ async fn render_page_html(url: &str, bound: Duration) -> Result<(String, String)
             Ok::<_, eyre::Report>((final_url, html))
         }
         .await;
+        for t in tasks {
+            t.abort();
+        }
         let _ = browser.close().await;
         handler_task.abort();
-        outcome
+        if let Some(b) = blocked_documents
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .first()
+        {
+            eyre::bail!("ssrf_blocked: page tried to navigate to {b}");
+        }
+        let (final_url, html) = outcome?;
+        if final_url.starts_with("chrome-error:") {
+            eyre::bail!("browser error page (navigation failed or was refused)");
+        }
+        let navigations = navigations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        Ok(octos_research::reader::Rendered {
+            final_url,
+            html,
+            navigations,
+        })
     };
     tokio::time::timeout(bound, fut)
         .await
@@ -892,6 +899,51 @@ mod tests {
         assert!(f.check_domain("https://other.org/a").is_ok());
         assert_eq!(f.max_per_domain, Some(1));
         assert_eq!(f.langs, vec!["en"]);
+    }
+
+    #[tokio::test]
+    async fn should_discard_rendered_page_that_redirected_to_a_private_ip() {
+        // Browser result for a page whose JS redirect lands on the cloud
+        // metadata endpoint: the shared reader must refuse it before any
+        // extraction, whatever the renderer returned.
+        let reader = research_reader();
+        let rendered = octos_research::reader::Rendered {
+            final_url: "http://169.254.169.254/latest/meta-data/".into(),
+            html: format!("<html><body><p>{}</p></body></html>", "secret ".repeat(80)),
+            navigations: vec!["http://93.184.216.34/start".into()],
+        };
+        let err = reader
+            .accept_rendered("http://93.184.216.34/start", rendered)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("ssrf_blocked"), "{err}");
+        // And a private URL is never fetched at all.
+        let err = read_page(&reader, "http://169.254.169.254/latest/meta-data/", 1000)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ssrf_blocked"), "{err}");
+    }
+
+    /// Live check (Chrome + network): an HTTP redirect to the metadata
+    /// endpoint is blocked inside the browser by request interception.
+    /// Run with `cargo test -p octos-agent -- --ignored render_page_blocks`.
+    #[cfg(feature = "browser")]
+    #[tokio::test]
+    #[ignore = "needs Chrome and network"]
+    async fn render_page_blocks_redirect_to_metadata() {
+        let err = render_page(
+            "https://httpbin.org/redirect-to?url=http%3A%2F%2F169.254.169.254%2Flatest%2Fmeta-data%2F",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("169.254.169.254"), "{err}");
+        let ok = render_page("https://example.com/", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(ok.html.contains("Example Domain"));
     }
 
     #[tokio::test]

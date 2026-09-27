@@ -1342,87 +1342,6 @@ async fn bing_cdp_search(query: &str, count: u8) -> Result<Vec<SearchHit>, Strin
         .collect())
 }
 
-// ---------------------------------------------------------------------------
-// Page fetching (SSRF-safe)
-// ---------------------------------------------------------------------------
-
-/// Identifiable UA for page reads (policy: no browser disguise).
-const FETCH_USER_AGENT: &str = octos_research::USER_AGENT;
-/// Max redirects followed by [`ssrf_safe_get`].
-const FETCH_MAX_REDIRECTS: usize = 10;
-
-/// GET a URL with SSRF re-validated + DNS-pinned on EVERY redirect hop.
-///
-/// The shared `reqwest::Client` follows redirects by default WITHOUT
-/// re-checking the target, so an allowed URL that 30x-redirects to a private
-/// host (169.254.169.254 / 10.x / …) would be fetched unchecked. This builds
-/// a per-hop client with auto-redirects disabled and DNS pinned to the
-/// validated addresses, and follows `Location` manually. Fails closed on DNS
-/// error. (This binary ships its own SSRF copy — it cannot depend on
-/// octos-agent's `ssrf::ssrf_safe_send`.)
-async fn ssrf_safe_get(url: &str) -> Result<reqwest::Response, String> {
-    let mut current = url.to_string();
-
-    for _ in 0..FETCH_MAX_REDIRECTS {
-        let parsed = url::Url::parse(&current).map_err(|_| "invalid URL".to_string())?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| "URL has no host".to_string())?
-            .to_string();
-        if is_private_host(&host) {
-            return Err("blocked: private/internal host".to_string());
-        }
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        // Fail closed on DNS error (rebinding variant: fail at check time,
-        // succeed at fetch time).
-        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map_err(|e| format!("DNS resolution failed (fail-closed): {e}"))?
-            .collect();
-        for addr in &addrs {
-            if is_private_ip(&addr.ip()) {
-                return Err("blocked: host resolves to a private IP".to_string());
-            }
-        }
-
-        let mut builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .user_agent(FETCH_USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none());
-        // Pin ALL validated addresses at once: `resolve()` in a loop replaces
-        // the per-host override each call, pinning only the last address (and
-        // failing if it happens to be unreachable).
-        if !addrs.is_empty() {
-            builder = builder.resolve_to_addrs(&host, &addrs);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| format!("HTTP client error: {e}"))?;
-
-        let response = client
-            .get(&current)
-            .send()
-            .await
-            .map_err(|e| format!("fetch failed: {e}"))?;
-
-        if !response.status().is_redirection() {
-            return Ok(response);
-        }
-
-        let location = response
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| "redirect with no Location header".to_string())?;
-        current = parsed
-            .join(location)
-            .map_err(|_| format!("invalid redirect URL: {location}"))?
-            .to_string();
-    }
-
-    Err(format!("too many redirects (max {FETCH_MAX_REDIRECTS})"))
-}
-
 /// Extract all outbound http(s) links from HTML.
 fn extract_links_from_html(html: &str, base_url: &str) -> Vec<String> {
     let base = url::Url::parse(base_url).ok();
@@ -1643,48 +1562,13 @@ fn clean_boilerplate(text: &str) -> String {
 // SSRF protection
 // ---------------------------------------------------------------------------
 
-fn is_private_host(host: &str) -> bool {
-    if host == "localhost"
-        || host == "127.0.0.1"
-        || host == "::1"
-        || host == "0.0.0.0"
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-    {
-        return true;
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return is_private_ip(&ip);
-    }
-    false
-}
-
-fn is_private_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_unspecified()
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (v6.octets()[0] & 0xfe) == 0xfc
-                || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80)
-        }
-    }
-}
-
+/// Private/internal link targets are dropped (shared SSRF classification
+/// from `octos_research::net`; the reader re-checks with DNS before any read).
 fn is_private_url(url: &str) -> bool {
-    if let Ok(parsed) = url::Url::parse(url) {
-        if let Some(host) = parsed.host_str() {
-            return is_private_host(host);
-        }
-    }
-    false
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(octos_research::net::is_private_host))
+        .unwrap_or(false)
 }
 
 /// Extract same-origin internal links from a page, filtering out already-seen URLs.
@@ -2993,10 +2877,11 @@ mod tests {
     }
 
     #[test]
-    fn test_is_private_host() {
-        assert!(is_private_host("localhost"));
-        assert!(is_private_host("127.0.0.1"));
-        assert!(!is_private_host("example.com"));
+    fn test_is_private_url() {
+        assert!(is_private_url("http://localhost/x"));
+        assert!(is_private_url("http://127.0.0.1/x"));
+        assert!(is_private_url("http://[::1]/x"));
+        assert!(!is_private_url("https://example.com/x"));
     }
 
     #[test]

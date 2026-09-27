@@ -199,13 +199,35 @@ pub fn robots_location(page_url: &str) -> Option<(String, String)> {
     Some((format!("{origin}/robots.txt"), path))
 }
 
-type Slot = Arc<tokio::sync::OnceCell<Arc<RobotsStatus>>>;
+/// How long a fetched robots.txt is trusted (RFC 9309 §2.4: SHOULD NOT
+/// cache for more than 24 hours).
+pub const ROBOTS_TTL: Duration = Duration::from_secs(24 * 3600);
+/// How long an "unreachable" (5xx / network error → disallow all) result is
+/// kept before robots.txt is fetched again.
+pub const UNREACHABLE_TTL: Duration = Duration::from_secs(3600);
+
+struct SlotInner {
+    created: std::time::Instant,
+    cell: tokio::sync::OnceCell<Arc<RobotsStatus>>,
+}
+
+type Slot = Arc<SlotInner>;
 
 /// Per-origin robots.txt cache. Concurrent checks for the same origin share
-/// one fetch.
-#[derive(Default, Clone)]
+/// one fetch. Entries expire: parsed/4xx after [`ROBOTS_TTL`], unreachable
+/// after [`UNREACHABLE_TTL`], so a transient outage does not block an
+/// origin for the life of the process.
+#[derive(Clone)]
 pub struct RobotsCache {
     slots: Arc<Mutex<HashMap<String, Slot>>>,
+    ttl: Duration,
+    unreachable_ttl: Duration,
+}
+
+impl Default for RobotsCache {
+    fn default() -> Self {
+        Self::with_ttls(ROBOTS_TTL, UNREACHABLE_TTL)
+    }
 }
 
 /// Decision for one URL.
@@ -220,6 +242,29 @@ pub struct RobotsDecision {
 impl RobotsCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Cache with custom expiry (tests, long-running services).
+    pub fn with_ttls(ttl: Duration, unreachable_ttl: Duration) -> Self {
+        Self {
+            slots: Arc::new(Mutex::new(HashMap::new())),
+            ttl,
+            unreachable_ttl,
+        }
+    }
+
+    fn expired(&self, slot: &SlotInner) -> bool {
+        match slot.cell.get() {
+            None => false, // fetch in flight
+            Some(status) => {
+                let ttl = if **status == RobotsStatus::Unreachable {
+                    self.unreachable_ttl
+                } else {
+                    self.ttl
+                };
+                slot.created.elapsed() >= ttl
+            }
+        }
     }
 
     /// Check `page_url` for `agent`, fetching the origin's robots.txt once
@@ -238,9 +283,20 @@ impl RobotsCache {
         };
         let slot = {
             let mut map = self.slots.lock().unwrap_or_else(|p| p.into_inner());
-            map.entry(robots_url.clone()).or_default().clone()
+            let fresh = || {
+                Arc::new(SlotInner {
+                    created: std::time::Instant::now(),
+                    cell: tokio::sync::OnceCell::new(),
+                })
+            };
+            let entry = map.entry(robots_url.clone()).or_insert_with(fresh);
+            if self.expired(entry) {
+                *entry = fresh();
+            }
+            entry.clone()
         };
         let status = slot
+            .cell
             .get_or_init(|| async move {
                 let (code, body) = fetch(robots_url).await;
                 Arc::new(RobotsStatus::from_response(code, &body))
@@ -345,5 +401,36 @@ mod tests {
             .await;
         assert!(!d.allowed);
         assert_eq!(d.reason, "robots_unreachable");
+    }
+
+    #[tokio::test]
+    async fn should_refetch_unreachable_robots_after_ttl_but_keep_parsed() {
+        // Unreachable expires immediately; parsed results are kept.
+        let cache = RobotsCache::with_ttls(Duration::from_secs(3600), Duration::ZERO);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let check = |url: &'static str, up: bool| {
+            let calls = calls.clone();
+            let cache = cache.clone();
+            async move {
+                cache
+                    .check(url, "octos-research", |_| async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if up {
+                            (Some(200), "User-agent: *\nDisallow:\n".to_string())
+                        } else {
+                            (Some(503), String::new())
+                        }
+                    })
+                    .await
+            }
+        };
+        assert!(!check("https://flaky.example/a", false).await.allowed);
+        // Outage over: the unreachable entry expired, robots.txt is fetched again.
+        assert!(check("https://flaky.example/a", true).await.allowed);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Parsed entry is cached (a later outage does not flip it).
+        assert!(check("https://flaky.example/b", false).await.allowed);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(UNREACHABLE_TTL, Duration::from_secs(3600));
     }
 }

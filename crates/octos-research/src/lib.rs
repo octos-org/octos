@@ -20,8 +20,12 @@ pub mod extract;
 pub mod filter;
 pub mod item;
 pub mod lang;
+#[cfg(feature = "fetch")]
+pub mod net;
 pub mod plan;
 pub mod providers;
+#[cfg(all(feature = "fetch", feature = "extract"))]
+pub mod reader;
 pub mod robots;
 pub mod throttle;
 pub mod urls;

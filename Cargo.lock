@@ -5079,6 +5079,7 @@ dependencies = [
  "dom_smoothie",
  "quick-xml",
  "regex",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",

@@ -13,21 +13,20 @@
 //! (no main text over plain HTTP) are rendered by the `deep_crawl` browser.
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
 use octos_research::date::Since;
-use octos_research::extract::{self, PageMeta};
+use octos_research::extract::PageMeta;
 use octos_research::plan::{self, Category, PlanInput, Provider};
 use octos_research::providers as free;
-use octos_research::{Filters, HostThrottle, OneOrMany, RobotsCache, SearchHit};
+use octos_research::reader;
+use octos_research::{Filters, HostThrottle, OneOrMany, SearchHit};
 
 use crate::Input;
 
-/// Largest page body read over plain HTTP.
-const MAX_PAGE_BYTES: usize = 3 * 1024 * 1024;
 /// Parallel page reads (per-host spacing still applies).
 const READ_CONCURRENCY: usize = 8;
 
@@ -633,7 +632,7 @@ pub(crate) fn parse_perplexity(text: &str) -> Result<ProviderOut, String> {
 // Reading pages
 // ---------------------------------------------------------------------------
 
-/// A page read for citation.
+/// A page read for citation (the shared reader's page plus its links).
 pub(crate) struct ReadPage {
     pub final_url: String,
     pub text: String,
@@ -651,14 +650,30 @@ impl ReadPage {
             self.meta.canonical.as_deref().unwrap_or(&self.final_url),
         )
     }
+
+    fn from_shared(p: reader::ReadPage) -> Self {
+        let links = if p.html.is_empty() {
+            Vec::new()
+        } else {
+            crate::extract_links_from_html(&p.html, &p.final_url)
+        };
+        Self {
+            final_url: p.final_url,
+            text: p.text,
+            meta: p.meta,
+            links,
+            rendered: p.rendered,
+            fetched_at: p.fetched_at,
+        }
+    }
 }
 
-/// Polite reader: robots.txt per origin, per-host spacing, size caps,
-/// identifiable User-Agent, browser rendering for JS-heavy pages.
+/// deep-search's use of the shared polite reader (`octos_research::reader`:
+/// SSRF + DNS pinning, robots.txt, per-host spacing, size caps, and
+/// post-render SSRF re-validation), with the `deep_crawl` browser as the
+/// renderer.
 pub(crate) struct Reader {
-    robots: RobotsCache,
-    throttle: HostThrottle,
-    render: bool,
+    inner: reader::Reader,
 }
 
 impl Reader {
@@ -668,126 +683,25 @@ impl Reader {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(1000)
             .clamp(200, 30_000);
+        let renderer: Option<reader::Renderer> = render.then(|| {
+            Arc::new(|url: String| {
+                Box::pin(async move { render_with_browser(&url).await }) as reader::RenderFuture
+            }) as reader::Renderer
+        });
         Self {
-            robots: RobotsCache::new(),
-            throttle: HostThrottle::new(Duration::from_millis(interval_ms)),
-            render,
-        }
-    }
-
-    async fn robots_allows(&self, url: &str) -> Result<Option<Duration>, String> {
-        let d = self
-            .robots
-            .check(url, octos_research::AGENT_TOKEN, |robots_url| async move {
-                match crate::ssrf_safe_get(&robots_url).await {
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        let body = read_capped(resp, 512 * 1024).await.unwrap_or_default();
-                        (Some(status), body)
-                    }
-                    Err(_) => (None, String::new()),
-                }
-            })
-            .await;
-        if d.allowed {
-            Ok(d.crawl_delay)
-        } else {
-            Err(d.reason.to_string())
+            inner: reader::Reader::new(reader::ReaderConfig {
+                host_interval: Duration::from_millis(interval_ms),
+                keep_html: true,
+                fallback_text: Some(crate::html_to_text),
+                renderer,
+                ..Default::default()
+            }),
         }
     }
 
     /// Read one page. `Err(reason)` is recorded as a skipped URL.
     pub async fn read(&self, url: &str) -> Result<ReadPage, String> {
-        if crate::is_private_url(url) {
-            return Err("blocked_private_host".to_string());
-        }
-        let crawl_delay = self.robots_allows(url).await?;
-        let host = octos_research::urls::domain_of(url).unwrap_or_default();
-        self.throttle.wait(&host, crawl_delay).await;
-
-        let resp = crate::ssrf_safe_get(url)
-            .await
-            .map_err(|e| format!("fetch_error: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(format!("fetch_error: HTTP {}", status.as_u16()));
-        }
-        let final_url = resp.url().to_string();
-        let ctype = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !ctype.is_empty()
-            && !ctype.contains("html")
-            && !ctype.contains("xml")
-            && !ctype.starts_with("text/")
-        {
-            return Err(format!("unsupported_content_type: {ctype}"));
-        }
-        let body = read_capped(resp, MAX_PAGE_BYTES)
-            .await
-            .map_err(|e| format!("fetch_error: {e}"))?;
-
-        let fetched_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        if ctype.starts_with("text/plain") {
-            return Ok(ReadPage {
-                final_url,
-                text: body.trim().to_string(),
-                meta: PageMeta::default(),
-                links: Vec::new(),
-                rendered: false,
-                fetched_at,
-            });
-        }
-
-        let mut ex = extract::extract(&body, &final_url);
-        let mut html = body;
-        let mut page_url = final_url;
-        let mut rendered = false;
-        if ex.is_empty_text() {
-            // Readability found no article; keep the plain boilerplate-
-            // stripped text when it is substantial (lists, docs pages).
-            let plain = crate::html_to_text(&html);
-            if plain.chars().filter(|c| !c.is_whitespace()).count() >= extract::MIN_MAIN_TEXT_CHARS
-            {
-                ex.text = plain;
-            }
-        }
-        if ex.is_empty_text() && self.render {
-            match render_with_browser(&page_url).await {
-                Ok((rurl, rhtml)) => {
-                    // The browser may land somewhere else (JS redirect):
-                    // that origin's robots.txt applies too.
-                    if octos_research::urls::domain_of(&rurl)
-                        != octos_research::urls::domain_of(&page_url)
-                    {
-                        self.robots_allows(&rurl).await?;
-                    }
-                    let rex = extract::extract(&rhtml, &rurl);
-                    if !rex.is_empty_text() {
-                        ex = rex;
-                        html = rhtml;
-                        page_url = rurl;
-                        rendered = true;
-                    }
-                }
-                Err(e) => eprintln!("[deep_search] render skipped for {page_url}: {e}"),
-            }
-        }
-        if ex.is_empty_text() {
-            return Err("no_main_text".to_string());
-        }
-        let links = crate::extract_links_from_html(&html, &page_url);
-        Ok(ReadPage {
-            final_url: page_url,
-            text: ex.text,
-            meta: ex.meta,
-            links,
-            rendered,
-            fetched_at,
-        })
+        self.inner.read(url).await.map(ReadPage::from_shared)
     }
 
     /// Split hits into those robots.txt lets us read and those it does not
@@ -798,7 +712,7 @@ impl Reader {
         hits: Vec<SearchHit>,
     ) -> (Vec<SearchHit>, Vec<(SearchHit, String)>) {
         let decisions: Vec<Result<Option<Duration>, String>> = stream::iter(hits.iter())
-            .map(|h| self.robots_allows(&h.url))
+            .map(|h| self.inner.robots_allows(&h.url))
             .buffered(READ_CONCURRENCY)
             .collect()
             .await;
@@ -823,28 +737,11 @@ impl Reader {
     }
 }
 
-/// Read a response body up to `cap` bytes (lossy UTF-8).
-async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<String, String> {
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                let room = cap.saturating_sub(buf.len());
-                buf.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                if buf.len() >= cap {
-                    break;
-                }
-            }
-            Ok(None) => break,
-            Err(e) => return Err(format!("read body failed: {e}")),
-        }
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// Render `url` in the `deep_crawl` headless browser and return
-/// `(final_url, html)`. Reading only: one page, no search-results pages.
-async fn render_with_browser(url: &str) -> Result<(String, String), String> {
+/// Render `url` in the `deep_crawl` headless browser. Reading only: one
+/// page, no search-results pages. deep_crawl blocks private destinations
+/// inside the browser (request interception) and reports the navigation
+/// chain; the shared reader re-validates it before accepting the HTML.
+async fn render_with_browser(url: &str) -> Result<reader::Rendered, String> {
     let _permit = crate::browser_semaphore()
         .acquire()
         .await
@@ -857,8 +754,13 @@ async fn render_with_browser(url: &str) -> Result<(String, String), String> {
         "include_html": true,
     });
     let stdout = crate::run_deep_crawl(&bin, &input, Duration::from_secs(45)).await?;
+    parse_render_output(&stdout, url)
+}
+
+/// Parse deep_crawl's `pages[0]` into a [`reader::Rendered`].
+fn parse_render_output(stdout: &str, url: &str) -> Result<reader::Rendered, String> {
     let parsed: serde_json::Value =
-        serde_json::from_str(&stdout).map_err(|_| "unparseable deep_crawl output".to_string())?;
+        serde_json::from_str(stdout).map_err(|_| "unparseable deep_crawl output".to_string())?;
     let page = parsed["pages"]
         .as_array()
         .and_then(|p| p.first())
@@ -867,8 +769,18 @@ async fn render_with_browser(url: &str) -> Result<(String, String), String> {
     if html.is_empty() {
         return Err("browser returned empty HTML".to_string());
     }
-    let final_url = page["final_url"].as_str().unwrap_or(url).to_string();
-    Ok((final_url, html))
+    Ok(reader::Rendered {
+        final_url: page["final_url"].as_str().unwrap_or(url).to_string(),
+        html,
+        navigations: page["navigations"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -967,6 +879,30 @@ mod tests {
         let o = parse_perplexity(pplx).unwrap();
         assert_eq!(o.hits[0].url, "https://p.example/1");
         assert_eq!(o.answer, "Answer [1]");
+    }
+
+    #[tokio::test]
+    async fn should_discard_browser_render_that_js_redirects_to_a_private_ip() {
+        // deep_crawl output for the fixture page that JS-redirects to the
+        // cloud metadata endpoint.
+        let stdout = serde_json::json!({
+            "output": "", "success": true,
+            "pages": [{
+                "url": "http://93.184.216.34/start",
+                "final_url": "http://169.254.169.254/latest/meta-data/",
+                "navigations": ["http://93.184.216.34/start", "http://169.254.169.254/latest/meta-data/"],
+                "html": format!("<html><body><p>{}</p></body></html>", "secret ".repeat(80)),
+            }]
+        })
+        .to_string();
+        let rendered = parse_render_output(&stdout, "http://93.184.216.34/start").unwrap();
+        assert_eq!(rendered.navigations.len(), 2);
+        let r = reader::Reader::new(reader::ReaderConfig::default());
+        let err = r
+            .accept_rendered("http://93.184.216.34/start", rendered)
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("ssrf_blocked"), "{err}");
     }
 
     #[test]
