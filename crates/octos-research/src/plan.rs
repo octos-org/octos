@@ -1,7 +1,8 @@
 //! Provider order. Free structured sources first, then a configured
-//! SearXNG, then search APIs the person added keys for, then the keyless
-//! HTML fallback. The headless-browser search-results scrape is never part
-//! of the automatic order; it is appended only when explicitly enabled.
+//! SearXNG, then search APIs the person added keys for. Scraping a search
+//! engine's results page (DuckDuckGo HTML, Bing in headless Chrome) is never
+//! part of the default order; both are appended only when an operator opts
+//! in with [`crate::SERP_SCRAPE_ENV`].
 
 use serde::{Deserialize, Serialize};
 
@@ -19,10 +20,12 @@ pub enum Provider {
     Perplexity,
     Brave,
     You,
+    /// DuckDuckGo's HTML results page. Opt-in only (see
+    /// [`crate::SERP_SCRAPE_ENV`]).
     #[serde(rename = "duckduckgo")]
     DuckDuckGo,
     /// Bing rendered in headless Chrome. Opt-in only (see
-    /// [`crate::BROWSER_SERP_ENV`]).
+    /// [`crate::SERP_SCRAPE_ENV`]).
     #[serde(rename = "bing_cdp")]
     BingBrowser,
 }
@@ -64,6 +67,11 @@ impl Provider {
     /// Free, key-less structured sources.
     pub fn is_free_structured(self) -> bool {
         matches!(self, Provider::Gdelt | Provider::GoogleNewsRss)
+    }
+
+    /// Providers that scrape a search engine's results page.
+    pub fn is_serp_scrape(self) -> bool {
+        matches!(self, Provider::DuckDuckGo | Provider::BingBrowser)
     }
 }
 
@@ -152,17 +160,15 @@ pub struct PlanInput {
     pub searxng_configured: bool,
     /// Keyed providers that have a key, in the caller's priority order.
     pub keyed: Vec<Provider>,
-    /// Include the keyless DuckDuckGo HTML endpoint as the last resort.
-    pub keyless_fallback: bool,
-    /// Operator opt-in for the headless-browser search-results scrape.
-    pub allow_browser_serp: bool,
+    /// Operator opt-in for scraping search-results pages (DuckDuckGo HTML,
+    /// then Bing in headless Chrome), appended as the last resorts.
+    pub allow_serp_scrape: bool,
 }
 
 /// Automatic provider order.
 ///
 /// news → `[gdelt, google_news_rss]`, then `searxng` if configured, then the
-/// keyed providers, then `duckduckgo` (if enabled), and `bing_cdp` only when
-/// explicitly allowed.
+/// keyed providers. `duckduckgo` and `bing_cdp` only when explicitly allowed.
 pub fn plan(input: &PlanInput) -> Vec<Provider> {
     let mut out = Vec::new();
     if input.news {
@@ -173,14 +179,12 @@ pub fn plan(input: &PlanInput) -> Vec<Provider> {
         out.push(Provider::Searxng);
     }
     for p in &input.keyed {
-        if !out.contains(p) && !matches!(p, Provider::BingBrowser | Provider::DuckDuckGo) {
+        if !out.contains(p) && !p.is_serp_scrape() {
             out.push(*p);
         }
     }
-    if input.keyless_fallback {
+    if input.allow_serp_scrape {
         out.push(Provider::DuckDuckGo);
-    }
-    if input.allow_browser_serp {
         out.push(Provider::BingBrowser);
     }
     out
@@ -201,8 +205,7 @@ mod tests {
             news: true,
             searxng_configured: true,
             keyed: vec![Provider::Serper, Provider::Brave],
-            keyless_fallback: true,
-            allow_browser_serp: false,
+            allow_serp_scrape: false,
         });
         assert_eq!(
             order,
@@ -212,40 +215,41 @@ mod tests {
                 Provider::Searxng,
                 Provider::Serper,
                 Provider::Brave,
-                Provider::DuckDuckGo,
             ]
         );
     }
 
     #[test]
-    fn should_never_plan_browser_serp_by_default() {
+    fn should_never_plan_serp_scrapers_by_default() {
         for news in [true, false] {
             let order = plan(&PlanInput {
                 news,
                 searxng_configured: false,
-                // Even if a caller lists it among its providers.
-                keyed: vec![Provider::BingBrowser],
-                keyless_fallback: true,
-                allow_browser_serp: false,
+                // Even if a caller lists them among its providers.
+                keyed: vec![
+                    Provider::BingBrowser,
+                    Provider::DuckDuckGo,
+                    Provider::Tavily,
+                ],
+                allow_serp_scrape: false,
             });
-            assert!(!order.contains(&Provider::BingBrowser), "{order:?}");
+            assert!(!order.iter().any(|p| p.is_serp_scrape()), "{order:?}");
         }
-        let opted_in = plan(&PlanInput {
-            allow_browser_serp: true,
-            keyless_fallback: true,
-            ..Default::default()
-        });
-        assert_eq!(opted_in.last(), Some(&Provider::BingBrowser));
+        // General query, nothing configured: nothing to run (no silent scrape).
+        assert!(plan(&PlanInput::default()).is_empty());
     }
 
     #[test]
-    fn should_skip_news_sources_for_general_queries_without_searxng() {
+    fn should_append_ddg_then_bing_when_scraping_is_opted_in() {
         let order = plan(&PlanInput {
-            news: false,
-            keyless_fallback: true,
+            keyed: vec![Provider::Brave],
+            allow_serp_scrape: true,
             ..Default::default()
         });
-        assert_eq!(order, vec![Provider::DuckDuckGo]);
+        assert_eq!(
+            order,
+            vec![Provider::Brave, Provider::DuckDuckGo, Provider::BingBrowser]
+        );
     }
 
     #[test]

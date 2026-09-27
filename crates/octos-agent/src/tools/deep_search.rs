@@ -564,7 +564,9 @@ impl DeepSearchTool {
 
         // Main text (readability); else the Markdown of the whole page.
         let mut extracted = octos_research::extract::extract(&body, &final_url);
+        #[cfg_attr(not(feature = "browser"), allow(unused_mut))]
         let mut page_url = final_url;
+        #[cfg_attr(not(feature = "browser"), allow(unused_mut))]
         let mut rendered = false;
         if extracted.is_empty_text() {
             let markdown = htmd::convert(&body).unwrap_or_else(|_| extract_text_simple(&body));

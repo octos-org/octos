@@ -296,6 +296,7 @@ struct SearchLog {
     seen: HashSet<String>,
     queries: Vec<String>,
     providers: Vec<String>,
+    tried: Vec<String>,
     errors: Vec<String>,
     dump: String,
     answer: String,
@@ -314,6 +315,11 @@ impl SearchLog {
             }
         }
         self.errors.extend(round.errors);
+        for t in round.tried {
+            if !self.tried.contains(&t) {
+                self.tried.push(t);
+            }
+        }
         if !round.answer.trim().is_empty() {
             self.answer.push_str(round.answer.trim());
             self.answer.push_str("\n\n");
@@ -588,14 +594,9 @@ async fn run_deep_search(
         log.add(query, lang.as_deref(), round);
     }
     if log.hits.is_empty() {
-        return Output {
-            output: format!(
-                "No results found from any search provider for: {query}\n\nProvider notes:\n- {}",
-                log.errors.join("\n- ")
-            ),
-            success: false,
-            ..Default::default()
-        };
+        // Empty result, not a scrape: say what was tried and how to get
+        // results (SearXNG, a key, or `category: news`).
+        return no_results_output(query, &log, opts);
     }
     let initial_answer = log.dump.clone();
 
@@ -992,6 +993,35 @@ async fn run_deep_search(
     }
 }
 
+/// Empty (successful) result when no allowed provider returned anything.
+fn no_results_output(query: &str, log: &SearchLog, opts: &research::Options) -> Output {
+    let mut message = octos_research::no_results_message(query, &log.tried);
+    if !log.errors.is_empty() {
+        message.push_str("\nProvider notes:\n- ");
+        message.push_str(&log.errors.join("\n- "));
+        message.push('\n');
+    }
+    let output = if opts.items_mode {
+        let mut doc = ItemsDocument::new(query, opts.controls_json());
+        doc.providers = log.tried.clone();
+        doc.note = Some(message);
+        serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
+    } else {
+        message
+    };
+    Output {
+        output,
+        success: true,
+        summary: Some(ResultSummary {
+            kind: "deep_research".to_string(),
+            headline: format!("No results for '{query}' from the allowed providers"),
+            rounds: Some(log.queries.len() as u32),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// `<report-stem>.items.json` next to the report, so repeated runs keep
 /// their own items like they keep their own reports.
 fn items_path_for(report_path: &Path) -> PathBuf {
@@ -1101,10 +1131,10 @@ fn build_client() -> reqwest::Client {
 // DuckDuckGo HTML search (keyless last resort)
 // ---------------------------------------------------------------------------
 
-/// DuckDuckGo's no-JavaScript HTML endpoint, the keyless last resort after
-/// the free structured sources, SearXNG and any keyed API. Requested with
-/// the identifiable research User-Agent (not a browser disguise); if
-/// DuckDuckGo declines, that is a clean miss.
+/// DuckDuckGo's no-JavaScript HTML results page. **Opt-in only**
+/// (`OCTOS_ALLOW_SERP_SCRAPE=1`): it is a search-results page, which ADR
+/// 0002 rules out scraping by default. Requested with the identifiable
+/// research User-Agent; if DuckDuckGo declines, that is a clean miss.
 async fn ddg_search(query: &str, count: u8) -> Result<Vec<SearchHit>, String> {
     let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoded(query));
     let response = research::api_client()
@@ -1271,12 +1301,12 @@ async fn run_deep_crawl(
 
 /// Bing results page rendered in headless Chrome, then scraped.
 ///
-/// **Opt-in only** (`OCTOS_ALLOW_BROWSER_SERP=1`): scraping a search
+/// **Opt-in only** (`OCTOS_ALLOW_SERP_SCRAPE=1`): scraping a search
 /// engine's results page with a browser is the "disguised search" OctoSense
 /// ADR 0002 §6 rules out, so it is never part of the automatic provider
 /// order. Kept for operators who explicitly accept that on their own box.
 async fn bing_cdp_search(query: &str, count: u8) -> Result<Vec<SearchHit>, String> {
-    if !research::browser_serp_allowed() {
+    if !research::serp_scrape_allowed() {
         return Err("disabled".to_string());
     }
     let _permit = browser_semaphore()
@@ -2916,6 +2946,31 @@ mod tests {
             items_path_for(Path::new("/r/topic_report-2.md")),
             PathBuf::from("/r/topic_report-2.items.json")
         );
+    }
+
+    #[test]
+    fn should_return_empty_result_with_guidance_when_nothing_is_configured() {
+        let mut opts = research::Options::from_input(
+            &serde_json::from_value(serde_json::json!({"query": "q", "output": "items"})).unwrap(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        let log = SearchLog {
+            queries: vec!["q".into()],
+            errors: vec!["duckduckgo: disabled (scraping search-results pages needs OCTOS_ALLOW_SERP_SCRAPE=1)".into()],
+            ..Default::default()
+        };
+        let out = no_results_output("q", &log, &opts);
+        assert!(out.success, "empty result, not a failure");
+        let doc: serde_json::Value = serde_json::from_str(&out.output).unwrap();
+        assert!(doc["items"].as_array().unwrap().is_empty());
+        let note = doc["note"].as_str().unwrap();
+        assert!(note.contains("Providers tried: none"), "{note}");
+        assert!(note.contains("SEARXNG_URL") && note.contains("OCTOS_ALLOW_SERP_SCRAPE"));
+
+        opts.items_mode = false;
+        let text = no_results_output("q", &log, &opts).output;
+        assert!(text.contains("add a search API key"), "{text}");
     }
 
     #[test]

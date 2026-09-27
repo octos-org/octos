@@ -127,6 +127,9 @@ pub struct ItemsDocument {
     pub report: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub items_file: Option<String>,
+    /// Human-readable note, e.g. why there are no items and how to fix it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl ItemsDocument {

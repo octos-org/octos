@@ -42,22 +42,51 @@ pub const AGENT_TOKEN: &str = "octos-research";
 pub const USER_AGENT: &str =
     "Mozilla/5.0 (compatible; octos-research/1.0; +https://github.com/octos-org/octos)";
 
-/// Environment variable that opts in to the headless-browser search-results
-/// scrape (Bing rendered in Chrome). Off unless set to `1`/`true`/`yes`.
-/// ADR 0002 forbids disguised search, so this exists only for operators who
-/// explicitly accept that trade-off on their own machine.
+/// Environment variable that opts in to scraping search-engine results
+/// pages: the keyless DuckDuckGo HTML endpoint and the Bing results page
+/// rendered in headless Chrome. Off unless set to `1`/`true`/`yes`.
+/// ADR 0002 rules out scraping search results pages, so this exists only for
+/// operators who explicitly accept that trade-off on their own machine.
+pub const SERP_SCRAPE_ENV: &str = "OCTOS_ALLOW_SERP_SCRAPE";
+
+/// Earlier name of [`SERP_SCRAPE_ENV`], still honoured as an alias.
 pub const BROWSER_SERP_ENV: &str = "OCTOS_ALLOW_BROWSER_SERP";
 
 /// Environment variable naming a self-hosted SearXNG base URL
 /// (e.g. `http://127.0.0.1:8888`).
 pub const SEARXNG_URL_ENV: &str = "SEARXNG_URL";
 
-/// Whether the browser search-results scrape is explicitly enabled, given an
-/// env lookup (injected so tests never touch process env).
-pub fn browser_serp_allowed(lookup: impl Fn(&str) -> Option<String>) -> bool {
-    lookup(BROWSER_SERP_ENV)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+/// Whether search-results-page scraping (DuckDuckGo HTML, Bing in a
+/// browser) is explicitly enabled, via [`SERP_SCRAPE_ENV`] or its alias
+/// [`BROWSER_SERP_ENV`]. The env lookup is injected so tests never touch
+/// process env.
+pub fn serp_scrape_allowed(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    [SERP_SCRAPE_ENV, BROWSER_SERP_ENV].iter().any(|k| {
+        lookup(k)
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+/// Message for a search where no allowed provider returned anything: what
+/// was tried and how to get results without scraping search pages.
+pub fn no_results_message(query: &str, tried: &[String]) -> String {
+    let tried = if tried.is_empty() {
+        "none (the query is not news-ish and no SearXNG or search API key is configured)"
+            .to_string()
+    } else {
+        tried.join(", ")
+    };
+    format!(
+        "No results for: {query}\n\nProviders tried: {tried}.\n\n\
+         Search-results pages are not scraped by default (OctoSense ADR 0002). To get \
+         results for general queries, either set {SEARXNG_URL_ENV} to a self-hosted \
+         SearXNG instance (with the `json` format enabled), or add a search API key \
+         (SERPER_API_KEY, TAVILY_API_KEY, BRAVE_API_KEY, YDC_API_KEY or \
+         PERPLEXITY_API_KEY). For news, use category \"news\" or a recent `since` so \
+         GDELT and Google News are used. An operator can opt in to scraping \
+         DuckDuckGo/Bing results pages with {SERP_SCRAPE_ENV}=1 (not recommended).\n"
+    )
 }
 
 #[cfg(test)]
@@ -65,12 +94,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_keep_browser_serp_off_when_env_is_unset_or_falsy() {
-        assert!(!browser_serp_allowed(|_| None));
-        assert!(!browser_serp_allowed(|_| Some("0".into())));
-        assert!(!browser_serp_allowed(|_| Some("".into())));
-        assert!(browser_serp_allowed(|_| Some("1".into())));
-        assert!(browser_serp_allowed(|_| Some("TRUE".into())));
+    fn should_keep_serp_scraping_off_unless_opted_in() {
+        assert!(!serp_scrape_allowed(|_| None));
+        assert!(!serp_scrape_allowed(|_| Some("0".into())));
+        assert!(!serp_scrape_allowed(|_| Some("".into())));
+        let only =
+            |key: &'static str, v: &'static str| move |k: &str| (k == key).then(|| v.to_string());
+        assert!(serp_scrape_allowed(only(SERP_SCRAPE_ENV, "1")));
+        assert!(serp_scrape_allowed(only(SERP_SCRAPE_ENV, "TRUE")));
+        assert!(serp_scrape_allowed(only(BROWSER_SERP_ENV, "1")), "alias");
+        assert!(!serp_scrape_allowed(only("OTHER", "1")));
+    }
+
+    #[test]
+    fn should_explain_how_to_get_results_without_scraping() {
+        let m = no_results_message("q", &["gdelt".into(), "google_news_rss".into()]);
+        assert!(m.contains("Providers tried: gdelt, google_news_rss"));
+        assert!(m.contains(SEARXNG_URL_ENV) && m.contains("TAVILY_API_KEY"));
+        assert!(m.contains(SERP_SCRAPE_ENV));
+        assert!(no_results_message("q", &[]).contains("Providers tried: none"));
     }
 
     #[test]

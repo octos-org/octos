@@ -2,9 +2,11 @@
 //!
 //! Provider order (see `octos_research::plan`): free structured sources
 //! first (GDELT + Google News RSS, for news-ish queries), then a
-//! self-hosted SearXNG (`SEARXNG_URL`), then search APIs with keys, then the
-//! keyless DuckDuckGo HTML endpoint. The headless-Chrome Bing scrape is not
-//! part of the automatic order; it needs `OCTOS_ALLOW_BROWSER_SERP=1`.
+//! self-hosted SearXNG (`SEARXNG_URL`), then search APIs with keys. Scraping
+//! search-results pages (DuckDuckGo HTML, Bing in headless Chrome) is not in
+//! the default order; both need `OCTOS_ALLOW_SERP_SCRAPE=1` (alias
+//! `OCTOS_ALLOW_BROWSER_SERP`). With nothing configured, a general query
+//! returns an empty result that says how to add SearXNG or a key.
 //!
 //! Pages that will be cited are read with an identifiable User-Agent,
 //! after a robots.txt check, spaced per host, with size caps; JS-heavy pages
@@ -41,6 +43,8 @@ pub(crate) struct Options {
     pub category: Category,
     /// Render JS-heavy pages with the browser when plain HTTP has no text.
     pub render: bool,
+    /// Operator opt-in (env) for scraping search-results pages.
+    pub allow_serp_scrape: bool,
     pub now: DateTime<Utc>,
 }
 
@@ -89,6 +93,7 @@ impl Options {
             region,
             category: Category::parse(input.category.as_deref())?,
             render,
+            allow_serp_scrape: serp_scrape_allowed(),
             now,
         })
     }
@@ -140,6 +145,8 @@ pub(crate) struct RoundOut {
     pub answer: String,
     pub providers: Vec<String>,
     pub errors: Vec<String>,
+    /// Every provider called this round (with or without results).
+    pub tried: Vec<String>,
 }
 
 pub(crate) fn api_client() -> &'static reqwest::Client {
@@ -177,18 +184,19 @@ fn keyed_available() -> Vec<Provider> {
     .collect()
 }
 
-pub(crate) fn browser_serp_allowed() -> bool {
-    octos_research::browser_serp_allowed(|k| std::env::var(k).ok())
+/// Operator opt-in for scraping search-results pages (DuckDuckGo HTML,
+/// Bing in headless Chrome).
+pub(crate) fn serp_scrape_allowed() -> bool {
+    octos_research::serp_scrape_allowed(|k| std::env::var(k).ok())
 }
 
 /// Automatic provider plan for this environment.
-pub(crate) fn auto_plan(news: bool) -> Vec<Provider> {
+pub(crate) fn auto_plan(news: bool, allow_serp_scrape: bool) -> Vec<Provider> {
     plan::plan(&PlanInput {
         news,
         searxng_configured: env_nonempty(octos_research::SEARXNG_URL_ENV).is_some(),
         keyed: keyed_available(),
-        keyless_fallback: true,
-        allow_browser_serp: browser_serp_allowed(),
+        allow_serp_scrape,
     })
 }
 
@@ -208,7 +216,7 @@ pub(crate) async fn search_round(
 ) -> RoundOut {
     let news = opts.is_news(query);
     let mut out = RoundOut::default();
-    let plan = auto_plan(news);
+    let plan = auto_plan(news, opts.allow_serp_scrape);
 
     let explicit = engine
         .map(str::trim)
@@ -219,9 +227,10 @@ pub(crate) async fn search_round(
     }
     if let Some(id) = explicit {
         match Provider::from_id(id) {
-            Some(Provider::BingBrowser) if !browser_serp_allowed() => out.errors.push(format!(
-                "bing_cdp: disabled (browser search-results scraping needs {}=1)",
-                octos_research::BROWSER_SERP_ENV
+            Some(p) if p.is_serp_scrape() && !opts.allow_serp_scrape => out.errors.push(format!(
+                "{}: disabled (scraping search-results pages needs {}=1)",
+                p.id(),
+                octos_research::SERP_SCRAPE_ENV
             )),
             Some(p) => {
                 run_parallel(opts, &[p], query, lang, count, &mut out).await;
@@ -246,8 +255,8 @@ pub(crate) async fn search_round(
         return out;
     }
 
-    // Tier 3: keyed APIs + keyless fallback, top two raced (historical
-    // deep-search behaviour, minus the browser scrape).
+    // Tier 3: keyed APIs (plus the opted-in scrapers), top two raced
+    // (historical deep-search behaviour).
     let rest: Vec<Provider> = plan
         .iter()
         .copied()
@@ -278,6 +287,11 @@ async fn run_parallel(
         (*p, r)
     });
     let results = futures::future::join_all(futs).await;
+    for p in providers {
+        if !out.tried.iter().any(|t| t == p.id()) {
+            out.tried.push(p.id().to_string());
+        }
+    }
     let mut seen: HashSet<String> = out
         .hits
         .iter()
@@ -464,12 +478,17 @@ async fn run_provider(
             .await?;
             parse_you(&text)?
         }
-        Provider::DuckDuckGo => ProviderOut {
-            hits: crate::ddg_search(query, count).await?,
-            answer: String::new(),
-        },
+        Provider::DuckDuckGo => {
+            if !opts.allow_serp_scrape {
+                return Err("disabled".to_string());
+            }
+            ProviderOut {
+                hits: crate::ddg_search(query, count).await?,
+                answer: String::new(),
+            }
+        }
         Provider::BingBrowser => {
-            if !browser_serp_allowed() {
+            if !opts.allow_serp_scrape {
                 return Err("disabled".to_string());
             }
             ProviderOut {
@@ -951,27 +970,42 @@ mod tests {
     }
 
     #[test]
-    fn should_not_plan_browser_serp_without_opt_in() {
-        // The env var is not set in the test environment.
-        if std::env::var(octos_research::BROWSER_SERP_ENV).is_ok() {
-            return;
-        }
+    fn should_not_plan_serp_scrapers_without_opt_in() {
         for news in [true, false] {
+            let order = auto_plan(news, false);
             assert!(
-                !auto_plan(news).contains(&Provider::BingBrowser),
-                "bing_cdp must not be in the automatic order"
+                !order.contains(&Provider::DuckDuckGo) && !order.contains(&Provider::BingBrowser),
+                "no search-results scraping in the default order: {order:?}"
             );
         }
-        assert_eq!(auto_plan(true)[0], Provider::Gdelt);
+        assert_eq!(auto_plan(true, false)[0], Provider::Gdelt);
+    }
+
+    #[test]
+    fn should_plan_ddg_then_bing_with_opt_in() {
+        let order = auto_plan(false, true);
+        let ddg = order.iter().position(|p| *p == Provider::DuckDuckGo);
+        let bing = order.iter().position(|p| *p == Provider::BingBrowser);
+        assert!(ddg.is_some() && bing.is_some() && ddg < bing, "{order:?}");
     }
 
     #[tokio::test]
-    async fn should_refuse_explicit_bing_without_opt_in() {
-        if std::env::var(octos_research::BROWSER_SERP_ENV).is_ok() {
-            return;
+    async fn should_refuse_scrapers_without_opt_in() {
+        let mut o = Options::from_input(&input(serde_json::json!({"query": "q"})), now()).unwrap();
+        o.allow_serp_scrape = false;
+        for p in [Provider::DuckDuckGo, Provider::BingBrowser] {
+            let r = run_provider(&o, p, "q", None, 3).await;
+            assert_eq!(r.err().as_deref(), Some("disabled"), "{p:?}");
         }
-        let o = Options::from_input(&input(serde_json::json!({"query": "q"})), now()).unwrap();
-        let r = run_provider(&o, Provider::BingBrowser, "q", None, 3).await;
-        assert_eq!(r.err().as_deref(), Some("disabled"));
+        // An explicit request is refused too, with the flag named.
+        let out = search_round(&o, Some("duckduckgo"), "q", None, 3).await;
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.contains(octos_research::SERP_SCRAPE_ENV)),
+            "{:?}",
+            out.errors
+        );
+        assert!(!out.tried.iter().any(|t| t == "duckduckgo"));
     }
 }

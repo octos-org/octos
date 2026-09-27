@@ -6,25 +6,27 @@
 //! 0b. SearXNG (`SEARXNG_URL`, or the profile's `searxng` search provider) —
 //!     a self-hosted instance, when configured
 //! 1. Tavily (`TAVILY_API_KEY`) — AI-optimized search, 1k free/month
-//! 2. DuckDuckGo (no key) — free HTML search
-//! 3. Exa (`EXA_API_KEY`) — neural/semantic search, 1k free/month
-//! 4. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
-//! 5. You.com (`YDC_API_KEY`) — rich JSON results with snippets
-//! 6. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
-//! 7. Headless-Chrome (CDP) Bing — **opt-in only** (`OCTOS_ALLOW_BROWSER_SERP=1`)
+//! 2. Exa (`EXA_API_KEY`) — neural/semantic search, 1k free/month
+//! 3. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
+//! 4. You.com (`YDC_API_KEY`) — rich JSON results with snippets
+//! 5. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
+//! 6. DuckDuckGo HTML results page — **opt-in only** (`OCTOS_ALLOW_SERP_SCRAPE=1`)
+//! 7. Headless-Chrome (CDP) Bing — **opt-in only** (same flag)
 //!
 //! Each provider is tried in order. If a provider returns no results or fails,
-//! the next one is attempted. Perplexity is last among the HTTP providers
+//! the next one is attempted. Perplexity is last among the keyed providers
 //! because it costs the most but gives the best answers (AI-synthesized with
 //! citations). `lang` / `region` / `since` go to the free tier (GDELT
 //! `sourcelang`/`timespan`, Google News edition and `when:`, SearXNG
-//! `language`/`time_range`) and filter its results.
+//! `language`/`time_range`) and filter its results. If no allowed provider
+//! returns anything, the result is empty and says which providers were tried
+//! and how to add SearXNG or a search key.
 //!
-//! The headless-Chrome (CDP) provider scrapes a Bing results page in a
-//! browser, which ADR 0002 rules out as disguised search. It is therefore not
-//! part of the automatic chain: it runs only when the operator sets
-//! `OCTOS_ALLOW_BROWSER_SERP=1`, and then only when the whole HTTP chain
-//! yielded nothing. It drives Bing through the same in-process `chromiumoxide`
+//! DuckDuckGo HTML and Bing-in-Chrome scrape search-engine results pages,
+//! which ADR 0002 rules out. They are not part of the default chain: they run
+//! only when the operator sets `OCTOS_ALLOW_SERP_SCRAPE=1` (alias
+//! `OCTOS_ALLOW_BROWSER_SERP=1`), after every keyed provider. Bing drives the
+//! same in-process `chromiumoxide`
 //! headless browser the `browser` tool uses and is gated behind the `browser`
 //! cargo feature. On any box with no Chrome/Chromium it degrades to a fast,
 //! clean miss (detected up-front via
@@ -194,10 +196,11 @@ impl FreeTierControls {
     }
 }
 
-/// Whether the operator opted in to the headless-browser Bing results
-/// scrape (off by default; ADR 0002 forbids disguised search).
-pub(crate) fn browser_serp_opted_in(lookup: impl Fn(&str) -> Option<String>) -> bool {
-    octos_research::browser_serp_allowed(lookup)
+/// Whether the operator opted in to scraping search-results pages
+/// (DuckDuckGo HTML, Bing in headless Chrome). Off by default: ADR 0002
+/// rules out scraping search results pages.
+pub(crate) fn serp_scrape_opted_in(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    octos_research::serp_scrape_allowed(lookup)
 }
 
 /// Free-tier providers in order: GDELT + Google News for news-ish queries,
@@ -316,7 +319,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web for information. Free sources first: GDELT and Google News RSS for news (dated, multi-language), a self-hosted SearXNG if configured; then Tavily, DuckDuckGo, Exa, Brave, You.com, Perplexity (auto-detected from keys). Optional lang, region, since, category."
+        "Search the web for information. Free sources first: GDELT and Google News RSS for news (dated, multi-language), a self-hosted SearXNG if configured; then Tavily, Exa, Brave, You.com, Perplexity (auto-detected from keys). Search-results pages are not scraped unless the operator enables it; with nothing configured a general query returns no results plus how to add SearXNG or a key. Optional lang, region, since, category."
     }
 
     fn tags(&self) -> &[&str] {
@@ -381,19 +384,21 @@ impl Tool for WebSearchTool {
             }
         };
 
+        let serp_scrape = serp_scrape_opted_in(|k| std::env::var(k).ok());
+
         // Free structured sources first (ADR 0002 §6): GDELT + Google News
         // for news-ish queries, then a configured SearXNG.
         if let Some(result) = self.free_tier_search(&input.query, count, &controls).await {
             return Ok(result);
         }
 
-        // Provider priority: Tavily first (best quality), then free/cheap, Perplexity last.
+        // Keyed providers: Tavily first (best quality), Perplexity last.
         // 1. Tavily (AI-optimized, 1k free/month)
-        // 2. DuckDuckGo (free, always available)
-        // 3. Exa (neural search)
-        // 4. Brave Search (free tier: 2k queries/month)
-        // 5. You.com (API key required)
-        // 6. Perplexity Sonar (AI-synthesized, most expensive — fallback only)
+        // 2. Exa (neural search)
+        // 3. Brave Search (free tier: 2k queries/month)
+        // 4. You.com (API key required)
+        // 5. Perplexity Sonar (AI-synthesized, most expensive — fallback only)
+        // Then, only with OCTOS_ALLOW_SERP_SCRAPE=1: DuckDuckGo HTML, Bing CDP.
 
         // Tavily (AI-optimized search — best for recent/niche topics)
         if let Some(api_key) = self.provider_key("tavily", "TAVILY_API_KEY") {
@@ -431,43 +436,6 @@ impl Tool for WebSearchTool {
                         "web_search rotation"
                     );
                 }
-            }
-        }
-
-        // Try DuckDuckGo (free, no key needed)
-        let ddg_result = self.ddg_search(&input.query, count).await;
-        if let Ok(ref r) = ddg_result {
-            if r.success && !r.output.contains("No results found") {
-                info!(
-                    provider = "duckduckgo",
-                    used_provider = "duckduckgo",
-                    query = %input.query,
-                    "web_search"
-                );
-                return ddg_result;
-            }
-            if is_quota_or_rate_limit_error(r) {
-                let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
-                warn!(
-                    provider = "duckduckgo",
-                    fallback_reason = "quota",
-                    error = %snippet,
-                    "web_search rotation"
-                );
-            } else if !r.success {
-                let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
-                warn!(
-                    provider = "duckduckgo",
-                    fallback_reason = "error",
-                    error = %snippet,
-                    "web_search rotation"
-                );
-            } else {
-                info!(
-                    provider = "duckduckgo",
-                    fallback_reason = "empty",
-                    "web_search rotation"
-                );
             }
         }
 
@@ -632,18 +600,38 @@ impl Tool for WebSearchTool {
             }
         }
 
-        // Headless-Chrome (CDP) fallback — last resort. Only meaningful when the
-        // HTTP chain produced nothing usable (e.g. keyless box where DuckDuckGo
-        // bot-403s). Drives Bing through the in-process headless browser. On a
-        // box with no Chrome this is a fast, clean miss (see
-        // `browser_cdp_search`), so the search terminates instead of hanging.
+        // DuckDuckGo HTML results page: a search-results scrape, so opt-in
+        // only (ADR 0002). Last resort after every keyed provider.
+        let ddg_result = if serp_scrape {
+            Some(self.ddg_search(&input.query, count).await)
+        } else {
+            None
+        };
+        if let Some(Ok(ref r)) = ddg_result {
+            if r.success && !r.output.contains("No results found") {
+                info!(
+                    provider = "duckduckgo",
+                    used_provider = "duckduckgo",
+                    query = %input.query,
+                    "web_search"
+                );
+                return ddg_result.expect("checked Some");
+            }
+            let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+            warn!(
+                provider = "duckduckgo",
+                fallback_reason = if r.success { "empty" } else { "error" },
+                error = %snippet,
+                "web_search rotation"
+            );
+        }
+
+        // Headless-Chrome (CDP) Bing — opt-in only, after DuckDuckGo. Drives
+        // Bing through the in-process headless browser. On a box with no
+        // Chrome this is a fast, clean miss (see `browser_cdp_search`).
         #[cfg(feature = "browser")]
-        if browser_serp_opted_in(|k| std::env::var(k).ok()) {
-            let http_chain_empty = ddg_result
-                .as_ref()
-                .map(|r| !r.success || r.output.contains("No results found"))
-                .unwrap_or(true);
-            if http_chain_empty {
+        if serp_scrape {
+            {
                 // Bound a touch above the per-action browser default headroom so
                 // launch + Bing nav fit, but a wedged Chrome can't block forever.
                 let cdp = self
@@ -670,20 +658,57 @@ impl Tool for WebSearchTool {
             }
         }
 
+        // Every allowed provider was exhausted. Return an empty result that
+        // says what was tried and how to get results (SearXNG or a key), not
+        // a silent scrape. The caller LLM should not retry with identical
+        // args (worker.txt guidance).
+        let tried = self.tried_providers(&controls, serp_scrape);
         info!(
-            provider = "duckduckgo (fallback)",
-            used_provider = "duckduckgo (fallback)",
+            provider = "none",
+            tried = %tried.join(","),
             query = %input.query,
-            "web_search"
+            "web_search: no results from allowed providers"
         );
-        // Return whatever DDG gave us (even if empty / quota-flagged); all
-        // configured providers were exhausted. The caller LLM should see this
-        // and not retry with identical args (worker.txt guidance).
-        ddg_result
+        Ok(ToolResult {
+            output: octos_research::no_results_message(&input.query, &tried),
+            success: true,
+            ..Default::default()
+        })
     }
 }
 
 impl WebSearchTool {
+    /// Providers this search would have called, in order (for the
+    /// no-results message).
+    fn tried_providers(&self, c: &FreeTierControls, serp_scrape: bool) -> Vec<String> {
+        let mut tried: Vec<String> = free_tier_providers(c.news, self.searxng_base().is_some())
+            .iter()
+            .map(|p| p.id().to_string())
+            .collect();
+        let has = |id: &str, env: &str| {
+            self.provider_key(id, env)
+                .is_some_and(|k| !k.trim().is_empty())
+        };
+        for (id, env) in [
+            ("tavily", "TAVILY_API_KEY"),
+            ("exa", "EXA_API_KEY"),
+            ("brave", "BRAVE_API_KEY"),
+            ("you", "YDC_API_KEY"),
+            ("perplexity", "PERPLEXITY_API_KEY"),
+        ] {
+            if has(id, env) {
+                tried.push(id.to_string());
+            }
+        }
+        if serp_scrape {
+            tried.push("duckduckgo".to_string());
+            if cfg!(feature = "browser") {
+                tried.push("bing_cdp".to_string());
+            }
+        }
+        tried
+    }
+
     // --- Free tier: GDELT, Google News RSS, SearXNG ---
 
     /// SearXNG base URL from the profile's `searxng` search provider or
@@ -1897,11 +1922,12 @@ mod tests {
     /// Structural invariant for the rotation order in `execute`:
     ///
     /// The `execute` method MUST iterate providers in the documented priority
-    /// (Tavily → DDG → Exa → Brave → You.com → Perplexity) and treat any
+    /// (Tavily → Exa → Brave → You.com → Perplexity, then the opt-in DDG /
+    /// Bing scrapers) and treat any
     /// `is_quota_or_rate_limit_error(&r) == true` outcome as "fall through to
     /// next provider", identical to the empty-results path. Perplexity must
     /// NOT short-circuit unconditionally; on quota error it must fall through
-    /// to the DDG fallback at the bottom of `execute`.
+    /// to the no-results message at the bottom of `execute`.
     ///
     /// This invariant is enforced by code review + the per-provider guards in
     /// `execute`. Mocking the HTTP layer would require restructuring the tool
@@ -1911,15 +1937,8 @@ mod tests {
         // This test is a structural anchor: if anyone changes the rotation
         // order or removes the per-provider quota guard, they must read the
         // doc comment above and update intentionally.
-        let providers = [
-            "tavily",
-            "duckduckgo",
-            "exa",
-            "brave",
-            "you.com",
-            "perplexity",
-        ];
-        assert_eq!(providers.len(), 6);
+        let providers = ["tavily", "exa", "brave", "you.com", "perplexity"];
+        assert_eq!(providers.len(), 5);
     }
 
     #[test]
@@ -1934,13 +1953,64 @@ mod tests {
     }
 
     #[test]
-    fn should_not_reach_browser_serp_fallback_by_default() {
-        // The Bing-in-Chrome scrape is gated on an explicit operator opt-in.
-        assert!(!browser_serp_opted_in(|_| None));
-        assert!(!browser_serp_opted_in(|_| Some("false".into())));
-        assert!(browser_serp_opted_in(|k| {
-            (k == octos_research::BROWSER_SERP_ENV).then(|| "1".to_string())
-        }));
+    fn should_gate_both_serp_scrapers_on_one_opt_in_flag() {
+        assert!(!serp_scrape_opted_in(|_| None));
+        assert!(!serp_scrape_opted_in(|_| Some("false".into())));
+        for key in [
+            octos_research::SERP_SCRAPE_ENV,
+            octos_research::BROWSER_SERP_ENV,
+        ] {
+            assert!(serp_scrape_opted_in(|k| (k == key).then(|| "1".to_string())));
+        }
+    }
+
+    #[test]
+    fn should_list_ddg_as_tried_only_with_the_flag() {
+        let tool = WebSearchTool::new();
+        let input: Input =
+            serde_json::from_value(serde_json::json!({"query": "rust", "category": "general"}))
+                .unwrap();
+        let c = FreeTierControls::parse(&input).unwrap();
+        assert!(
+            !tool
+                .tried_providers(&c, false)
+                .iter()
+                .any(|p| p == "duckduckgo" || p == "bing_cdp")
+        );
+        assert!(
+            tool.tried_providers(&c, true)
+                .iter()
+                .any(|p| p == "duckduckgo")
+        );
+    }
+
+    /// With no key, no SearXNG and no opt-in, a general query must not fall
+    /// back to scraping DuckDuckGo: it returns an empty result with guidance
+    /// (and makes no network call at all).
+    #[tokio::test]
+    async fn should_not_use_duckduckgo_by_default() {
+        let configured = [
+            "TAVILY_API_KEY",
+            "EXA_API_KEY",
+            "BRAVE_API_KEY",
+            "YDC_API_KEY",
+            "PERPLEXITY_API_KEY",
+            octos_research::SEARXNG_URL_ENV,
+            octos_research::SERP_SCRAPE_ENV,
+            octos_research::BROWSER_SERP_ENV,
+        ];
+        if configured.iter().any(|k| std::env::var(k).is_ok()) {
+            return; // developer machine with keys: not the keyless case
+        }
+        let tool = WebSearchTool::new();
+        let r = tool
+            .execute(&serde_json::json!({"query": "rust borrow checker", "category": "general"}))
+            .await
+            .unwrap();
+        assert!(r.success, "empty result, not an error");
+        assert!(r.output.contains("Providers tried: none"), "{}", r.output);
+        assert!(r.output.contains("SEARXNG_URL"));
+        assert!(!r.output.contains("Results for:"));
     }
 
     #[test]

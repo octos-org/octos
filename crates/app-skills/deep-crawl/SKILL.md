@@ -77,5 +77,5 @@ deep_crawl is a real browser for **reading** pages, not for getting around bot d
 
 - The browser is not disguised. There is no `navigator.webdriver` override, no `AutomationControlled` switches, no fake plugins/languages, and no spoofed desktop User-Agent. Chrome's own User-Agent is kept and `octos-research/1.0 (+https://github.com/octos-org/octos)` is appended to it.
 - No CAPTCHA solving, no human-behaviour imitation, no fingerprint spoofing. A bot challenge ends the attempt for that page.
-- Do not use deep_crawl to scrape search-engine results pages. Use a search provider (GDELT, Google News RSS, a self-hosted SearXNG, or a search API key) and crawl the result pages instead.
+- Do not use deep_crawl to scrape search-engine results pages. Use a search provider (GDELT, Google News RSS, a self-hosted SearXNG, or a search API key) and crawl the result pages instead. (deep-search only renders a Bing results page through deep_crawl when an operator has set `OCTOS_ALLOW_SERP_SCRAPE=1`.)
 - There is no flag to turn evasion back on; adding one requires a new ADR.
