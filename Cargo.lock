@@ -683,6 +683,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq 0.4.2",
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1211,6 +1224,7 @@ checksum = "00828ba6fd27b45a448e57dbfe84f1029d4c9f26b368157e9a448a5f49a2ec2a"
 dependencies = [
  "compression-core",
  "flate2",
+ "memchr",
 ]
 
 [[package]]
@@ -1243,6 +1257,12 @@ name = "constant_time_eq"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "convert_case"
@@ -1397,7 +1417,7 @@ dependencies = [
  "dtoa-short",
  "itoa",
  "phf 0.11.3",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -1410,7 +1430,7 @@ dependencies = [
  "dtoa-short",
  "itoa",
  "phf 0.13.1",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2136,7 +2156,7 @@ dependencies = [
  "futures-core",
  "futures-lite",
  "pin-project",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2338,7 +2358,7 @@ dependencies = [
  "gix-utils",
  "gix-validate",
  "gix-worktree",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
 ]
 
@@ -2366,7 +2386,7 @@ dependencies = [
  "gix-quote",
  "gix-trace",
  "kstring",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
  "unicode-bom",
 ]
@@ -2429,7 +2449,7 @@ dependencies = [
  "gix-ref",
  "gix-sec",
  "memchr",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
  "unicode-bom",
  "winnow 0.7.14",
@@ -2458,7 +2478,7 @@ dependencies = [
  "gix-error",
  "itoa",
  "jiff",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2543,7 +2563,7 @@ dependencies = [
  "gix-quote",
  "gix-trace",
  "gix-utils",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
 ]
 
@@ -2633,7 +2653,7 @@ dependencies = [
  "libc",
  "memmap2",
  "rustix",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
 ]
 
@@ -2664,7 +2684,7 @@ dependencies = [
  "gix-utils",
  "gix-validate",
  "itoa",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
  "winnow 0.7.14",
 ]
@@ -2704,7 +2724,7 @@ dependencies = [
  "gix-object",
  "gix-path",
  "memmap2",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
  "uluru",
 ]
@@ -2811,7 +2831,7 @@ dependencies = [
  "gix-hash",
  "gix-revision",
  "gix-validate",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
 ]
 
@@ -2845,7 +2865,7 @@ dependencies = [
  "gix-hash",
  "gix-hashtable",
  "gix-object",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
 ]
 
@@ -2936,7 +2956,7 @@ dependencies = [
  "gix-hashtable",
  "gix-object",
  "gix-revwalk",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.18",
 ]
 
@@ -3374,7 +3394,7 @@ dependencies = [
  "itoa",
  "pin-project-lite",
  "pin-utils",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio",
  "want",
 ]
@@ -3480,7 +3500,7 @@ dependencies = [
  "icu_normalizer_data",
  "icu_properties",
  "icu_provider",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "zerovec",
 ]
 
@@ -3538,7 +3558,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b0875f23caa03898994f6ddc501886a45c7d3d62d04d2d90788d47be1b1e4de"
 dependencies = [
  "idna_adapter",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "utf8_iter",
 ]
 
@@ -4172,6 +4192,101 @@ dependencies = [
 ]
 
 [[package]]
+name = "makepad-error-log"
+version = "1.0.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+dependencies = [
+ "makepad-micro-serde",
+]
+
+[[package]]
+name = "makepad-html"
+version = "1.0.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+dependencies = [
+ "makepad-live-id",
+]
+
+[[package]]
+name = "makepad-live-id"
+version = "1.0.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+dependencies = [
+ "makepad-live-id-macros",
+]
+
+[[package]]
+name = "makepad-live-id-macros"
+version = "1.0.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+dependencies = [
+ "makepad-micro-proc-macro",
+]
+
+[[package]]
+name = "makepad-math"
+version = "1.0.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+dependencies = [
+ "makepad-micro-serde",
+]
+
+[[package]]
+name = "makepad-micro-proc-macro"
+version = "1.0.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+
+[[package]]
+name = "makepad-micro-serde"
+version = "1.0.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+dependencies = [
+ "makepad-live-id",
+ "makepad-micro-serde-derive",
+]
+
+[[package]]
+name = "makepad-micro-serde-derive"
+version = "1.0.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+dependencies = [
+ "makepad-micro-proc-macro",
+]
+
+[[package]]
+name = "makepad-regex"
+version = "0.1.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+
+[[package]]
+name = "makepad-script"
+version = "1.0.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+dependencies = [
+ "makepad-error-log",
+ "makepad-html",
+ "makepad-live-id",
+ "makepad-math",
+ "makepad-regex",
+ "makepad-script-derive",
+ "makepad-stitch",
+ "smallvec 1.15.1 (git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825)",
+]
+
+[[package]]
+name = "makepad-script-derive"
+version = "1.0.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+dependencies = [
+ "makepad-micro-proc-macro",
+]
+
+[[package]]
+name = "makepad-stitch"
+version = "0.1.0"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
+
+[[package]]
 name = "markup5ever"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4484,7 +4599,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77a5d83df9f36fe23f0c3648c6bbb8b0298bb5f1939c8f2704431371f4b84d43"
 dependencies = [
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -4802,7 +4917,7 @@ dependencies = [
  "clap_complete",
  "color-eyre",
  "colored 2.2.0",
- "constant_time_eq",
+ "constant_time_eq 0.3.1",
  "dirs",
  "dunce",
  "eyre",
@@ -5077,12 +5192,17 @@ version = "2.0.3-rc.13"
 dependencies = [
  "chrono",
  "dom_smoothie",
+ "futures",
+ "makepad-script",
+ "octoscript-core",
  "quick-xml",
  "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
+ "tracing",
  "url",
 ]
 
@@ -5169,7 +5289,7 @@ version = "2.0.3-rc.13"
 dependencies = [
  "base64",
  "chrono",
- "constant_time_eq",
+ "constant_time_eq 0.3.1",
  "eyre",
  "getrandom 0.2.17",
  "octos-core",
@@ -5241,6 +5361,25 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "octoscript-core"
+version = "0.1.0"
+source = "git+https://github.com/OctoSense-org/Octoscript?rev=e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23#e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23"
+dependencies = [
+ "makepad-script",
+ "octoscript-ui-l0",
+ "serde_json",
+]
+
+[[package]]
+name = "octoscript-ui-l0"
+version = "0.1.0"
+source = "git+https://github.com/OctoSense-org/Octoscript?rev=e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23#e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23"
+dependencies = [
+ "blake3",
+ "serde_json",
 ]
 
 [[package]]
@@ -5321,7 +5460,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "redox_syscall 0.5.18",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "windows-link",
 ]
 
@@ -6388,7 +6527,7 @@ dependencies = [
  "fallible-streaming-iterator",
  "hashlink",
  "libsqlite3-sys",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "sqlite-wasm-rs",
 ]
 
@@ -6822,7 +6961,7 @@ dependencies = [
  "phf_codegen 0.11.3",
  "precomputed-hash",
  "servo_arc",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -6841,7 +6980,7 @@ dependencies = [
  "precomputed-hash",
  "rustc-hash",
  "servo_arc",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -6934,9 +7073,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.149"
+version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
  "indexmap 2.12.1",
  "itoa",
@@ -7205,6 +7344,11 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "smallvec"
+version = "1.15.1"
+source = "git+https://github.com/OctoSense-org/makepad.git?rev=6e5898fecbe5931c16fb7b1e54357104dd54e825#6e5898fecbe5931c16fb7b1e54357104dd54e825"
 
 [[package]]
 name = "smart-home"
@@ -7978,13 +8122,18 @@ version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
+ "async-compression",
  "bitflags 2.10.0",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "iri-string",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
@@ -8092,7 +8241,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sharded-slab",
- "smallvec",
+ "smallvec 1.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "thread_local",
  "tracing",
  "tracing-core",
@@ -9593,7 +9742,7 @@ dependencies = [
  "aes",
  "arbitrary",
  "bzip2",
- "constant_time_eq",
+ "constant_time_eq 0.3.1",
  "crc32fast",
  "crossbeam-utils",
  "deflate64",

@@ -1,0 +1,17 @@
+{
+  "id": "gdelt",
+  "name": "GDELT DOC 2.0",
+  "categories": ["news"],
+  "languages": ["*"],
+  "multi_language": true,
+  "hosts": ["api.gdeltproject.org"],
+  "rate_limit": {
+    "min_interval_ms": 6000,
+    "source": "GDELT answers faster clients with: \"Please limit requests to one every 5 seconds\""
+  },
+  "docs_url": ["https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/"],
+  "license_note": "GDELT data is free and open for unlimited use with attribution to the GDELT Project (https://www.gdeltproject.org/about.html#termsofuse). Items link to the original publishers.",
+  "weight": 1.0,
+  "cache_ttl_secs": 600,
+  "timeout_secs": 15
+}

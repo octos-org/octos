@@ -1,0 +1,16 @@
+{
+  "id": "wikipedia",
+  "name": "Wikipedia",
+  "categories": ["general"],
+  "languages": ["en", "zh", "ja", "ko", "de", "fr", "es", "pt", "it", "ru", "ar", "nl", "pl", "sv", "tr", "uk", "vi", "id", "he", "fa", "hi", "cs", "fi", "no", "da", "hu", "ro", "th", "el", "ca"],
+  "hosts": ["en.wikipedia.org", "zh.wikipedia.org", "ja.wikipedia.org", "ko.wikipedia.org", "de.wikipedia.org", "fr.wikipedia.org", "es.wikipedia.org", "pt.wikipedia.org", "it.wikipedia.org", "ru.wikipedia.org", "ar.wikipedia.org", "nl.wikipedia.org", "pl.wikipedia.org", "sv.wikipedia.org", "tr.wikipedia.org", "uk.wikipedia.org", "vi.wikipedia.org", "id.wikipedia.org", "he.wikipedia.org", "fa.wikipedia.org", "hi.wikipedia.org", "cs.wikipedia.org", "fi.wikipedia.org", "no.wikipedia.org", "da.wikipedia.org", "hu.wikipedia.org", "ro.wikipedia.org", "th.wikipedia.org", "el.wikipedia.org", "ca.wikipedia.org"],
+  "rate_limit": {
+    "min_interval_ms": 1000,
+    "source": "https://www.mediawiki.org/wiki/API:Etiquette (make requests in series, not in parallel)"
+  },
+  "docs_url": ["https://www.mediawiki.org/wiki/API:Search", "https://www.mediawiki.org/wiki/API:Etiquette"],
+  "license_note": "Text is CC BY-SA 4.0 (https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use); link to the article when quoting.",
+  "weight": 0.9,
+  "cache_ttl_secs": 3600,
+  "timeout_secs": 10
+}

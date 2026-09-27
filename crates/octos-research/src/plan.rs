@@ -1,5 +1,7 @@
-//! Provider order. Free structured sources first, then a configured
-//! SearXNG, then search APIs the person added keys for. Scraping a search
+//! Provider order. octos's own metasearch first (key-less engines over
+//! official APIs and feeds, see [`crate::metasearch`]), then a configured
+//! SearXNG, then search APIs the person added keys for. When the metasearch
+//! is turned off, GDELT and Google News RSS are called directly for news. Scraping a search
 //! engine's results page (DuckDuckGo HTML, Bing in headless Chrome) is never
 //! part of the default order; both are appended only when an operator opts
 //! in with [`crate::SERP_SCRAPE_ENV`].
@@ -11,6 +13,8 @@ use crate::date::Since;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
+    /// octos metasearch (sandboxed OctoScript engines).
+    Metasearch,
     Gdelt,
     GoogleNewsRss,
     Searxng,
@@ -33,6 +37,7 @@ pub enum Provider {
 impl Provider {
     pub fn id(self) -> &'static str {
         match self {
+            Provider::Metasearch => "metasearch",
             Provider::Gdelt => "gdelt",
             Provider::GoogleNewsRss => "google_news_rss",
             Provider::Searxng => "searxng",
@@ -49,6 +54,7 @@ impl Provider {
 
     pub fn from_id(id: &str) -> Option<Self> {
         Some(match id.trim().to_ascii_lowercase().as_str() {
+            "metasearch" => Provider::Metasearch,
             "gdelt" => Provider::Gdelt,
             "google_news_rss" | "google_news" | "gnews" => Provider::GoogleNewsRss,
             "searxng" => Provider::Searxng,
@@ -66,7 +72,10 @@ impl Provider {
 
     /// Free, key-less structured sources.
     pub fn is_free_structured(self) -> bool {
-        matches!(self, Provider::Gdelt | Provider::GoogleNewsRss)
+        matches!(
+            self,
+            Provider::Metasearch | Provider::Gdelt | Provider::GoogleNewsRss
+        )
     }
 
     /// Providers that scrape a search engine's results page.
@@ -84,6 +93,12 @@ pub enum Category {
     Auto,
     News,
     General,
+    /// Papers and preprints (arXiv, OpenAlex).
+    Science,
+    /// Software (Hacker News, GitHub, Stack Exchange).
+    It,
+    /// Public social posts (Mastodon hashtags).
+    Social,
 }
 
 impl Category {
@@ -93,8 +108,11 @@ impl Category {
             Some(s) if s.is_empty() || s == "auto" => Ok(Category::Auto),
             Some(s) if s == "news" => Ok(Category::News),
             Some(s) if s == "general" || s == "web" => Ok(Category::General),
+            Some(s) if s == "science" || s == "papers" => Ok(Category::Science),
+            Some(s) if s == "it" || s == "code" || s == "tech" => Ok(Category::It),
+            Some(s) if s == "social" => Ok(Category::Social),
             Some(s) => Err(format!(
-                "invalid category {s:?} (use news, general or auto)"
+                "invalid category {s:?} (use auto, news, general, science, it or social)"
             )),
         }
     }
@@ -108,8 +126,24 @@ impl Category {
     ) -> bool {
         match self {
             Category::News => true,
-            Category::General => false,
+            Category::General | Category::Science | Category::It | Category::Social => false,
             Category::Auto => looks_newsish(query, since, now),
+        }
+    }
+
+    /// Metasearch category for a query (`Auto` resolves to news or general).
+    pub fn metasearch_category(
+        self,
+        query: &str,
+        since: Option<&Since>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> &'static str {
+        match self {
+            Category::Science => "science",
+            Category::It => "it",
+            Category::Social => "social",
+            _ if self.is_news(query, since, now) => "news",
+            _ => "general",
         }
     }
 }
@@ -157,6 +191,8 @@ pub fn looks_newsish(
 #[derive(Debug, Clone, Default)]
 pub struct PlanInput {
     pub news: bool,
+    /// The metasearch is enabled (see [`crate::metasearch::enabled`]).
+    pub metasearch: bool,
     pub searxng_configured: bool,
     /// Keyed providers that have a key, in the caller's priority order.
     pub keyed: Vec<Provider>,
@@ -167,11 +203,15 @@ pub struct PlanInput {
 
 /// Automatic provider order.
 ///
-/// news → `[gdelt, google_news_rss]`, then `searxng` if configured, then the
-/// keyed providers. `duckduckgo` and `bing_cdp` only when explicitly allowed.
+/// `metasearch` first for every category (its engines include GDELT and,
+/// if enabled, Google News); without it, news → `[gdelt, google_news_rss]`.
+/// Then `searxng` if configured, then the keyed providers. `duckduckgo` and
+/// `bing_cdp` only when explicitly allowed.
 pub fn plan(input: &PlanInput) -> Vec<Provider> {
     let mut out = Vec::new();
-    if input.news {
+    if input.metasearch {
+        out.push(Provider::Metasearch);
+    } else if input.news {
         out.push(Provider::Gdelt);
         out.push(Provider::GoogleNewsRss);
     }
@@ -206,6 +246,7 @@ mod tests {
             searxng_configured: true,
             keyed: vec![Provider::Serper, Provider::Brave],
             allow_serp_scrape: false,
+            ..Default::default()
         });
         assert_eq!(
             order,
@@ -232,6 +273,7 @@ mod tests {
                     Provider::Tavily,
                 ],
                 allow_serp_scrape: false,
+                ..Default::default()
             });
             assert!(!order.iter().any(|p| p.is_serp_scrape()), "{order:?}");
         }
@@ -277,6 +319,36 @@ mod tests {
             assert_eq!(Provider::from_id(p.id()), Some(p));
         }
         assert_eq!(Category::parse(Some("NEWS")).unwrap(), Category::News);
+        assert_eq!(Category::parse(Some("it")).unwrap(), Category::It);
         assert!(Category::parse(Some("sports")).is_err());
+        assert_eq!(Provider::from_id("metasearch"), Some(Provider::Metasearch));
+    }
+
+    #[test]
+    fn should_put_metasearch_first_for_every_category() {
+        for news in [true, false] {
+            let order = plan(&PlanInput {
+                news,
+                metasearch: true,
+                searxng_configured: true,
+                keyed: vec![Provider::Brave],
+                allow_serp_scrape: false,
+            });
+            assert_eq!(
+                order,
+                vec![Provider::Metasearch, Provider::Searxng, Provider::Brave],
+                "news={news}: GDELT and Google News run inside the metasearch"
+            );
+        }
+        let q = "rust borrow checker";
+        assert_eq!(Category::It.metasearch_category(q, None, now()), "it");
+        assert_eq!(
+            Category::Auto.metasearch_category(q, None, now()),
+            "general"
+        );
+        assert_eq!(
+            Category::Auto.metasearch_category("latest news", None, now()),
+            "news"
+        );
     }
 }

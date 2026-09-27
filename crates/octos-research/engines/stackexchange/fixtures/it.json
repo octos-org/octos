@@ -1,0 +1,56 @@
+{
+  "body_file": "it.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": "2024-09-05T09:57:36Z",
+      "source": "Stack Overflow · linrongbin",
+      "title": "Do I need to clean the completed tasks in tokio::task::JoinSet?",
+      "url": "https://stackoverflow.com/questions/78952401/do-i-need-to-clean-the-completed-tasks-in-tokiotaskjoinset"
+    },
+    {
+      "lang": "en",
+      "published": "2024-01-19T16:09:45Z",
+      "source": "Stack Overflow · Henry",
+      "title": "How to Tokio::select! futures, but never cancel slow ones",
+      "url": "https://stackoverflow.com/questions/77847411/how-to-tokioselect-futures-but-never-cancel-slow-ones"
+    },
+    {
+      "lang": "en",
+      "published": "2023-02-11T12:04:12Z",
+      "source": "Stack Overflow · Alpharius",
+      "title": "Why tokio::select! chooses an action with a higher frequency?",
+      "url": "https://stackoverflow.com/questions/75420084/why-tokioselect-chooses-an-action-with-a-higher-frequency"
+    },
+    {
+      "lang": "en",
+      "published": "2023-02-10T14:07:19Z",
+      "source": "Stack Overflow · Alpharius",
+      "title": "Why does tokio::mpsc::Sender close when entering the loop?",
+      "url": "https://stackoverflow.com/questions/75412248/why-does-tokiompscsender-close-when-entering-the-loop"
+    },
+    {
+      "lang": "en",
+      "published": "2020-06-08T13:52:30Z",
+      "source": "Stack Overflow · Theof",
+      "title": "dropping a tokio::pin! -ned async block does not release borrow",
+      "url": "https://stackoverflow.com/questions/62263664/dropping-a-tokiopin-ned-async-block-does-not-release-borrow"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/json"
+    },
+    "method": "GET",
+    "url": "https://api.stackexchange.com/2.3/search/advanced?q=tokio+select+timeout&site=stackoverflow&pagesize=5&page=1&order=desc&sort=relevance"
+  },
+  "recorded": "live, 2026-09-27",
+  "request": {
+    "category": "it",
+    "count": 5,
+    "langs": [],
+    "now": "2026-09-27T22:00:00Z",
+    "query": "tokio select timeout",
+    "since": null
+  }
+}

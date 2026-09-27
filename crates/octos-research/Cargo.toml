@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Research building blocks for octos search tools: free news/search providers, structured items, lang/since/domain filters, robots.txt, main-text extraction"
+description = "Research building blocks for octos search tools: free news/search providers, structured items, lang/since/domain filters, robots.txt, main-text extraction, and a clean-room metasearch with sandboxed OctoScript engines"
 
 [dependencies]
 serde = { workspace = true }
@@ -14,22 +14,50 @@ url = { workspace = true }
 regex = { workspace = true }
 quick-xml = { workspace = true }
 tokio = { version = "1", features = ["sync", "time", "net"] }
-# SSRF-safe HTTP for the shared reader (`fetch` feature).
-reqwest = { workspace = true, optional = true }
+# SSRF-safe HTTP for the shared reader (`fetch` feature) and the metasearch
+# fetcher (`http`). gzip: Stack Exchange compresses every response.
+reqwest = { workspace = true, optional = true, features = ["gzip"] }
 # Readability-style main-text + metadata extraction (MIT, a port of Mozilla
 # readability.js). Optional so `deep-crawl` can use the robots.txt and URL
 # helpers without pulling in an HTML parser it does not need.
 dom_smoothie = { version = "0.18", optional = true }
+# Metasearch: engines are sandboxed OctoScript scripts (MIT, OctoSense-org),
+# pinned to one reviewed revision. Only the bounded core runtime is used (the
+# host installs its own `net`/`markup` modules); makepad-script is the VM it
+# re-exports, pinned to the same revision Octoscript uses, for the native
+# method macros.
+octoscript-core = { git = "https://github.com/OctoSense-org/Octoscript", rev = "e152f8bc1fd7dae1ce51993cab1c5fcb0fdc8b23", optional = true }
+makepad-script = { git = "https://github.com/OctoSense-org/makepad.git", rev = "6e5898fecbe5931c16fb7b1e54357104dd54e825", optional = true }
+sha2 = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [features]
-default = ["extract", "fetch"]
+default = ["extract", "fetch", "metasearch"]
 extract = ["dep:dom_smoothie"]
 # SSRF checks + DNS-pinned GET (`net`), and with `extract` the polite
 # `reader`. deep-crawl uses `fetch` without `extract`.
 fetch = ["dep:reqwest"]
+metasearch = [
+    "dep:octoscript-core",
+    "dep:makepad-script",
+    "dep:sha2",
+    "dep:futures",
+    "dep:tracing",
+]
+# `ReqwestFetch`: a ready-made metasearch fetcher over reqwest.
+http = ["metasearch", "fetch"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+
+[[example]]
+name = "record_engine_fixtures"
+required-features = ["http"]
+
+[[test]]
+name = "engines_live"
+required-features = ["http"]
 
 [lints]
 workspace = true

@@ -1,7 +1,9 @@
 //! Search providers, controls and the polite page reader for deep-search.
 //!
-//! Provider order (see `octos_research::plan`): free structured sources
-//! first (GDELT + Google News RSS, for news-ish queries), then a
+//! Provider order (see `octos_research::plan`): the octos metasearch first
+//! (key-less OctoScript engines over official APIs and feeds: GDELT, Hacker
+//! News, Wikipedia, arXiv, ...; disable with `OCTOS_METASEARCH=0` to call
+//! GDELT + Google News RSS directly for news), then a
 //! self-hosted SearXNG (`SEARXNG_URL`), then search APIs with keys. Scraping
 //! search-results pages (DuckDuckGo HTML, Bing in headless Chrome) is not in
 //! the default order; both need `OCTOS_ALLOW_SERP_SCRAPE=1` (alias
@@ -195,6 +197,7 @@ pub(crate) fn serp_scrape_allowed() -> bool {
 pub(crate) fn auto_plan(news: bool, allow_serp_scrape: bool) -> Vec<Provider> {
     plan::plan(&PlanInput {
         news,
+        metasearch: octos_research::metasearch::enabled(|k| std::env::var(k).ok()),
         searxng_configured: env_nonempty(octos_research::SEARXNG_URL_ENV).is_some(),
         keyed: keyed_available(),
         allow_serp_scrape,
@@ -351,6 +354,7 @@ async fn run_provider(
     let lang_primary = lang.map(octos_research::lang::primary);
     let key = |k: &str| env_nonempty(k).ok_or_else(|| format!("{k} not set"));
     let hits = match p {
+        Provider::Metasearch => metasearch_round(opts, query, lang, count).await?,
         Provider::Gdelt => {
             gdelt_throttle().wait("api.gdeltproject.org", None).await;
             let url = free::gdelt_request_url(query, lang, since, count as usize, opts.now);
@@ -501,6 +505,59 @@ async fn run_provider(
         Provider::Exa => return Err("not supported by deep-search".to_string()),
     };
     Ok(hits)
+}
+
+/// The process-wide metasearch (shares rate limits, cache and engine
+/// health across rounds).
+fn metasearch() -> &'static octos_research::metasearch::Metasearch {
+    static M: OnceLock<octos_research::metasearch::Metasearch> = OnceLock::new();
+    M.get_or_init(|| {
+        octos_research::metasearch::Metasearch::from_env(
+            std::sync::Arc::new(octos_research::metasearch::ReqwestFetch::new()),
+            &Default::default(),
+        )
+    })
+}
+
+/// One metasearch call for `query` in `lang`.
+async fn metasearch_round(
+    opts: &Options,
+    query: &str,
+    lang: Option<&str>,
+    count: u8,
+) -> Result<ProviderOut, String> {
+    let since = opts.filters.since.as_ref();
+    let mut req = octos_research::metasearch::SearchRequest::new(
+        query,
+        opts.category.metasearch_category(query, since, opts.now),
+    );
+    req.langs = lang.map(|l| vec![l.to_string()]).unwrap_or_default();
+    req.region = opts.region.clone();
+    req.since = opts.filters.since.clone();
+    req.count = count as usize;
+    req.limit = count as usize * 2;
+    req.filters = opts.filters.clone();
+    req.now = opts.now;
+    let resp = metasearch().search(&req).await;
+    if resp.items.is_empty() {
+        let engines: Vec<String> = resp
+            .engines
+            .iter()
+            .map(|e| match &e.error {
+                Some(err) => format!("{} {:?}: {err}", e.engine, e.status),
+                None => format!("{} {:?}", e.engine, e.status),
+            })
+            .collect();
+        let mut msg = format!("no results ({})", engines.join("; "));
+        if let Some(note) = resp.note {
+            msg.push_str(&format!(". {note}"));
+        }
+        return Err(msg);
+    }
+    Ok(ProviderOut {
+        hits: resp.hits(),
+        answer: String::new(),
+    })
 }
 
 fn hit(url: &str, title: &str, snippet: &str, provider: &str) -> Option<SearchHit> {
@@ -938,7 +995,14 @@ mod tests {
                 "no search-results scraping in the default order: {order:?}"
             );
         }
-        assert_eq!(auto_plan(true, false)[0], Provider::Gdelt);
+        // The metasearch is the first free provider for every category
+        // (GDELT runs inside it), unless OCTOS_METASEARCH=0.
+        if octos_research::metasearch::enabled(|k| std::env::var(k).ok()) {
+            assert_eq!(auto_plan(true, false)[0], Provider::Metasearch);
+            assert_eq!(auto_plan(false, false)[0], Provider::Metasearch);
+        } else {
+            assert_eq!(auto_plan(true, false)[0], Provider::Gdelt);
+        }
     }
 
     #[test]

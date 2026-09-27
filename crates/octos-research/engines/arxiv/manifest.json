@@ -1,0 +1,16 @@
+{
+  "id": "arxiv",
+  "name": "arXiv",
+  "categories": ["science"],
+  "languages": ["en"],
+  "hosts": ["export.arxiv.org"],
+  "rate_limit": {
+    "min_interval_ms": 3000,
+    "source": "https://info.arxiv.org/help/api/tou.html (no more than one request every three seconds, one connection at a time)"
+  },
+  "docs_url": ["https://info.arxiv.org/help/api/user-manual.html", "https://info.arxiv.org/help/api/tou.html"],
+  "license_note": "Thank you to arXiv for use of its open access interoperability. Metadata is CC0; each paper keeps its own licence.",
+  "weight": 1.0,
+  "cache_ttl_secs": 3600,
+  "timeout_secs": 15
+}

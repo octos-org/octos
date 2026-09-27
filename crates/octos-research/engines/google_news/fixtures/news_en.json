@@ -1,0 +1,35 @@
+{
+  "body_file": "news_en.body",
+  "expect": [
+    {
+      "lang": "en-US",
+      "published": "2026-09-25T14:05:00Z",
+      "source": "Reuters",
+      "title": "Turkey launches AI initiative ahead of COP31 climate summit",
+      "url": "https://news.google.com/rss/articles/CBMisAFBVV95cUxQY0xSMUdU?oc=5"
+    },
+    {
+      "lang": "en-US",
+      "published": "2026-09-23T07:00:00Z",
+      "source": "Welcome to the United Nations",
+      "title": "Climate Summit 2026",
+      "url": "https://news.google.com/rss/articles/CBMiZkFVX3lxTE9Z?oc=5"
+    }
+  ],
+  "http": {
+    "headers": {},
+    "method": "GET",
+    "url": "https://news.google.com/rss/search?q=climate+summit+when%3A7d&hl=en-US&gl=US&ceid=US%3Aen"
+  },
+  "recorded": "body recorded for octos#2568 (tests/fixtures/google_news_search.xml); not re-fetched because robots.txt disallows /rss",
+  "request": {
+    "category": "news",
+    "count": 5,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-27T22:00:00Z",
+    "query": "climate summit",
+    "since": "7d"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "id": "wikidata",
+  "name": "Wikidata",
+  "categories": ["general"],
+  "languages": ["*"],
+  "hosts": ["www.wikidata.org"],
+  "rate_limit": {
+    "min_interval_ms": 1000,
+    "source": "https://www.mediawiki.org/wiki/API:Etiquette (make requests in series, not in parallel)"
+  },
+  "docs_url": ["https://www.wikidata.org/w/api.php?action=help&modules=wbsearchentities", "https://www.mediawiki.org/wiki/API:Etiquette"],
+  "license_note": "Structured data is CC0 (https://www.wikidata.org/wiki/Wikidata:Licensing).",
+  "weight": 0.6,
+  "cache_ttl_secs": 3600,
+  "timeout_secs": 10
+}

@@ -20,6 +20,8 @@ pub mod extract;
 pub mod filter;
 pub mod item;
 pub mod lang;
+#[cfg(feature = "metasearch")]
+pub mod metasearch;
 #[cfg(feature = "fetch")]
 pub mod net;
 pub mod plan;
@@ -44,8 +46,7 @@ pub const AGENT_TOKEN: &str = "octos-research";
 /// their own behalf (provider APIs, robots.txt, page reads). It names the
 /// software and where to learn about it, instead of posing as a desktop
 /// browser.
-pub const USER_AGENT: &str =
-    "Mozilla/5.0 (compatible; octos-research/1.0; +https://github.com/octos-org/octos)";
+pub const USER_AGENT: &str = "octos-research/1.0 (+https://github.com/octos-org/octos)";
 
 /// Environment variable that opts in to scraping search-engine results
 /// pages: the keyless DuckDuckGo HTML endpoint and the Bing results page
@@ -146,7 +147,8 @@ mod tests {
 
     #[test]
     fn should_identify_itself_in_user_agent() {
-        assert!(USER_AGENT.contains(AGENT_TOKEN));
-        assert!(!USER_AGENT.contains("Chrome/"));
+        assert!(USER_AGENT.starts_with(AGENT_TOKEN));
+        assert!(USER_AGENT.contains("https://github.com/octos-org/octos"));
+        assert!(!USER_AGENT.contains("Mozilla") && !USER_AGENT.contains("Chrome/"));
     }
 }
