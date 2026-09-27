@@ -624,6 +624,7 @@ async fn session_open_snapshot_waits_for_runtime_window_before_compacting() {
             cwd: None,
             sandbox: None,
             after: None,
+            client_commands: None,
         },
     )
     .await
