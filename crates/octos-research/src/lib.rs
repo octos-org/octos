@@ -56,6 +56,21 @@ pub const SERP_SCRAPE_ENV: &str = "OCTOS_ALLOW_SERP_SCRAPE";
 /// Earlier name of [`SERP_SCRAPE_ENV`], still honoured as an alias.
 pub const BROWSER_SERP_ENV: &str = "OCTOS_ALLOW_BROWSER_SERP";
 
+/// Operator setting that turns robots.txt checks **on** for the research
+/// tools (`1`/`true`/`yes`). Default off: OctoSense agents are personal
+/// assistants reading on behalf of one person (a product decision by the
+/// maintainer). When off, robots.txt is never fetched or consulted; the
+/// honest User-Agent, per-host spacing, 429/503 backoff, timeouts, size
+/// caps and SSRF protections all still apply.
+pub const RESPECT_ROBOTS_ENV: &str = "OCTOS_RESPECT_ROBOTS";
+
+/// Whether robots.txt checks are enabled (env lookup injected for tests).
+pub fn respect_robots(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    lookup(RESPECT_ROBOTS_ENV)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 /// Environment variable naming a self-hosted SearXNG base URL
 /// (e.g. `http://127.0.0.1:8888`).
 pub const SEARXNG_URL_ENV: &str = "SEARXNG_URL";
@@ -117,6 +132,15 @@ mod tests {
         assert!(m.contains(SEARXNG_URL_ENV) && m.contains("TAVILY_API_KEY"));
         assert!(m.contains(SERP_SCRAPE_ENV));
         assert!(no_results_message("q", &[]).contains("Providers tried: none"));
+    }
+
+    #[test]
+    fn should_keep_robots_checks_off_by_default() {
+        assert!(!respect_robots(|_| None));
+        assert!(!respect_robots(|_| Some("0".into())));
+        assert!(respect_robots(
+            |k| (k == RESPECT_ROBOTS_ENV).then(|| "1".to_string())
+        ));
     }
 
     #[test]

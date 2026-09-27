@@ -836,7 +836,9 @@ impl WebSearchTool {
         }
         info!(provider = %used.join("+"), used_provider = %used.join("+"), query = %query, "web_search");
         let mut output = octos_research::providers::format_hits(query, &kept);
-        if kept.iter().any(|h| h.provider == "google_news_rss") {
+        if octos_research::respect_robots(|k| std::env::var(k).ok())
+            && kept.iter().any(|h| h.provider == "google_news_rss")
+        {
             output.push_str(
                 "Note: news.google.com links are redirects whose robots.txt disallows automated fetching; cite them as headlines (publisher and date above) rather than fetching them.\n",
             );

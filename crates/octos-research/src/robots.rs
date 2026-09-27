@@ -244,6 +244,11 @@ impl RobotsCache {
         Self::default()
     }
 
+    /// Number of origins whose robots.txt was requested (tests/diagnostics).
+    pub fn origins_requested(&self) -> usize {
+        self.slots.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
     /// Cache with custom expiry (tests, long-running services).
     pub fn with_ttls(ttl: Duration, unreachable_ttl: Duration) -> Self {
         Self {

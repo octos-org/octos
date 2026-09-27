@@ -933,6 +933,12 @@ async fn set_identifiable_user_agent(ws: &mut WsStream, session_id: &str) {
     .await;
 }
 
+/// Whether robots.txt is applied: operator setting `OCTOS_RESPECT_ROBOTS`,
+/// default off (env lookup injected for tests).
+fn robots_enabled(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    octos_research::respect_robots(lookup)
+}
+
 /// robots.txt check for one URL (RFC 9309 via `octos-research`), fetched
 /// once per origin with an identifiable User-Agent.
 async fn robots_check(
@@ -1224,6 +1230,7 @@ async fn run() -> Output {
         };
     }
     let robots = octos_research::RobotsCache::new();
+    let respect_robots = robots_enabled(|k| std::env::var(k).ok());
 
     // BFS crawl
     let mut visited: HashSet<String> = HashSet::new();
@@ -1274,9 +1281,20 @@ async fn run() -> Output {
             progress_fraction,
         );
 
-        // robots.txt: a disallowed (or unreachable-robots) URL is recorded,
-        // never navigated. Crawl-delay is honoured between pages.
-        let decision = robots_check(&robots, &url).await;
+        // robots.txt (only when the operator enabled it with
+        // OCTOS_RESPECT_ROBOTS=1; default off, never fetched): a disallowed
+        // (or unreachable-robots) URL is recorded, never navigated, and
+        // Crawl-delay is honoured between pages. Otherwise pages are spaced
+        // by the settle time alone (sequential, one tab).
+        let decision = if respect_robots {
+            robots_check(&robots, &url).await
+        } else {
+            octos_research::robots::RobotsDecision {
+                allowed: true,
+                crawl_delay: None,
+                reason: "robots_off",
+            }
+        };
         if !decision.allowed {
             eprintln!(
                 "[deep_crawl] skipped by robots.txt ({}): {url}",
@@ -1618,6 +1636,14 @@ mod tests {
         let needle = ["'web", "driver'"].concat();
         assert!(!src.contains(&needle), "no webdriver-hiding script");
         assert!(UA_SUFFIX.contains(octos_research::AGENT_TOKEN));
+    }
+
+    #[test]
+    fn should_skip_robots_txt_unless_the_operator_enables_it() {
+        assert!(!robots_enabled(|_| None));
+        assert!(robots_enabled(|k| {
+            (k == octos_research::RESPECT_ROBOTS_ENV).then(|| "1".to_string())
+        }));
     }
 
     #[test]

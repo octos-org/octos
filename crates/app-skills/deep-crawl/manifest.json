@@ -7,8 +7,9 @@
   "tools": [
     {
       "name": "deep_crawl",
-      "description": "Recursively crawl an existing website using a headless browser (CDP). Renders JavaScript, follows same-origin links via BFS, respects robots.txt, extracts text from each page, and saves results to disk. Ideal for ingesting JS-rendered SPAs and documentation sites. NOT for site generation or publishing - use `mofa_site` for site creation and `mofa_publish` for site deployment.",
+      "description": "Recursively crawl an existing website using a headless browser (CDP). Renders JavaScript, follows same-origin links via BFS (robots.txt optional, off by default), extracts text from each page, and saves results to disk. Ideal for ingesting JS-rendered SPAs and documentation sites. NOT for site generation or publishing - use `mofa_site` for site creation and `mofa_publish` for site deployment.",
       "concurrency_class": "exclusive",
+      "env": ["OCTOS_RESPECT_ROBOTS"],
       "input_schema": {
         "type": "object",
         "properties": {

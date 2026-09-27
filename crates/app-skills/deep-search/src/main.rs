@@ -644,8 +644,9 @@ async fn run_deep_search(
         cap: DomainCap::new(opts.filters.max_per_domain),
         seen_canonical: HashSet::new(),
     };
-    // robots.txt first, so disallowed links (e.g. Google News article
-    // redirects) become headline-only sources instead of using the budget.
+    // robots.txt first (only when the operator enabled it; a no-op
+    // otherwise), so disallowed links (e.g. Google News article redirects)
+    // become headline-only sources instead of using the budget.
     let (readable, denied) = reader.robots_partition(kept).await;
     for (hit, reason) in denied {
         st.skipped.push(SkippedUrl {
@@ -659,10 +660,7 @@ async fn run_deep_search(
 
     progress_simple(
         ProgressPhase::Fetch,
-        &format!(
-            "Reading {} pages in parallel (robots.txt respected)...",
-            to_read.len()
-        ),
+        &format!("Reading {} pages in parallel...", to_read.len()),
     );
     read_into(&reader, opts, to_read, &mut st).await;
 

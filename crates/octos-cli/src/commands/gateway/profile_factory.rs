@@ -43,8 +43,12 @@ const FIRST_PARTY_SKILL_ENV_VARS: &[&str] = &[
     "DASHSCOPE_BASE_URL",
     "ARK_API_KEY",
     "ARK_BASE_URL",
-    // Self-hosted SearXNG base URL for the research tools (deep-search).
+    // Research tool operator settings (deep-search / deep-crawl):
+    // self-hosted SearXNG base URL, robots.txt (default off) and the
+    // search-results scrape opt-in (default off).
     "SEARXNG_URL",
+    "OCTOS_RESPECT_ROBOTS",
+    "OCTOS_ALLOW_SERP_SCRAPE",
 ];
 
 /// Google / Vertex credential material: the raw service-account JSON, the

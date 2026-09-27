@@ -150,6 +150,24 @@ pub async fn safe_get(url: &str, timeout: Duration) -> Result<reqwest::Response,
     Err(format!("too many redirects (max {MAX_REDIRECTS})"))
 }
 
+/// Longest `Retry-After` we will wait inline.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Parse a `Retry-After` value (delta-seconds or HTTP-date) relative to
+/// `now`, capped at [`MAX_RETRY_AFTER`]. `None` if absent/unparseable.
+pub fn parse_retry_after(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let v = value.trim();
+    let d = if let Ok(secs) = v.parse::<u64>() {
+        Duration::from_secs(secs)
+    } else {
+        let at = chrono::DateTime::parse_from_rfc2822(v)
+            .ok()?
+            .with_timezone(&chrono::Utc);
+        (at - now).to_std().unwrap_or_default()
+    };
+    Some(d.min(MAX_RETRY_AFTER))
+}
+
 /// Read a response body up to `cap` bytes (lossy UTF-8).
 pub async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<String, String> {
     let mut buf: Vec<u8> = Vec::new();
@@ -201,6 +219,24 @@ mod tests {
         assert!(is_private_host("foo.localhost"));
         assert!(is_private_host("[::1]"));
         assert!(!is_private_host("example.com"));
+    }
+
+    #[test]
+    fn should_parse_retry_after_seconds_and_dates_with_a_cap() {
+        let now = chrono::DateTime::parse_from_rfc2822("Sun, 27 Sep 2026 12:00:00 GMT")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(parse_retry_after("7", now), Some(Duration::from_secs(7)));
+        assert_eq!(parse_retry_after("3600", now), Some(MAX_RETRY_AFTER));
+        assert_eq!(
+            parse_retry_after("Sun, 27 Sep 2026 12:00:10 GMT", now),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            parse_retry_after("Sun, 27 Sep 2026 11:00:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse_retry_after("soon", now), None);
     }
 
     #[tokio::test]

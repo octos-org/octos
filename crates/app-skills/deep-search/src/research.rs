@@ -117,6 +117,8 @@ impl Options {
         v["region"] = serde_json::json!(self.region);
         v["category"] = serde_json::json!(self.category);
         v["render"] = serde_json::json!(if self.render { "auto" } else { "off" });
+        v["respect_robots"] =
+            serde_json::json!(octos_research::respect_robots(|k| std::env::var(k).ok()));
         v
     }
 }
@@ -692,6 +694,7 @@ impl Reader {
             inner: reader::Reader::new(reader::ReaderConfig {
                 host_interval: Duration::from_millis(interval_ms),
                 keep_html: true,
+                respect_robots: octos_research::respect_robots(|k| std::env::var(k).ok()),
                 fallback_text: Some(crate::html_to_text),
                 renderer,
                 ..Default::default()
@@ -903,6 +906,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.starts_with("ssrf_blocked"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn should_not_consult_robots_txt_by_default() {
+        if std::env::var(octos_research::RESPECT_ROBOTS_ENV).is_ok() {
+            return; // operator setting present in this environment
+        }
+        let r = Reader::new(false);
+        let hits = vec![SearchHit {
+            url: "https://news.google.com/rss/articles/CBMi?oc=5".into(),
+            provider: "google_news_rss".into(),
+            ..Default::default()
+        }];
+        // No robots.txt request: every hit stays readable (Google News
+        // links included), and nothing is recorded as a robots skip.
+        let (ok, denied) = r.robots_partition(hits).await;
+        assert_eq!(ok.len(), 1);
+        assert!(denied.is_empty());
+        assert!(!r.inner.respects_robots());
+        assert_eq!(r.inner.robots_origins_requested(), 0);
     }
 
     #[test]

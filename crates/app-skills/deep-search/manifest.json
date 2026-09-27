@@ -2,7 +2,7 @@
   "name": "deep-search",
   "version": "2.0.0",
   "author": "octos",
-  "description": "Deep multi-round web research: free sources first (GDELT, Google News RSS, optional SearXNG, then keyed APIs), polite page reading (robots.txt, identifiable User-Agent, browser for JS-heavy pages), reference chasing, a cited report and structured items.",
+  "description": "Deep multi-round web research: free sources first (GDELT, Google News RSS, optional SearXNG, then keyed APIs), polite page reading (honest User-Agent, per-host spacing, browser for JS-heavy pages; robots.txt optional, off by default), reference chasing, a cited report and structured items.",
   "timeout_secs": 600,
   "tools": [
     {
@@ -26,6 +26,7 @@
         "DEEP_SEARCH_MAX_BROWSERS",
         "DEEP_SEARCH_HOST_INTERVAL_MS",
         "OCTOS_ALLOW_SERP_SCRAPE",
+        "OCTOS_RESPECT_ROBOTS",
         "OCTOS_ALLOW_BROWSER_SERP"
       ],
       "input_schema": {

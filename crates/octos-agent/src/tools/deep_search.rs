@@ -5,10 +5,13 @@
 //! or (`output: "items"`) the structured items document, which is also always
 //! written as `items.json` next to the pages.
 //!
-//! Pages are read politely (OctoSense ADR 0002 §6): robots.txt checked per
-//! origin first, an identifiable User-Agent, at least 1s between requests to
-//! one host, a body-size cap, and a real browser only to render JS-heavy pages
-//! that plain HTTP returns without main text.
+//! Pages are read politely through the shared `octos_research::reader`: an
+//! identifiable User-Agent, at least 1s between requests to one host, one
+//! backoff on 429/503 honouring `Retry-After`, a body-size cap, SSRF checks
+//! with DNS pinning on every hop, and a real browser only to render JS-heavy
+//! pages (private destinations blocked inside it, result re-validated).
+//! robots.txt is an operator setting (`OCTOS_RESPECT_ROBOTS=1`), off by
+//! default.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -111,7 +114,7 @@ impl Tool for DeepSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web (free news sources first) and read the result pages in parallel, respecting robots.txt. Saves each page's main text as a markdown file under .octos/research/<query>/ plus items.json (title, url, source, lang, published, summary). Returns an index of saved files (or the items with output=items) — use read_file to examine specific pages for synthesis."
+        "Search the web (free news sources first) and read the result pages in parallel (honest User-Agent, polite per-host rate). Saves each page's main text as a markdown file under .octos/research/<query>/ plus items.json (title, url, source, lang, published, summary). Returns an index of saved files (or the items with output=items) — use read_file to examine specific pages for synthesis."
     }
 
     fn tags(&self) -> &[&str] {
@@ -259,10 +262,7 @@ impl Tool for DeepSearchTool {
         // Step 2: Parallel, polite reads of all URLs
         emit_deep_research_progress(
             "fetch",
-            &format!(
-                "Reading {} pages in parallel (robots.txt respected)...",
-                urls.len()
-            ),
+            &format!("Reading {} pages in parallel...", urls.len()),
             Some(0.4),
         );
         let reader = research_reader();
@@ -346,7 +346,7 @@ impl Tool for DeepSearchTool {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    // `fetch_page` propagates robots.txt refusals, 403/500,
+                    // `read_page` propagates robots.txt refusals (when enabled), 403/500,
                     // transport, and body-read failures. Persist the error
                     // artifact AND surface it in the returned index —
                     // otherwise a failed (or all-failed) crawl hands the agent
@@ -478,7 +478,8 @@ fn emit_deep_research_progress(phase: &str, message: &str, progress: Option<f64>
 }
 
 /// The shared polite reader (`octos_research::reader`): SSRF check + DNS
-/// pinning on every hop, robots.txt, per-host spacing, size caps, and
+/// pinning on every hop, per-host spacing, 429/503 backoff, size caps,
+/// robots.txt when the operator enabled it, and
 /// post-render SSRF re-validation. The browser renderer (feature `browser`)
 /// also blocks private destinations inside Chrome.
 fn research_reader() -> octos_research::reader::Reader {
@@ -499,6 +500,9 @@ fn research_reader() -> octos_research::reader::Reader {
         timeout: DEEP_SEARCH_FETCH_TIMEOUT,
         max_page_bytes: MAX_PAGE_BYTES,
         keep_html: false,
+        // Operator setting, default off (maintainer decision: personal
+        // assistant reads on the person's behalf).
+        respect_robots: octos_research::respect_robots(|k| std::env::var(k).ok()),
         fallback_text: Some(html_to_markdown),
         renderer,
     })

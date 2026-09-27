@@ -40,6 +40,18 @@ impl HostThrottle {
         slot.saturating_duration_since(now)
     }
 
+    /// Push this host's next slot at least `delay` into the future (e.g. a
+    /// 429/503 `Retry-After`), so concurrent readers back off too.
+    pub fn defer(&self, host: &str, delay: Duration) {
+        let key = host.to_ascii_lowercase();
+        let until = Instant::now() + delay;
+        let mut map = self.next_slot.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = map.entry(key).or_insert(until);
+        if *slot < until {
+            *slot = until;
+        }
+    }
+
     /// Wait for this host's next slot.
     pub async fn wait(&self, host: &str, crawl_delay: Option<Duration>) {
         let d = self.reserve(host, crawl_delay);
@@ -66,6 +78,15 @@ mod tests {
             Duration::ZERO,
             "other hosts are independent"
         );
+    }
+
+    #[tokio::test]
+    async fn should_defer_a_host_after_backoff() {
+        let t = HostThrottle::new(Duration::from_millis(10));
+        t.defer("a.com", Duration::from_secs(5));
+        let wait = t.reserve("a.com", None);
+        assert!(wait > Duration::from_millis(4900), "{wait:?}");
+        assert_eq!(t.reserve("b.com", None), Duration::ZERO);
     }
 
     #[tokio::test]

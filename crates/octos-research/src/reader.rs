@@ -1,8 +1,10 @@
 //! The polite page reader shared by the research tools (deep-search skill
 //! and the built-in `search`): one implementation of the reading discipline.
 //!
-//! For each URL: SSRF check, robots.txt (per origin, cached), per-host
-//! spacing (plus `Crawl-delay`), SSRF-safe GET with DNS pinning on every hop,
+//! For each URL: SSRF check, robots.txt only when the operator enabled it
+//! ([`ReaderConfig::respect_robots`], default off), per-host spacing (plus
+//! `Crawl-delay` when robots is on), SSRF-safe GET with DNS pinning on every
+//! hop, one backoff-and-retry on 429/503 honouring `Retry-After`,
 //! content-type and size caps, readability extraction. When plain HTTP yields
 //! no main text, an optional browser [`Renderer`] renders the page; the
 //! rendered result is only accepted after the browser's final URL and every
@@ -40,6 +42,10 @@ pub struct ReaderConfig {
     pub host_interval: Duration,
     pub timeout: Duration,
     pub max_page_bytes: usize,
+    /// Fetch and obey robots.txt (and `Crawl-delay`). Default off: an
+    /// operator setting ([`crate::RESPECT_ROBOTS_ENV`]). When off robots.txt
+    /// is never requested.
+    pub respect_robots: bool,
     /// Keep the page HTML in [`ReadPage::html`] (for link extraction).
     pub keep_html: bool,
     /// Plain-text fallback when readability finds no article (e.g. a
@@ -54,6 +60,7 @@ impl Default for ReaderConfig {
             host_interval: Duration::from_secs(1),
             timeout: Duration::from_secs(15),
             max_page_bytes: 3 * 1024 * 1024,
+            respect_robots: false,
             keep_html: false,
             fallback_text: None,
             renderer: None,
@@ -97,9 +104,23 @@ impl Reader {
         }
     }
 
+    /// Whether robots.txt is being applied.
+    pub fn respects_robots(&self) -> bool {
+        self.cfg.respect_robots
+    }
+
+    /// Origins whose robots.txt was requested (0 when robots is off).
+    pub fn robots_origins_requested(&self) -> usize {
+        self.robots.origins_requested()
+    }
+
     /// robots.txt decision for `url`: `Ok(crawl_delay)` or `Err(reason)`
-    /// (`robots`, `robots_unreachable`, `invalid_url`).
+    /// (`robots`, `robots_unreachable`, `invalid_url`). Always `Ok(None)`
+    /// without any request when robots is off.
     pub async fn robots_allows(&self, url: &str) -> Result<Option<Duration>, String> {
+        if !self.cfg.respect_robots {
+            return Ok(None);
+        }
         let timeout = self.cfg.timeout;
         let d = self
             .robots
@@ -130,9 +151,25 @@ impl Reader {
         let host = urls::domain_of(url).unwrap_or_default();
         self.throttle.wait(&host, crawl_delay).await;
 
-        let resp = net::safe_get(url, self.cfg.timeout)
+        let mut resp = net::safe_get(url, self.cfg.timeout)
             .await
             .map_err(|e| format!("fetch_error: {e}"))?;
+        // Busy/rate-limited: back off (Retry-After, capped) and retry once;
+        // the host's next slot is pushed out for concurrent readers too.
+        if matches!(resp.status().as_u16(), 429 | 503) {
+            let wait = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| net::parse_retry_after(v, chrono::Utc::now()))
+                .unwrap_or(self.cfg.host_interval * 5)
+                .min(net::MAX_RETRY_AFTER);
+            self.throttle.defer(&host, wait);
+            self.throttle.wait(&host, None).await;
+            resp = net::safe_get(url, self.cfg.timeout)
+                .await
+                .map_err(|e| format!("fetch_error: {e}"))?;
+        }
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("fetch_error: HTTP {}", status.as_u16()));
@@ -243,7 +280,7 @@ impl Reader {
                 .await
                 .map_err(|e| format!("ssrf_blocked: rendered page went to {u}: {e}"))?;
         }
-        if urls::domain_of(&final_url) != urls::domain_of(page_url) {
+        if self.cfg.respect_robots && urls::domain_of(&final_url) != urls::domain_of(page_url) {
             self.robots_allows(&final_url).await?;
         }
         let ex = self.extract_with_fallback(&rendered.html, &final_url);
@@ -304,6 +341,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("127.0.0.1"), "{err}");
+    }
+
+    /// Default runs never request /robots.txt; with the operator setting on,
+    /// the origin's robots.txt is requested before the page. Uses TEST-NET-1
+    /// (192.0.2.0/24: public per the SSRF rules, never routed), so no real
+    /// site is contacted and requests just time out.
+    #[tokio::test]
+    async fn should_not_request_robots_txt_unless_enabled() {
+        let quick = |respect_robots| ReaderConfig {
+            timeout: Duration::from_millis(300),
+            host_interval: Duration::from_millis(1),
+            respect_robots,
+            ..Default::default()
+        };
+        let off = Reader::new(quick(false));
+        assert!(!off.respects_robots());
+        let _ = off.read("http://192.0.2.1/article").await;
+        assert_eq!(
+            off.robots_origins_requested(),
+            0,
+            "robots.txt must not be requested by default"
+        );
+        assert_eq!(off.robots_allows("http://192.0.2.1/x").await, Ok(None));
+
+        let on = Reader::new(quick(true));
+        let err = on.read("http://192.0.2.1/article").await.unwrap_err();
+        assert_eq!(on.robots_origins_requested(), 1);
+        assert_eq!(
+            err, "robots_unreachable",
+            "RFC 9309: unreachable robots.txt disallows"
+        );
     }
 
     #[tokio::test]
