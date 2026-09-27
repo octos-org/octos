@@ -209,3 +209,79 @@ pub(super) fn confine() -> Result<HostSandbox> {
         platform: "macos-seatbelt",
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn should_quote_plain_path_when_profile_literal_built() {
+        // Baseline shape: spaces need no escaping; the whole path becomes one
+        // double-quoted SBPL literal.
+        assert_eq!(
+            profile_literal(Path::new("/opt/Octos Worker.app/agent")).unwrap(),
+            "\"/opt/Octos Worker.app/agent\""
+        );
+    }
+
+    #[test]
+    fn should_escape_backslash_and_quote_when_profile_literal_built() {
+        // The integration escape probe proves these paths survive a real
+        // sandbox-exec round trip; this pins the exact emitted literal so the
+        // SBPL escaping cannot silently change shape.
+        assert_eq!(
+            profile_literal(Path::new("/tmp/a\\b\"c")).unwrap(),
+            "\"/tmp/a\\\\b\\\"c\""
+        );
+    }
+
+    #[test]
+    fn should_reject_control_characters_when_profile_literal_built() {
+        // Control characters could terminate or rewrite an SBPL literal; they
+        // must never reach the profile.
+        let error = profile_literal(Path::new("/tmp/a\nb")).unwrap_err();
+        assert!(error.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn should_reject_non_utf8_path_when_profile_literal_built() {
+        // Non-UTF-8 bytes cannot be represented in an SBPL literal; they must
+        // fail closed instead of being lossily converted into a grant for the
+        // wrong path.
+        let path = std::ffi::OsStr::from_bytes(b"/tmp/\xff\xfe");
+        let error = profile_literal(Path::new(path)).unwrap_err();
+        assert!(error.to_string().contains("UTF-8"));
+    }
+
+    #[test]
+    fn should_pin_worker_profile_grants_when_command_built() {
+        // The deny-default posture plus the exact exec/read grants are the
+        // security contract; the end-to-end probe only proves "the child ran
+        // confined", not which grants the emitted profile carries.
+        let command = command(Path::new("/bin/ls")).unwrap();
+        assert_eq!(command.get_program(), "/usr/bin/sandbox-exec");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args.first(), Some(&std::ffi::OsStr::new("-p")));
+        let profile = args.get(1).expect("profile follows -p").to_string_lossy();
+        assert!(profile.contains("(deny default)"), "profile: {profile}");
+        assert!(
+            profile.contains("(allow process-exec (literal \"/bin/ls\"))"),
+            "profile: {profile}"
+        );
+        assert!(
+            profile.contains("(import \"dyld-support.sb\")"),
+            "profile: {profile}"
+        );
+        assert_eq!(*args.last().unwrap(), std::ffi::OsStr::new("/bin/ls"));
+    }
+
+    #[test]
+    fn should_report_stdio_descriptors_when_descriptor_table_inspected() {
+        // The pre-exec close-on-exe sweep must at least see the standard
+        // streams, and the table must not be truncated into an error on a
+        // normal test process.
+        let (_, count) = descriptors().unwrap();
+        assert!(count >= 3, "stdio descriptors must be visible, got {count}");
+    }
+}
