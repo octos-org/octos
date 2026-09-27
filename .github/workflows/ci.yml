@@ -1012,6 +1012,13 @@ jobs:
       - name: Check octos-cli + all features (all targets)
         run: cargo check -p octos-cli --all-targets --features ${{ env.FEATURES }}
 
+      # The updater's signature-preservation behavior (#2559) lives in
+      # macOS-gated code, so the ubuntu `cargo test -p octos-services` lane
+      # never executes it — coverage that prints nothing and looks like
+      # passing coverage (#2055).
+      - name: Test octos-services (macOS behavior)
+        run: cargo test -p octos-services
+
   # ── Release artifact builds (main only) ──────────────────────────
   build-macos-arm:
     if: github.event_name == 'push'

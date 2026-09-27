@@ -5,7 +5,8 @@
 //! API-reported asset size — corruption protection only: the sidecar ships
 //! from the same release, so a compromised release channel is out of scope
 //! (nothing signs these artifacts yet). Backs up existing binaries, replaces
-//! only the whitelisted bundle entries, and runs `codesign` on macOS.
+//! only the whitelisted bundle entries, and ad-hoc-signs the entries that
+//! shipped without a valid code signature (macOS) so they stay executable.
 
 use std::path::{Path, PathBuf};
 
@@ -408,22 +409,34 @@ impl Updater {
                 std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
             }
 
-            // Codesign on macOS
+            // Sign on macOS, but never overwrite a valid incoming signature:
+            // the artifact's own signature (Developer ID or ad-hoc) is its
+            // Gatekeeper provenance, and a `--force -s -` re-sign would
+            // replace it with a fresh ad-hoc one (#2559). Only the installed
+            // copy that arrived without a valid signature gets the ad-hoc
+            // sign that lets arm64 macOS execute it.
             #[cfg(target_os = "macos")]
             {
-                let status = std::process::Command::new("codesign")
-                    .args(["--force", "-s", "-"])
-                    .arg(&target)
-                    .status();
-                match status {
-                    Ok(s) if s.success() => {
-                        tracing::debug!(binary = %name, "codesigned");
-                    }
-                    Ok(s) => {
-                        tracing::warn!(binary = %name, code = ?s.code(), "codesign failed");
-                    }
-                    Err(e) => {
-                        tracing::warn!(binary = %name, error = %e, "codesign command failed");
+                if has_valid_code_signature(&target) {
+                    tracing::debug!(binary = %name, "incoming code signature kept");
+                } else {
+                    // Nothing valid to preserve here (unsigned or corrupt
+                    // signature): `--force` re-signs it either way, keeping
+                    // today's recovery path for a corrupt one.
+                    let status = std::process::Command::new("codesign")
+                        .args(["--force", "-s", "-"])
+                        .arg(&target)
+                        .status();
+                    match status {
+                        Ok(s) if s.success() => {
+                            tracing::debug!(binary = %name, "codesigned");
+                        }
+                        Ok(s) => {
+                            tracing::warn!(binary = %name, code = ?s.code(), "codesign failed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(binary = %name, error = %e, "codesign command failed");
+                        }
                     }
                 }
             }
@@ -512,6 +525,27 @@ fn sidecar_hash_for(sidecar: &str, asset_name: &str) -> Option<String> {
         let valid_hash = hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit());
         (valid_hash && name == asset_name).then(|| hash.to_ascii_lowercase())
     })
+}
+
+/// True when `path` carries a valid code signature (`codesign --verify`).
+/// Ad-hoc signatures count: the goal is to keep whatever signature the
+/// release artifact shipped with, since re-signing with `--force -s -`
+/// replaces a Developer ID / notarized signature with an ad-hoc one and
+/// destroys its Gatekeeper provenance. Unsigned data files (the model
+/// catalog) fail this too, and take the re-sign path — `codesign` signs
+/// them as generic format entries, same as it always has.
+#[cfg(target_os = "macos")]
+fn has_valid_code_signature(path: &Path) -> bool {
+    use std::process::{Command, Stdio};
+
+    Command::new("codesign")
+        .args(["--verify", "--strict"])
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// SHA-256 of a file, lower-case hex.
@@ -820,7 +854,7 @@ mod tests {
         addr
     }
 
-    fn tar_gz_bytes(entries: &[(&str, &str)]) -> Vec<u8> {
+    fn tar_gz_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         let mut tar = tar::Builder::new(encoder);
         for (name, contents) in entries {
@@ -828,8 +862,7 @@ mod tests {
             header.set_size(contents.len() as u64);
             header.set_mode(0o755);
             header.set_cksum();
-            tar.append_data(&mut header, name, contents.as_bytes())
-                .unwrap();
+            tar.append_data(&mut header, name, *contents).unwrap();
         }
         tar.into_inner().unwrap().finish().unwrap()
     }
@@ -887,7 +920,10 @@ mod tests {
         // A pre-existing skill dir that a successful update must clean.
         std::fs::create_dir_all(skills_root.join("news")).unwrap();
 
-        let tarball = tar_gz_bytes(&[("clock", "new-clock"), ("evil.sh", "planted")]);
+        let tarball = tar_gz_bytes(&[
+            ("clock", "new-clock".as_bytes()),
+            ("evil.sh", "planted".as_bytes()),
+        ]);
         let addr = fixture_tarball(&tarball, Some(sidecar_for(&tarball))).await;
 
         let result = updater
@@ -925,7 +961,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (bin_dir, _skills, updater) = sandbox_updater(&tmp);
 
-        let tarball = tar_gz_bytes(&[("clock", "tampered")]);
+        let tarball = tar_gz_bytes(&[("clock", "tampered".as_bytes())]);
         let wrong = format!("{}  {ASSET_NAME}\n", "0".repeat(64));
         let addr = fixture_tarball(&tarball, Some(wrong)).await;
 
@@ -953,7 +989,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (bin_dir, _skills, updater) = sandbox_updater(&tmp);
 
-        let tarball = tar_gz_bytes(&[("clock", "truncated")]);
+        let tarball = tar_gz_bytes(&[("clock", "truncated".as_bytes())]);
         let addr = fixture_tarball(&tarball, None).await;
 
         // The API-reported size no longer matches what the (proxied) download
@@ -975,7 +1011,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (bin_dir, _skills, updater) = sandbox_updater(&tmp);
 
-        let tarball = tar_gz_bytes(&[("clock", "legacy")]);
+        let tarball = tar_gz_bytes(&[("clock", "legacy".as_bytes())]);
         // No /bundle.tar.gz.sha256 route — the fixture server 404s it, the
         // signature of a pre-rc.12 release.
         let addr = fixture_tarball(&tarball, None).await;
@@ -1001,7 +1037,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (bin_dir, _skills, updater) = sandbox_updater(&tmp);
 
-        let tarball = tar_gz_bytes(&[("clock", "sneaky")]);
+        let tarball = tar_gz_bytes(&[("clock", "sneaky".as_bytes())]);
         // The sidecar exists but names some other asset — exactly the case
         // where refusing is cheap and skipping is dangerous.
         let other = format!("{}  some-other-asset.tar.gz\n", "9".repeat(64));
@@ -1027,7 +1063,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (bin_dir, _skills, updater) = sandbox_updater(&tmp);
 
-        let tarball = tar_gz_bytes(&[("clock", "unverified")]);
+        let tarball = tar_gz_bytes(&[("clock", "unverified".as_bytes())]);
         let mut routes = std::collections::HashMap::new();
         routes.insert("/bundle.tar.gz".to_string(), (200, tarball.clone()));
         routes.insert("/bundle.tar.gz.sha256".to_string(), (500, b"boom".to_vec()));
@@ -1054,7 +1090,10 @@ mod tests {
         let (bin_dir, _skills, updater) = sandbox_updater(&tmp);
 
         // Only non-bundle entries — the signature of whitelist/bundle drift.
-        let tarball = tar_gz_bytes(&[("evil.sh", "planted"), ("readme.txt", "hi")]);
+        let tarball = tar_gz_bytes(&[
+            ("evil.sh", "planted".as_bytes()),
+            ("readme.txt", "hi".as_bytes()),
+        ]);
         let addr = fixture_tarball(&tarball, Some(sidecar_for(&tarball))).await;
 
         let err = updater
@@ -1070,6 +1109,214 @@ mod tests {
             "got: {err:#}"
         );
         assert!(bin_dir.read_dir().unwrap().next().is_none());
+    }
+
+    /// Copy the running test binary and sign it ad-hoc with a custom
+    /// identifier and the hardened-runtime flag — the closest local stand-in
+    /// for a future signed release artifact (#2559): both are properties a
+    /// `--force -s -` re-sign is known to destroy.
+    #[cfg(target_os = "macos")]
+    fn signed_binary_fixture(dest: &Path) {
+        std::fs::copy(std::env::current_exe().unwrap(), dest).unwrap();
+        let ok = std::process::Command::new("codesign")
+            .args([
+                "--force",
+                "-s",
+                "-",
+                "--identifier",
+                "octos-updater-test",
+                "-o",
+                "runtime",
+            ])
+            .arg(dest)
+            .status()
+            .unwrap();
+        assert!(ok.success(), "codesign fixture setup failed");
+    }
+
+    /// `(verifies, hardened-runtime flag kept, Identifier line)` of a path.
+    /// The runtime flag is read from the `flags=0x…` bitfield (0x10000 =
+    /// CS_RUNTIME) rather than matched as a substring of the flag list.
+    #[cfg(target_os = "macos")]
+    fn signature_of(path: &Path) -> (bool, bool, String) {
+        let verifies = std::process::Command::new("codesign")
+            .args(["--verify", "--strict"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success();
+        let output = std::process::Command::new("codesign")
+            .arg("-dvv")
+            .arg(path)
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let info = String::from_utf8_lossy(&output.stderr);
+        let runtime = info
+            .split("flags=0x")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_hexdigit()).next())
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .map(|bits| bits & 0x10000 != 0)
+            .unwrap_or(false);
+        let identifier = info
+            .lines()
+            .find(|l| l.starts_with("Identifier="))
+            .unwrap_or_default()
+            .to_string();
+        (verifies, runtime, identifier)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn has_valid_code_signature_accepts_signed_and_rejects_unsigned_binaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signed = tmp.path().join("signed");
+        signed_binary_fixture(&signed);
+        assert!(
+            has_valid_code_signature(&signed),
+            "a freshly signed binary must verify"
+        );
+
+        let unsigned = tmp.path().join("unsigned");
+        std::fs::copy(&signed, &unsigned).unwrap();
+        let ok = std::process::Command::new("codesign")
+            .arg("--remove-signature")
+            .arg(&unsigned)
+            .status()
+            .unwrap();
+        assert!(ok.success(), "codesign --remove-signature failed");
+        assert!(
+            !has_valid_code_signature(&unsigned),
+            "a stripped binary must not verify"
+        );
+    }
+
+    /// The provenance contract: a signed artifact keeps its signature through
+    /// an update (identifier and runtime flag intact — both would be replaced
+    /// by a `--force -s -` re-sign), while an unsigned one still gets the
+    /// ad-hoc signature that lets arm64 macOS execute it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn replace_binaries_keeps_incoming_signatures_and_signs_only_unsigned_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let extract_dir = tmp.path().join("extracted");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&extract_dir).unwrap();
+
+        signed_binary_fixture(&extract_dir.join("clock"));
+        std::fs::copy(std::env::current_exe().unwrap(), extract_dir.join("voice")).unwrap();
+        let ok = std::process::Command::new("codesign")
+            .arg("--remove-signature")
+            .arg(extract_dir.join("voice"))
+            .status()
+            .unwrap();
+        assert!(ok.success(), "codesign --remove-signature failed");
+
+        let updater = Updater::new(None).unwrap().with_bin_dir(bin_dir.clone());
+        let mut updated = Vec::new();
+        let mut backed_up = Vec::new();
+        updater
+            .replace_binaries(&extract_dir, &mut updated, &mut backed_up)
+            .unwrap();
+        assert_eq!(updated.len(), 2);
+
+        let (verifies, runtime, identifier) = signature_of(&bin_dir.join("clock"));
+        assert!(verifies, "installed binary must still verify");
+        assert!(runtime, "hardened-runtime flag must survive the install");
+        assert_eq!(
+            identifier, "Identifier=octos-updater-test",
+            "re-signing would replace the identifier with a file-name-derived hash"
+        );
+
+        let (verifies, _, _) = signature_of(&bin_dir.join("voice"));
+        assert!(
+            verifies,
+            "an unsigned artifact must leave the install with the ad-hoc signature"
+        );
+    }
+
+    /// End-to-end: a full `update()` install — download, sidecar verify,
+    /// extract, backup, replace — keeps the artifact's own signature instead
+    /// of re-signing over it (#2559).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn update_preserves_incoming_signatures_through_the_full_pipeline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bin_dir, _skills, updater) = sandbox_updater(&tmp);
+
+        let signed = tmp.path().join("signed-clock");
+        signed_binary_fixture(&signed);
+        let signed_bytes = std::fs::read(&signed).unwrap();
+
+        let tarball = tar_gz_bytes(&[("clock", signed_bytes.as_slice())]);
+        let addr = fixture_tarball(&tarball, Some(sidecar_for(&tarball))).await;
+
+        updater
+            .update(&release_for(
+                &format!("http://{addr}/bundle.tar.gz"),
+                tarball.len() as u64,
+                "v0.0.0-signed",
+            ))
+            .await
+            .expect("verified signed bundle installs");
+
+        let (verifies, runtime, identifier) = signature_of(&bin_dir.join("clock"));
+        assert!(verifies, "installed binary must still verify");
+        assert!(runtime, "hardened-runtime flag must survive the update");
+        assert_eq!(
+            identifier, "Identifier=octos-updater-test",
+            "re-signing would replace the identifier with a file-name-derived hash"
+        );
+    }
+
+    /// The recovery path: a corrupt signature fails verify and is re-signed
+    /// into a valid one (the behavior the old unconditional `--force -s -`
+    /// provided), and unsigned data files like the model catalog take the
+    /// same path — `codesign` signs them as generic format entries.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn replace_binaries_resigns_corrupt_signatures_and_unsigned_data_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let extract_dir = tmp.path().join("extracted");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&extract_dir).unwrap();
+
+        // A signed Mach-O with one flipped byte inside the first content
+        // page (away from the header and the trailing signature blob): the
+        // page hash no longer matches, so verify must fail — and the re-sign
+        // path must still produce a valid binary.
+        signed_binary_fixture(&extract_dir.join("clock"));
+        let mut corrupted = std::fs::read(extract_dir.join("clock")).unwrap();
+        corrupted[4096] ^= 0xff;
+        std::fs::write(extract_dir.join("clock"), &corrupted).unwrap();
+        assert!(
+            !has_valid_code_signature(&extract_dir.join("clock")),
+            "fixture must fail verify before the re-sign path runs"
+        );
+
+        std::fs::write(extract_dir.join("model_catalog.json"), "{}").unwrap();
+
+        let updater = Updater::new(None).unwrap().with_bin_dir(bin_dir.clone());
+        let mut updated = Vec::new();
+        let mut backed_up = Vec::new();
+        updater
+            .replace_binaries(&extract_dir, &mut updated, &mut backed_up)
+            .unwrap();
+        assert_eq!(updated.len(), 2);
+
+        let (verifies, _, _) = signature_of(&bin_dir.join("clock"));
+        assert!(
+            verifies,
+            "a corrupt signature must leave the install re-signed and valid"
+        );
+        let (verifies, _, _) = signature_of(&bin_dir.join("model_catalog.json"));
+        assert!(
+            verifies,
+            "an unsigned data file must be signed as a generic entry"
+        );
     }
 
     #[tokio::test]
