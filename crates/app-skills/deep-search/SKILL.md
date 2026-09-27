@@ -28,7 +28,7 @@ Example: `{"query": "COP31 climate summit", "lang": ["en", "es"], "since": "7d",
 
 ## Providers and policy (OctoSense ADR 0002 §6)
 
-1. Metasearch: sandboxed engines over official APIs and feeds, run in parallel, merged and ranked. news: GDELT, Hacker News, Mastodon hashtags; general: Wikipedia, Wikidata; science: arXiv, OpenAlex; it: Hacker News, GitHub, Stack Exchange; social: Mastodon; Brave joins general/news when `BRAVE_API_KEY` is set. Each provider's rate limit is enforced; failing engines are suspended with backoff. `OCTOS_METASEARCH=0` turns it off (GDELT + Google News RSS are then called directly for news).
+1. Metasearch: sandboxed engines over official APIs and feeds, run in parallel, merged and ranked. news: GDELT, Google News RSS (headlines), Hacker News, Mastodon hashtags; general: Wikipedia, Wikidata; science: arXiv, OpenAlex; it: Hacker News, GitHub, Stack Exchange; social: Mastodon; Brave joins general/news when `BRAVE_API_KEY` is set. Each provider's rate limit is enforced; failing engines are suspended with backoff. `OCTOS_METASEARCH=0` turns it off (GDELT + Google News RSS are then called directly for news).
 2. SearXNG when `SEARXNG_URL` is set (instance must enable the `json` format).
 3. Keyed APIs: Serper, Tavily, Perplexity, Brave, You.com.
 

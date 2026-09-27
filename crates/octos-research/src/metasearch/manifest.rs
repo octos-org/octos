@@ -53,8 +53,9 @@ pub struct EngineManifest {
     /// Per-request timeout in seconds.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-    /// Check the host's robots.txt before each request (feeds on sites that
-    /// publish one for automated clients).
+    /// The host publishes robots.txt rules for this path. They are checked
+    /// only when the operator turns robots checks on
+    /// ([`crate::RESPECT_ROBOTS_ENV`]); off by default.
     #[serde(default)]
     pub robots: bool,
     /// Whether `http://` URLs are allowed (default: https only).

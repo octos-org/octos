@@ -54,7 +54,16 @@ const CASES: &[Case] = &[
         langs: &["en"],
         since: Some("7d"),
         category: "news",
-        source: Source::File("tests/fixtures/google_news_search.xml"),
+        source: Source::Live,
+    },
+    Case {
+        engine: "google_news",
+        name: "news_zh",
+        query: "台风",
+        langs: &["zh-CN"],
+        since: Some("7d"),
+        category: "news",
+        source: Source::Live,
     },
     Case {
         engine: "wikipedia",

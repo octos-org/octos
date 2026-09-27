@@ -39,6 +39,11 @@ fn build_request(query, opts) {
 fn parse_response(response, opts) {
     let out = []
     for s in response.json {
+        // Skip posts their authors marked sensitive or put behind a content
+        // warning (Status.sensitive, Status.spoiler_text).
+        if object.get(s, "sensitive", false) || object.get(s, "spoiler_text", "") != "" {
+            continue
+        }
         let content = markup.text({html: object.get(s, "content", "")}).text
         if content == "" {
             continue

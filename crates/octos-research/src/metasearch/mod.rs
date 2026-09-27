@@ -4,11 +4,12 @@
 //!
 //! Clean-room: every engine is written from its provider's public API
 //! documentation (listed in its manifest's `docs_url`). Engines use official
-//! APIs, open datasets or published feeds only; no search-results page is
+//! APIs, open datasets or published feeds; no search-results page is
 //! scraped. Requests carry the identifiable octos User-Agent, respect each
-//! provider's published rate limit per host, honour `Retry-After`, revalidate
-//! cached responses with ETag / Last-Modified, and check robots.txt where the
-//! engine asks for it.
+//! provider's published rate limit per host, honour `Retry-After`, and
+//! revalidate cached responses with ETag / Last-Modified. robots.txt is
+//! checked only when the operator turns it on ([`crate::RESPECT_ROBOTS_ENV`]):
+//! an octos agent acts for one person.
 //!
 //! An engine is `engines/<id>/manifest.json` + `engine.octoscript` with:
 //!
@@ -97,6 +98,9 @@ pub struct Config {
     pub backoff_max: Duration,
     /// Consecutive timeouts before an engine is suspended.
     pub timeouts_before_suspend: u32,
+    /// Check robots.txt for engines whose manifest sets `robots` (operator
+    /// setting, off by default; see [`crate::RESPECT_ROBOTS_ENV`]).
+    pub respect_robots: bool,
 }
 
 impl Default for Config {
@@ -110,6 +114,7 @@ impl Default for Config {
             backoff_base: Duration::from_secs(30),
             backoff_max: Duration::from_secs(15 * 60),
             timeouts_before_suspend: 3,
+            respect_robots: false,
         }
     }
 }
@@ -151,6 +156,7 @@ impl Config {
             }
         }
         c.contact = nonempty(CONTACT_ENV).filter(|v| v.contains('@'));
+        c.respect_robots = crate::respect_robots(&lookup);
         c
     }
 }
@@ -694,9 +700,9 @@ impl Metasearch {
             url::Url::parse(&sreq.url).map_err(|err| CallError::Failed(err.to_string(), None))?;
         let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
 
-        // robots.txt, for engines that ask for it.
+        // robots.txt: only when the operator turned checks on.
         let mut interval = m.min_interval();
-        if m.robots {
+        if m.robots && self.inner.config.respect_robots {
             let fetch = self.inner.fetch.clone();
             let decision = self
                 .inner

@@ -1,8 +1,8 @@
-// Google News search feed (RSS 2.0). There is no public documentation for
-// it; the parameters are the ones Google's own feed links use (q, hl, gl,
-// ceid). The core checks robots.txt before every request, and
-// news.google.com/robots.txt currently disallows /rss for all agents, so
-// this engine is off by default and refused when enabled.
+// Google News search feed (RSS 2.0). Google does not document it; the
+// parameters are the ones its own feed links use (q, hl, gl, ceid).
+// Headlines only: article links are news.google.com redirects, cited but
+// never fetched. robots.txt (which disallows /rss) applies only when the
+// operator sets OCTOS_RESPECT_ROBOTS=1.
 use mod.markup
 use mod.net
 use mod.std.math

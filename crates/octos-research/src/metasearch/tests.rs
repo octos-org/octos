@@ -425,21 +425,38 @@ async fn should_attach_keys_in_the_host_and_skip_keyed_engines_without_one() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn should_skip_engines_when_robots_txt_disallows() {
+async fn should_check_robots_txt_only_when_the_operator_turns_it_on() {
     let fetch = MockFetch::default();
     fetch.on(
         "feed.example.org",
         Behavior::Respond(200, Vec::new(), "User-agent: *\nDisallow: /search\n".into()),
     );
-    let ms = search(
-        vec![test_engine(
+    let engine = || {
+        test_engine(
             "feed",
             "feed.example.org",
             serde_json::json!({"robots": true}),
-        )],
-        &fetch,
-        Config::default(),
+        )
+    };
+
+    // Default: robots.txt is not fetched or applied.
+    let ms = search(vec![engine()], &fetch, Config::default());
+    let resp = ms.search(&request("q")).await;
+    assert_ne!(resp.engines[0].status, EngineStatus::Robots);
+    let calls = fetch.calls_to("feed.example.org");
+    assert!(calls.iter().all(|(_, r)| !r.url.ends_with("/robots.txt")));
+
+    // Operator opt-in: the disallow rule wins.
+    let fetch = MockFetch::default();
+    fetch.on(
+        "feed.example.org",
+        Behavior::Respond(200, Vec::new(), "User-agent: *\nDisallow: /search\n".into()),
     );
+    let config = Config {
+        respect_robots: true,
+        ..Config::default()
+    };
+    let ms = search(vec![engine()], &fetch, config);
     let resp = ms.search(&request("q")).await;
     assert_eq!(resp.engines[0].status, EngineStatus::Robots);
     let calls = fetch.calls_to("feed.example.org");

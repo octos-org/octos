@@ -17,7 +17,7 @@ octos-research (Rust, trusted)                      engines/<id>/ (sandboxed Oct
  ├─ dispatcher: parallel fan-out, deadline           ├─ manifest.json   id, categories, languages, hosts,
  ├─ engine suspension on errors (doubling backoff)   │                  auth, rate_limit, docs_url, license_note
  ├─ HTTP: per-host spacing, Retry-After, ETag /      ├─ engine.octoscript
- │   If-Modified-Since cache, robots.txt, octos UA   │    build_request(query, opts)  -> {url, method, headers, body}
+ │   If-Modified-Since cache, octos UA   │    build_request(query, opts)  -> {url, method, headers, body}
  ├─ merge: canonical URL + near-duplicate titles     │    parse_response(response, opts) -> [item] | {items, backoff, error}
  ├─ rank: engine weight / √(1+position), recency     └─ fixtures/        recorded responses + expected items
  └─ filters: lang, since, domain allow/deny, cap
@@ -45,7 +45,7 @@ octos-research (Rust, trusted)                      engines/<id>/ (sandboxed Oct
 | Engine | Category | Source | Key | Rate limit (per host) | `docs_url` |
 |---|---|---|---|---|---|
 | `gdelt` | news | GDELT DOC 2.0 ArtList JSON | none | 6 s | https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/ |
-| `google_news` | news | Google News search RSS (headlines) | none | 2 s, **off by default** | https://news.google.com/robots.txt |
+| `google_news` | news | Google News search RSS (headlines only) | none | 2 s | https://news.google.com/rss |
 | `wikipedia` | general | MediaWiki Action API `list=search` | none | 1 s | https://www.mediawiki.org/wiki/API:Search, https://www.mediawiki.org/wiki/API:Etiquette |
 | `wikidata` | general | `wbsearchentities` | none | 1 s | https://www.wikidata.org/w/api.php?action=help&modules=wbsearchentities |
 | `arxiv` | science | arXiv API (Atom) | none | 3 s | https://info.arxiv.org/help/api/user-manual.html, https://info.arxiv.org/help/api/tou.html |
@@ -59,18 +59,19 @@ octos-research (Rust, trusted)                      engines/<id>/ (sandboxed Oct
 Notes:
 
 - **`general` without a key is thin.** Key-less general search is Wikipedia and Wikidata only, and results say so.
-- **Google News.** news.google.com/robots.txt disallows `/rss` for every user agent. The engine checks robots.txt before each request, so it ships off by default and is refused when enabled while that rule stands.
+- **Google News.** Headlines, publisher and date only; article redirect links are cited, never fetched. Google doesn't document the feed, and its text limits it to personal, non-commercial feed-reader use, which is how an octos agent acting for one person uses it.
 - **Mastodon.** Uses the public hashtag timeline, because full-text search needs a user token. Set another instance with `OCTOS_METASEARCH_MASTODON_INSTANCE`.
 - **Small key-less quotas.** OpenAlex allows about 100 searches a day per IP without a key. Stack Exchange allows 300 requests a day.
 
 ### Clean-room method
 
-SearXNG (AGPL-3.0) was only the conceptual model: engines as small modules, parallel dispatch, merge and rank. No SearXNG source, engine module or settings file was read, translated or copied. Each engine was written from its provider's public documentation (its manifest's `docs_url`), and its request and response shapes were checked against one recorded live response. The exceptions are Brave (needs a key) and Google News (robots.txt), whose fixtures are marked in their files. Every engine uses an official API or a published feed; no results page is scraped.
+SearXNG (AGPL-3.0) was only the conceptual model: engines as small modules, parallel dispatch, merge and rank. No SearXNG source, engine module or settings file was read, translated or copied. Each engine was written from its provider's public documentation (its manifest's `docs_url`), and its request and response shapes were checked against one recorded live response. The exceptions are Brave (needs a key) and GDELT (it answered HTTP 429 while recording), whose fixtures are synthetic and marked as such in their files. Every engine uses an official API or a published feed; no results page is scraped.
 
 ### Configuration
 
 | Variable | Effect |
 |---|---|
+| `OCTOS_RESPECT_ROBOTS=1` | Operator opt-in: check robots.txt for engines whose manifest sets `robots` (off by default; octos agents act for one person). |
 | `OCTOS_METASEARCH=0` | Turn the metasearch off; news falls back to direct GDELT and Google News RSS calls. |
 | `OCTOS_METASEARCH_ENGINES` | Directory of extra, pinned engines. |
 | `OCTOS_METASEARCH_<ENGINE>_<SETTING>` | Engine setting, e.g. `OCTOS_METASEARCH_MASTODON_INSTANCE=fosstodon.org`. |

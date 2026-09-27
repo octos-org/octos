@@ -1,0 +1,56 @@
+{
+  "body_file": "news_zh.body",
+  "expect": [
+    {
+      "lang": "zh-CN",
+      "published": "2026-09-21T11:35:14Z",
+      "source": "新华网",
+      "title": "台风“杜鹃”带来暴雨 日本关东地区发生山体滑坡",
+      "url": "https://news.google.com/rss/articles/CBMif0FVX3lxTE1HZjJ0cldUTDBtQ2piZEdjUDhjZnRKVklGYzhFQWtKOUpNb2syRFRESE5nZGw5XzYtXzl4Q0ZLRmNSV3VFWlVfSVdiMzVjZUtiQ3h3MjhjNHBKckhiYVJESEcxd1JqSXNzQ09PZVppRHlMZ3Z1aVZtTWNtQUlQVE0?oc=5"
+    },
+    {
+      "lang": "zh-CN",
+      "published": "2026-09-21T23:07:47Z",
+      "source": "天气网",
+      "title": "台风“杜鹃”向东偏北方向快速移动 强度变化不大",
+      "url": "https://news.google.com/rss/articles/CBMiYEFVX3lxTFBacGw4Yk40TVczSngzVGxHek5rRDNGYWR1NlBOU3BBMVlJSk5yOWlHckdhTUoyUXpIaG1lTVU0NmpLN2FXVzhUUENPdHlsSlVjNjNkaklqVmoxbkpHeGZWUw?oc=5"
+    },
+    {
+      "lang": "zh-CN",
+      "published": "2026-09-23T07:26:00Z",
+      "source": "sz.gov.cn",
+      "title": "什么是“秋”台风",
+      "url": "https://news.google.com/rss/articles/CBMie0FVX3lxTE1INHI1VlhhRjNtM3dOVEZya0xveDZkbnJNMXRLVVMwSVNNbDJuenJxSzBjY2VMWjhmQmtIMnNMbUdwODlhU0QyQXBJaDBHNzFzOWRySHhQREd5Y3FySFNUdmR2UE90WlBEc2h3eWFQZW1nU0ZCc0N0YU9lRQ?oc=5"
+    },
+    {
+      "lang": "zh-CN",
+      "published": "2026-09-25T10:45:29Z",
+      "source": "央广网",
+      "title": "台风“杜鹃”已致日本12死3失踪",
+      "url": "https://news.google.com/rss/articles/CBMiaEFVX3lxTE9wRjJpQVZYZmJmSDF1c2o0UGdlTFhySU95NDhINDlGREFjRjBIQ2lMRTZybUd0UU9pY2FKWGZJeE03MXloQVM1Z0E3TF80TGltQ3pIam1hRC1qU1lkU3JKZkhfVEdDZUdy?oc=5"
+    },
+    {
+      "lang": "zh-CN",
+      "published": "2026-09-24T08:55:00Z",
+      "source": "21财经",
+      "title": "第26号台风“舒力基”已生成，中秋节广东能赏月吗？",
+      "url": "https://news.google.com/rss/articles/CBMijwFBVV95cUxOQldGcDd6Nm5QVXVtQU5mOERPS0lqdV8tOUhONEQ5SURvRGJlZ1dQdGx0MjhuX0U1LWp5VmJsMm05UWJndG1la3Q4cnFPc2JMaDBnX2NjZVVOR3VCSGR3cHZoTFQ2alU0WkdRZTdDWWZmZVFuRWdjOEctOGR2SmNfU0FoTmNKb0RPLWEwbm1BRQ?oc=5"
+    }
+  ],
+  "http": {
+    "headers": {},
+    "method": "GET",
+    "url": "https://news.google.com/rss/search?q=%E5%8F%B0%E9%A3%8E+when%3A7d&hl=zh-CN&gl=CN&ceid=CN%3Azh-Hans"
+  },
+  "recorded": "live, 2026-09-27",
+  "request": {
+    "category": "news",
+    "count": 5,
+    "langs": [
+      "zh-CN"
+    ],
+    "now": "2026-09-27T23:00:00Z",
+    "query": "台风",
+    "since": "7d"
+  }
+}

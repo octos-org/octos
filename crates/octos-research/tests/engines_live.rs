@@ -36,6 +36,7 @@ macro_rules! live {
 }
 
 live!(gdelt_live, "gdelt", "climate", "news");
+live!(google_news_live, "google_news", "climate", "news");
 live!(
     wikipedia_live,
     "wikipedia",
