@@ -239,6 +239,14 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     ));
     report.push(shadow_check(&located, &method, &spec));
 
+    // --- Embedded web UI bundles --------------------------------------------
+    // What this binary can actually serve at /app, /admin, and /swarm. The
+    // SPAs are embedded from gitignored static/ trees, so a source-clone
+    // build without the scripts/build-*.sh step 503s at every UI route
+    // (#2384) — surface that before the first serve.
+    #[cfg(feature = "api")]
+    report.push(ui_bundles_check());
+
     // --- Installations (every octos + octoscode copy, with versions) --------
     // Parity with `octoscode doctor`'s Installations section: enumerate BOTH
     // binaries across PATH + the known install dirs so duplicate / mismatched
@@ -331,6 +339,69 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     ));
 
     Ok(report)
+}
+
+/// What this binary can serve at the embedded UI routes (#2384): pass with
+/// the available bundles, warn naming the missing ones' build scripts.
+#[cfg(feature = "api")]
+fn ui_bundles_check() -> Check {
+    ui_bundles_check_from(
+        &crate::api::static_files::embedded_ui_bundles(),
+        cfg!(debug_assertions),
+    )
+}
+
+#[cfg(feature = "api")]
+fn ui_bundles_check_from(
+    bundles: &[crate::api::static_files::UiBundleStatus],
+    reads_static_from_disk: bool,
+) -> Check {
+    let missing: Vec<&crate::api::static_files::UiBundleStatus> =
+        bundles.iter().filter(|bundle| !bundle.embedded).collect();
+    if missing.is_empty() {
+        let present: Vec<&str> = bundles
+            .iter()
+            .filter(|bundle| bundle.embedded)
+            .map(|bundle| bundle.label)
+            .collect();
+        return Check::pass(CAT_BINARY, "web UI bundles", present.join(", "))
+            .with_value(embed_mode_value(reads_static_from_disk));
+    }
+    let scripts = missing
+        .iter()
+        .map(|bundle| bundle.build_script)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rebuild = if reads_static_from_disk {
+        // A debug binary reads `static/` from disk at serve time — the
+        // scripts' output is picked up without recompiling.
+        " (debug build reads static/ from disk; no rebuild needed)"
+    } else {
+        ", then rebuild octos-cli"
+    };
+    Check::warn(
+        CAT_BINARY,
+        "web UI bundles",
+        format!(
+            "not available: {} — those UI routes serve 503",
+            missing
+                .iter()
+                .map(|bundle| bundle.label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        format!("run {scripts}{rebuild}"),
+    )
+    .with_value(embed_mode_value(reads_static_from_disk))
+}
+
+#[cfg(feature = "api")]
+fn embed_mode_value(reads_static_from_disk: bool) -> &'static str {
+    if reads_static_from_disk {
+        "debug build: static/ read from disk at runtime"
+    } else {
+        "release build: bundles compiled in"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2126,6 +2197,13 @@ mod tests {
         assert_eq!(skew.status, octos_diagnostics::CheckStatus::Pass);
         // Glyphs are present in the rendered output.
         assert!(text.contains("[✓]"));
+        // The #2384 bundle check is wired into the report — asserted for
+        // presence only, since the status depends on the checkout's
+        // (gitignored) static/ tree.
+        assert!(
+            report.checks.iter().any(|c| c.name == "web UI bundles"),
+            "embedded web UI bundle check must be part of the report"
+        );
     }
 
     // ---- Stage 3 ----
@@ -2983,5 +3061,110 @@ mod tests {
         assert!(is_local_server_family("vllm"));
         assert!(!is_local_server_family("anthropic"));
         assert!(!is_local_server_family("openai"));
+    }
+
+    #[cfg(feature = "api")]
+    fn ui_bundle(
+        label: &'static str,
+        script: &'static str,
+        embedded: bool,
+    ) -> crate::api::static_files::UiBundleStatus {
+        crate::api::static_files::UiBundleStatus {
+            label,
+            build_script: script,
+            embedded,
+        }
+    }
+
+    /// #2384: a fresh-clone build has none of the gitignored SPA bundles;
+    /// the check must warn and hand out every missing bundle's build script.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_warn_with_build_scripts_when_no_ui_bundle_is_embedded() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", false),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", false),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", false),
+            ],
+            false,
+        );
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.name, "web UI bundles");
+        assert!(check.detail.contains("web (/app)"), "{}", check.detail);
+        assert!(check.detail.contains("admin (/admin)"), "{}", check.detail);
+        assert!(check.detail.contains("swarm (/swarm)"), "{}", check.detail);
+        let fix = check.fix.as_deref().unwrap_or_default();
+        assert!(fix.contains("build-web-app.sh"), "{fix}");
+        assert!(fix.contains("build-dashboard.sh"), "{fix}");
+        assert!(fix.contains("build-swarm-app.sh"), "{fix}");
+        assert!(fix.contains(", then rebuild octos-cli"), "{fix}");
+        assert_eq!(
+            check.value.as_deref(),
+            Some("release build: bundles compiled in")
+        );
+    }
+
+    /// A build that ran some (not all) bundle scripts warns only about the
+    /// missing ones — the available bundles must not be reported as absent.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_warn_only_for_missing_bundles_when_partially_embedded() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", true),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", true),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", false),
+            ],
+            false,
+        );
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(!check.detail.contains("web (/app)"), "{}", check.detail);
+        assert!(!check.detail.contains("admin (/admin)"), "{}", check.detail);
+        assert!(check.detail.contains("swarm (/swarm)"), "{}", check.detail);
+        assert_eq!(
+            check.fix.as_deref(),
+            Some("run ./scripts/build-swarm-app.sh, then rebuild octos-cli")
+        );
+    }
+
+    /// A fully bundled binary passes with the embedded routes and no fix line.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_pass_when_every_ui_bundle_is_embedded() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", true),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", true),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", true),
+            ],
+            false,
+        );
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.detail, "web (/app), admin (/admin), swarm (/swarm)");
+        assert!(check.fix.is_none());
+    }
+
+    /// A debug binary reads `static/` from disk at serve time, so the fix
+    /// line must not send the operator through a rebuild — and the report
+    /// must disclose which embed mode produced the verdict.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_skip_rebuild_in_fix_and_disclose_mode_for_debug_builds() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", false),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", false),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", false),
+            ],
+            true,
+        );
+        let fix = check.fix.as_deref().unwrap_or_default();
+        assert!(fix.contains("no rebuild needed"), "{fix}");
+        assert!(!fix.contains("rebuild octos-cli"), "{fix}");
+        assert_eq!(
+            check.value.as_deref(),
+            Some("debug build: static/ read from disk at runtime")
+        );
     }
 }

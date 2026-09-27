@@ -34,7 +34,7 @@ mod slide_edits;
 mod smart_home_bridge;
 mod smart_home_panel;
 pub(crate) mod solo_auth;
-mod static_files;
+pub(crate) mod static_files;
 pub mod swarm;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha9_bridge;
