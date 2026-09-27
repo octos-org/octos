@@ -155,10 +155,13 @@ pub fn parse_release(payload: &serde_json::Value, spec: &ProductSpec) -> Result<
         .to_string();
     let version = tag.strip_prefix('v').unwrap_or(&tag).to_string();
 
-    // Asset selection: the cargo-dist asset is `<prefix>-<triple>` with some
-    // archive extension (`.tar.gz`/`.zip`). Match by *prefix* of the asset name
-    // so we don't have to hardcode the extension per OS.
+    // Asset selection: the cargo-dist asset is `<prefix>-<triple>` plus an
+    // archive extension (`.tar.gz`/`.zip`). Match the exact name — a prefix
+    // match lets a sibling (`.tar.gz.sha256`) or decoy asset shadow the real
+    // bundle, which becomes load-bearing once a driver verifies downloads.
     let wanted = spec.asset_selector.asset_name(&host_target_triple());
+    let wanted_tar = format!("{wanted}.tar.gz");
+    let wanted_zip = format!("{wanted}.zip");
     let asset_url = payload["assets"].as_array().and_then(|assets| {
         assets
             .iter()
@@ -167,7 +170,7 @@ pub fn parse_release(payload: &serde_json::Value, spec: &ProductSpec) -> Result<
                 let url = a["browser_download_url"].as_str()?;
                 Some((name, url))
             })
-            .find(|(name, _)| name.starts_with(&wanted))
+            .find(|(name, _)| name == &wanted_tar || name == &wanted_zip)
             .map(|(_, url)| url.to_string())
     });
 
@@ -265,6 +268,36 @@ mod tests {
         let info = parse_release(&payload, &octos_spec()).expect("parses");
         assert_eq!(info.version, "2.0.0");
         assert!(info.asset_url.is_none());
+    }
+
+    #[test]
+    fn parse_release_prefix_siblings_may_not_shadow_the_bundle() {
+        // The real bundle sits behind its checksum sidecar and a decoy; a
+        // prefix match would pick the first shadow instead of the bundle.
+        let triple = host_target_triple();
+        let base = format!("octos-bundle-{triple}");
+        let payload = serde_json::json!({
+            "tag_name": "v2.0.3",
+            "assets": [
+                {
+                    "name": format!("{base}.tar.gz.sha256"),
+                    "browser_download_url": "https://example.com/shadowed.sha256"
+                },
+                {
+                    "name": format!("{base}.tar.gz.EVIL.tar.gz"),
+                    "browser_download_url": "https://example.com/decoy"
+                },
+                {
+                    "name": format!("{base}.tar.gz"),
+                    "browser_download_url": "https://example.com/real.tar.gz"
+                }
+            ]
+        });
+        let info = parse_release(&payload, &octos_spec()).expect("parses");
+        assert_eq!(
+            info.asset_url.as_deref(),
+            Some("https://example.com/real.tar.gz")
+        );
     }
 
     #[test]

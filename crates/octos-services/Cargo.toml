@@ -20,6 +20,7 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
+sha2 = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 

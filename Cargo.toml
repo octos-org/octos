@@ -104,6 +104,7 @@ clap_complete = "4"
 colored = "2"
 dirs = "5"
 rustyline = "15"
+semver = "1"
 open = "5"
 # Keychain (platform-native secure credential storage)
 keyring = { version = "3", default-features = false }

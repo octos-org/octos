@@ -384,6 +384,9 @@ jobs:
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
 
+      - name: Test octos-services
+        run: cargo test -p octos-services
+
       # Bundled harness starter skills (each has small lib + 1 smoke test)
       - name: Test harness starter skills
         run: |

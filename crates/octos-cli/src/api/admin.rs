@@ -3566,10 +3566,10 @@ pub async fn system_version(
     };
 
     let current_semver = env!("CARGO_PKG_VERSION");
-    let update_available = latest
-        .get("version")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v != current_semver);
+    let update_available = update_available_for(
+        current_semver,
+        latest.get("version").and_then(|v| v.as_str()),
+    );
 
     Ok(Json(serde_json::json!({
         "current": current,
@@ -3587,6 +3587,27 @@ pub struct UpdateRequest {
 }
 fn default_version() -> String {
     "latest".to_string()
+}
+
+/// Whether `latest` is strictly newer than the running `current` release,
+/// with full semver precedence: `2.0.3-rc.12 < 2.0.3-rc.13 < 2.0.3`. This is
+/// deliberately pre-release-aware — unlike `octos_diagnostics`' planner, whose
+/// `parse_version` strips pre-releases — because the admin channel installs
+/// pinned rc tags and must keep the rc train flowing forward while still
+/// refusing downgrades. Unparseable on either side means "can't tell" and
+/// counts as up to date — never push a spurious (or backwards) update off an
+/// unparseable version.
+fn update_available_for(current: &str, latest: Option<&str>) -> bool {
+    let Some(latest) = latest else {
+        return false;
+    };
+    let (Ok(current), Ok(latest)) = (
+        semver::Version::parse(current.trim().trim_start_matches('v')),
+        semver::Version::parse(latest.trim().trim_start_matches('v')),
+    ) else {
+        return false;
+    };
+    latest > current
 }
 
 /// POST /api/admin/system/update — download and apply an update
@@ -3609,6 +3630,17 @@ pub async fn system_update(
         updater.check_version(&tag).await
     }
     .map_err(|e| (StatusCode::BAD_REQUEST, format!("Release not found: {e}")))?;
+
+    // Refuse anything that is not strictly newer — an update channel that
+    // accepts equal or older releases is a downgrade vector.
+    let current = env!("CARGO_PKG_VERSION");
+    let new_version = &release.version;
+    if !update_available_for(current, Some(new_version)) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("refusing update: {new_version} is not newer than the running {current}"),
+        ));
+    }
 
     // Perform the update
     let result = updater.update(&release).await.map_err(|e| {
@@ -5637,6 +5669,29 @@ mod register_flow_tests {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    /// Strictly-newer only, with full semver precedence: the rc train flows
+    /// forward (rc.12 → rc.13), an rc graduates to its stable, but the older
+    /// July stable never shows as an "update" over a newer rc build — which
+    /// the string `!=` used to advertise.
+    #[test]
+    fn should_only_advertise_strictly_newer_releases() {
+        assert!(update_available_for("2.0.3-rc.13", Some("2.0.4")));
+        assert!(update_available_for("2.0.2", Some("2.0.3")));
+        // The rc train: forward allowed, backward refused.
+        assert!(update_available_for("2.0.3-rc.12", Some("2.0.3-rc.13")));
+        assert!(update_available_for("2.0.3-rc.13", Some("2.0.3")));
+        assert!(!update_available_for("2.0.3-rc.13", Some("2.0.3-rc.12")));
+        // Stable beats the pre-release of the same core version…
+        assert!(!update_available_for("2.0.3", Some("2.0.3-rc.13")));
+        // …and plain downgrades, which `!=` used to count as updates.
+        assert!(!update_available_for("2.0.3-rc.13", Some("2.0.2")));
+        assert!(!update_available_for("2.0.3", Some("2.0.3")));
+        // Unparseable on either side → never claim an update.
+        assert!(!update_available_for("2.0.3", None));
+        assert!(!update_available_for("2.0.3", Some("garbage")));
+        assert!(!update_available_for("garbage", Some("2.0.4")));
+    }
 
     /// The guard blocks exactly the link-local (metadata) ranges and nothing
     /// a local model server legitimately uses (loopback, RFC1918, hostnames).
