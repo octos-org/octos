@@ -534,7 +534,11 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   choice), `model_note`, `memory_namespace`, `resumed` and `host_token`
   (minted once at creation; required for every later control call on the
   peer). A binding whose namespace or workspace nests with another app
-  peer's is refused. Typed `data.kind`: `peer_originator_mismatch`,
+  peer's is refused. A host-owned app peer's tool approvals are answered
+  only by the person through the host (`approval/respond`): the owning
+  system agent is not woken for them, `peer_list` does not offer them, and
+  `peer_respond` refuses them; it still answers the peer's questions.
+  Typed `data.kind`: `peer_originator_mismatch`,
   `peer_host_token_mismatch`, `peer_binding_mismatch`,
   `peer_binding_conflict`, `peer_closed`.
 - `peer/model/set` (accepted `UPCR-2026-034`: the peer's originator sets or

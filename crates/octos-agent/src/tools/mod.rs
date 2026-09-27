@@ -932,7 +932,9 @@ pub use peer_list::{PeerListCallback, PeerListTool};
 pub use peer_respond::{
     PeerRespondAnswer, PeerRespondCallback, PeerRespondRequest, PeerRespondTool,
 };
-pub use peer_send_input::{PeerSendInputCallback, PeerSendInputRequest, PeerSendInputTool};
+pub use peer_send_input::{
+    PeerSendInputCallback, PeerSendInputDelivery, PeerSendInputRequest, PeerSendInputTool,
+};
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
 pub use recall::{RecallTool, ToolOutputLedger};

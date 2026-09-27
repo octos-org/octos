@@ -4092,6 +4092,33 @@ pub(crate) fn peer_pending_summaries(
     approvals
 }
 
+/// The part of a peer's parked set its ORIGINATOR may answer. A host-owned app
+/// peer's tool approvals belong to the person in the app's own UI (ADR 0007,
+/// UPCR-2026-034): they are dropped here, so neither `peer_list` nor
+/// `peer_respond` offers them to the owning system agent. Every other peer's
+/// set is returned unchanged.
+pub(crate) fn peer_pending_answerable_by_originator(
+    peers_root: &Path,
+    slug: &str,
+    pendings: Vec<PeerPendingSummary>,
+) -> Vec<PeerPendingSummary> {
+    if !app_binding::peer_is_host_owned(peers_root, slug) {
+        return pendings;
+    }
+    pendings
+        .into_iter()
+        .filter(|pending| pending.kind != PeerPendingKind::Approval)
+        .collect()
+}
+
+/// The refusal `peer_respond` returns for a host-owned app peer's approval.
+fn host_owned_approval_refusal(slug: &str) -> String {
+    format!(
+        "peer '{slug}' is a host-owned app peer: its tool approvals are answered \
+         only by the person in the app, not via peer_respond — leave it to them"
+    )
+}
+
 /// The peer's TRUSTED session key (#P1-1): the wire it runs its turns under,
 /// recorded server-side at `session/open`. `None` when the peer is not currently
 /// open — it then has no live oneshot to answer or cancel. This is the ONLY
@@ -4185,7 +4212,28 @@ pub(crate) fn peer_respond_resolve(
     };
 
     // The AUTHORITATIVE parked set for this peer, straight from the store.
-    let pendings = peer_pending_summaries(contracts, &peer_session);
+    let all_pendings = peer_pending_summaries(contracts, &peer_session);
+    // ADR 0007 — a host-owned app peer's approvals are the person's, answered
+    // in the app's own UI. The originator (the system agent) may answer the
+    // peer's questions but never approve its tools: refuse a targeted
+    // approval, and never select one by default.
+    if app_binding::peer_is_host_owned(peers_root, &slug) {
+        let targets_approval = match req.id.as_deref() {
+            Some(id) => all_pendings
+                .iter()
+                .any(|p| p.id == id && p.kind == PeerPendingKind::Approval),
+            None => {
+                req.decision.is_some()
+                    && all_pendings
+                        .iter()
+                        .any(|p| p.kind == PeerPendingKind::Approval)
+            }
+        };
+        if targets_approval {
+            return Err(host_owned_approval_refusal(&slug));
+        }
+    }
+    let pendings = peer_pending_answerable_by_originator(peers_root, &slug, all_pendings);
     if pendings.is_empty() {
         return Err(format!(
             "peer '{slug}' is not awaiting input — nothing to respond to \
@@ -4974,7 +5022,13 @@ pub(crate) fn build_peer_list_callback(
             .filter(|row| !row.closed)
             .filter_map(|row| {
                 let session = peer_trusted_session(&profile_id, &row.slug)?;
-                let pending = peer_pending_summaries(&contracts, &session);
+                // ADR 0007 — a host-owned app peer's approvals are the
+                // person's; they are not shown to the originator as input to give.
+                let pending = peer_pending_answerable_by_originator(
+                    &peers_root,
+                    &row.slug,
+                    peer_pending_summaries(&contracts, &session),
+                );
                 (!pending.is_empty()).then(|| (row.slug.clone(), pending))
             })
             .collect();

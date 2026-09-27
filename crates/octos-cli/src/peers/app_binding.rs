@@ -213,6 +213,16 @@ pub(crate) fn read_peer_host_binding(peers_root: &Path, slug: &str) -> Option<Pe
     read_host_binding_in(&dir)
 }
 
+/// Whether staged peer `slug` is a host-owned app peer (ADR 0007): its tool
+/// approvals are answered only by the person, in the app's own UI, never by
+/// the owning system agent through `peer_respond`. Fail-closed — a peer dir
+/// that carries the binding leaf counts even when the leaf is unreadable or
+/// malformed, so a torn binding can never re-open the originator path.
+pub(crate) fn peer_is_host_owned(peers_root: &Path, slug: &str) -> bool {
+    staged_peer_dir(peers_root, slug)
+        .is_some_and(|dir| dir.join(HOST_BINDING_LEAF).symlink_metadata().is_ok())
+}
+
 pub(crate) fn read_host_binding_in(peer_dir: &Path) -> Option<PeerHostBinding> {
     let body = peer_io::read_peer_file(
         peer_dir,

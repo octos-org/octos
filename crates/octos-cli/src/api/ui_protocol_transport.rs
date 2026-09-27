@@ -15435,6 +15435,10 @@ enum PeerAwaitingWakeOutcome {
     /// malformed/hostile originator can never strand a continuation on the wrong
     /// or an unanswerable session.
     InvalidOriginator,
+    /// ADR 0007 — a host-owned app peer parked on a tool APPROVAL. That is the
+    /// person's decision, made in the app's own UI; the owning system agent is
+    /// never asked (and `peer_respond` refuses it). Questions still wake.
+    HostOwnedApproval,
 }
 
 /// Short, single-line summary of what a peer is blocked on, for the wake nudge.
@@ -15480,6 +15484,13 @@ fn enqueue_peer_awaiting_input_wake(
     let Some(peer_dir) = staged_peer_dir(peers_root, slug) else {
         return PeerAwaitingWakeOutcome::NoStagedPeer;
     };
+    // ADR 0007 — never ask the system agent to answer a host-owned app peer's
+    // tool approval: the person answers it in the app.
+    if park_kind == PeerPendingKind::Approval
+        && crate::peers::app_binding::peer_is_host_owned(peers_root, slug)
+    {
+        return PeerAwaitingWakeOutcome::HostOwnedApproval;
+    }
     let Some(master) =
         peer_io::read_peer_file(&peer_dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
     else {
@@ -15949,6 +15960,58 @@ mod peer_awaiting_wake_tests {
         assert!(
             prompt.contains("peer_list") && prompt.contains("peer_respond"),
             "prompt directs peer_list/peer_respond: {prompt}"
+        );
+    }
+
+    /// ADR 0007 — a host-owned app peer parking on a tool APPROVAL must not
+    /// wake its owning system agent: the person answers it in the app. The
+    /// same peer's QUESTION still wakes the system agent.
+    #[test]
+    fn host_owned_peer_approval_park_does_not_wake_the_system_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-host-appr";
+        let master = "tenant-wake-host-appr:api:octosense#system";
+        stage_peer_with_originator(peers_root, "rinx", Some(master));
+        crate::peers::app_binding::write_host_binding_in(
+            &peers_root.join("rinx"),
+            &crate::peers::app_binding::PeerHostBinding {
+                version: 1,
+                cwd: peers_root.join("work"),
+                memory_namespace: "app/rinx".to_owned(),
+                token_sha256: crate::peers::app_binding::token_digest("t"),
+            },
+        )
+        .unwrap();
+        let session = peer_session(profile, "rinx-wire", "rinx");
+        let master_key = SessionKey(master.to_owned());
+        let orchestrator = default_agent_orchestrator();
+
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-host-1",
+            PeerPendingKind::Approval,
+            "shell: rm -rf build",
+        );
+        assert_eq!(outcome, PeerAwaitingWakeOutcome::HostOwnedApproval);
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
+            0,
+            "no wake is queued on the system agent for a host-owned approval",
+        );
+
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "question-host-1",
+            PeerPendingKind::Question,
+            "Which number?",
+        );
+        assert_eq!(
+            outcome,
+            PeerAwaitingWakeOutcome::Woke,
+            "the host-owned peer's question still wakes the system agent"
         );
     }
 
@@ -35101,6 +35164,21 @@ fn interrupted_goal_charge(
     }
 }
 
+/// The dedupe occurrence of one `peer_send_input` call: the calling session,
+/// its turn, then the tool's own occurrence id (the provider's tool-call id).
+/// A provider's tool-call id is unique only within one response — scripted
+/// and some OpenAI-compatible servers reuse `call_1` on every turn — so the
+/// bare id let a later turn's send collapse onto an earlier, already-drained
+/// one and be dropped. Scoped this way, a retry of the same call in the same
+/// turn still dedupes, and a new turn never collides with an old one.
+pub(crate) fn peer_send_input_occurrence_id(
+    calling_session: &str,
+    turn_id: &TurnId,
+    tool_occurrence_id: &str,
+) -> String {
+    format!("{calling_session}/{}/{tool_occurrence_id}", turn_id.0)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_standalone_turn(
     ws: WsConnection,
@@ -36836,6 +36914,7 @@ async fn run_standalone_turn(
             // captured at wire time. Only the session that staged the peer may
             // inject into it.
             let send_origin_session = session_id.to_string();
+            let send_turn_id = turn_id.clone();
             let send_input: octos_agent::PeerSendInputCallback =
                 Arc::new(move |req: octos_agent::PeerSendInputRequest| {
                     // Resolve the identifier (peer NAME or slug) to the actual
@@ -36903,9 +36982,12 @@ async fn run_standalone_turn(
                             attachment_media: vec![],
                             attachment_prompt: None,
                         };
-                        return tx.try_send(actor_msg).map_err(|e| {
-                            format!("peer session '{slug}' inbox is full or closed: {e}")
-                        });
+                        return tx
+                            .try_send(actor_msg)
+                            .map(|()| octos_agent::PeerSendInputDelivery::Queued)
+                            .map_err(|e| {
+                                format!("peer session '{slug}' inbox is full or closed: {e}")
+                            });
                     }
 
                     // Path 2: serve continuation queue.
@@ -36933,7 +37015,11 @@ async fn run_standalone_turn(
                             &target,
                             &send_profile_id,
                             &slug,
-                            &req.occurrence_id,
+                            &peer_send_input_occurrence_id(
+                                &send_origin_session,
+                                &send_turn_id,
+                                &req.occurrence_id,
+                            ),
                             &req.message,
                         )
                         .into_callback_result(&slug)

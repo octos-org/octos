@@ -131,15 +131,34 @@ For a session whose topic is `peer-<slug>` of a host-owned peer, or any
 - **Background extraction**: the profile's memory-refresh sweep never reads
   a bound session's transcript.
 
-Ordinary sessions and agent-staged peers are unchanged.
+### Approvals belong to the person
+
+A host-owned app peer's tool approvals are answered only by the person, in
+the app's own UI (the host answers them with `approval/respond` on the
+peer's session). The owning system agent never approves them:
+
+- `peer_respond` refuses to approve or deny a host-owned peer's approval —
+  named by id, or as the default target — with a model-visible error that
+  says the person answers it in the app. Nothing is decided and the approval
+  stays parked.
+- A host-owned peer parking on an approval does not wake the system agent,
+  and `peer_list` does not show the approval as input for it to give.
+- The system agent still answers the peer's questions (`ask_user_question`)
+  through `peer_respond`, and is still woken for them.
+
+A peer dir carrying a host binding counts as host-owned even when the
+binding file is unreadable, so a torn binding cannot re-open the path.
+
+Ordinary sessions and agent-staged peers are unchanged: their originator
+still answers their approvals.
 
 ## Non-goals and conservative defaults
 
 - **Permission prompts.** Approvals keep their existing policy: an app
   peer's tool approval is raised like any session's and is answered by the
-  person through the host. The system agent's ability to answer a peer's
-  ordinary question is not authority to approve a tool; nothing here
-  auto-approves.
+  person through the host (see "Approvals belong to the person"). The system
+  agent's ability to answer a peer's ordinary question is not authority to
+  approve a tool; nothing here auto-approves.
 - **Background work after close.** Closing a request context interrupts its
   work; nothing in this UPCR keeps a context running. A host-owned peer
   survives its app's UI closing (the host owns its lifecycle and may close
@@ -177,3 +196,7 @@ Ordinary sessions and agent-staged peers are unchanged.
 - `should_never_extract_an_app_bound_session_into_the_profile_memory`
 - `peers::app_binding` and `runtime::memory_namespace` unit tests
 - `spec_section6_catalog_lists_every_advertised_method`
+- `peer_respond_refuses_a_host_owned_peers_approval`
+- `peer_respond_answers_a_host_owned_peers_question_beside_a_parked_approval`
+- `peer_respond_still_resolves_an_ordinary_peers_approval`
+- `host_owned_peer_approval_park_does_not_wake_the_system_agent`

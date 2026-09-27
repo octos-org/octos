@@ -12370,6 +12370,79 @@ async fn peer_send_input_injects_continuation_for_peer_session() {
     );
 }
 
+/// A provider that reuses tool-call ids (`call_1` on every response — scripted
+/// servers, some OpenAI-compatible ones) must not lose a follow-up input. The
+/// occurrence is scoped to the calling session and turn, so a second turn's
+/// `peer_send_input` with the SAME tool-call id queues even after the first
+/// was drained (inside the scheduler's recent-claim window), while a retry of
+/// the same call within one turn still dedupes and is reported as such.
+#[tokio::test]
+async fn peer_send_input_with_a_reused_tool_call_id_queues_on_each_turn() {
+    use crate::autonomy::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let profile_id = "test-peer-send-input-reused-call-id";
+    let slug = "reused-otter";
+    let peer_key =
+        SessionKey::with_profile_topic(profile_id, "api", "tab-3", &format!("peer-{slug}"));
+    let state = Arc::new(AppState::empty_for_tests());
+    register_peer_wire_session(&state, &peer_key);
+    let target = peer_wire_registry()
+        .resolve(&peer_wire_key(profile_id, slug))
+        .expect("opened peer resolves");
+    let system = format!("{profile_id}:api:octosense#system");
+    let (turn_1, turn_2) = (TurnId::new(), TurnId::new());
+    let orchestrator = default_agent_orchestrator();
+    let idle = crate::autonomy::master_continuation_scheduler::MasterContinuationRuntimeState::idle;
+    let send = |turn: &TurnId, message: &str| {
+        orchestrator.enqueue_peer_send_input_continuation(
+            &target,
+            profile_id,
+            slug,
+            &peer_send_input_occurrence_id(&system, turn, "call_1"),
+            message,
+        )
+    };
+
+    assert_eq!(send(&turn_1, "FIRST"), PeerSendInputEnqueueOutcome::Queued);
+    // Same call retried within the turn: dedupes, reported as already queued.
+    let retry = send(&turn_1, "FIRST");
+    assert_eq!(retry, PeerSendInputEnqueueOutcome::Duplicate);
+    assert_eq!(
+        retry.into_callback_result(slug),
+        Ok(octos_agent::PeerSendInputDelivery::AlreadyQueued),
+        "a genuine retry is not reported as a fresh send"
+    );
+    // The peer runs the first input (dequeue starts the recent-claim window).
+    let drained =
+        orchestrator.drain_ready_continuations_for_session(&peer_key, profile_id, idle(), 8);
+    assert_eq!(drained.len(), 1);
+    assert_eq!(master_continuation_prompt(&drained[0]), "FIRST");
+    // A retry after the drain is still the same occurrence: still deduped.
+    assert_eq!(
+        send(&turn_1, "FIRST"),
+        PeerSendInputEnqueueOutcome::Duplicate
+    );
+
+    // The NEXT turn reuses `call_1`: it is a new input and must queue.
+    let second = send(&turn_2, "SECOND");
+    assert_eq!(
+        second,
+        PeerSendInputEnqueueOutcome::Queued,
+        "a later turn's send with a reused tool-call id must not be dropped"
+    );
+    assert_eq!(
+        second.into_callback_result(slug),
+        Ok(octos_agent::PeerSendInputDelivery::Queued)
+    );
+    let drained =
+        orchestrator.drain_ready_continuations_for_session(&peer_key, profile_id, idle(), 8);
+    assert_eq!(
+        drained.len(),
+        1,
+        "the second input runs as the peer's next turn"
+    );
+    assert_eq!(master_continuation_prompt(&drained[0]), "SECOND");
+}
+
 /// #436 P1 #6 — only the peer's recorded ORIGINATOR may inject. A different
 /// same-profile session (or a peer with no recorded owner) is rejected.
 #[test]
@@ -13407,10 +13480,10 @@ fn peer_send_input_persist_failure_maps_to_error_not_success() {
             .into_callback_result("slugz")
             .is_ok()
     );
-    assert!(
-        PeerSendInputEnqueueOutcome::Duplicate
-            .into_callback_result("slugz")
-            .is_ok()
+    assert_eq!(
+        PeerSendInputEnqueueOutcome::Duplicate.into_callback_result("slugz"),
+        Ok(octos_agent::PeerSendInputDelivery::AlreadyQueued),
+        "a retry is a success, but reported as already queued"
     );
 }
 
@@ -37927,6 +38000,165 @@ fn peer_respond_resolves_pending_approval_deny() {
     )
     .expect("deny resolves");
     assert_eq!(rx.try_recv().unwrap(), ApprovalDecision::Deny);
+}
+
+/// Mark a staged peer as a host-owned app peer (UPCR-2026-034) by writing its
+/// host binding, as `peer/prepare` with `memory_namespace` does.
+fn bind_peer_to_host(peers_root: &std::path::Path, slug: &str) {
+    crate::peers::app_binding::write_host_binding_in(
+        &peers_root.join(slug),
+        &crate::peers::app_binding::PeerHostBinding {
+            version: 1,
+            cwd: peers_root.parent().unwrap().join("work"),
+            memory_namespace: "app/test".to_owned(),
+            token_sha256: crate::peers::app_binding::token_digest("host-token"),
+        },
+    )
+    .unwrap();
+}
+
+/// ADR 0007 — a host-owned app peer's tool approval is the person's, answered
+/// in the app's own UI. The owning system agent (the originator) must not be
+/// able to approve or deny it through `peer_respond`, whether it names the
+/// approval's id or relies on the single-pending default; the approval stays
+/// parked and nothing is decided.
+#[test]
+fn peer_respond_refuses_a_host_owned_peers_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let system = octos_core::SessionKey::with_profile_topic("dev", "api", "octosense", "system");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-hostappr", "rinx", &system);
+    bind_peer_to_host(&peers_root, &slug);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+    let decided = std::cell::RefCell::new(0usize);
+    let sink = |_event: &ApprovalDecidedEvent, _tool: Option<&str>| {
+        *decided.borrow_mut() += 1;
+    };
+
+    let approval_id_text = approval_id.0.to_string();
+    for (label, id, decision) in [
+        ("default approve", None, "approve"),
+        (
+            "targeted approve",
+            Some(approval_id_text.as_str()),
+            "approve",
+        ),
+        ("targeted deny", Some(approval_id_text.as_str()), "deny"),
+    ] {
+        let err = peer_respond_resolve(
+            &peers_root,
+            &system.0,
+            "prof-hostappr",
+            &contracts,
+            &sink,
+            octos_agent::PeerRespondRequest {
+                slug: slug.clone(),
+                id: id.map(ToOwned::to_owned),
+                decision: Some(decision.to_owned()),
+                answers: None,
+            },
+        )
+        .expect_err(label);
+        assert!(
+            err.contains("host-owned app peer") && err.contains("person in the app"),
+            "{label}: a clear refusal naming who answers: {err}"
+        );
+    }
+    assert!(rx.try_recv().is_err(), "the approval is still parked");
+    assert_eq!(*decided.borrow(), 0, "no approval/decided was emitted");
+    assert_eq!(
+        peer_pending_summaries(&contracts, &peer_key).len(),
+        1,
+        "the approval is still pending for the person"
+    );
+
+    // peer_list does not offer it to the system agent as input to give.
+    let contracts = Arc::new(contracts);
+    let list = build_peer_list_callback(
+        peers_root.clone(),
+        Vec::new(),
+        contracts.clone(),
+        "prof-hostappr".to_owned(),
+    );
+    let text = list().unwrap();
+    assert!(
+        !text.contains(&approval_id_text),
+        "a host-owned peer's approval is not listed for the originator: {text}"
+    );
+}
+
+/// ADR 0007 — the system agent still answers a host-owned app peer's
+/// QUESTION, and with an approval also parked the default target is the
+/// question, never the approval.
+#[test]
+fn peer_respond_answers_a_host_owned_peers_question_beside_a_parked_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let system = octos_core::SessionKey::with_profile_topic("dev", "api", "octosense", "system");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-hostq", "rinx", &system);
+    bind_peer_to_host(&peers_root, &slug);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut approval_rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+    let question_id = QuestionId::new();
+    let mut question_rx = contracts.user_questions.request_runtime(question_event(
+        &peer_key,
+        &question_id,
+        one_free_text_question(),
+    ));
+
+    peer_respond_resolve(
+        &peers_root,
+        &system.0,
+        "prof-hostq",
+        &contracts,
+        &no_decided_sink(),
+        answer_req(&slug, &["postgres"]),
+    )
+    .expect("the system agent answers the host-owned peer's question");
+    assert!(question_rx.try_recv().is_ok(), "the question is answered");
+    assert!(approval_rx.try_recv().is_err(), "the approval is untouched");
+}
+
+/// Ordinary (agent-staged) peers are unchanged: the originator still answers
+/// their approvals, and peer_list still lists them.
+#[test]
+fn peer_respond_still_resolves_an_ordinary_peers_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-ordappr", "ordinary", &master);
+
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+    let list = build_peer_list_callback(
+        peers_root.clone(),
+        Vec::new(),
+        contracts.clone(),
+        "prof-ordappr".to_owned(),
+    );
+    assert!(list().unwrap().contains(&approval_id.0.to_string()));
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-ordappr",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, Some(&approval_id.0.to_string())),
+    )
+    .expect("an ordinary peer's approval is still the originator's to answer");
+    assert_eq!(rx.try_recv().unwrap(), ApprovalDecision::Approve);
 }
 
 /// (C) peer_respond resolves a single-question prompt with a free-text answer.

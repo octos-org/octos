@@ -64,9 +64,19 @@ pub struct PeerSendInputRequest {
 static PEER_SEND_INPUT_OCCURRENCE_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// What the host did with a `peer_send_input` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSendInputDelivery {
+    /// Newly queued: the peer will process it as its next turn.
+    Queued,
+    /// This same tool call (same occurrence id) was already queued, so the
+    /// retry was not queued again. Not a new message to the peer.
+    AlreadyQueued,
+}
+
 /// Host callback that delivers a message to a running peer session's inbox.
 pub type PeerSendInputCallback =
-    Arc<dyn Fn(PeerSendInputRequest) -> Result<(), String> + Send + Sync>;
+    Arc<dyn Fn(PeerSendInputRequest) -> Result<PeerSendInputDelivery, String> + Send + Sync>;
 
 /// `peer_send_input` tool. See the module docs for the cross-session channel.
 pub struct PeerSendInputTool {
@@ -206,10 +216,20 @@ impl Tool for PeerSendInputTool {
         };
 
         match (self.send_input)(request) {
-            Ok(()) => Ok(ToolResult {
+            Ok(PeerSendInputDelivery::Queued) => Ok(ToolResult {
                 output: format!(
                     "message sent to peer {slug} — \
                      the peer will process it as its next turn"
+                ),
+                success: true,
+                ..Default::default()
+            }),
+            // A retry of THIS call collapsed onto the copy it already queued.
+            // Say so rather than claim a fresh send.
+            Ok(PeerSendInputDelivery::AlreadyQueued) => Ok(ToolResult {
+                output: format!(
+                    "already queued by this call — peer {slug} has this input \
+                     (not sent again)"
                 ),
                 success: true,
                 ..Default::default()
