@@ -13,9 +13,9 @@
 //! `OCTOS_NO_MODEL_DOWNLOAD=1`); without the file the runtime stays
 //! keyword-only, which every memory path supports.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eyre::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -35,7 +35,35 @@ pub const DEFAULT_MODEL_ID: &str = "llamacpp/embeddinggemma-300M-Q8_0";
 /// Environment switch that disables the automatic download everywhere.
 pub const NO_DOWNLOAD_ENV: &str = "OCTOS_NO_MODEL_DOWNLOAD";
 
+/// Total wall-clock budget for ONE fetch, shared across its retry attempts
+/// (each attempt receives the remaining budget as its own total timeout).
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// A transfer delivering no bytes for this long is dead: CDN hiccups stall
+/// mid-body, and without a read deadline the stream sits on one read until
+/// the total timeout, starving whatever awaits the file (#2561).
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Fresh-connection attempts for one fetch. A failed transfer is usually a
+/// transient network fault (#2561: an oup-lane run died on a first-use
+/// download that never finished within the awaiting RPC's budget), and a new
+/// connection often does better — but the attempts share ONE budget, so the
+/// fetch still gives up after [`DOWNLOAD_TIMEOUT`] overall: the same
+/// 15-minute bound a single un-retried download had before.
+const DOWNLOAD_ATTEMPTS: usize = 3;
+
+/// Where a model comes from and how to prove it arrived intact. Injectable so
+/// the fetch pipeline (stream, hash, rename) is testable against a local
+/// server instead of the pinned 334 MB release.
+struct ModelSource<'a> {
+    url: &'a str,
+    sha256: &'a str,
+    bytes: u64,
+}
+
+const DEFAULT_MODEL_SOURCE: ModelSource<'static> = ModelSource {
+    url: DEFAULT_MODEL_URL,
+    sha256: DEFAULT_MODEL_SHA256,
+    bytes: DEFAULT_MODEL_BYTES,
+};
 
 /// Where the default model lives for `data_dir`.
 pub fn default_model_path(data_dir: &Path) -> PathBuf {
@@ -77,15 +105,21 @@ pub fn downloads_allowed(config_flag: Option<bool>) -> bool {
 /// `download` is true. Returns the model path. Fails when the file is absent
 /// and downloading is not allowed, or when the download does not verify.
 pub fn ensure_default_model(data_dir: &Path, download: bool) -> Result<PathBuf> {
-    ensure_default_model_with(data_dir, download, download_default_model)
+    ensure_default_model_with(data_dir, download, |dest, total| {
+        download_default_model(dest, total)
+    })
 }
 
 /// [`ensure_default_model`] with the fetch injected, so the concurrency
-/// contract can be tested without downloading 300 MB.
+/// contract can be tested without downloading 300 MB. The fetch may be
+/// invoked several times — failed attempts are retried, bounded by
+/// [`DOWNLOAD_ATTEMPTS`] tries within one shared [`DOWNLOAD_TIMEOUT`] budget
+/// (passed to each attempt as its remaining time) — and every attempt writes
+/// a fresh `.part` file.
 fn ensure_default_model_with(
     data_dir: &Path,
     download: bool,
-    fetch: impl FnOnce(&Path) -> Result<()>,
+    mut fetch: impl FnMut(&Path, Duration) -> Result<()>,
 ) -> Result<PathBuf> {
     let status = model_status(data_dir);
     if status.complete {
@@ -127,14 +161,37 @@ fn ensure_default_model_with(
     if status.complete {
         return Ok(status.path);
     }
-    fetch(&status.path)?;
-    Ok(status.path)
+    let deadline = Instant::now() + DOWNLOAD_TIMEOUT;
+    let mut last_err: Option<eyre::Report> = None;
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!("default embedding model fetch budget exhausted; giving up");
+            break;
+        }
+        match fetch(&status.path, remaining) {
+            Ok(()) => return Ok(status.path),
+            Err(err) => {
+                tracing::warn!(
+                    attempt,
+                    attempts = DOWNLOAD_ATTEMPTS,
+                    error = %err,
+                    "default embedding model fetch failed"
+                );
+                last_err = Some(err);
+            }
+        }
+    }
+    match last_err {
+        Some(err) => Err(err),
+        None => bail!("default embedding model fetch budget exhausted before any attempt"),
+    }
 }
 
-/// Download + verify on a dedicated thread with its own blocking HTTP
-/// client, so this can be called from sync code, from inside a tokio runtime,
-/// or from the FFI without caring about the caller's executor.
-fn download_default_model(dest: &Path) -> Result<()> {
+/// Download + verify on a dedicated thread with its own HTTP client, so this
+/// can be called from sync code, from inside a tokio runtime, or from the FFI
+/// without caring about the caller's executor. `total` bounds the attempt.
+fn download_default_model(dest: &Path, total: Duration) -> Result<()> {
     let dest = dest.to_path_buf();
     tracing::info!(
         url = DEFAULT_MODEL_URL,
@@ -145,72 +202,92 @@ fn download_default_model(dest: &Path) -> Result<()> {
     );
     let handle = std::thread::Builder::new()
         .name("octos-model-download".into())
-        .spawn(move || download_and_verify(&dest))
+        .spawn(move || download_and_verify(&DEFAULT_MODEL_SOURCE, &dest, READ_TIMEOUT, total))
         .wrap_err("failed to spawn the model download thread")?;
     handle
         .join()
         .map_err(|_| eyre::eyre!("model download thread panicked"))?
 }
 
-fn download_and_verify(dest: &Path) -> Result<()> {
+/// Stream `source.url` into `dest`, verifying the pinned SHA-256, under a
+/// `read_timeout` under a `total` budget. The download runs on a private
+/// single-thread runtime: the async client exposes a read deadline, which the
+/// blocking client lacks, and a transfer that goes silent mid-body must error
+/// out instead of hanging until the total timeout (#2561 — such a transfer
+/// starves whatever bootstrap awaits the model for the rest of the budget).
+/// Bounding the failure is all this does: it cannot make a stalled or slow
+/// transfer finish within a caller's own deadline.
+fn download_and_verify(
+    source: &ModelSource,
+    dest: &Path,
+    read_timeout: Duration,
+    total: Duration,
+) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
     }
     let part = dest.with_extension(format!("gguf.part.{}", std::process::id()));
-    let client = reqwest::blocking::Client::builder()
-        .timeout(DOWNLOAD_TIMEOUT)
-        .user_agent(concat!("octos/", env!("CARGO_PKG_VERSION")))
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
-        .wrap_err("failed to build the download client")?;
-    let response = client
-        .get(DEFAULT_MODEL_URL)
-        .send()
-        .wrap_err("model download request failed")?
-        .error_for_status()
-        .wrap_err("model download refused")?;
-    let mut reader = response;
-    let mut file = std::fs::File::create(&part)
-        .wrap_err_with(|| format!("failed to create {}", part.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut total: u64 = 0;
-    let mut next_report: u64 = 0;
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .wrap_err("model download read failed")?;
-        if n == 0 {
-            break;
+        .wrap_err("failed to build the download runtime")?;
+    runtime.block_on(async move {
+        let client = reqwest::Client::builder()
+            .timeout(total)
+            .read_timeout(read_timeout)
+            .user_agent(concat!("octos/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .wrap_err("failed to build the download client")?;
+        let mut response = client
+            .get(source.url)
+            .send()
+            .await
+            .wrap_err("model download request failed")?
+            .error_for_status()
+            .wrap_err("model download refused")?;
+        let mut file = std::fs::File::create(&part)
+            .wrap_err_with(|| format!("failed to create {}", part.display()))?;
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+        let mut next_report: u64 = 0;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .wrap_err("model download read failed")?
+        {
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .wrap_err("model download write failed")?;
+            total += chunk.len() as u64;
+            if total >= next_report {
+                tracing::info!(
+                    downloaded_mb = total / (1024 * 1024),
+                    total_mb = DEFAULT_MODEL_BYTES / (1024 * 1024),
+                    "embedding model download progress"
+                );
+                next_report += 64 * 1024 * 1024;
+            }
         }
-        hasher.update(&buf[..n]);
-        file.write_all(&buf[..n])
-            .wrap_err("model download write failed")?;
-        total += n as u64;
-        if total >= next_report {
-            tracing::info!(
-                downloaded_mb = total / (1024 * 1024),
-                total_mb = DEFAULT_MODEL_BYTES / (1024 * 1024),
-                "embedding model download progress"
+        file.flush()?;
+        drop(file);
+        let digest = format!("{:x}", hasher.finalize());
+        if digest != source.sha256 || total != source.bytes {
+            let _ = std::fs::remove_file(&part);
+            bail!(
+                "downloaded embedding model does not match the pinned release \
+                 (sha256 {digest}, {total} bytes; expected {}, {}) — \
+                 the file was discarded",
+                source.sha256,
+                source.bytes
             );
-            next_report += 64 * 1024 * 1024;
         }
-    }
-    file.flush()?;
-    drop(file);
-    let digest = format!("{:x}", hasher.finalize());
-    if digest != DEFAULT_MODEL_SHA256 || total != DEFAULT_MODEL_BYTES {
-        let _ = std::fs::remove_file(&part);
-        bail!(
-            "downloaded embedding model does not match the pinned release \
-             (sha256 {digest}, {total} bytes; expected {DEFAULT_MODEL_SHA256}, {DEFAULT_MODEL_BYTES}) — \
-             the file was discarded"
-        );
-    }
-    std::fs::rename(&part, dest)
-        .wrap_err_with(|| format!("failed to move the model into place at {}", dest.display()))?;
-    tracing::info!(path = %dest.display(), "default embedding model ready");
-    Ok(())
+        std::fs::rename(&part, dest).wrap_err_with(|| {
+            format!("failed to move the model into place at {}", dest.display())
+        })?;
+        tracing::info!(path = %dest.display(), "default embedding model ready");
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -265,7 +342,7 @@ mod tests {
                     (in_flight.clone(), max_in_flight.clone(), barrier.clone());
                 std::thread::spawn(move || {
                     barrier.wait();
-                    ensure_default_model_with(&data_dir, true, |_| {
+                    ensure_default_model_with(&data_dir, true, |_, _| {
                         let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                         max_in_flight.fetch_max(now, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(50));
@@ -292,5 +369,201 @@ mod tests {
             assert!(downloads_allowed(Some(true)));
         }
         assert!(!downloads_allowed(Some(false)));
+    }
+
+    /// One failed attempt (a stalled transfer, a reset connection) must not
+    /// fail the whole fetch: #2561 saw an oup-lane run die on a first-use
+    /// download that never finished in time, with no retry to recover. A
+    /// fresh connection often does better, so the fetch retries within
+    /// bounds.
+    #[test]
+    fn should_retry_transient_fetch_failures_and_recover() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_fetch = calls.clone();
+        let path = ensure_default_model_with(dir.path(), true, move |dest, _| {
+            let attempt = calls_for_fetch.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt < 3 {
+                bail!("simulated stall on attempt {attempt}");
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(dest, b"model-bytes")?;
+            Ok(())
+        })
+        .expect("a transient failure should be retried, not surfaced");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(path, dir.path().join("models").join(DEFAULT_MODEL_FILE));
+    }
+
+    #[test]
+    fn should_surface_the_failure_after_bounded_retry_attempts() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_fetch = calls.clone();
+        let err = ensure_default_model_with(dir.path(), true, move |_, _| {
+            calls_for_fetch.fetch_add(1, Ordering::SeqCst);
+            bail!("persistent failure")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("persistent failure"), "{err}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            DOWNLOAD_ATTEMPTS,
+            "the fetch must give up after a bounded number of attempts"
+        );
+    }
+
+    /// Retry attempts must share one total budget: three unbounded 15-minute
+    /// attempts would triple the worst-case hang the deadline exists to
+    /// bound. The attempts each see the REMAINING budget, so the sum can
+    /// never exceed [`DOWNLOAD_TIMEOUT`].
+    #[test]
+    fn should_split_one_shared_budget_across_retry_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seen: Vec<Duration> = Vec::new();
+        let err = ensure_default_model_with(dir.path(), true, |_, remaining| {
+            seen.push(remaining);
+            std::thread::sleep(Duration::from_millis(50));
+            bail!("always fails")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("always fails"), "{err}");
+        assert_eq!(seen.len(), DOWNLOAD_ATTEMPTS);
+        assert!(
+            seen[0] <= DOWNLOAD_TIMEOUT,
+            "the first attempt must be capped by the total budget"
+        );
+        for pair in seen.windows(2) {
+            assert!(
+                pair[1] < pair[0],
+                "each retry must see a strictly smaller remaining budget"
+            );
+        }
+    }
+
+    /// The full happy path of the real HTTP pipeline — stream, hash, rename —
+    /// against a local server serving bytes that match an injected source
+    /// spec, so the pinned 334 MB release is not needed.
+    #[test]
+    fn should_stream_hash_and_rename_a_matching_download() {
+        let body = b"octos model bytes";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (served_tx, served_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            drain_request_head(&mut socket);
+            use std::io::Write as _;
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            socket.write_all(response.as_bytes()).unwrap();
+            socket.write_all(body).unwrap();
+            let _ = served_tx.send(());
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("models").join("served.gguf");
+        let digest = Sha256::digest(body);
+        let source = ModelSource {
+            url: &format!("http://{addr}/gguf"),
+            sha256: &format!("{digest:x}"),
+            bytes: body.len() as u64,
+        };
+        let served = download_and_verify(&source, &dest, READ_TIMEOUT, Duration::from_secs(30));
+        // A proxy configured via the environment could swallow the loopback
+        // connection; fail loudly instead of hanging on the server join.
+        served_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the local server never accepted a connection");
+        server.join().unwrap();
+        served.expect("a matching download should verify and land");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let part = dest.with_extension(format!("gguf.part.{}", std::process::id()));
+        assert!(!part.exists(), "the .part file must be renamed into place");
+    }
+
+    /// Drain one request head the way hyper's h1 client expects before
+    /// responding: writing while the client is still sending its request
+    /// races `Conn::require_empty_read` and surfaces as a spurious
+    /// `UnexpectedMessage`, not as the behavior under test.
+    fn drain_request_head(socket: &mut std::net::TcpStream) {
+        use std::io::Read as _;
+        let _ = socket.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut buf = [0u8; 512];
+        let mut seen = Vec::new();
+        while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+            match socket.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    /// A transfer that stops delivering bytes mid-body must error at the read
+    /// deadline instead of hanging until the total timeout: #2561 saw a CI
+    /// transfer die mid-model, and without a deadline the awaiting
+    /// `profile/llm/upsert` hangs past its own budget while the bootstrap
+    /// holds the runtime. Drives the real HTTP path against a local server
+    /// that promises a body and then goes silent.
+    #[test]
+    fn should_error_when_the_transfer_stalls_mid_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            drain_request_head(&mut socket);
+            use std::io::Write as _;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n0123456789")
+                .unwrap();
+            let _ = accepted_tx.send(());
+            // Hold the socket open without sending the rest — a stall, not a
+            // close, so a plain EOF cannot mask the missing deadline.
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("models").join("stalled.gguf");
+        let source = ModelSource {
+            url: &format!("http://{addr}/gguf"),
+            sha256: "unused",
+            bytes: 1000,
+        };
+        let started = std::time::Instant::now();
+        // The read deadline (500 ms) fires long before the total budget, so
+        // this exercises the read deadline itself, not the total.
+        let result = download_and_verify(
+            &source,
+            &dest,
+            Duration::from_millis(500),
+            Duration::from_secs(30),
+        );
+        let elapsed = started.elapsed();
+        // A proxy configured via the environment could swallow the loopback
+        // connection; fail loudly instead of hanging on the server join.
+        accepted_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the local server never accepted a connection");
+        server.join().unwrap();
+        let _must_err = result.expect_err("a stalled transfer must error, not hang");
+        // Which deadline names the error varies with load (the read deadline
+        // also bounds the header phase); the invariants that matter are that
+        // the failure arrived promptly and mid-body, after real streaming.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the read deadline should fire promptly, took {elapsed:?}"
+        );
+        // The stall hit mid-body: the sliver that arrived must be on disk in
+        // the part file, proving the failure came after real streaming.
+        let part = dest.with_extension(format!("gguf.part.{}", std::process::id()));
+        assert_eq!(std::fs::read(&part).unwrap(), b"0123456789");
     }
 }
