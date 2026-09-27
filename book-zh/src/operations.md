@@ -27,6 +27,16 @@ sudo systemctl restart octos-serve
 
 ---
 
+## 会话存储容量
+
+会话以滚动 JSONL 分段存储，而不是单个无限增长的文件。当活跃文件达到 `OCTOS_SESSION_SEGMENT_BYTES`（默认 8 MiB）时，它会被封存为旁边的 `<name>.segments/NNNNNN.jsonl`，并新建一个活跃文件。普通加载会读取活跃文件，再按新到旧纳入尽可能多的封存分段，直到 `OCTOS_SESSION_LOAD_BUDGET_BYTES`（默认 32 MiB；`0` = 不限）——超出预算的历史仍留在磁盘上，可通过全量加载和 `/undo` 访问。
+
+**内存规划**：该预算限制单个驻留会话占用的文件字节；解析后的行开销约为文件大小的 1.5–3 倍，因此缓存 N 个长会话的进程最多需要约 `N × 32 MiB × 3`。内存受限的主机应调低预算（如 `OCTOS_SESSION_LOAD_BUDGET_BYTES=16777216`）或调小会话缓存（`gateway.max_sessions`）。
+
+**混布版本重叠**（例如共享数据目录上的 Kubernetes 滚动升级）：旧二进制看不到 `.segments/`，其 `*.jsonl` 扫描只会看到活跃文件，看起来像一个很短的会话。不会丢失数据——封存分段原样保留，新二进制可以读取——但应避免在共享数据目录上长时间重叠，且绝不能让旧二进制**改写**（重命名、摘要）已滚动的会话：它会写入 `sealed_segments: 0` 并使分段成为孤儿。
+
+---
+
 ## 钥匙串集成
 
 Octos 支持将 API 密钥存储在操作系统的密钥存储中，而不是以明文形式存放在配置文件的 JSON 中：macOS 使用钥匙串（Apple Silicon 上提供硬件级加密和操作系统级别的访问控制），Linux 使用 `~/.octos/secrets` 下的 0600 文件，Windows 暂无密钥存储——请改用环境变量或明文 `env_vars`。下图展示的是 macOS 后端。

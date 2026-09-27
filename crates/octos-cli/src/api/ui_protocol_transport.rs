@@ -38309,8 +38309,8 @@ async fn run_standalone_turn(
                 // exactly like `final_assistant_message_id`.
                 let mut final_assistant_committed_seq: Option<u64> = None;
                 // #1158 codex P2 rev2 follow-up: `add_message_with_seq`
-                // can fail (e.g. JSONL at MAX_SESSION_FILE_SIZE, I/O
-                // error). Track whether the assistant row carrying
+                // can fail (e.g. a session JSONL I/O error). Track whether
+                // the assistant row carrying
                 // `response.content` actually persisted. If not, the
                 // captured reply must NOT be released to the post-turn
                 // reschedule block — that would let it call

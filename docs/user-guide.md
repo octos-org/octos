@@ -2299,6 +2299,9 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | **Voice** | |
 | `ASR_API_URL` | Dedicated batch-ASR service base URL; overrides OMiniX for transcription |
 | `OMINIX_API_URL` | OminiX ASR/TTS API URL |
+| **Session storage** | |
+| `OCTOS_SESSION_SEGMENT_BYTES` | Active session file size at which it seals into a segment (default 8 MiB) |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | Session history bytes a plain load reads, newest first (default 32 MiB; `0` = unlimited) |
 | **System** | |
 | `RUST_LOG` | Log level (error/warn/info/debug/trace) |
 | `OCTOS_LOG_JSON` | Enable JSON-formatted logs (set to any value) |

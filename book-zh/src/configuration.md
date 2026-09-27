@@ -304,6 +304,13 @@ Origin 应使用 HTTPS。浏览器认证 token 按 Origin 存储；URL 变化后
 |------|------|
 | `OMINIX_API_URL` | OminiX ASR/TTS API 地址 |
 
+### 会话存储
+
+| 变量 | 说明 |
+|------|------|
+| `OCTOS_SESSION_SEGMENT_BYTES` | 活跃会话文件封存为分段的大小（默认 8 MiB） |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | 普通加载按新到旧读取的会话历史字节数（默认 32 MiB；`0` = 不限） |
+
 ### 系统
 
 | 变量 | 说明 |

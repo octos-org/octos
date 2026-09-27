@@ -80,11 +80,11 @@ Within a profile, each user (identified by `channel:chat_id`) gets a dedicated `
 
 **Backward compatibility**: `SessionHandle::open()` tries the new per-user path first, then falls back to the legacy flat path (`{data_dir}/sessions/{encoded_key}.jsonl`). On successful legacy load, the file is auto-migrated to the new path and the old file is removed.
 
-#### Session-level isolation (JSONL file)
+#### Session-level isolation (JSONL store)
 
-Each session is an independent JSONL file with the following protections:
+Each session is an independent JSONL store (an active file plus sealed `<name>.segments/` segments) with the following protections:
 
-- File size limit: 10 MB per session file (`MAX_SESSION_FILE_SIZE`). Prevents OOM on adversarial files.
+- Bounded memory without a size cliff: the active file seals into 8 MiB segments (`OCTOS_SESSION_SEGMENT_BYTES`), and loads read at most `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB, 0 = unlimited) of newest-first history.
 - Atomic write-then-rename for crash safety.
 - No cross-session file access — `SessionHandle` only reads/writes within its `sessions_dir`.
 
@@ -409,7 +409,7 @@ Shared resources such as deployment-scoped skills, platform skills, global confi
 
 **Issue**: `read_no_follow` reads the entire file into memory before any slicing or offset is applied. A large file (e.g., multi-GB log) can cause OOM.
 
-**Mitigation**: Session files have a 10 MB limit. For general file reads, the tool should implement streaming or size-check-before-read. Currently relies on the LLM not targeting excessively large files.
+**Mitigation**: Session files roll into segments at `OCTOS_SESSION_SEGMENT_BYTES` (8 MiB), so no single session file grows unbounded. For general file reads, the tool should implement streaming or size-check-before-read. Currently relies on the LLM not targeting excessively large files.
 
 ### 4.7 Sandbox Enabled by Default
 

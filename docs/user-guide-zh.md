@@ -2179,6 +2179,9 @@ chmod +x .octos/skills/translator/main
 | **语音** | |
 | `ASR_API_URL` | 独立批量 ASR 服务基址；设置后转录不再走 OMiniX |
 | `OMINIX_API_URL` | OminiX ASR/TTS API 地址 |
+| **会话存储** | |
+| `OCTOS_SESSION_SEGMENT_BYTES` | 活跃会话文件封存为分段的大小（默认 8 MiB） |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | 普通加载按新到旧读取的会话历史字节数（默认 32 MiB；`0` = 不限） |
 | **系统** | |
 | `RUST_LOG` | 日志级别（error/warn/info/debug/trace） |
 | `OCTOS_LOG_JSON` | 启用 JSON 格式日志（设置为任意值） |

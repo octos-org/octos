@@ -27,6 +27,16 @@ sudo systemctl restart octos-serve
 
 ---
 
+## Session Storage Capacity
+
+Sessions are stored as rolling JSONL segments, not one ever-growing file. When the active file reaches `OCTOS_SESSION_SEGMENT_BYTES` (default 8 MiB), it is sealed into a sibling `<name>.segments/NNNNNN.jsonl` and a fresh active file starts. A plain load reads the active file plus as many sealed segments, newest first, as fit within `OCTOS_SESSION_LOAD_BUDGET_BYTES` (default 32 MiB; `0` = unlimited) — history beyond the budget stays on disk and remains reachable through full-history loads and `/undo`.
+
+**Memory planning**: the budget bounds the file bytes one resident session holds; parsed rows cost roughly 1.5–3× their file size, so a process caching N long sessions needs up to about `N × 32 MiB × 3`. Memory-limited hosts should lower the budget (e.g. `OCTOS_SESSION_LOAD_BUDGET_BYTES=16777216`) or the session cache size (`gateway.max_sessions`).
+
+**Mixed-version overlap** (e.g. a Kubernetes rolling upgrade on a shared data directory): an old binary does not see `.segments/`; its `*.jsonl` walks show only the active file, which looks like a short session. Nothing is lost — the sealed segments are untouched and the new binary reads them — but avoid long overlaps on a shared data directory, and never let an old binary *rewrite* (rename, summary) a rolled session: it would record `sealed_segments: 0` and orphan the segments.
+
+---
+
 ## Keychain Integration
 
 Octos supports storing API keys in the OS secret store instead of plaintext in profile JSON files: the macOS Keychain on macOS (hardware-backed, per-user access control), a 0600 file under `~/.octos/secrets` on Linux, and no store on Windows yet — use the process environment or plain `env_vars` there. The diagram below shows the macOS backend.

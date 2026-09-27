@@ -1419,7 +1419,6 @@ pub struct Thread {
 /// Default maximum number of sessions kept in memory.
 const DEFAULT_MAX_SESSIONS: usize = 1000;
 
-/// Maximum session file size we'll load (10 MB). Prevents OOM on corrupted/adversarial files.
 /// Size at which the ACTIVE session file is sealed and a fresh one started
 /// (see [`segments_dir`]). Overridable with `OCTOS_SESSION_SEGMENT_BYTES`
 /// (minimum 64 KiB, so tests can roll on tiny files).
@@ -2284,7 +2283,7 @@ impl SessionManager {
     ///
     /// Same semantics as [`Self::load`] (both layouts merged, rollback
     /// control records folded — rolled-back turns are absent — schema
-    /// handling, 10MB cap) and none of `SessionHandle::open`'s migration
+    /// handling, budgeted window) and none of `SessionHandle::open`'s migration
     /// side effects (no legacy deletion, no marker writes, no dir
     /// creation).
     pub async fn export_transcript(&self, key: &SessionKey) -> Option<Vec<(usize, Message)>> {
@@ -3666,9 +3665,9 @@ impl SessionHandle {
             }
         }
 
-        // UPCR-2026-012: write to disk BEFORE the in-memory push so a
-        // size-cap rejection (or any other I/O failure) leaves disk and
-        // RAM in lockstep. Previously the push happened first, which
+        // UPCR-2026-012: write to disk BEFORE the in-memory push so any
+        // append failure leaves disk and RAM in lockstep. Previously the
+        // push happened first, which
         // would leave a row in `Session::messages` that never reached
         // disk on failure — and the observer would have fired for it.
         let next_seq = self.session.next_seq();
