@@ -378,16 +378,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_pins_addresses_for_dns_resolved_hosts() {
-        // The DNS-pin side of the contract: a resolved host must carry its
-        // pin set for the fetchers' `resolve_to_addrs` — an empty pin set is
-        // reserved for literal hosts and would disable pinning.
-        let result = check_ssrf_with_addrs("https://example.com/").await;
-        let result = result.expect("example.com must be allowed");
-        assert!(
-            !result.resolved_addrs.is_empty(),
-            "a DNS-resolved host must carry its pin set"
-        );
+    async fn adapter_never_returns_ok_with_empty_pins_for_a_dns_host() {
+        // The DNS-pin side of the contract: when a host name resolves to an
+        // allowed answer set, the fetchers' `resolve_to_addrs` must receive
+        // it — an empty pin set is reserved for literal hosts and would
+        // disable pinning. (Behind a fake-ip/VPN resolver example.com
+        // answers from a blocked range; the check must then fail closed —
+        // never come back `Ok` un-pinned.)
+        match check_ssrf_with_addrs("https://example.com/").await {
+            Ok(result) => assert!(
+                !result.resolved_addrs.is_empty(),
+                "a DNS-resolved host must carry its pin set"
+            ),
+            Err(err) => assert!(
+                err.contains("private") || err.contains("fail closed"),
+                "a blocked resolution must say why: {err}"
+            ),
+        }
     }
 
     // --- check_ssrf_with_addrs tests ---
