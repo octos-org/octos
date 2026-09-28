@@ -148,6 +148,7 @@ impl Fetch for Mock {
                 status: 200,
                 headers: Vec::new(),
                 body: json!({"hits": [
+                    {"url": "https://social.example.org/@a/1", "title": "Watching the summit", "lang": "en", "kind": "post"},
                     {"url": "https://news.example.org/a", "title": "Summit opens", "published": "2026-09-26T10:00:00Z", "lang": "en", "source": "Example News"},
                     {"url": "https://tabloid.example/b", "title": "Gossip", "lang": "en"}
                 ]})
@@ -186,10 +187,14 @@ async fn should_write_scoped_search_items_into_the_app_folder() {
         .unwrap();
     assert_eq!(
         res.items.len(),
-        1,
+        2,
         "denied domain filtered: {:?}",
         res.items
     );
+    // News: the article first, the post after it and marked as a post.
+    assert_eq!(res.items[1].url, "https://social.example.org/@a/1");
+    assert_eq!(res.items[1].kind, crate::ItemKind::Post);
+    assert_eq!(res.items[0].kind, crate::ItemKind::Article);
     let item = &res.items[0];
     assert_eq!(item.citation, Some(1));
     assert_eq!(item.engines, vec!["mock"]);
@@ -199,7 +204,9 @@ async fn should_write_scoped_search_items_into_the_app_folder() {
         serde_json::from_str(&std::fs::read_to_string(&res.items_file).unwrap()).unwrap();
     assert_eq!(doc["schema"], "octos.research.items.v1");
     assert_eq!(doc["items"][0]["url"], "https://news.example.org/a");
-    assert!(res.summary.starts_with("1 item(s)"), "{}", res.summary);
+    assert!(doc["items"][0].get("kind").is_none(), "articles omit kind");
+    assert_eq!(doc["items"][1]["kind"], "post");
+    assert!(res.summary.starts_with("2 item(s)"), "{}", res.summary);
     assert!(res.summary.contains("[1] Summit opens"), "{}", res.summary);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -218,6 +225,10 @@ async fn should_refuse_to_read_pages_outside_the_domain_grant() {
         .await
         .unwrap_err();
     assert!(err.contains("outside this app's research grant"), "{err}");
+    assert!(
+        err.starts_with("blocked: "),
+        "scope refusals are `blocked`: {err}"
+    );
 }
 
 #[test]

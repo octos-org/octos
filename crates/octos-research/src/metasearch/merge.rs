@@ -8,13 +8,17 @@
 //!    that returned it (best position per engine), times a recency factor
 //!    `1 + ½·2^(−age / half_life)` when it has a date. Ties keep first-seen
 //!    order, so the ranking is stable for the same inputs.
+//! 4. In category `news`, posts ([`ItemKind::Post`]: social posts,
+//!    discussion threads) rank after every article: they are signal about
+//!    what people say, not reports to cite. A merged item takes its URL and
+//!    kind from an article hit when it has one.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::item::SearchHit;
+use crate::item::{ItemKind, SearchHit};
 use crate::urls;
 
 /// One merged, ranked result (octos.research items schema, metasearch form).
@@ -40,6 +44,9 @@ pub struct MetaItem {
     /// Publisher home page for aggregator links (used for domain filters).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+    /// Article or post; absent means article.
+    #[serde(default, skip_serializing_if = "ItemKind::is_article")]
+    pub kind: ItemKind,
 }
 
 impl MetaItem {
@@ -56,6 +63,7 @@ impl MetaItem {
             provider: super::PROVIDER_ID.to_string(),
             engines: self.engines.clone(),
             score: Some(self.score),
+            kind: self.kind,
         }
     }
 }
@@ -211,9 +219,12 @@ pub fn merge(hits: Vec<RankedHit>, category: &str, opts: RankOptions) -> Vec<Met
             (item.score, g.first_seen, item)
         })
         .collect();
+    // 4. News: posts after articles.
+    let demoted = |i: &MetaItem| category == "news" && i.kind.is_post();
     items.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        demoted(&a.2)
+            .cmp(&demoted(&b.2))
+            .then(b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal))
             .then(a.1.cmp(&b.1))
     });
     items.into_iter().map(|(_, _, i)| i).collect()
@@ -241,12 +252,17 @@ fn build_item(hits: &[RankedHit], category: &str, opts: RankOptions) -> MetaItem
     });
     let base: f64 = engines.iter().map(|(_, c)| c).sum();
 
-    // Representative: best-contributing hit, preferring a publisher URL
-    // over an aggregator redirect.
+    // Representative: best-contributing hit, preferring an article over a
+    // post and a publisher URL over an aggregator redirect.
     let rep = hits
         .iter()
         .max_by(|a, b| {
-            let key = |h: &RankedHit| (!is_aggregator(&h.hit.url), contribution(h));
+            let key = |h: &RankedHit| {
+                (
+                    (h.hit.kind.is_article(), !is_aggregator(&h.hit.url)),
+                    contribution(h),
+                )
+            };
             let (ka, kb) = (key(a), key(b));
             ka.0.cmp(&kb.0)
                 .then(ka.1.partial_cmp(&kb.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -287,6 +303,7 @@ fn build_item(hits: &[RankedHit], category: &str, opts: RankOptions) -> MetaItem
         score,
         category: category.to_string(),
         source_url: first(|h| h.source_url.as_ref()),
+        kind: rep.hit.kind,
     }
 }
 
@@ -438,5 +455,28 @@ mod tests {
             pos("https://d.org/2") < pos("https://c.org/1"),
             "ties break by engine id order"
         );
+    }
+
+    #[test]
+    fn should_take_url_and_kind_from_the_article_when_a_post_shares_its_story() {
+        let mut post = hit(
+            "mastodon",
+            0,
+            "https://social.example/@a/1",
+            "Vucic resigns ahead of October parliamentary elections",
+        );
+        post.hit.kind = ItemKind::Post;
+        post.weight = 5.0;
+        let article = hit(
+            "google_news",
+            3,
+            "https://news.google.com/rss/articles/CBMi1",
+            "Vucic resigns ahead of October parliamentary elections - Reuters",
+        );
+        let items = merge(vec![post, article], "news", opts());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].url, "https://news.google.com/rss/articles/CBMi1");
+        assert_eq!(items[0].kind, ItemKind::Article);
+        assert_eq!(items[0].engines, vec!["mastodon", "google_news"]);
     }
 }

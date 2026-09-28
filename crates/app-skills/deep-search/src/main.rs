@@ -397,10 +397,8 @@ async fn read_into(
                     opts.filters
                         .check(&page.final_url, lang.as_deref(), published.as_deref())
                 {
-                    st.skipped.push(SkippedUrl {
-                        url: hit.url.clone(),
-                        reason: reason.to_string(),
-                    });
+                    st.skipped
+                        .push(SkippedUrl::new(hit.url.clone(), reason.to_string()));
                     continue;
                 }
                 let canonical = page.canonical_url();
@@ -411,19 +409,15 @@ async fn read_into(
                     continue;
                 }
                 if !st.cap.admit(&canonical) {
-                    st.skipped.push(SkippedUrl {
-                        url: hit.url.clone(),
-                        reason: "per_domain_cap".to_string(),
-                    });
+                    st.skipped
+                        .push(SkippedUrl::new(hit.url.clone(), "per_domain_cap"));
                     continue;
                 }
                 st.sources.push(CitedSource { hit, page });
             }
-            Err(reason) => {
-                st.skipped.push(SkippedUrl {
-                    url: hit.url.clone(),
-                    reason,
-                });
+            Err(err) => {
+                st.skipped
+                    .push(SkippedUrl::read_failed(hit.url.clone(), &err));
                 st.unread.push(hit);
             }
         }
@@ -498,6 +492,7 @@ fn source_item(s: &CitedSource, citation: usize, cited: bool, file: &str) -> Res
         provider: s.hit.provider.clone(),
         engines: s.hit.engines.clone(),
         score: s.hit.score,
+        kind: s.hit.kind,
         read: true,
         rendered: s.page.rendered,
         citation: (citation > 0).then_some(citation),
@@ -535,6 +530,7 @@ fn unread_item(hit: &SearchHit, citation: Option<usize>, cited: bool) -> Researc
         provider: hit.provider.clone(),
         engines: hit.engines.clone(),
         score: hit.score,
+        kind: hit.kind,
         read: false,
         rendered: false,
         citation,
@@ -676,10 +672,7 @@ async fn run_deep_search(
     // become headline-only sources instead of using the budget.
     let (readable, denied) = reader.robots_partition(kept).await;
     for (hit, reason) in denied {
-        st.skipped.push(SkippedUrl {
-            url: hit.url.clone(),
-            reason,
-        });
+        st.skipped.push(SkippedUrl::new(hit.url.clone(), reason));
         st.unread.push(hit);
     }
     let to_read: Vec<SearchHit> = readable.into_iter().take(max_pages).collect();
@@ -1381,27 +1374,102 @@ fn find_deep_crawl_bin() -> Option<PathBuf> {
         .then(|| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
 }
 
+/// How long a `deep_crawl` that is being stopped gets to close its browser
+/// before it is killed.
+const DEEP_CRAWL_STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// A running `deep_crawl` that is stopped gracefully however its caller
+/// ends (finished, timed out, or its future dropped).
+///
+/// deep_crawl starts its own headless Chrome and kills it in its SIGTERM
+/// handler. A SIGKILL (what `kill_on_drop` sends) gives it no chance to, and
+/// the browser was left running with no parent. So: SIGTERM first, then
+/// SIGKILL if it has not exited within [`DEEP_CRAWL_STOP_GRACE`]. The child
+/// is held until it is reaped, so its pid cannot be reused in between.
+/// deep_crawl stays in this process's group, so a host that kills this
+/// plugin's process group still reaches it and its browser.
+struct DeepCrawlChild(Option<tokio::process::Child>);
+
+impl DeepCrawlChild {
+    fn child(&mut self) -> &mut tokio::process::Child {
+        self.0
+            .as_mut()
+            .expect("deep_crawl child is present until drop")
+    }
+}
+
+impl Drop for DeepCrawlChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if tokio::time::timeout(DEEP_CRAWL_STOP_GRACE, child.wait())
+                        .await
+                        .is_err()
+                    {
+                        let _ = child.kill().await;
+                    }
+                });
+            }
+            Err(_) => {
+                let _ = child.start_kill();
+            }
+        }
+    }
+}
+
 /// Run `deep_crawl` with `input` on stdin; returns its stdout.
 async fn run_deep_crawl(
     bin: &Path,
     input: &serde_json::Value,
     limit: Duration,
 ) -> Result<String, String> {
-    let mut child = tokio::process::Command::new(bin)
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let child = tokio::process::Command::new(bin)
         .arg("deep_crawl")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        // Last resort only: `DeepCrawlChild` stops it first.
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("failed to spawn deep_crawl: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(input.to_string().as_bytes()).await;
-    }
-    match tokio::time::timeout(limit, child.wait_with_output()).await {
-        Ok(Ok(o)) => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
-        Ok(Err(e)) => Err(format!("deep_crawl failed: {e}")),
+    let mut crawl = DeepCrawlChild(Some(child));
+    let work = async {
+        if let Some(mut stdin) = crawl.child().stdin.take() {
+            let _ = stdin.write_all(input.to_string().as_bytes()).await;
+        }
+        let mut stdout = Vec::new();
+        if let Some(mut out) = crawl.child().stdout.take() {
+            out.read_to_end(&mut stdout)
+                .await
+                .map_err(|e| format!("deep_crawl failed: {e}"))?;
+        }
+        crawl
+            .child()
+            .wait()
+            .await
+            .map_err(|e| format!("deep_crawl failed: {e}"))?;
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
+    };
+    match tokio::time::timeout(limit, work).await {
+        Ok(result) => result,
+        // `crawl` is dropped on return: deep_crawl gets SIGTERM and closes
+        // its browser.
         Err(_) => Err(format!("deep_crawl timed out after {}s", limit.as_secs())),
     }
 }
@@ -2934,6 +3002,53 @@ fn print_output(output: &Output) {
 mod tests {
     use super::*;
 
+    /// A deep_crawl that times out is asked to stop (SIGTERM) and gets to
+    /// clean up its browser, instead of being SIGKILLed and leaving the
+    /// browser behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_stop_a_timed_out_deep_crawl_gracefully() {
+        let dir = std::env::temp_dir().join(format!("deep-crawl-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("cleaned");
+        let script = dir.join("deep_crawl");
+        // A stand-in deep_crawl: a long-running "browser" child, killed by
+        // its TERM handler, which also leaves a marker.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 300 &\nbrowser=$!\ntrap 'kill $browser; echo $browser > {m}; exit 130' TERM\nwait $browser\n",
+                m = marker.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = run_deep_crawl(&script, &serde_json::json!({}), Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        let mut browser = None;
+        for _ in 0..50 {
+            if let Ok(pid) = std::fs::read_to_string(&marker) {
+                browser = Some(pid.trim().to_string());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let browser = browser.expect("deep_crawl was not asked to clean up");
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &browser])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the stand-in browser {browser} was left running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_slugify() {
         assert_eq!(slugify("top AI startups 2025"), "top-AI-startups-2025");
@@ -3129,10 +3244,7 @@ mod tests {
 
         let mut doc = ItemsDocument::new("cumbre", serde_json::json!({"lang": ["es"]}));
         doc.items = vec![item, unread];
-        doc.skipped = vec![SkippedUrl {
-            url: gnews.url.clone(),
-            reason: "robots".into(),
-        }];
+        doc.skipped = vec![SkippedUrl::new(gnews.url.clone(), "robots")];
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["schema"], "octos.research.items.v1");
         assert_eq!(v["items"].as_array().unwrap().len(), 2);

@@ -2,6 +2,7 @@
   "body_file": "social.body",
   "expect": [
     {
+      "kind": "post",
       "lang": "en",
       "published": "2026-09-27T22:19:53Z",
       "source": "@orhun@fosstodon.org on mastodon.social",
@@ -9,6 +10,7 @@
       "url": "https://fosstodon.org/@orhun/117345327084337960"
     },
     {
+      "kind": "post",
       "lang": "en",
       "published": "2026-09-27T21:10:08Z",
       "source": "@ekuber@hachyderm.io on mastodon.social",
@@ -16,6 +18,7 @@
       "url": "https://hachyderm.io/@ekuber/117345052829374264"
     },
     {
+      "kind": "post",
       "lang": "en",
       "published": "2026-09-27T20:37:48Z",
       "source": "@haitchfive@oldbytes.space on mastodon.social",
@@ -23,6 +26,7 @@
       "url": "https://oldbytes.space/@haitchfive/117344925701533802"
     },
     {
+      "kind": "post",
       "lang": "de",
       "published": "2026-09-27T20:33:05Z",
       "source": "@cehteh@social.tchncs.de on mastodon.social",
@@ -30,6 +34,7 @@
       "url": "https://social.tchncs.de/@cehteh/117344907101086561"
     },
     {
+      "kind": "post",
       "lang": "en",
       "published": "2026-09-27T18:15:04Z",
       "source": "@infoq@techhub.social on mastodon.social",

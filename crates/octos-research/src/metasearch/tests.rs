@@ -701,3 +701,87 @@ fn parse_response(response, opts) {
     let err = report.error.as_deref().unwrap_or_default();
     assert!(err.starts_with("1 of 2 requests failed"), "{err}");
 }
+
+/// A Mastodon-like engine (posts, high weight so it would win on score) and
+/// a news engine: in `news` every article ranks before any post; posts are
+/// kept (signal) and marked, and an item's own `kind` wins.
+#[tokio::test(start_paused = true)]
+async fn should_rank_posts_after_articles_when_category_is_news() {
+    let fetch = MockFetch::default();
+    fetch.on(
+        "social.example.org",
+        ok(hits(&[
+            (
+                "https://social.example/@a/1",
+                "GTA 2 runs on my old Nvidia card",
+            ),
+            ("https://social.example/@b/2", "Nvidia earnings thread"),
+        ])),
+    );
+    let news = serde_json::json!({"hits": [
+        {"url": "https://paper.example/nvidia-results", "title": "Nvidia beats estimates"},
+        {"url": "https://forum.example/t/9", "title": "Discussion: results", "kind": "post"},
+        {"url": "https://wire.example/nvidia-guidance", "title": "Nvidia raises guidance"}
+    ]});
+    fetch.on("news.example.org", ok(news.to_string()));
+    let engines = || {
+        vec![
+            test_engine(
+                "socialish",
+                "social.example.org",
+                serde_json::json!({"kind": "post", "weight": 5.0, "categories": ["news", "social"]}),
+            ),
+            test_engine(
+                "newsish",
+                "news.example.org",
+                serde_json::json!({"categories": ["news", "social"]}),
+            ),
+        ]
+    };
+    let ms = search(engines(), &fetch, Config::default());
+    let resp = ms.search(&request("nvidia earnings")).await;
+    let kinds: Vec<(&str, ItemKind)> = resp
+        .items
+        .iter()
+        .map(|i| (i.url.as_str(), i.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("https://paper.example/nvidia-results", ItemKind::Article),
+            ("https://wire.example/nvidia-guidance", ItemKind::Article),
+            ("https://social.example/@a/1", ItemKind::Post),
+            ("https://social.example/@b/2", ItemKind::Post),
+            ("https://forum.example/t/9", ItemKind::Post),
+        ],
+        "{:#?}",
+        resp.items
+    );
+    assert!(resp.hits().iter().filter(|h| h.kind.is_post()).count() == 3);
+
+    // Outside news, posts are ranked by score like anything else.
+    let ms = search(engines(), &fetch, Config::default());
+    let mut req = request("nvidia earnings");
+    req.category = "social".into();
+    let resp = ms.search(&req).await;
+    assert_eq!(resp.items[0].url, "https://social.example/@a/1");
+    assert_eq!(resp.items[0].kind, ItemKind::Post);
+}
+
+#[test]
+fn should_parse_engine_kind_and_default_to_article() {
+    let post = test_engine("p", "p.example.org", serde_json::json!({"kind": "post"}));
+    assert_eq!(post.manifest.kind, ItemKind::Post);
+    let plain = test_engine("a", "a.example.org", serde_json::json!({}));
+    assert_eq!(plain.manifest.kind, ItemKind::Article);
+    assert_eq!(
+        Registry::builtin().get("mastodon").unwrap().manifest.kind,
+        ItemKind::Post,
+        "Mastodon results are posts"
+    );
+    assert_eq!(
+        Registry::builtin().get("hackernews").unwrap().manifest.kind,
+        ItemKind::Article,
+        "HN stories link to articles; text posts mark themselves"
+    );
+}

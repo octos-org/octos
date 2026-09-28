@@ -23,9 +23,13 @@ fn parse_response(response, opts) {
     for h in object.get(data, "hits", []) {
         let id = object.get(h, "objectID", "")
         let discussion = "https://news.ycombinator.com/item?id=" + id
+        // A story links to an article; a text post (Ask HN, …) is only
+        // its discussion thread.
         let url = object.get(h, "url", nil)
+        let kind = "article"
         if url == nil || url == "" {
             url = discussion
+            kind = "post"
         }
         let story = object.get(h, "story_text", nil)
         let snippet = if story == nil {
@@ -44,7 +48,8 @@ fn parse_response(response, opts) {
             },
             source: "Hacker News",
             lang: "en",
-            published: object.get(h, "created_at", nil)
+            published: object.get(h, "created_at", nil),
+            kind: kind
         })
     }
     return out

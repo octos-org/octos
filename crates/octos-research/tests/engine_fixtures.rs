@@ -151,13 +151,17 @@ async fn replay(engine: &str, case: &Path) {
         .items
         .iter()
         .map(|i| {
-            serde_json::json!({
+            let mut v = serde_json::json!({
                 "url": i.url,
                 "title": i.title,
                 "source": i.source,
                 "lang": i.lang,
                 "published": i.published,
-            })
+            });
+            if i.kind.is_post() {
+                v["kind"] = "post".into();
+            }
+            v
         })
         .collect();
     assert_eq!(Value::Array(got), doc["expect"], "{name}: items");

@@ -14,6 +14,7 @@
 //! has its own SSRF-safe fetch path), which keeps every piece here testable
 //! from fixtures.
 
+pub mod access;
 pub mod date;
 #[cfg(feature = "extract")]
 pub mod extract;
@@ -35,8 +36,9 @@ pub mod throttle;
 pub mod toolbox;
 pub mod urls;
 
+pub use access::{ReadError, ReadFailure};
 pub use filter::{DomainCap, Filters, OneOrMany};
-pub use item::{ItemsDocument, ResearchItem, SearchHit, SkippedUrl, SummaryKind};
+pub use item::{ItemKind, ItemsDocument, ResearchItem, SearchHit, SkippedUrl, SummaryKind};
 pub use plan::{Category, Provider};
 pub use robots::{Robots, RobotsCache, RobotsStatus};
 pub use throttle::HostThrottle;

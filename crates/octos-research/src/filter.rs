@@ -144,17 +144,11 @@ impl Filters {
                 hit.lang.as_deref(),
                 hit.published.as_deref(),
             ) {
-                skipped.push(SkippedUrl {
-                    url: hit.url,
-                    reason: reason.to_string(),
-                });
+                skipped.push(SkippedUrl::new(hit.url, reason.to_string()));
                 continue;
             }
             if !cap.admit(hit.domain_url()) {
-                skipped.push(SkippedUrl {
-                    url: hit.url,
-                    reason: "per_domain_cap".to_string(),
-                });
+                skipped.push(SkippedUrl::new(hit.url, "per_domain_cap".to_string()));
                 continue;
             }
             kept.push(hit);

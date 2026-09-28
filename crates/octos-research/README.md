@@ -61,9 +61,50 @@ Notes:
 
 - **`general` without a key is thin.** Key-less general search is Wikipedia and Wikidata only, and results say so.
 - **Google News.** Headlines, publisher and date only; article redirect links are cited, never fetched. Google doesn't document the feed, and its text limits it to personal, non-commercial feed-reader use, which is how an octos agent acting for one person uses it.
-- **Mastodon.** Uses the public hashtag timeline, because full-text search needs a user token. Set another instance with `OCTOS_METASEARCH_MASTODON_INSTANCE`.
+- **Mastodon.** Uses the public hashtag timeline, because full-text search needs a user token. Set another instance with `OCTOS_METASEARCH_MASTODON_INSTANCE`. Its results are posts (see [Articles and posts](#articles-and-posts)).
 - **Publisher feeds.** Feeds can't be searched, so the engine reads the feeds for the requested languages (one request per feed, each cached 15 minutes) and keeps entries that mention the query terms; English terms match whole words, Chinese terms match anywhere. Headline, source, date and link only. Publishers whose terms forbid AI or automated use (BBC, The Guardian, Al Jazeera, DW, NYT 中文网) are not included.
 - **Small key-less quotas.** OpenAlex allows about 100 searches a day per IP without a key. Stack Exchange allows 300 requests a day.
+
+### Articles and posts
+
+Every result has a `kind`: `article` (a news story, page, paper or repository that can be read and cited) or `post` (a social post, or a discussion thread with no linked article). JSON omits `kind` for articles, so an absent `kind` means `article`.
+
+- **Mastodon** results are posts (its manifest sets `"kind": "post"`).
+- **Hacker News** stories are articles, because the item's URL is the submitted link, which is what gets read. Text posts such as Ask HN link only to their thread and are posts.
+- An engine sets its default in the manifest (`kind`), and an item may override it with its own `kind`.
+- When a post and an article are merged as the same story, the item keeps the article's URL and kind.
+
+In category `news`, posts rank after every article. They stay in the results as signal (what people are saying, or that a story is spreading), but they are not reports, so a caller that reads sources as evidence should skip `kind: post` or treat it as discussion. Other categories (`social`, `it`, …) rank posts by score like anything else. The `kind` field reaches `SearchHit`, `MetaItem` and the `octos.research.items.v1` items.
+
+## Reading pages
+
+The shared reader (`reader::Reader`, used by `deep-search`, the built-in `deep_search` tool and the toolbox's `web_read`) reads a page over plain HTTP first and asks a browser renderer only when that finds no article, as with Google News links, which reach the publisher only through a script. It never gets past a wall: a bot challenge over plain HTTP is not retried in the browser, and nothing in a rendered page is clicked.
+
+### Failure reasons
+
+Every failed read is a `ReadError`: `{reason, detail, final_url}`. It displays as `<reason>: <detail> (final URL: <url>)`, and `SkippedUrl` keeps the reason and final URL.
+
+| `reason` | Meaning |
+|---|---|
+| `redirect_unresolved` | A Google News link never reached the publisher: no renderer is configured, or the browser stayed on news.google.com. |
+| `consent_page` | A cookie or privacy consent wall, including a redirect to consent.google.com or guce.yahoo.com. It is not clicked through. |
+| `paywall` | Subscriber-only content, from schema.org `isAccessibleForFree: false` or the page's subscribe prompt. It is not bypassed. |
+| `login_wall` | The content is shown only to signed-in users. |
+| `bot_challenge` | An anti-bot check: Cloudflare, DataDome, HUMAN/PerimeterX, or Google's unusual-traffic page. It is not bypassed. |
+| `render_failed` / `render_timeout` | The browser renderer failed, or did not finish within `ReaderConfig::render_timeout` (60 s). |
+| `no_main_text` | The page loaded, was none of the above, and had no extractable article. |
+| `blocked` | Refused by octos: SSRF protection (a private or internal address, before fetching or anywhere in the browser's navigation) or the caller's scope. |
+| `http_<status>` | The publisher answered with an error status, or the rendered page is an error page that states one (`403 Forbidden`, `Access denied`) when the renderer reports no status. |
+| `robots`, `robots_unreachable` | robots.txt refused the page (only when `OCTOS_RESPECT_ROBOTS=1`). |
+| `fetch_error`, `unsupported_content_type` | Network error, or the page is not HTML, XML or text. |
+
+The detection is deliberately conservative (`access::diagnose`), so an article that only talks about cookies, paywalls or "Just a moment..." screens is never reported as a wall:
+
+- **Always applied:** URL rules (consent hosts, Google's `/sorry/` page, a Google News link the browser never left) and markers that only challenge pages carry (`_cf_chl_opt`, `captcha-delivery.com`, `px-captcha`, or a challenge title).
+- **Only when the page had no main text and little visible text:** the phrase rules (challenge, consent, paywall and login wording) and error-page titles.
+- **Consent dialog taken for the article:** caught only when the extracted text is short, uses consent-dialog wording ("store and/or access information on a device", "our partners", …), and the page shows the dialog's buttons.
+
+**Renderers** should return `Ok(Rendered)` with the page the browser ended on, even when it is a challenge or an error page, and set `Rendered::status` when they know it. The reader then classifies the page and reports its final URL. An `Err(message)` is classified by `ReadError::from_render_error`: a message that starts with a reason code (`bot_challenge: …`) keeps that code.
 
 ### Clean-room method
 
