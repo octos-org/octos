@@ -470,7 +470,29 @@ jobs:
 
       - name: Test octos-agent (lib)
         timeout-minutes: 30
-        run: cargo test -p octos-agent --lib
+        run: |
+          cat > /tmp/watchdog.sh <<'WD'
+          i=0
+          while true; do
+            sleep 3; i=$((i+1))
+            avail=$(df --output=avail -k / | tail -1)
+            memavail=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+            nprocs=$(ps -e --no-headers | wc -l)
+            if [ $((i % 20)) -eq 0 ]; then echo "=== WD $(date -u +%T) disk_avail_kb=$avail mem_avail_kb=$memavail procs=$nprocs load=$(cut -d' ' -f1-3 /proc/loadavg)"; fi
+            if [ "$avail" -lt 2000000 ] || [ "$memavail" -lt 1500000 ] || [ "$nprocs" -gt 3000 ]; then
+              echo "=== WD TRIP $(date -u +%T) disk_avail_kb=$avail mem_avail_kb=$memavail procs=$nprocs"
+              df -h; free -m
+              ps -eo pid,ppid,pgid,etime,rss,pcpu,args --sort=-rss | cut -c1-220 | head -40
+              ps -eo comm --no-headers | sort | uniq -c | sort -rn | head -15
+              du -xsh /tmp /home/runner/work /home/runner/.cargo 2>/dev/null
+              du -xh --max-depth=2 /tmp 2>/dev/null | sort -rh | head -15
+              pkill -9 -f 'target/debug/deps/octos_agent-' || true
+              exit 0
+            fi
+          done
+          WD
+          bash /tmp/watchdog.sh &
+          cargo test -p octos-agent --lib
 
   # Split three ways so the PR wait is the slowest third (~25 min), not the
   # whole ~57 min serial run. Every step that ran before still runs, in
