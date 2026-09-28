@@ -6,6 +6,39 @@ use serde::{Deserialize, Serialize};
 /// Schema tag for [`ItemsDocument`].
 pub const ITEMS_SCHEMA: &str = "octos.research.items.v1";
 
+/// What a result is: an article (a news story, page, paper or repository
+/// that can be read and cited as a source) or a post (a social post, or a
+/// discussion thread without a linked article). Posts are signal about what
+/// people are saying, not evidence for a news claim: in category `news` the
+/// metasearch ranks them after every article, and callers can choose not to
+/// read them. Serialized only when it is `post`; absent means `article`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemKind {
+    #[default]
+    Article,
+    Post,
+}
+
+impl ItemKind {
+    pub fn is_article(&self) -> bool {
+        *self == Self::Article
+    }
+
+    pub fn is_post(&self) -> bool {
+        *self == Self::Post
+    }
+
+    /// Parse `article` / `post`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "article" => Some(Self::Article),
+            "post" => Some(Self::Post),
+            _ => None,
+        }
+    }
+}
+
 /// One search result as a provider returned it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SearchHit {
@@ -33,6 +66,9 @@ pub struct SearchHit {
     /// Metasearch rank score (higher is better), when ranked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    /// Article or post ([`ItemKind`]); absent means article.
+    #[serde(default, skip_serializing_if = "ItemKind::is_article")]
+    pub kind: ItemKind,
 }
 
 impl SearchHit {
@@ -97,6 +133,9 @@ pub struct ResearchItem {
     /// Metasearch rank score, when the item came from the metasearch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    /// Article or post ([`ItemKind`]); absent means article.
+    #[serde(default, skip_serializing_if = "ItemKind::is_article")]
+    pub kind: ItemKind,
     /// Whether the page main text was read (plain HTTP or browser).
     pub read: bool,
     /// Whether a real browser rendered the page (JS-heavy pages).
@@ -111,13 +150,44 @@ pub struct ResearchItem {
     pub file: Option<String>,
 }
 
-/// A URL that was deliberately not read, and why (`robots`, `domain_deny`,
-/// `domain_allow`, `per_domain_cap`, `lang`, `older_than_since`,
-/// `fetch_error: ...`).
+/// A URL that was deliberately not read, or could not be, and why:
+/// filters (`robots`, `domain_deny`, `domain_allow`, `per_domain_cap`,
+/// `lang`, `older_than_since`) or a failed read as `<code>: <detail>` (see
+/// [`crate::ReadFailure`]: `bot_challenge`, `paywall`, `http_403`, …).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedUrl {
     pub url: String,
     pub reason: String,
+    /// Where a failed read ended (after redirects or in the browser), when
+    /// known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_url: Option<String>,
+}
+
+impl SkippedUrl {
+    /// A URL skipped for `reason` (a filter name).
+    pub fn new(url: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            reason: reason.into(),
+            final_url: None,
+        }
+    }
+
+    /// A URL whose read failed: `reason` is `<code>: <detail>`, and the
+    /// final URL is kept.
+    pub fn read_failed(url: impl Into<String>, err: &crate::ReadError) -> Self {
+        let reason = if err.detail.is_empty() {
+            err.code()
+        } else {
+            format!("{}: {}", err.code(), err.detail)
+        };
+        Self {
+            url: url.into(),
+            reason,
+            final_url: err.final_url.clone(),
+        }
+    }
 }
 
 /// The `items` output document (also written as `items.json`).
@@ -231,6 +301,7 @@ mod tests {
             provider: "gdelt".into(),
             engines: Vec::new(),
             score: None,
+            kind: ItemKind::Article,
             read: true,
             rendered: false,
             citation: Some(1),
@@ -275,5 +346,49 @@ mod tests {
             "峰会周一开幕，来自190个国家的代表出席了会议并发表讲话。谈判代表预计周五前拿出草案。";
         assert!(extractive_summary(cjk, 200).contains("峰会周一开幕"));
         assert_eq!(extractive_summary("short\nlines", 100), "");
+    }
+
+    #[test]
+    fn should_mark_posts_and_omit_kind_when_item_is_an_article() {
+        let post = SearchHit {
+            url: "https://mastodon.social/@a/1".into(),
+            kind: ItemKind::Post,
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(&post).unwrap()["kind"], "post");
+        let article = SearchHit::default();
+        assert!(
+            serde_json::to_value(&article)
+                .unwrap()
+                .get("kind")
+                .is_none()
+        );
+        let back: SearchHit = serde_json::from_value(serde_json::json!({
+            "url": "u", "title": "t", "provider": "p"
+        }))
+        .unwrap();
+        assert_eq!(back.kind, ItemKind::Article, "absent kind means article");
+        assert_eq!(ItemKind::parse("post"), Some(ItemKind::Post));
+        assert_eq!(ItemKind::parse("thread"), None);
+    }
+
+    #[test]
+    fn should_keep_reason_code_and_final_url_when_read_failed() {
+        let err = crate::ReadError::new(crate::ReadFailure::Paywall, "subscriber-only")
+            .at("https://publisher.example/story");
+        let s = SkippedUrl::read_failed("https://news.google.com/rss/articles/x", &err);
+        assert_eq!(s.reason, "paywall: subscriber-only");
+        assert_eq!(
+            s.final_url.as_deref(),
+            Some("https://publisher.example/story")
+        );
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["final_url"], "https://publisher.example/story");
+        assert!(
+            serde_json::to_value(SkippedUrl::new("u", "lang"))
+                .unwrap()
+                .get("final_url")
+                .is_none()
+        );
     }
 }

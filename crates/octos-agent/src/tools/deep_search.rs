@@ -417,10 +417,7 @@ fn invalid_input(msg: &str) -> ToolResult {
 }
 
 fn skip(url: &str, reason: &str) -> octos_research::SkippedUrl {
-    octos_research::SkippedUrl {
-        url: url.to_string(),
-        reason: reason.to_string(),
-    }
+    octos_research::SkippedUrl::new(url, reason)
 }
 
 fn one_line(s: &str) -> String {
@@ -477,6 +474,7 @@ fn page_item(
         provider: "web_search".to_string(),
         engines: Vec::new(),
         score: None,
+        kind: octos_research::ItemKind::Article,
         read: true,
         rendered: page.rendered,
         citation: Some(citation),
@@ -521,6 +519,7 @@ fn research_reader() -> octos_research::reader::Reader {
         respect_robots: octos_research::respect_robots(|k| std::env::var(k).ok()),
         fallback_text: Some(html_to_markdown),
         renderer,
+        ..Default::default()
     })
 }
 
@@ -538,11 +537,12 @@ async fn read_page(
     url: &str,
     max_chars: usize,
 ) -> Result<PageRead> {
-    let page = reader.read(url).await.map_err(|reason| {
-        if reason.starts_with("robots") {
-            eyre::eyre!("skipped: {reason} (robots.txt)")
+    let page = reader.read(url).await.map_err(|err| {
+        use octos_research::ReadFailure::{Robots, RobotsUnreachable};
+        if matches!(err.reason, Robots | RobotsUnreachable) {
+            eyre::eyre!("skipped: {err} (robots.txt)")
         } else {
-            eyre::eyre!("{reason}")
+            eyre::eyre!("{err}")
         }
     })?;
     // Characters, not bytes: a byte cap gives CJK pages a third of the room.
@@ -719,6 +719,7 @@ async fn render_page(url: &str, bound: Duration) -> Result<octos_research::reade
             final_url,
             html,
             navigations,
+            status: None,
         })
     };
     tokio::time::timeout(bound, fut)
@@ -931,18 +932,19 @@ mod tests {
             final_url: "http://169.254.169.254/latest/meta-data/".into(),
             html: format!("<html><body><p>{}</p></body></html>", "secret ".repeat(80)),
             navigations: vec!["http://93.184.216.34/start".into()],
+            status: None,
         };
         let err = reader
             .accept_rendered("http://93.184.216.34/start", rendered)
             .await
             .unwrap_err();
-        assert!(err.starts_with("ssrf_blocked"), "{err}");
+        assert_eq!(err.reason, octos_research::ReadFailure::Blocked, "{err}");
         // And a private URL is never fetched at all.
         let err = read_page(&reader, "http://169.254.169.254/latest/meta-data/", 1000)
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("ssrf_blocked"), "{err}");
+        assert!(err.starts_with("blocked: ssrf"), "{err}");
     }
 
     /// Live check (Chrome + network): an HTTP redirect to the metadata

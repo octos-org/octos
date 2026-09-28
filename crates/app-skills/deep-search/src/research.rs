@@ -810,8 +810,9 @@ impl Reader {
         }
     }
 
-    /// Read one page. `Err(reason)` is recorded as a skipped URL.
-    pub async fn read(&self, url: &str) -> Result<ReadPage, String> {
+    /// Read one page. A failure is recorded as a skipped URL with its
+    /// reason and final URL.
+    pub async fn read(&self, url: &str) -> Result<ReadPage, octos_research::ReadError> {
         self.inner.read(url).await.map(ReadPage::from_shared)
     }
 
@@ -839,7 +840,10 @@ impl Reader {
     }
 
     /// Read many URLs concurrently, preserving input order.
-    pub async fn read_all(&self, urls: &[String]) -> Vec<Result<ReadPage, String>> {
+    pub async fn read_all(
+        &self,
+        urls: &[String],
+    ) -> Vec<Result<ReadPage, octos_research::ReadError>> {
         stream::iter(urls.iter())
             .map(|u| self.read(u))
             .buffered(READ_CONCURRENCY)
@@ -876,6 +880,11 @@ fn parse_render_output(stdout: &str, url: &str) -> Result<reader::Rendered, Stri
         .as_array()
         .and_then(|p| p.first())
         .ok_or("browser returned no page")?;
+    // deep_crawl's own verdict (e.g. "blocked by a bot challenge (not
+    // bypassed)"); the shared reader classifies the message.
+    if let Some(error) = page["error"].as_str().filter(|e| !e.is_empty()) {
+        return Err(error.to_string());
+    }
     let html = page["html"].as_str().unwrap_or("").to_string();
     if html.is_empty() {
         return Err("browser returned empty HTML".to_string());
@@ -891,6 +900,7 @@ fn parse_render_output(stdout: &str, url: &str) -> Result<reader::Rendered, Stri
                     .collect()
             })
             .unwrap_or_default(),
+        status: None,
     })
 }
 
@@ -1049,7 +1059,29 @@ mod tests {
             .accept_rendered("http://93.184.216.34/start", rendered)
             .await
             .unwrap_err();
-        assert!(err.starts_with("ssrf_blocked"), "{err}");
+        assert_eq!(err.reason, octos_research::ReadFailure::Blocked, "{err}");
+        assert!(err.to_string().contains("169.254.169.254"), "{err}");
+    }
+
+    #[test]
+    fn should_report_deep_crawl_page_error_when_browser_hit_a_challenge() {
+        let stdout = serde_json::json!({
+            "output": "",
+            "success": true,
+            "pages": [{
+                "url": "https://publisher.example/story",
+                "final_url": "https://publisher.example/story",
+                "navigations": [],
+                "html": "",
+                "error": "blocked by a bot challenge (not bypassed)"
+            }]
+        })
+        .to_string();
+        let err = parse_render_output(&stdout, "https://publisher.example/story").unwrap_err();
+        assert_eq!(
+            octos_research::ReadError::from_render_error(&err).reason,
+            octos_research::ReadFailure::BotChallenge
+        );
     }
 
     #[tokio::test]

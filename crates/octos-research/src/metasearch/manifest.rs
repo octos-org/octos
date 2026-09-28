@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::item::ItemKind;
+
 /// Categories an engine can serve. A search asks for one category; every
 /// enabled engine that lists it runs.
 pub const CATEGORIES: &[&str] = &["general", "news", "science", "it", "social"];
@@ -44,6 +46,10 @@ pub struct EngineManifest {
     pub docs_url: Vec<String>,
     /// Terms, attribution or licence notes for the data.
     pub license_note: String,
+    /// What the engine's results are: `article` (default) or `post`
+    /// (social posts). An item may override it with its own `kind`.
+    #[serde(default, skip_serializing_if = "ItemKind::is_article")]
+    pub kind: ItemKind,
     /// Relative weight in ranking (default 1.0).
     #[serde(default = "one")]
     pub weight: f64,

@@ -131,6 +131,10 @@ struct PageHtml {
     /// Main-frame navigations the browser reported (redirect chain).
     navigations: Vec<String>,
     html: String,
+    /// Why the page yielded nothing (e.g. "blocked by a bot challenge (not
+    /// bypassed)"), so the reader can report a specific reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Default)]
@@ -1470,7 +1474,7 @@ async fn run() -> Output {
     let pages = if input.include_html {
         results
             .into_iter()
-            .filter(|p| p.error.is_none() && !p.html.is_empty())
+            .filter(|p| p.error.is_some() || !p.html.is_empty())
             .map(|p| PageHtml {
                 final_url: if p.final_url.is_empty() {
                     p.url.clone()
@@ -1479,7 +1483,13 @@ async fn run() -> Output {
                 },
                 url: p.url,
                 navigations: p.navigations,
-                html: p.html,
+                // A failed page carries its reason, never its HTML.
+                html: if p.error.is_some() {
+                    String::new()
+                } else {
+                    p.html
+                },
+                error: p.error,
             })
             .collect()
     } else {

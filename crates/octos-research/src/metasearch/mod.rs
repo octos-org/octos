@@ -41,7 +41,7 @@ use tokio::time::Instant;
 
 use crate::date::Since;
 use crate::filter::{DomainCap, Filters};
-use crate::item::{SearchHit, SkippedUrl};
+use crate::item::{ItemKind, SearchHit, SkippedUrl};
 use crate::robots::RobotsCache;
 use crate::{lang, urls};
 
@@ -493,10 +493,7 @@ impl Metasearch {
                     rh.hit.published.as_deref(),
                 ) {
                     Ok(()) => ranked.push(RankedHit { position, ..rh }),
-                    Err(reason) => skipped.push(SkippedUrl {
-                        url: rh.hit.url,
-                        reason: reason.to_string(),
-                    }),
+                    Err(reason) => skipped.push(SkippedUrl::new(rh.hit.url, reason.to_string())),
                 }
             }
             reports.push(report);
@@ -518,10 +515,7 @@ impl Metasearch {
                 _ => item.url.clone(),
             };
             if !cap.admit(&domain_url) {
-                skipped.push(SkippedUrl {
-                    url: item.url,
-                    reason: "per_domain_cap".to_string(),
-                });
+                skipped.push(SkippedUrl::new(item.url, "per_domain_cap".to_string()));
                 continue;
             }
             if items.len() < req.limit {
@@ -814,7 +808,7 @@ impl Metasearch {
         let default_lang = (call.langs.len() == 1).then(|| call.langs[0].clone());
         let hits = items
             .iter()
-            .filter_map(|v| normalize_item(v, &m.id, default_lang.as_deref()))
+            .filter_map(|v| normalize_item(v, &m.id, m.kind, default_lang.as_deref()))
             .take(req.count.max(1))
             .map(|hit| RankedHit {
                 engine: m.id.clone(),
@@ -1014,8 +1008,14 @@ enum CallError {
     Failed(String, Option<Duration>),
 }
 
-/// Validate and normalize one item a script returned.
-fn normalize_item(v: &Value, engine: &str, default_lang: Option<&str>) -> Option<SearchHit> {
+/// Validate and normalize one item a script returned. `kind` is the
+/// engine's default; an item's own valid `kind` wins.
+fn normalize_item(
+    v: &Value,
+    engine: &str,
+    kind: ItemKind,
+    default_lang: Option<&str>,
+) -> Option<SearchHit> {
     let s = |k: &str| {
         v.get(k)
             .and_then(Value::as_str)
@@ -1057,6 +1057,11 @@ fn normalize_item(v: &Value, engine: &str, default_lang: Option<&str>) -> Option
         lang,
         published,
         provider: engine.to_string(),
+        kind: v
+            .get("kind")
+            .and_then(Value::as_str)
+            .and_then(ItemKind::parse)
+            .unwrap_or(kind),
         ..Default::default()
     })
 }

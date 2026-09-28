@@ -27,6 +27,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::access::{ReadError, ReadFailure};
 use crate::date::Since;
 use crate::filter::Filters;
 use crate::item::{ItemsDocument, ResearchItem, SummaryKind};
@@ -436,6 +437,7 @@ impl Toolbox {
                     provider: crate::metasearch::PROVIDER_ID.to_string(),
                     engines: m.engines.clone(),
                     score: Some(m.score),
+                    kind: m.kind,
                     ..Default::default()
                 }
             })
@@ -445,7 +447,9 @@ impl Toolbox {
 
     /// `web_read`: read one page (browser-rendered when plain HTTP has no
     /// main text and a renderer is configured) and return its main text as
-    /// one item, written to `app_dir`.
+    /// one item, written to `app_dir`. A failure is the read's reason as
+    /// `<code>: <detail> (final URL: …)` (see [`ReadError`]); pages outside
+    /// the grant are `blocked`.
     pub async fn web_read(
         &self,
         scope: &Scope,
@@ -457,10 +461,12 @@ impl Toolbox {
             .get("url")
             .and_then(Value::as_str)
             .ok_or("url is required")?;
-        scope.check_domain(url)?;
+        let blocked = |e: String| ReadError::new(ReadFailure::Blocked, e);
+        scope.check_domain(url).map_err(blocked)?;
         let page = self.reader.read(url).await?;
         let canonical = page.canonical_url();
-        check_read_location(scope, &page.final_url, &canonical)?;
+        check_read_location(scope, &page.final_url, &canonical)
+            .map_err(|e| blocked(e).at(&page.final_url))?;
         let domain = urls::domain_of(&canonical).unwrap_or_default();
         let summary = crate::item::extractive_summary(&page.text, 600);
         let item = ResearchItem {
