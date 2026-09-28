@@ -439,17 +439,19 @@ jobs:
   # default-keyed cache and don't fight each other.
 
   test-octos-agent:
+    name: test-octos-agent (${{ matrix.shard.name }})
     strategy:
       fail-fast: false
       matrix:
-        # `lib` runs `--lib` only. `integration` selects every integration
-        # test target with `--test '*'` without rebuilding the lib unit-test
-        # harness, which `--tests` includes by default.
-        # Splitting these onto separate runners means each gets a fresh
-        # 16GB allocation and neither inherits residual RAM from the
-        # other's compile phase.
-        test-mode: [lib, integration]
+        shard:
+          - { name: "lib-agent", args: "agent::" }
+          - { name: "lib-coding", args: "tools::coding_tools tools::shell tools::check format::" }
+          - { name: "lib-spawn", args: "tools::spawn tools::delegate tools::registry" }
+          - { name: "lib-plugins", args: "plugins::" }
+          - { name: "lib-supervisor", args: "task_supervisor validators snapshot exec_env sandbox" }
+          - { name: "lib-rest", args: "--skip agent:: --skip tools::coding_tools --skip tools::shell --skip tools::check --skip format:: --skip tools::spawn --skip tools::delegate --skip tools::registry --skip plugins:: --skip task_supervisor --skip validators --skip snapshot --skip exec_env --skip sandbox" }
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     env:
       CARGO_BUILD_JOBS: "1"
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
@@ -467,35 +469,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: octos-agent-tests-${{ matrix.test-mode }}
+          shared-key: octos-agent-tests-lib
 
-      - name: Test octos-agent (lib)
-        if: matrix.test-mode == 'lib'
-        timeout-minutes: 25
+      - name: Build
+        run: cargo test -p octos-agent --lib --no-run
+
+      - name: Test octos-agent (lib shard)
+        timeout-minutes: 20
         run: |
-          (while true; do sleep 60; echo "=== DIAG $(date -u +%T)"; free -m; df -h / /tmp | tail -2; ps -eo pid,ppid,etime,rss,pcpu,args --sort=-rss | cut -c1-200 | head -30; done) &
-          cargo test -p octos-agent --lib
-
-      - name: Test octos-agent (integration)
-        if: matrix.test-mode == 'integration'
-        env:
-          # Keep a cache miss viable on the standard runner. This shard links
-          # many test binaries, so omit debug info to reduce disk and peak RSS.
-          CARGO_PROFILE_TEST_DEBUG: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-        # `--tests` also builds and runs the lib unit-test harness, duplicating
-        # the lib matrix job. The quoted target glob selects integration tests
-        # only and prevents the shell from expanding it before Cargo sees it.
-        # --test-threads=1: validator_runner.rs::should_kill_child_process_on_validator_timeout
-        # spawns a `sh -c "... sleep 30"` child to test the kill path. Under the
-        # default thread-per-core parallelism, multiple validator-timeout tests
-        # pile up concurrent sleep children and the ubuntu-latest runner gets
-        # terminated by GitHub for resource use (deterministic shutdown ~296ms
-        # after the preceding test passes). Serialising the integration tests
-        # eliminates the pileup. The full integration suite still finishes
-        # comfortably within the runner's 6h budget.
-        run: cargo test -p octos-agent --test '*' -- --test-threads=1
-
+          (while true; do sleep 60; echo "=== DIAG $(date -u +%T)"; free -m | head -2; df -h / | tail -1; ps -eo pid,ppid,pgid,etime,rss,args --sort=-rss | cut -c1-160 | head -15; done) &
+          cargo test -p octos-agent --lib -- ${{ matrix.shard.args }}
 
   # Split three ways so the PR wait is the slowest third (~25 min), not the
   # whole ~57 min serial run. Every step that ran before still runs, in
