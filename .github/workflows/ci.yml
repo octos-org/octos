@@ -443,7 +443,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [warm, cold]
+        variant: [warm, cold-bigpid]
         attempt: [1, 2]
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -468,9 +468,20 @@ jobs:
           shared-key: octos-agent-tests-lib
           save-if: false
 
+      - name: PID facts
+        run: |
+          echo "pid_max=$(cat /proc/sys/kernel/pid_max) last_pid=$(cat /proc/sys/kernel/ns_last_pid)"
+          sysctl kernel.pid_max; ls /usr/lib/sysctl.d/ /etc/sysctl.d/ ; grep -rh pid_max /usr/lib/sysctl.d/ /etc/sysctl.d/ /etc/sysctl.conf || true
+
+      - name: Raise pid_max
+        if: matrix.variant == 'cold-bigpid'
+        run: sudo sysctl -w kernel.pid_max=4194304
+
       - name: Test octos-agent (lib)
         timeout-minutes: 30
         run: |
+          echo "before: last_pid=$(cat /proc/sys/kernel/ns_last_pid)"
+          trap 'echo "after: last_pid=$(cat /proc/sys/kernel/ns_last_pid)"' EXIT
           cat > /tmp/watchdog.sh <<'WD'
           i=0
           while true; do
@@ -478,7 +489,7 @@ jobs:
             avail=$(df --output=avail -k / | tail -1)
             memavail=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
             nprocs=$(ps -e --no-headers | wc -l)
-            if [ $((i % 20)) -eq 0 ]; then echo "=== WD $(date -u +%T) disk_avail_kb=$avail mem_avail_kb=$memavail procs=$nprocs load=$(cut -d' ' -f1-3 /proc/loadavg)"; fi
+            if [ $((i % 20)) -eq 0 ]; then echo "=== WD $(date -u +%T) disk_avail_kb=$avail mem_avail_kb=$memavail procs=$nprocs load=$(cut -d' ' -f1-3 /proc/loadavg) last_pid=$(cat /proc/sys/kernel/ns_last_pid)"; fi
             if [ "$avail" -lt 2000000 ] || [ "$memavail" -lt 1500000 ] || [ "$nprocs" -gt 3000 ]; then
               echo "=== WD TRIP $(date -u +%T) disk_avail_kb=$avail mem_avail_kb=$memavail procs=$nprocs"
               df -h; free -m
