@@ -668,14 +668,18 @@ jobs:
   # job lean, but the Dockerfile and several release configurations enable it.
   # Without this job, feature-gated compile errors (e.g. an identifier referenced
   # only inside `#[cfg(feature = "matrix")]`) slip past PR CI and only surface
-  # during docker builds. Keep this job intentionally tiny: no tests.
-  # It also carries the clippy gate for the feature-gated api/serve/ui_protocol
-  # modules: octos-cli has `default = []`, so the workspace clippy in `check`
-  # never lints them — and clippy subsumes `cargo check`.
+  # during docker builds. It also carries the clippy gate for the feature-gated
+  # channel modules: the non-api channels stay outside octos-cli's default
+  # features, so the workspace clippy in `check` never lints them — and clippy
+  # subsumes `cargo check`. And it runs the feature-gated octos-bus matrix
+  # test suite: with the feature off (as in `check`'s `cargo test -p
+  # octos-bus`) the whole suite is cfg'd out, and the workspace-wide runs that
+  # do execute it only exist in the nightly and self-hosted lanes.
   check-matrix:
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v6
 
@@ -695,6 +699,21 @@ jobs:
 
       - name: Clippy octos-cli with matrix feature
         run: cargo clippy -p octos-cli --all-targets --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3 -- -D warnings
+
+      # The suite itself: its only PR-time execution. Floor-check the listing
+      # first so the gate fails loudly if the suite silently drops to zero
+      # (the #2029 lesson), and skip the known nightly failure
+      # test_handle_room_query_requires_token (#2267: fails on the slow
+      # runner lanes) so the gate stays deterministic; lift the skip with the
+      # #2267 fix.
+      - name: Test octos-bus with the matrix feature
+        run: |
+          count=$(cargo test -p octos-bus --features matrix -- --list matrix_ | grep -c ': test$')
+          if [ "$count" -lt 100 ]; then
+            echo "::error::only $count matrix-gated tests listed; expected the suite floor of 100"
+            exit 1
+          fi
+          cargo test -p octos-bus --features matrix -- --skip test_handle_room_query_requires_token
 
   check-arm:
     # Deliberately NOT on PRs, unlike check-windows: the workspace has ZERO
