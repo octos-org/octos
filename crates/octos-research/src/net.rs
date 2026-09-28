@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use url::{Host, Url};
 
-/// Max redirects [`safe_get`] follows.
+/// Max redirects [`pinned_get`] follows.
 pub const MAX_REDIRECTS: usize = 10;
 
 /// SSRF-relevant IPv4 ranges that `Ipv4Addr::is_private()` /
@@ -127,6 +127,10 @@ fn validate_answer_set(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, String
     Ok(addrs)
 }
 
+/// A synchronous per-host gate, borrowed for the whole fetch: `Err` refuses
+/// the host before any DNS or socket.
+pub type HostGate<'a> = &'a (dyn Fn(&str) -> Result<(), String> + Send + Sync);
+
 /// Per-fetcher configuration for [`pinned_get`]: everything the shared hop
 /// loop leaves to the caller.
 pub struct PinnedFetch<'a> {
@@ -137,7 +141,7 @@ pub struct PinnedFetch<'a> {
     /// Extra per-host gate run on every hop BEFORE [`check_url`], so a
     /// refused host never triggers DNS or opens a socket (e.g. a fleet
     /// worker's host allowlist). `None` = unrestricted.
-    pub pre_check: Option<&'a (dyn Fn(&str) -> Result<(), String> + Send + Sync)>,
+    pub pre_check: Option<HostGate<'a>>,
 }
 
 /// GET `initial_url`, re-validating and DNS-pinning every redirect hop.
