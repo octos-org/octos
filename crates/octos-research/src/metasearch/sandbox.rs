@@ -7,8 +7,10 @@
 //!
 //! - `net`: `net.request({url, method, headers, body})` validates a request
 //!   against the engine's declared hosts and returns it; `net.url({base,
-//!   query})` builds a percent-encoded URL on a declared host. Neither opens a
-//!   connection: the core performs the request after the script returns.
+//!   query})` builds a percent-encoded URL on a declared host. A record
+//!   `query` carries no key-order contract; pass a list of `[name, value]`
+//!   pairs when order matters. Neither opens a connection: the core
+//!   performs the request after the script returns.
 //! - `markup`: `markup.feed({lang})` parses the response being handled as
 //!   RSS/Atom (the body stays in the host), `markup.text({html})` turns an
 //!   HTML fragment into plain text, and `markup.matches({query, text})` says
@@ -562,9 +564,27 @@ fn parse_response(response, opts) {
         assert_eq!(reqs.len(), 1);
         let req = &reqs[0];
         assert_eq!(req.method, "GET");
+        // Query-param order carries no contract: a record query comes back
+        // in the host build's serde_json Map order (sorted, or insertion-
+        // ordered when the preserve_order feature is unified into the
+        // graph), so compare decoded pairs instead of the serialized string.
+        assert!(
+            req.url.starts_with("https://api.example.org/search?"),
+            "{}",
+            req.url
+        );
+        let mut pairs: Vec<(String, String)> = Url::parse(&req.url)
+            .unwrap()
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        pairs.sort();
         assert_eq!(
-            req.url,
-            "https://api.example.org/search?n=5&q=rust+%26+tokio"
+            pairs,
+            vec![
+                ("n".into(), "5".into()),
+                ("q".into(), "rust & tokio".into())
+            ]
         );
         assert_eq!(
             req.headers,
