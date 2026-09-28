@@ -24,6 +24,8 @@ ono = "ono"
 scaned = "scaned"
 # Timezone abbreviation (IST)
 ist = "ist"
+# Spanish test page in octos-research's extract tests ("reconocieron avances")
+avances = "avances"
 # Test data fragment in SSE test
 hel = "hel"
 # Homoglyph security test string
