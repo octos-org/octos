@@ -27,6 +27,7 @@ pub mod providers;
 #[cfg(all(feature = "fetch", feature = "extract"))]
 pub mod reader;
 pub mod robots;
+pub mod text;
 pub mod throttle;
 pub mod urls;
 

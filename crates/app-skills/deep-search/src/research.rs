@@ -427,8 +427,9 @@ async fn run_provider(
         Provider::Perplexity => {
             let mut body = serde_json::json!({
                 "model": "sonar",
-                "messages": [{"role": "user", "content": query}],
-                "max_tokens": 1024
+                "messages": [{"role": "user", "content": query}]
+                // No max_tokens: output size is left to the provider (standing
+                // decision: no hard-coded output caps on model calls).
             });
             if let Some(b) = bucket {
                 body["search_recency_filter"] = serde_json::json!(b.as_word());

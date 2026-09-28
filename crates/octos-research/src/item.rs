@@ -130,6 +130,10 @@ pub struct ItemsDocument {
     /// Human-readable note, e.g. why there are no items and how to fix it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Problems with this result a consumer should know about, e.g. a
+    /// report whose synthesis was cut off or has uncited sentences.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
 }
 
 impl ItemsDocument {

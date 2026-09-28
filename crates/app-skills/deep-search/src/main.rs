@@ -142,6 +142,14 @@ struct ResultSummary {
     sources: Vec<ResultSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rounds: Option<u32>,
+    /// `ok`, or `partial` when the synthesis was cut off. Passed through by
+    /// the host as a kind-specific extra field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    /// Human-readable problems with this result (cut-off synthesis,
+    /// uncited sentences, failed synthesis call).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    diagnostics: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -222,11 +230,15 @@ async fn main() {
     // Budgets include polite reading (robots.txt, per-host spacing, GDELT's
     // 5s interval) and the occasional browser render; still well inside the
     // manifest's 600s.
+    // Synthesis has no output-token cap and may retry once, so each budget
+    // leaves up to two minutes for it; the deepest still fits the
+    // manifest's 600s.
     let timeout = match depth {
-        1 => Duration::from_secs(120),
-        2 => Duration::from_secs(240),
-        _ => Duration::from_secs(360),
+        1 => Duration::from_secs(240),
+        2 => Duration::from_secs(360),
+        _ => Duration::from_secs(480),
     };
+    let _ = RUN_DEADLINE.set(std::time::Instant::now() + timeout);
 
     let result = tokio::time::timeout(
         timeout,
@@ -779,6 +791,10 @@ async fn run_deep_search(
     // Save read pages (main text + metadata front matter)
     // -----------------------------------------------------------------------
     let mut saved_files: Vec<(String, String, String)> = Vec::new(); // (filename, url, preview)
+                                                                     // What the synthesis model sees per source, parallel to `saved_files`:
+                                                                     // the full main text (the prompt builder trims it to a character budget),
+                                                                     // not the short report preview.
+    let mut synthesis_texts: Vec<String> = Vec::new();
     for (i, s) in st.sources.iter().enumerate() {
         let filename = format!("{:02}_{}.md", i + 1, host_slug(&s.page.final_url));
         let item = source_item(s, i + 1, false, &filename);
@@ -799,6 +815,7 @@ async fn run_deep_search(
             source_meta_line(s),
             truncate_utf8(&s.page.text, 2000, "\n... (truncated)")
         );
+        synthesis_texts.push(format!("{}\n\n{}", source_meta_line(s), s.page.text));
         saved_files.push((filename, item.url, preview));
     }
 
@@ -819,6 +836,7 @@ async fn run_deep_search(
             preview.push_str("\n\n");
             preview.push_str(&hit.snippet);
         }
+        synthesis_texts.push(preview.clone());
         saved_files.push((
             String::new(),
             octos_research::urls::canonicalize(&hit.url),
@@ -869,16 +887,19 @@ async fn run_deep_search(
         rounds: log.queries.len(),
         sources: saved_files
             .iter()
+            .zip(synthesis_texts)
             .enumerate()
-            .map(|(i, (_, url, preview))| SynthesisSource {
+            .map(|(i, ((_, url, _), text))| SynthesisSource {
                 index: i + 1,
                 url: url.clone(),
-                excerpt: preview.clone(),
+                excerpt: text,
             })
             .collect(),
     };
 
-    let synthesis = synthesize(client, &synthesis_input, synthesis_config).await;
+    let (synthesis, diagnostics) =
+        synthesis_diagnostics(synthesize(client, &synthesis_input, synthesis_config).await);
+    let partial = synthesis.as_ref().is_some_and(|s| s.truncated.is_some());
 
     progress_simple(ProgressPhase::ReportBuild, "Building report...");
     emit_v2_progress(
@@ -934,6 +955,7 @@ async fn run_deep_search(
     doc.providers = log.providers.clone();
     doc.report = Some(report_path.display().to_string());
     doc.items_file = Some(items_path.display().to_string());
+    doc.diagnostics = diagnostics.clone();
     let items_json = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
     let _ = fs::write(&items_path, &items_json);
 
@@ -950,9 +972,10 @@ async fn run_deep_search(
             cited: it.cited,
         })
         .collect();
-    let summary = ResultSummary {
-        kind: "deep_research".to_string(),
-        headline: synthesis
+    let headline = if partial {
+        format!("Incomplete report on '{query}': the synthesis was cut off")
+    } else {
+        synthesis
             .as_ref()
             .map(|s| s.headline.clone())
             .filter(|h| !h.is_empty())
@@ -962,10 +985,16 @@ async fn run_deep_search(
                     saved_files.len(),
                     log.queries.len()
                 )
-            }),
+            })
+    };
+    let summary = ResultSummary {
+        kind: "deep_research".to_string(),
+        headline,
         confidence: synthesis.as_ref().and_then(|s| s.confidence),
         sources: summary_sources,
         rounds: Some(log.queries.len() as u32),
+        status: Some(if partial { "partial" } else { "ok" }.to_string()),
+        diagnostics: diagnostics.clone(),
     };
 
     let cost = synthesis.as_ref().map(|s| ResultCost {
@@ -981,13 +1010,72 @@ async fn run_deep_search(
     } else {
         format!("{report}Items saved to: {}\n", items_path.display())
     };
+    assemble_output(output, &diagnostics, partial, summary, cost, &report_path)
+}
 
+/// Split a synthesis outcome into the usable result and the diagnostics a
+/// caller must see (failed call, cut-off reply, uncited sentences).
+fn synthesis_diagnostics(outcome: SynthesisOutcome) -> (Option<SynthesisResult>, Vec<String>) {
+    let mut diagnostics = Vec::new();
+    let synthesis = match outcome {
+        SynthesisOutcome::NotConfigured => None,
+        SynthesisOutcome::Failed(reason) => {
+            diagnostics.push(format!(
+                "Synthesis failed ({reason}); the report lists the sources without a synthesized answer."
+            ));
+            None
+        }
+        SynthesisOutcome::Done(s) => Some(s),
+    };
+    if let Some(s) = &synthesis {
+        if let Some(reason) = &s.truncated {
+            diagnostics.push(format!(
+                "Synthesis incomplete: {reason} (after {} attempt(s)). The report's synthesis is cut off; do not treat it as a complete answer.",
+                s.attempts
+            ));
+        }
+        if s.uncited_flagged > 0 {
+            diagnostics.push(format!(
+                "{} sentence(s) in the synthesis have no [N] citation and are marked [citation needed].",
+                s.uncited_flagged
+            ));
+        }
+    }
+    (synthesis, diagnostics)
+}
+
+/// Final plugin result. An incomplete synthesis (`partial`) is never
+/// success, and is not auto-delivered to chat as if it were a finished
+/// report (its path is still in `output`). Diagnostics lead the output so
+/// the calling agent reads them first.
+fn assemble_output(
+    output: String,
+    diagnostics: &[String],
+    partial: bool,
+    summary: ResultSummary,
+    cost: Option<ResultCost>,
+    report_path: &Path,
+) -> Output {
+    let output = if diagnostics.is_empty() {
+        output
+    } else {
+        let lead = if partial {
+            "Deep search partial: the report is incomplete."
+        } else {
+            "Deep search notes:"
+        };
+        format!("{lead}\n- {}\n\n{output}", diagnostics.join("\n- "))
+    };
     Output {
         output,
-        success: true,
+        success: !partial,
         summary: Some(summary),
         cost,
-        files_to_send: vec![report_path.display().to_string()],
+        files_to_send: if partial {
+            Vec::new()
+        } else {
+            vec![report_path.display().to_string()]
+        },
     }
 }
 
@@ -1734,17 +1822,10 @@ fn host_slug(raw_url: &str) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Keep at most `max_chars` characters (not bytes, so CJK text gets the same
+/// room as English) and append `suffix` when anything was cut.
 fn truncate_utf8(s: &str, max_chars: usize, suffix: &str) -> String {
-    if s.len() <= max_chars {
-        return s.to_string();
-    }
-    let mut end = max_chars;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut result = s[..end].to_string();
-    result.push_str(suffix);
-    result
+    octos_research::text::truncate_chars(s, max_chars, suffix)
 }
 
 /// Extract `(title, url)` pairs from a Bing SERP text dump.
@@ -1942,8 +2023,16 @@ fn build_report(
                 report.push_str(&format!("_{}_\n\n", syn.headline));
             }
             report.push_str("## Synthesis\n\n");
+            if let Some(reason) = &syn.truncated {
+                report.push_str(&format!(
+                    "> **Incomplete:** this synthesis was cut off ({reason}). Treat it as partial and check the sources below.\n\n"
+                ));
+            }
             report.push_str(syn.synthesis.trim());
             report.push_str("\n\n");
+            if syn.truncated.is_some() {
+                report.push_str("_[synthesis cut off here]_\n\n");
+            }
             if let Some(conf) = syn.confidence {
                 report.push_str(&format!("_Self-reported confidence: {conf:.2}_\n\n"));
             }
@@ -1953,6 +2042,11 @@ fn build_report(
             // keep the v1 "Overview" but label it so it's clear we did
             // NOT synthesize, and operators know the result is raw.
             report.push_str("## Overview\n\n");
+            if let Some(reason) = synthesis.and_then(|s| s.truncated.as_ref()) {
+                report.push_str(&format!(
+                    "> **Incomplete:** the synthesis produced no usable text ({reason}).\n\n"
+                ));
+            }
             report.push_str("_LLM synthesis unavailable — showing raw search results below._\n\n");
             report.push_str(initial_answer);
             report.push_str("\n\n");
@@ -2022,8 +2116,9 @@ struct SynthesisSource {
     excerpt: String,
 }
 
-/// Output of a successful synthesis call: prose with citations + metadata
-/// for the v2 result envelope.
+/// Output of a synthesis call: prose with citations + metadata for the v2
+/// result envelope, plus whether the reply was complete.
+#[derive(Default)]
 struct SynthesisResult {
     /// Multi-paragraph synthesized answer with `[N]` citations.
     synthesis: String,
@@ -2035,9 +2130,19 @@ struct SynthesisResult {
     /// Provider / model used. Reported in the v2 cost envelope.
     provider: String,
     model: String,
+    /// Summed over every attempt.
     tokens_in: u32,
     tokens_out: u32,
     usd: Option<f64>,
+    /// Why the synthesis is incomplete (`finish_reason: length`, or it ends
+    /// mid-sentence / mid-structure) after the last attempt. `None` when
+    /// the reply finished cleanly. An incomplete synthesis never counts as
+    /// success.
+    truncated: Option<String>,
+    /// Model calls made (1, or 2 when a cut-off reply was retried).
+    attempts: u32,
+    /// Sentences with no `[N]` citation, marked `[citation needed]`.
+    uncited_flagged: usize,
 }
 
 impl SynthesisResult {
@@ -2068,52 +2173,84 @@ impl SynthesisResult {
     }
 }
 
-/// Run the synthesis LLM call. Returns `None` when no API key is
-/// configured, the call fails, or the response is unusable. The deep_search
-/// flow falls back to the v1 raw-dump report in that case.
-async fn synthesize(
-    client: &reqwest::Client,
-    input: &SynthesisInput<'_>,
-    args_config: Option<&SynthesisConfig>,
-) -> Option<SynthesisResult> {
-    let (endpoint, api_key, model, provider) = resolve_synthesis_config(args_config)?;
+/// What the synthesis step produced.
+enum SynthesisOutcome {
+    /// No provider configured: the raw-results report is the designed
+    /// output, not an error.
+    NotConfigured,
+    /// The call failed (transport, HTTP, unparseable or empty reply).
+    Failed(String),
+    /// The model replied. Check `truncated` before trusting it.
+    Done(SynthesisResult),
+}
 
-    let prompt = build_synthesis_prompt(input);
-    let prompt_chars = prompt.len();
+/// Upper bound for one synthesis call. There is no output-token cap (see
+/// [`synthesis_request_body`]), so a reasoning model can think for a while.
+const SYNTHESIS_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-    let body = serde_json::json!({
+/// Deadline of the whole run, set by `main`. The synthesis step keeps its
+/// calls (and the retry) inside it so a slow model yields an honest
+/// "incomplete" result instead of the whole run timing out with nothing.
+static RUN_DEADLINE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Optional output-token cap for the synthesis call, from
+/// `DEEP_SEARCH_SYNTHESIS_MAX_TOKENS`. Unset by default: a fixed cap cut
+/// off reasoning models (their thinking tokens count against it) in 3 of 6
+/// validation runs. Output size is bounded by the prompt and the source
+/// budget instead.
+fn synthesis_max_tokens() -> Option<u32> {
+    std::env::var("DEEP_SEARCH_SYNTHESIS_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+}
+
+/// OpenAI-compatible chat request. `max_tokens` is sent only when an
+/// operator configured one.
+fn synthesis_request_body(model: &str, prompt: &str, max_tokens: Option<u32>) -> serde_json::Value {
+    let mut body = serde_json::json!({
         "model": model,
         "messages": [
-            {
-                "role": "system",
-                "content": SYNTHESIS_SYSTEM_PROMPT
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
         ],
-        "max_tokens": 1500,
         "temperature": 0.3,
     });
+    if let Some(n) = max_tokens {
+        body["max_tokens"] = serde_json::json!(n);
+    }
+    body
+}
 
-    let response = match client
+/// Appended to the prompt when the first reply was cut off.
+const SYNTHESIS_RETRY_NOTE: &str = "\n\nA previous attempt at this answer was cut off before it \
+finished. Write a shorter answer: at most three paragraphs, every sentence complete, and \
+finish with the Gaps line.";
+
+/// One model reply.
+struct ModelReply {
+    content: String,
+    finish_reason: Option<String>,
+    tokens_in: u32,
+    tokens_out: u32,
+}
+
+async fn call_synthesis_model(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    timeout: Duration,
+) -> Result<ModelReply, String> {
+    let response = client
         .post(format!("{endpoint}/chat/completions"))
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
-        .json(&body)
-        .timeout(Duration::from_secs(60))
+        .json(body)
+        .timeout(timeout)
         .send()
         .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[synthesis] LLM call failed: {e}");
-            emit_v2_progress("synthesizing", &format!("LLM call failed: {e}"), None);
-            return None;
-        }
-    };
-
+        .map_err(|e| format!("LLM call failed: {e}"))?;
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
@@ -2121,56 +2258,188 @@ async fn synthesize(
             "[synthesis] HTTP {status}: {}",
             truncate_utf8(&text, 300, "")
         );
-        emit_v2_progress("synthesizing", &format!("LLM HTTP {status}"), None);
-        return None;
+        return Err(format!("LLM HTTP {status}"));
     }
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse response: {e}"))?;
+    Ok(ModelReply {
+        content: json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        finish_reason: json["choices"][0]["finish_reason"]
+            .as_str()
+            .map(str::to_string),
+        // OpenAI-compatible providers return token usage under "usage".
+        tokens_in: json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+        tokens_out: json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
+    })
+}
 
-    let json: serde_json::Value = match response.json().await {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("[synthesis] failed to parse response: {e}");
-            return None;
-        }
+/// Why a reply is incomplete, or `None` when it finished cleanly.
+fn truncation_reason(reply: &ModelReply, synthesis: &str) -> Option<String> {
+    if reply.finish_reason.as_deref() == Some("length") {
+        return Some("the model hit its output limit (finish_reason: length)".to_string());
+    }
+    let has_headline = reply.content.lines().any(|l| {
+        l.trim()
+            .trim_start_matches('#')
+            .trim()
+            .eq_ignore_ascii_case("headline")
+    });
+    if has_headline && !has_synthesis_section(&reply.content) {
+        return Some("the reply stopped before its Synthesis section".to_string());
+    }
+    octos_research::text::looks_cut_off(synthesis).map(|r| format!("the synthesis {r}"))
+}
+
+fn has_synthesis_section(text: &str) -> bool {
+    text.lines().any(|l| {
+        l.trim()
+            .strip_prefix("##")
+            .map(|r| {
+                matches!(
+                    r.trim().to_lowercase().as_str(),
+                    "synthesis" | "answer" | "report"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Run the synthesis LLM call, retrying once when the reply is cut off.
+///
+/// Returns [`SynthesisOutcome::NotConfigured`] without an API key, in which
+/// case the deep_search flow falls back to the v1 raw-dump report.
+async fn synthesize(
+    client: &reqwest::Client,
+    input: &SynthesisInput<'_>,
+    args_config: Option<&SynthesisConfig>,
+) -> SynthesisOutcome {
+    let Some((endpoint, api_key, model, provider)) = resolve_synthesis_config(args_config) else {
+        return SynthesisOutcome::NotConfigured;
     };
 
-    let content = json["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .trim();
-    if content.is_empty() {
-        eprintln!("[synthesis] empty response");
-        return None;
+    let prompt = build_synthesis_prompt(input);
+    let max_tokens = synthesis_max_tokens();
+    let mut result = SynthesisResult {
+        provider: provider.clone(),
+        model: model.clone(),
+        ..Default::default()
+    };
+    let mut last_error = None;
+
+    for attempt in 1..=2u32 {
+        let remaining = RUN_DEADLINE
+            .get()
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or(SYNTHESIS_CALL_TIMEOUT + Duration::from_secs(10))
+            .saturating_sub(Duration::from_secs(10));
+        if remaining < Duration::from_secs(15) {
+            if attempt == 1 {
+                return SynthesisOutcome::Failed("no time left in the run budget".to_string());
+            }
+            if let Some(reason) = &mut result.truncated {
+                reason.push_str("; no time left to retry");
+            }
+            break;
+        }
+        let user_prompt = if attempt == 1 {
+            prompt.clone()
+        } else {
+            format!("{prompt}{SYNTHESIS_RETRY_NOTE}")
+        };
+        let body = synthesis_request_body(&model, &user_prompt, max_tokens);
+        let reply = match call_synthesis_model(
+            client,
+            &endpoint,
+            &api_key,
+            &body,
+            remaining.min(SYNTHESIS_CALL_TIMEOUT),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[synthesis] attempt {attempt}: {e}");
+                emit_v2_progress("synthesizing", &e, None);
+                last_error = Some(e);
+                // Keep a cut-off first reply rather than nothing.
+                if result.attempts > 0 {
+                    break;
+                }
+                return SynthesisOutcome::Failed(last_error.unwrap_or_default());
+            }
+        };
+        result.attempts = attempt;
+        result.tokens_in += reply.tokens_in;
+        result.tokens_out += reply.tokens_out;
+
+        let (synthesis_text, headline, confidence) = if reply.content.is_empty() {
+            (String::new(), String::new(), None)
+        } else {
+            parse_synthesis_response(&reply.content)
+        };
+        if reply.content.is_empty() && reply.finish_reason.as_deref() != Some("length") {
+            eprintln!("[synthesis] attempt {attempt}: empty response");
+            if result.attempts > 1 || !result.synthesis.is_empty() {
+                break;
+            }
+            return SynthesisOutcome::Failed("empty reply".to_string());
+        }
+        let truncated = truncation_reason(&reply, &synthesis_text);
+        eprintln!(
+            "[synthesis] attempt {attempt}: prompt_chars={} sources={} tokens_in={} tokens_out={} \
+             finish_reason={} synthesis_chars={} complete={}",
+            user_prompt.chars().count(),
+            input.sources.len(),
+            reply.tokens_in,
+            reply.tokens_out,
+            reply.finish_reason.as_deref().unwrap_or("-"),
+            synthesis_text.chars().count(),
+            truncated.is_none()
+        );
+        // A complete reply always wins; between two cut-off replies keep
+        // the longer one.
+        if truncated.is_none() || synthesis_text.len() >= result.synthesis.len() {
+            result.synthesis = synthesis_text;
+            result.headline = headline;
+            result.confidence = confidence;
+        }
+        result.truncated = truncated;
+        if result.truncated.is_none() {
+            break;
+        }
+        if attempt == 1 {
+            emit_v2_progress(
+                "synthesizing",
+                "Synthesis was cut off; retrying once with a shorter answer...",
+                None,
+            );
+        }
+    }
+    if let Some(e) = last_error {
+        if let Some(reason) = &mut result.truncated {
+            reason.push_str(&format!("; the retry failed: {e}"));
+        }
     }
 
-    // OpenAI-compatible providers return token usage under "usage".
-    let tokens_in = json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
-    let tokens_out = json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
-    let usd = project_usd(&model, tokens_in, tokens_out);
-
-    let (synthesis_text, headline, confidence) = parse_synthesis_response(content);
-
+    let (flagged, count) = octos_research::text::flag_uncited_sentences(&result.synthesis);
+    result.synthesis = flagged;
+    result.uncited_flagged = count;
+    result.usd = project_usd(&model, result.tokens_in, result.tokens_out);
     // Emit a v2 cost event so the host can attribute spend.
-    emit_v2_cost(&provider, &model, tokens_in, tokens_out, usd);
-
-    eprintln!(
-        "[synthesis] ok: prompt_chars={} sources={} tokens_in={} tokens_out={} synthesis_chars={}",
-        prompt_chars,
-        input.sources.len(),
-        tokens_in,
-        tokens_out,
-        synthesis_text.len()
+    emit_v2_cost(
+        &provider,
+        &model,
+        result.tokens_in,
+        result.tokens_out,
+        result.usd,
     );
-
-    Some(SynthesisResult {
-        synthesis: synthesis_text,
-        headline,
-        confidence,
-        provider,
-        model,
-        tokens_in,
-        tokens_out,
-        usd,
-    })
+    SynthesisOutcome::Done(result)
 }
 
 /// System prompt for the synthesis call.
@@ -2178,60 +2447,85 @@ async fn synthesize(
 /// The output format is a strict 3-section markdown doc:
 /// 1. `## Headline` — one line summarizing the answer
 /// 2. `## Confidence` — numeric in `[0, 1]`
-/// 3. `## Synthesis` — multi-paragraph prose with `[N]` citations
+/// 3. `## Synthesis` — multi-paragraph prose with `[N]` citations, ending
+///    with one `Gaps:` line
 ///
 /// We parse this in [`parse_synthesis_response`] so we can lift each piece
-/// into the v2 result envelope.
+/// into the v2 result envelope. In validation every unsupported or wrongly
+/// cited claim was an uncited sentence (often about the sources rather than
+/// the topic), so the rules forbid both and give "what's missing" one
+/// exempt line.
 const SYNTHESIS_SYSTEM_PROMPT: &str = "\
-You are a research analyst. You write grounded, cited answers from the source \
-material the user provides. Rules: (1) Every factual claim MUST end with one or \
-more `[N]` citations referencing the numbered sources. (2) Use multiple \
-paragraphs; do NOT bulletpoint the entire answer. (3) Acknowledge contradiction \
-between sources when present. (4) If the sources don't cover an aspect of the \
-question, say so explicitly rather than guess. (5) Output exactly three \
-sections, in this order:\n\n\
+You are a research analyst. You write grounded, cited answers using only the numbered source \
+material the user provides. Rules:\n\
+(1) Every sentence that states a fact, figure, date, quote, cause or consequence MUST end with \
+one or more `[N]` citations to the sources that support it. This includes sentences that \
+restate, connect or compare facts. If no source supports a sentence, do not write it.\n\
+(2) Write about the topic, not about the sources: no sentences about how many sources there \
+are, their quality, or what they do or do not say. The only place for that is the final Gaps \
+line.\n\
+(3) Use only the sources; add nothing from memory.\n\
+(4) Use multiple paragraphs; do NOT bulletpoint the entire answer.\n\
+(5) When sources disagree, say so and cite each side.\n\
+(6) Write in the language of the question.\n\
+(7) Finish every sentence. Output exactly three sections, in this order:\n\n\
 ## Headline\n\
 <one-line answer, no citations>\n\n\
 ## Confidence\n\
 <a number from 0.0 to 1.0 reflecting source agreement and depth>\n\n\
 ## Synthesis\n\
-<3-6 paragraphs of cited prose>\n";
+<2-6 paragraphs of cited prose>\n\
+Gaps: <one line naming what the sources do not cover, or \"none\"; keep the English word \
+\"Gaps:\" whatever the language>\n";
+
+/// Characters (not bytes) of each source's text in the synthesis prompt.
+/// About one full news article: the old 1500-*byte* cap kept roughly 500
+/// Chinese characters, often just the lede.
+const PER_SOURCE_CHARS: usize = 6_000;
+/// Total source text in one prompt, shared evenly when many sources come
+/// back (12 sources get 4000 characters each). 48k characters is about 12k
+/// tokens of English or 30-48k of CJK text, well inside current 128k-token
+/// context windows, and about US$0.01 of input at DeepSeek Flash prices.
+const TOTAL_SOURCE_CHARS: usize = 48_000;
+/// Sources beyond this are listed in the report but not sent to the model.
+const MAX_SYNTHESIS_SOURCES: usize = 12;
+
+/// Per-source character budget when `n` sources go into the prompt.
+fn per_source_chars(n: usize) -> usize {
+    if n == 0 {
+        return PER_SOURCE_CHARS;
+    }
+    (TOTAL_SOURCE_CHARS / n).min(PER_SOURCE_CHARS)
+}
 
 fn build_synthesis_prompt(input: &SynthesisInput<'_>) -> String {
     let mut prompt = String::new();
     prompt.push_str(&format!("Question: {}\n\n", input.query));
     prompt.push_str(&format!(
         "Researcher gathered {} sources across {} search rounds. Source excerpts \
-         (truncated):\n\n",
+         (long pages are trimmed):\n\n",
         input.sources.len(),
         input.rounds
     ));
-    // Cap the excerpts so the prompt stays within reasonable LLM context.
-    // 1500 chars * 12 sources = 18k chars ≈ 4-5k tokens.
-    const PER_SOURCE_CHARS: usize = 1500;
-    const MAX_SOURCES: usize = 12;
-    for src in input.sources.iter().take(MAX_SOURCES) {
+    let included = input.sources.len().min(MAX_SYNTHESIS_SOURCES);
+    let budget = per_source_chars(included);
+    for src in input.sources.iter().take(MAX_SYNTHESIS_SOURCES) {
         prompt.push_str(&format!("---\n[{}] {}\n", src.index, src.url));
-        let excerpt = if src.excerpt.len() > PER_SOURCE_CHARS {
-            truncate_utf8(&src.excerpt, PER_SOURCE_CHARS, "\n... (truncated)")
-        } else {
-            src.excerpt.clone()
-        };
-        prompt.push_str(&excerpt);
+        prompt.push_str(&truncate_utf8(&src.excerpt, budget, "\n... (truncated)"));
         prompt.push_str("\n\n");
     }
-    if input.sources.len() > MAX_SOURCES {
+    if input.sources.len() > MAX_SYNTHESIS_SOURCES {
         prompt.push_str(&format!(
             "---\n(+ {} more sources omitted from this prompt for brevity; \
              they are still listed in the final report.)\n",
-            input.sources.len() - MAX_SOURCES
+            input.sources.len() - MAX_SYNTHESIS_SOURCES
         ));
     }
     prompt.push_str(
-        "---\n\nWrite the answer. Cite each numbered source at least once if it \
-         is used. Sources you do not cite will not appear in the final summary. \
-         Sources marked \"headline only\" were not read: cite them only for what \
-         the headline itself says. Mention publication dates when they matter.\n",
+        "---\n\nWrite the answer. Every factual sentence ends with its [N] citation(s); \
+         cite each numbered source you use. Sources you do not cite will not appear in the \
+         final summary. Sources marked \"headline only\" were not read: cite them only for \
+         what the headline itself says. Mention publication dates when they matter.\n",
     );
     prompt
 }
@@ -2872,6 +3166,8 @@ mod tests {
     fn test_truncate_utf8() {
         assert_eq!(truncate_utf8("Hello, world!", 100, "..."), "Hello, world!");
         assert_eq!(truncate_utf8("Hello, world!", 5, "..."), "Hello...");
+        // Characters, not bytes: 5 Han characters are 15 bytes.
+        assert_eq!(truncate_utf8("台风正在逼近广东", 5, "..."), "台风正在逼...");
     }
 
     #[test]
@@ -3287,6 +3583,7 @@ And another sentence [2].";
             tokens_in: 0,
             tokens_out: 0,
             usd: None,
+            ..Default::default()
         };
         let cited = result.cited_indexes();
         assert!(cited.contains(&1));
@@ -3307,6 +3604,7 @@ And another sentence [2].";
             tokens_in: 0,
             tokens_out: 0,
             usd: None,
+            ..Default::default()
         };
         let cited = result.cited_indexes();
         assert!(cited.contains(&1));
@@ -3315,7 +3613,7 @@ And another sentence [2].";
 
     #[test]
     fn build_synthesis_prompt_caps_per_source_chars() {
-        let huge_excerpt = "x".repeat(5_000);
+        let huge_excerpt = "x".repeat(PER_SOURCE_CHARS + 1_000);
         let input = SynthesisInput {
             query: "test",
             rounds: 1,
@@ -3326,8 +3624,10 @@ And another sentence [2].";
             }],
         };
         let prompt = build_synthesis_prompt(&input);
-        // 1500 char cap + suffix → cap is enforced
+        // Per-source cap + suffix → cap is enforced
         assert!(prompt.contains("(truncated)"));
+        assert!(prompt.contains(&"x".repeat(PER_SOURCE_CHARS)));
+        assert!(!prompt.contains(&"x".repeat(PER_SOURCE_CHARS + 1)));
     }
 
     #[test]
@@ -3400,6 +3700,7 @@ A second paragraph elaborates on alternatives [2]."
             tokens_in: 1000,
             tokens_out: 200,
             usd: Some(0.0009),
+            ..Default::default()
         };
         let dir = std::path::PathBuf::from("/tmp/research/topic");
         // Issue #261: canonical report filename now derives from the
@@ -3510,6 +3811,7 @@ A second paragraph elaborates on alternatives [2]."
             tokens_in: 0,
             tokens_out: 0,
             usd: None,
+            ..Default::default()
         };
         // Issue #261: even in the degenerate-synthesis fallback the
         // file is named after the topic slug.
@@ -3618,6 +3920,7 @@ A second paragraph elaborates on alternatives [2]."
                     cited: true,
                 }],
                 rounds: Some(3),
+                ..Default::default()
             }),
             cost: Some(ResultCost {
                 provider: Some("deepseek".to_string()),
@@ -3646,5 +3949,268 @@ A second paragraph elaborates on alternatives [2]."
             json.get("files_to_send").is_none(),
             "files_to_send should be omitted"
         );
+    }
+
+    // --- Synthesis completeness (validation findings, 27 Sep 2026) ---
+
+    /// A fake OpenAI-compatible endpoint: serves `replies` in order, one per
+    /// connection, and records each request body.
+    fn fake_model(
+        replies: Vec<serde_json::Value>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let mut body = vec![0u8; len];
+                reader.read_exact(&mut body).unwrap();
+                seen.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(&body).unwrap());
+                let text = reply.to_string();
+                let mut stream = stream;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                    text.len()
+                )
+                .unwrap();
+            }
+        });
+        (endpoint, bodies)
+    }
+
+    fn model_reply(content: &str, finish_reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+        })
+    }
+
+    fn fake_config(endpoint: &str) -> SynthesisConfig {
+        SynthesisConfig {
+            endpoint: endpoint.to_string(),
+            api_key: "test-key".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            provider: "deepseek".to_string(),
+        }
+    }
+
+    fn one_source_input() -> SynthesisInput<'static> {
+        SynthesisInput {
+            query: "EU AI Act",
+            rounds: 1,
+            sources: vec![SynthesisSource {
+                index: 1,
+                url: "https://a.example/x".to_string(),
+                excerpt: "Spain's regulator warned a company before launch.".to_string(),
+            }],
+        }
+    }
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    const CUT_OFF: &str = "## Headline\nRegulators act early\n\n## Confidence\n0.4\n\n## Synthesis\n\
+        Spain's regulator warned a company before launch [1]. Notably, the warning came before the tool";
+    const COMPLETE: &str =
+        "## Headline\nRegulators act early\n\n## Confidence\n0.4\n\n## Synthesis\n\
+        Spain's regulator warned a company before launch [1].\n\nGaps: fines imposed so far.";
+
+    #[test]
+    fn synthesis_request_sends_no_max_tokens_by_default() {
+        let body = synthesis_request_body("m", "p", None);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+        let body = synthesis_request_body("m", "p", Some(4000));
+        assert_eq!(body["max_tokens"], 4000, "operator opt-in still works");
+    }
+
+    #[tokio::test]
+    async fn length_cut_off_reply_is_retried_and_never_success() {
+        let (endpoint, bodies) = fake_model(vec![
+            model_reply(CUT_OFF, "length"),
+            model_reply(CUT_OFF, "length"),
+        ]);
+        let cfg = fake_config(&endpoint);
+        let outcome = synthesize(&test_client(), &one_source_input(), Some(&cfg)).await;
+        let SynthesisOutcome::Done(result) = outcome else {
+            panic!("expected a reply");
+        };
+        assert_eq!(result.attempts, 2, "one retry");
+        assert!(
+            result
+                .truncated
+                .as_deref()
+                .unwrap()
+                .contains("finish_reason: length"),
+            "{:?}",
+            result.truncated
+        );
+        assert_eq!(
+            (result.tokens_in, result.tokens_out),
+            (200, 100),
+            "both calls counted"
+        );
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        for b in bodies.iter() {
+            assert!(b.get("max_tokens").is_none(), "no output cap sent: {b}");
+        }
+        let retry_prompt = bodies[1]["messages"][1]["content"].as_str().unwrap();
+        assert!(retry_prompt.contains("was cut off"), "{retry_prompt}");
+
+        // The run result built from it is partial, not success.
+        let (synthesis, diagnostics) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        let syn = synthesis.unwrap();
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.starts_with("Synthesis incomplete")));
+        let out = assemble_output(
+            "report".to_string(),
+            &diagnostics,
+            syn.truncated.is_some(),
+            ResultSummary::default(),
+            None,
+            Path::new("/tmp/r.md"),
+        );
+        assert!(!out.success, "a cut-off report must not report success");
+        assert!(out.output.starts_with("Deep search partial"));
+        assert!(out.files_to_send.is_empty());
+
+        let report = build_report(
+            "EU AI Act",
+            Some(&syn),
+            "",
+            &[],
+            &[],
+            Path::new("/tmp"),
+            Path::new("/tmp/r.md"),
+        );
+        assert!(report.contains("**Incomplete:**"), "{report}");
+        assert!(report.contains("_[synthesis cut off here]_"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn mid_sentence_reply_without_length_flag_is_caught_and_retry_can_fix_it() {
+        // Some providers say "stop" even when the text is cut off.
+        let (endpoint, _bodies) = fake_model(vec![
+            model_reply(CUT_OFF, "stop"),
+            model_reply(COMPLETE, "stop"),
+        ]);
+        let cfg = fake_config(&endpoint);
+        let SynthesisOutcome::Done(result) =
+            synthesize(&test_client(), &one_source_input(), Some(&cfg)).await
+        else {
+            panic!("expected a reply");
+        };
+        assert_eq!(result.attempts, 2);
+        assert!(result.truncated.is_none(), "{:?}", result.truncated);
+        assert!(result.synthesis.ends_with("Gaps: fines imposed so far."));
+        assert_eq!(result.uncited_flagged, 0);
+        let (_, diagnostics) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[tokio::test]
+    async fn reasoning_model_with_empty_content_on_length_is_incomplete_not_fallback() {
+        let (endpoint, _bodies) =
+            fake_model(vec![model_reply("", "length"), model_reply("", "length")]);
+        let cfg = fake_config(&endpoint);
+        let SynthesisOutcome::Done(result) =
+            synthesize(&test_client(), &one_source_input(), Some(&cfg)).await
+        else {
+            panic!("an output-limit hit is a cut-off reply, not a missing one");
+        };
+        assert!(result.truncated.is_some());
+    }
+
+    #[tokio::test]
+    async fn uncited_sentences_are_flagged_in_a_complete_reply() {
+        let reply = "## Headline\nVucic resigns\n\n## Confidence\n0.7\n\n## Synthesis\n\
+            Vucic resigned on Friday [1]. The immediate political context is nearly two years of protest.\n\n\
+            Gaps: none";
+        let (endpoint, _bodies) = fake_model(vec![model_reply(reply, "stop")]);
+        let cfg = fake_config(&endpoint);
+        let SynthesisOutcome::Done(result) =
+            synthesize(&test_client(), &one_source_input(), Some(&cfg)).await
+        else {
+            panic!("expected a reply");
+        };
+        assert_eq!(result.attempts, 1);
+        assert!(result.truncated.is_none());
+        assert_eq!(result.uncited_flagged, 1);
+        assert!(result
+            .synthesis
+            .contains("two years of protest. [citation needed]"));
+        let (_, diagnostics) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        assert!(diagnostics[0].contains("[citation needed]"));
+    }
+
+    #[test]
+    fn synthesis_prompt_trims_cjk_sources_by_characters() {
+        // 5000 Han characters (15000 bytes) fit the 6000-character budget
+        // whole; the old 1500-byte cap kept 500 of them.
+        let zh = "台风".repeat(2_500);
+        let input = SynthesisInput {
+            query: "台风",
+            rounds: 1,
+            sources: vec![SynthesisSource {
+                index: 1,
+                url: "https://news.example/zh".to_string(),
+                excerpt: zh.clone(),
+            }],
+        };
+        let prompt = build_synthesis_prompt(&input);
+        assert!(prompt.contains(&zh), "whole CJK source kept");
+        assert!(!prompt.contains("(truncated)"));
+
+        // With 12 sources the total budget is shared: 4000 characters each.
+        assert_eq!(per_source_chars(12), TOTAL_SOURCE_CHARS / 12);
+        assert_eq!(per_source_chars(3), PER_SOURCE_CHARS);
+        let sources = (1..=12)
+            .map(|i| SynthesisSource {
+                index: i,
+                url: format!("https://x{i}"),
+                excerpt: "台".repeat(9_000),
+            })
+            .collect();
+        let prompt = build_synthesis_prompt(&SynthesisInput {
+            query: "台风",
+            rounds: 1,
+            sources,
+        });
+        assert!(prompt.contains(&"台".repeat(4_000)));
+        assert!(!prompt.contains(&"台".repeat(4_001)));
+        assert!(prompt.chars().count() < TOTAL_SOURCE_CHARS + 3_000);
+    }
+
+    #[test]
+    fn system_prompt_requires_citation_on_every_factual_sentence() {
+        assert!(SYNTHESIS_SYSTEM_PROMPT.contains("Every sentence that states a fact"));
+        assert!(SYNTHESIS_SYSTEM_PROMPT.contains(octos_research::text::GAPS_PREFIX));
     }
 }

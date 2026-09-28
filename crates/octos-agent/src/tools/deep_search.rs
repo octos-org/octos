@@ -334,9 +334,8 @@ impl Tool for DeepSearchTool {
                             .unwrap_or_default(),
                     ));
                     output.push_str(&format!("_Full content: {}_\n\n", filepath.display()));
-                    let mut preview = page.content.clone();
-                    octos_core::truncate_utf8(
-                        &mut preview,
+                    let preview = octos_research::text::truncate_chars(
+                        &page.content,
                         INLINE_CHARS_PER_PAGE,
                         "\n... (truncated, use read_file for full content)",
                     );
@@ -529,8 +528,8 @@ async fn read_page(
             eyre::eyre!("{reason}")
         }
     })?;
-    let mut content = page.text;
-    octos_core::truncate_utf8(&mut content, max_chars, "\n... (truncated)");
+    // Characters, not bytes: a byte cap gives CJK pages a third of the room.
+    let content = octos_research::text::truncate_chars(&page.text, max_chars, "\n... (truncated)");
     Ok(PageRead {
         content,
         final_url: page.final_url,

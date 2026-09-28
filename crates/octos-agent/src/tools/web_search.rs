@@ -988,8 +988,9 @@ impl WebSearchTool {
     async fn perplexity_search(&self, query: &str, api_key: &str) -> Result<ToolResult> {
         let body = serde_json::json!({
             "model": "sonar",
-            "messages": [{"role": "user", "content": query}],
-            "max_tokens": 1024
+            "messages": [{"role": "user", "content": query}]
+            // No max_tokens: output size is left to the provider (standing
+            // decision: no hard-coded output caps on model calls).
         });
 
         let response = self
