@@ -2358,11 +2358,26 @@ impl Drop for ProcessGroupKillGuard {
             return;
         }
         let _ = std::process::Command::new("kill")
-            .args(["-9", "--", &format!("-{}", self.pid)])
+            .args(sigkill_process_group_args(self.pid))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// `kill(1)` arguments that SIGKILL the process group `pgid`.
+///
+/// The `--` is load-bearing. procps-ng `kill` (4.0.x, e.g. Ubuntu 24.04) does
+/// not read a bare negative pid after the signal as a pid: `kill -9 -12345`
+/// becomes `kill(-1, SIGKILL)` — only the first digit survives — which
+/// signals EVERY process the user can reach. On a GitHub runner that kills the
+/// runner agent itself ("The hosted runner lost communication with the
+/// server"); on a workstation it kills the user's whole session. Whether it
+/// fires depends on the pid's leading digit, which is why it looked like a
+/// flaky hang. `kill -9 -- -12345` is parsed correctly everywhere.
+#[cfg(unix)]
+fn sigkill_process_group_args(pgid: u32) -> [String; 3] {
+    ["-9".to_string(), "--".to_string(), format!("-{pgid}")]
 }
 
 #[async_trait]
@@ -2935,7 +2950,7 @@ impl Tool for PluginTool {
                     #[cfg(unix)]
                     if child_pid > 0 {
                         let _ = std::process::Command::new("kill")
-                            .args(["-9", &format!("-{child_pid}")])
+                            .args(sigkill_process_group_args(child_pid))
                             .status();
                         let _ = std::process::Command::new("kill")
                             .args(["-9", &child_pid.to_string()])
@@ -3053,7 +3068,7 @@ impl Tool for PluginTool {
                     #[cfg(unix)]
                     if child_pid > 0 {
                         let _ = std::process::Command::new("kill")
-                            .args(["-9", &format!("-{child_pid}")])
+                            .args(sigkill_process_group_args(child_pid))
                             .status();
                         let _ = std::process::Command::new("kill")
                             .args(["-9", &child_pid.to_string()])
