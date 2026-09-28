@@ -487,7 +487,7 @@ jobs:
         if: matrix.variant == 'netns'
         timeout-minutes: 25
         run: |
-          sudo -E unshare --net -- sudo -E -u "$USER" env "PATH=$PATH" "HOME=$HOME" bash -c 'ip link set lo up 2>/dev/null; cargo test -p octos-agent --lib --offline' || true
+          sudo -E unshare --net -- bash -c "ip link set lo up; sudo -E -u $USER env PATH=$PATH HOME=$HOME cargo test -p octos-agent --lib --offline" || true
           echo "netns run finished"
 
   # Split three ways so the PR wait is the slowest third (~25 min), not the
