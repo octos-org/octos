@@ -137,7 +137,7 @@ pub struct PinnedFetch<'a> {
     /// Extra per-host gate run on every hop BEFORE [`check_url`], so a
     /// refused host never triggers DNS or opens a socket (e.g. a fleet
     /// worker's host allowlist). `None` = unrestricted.
-    pub pre_check: Option<&'a dyn Fn(&str) -> Result<(), String>>,
+    pub pre_check: Option<&'a (dyn Fn(&str) -> Result<(), String> + Send + Sync)>,
 }
 
 /// GET `initial_url`, re-validating and DNS-pinning every redirect hop.
