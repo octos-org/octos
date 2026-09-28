@@ -677,7 +677,7 @@ Currently each profile runs as a native OS process on the host. The next evoluti
 
 **Current model** (shell sandbox only):
 ```
-Profile "sales" (host process, PID 1001, uid=yuechen)
+Profile "sales" (host process, PID 1001, uid=alice)
 └── shell("curl api.moonshot.ai") → docker run --rm alpine sh -c "curl ..."
     ↑ only shell commands are containerized
     ↑ profile process itself runs on host with full access

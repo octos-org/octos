@@ -244,7 +244,9 @@ Options:
   --no-tunnel        Skip frpc tunnel setup even in --full mode
   --tenant-name NAME Tenant subdomain (e.g. "alice")
   --frps-token TOKEN shared frps auth token
-  --frps-server ADDR frps server address (recommend a DNS-only host such as frps.example.com)
+  --frps-server ADDR frps relay server address (required for the tunnel, no default;
+                     e.g. a DNS-only host such as frps.example.com. Also FRPS_SERVER.
+                     Without it, tunnel setup is skipped)
   --ssh-port PORT    SSH tunnel remote port (default: 6001)
   --domain DOMAIN    Tunnel domain (default: octos-cloud.org)
   --auth-token TOKEN Dashboard auth token (default: auto-generated)

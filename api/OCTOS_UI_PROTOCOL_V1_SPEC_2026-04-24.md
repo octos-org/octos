@@ -8,7 +8,7 @@ This is the first protocol document for the M9 control-plane layer. It is intent
 
 Code sketch:
 
-- draft Rust types live in [crates/octos-core/src/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
+- draft Rust types live in [crates/octos-core/src/ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs)
 
 Related planning:
 
@@ -155,7 +155,7 @@ Process:
 
 Executable contract gate:
 
-- [crates/octos-core/src/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
+- [crates/octos-core/src/ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs)
   contains literal golden tests for the v1 protocol identifier, schema
   versions, JSON-RPC version, command method set, notification method set, and
   representative wire payloads.
@@ -342,7 +342,7 @@ These ids need to be stable and client-visible:
 - `event_cursor`
   A resumable position in the ordered protocol event stream.
 
-Current draft Rust types for `turn_id`, `approval_id`, `preview_id`, `output_cursor`, and `event_cursor` live in [ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1).
+Current draft Rust types for `turn_id`, `approval_id`, `preview_id`, `output_cursor`, and `event_cursor` live in [ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs).
 
 ### 5.1 M9-γ projection identity (UPCR-2026-014)
 
@@ -2837,9 +2837,9 @@ Field contract:
 - `topic` (`string`, optional) — Topic suffix for topic-scoped routing.
   Omitted when the envelope is not topic-scoped.
 
-Rust source: [`Envelope`](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
+Rust source: [`Envelope`](../crates/octos-core/src/ui_protocol.rs)
 in `octos-core::ui_protocol`. TS source: `Envelope` in
-[`crates/octos-web/src/runtime/ui-protocol-types.ts`](/Users/yuechen/home/octos/crates/octos-web/src/runtime/ui-protocol-types.ts:1).
+[`crates/octos-web/src/runtime/ui-protocol-types.ts`](../crates/octos-web/src/runtime/ui-protocol-types.ts).
 
 ### 14.2 Payload (sealed tagged union)
 

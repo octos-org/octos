@@ -1,6 +1,6 @@
 [book]
 title = "Octos Documentation"
-authors = ["Yue Chen"]
+authors = ["octos contributors"]
 language = "en"
 src = "src"
 

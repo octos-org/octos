@@ -33,12 +33,12 @@
  * bot, octos, ocean).
  *
  * Run:
- *   cd /Users/yuechen/home/octos/e2e
+ *   cd ~/home/octos/e2e
  *   OCTOS_AUTH_TOKEN=octos-admin-2026 OCTOS_PROFILE=dspfac \
  *     npx playwright test tests/round12-fleet-slides-validation.spec.ts \
  *     --reporter=json --workers=4
  *
- * SSH disk-check requires key-based SSH to cloud@69.194.3.{128,129,203,19}
+ * SSH disk-check requires key-based SSH to cloud@<mini1,2,3,5 addresses>
  * (see fleet-host-keys table in MEMORY). Failures degrade gracefully —
  * `pptxOnDisk: null`, `diskErr: <stderr>` — so a broken SSH never
  * blocks the test run.
@@ -65,33 +65,46 @@ interface HostTrial {
   sshHost: string;
 }
 
-// IP/SSH mapping mirrors HOST_MAP in m8-runtime-invariants-live.spec.ts and
-// scripts/register-fleet-voices.sh. river/.66 uses key auth; the rest use
+// SSH targets come from OCTOS_FLEET_SSH_MAP (same format as in
+// m8-runtime-invariants-live.spec.ts). river uses key auth; the rest use
 // the project SSH config (~/.ssh/config) and ControlMaster.
+// SSH targets per fleet host come from the environment so no host
+// addresses live in the repo, e.g.
+//   OCTOS_FLEET_SSH_MAP='dspfac.crew.ominix.io=cloud@<host>,dspfac.bot.ominix.io=cloud@<host>'
+const SSH_MAP: Record<string, string> = Object.fromEntries(
+  (process.env.OCTOS_FLEET_SSH_MAP || '')
+    .split(',')
+    .map((pair): [string, string] => {
+      const [k = '', v = ''] = pair.trim().split('=');
+      return [k, v];
+    })
+    .filter(([k, v]) => k !== '' && v !== ''),
+);
+
 const HOSTS: HostTrial[] = [
   {
     short: 'crew',
     host: 'crew.ominix.io',
     baseUrl: 'https://dspfac.crew.ominix.io',
-    sshHost: 'cloud@69.194.3.128',
+    sshHost: SSH_MAP['dspfac.crew.ominix.io'] || '',
   },
   {
     short: 'bot',
     host: 'bot.ominix.io',
     baseUrl: 'https://dspfac.bot.ominix.io',
-    sshHost: 'cloud@69.194.3.129',
+    sshHost: SSH_MAP['dspfac.bot.ominix.io'] || '',
   },
   {
     short: 'octos',
     host: 'octos.ominix.io',
     baseUrl: 'https://dspfac.octos.ominix.io',
-    sshHost: 'cloud@69.194.3.203',
+    sshHost: SSH_MAP['dspfac.octos.ominix.io'] || '',
   },
   {
     short: 'ocean',
     host: 'ocean.ominix.io',
     baseUrl: 'https://dspfac.ocean.ominix.io',
-    sshHost: 'cloud@69.194.3.19',
+    sshHost: SSH_MAP['dspfac.ocean.ominix.io'] || '',
   },
 ];
 

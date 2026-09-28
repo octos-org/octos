@@ -23,7 +23,9 @@
 #     --tenant-name NAME     Tenant subdomain (e.g. "alice") for public access
 #     --frps-token TOKEN     per-tenant tunnel token (goes in metadatas.token)
 #     --frps-token-file FILE Read per-tenant tunnel token from FILE
-#     --frps-server ADDR     frps server address (default: 163.192.33.32)
+#     --frps-server ADDR     frps relay server address (required for the tunnel;
+#                            or set FRPS_SERVER). No default: without it the
+#                            tunnel setup is skipped.
 #     --ssh-port PORT        SSH tunnel remote port (default: 6001)
 #     --domain DOMAIN        Tunnel domain (default: octos-cloud.org)
 
@@ -39,7 +41,7 @@ FRPC_VERSION="0.65.0"
 TENANT_NAME=""
 FRPS_TOKEN="${FRPS_TOKEN:-}"
 FRPS_TOKEN_FILE=""
-FRPS_SERVER="163.192.33.32"
+FRPS_SERVER="${FRPS_SERVER:-}"
 SSH_PORT="6001"
 AUTH_TOKEN=""
 TUNNEL_DOMAIN="octos-cloud.org"
@@ -100,7 +102,8 @@ Optional tunnel (frpc):
   --tenant-name NAME       Tenant subdomain (e.g. "alice") for public access
   --frps-token TOKEN       per-tenant tunnel token (goes in metadatas.token)
   --frps-token-file FILE   Read per-tenant tunnel token from FILE
-  --frps-server ADDR       frps server address (default: 163.192.33.32)
+  --frps-server ADDR       frps relay server address (required for the tunnel;
+                           or set FRPS_SERVER). Without it, tunnel setup is skipped.
   --ssh-port PORT          SSH tunnel remote port (default: 6001)
   --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
 HELPEOF
@@ -209,6 +212,13 @@ validate() {
         echo "       Must match: $pattern"
         exit 1
     fi
+}
+
+# Explain how to supply the tunnel relay server when none was given.
+frps_server_missing() {
+    warn "no tunnel relay (frps) server configured — skipping tunnel setup"
+    hint "Pass --frps-server <host> or set FRPS_SERVER=<host>, using the relay"
+    hint "address from your tenant setup command, then re-run with --tunnel."
 }
 
 # Validate all non-empty user-controlled values that get embedded in config files.
@@ -1355,9 +1365,9 @@ if [ -f "$PREFIX/octos" ] && [ "$ENABLE_TUNNEL" = true ]; then
                 ok "per-tenant tunnel token from existing config: ${FRPS_TOKEN:0:8}..."
             fi
         fi
-        if [ "$FRPS_SERVER" = "163.192.33.32" ]; then
+        if [ -z "$FRPS_SERVER" ]; then
             EXISTING_FRPS_SERVER=$(grep 'serverAddr' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*= *"\(.*\)"/\1/')
-            if [ -n "$EXISTING_FRPS_SERVER" ] && [ "$EXISTING_FRPS_SERVER" != "163.192.33.32" ]; then
+            if [ -n "$EXISTING_FRPS_SERVER" ]; then
                 FRPS_SERVER="$EXISTING_FRPS_SERVER"
                 ok "frps server from existing config: $FRPS_SERVER"
             fi
@@ -1369,6 +1379,13 @@ if [ -f "$PREFIX/octos" ] && [ "$ENABLE_TUNNEL" = true ]; then
                 ok "ssh port from existing config: $SSH_PORT"
             fi
         fi
+    fi
+
+    # No relay server from flags, env, or existing config: there is no
+    # built-in default, so stop here instead of guessing one.
+    if [ -z "$FRPS_SERVER" ]; then
+        frps_server_missing
+        exit 1
     fi
 
     # Still missing? Prompt interactively
@@ -1431,6 +1448,13 @@ fi
 # ══════════════════════════════════════════════════════════════════════
 # ── Install mode (default) ───────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════
+
+# The tunnel needs an explicit relay server; there is no built-in default.
+# Without one, install everything else and skip the tunnel.
+if [ "$ENABLE_TUNNEL" = true ] && [ -z "$FRPS_SERVER" ]; then
+    frps_server_missing
+    ENABLE_TUNNEL=false
+fi
 
 # ── Detect platform ──────────────────────────────────────────────────
 section "Detecting platform"

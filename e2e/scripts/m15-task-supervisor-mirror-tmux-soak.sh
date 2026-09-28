@@ -5,7 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 
 run_id="${OCTOS_M15_TASK_MIRROR_TMUX_RUN_ID:-m15-task-mirror-tmux-$(date -u +%Y%m%dT%H%M%SZ)}"
-tui_repo="${OCTOSCODE_REPO:-/Users/yuechen/home/octoscode}"
+tui_repo="${OCTOSCODE_REPO:-$(dirname "$repo_root")/octoscode}"
 tui_runner="${OCTOS_M15_TASK_MIRROR_TUI_RUNNER:-$tui_repo/scripts/run-m15-live-tmux-ux-soak.sh}"
 out_root="${OCTOS_M15_TASK_MIRROR_TMUX_OUT_ROOT:-$repo_root/e2e/test-results-m15-task-supervisor-mirror-tmux}"
 out_dir="${OCTOS_M15_TASK_MIRROR_TMUX_OUT_DIR:-$out_root/$run_id}"
@@ -27,7 +27,7 @@ Runs a real tmux visual soak proving that octoscode can display a backend
 TaskSupervisor task mirrored into the AppUI agent lifecycle over stdio.
 
 Environment:
-  OCTOSCODE_REPO                         Path to octoscode checkout. Default: /Users/yuechen/home/octoscode.
+  OCTOSCODE_REPO                         Path to octoscode checkout. Default: an octoscode checkout next to this repo.
   OCTOS_BIN                              octos binary. Default: octos/target/debug/octos.
   OCTOSCODE_BIN                          octoscode binary. Default: octoscode/target/debug/octoscode.
   OCTOS_M15_TASK_MIRROR_BUILD            Set 0 to skip building octos. Default: 1.

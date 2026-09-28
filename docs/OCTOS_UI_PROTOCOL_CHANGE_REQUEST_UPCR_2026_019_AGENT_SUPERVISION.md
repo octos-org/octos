@@ -221,13 +221,13 @@ Implementation note, 2026-05-16:
   deterministic task-output fixture and verified `agent/updated`,
   `agent/list`, `agent/status/read`, and `task/output/read`.
   Evidence:
-  `/Users/yuechen/home/octos/e2e/test-results-m15-task-supervisor-mirror-stdio/20260516T224154Z`
+  `~/home/octos/e2e/test-results-m15-task-supervisor-mirror-stdio/20260516T224154Z`
 - Real tmux evidence now covers the same ordinary `TaskSupervisor` mirror path
   through `octoscode` against real `octos serve --stdio`:
   `e2e/scripts/m15-task-supervisor-mirror-tmux-soak.sh run` passed after fixing
   octoscode to render the backend-provided agent summary/last-task detail in
   the visible activity row. Evidence:
-  `/Users/yuechen/home/octos/e2e/test-results-m15-task-supervisor-mirror-tmux/m15-task-mirror-tmux-20260516T224202Z`
+  `~/home/octos/e2e/test-results-m15-task-supervisor-mirror-tmux/m15-task-mirror-tmux-20260516T224202Z`
 
 ## Artifact Methods
 

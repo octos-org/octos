@@ -247,14 +247,14 @@ out-of-band; they are not committed to the repo.
 
 | Mini | IP | Domain | Daemon | Color | E2E target? |
 |---|---|---|---|---|---|
-| mini1 | `69.194.3.128` | `dspfac.crew.ominix.io` | root LaunchDaemon `/Library/LaunchDaemons/io.octos.serve.plist` | yellow | ✅ safe |
-| mini2 | `69.194.3.129` | `dspfac.bot.ominix.io` | root LaunchDaemon | yellow | ⚠️ check with maintainer first (separate auth setup) |
-| mini3 | `69.194.3.203` | `dspfac.octos.ominix.io` | **USER agent** at `~/Library/LaunchAgents/io.ominix.octos-serve.plist` on port 50080 — root daemon `io.octos.serve` is in pre-existing crash-loop on port 8080, leave it alone | yellow | ✅ safe |
-| mini4 | `69.194.3.66` | `dspfac.river.ominix.io` | root LaunchDaemon | blue (intentional baseline / rollback target) | ✅ safe |
-| mini5 | `69.194.3.19` | `dspfac.ocean.ominix.io` | root LaunchDaemon | yellow | ❌ **DO NOT SOAK** — reserved for active sprint work; active deploys will break your run |
-| mini6 | `69.194.3.249` | (varies — check `~/octos-web` symlink target) | check both root + user daemon | (newer host, profile TBD) | check with maintainer |
+| mini1 | `<mini1-ip>` | `dspfac.crew.ominix.io` | root LaunchDaemon `/Library/LaunchDaemons/io.octos.serve.plist` | yellow | ✅ safe |
+| mini2 | `<mini2-ip>` | `dspfac.bot.ominix.io` | root LaunchDaemon | yellow | ⚠️ check with maintainer first (separate auth setup) |
+| mini3 | `<mini3-ip>` | `dspfac.octos.ominix.io` | **USER agent** at `~/Library/LaunchAgents/io.ominix.octos-serve.plist` on port 50080 — root daemon `io.octos.serve` is in pre-existing crash-loop on port 8080, leave it alone | yellow | ✅ safe |
+| mini4 | `<mini4-ip>` | `dspfac.river.ominix.io` | root LaunchDaemon | blue (intentional baseline / rollback target) | ✅ safe |
+| mini5 | `<mini5-ip>` | `dspfac.ocean.ominix.io` | root LaunchDaemon | yellow | ❌ **DO NOT SOAK** — reserved for active sprint work; active deploys will break your run |
+| mini6 | `<mini6-ip>` | (varies — check `~/octos-web` symlink target) | check both root + user daemon | (newer host, profile TBD) | check with maintainer |
 
-**Excluded — do NOT touch**: `cloud@66.201.40.31` (`macmini-31.octos.bot`).
+**Excluded — do NOT touch**: `cloud@<excluded-host-ip>` (`macmini-31.octos.bot`).
 Earlier deploy scripts had it as "mini4"; the river.ominix.io box
 replaced it. It's a separate dev/test box.
 

@@ -13974,7 +13974,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
         title: "Approve shell command".into(),
         body: "Command:\ncargo test".into(),
         command: Some("cargo test".into()),
-        cwd: Some("/Users/yuechen/home/octos".into()),
+        cwd: Some("/workspace/octos".into()),
     };
     let session_id = SessionKey("local:test".into());
     let approval_id = ApprovalId::new();
@@ -14040,7 +14040,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
         .and_then(|details| details.command.as_ref())
         .expect("typed command details");
     assert_eq!(command.command_line.as_deref(), Some("cargo test"));
-    assert_eq!(command.cwd.as_deref(), Some("/Users/yuechen/home/octos"));
+    assert_eq!(command.cwd.as_deref(), Some("/workspace/octos"));
     assert_eq!(command.tool_call_id.as_deref(), Some("tool-1"));
     clear_tool_risk_registry_for_test();
 }

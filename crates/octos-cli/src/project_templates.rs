@@ -279,7 +279,7 @@ fn site_preset_from_topic(session_topic: &str) -> Option<SitePreset> {
             site_name: "Physics Learning Studio",
             description: "Lesson-driven math and physics site with chapter pages, diagrams, and explanatory notes.",
             accent: "#2563eb",
-            reference: "/Users/yuechen/home/sophie/3b1b-calculus",
+            reference: "3b1b-calculus",
             reference_label: "3b1b-calculus",
         },
         "astro" | "docs" | "documentation" | "guide" => SitePreset {
@@ -289,7 +289,7 @@ fn site_preset_from_topic(session_topic: &str) -> Option<SitePreset> {
             site_name: "Signal Atlas",
             description: "Structured content site for guides, onboarding, changelogs, and reference pages.",
             accent: "#d97706",
-            reference: "/Users/yuechen/home/origin2025",
+            reference: "origin2025",
             reference_label: "origin2025",
         },
         "next" | "nextjs" | "app" | "product" | "event" => SitePreset {
@@ -299,7 +299,7 @@ fn site_preset_from_topic(session_topic: &str) -> Option<SitePreset> {
             site_name: "Vision Forum",
             description: "App-like landing shell for events, products, and structured call-to-action flows.",
             accent: "#0f766e",
-            reference: "/Users/yuechen/home/ai-vision-forum-paris-2026",
+            reference: "ai-vision-forum-paris-2026",
             reference_label: "ai-vision-forum-paris-2026",
         },
         "react" | "vite" | "prototype" | "tool" => SitePreset {
@@ -309,7 +309,7 @@ fn site_preset_from_topic(session_topic: &str) -> Option<SitePreset> {
             site_name: "React Lab",
             description: "Lean React/Vite shell for prototypes, interface experiments, and lightweight tools.",
             accent: "#be123c",
-            reference: "/Users/yuechen/home/adora-website",
+            reference: "adora-website",
             reference_label: "adora-website",
         },
         _ => SitePreset {
@@ -319,7 +319,7 @@ fn site_preset_from_topic(session_topic: &str) -> Option<SitePreset> {
             site_name: "Physics Learning Studio",
             description: "Lesson-driven math and physics site with chapter pages, diagrams, and explanatory notes.",
             accent: "#2563eb",
-            reference: "/Users/yuechen/home/sophie/3b1b-calculus",
+            reference: "3b1b-calculus",
             reference_label: "3b1b-calculus",
         },
     };

@@ -2,7 +2,7 @@
 
 - **Status**: Proposed
 - **Date**: 2026-05-28
-- **Driver**: ychen@futurewei.com
+- **Driver**: @ymote
 - **Related**: PR #1015 (run_pipeline pre-flight), PR #1323 (mofa_slides style pre-flight), PR #1324 (L3 post-spawn failure feedback), PR #1348 (L3 WS-path wiring), PR #1342/PR-F (skill card refactor)
 
 ## Context

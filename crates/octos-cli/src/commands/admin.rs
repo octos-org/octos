@@ -34,8 +34,9 @@ pub enum AdminAction {
         /// Base domain for the tunnel (default: octos-cloud.org).
         #[arg(long, default_value = "octos-cloud.org")]
         domain: String,
-        /// frps server address (VPS IP or hostname).
-        #[arg(long, default_value = "163.192.33.32")]
+        /// frps relay server address (IP or hostname). Required: there is
+        /// no built-in default relay.
+        #[arg(long)]
         server: String,
         /// frps control port.
         #[arg(long, default_value = "7000")]
@@ -72,8 +73,9 @@ pub enum AdminAction {
         /// Base domain for the tunnel.
         #[arg(long, default_value = "octos-cloud.org")]
         domain: String,
-        /// frps server address.
-        #[arg(long, default_value = "163.192.33.32")]
+        /// frps relay server address. Required: there is no built-in
+        /// default relay.
+        #[arg(long)]
         server: String,
         /// frps control port.
         #[arg(long, default_value = "7000")]

@@ -291,7 +291,7 @@ async fn should_accept_review_decision_and_emit_typed_event() {
     let review = json!({
         "schema_version": 1,
         "accepted": true,
-        "reviewer": "ychen@futurewei.com",
+        "reviewer": "reviewer@example.com",
         "notes": "LGTM — reviewed aggregate output",
     });
     let review_body = serde_json::to_string(&review).unwrap();
@@ -310,7 +310,7 @@ async fn should_accept_review_decision_and_emit_typed_event() {
     assert_eq!(review_resp.status(), StatusCode::OK);
     let parsed: SwarmReviewResponse = read_json(review_resp).await;
     assert!(parsed.accepted);
-    assert_eq!(parsed.reviewer, "ychen@futurewei.com");
+    assert_eq!(parsed.reviewer, "reviewer@example.com");
 
     // Confirm the typed event made it to the broadcaster. We expect a
     // JSON frame with `kind == "swarm_review_decision"` and the same
@@ -333,7 +333,7 @@ async fn should_accept_review_decision_and_emit_typed_event() {
     assert_eq!(parsed.get("accepted").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(
         parsed.get("reviewer").and_then(|v| v.as_str()),
-        Some("ychen@futurewei.com")
+        Some("reviewer@example.com")
     );
 
     // Follow-up: list the dispatch and verify review_accepted was
@@ -367,7 +367,7 @@ async fn should_reject_review_for_unknown_dispatch() {
     let review = SwarmReviewRequest {
         schema_version: 1,
         accepted: false,
-        reviewer: "ychen@futurewei.com".into(),
+        reviewer: "reviewer@example.com".into(),
         notes: None,
     };
     let body = serde_json::to_string(&review).unwrap();

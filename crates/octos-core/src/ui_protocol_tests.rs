@@ -1487,7 +1487,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
         ApprovalCommandDetails {
             argv: vec!["cargo".into(), "test".into()],
             command_line: Some("cargo test".into()),
-            cwd: Some("/Users/yuechen/home/octos".into()),
+            cwd: Some("/workspace/octos".into()),
             env_keys: vec!["RUST_LOG".into()],
             tool_call_id: Some("tool-1".into()),
         },
@@ -1495,7 +1495,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
             mode: Some("workspace_write".into()),
             filesystem_access: Some("workspace_write".into()),
             network_access: Some(false),
-            writable_roots: vec!["/Users/yuechen/home/octos".into()],
+            writable_roots: vec!["/workspace/octos".into()],
         }),
     );
     assert_typed_approval_round_trips(
@@ -1554,7 +1554,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
                     operation: "write".into(),
                     paths: vec!["docs/example.md".into()],
                     outside_workspace: false,
-                    writable_roots: vec!["/Users/yuechen/home/octos".into()],
+                    writable_roots: vec!["/workspace/octos".into()],
                 }),
                 network: None,
                 sandbox_escalation: None,

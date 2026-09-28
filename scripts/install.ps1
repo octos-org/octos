@@ -95,7 +95,8 @@ OPTIONAL TUNNEL (frpc)
   -TenantName <name>     Tenant subdomain (e.g. "alice") for public access
   -FrpsToken <token>     per-tenant tunnel token (goes in metadatas.token)
   -FrpsTokenFile <file>  Read per-tenant tunnel token from file
-  -FrpsServer <addr>     frps server address (default: 163.192.33.32)
+  -FrpsServer <addr>     frps relay server address (required for the tunnel;
+                         or set FRPS_SERVER). Without it, tunnel setup is skipped.
   -SshPort <port>        SSH tunnel remote port (default: 6001)
   -TunnelDomain <domain> Tunnel domain (default: octos-cloud.org)
 
@@ -105,6 +106,7 @@ ENVIRONMENT VARIABLES
   OCTOS_HOME         Data directory override (default: ~\.octos)
   OCTOS_AUTH_TOKEN   Auth token override
   OCTOS_DOWNLOAD_URL Local/self-hosted download directory
+  FRPS_SERVER        Tunnel relay (frps) server address (no default)
 "@
     exit 0
 }
@@ -119,7 +121,9 @@ $DataDir = if ($env:OCTOS_HOME) { $env:OCTOS_HOME } else { Join-Path $HOME ".oct
 
 # -- Tunnel defaults --------------------------------------------------
 $FrpcVersion = "0.65.0"
-if (-not $FrpsServer)   { $FrpsServer   = "163.192.33.32" }
+# No built-in relay server: it must come from -FrpsServer, $env:FRPS_SERVER,
+# or an existing frpc config. Without one the tunnel setup is skipped.
+if (-not $FrpsServer -and $env:FRPS_SERVER) { $FrpsServer = $env:FRPS_SERVER }
 if ($SshPort -eq 0)     { $SshPort      = 6001 }
 if (-not $TunnelDomain) { $TunnelDomain = "octos-cloud.org" }
 
@@ -147,6 +151,11 @@ function Section($msg) { Write-Host "`n==> $msg" }
 function Ok($msg)      { Write-Host "    OK: $msg" }
 function Warn($msg)    { Write-Host "    WARN: $msg" -ForegroundColor Yellow }
 function Hint($msg)    { Write-Host "          -> $msg" }
+function Show-FrpsServerMissing {
+    Warn "no tunnel relay (frps) server configured - skipping tunnel setup"
+    Hint "Pass -FrpsServer <host> or set `$env:FRPS_SERVER, using the relay"
+    Hint "address from your tenant setup command, then re-run with -Tunnel."
+}
 function Err($msg) {
     if ($Doctor) {
         Write-Host "    FAIL: $msg" -ForegroundColor Red
@@ -436,9 +445,9 @@ if ((Test-Path $octosBinCheck) -and $Tunnel) {
             $FrpsToken = $Matches[1]
             Ok "per-tenant tunnel token from existing config: $($FrpsToken.Substring(0, [Math]::Min(8, $FrpsToken.Length)))..."
         }
-        if ($FrpsServer -eq "163.192.33.32" -and $existingConfig -match 'serverAddr\s*=\s*"([^"]+)"') {
+        if (-not $FrpsServer -and $existingConfig -match 'serverAddr\s*=\s*"([^"]+)"') {
             $existingFrpsServer = $Matches[1]
-            if ($existingFrpsServer -and $existingFrpsServer -ne "163.192.33.32") {
+            if ($existingFrpsServer) {
                 $FrpsServer = $existingFrpsServer
                 Ok "frps server from existing config: $FrpsServer"
             }
@@ -450,6 +459,12 @@ if ((Test-Path $octosBinCheck) -and $Tunnel) {
                 Ok "ssh port from existing config: $SshPort"
             }
         }
+    }
+
+    # No relay server from flags, env, or existing config: stop instead of guessing.
+    if (-not $FrpsServer) {
+        Show-FrpsServerMissing
+        exit 1
     }
 
     # Prompt for anything still missing
@@ -484,6 +499,13 @@ if ((Test-Path $octosBinCheck) -and $Tunnel) {
     Write-Host "    Tunnel: https://${TenantName}.${TunnelDomain}"
     Write-Host ""
     exit 0
+}
+
+# The tunnel needs an explicit relay server; there is no built-in default.
+# Without one, install everything else and skip the tunnel.
+if ($Tunnel -and -not $FrpsServer) {
+    Show-FrpsServerMissing
+    $Tunnel = [switch]::new($false)
 }
 
 # ======================================================================

@@ -188,7 +188,7 @@ impl Tool for RecallMemoryTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Entity name (e.g. 'octos', 'yuechen'), or 'MEMORY' for the full long-term registry"
+                    "description": "Entity name (e.g. 'octos', 'alice'), or 'MEMORY' for the full long-term registry"
                 },
                 "query": {
                     "type": "string",
@@ -458,7 +458,7 @@ mod tests {
                 "{name:?} should be a registry alias"
             );
         }
-        for name in ["octos", "yuechen", "memories", "mem"] {
+        for name in ["octos", "alice", "memories", "mem"] {
             assert!(
                 !octos_memory::is_reserved_memory_name(name),
                 "{name:?} is a bank entity, not the registry"

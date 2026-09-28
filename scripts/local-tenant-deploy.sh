@@ -17,7 +17,8 @@
 #   --no-tunnel              Skip frpc tunnel setup even in --full mode
 #   --tenant-name NAME       Tenant subdomain (e.g. "alice")
 #   --frps-token TOKEN       per-tenant tunnel token (written to metadatas.token; issued by your cloud operator)
-#   --frps-server ADDR       frps server address (default: 163.192.33.32)
+#   --frps-server ADDR       frps relay server address (required for the tunnel;
+#                            or set FRPS_SERVER; without it the tunnel is skipped)
 #   --ssh-port PORT          SSH tunnel remote port (default: 6001)
 #   --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
 #   --auth-token TOKEN       Dashboard auth token (default: auto-generated)
@@ -41,7 +42,7 @@ DATA_DIR="${OCTOS_HOME:-$HOME/.octos}"
 SKIP_TUNNEL=false
 TENANT_NAME=""
 FRPS_TOKEN=""
-FRPS_SERVER="163.192.33.32"
+FRPS_SERVER="${FRPS_SERVER:-}"
 SSH_PORT="6001"
 AUTH_TOKEN=""
 TUNNEL_DOMAIN="octos-cloud.org"
@@ -65,7 +66,7 @@ while [ $# -gt 0 ]; do
         --auth-token)    AUTH_TOKEN="$2"; shift 2 ;;
         --domain)        TUNNEL_DOMAIN="$2"; shift 2 ;;
         --help|-h)
-            sed -n '2,26s/^# //p' "$0"
+            sed -n '2,27s/^# //p' "$0"
             exit 0
             ;;
         *)
@@ -178,7 +179,8 @@ data.setdefault("api_key_env", api_key_env)
 data["mode"] = mode
 if mode == "tenant":
     data["tunnel_domain"] = tunnel_domain
-    data["frps_server"] = frps_server
+    if frps_server:
+        data["frps_server"] = frps_server
 else:
     data.pop("tunnel_domain", None)
     data.pop("frps_server", None)
@@ -602,6 +604,11 @@ else
 fi
 
 # ── Tunnel setup (optional) ───────────────────────────────────────────
+if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ] && [ -z "$FRPS_SERVER" ]; then
+    echo "    WARN: no tunnel relay (frps) server configured — skipping tunnel setup"
+    echo "          -> Pass --frps-server <host> or set FRPS_SERVER=<host>, then re-run."
+    SKIP_TUNNEL=true
+fi
 if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; then
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 

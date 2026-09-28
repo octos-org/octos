@@ -33,7 +33,7 @@ From the octos repo:
 
 Useful overrides:
 
-  OCTOSCODE_REPO=/Users/yuechen/home/octoscode \
+  OCTOSCODE_REPO=~/home/octoscode \
   OCTOS_M16_UX_RUN_ID=m16-local \
   bash e2e/scripts/m16-live-tui-tmux-soak.sh run
 
@@ -84,7 +84,7 @@ The M16 validator asserts:
 
 Latest passing evidence
 
-  /Users/yuechen/home/octos/e2e/test-results-m16-tmux-ux/m16-context-promote-20260516T203002Z
+  ~/home/octos/e2e/test-results-m16-tmux-ux/m16-context-promote-20260516T203002Z
 
 Validator status:
 

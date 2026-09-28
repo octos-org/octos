@@ -4582,6 +4582,21 @@ pub async fn delete_tenant(
     }))
 }
 
+/// The tunnel relay (frps) address this node hands out in setup scripts.
+/// There is no built-in default: it must be set as `frps_server` in the
+/// node config, otherwise tenant setup is refused with a clear error.
+fn required_frps_server(state: &AppState) -> Result<&str, (StatusCode, String)> {
+    state
+        .frps_server
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tunnel relay not configured: set `frps_server` in this node's config".into(),
+        ))
+}
+
 /// GET /api/admin/tenants/{id}/setup-script — returns a bash one-liner that
 /// installs octos + frpc on a fresh Mac Mini.
 pub async fn tenant_setup_script(
@@ -4598,7 +4613,7 @@ pub async fn tenant_setup_script(
         .ok_or((StatusCode::NOT_FOUND, format!("tenant '{id}' not found")))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_admin_tenant_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -4718,6 +4733,9 @@ pub async fn register_tenant(
         ));
     }
 
+    // Fail before creating the tenant if this node has no tunnel relay.
+    let server = required_frps_server(&state)?;
+
     let ssh_port = store
         .next_ssh_port()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -4746,7 +4764,6 @@ pub async fn register_tenant(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
     let dashboard_url = format!("https://{}.{}", tenant.subdomain, domain);
 
     let mut email_sent = false;
@@ -4855,7 +4872,7 @@ pub async fn register_setup_script(
     ))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_register_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -4886,7 +4903,7 @@ pub async fn register_setup_script_public(
     }
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_register_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -5023,7 +5040,7 @@ mod register_setup_script_tests {
             updated_at: Utc::now(),
         };
 
-        let script = build_register_setup_script(&tenant, "octos-cloud.org", "163.192.33.32");
+        let script = build_register_setup_script(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert!(script.contains("managed tenant bootstrap"));
         assert!(script.contains("--tunnel"));
@@ -5032,7 +5049,7 @@ mod register_setup_script_tests {
         assert!(script.contains("--frps-token \"per-tenant-uuid\""));
         assert!(script.contains("--ssh-port 6001"));
         assert!(script.contains("--domain \"octos-cloud.org\""));
-        assert!(script.contains("--frps-server \"163.192.33.32\""));
+        assert!(script.contains("--frps-server \"relay.example.com\""));
         assert!(!script.contains("$FRPS_TOKEN"));
     }
 
@@ -5053,7 +5070,7 @@ mod register_setup_script_tests {
         };
 
         let (_subject, html) =
-            build_register_setup_email(&tenant, "octos-cloud.org", "163.192.33.32");
+            build_register_setup_email(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert!(html.contains("/api/register/setup-script/alice/"));
         assert!(html.contains("install.ps1"));
@@ -5081,7 +5098,7 @@ mod register_setup_script_tests {
 
         let unix_command = build_register_setup_command_unix(&tenant, "octos-cloud.org");
         let windows_command =
-            build_register_setup_command_windows(&tenant, "octos-cloud.org", "163.192.33.32");
+            build_register_setup_command_windows(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert_eq!(
             unix_command,
@@ -5117,7 +5134,7 @@ mod register_tenant_email_tests {
             )),
             tunnel_domain: Some("octos-cloud.org".into()),
             base_domain: None,
-            frps_server: Some("163.192.33.32".into()),
+            frps_server: Some("relay.example.com".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,
             ..AppState::empty_for_tests()
@@ -5255,7 +5272,7 @@ mod register_flow_tests {
             )),
             tunnel_domain: Some("octos-cloud.org".into()),
             base_domain: None,
-            frps_server: Some("163.192.33.32".into()),
+            frps_server: Some("relay.example.com".into()),
             frps_port: Some(7000),
             deployment_mode: mode,
             ..AppState::empty_for_tests()
@@ -5540,7 +5557,7 @@ mod register_flow_tests {
 
         assert!(script.contains("--tenant-name \"macmini\""));
         assert!(script.contains("--domain \"octos-cloud.org\""));
-        assert!(script.contains("--frps-server \"163.192.33.32\""));
+        assert!(script.contains("--frps-server \"relay.example.com\""));
         assert!(script.contains("--ssh-port"));
         assert!(
             script.contains(&format!("--frps-token \"{saved_tunnel_token}\"")),

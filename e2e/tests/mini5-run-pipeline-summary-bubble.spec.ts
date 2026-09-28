@@ -14,7 +14,7 @@
  *   - capturing the result bubble's text content, files, and timing.
  *
  * Run:
- *   cd /Users/yuechen/home/octos/e2e
+ *   cd ~/home/octos/e2e
  *   OCTOS_TEST_URL=https://dspfac.ocean.ominix.io \
  *   OCTOS_AUTH_TOKEN=octos-admin-2026 \
  *   OCTOS_PROFILE=dspfac \
