@@ -1,0 +1,37 @@
+{
+  "body_file": "general_synthetic.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": "2026-09-20T10:00:00Z",
+      "source": "GitHub",
+      "title": "octos: a Rust-native agentic OS",
+      "url": "https://github.com/octos-org/octos"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "octos-org.github.io",
+      "title": "octos documentation",
+      "url": "https://octos-org.github.io/octos"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/json"
+    },
+    "method": "GET",
+    "url": "https://api.search.brave.com/res/v1/web/search?q=octos+agent&count=5&offset=0&search_lang=en"
+  },
+  "recorded": "synthetic body, shaped after the documented web search response (needs a key)",
+  "request": {
+    "category": "general",
+    "count": 5,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-27T22:00:00Z",
+    "query": "octos agent",
+    "since": null
+  }
+}

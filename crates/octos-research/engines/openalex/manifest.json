@@ -1,0 +1,18 @@
+{
+  "id": "openalex",
+  "name": "OpenAlex",
+  "categories": ["science"],
+  "languages": ["*"],
+  "hosts": ["api.openalex.org"],
+  "auth": {"query": {"name": "api_key"}},
+  "key_env": "OPENALEX_API_KEY",
+  "rate_limit": {
+    "min_interval_ms": 1000,
+    "source": "https://help.openalex.org/api/authentication/ (daily usage budget, lower without a key; 100 requests per second ceiling)"
+  },
+  "docs_url": ["https://help.openalex.org/api/", "https://help.openalex.org/api/searching/", "https://help.openalex.org/api/authentication/"],
+  "license_note": "OpenAlex data is CC0 (https://openalex.org/about). The key-less daily budget is small (about 100 searches per IP); an optional key raises it and stays in the host.",
+  "weight": 1.0,
+  "cache_ttl_secs": 3600,
+  "timeout_secs": 15
+}

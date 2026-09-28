@@ -30,6 +30,47 @@ pub fn normalize(tag: &str) -> Option<String> {
     Some(out)
 }
 
+/// The query to use for `lang`: its entry in `by_lang` (exact tag first,
+/// then the same primary subtag), else `query`. Lets a caller search each
+/// language in its own words.
+pub fn query_for<'a>(
+    query: &'a str,
+    by_lang: &'a std::collections::BTreeMap<String, String>,
+    lang: Option<&str>,
+) -> &'a str {
+    let Some(tag) = lang else {
+        return query;
+    };
+    let p = primary(tag);
+    by_lang
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(tag))
+        .or_else(|| by_lang.iter().find(|(k, _)| primary(k) == p))
+        .map(|(_, q)| q.trim())
+        .filter(|q| !q.is_empty())
+        .unwrap_or(query)
+}
+
+/// Validate a `query_by_lang` map: keys are BCP-47 tags (normalized), values
+/// non-empty and at most 400 characters.
+pub fn parse_query_by_lang(
+    raw: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (k, v) in raw {
+        let tag =
+            normalize(k).ok_or_else(|| format!("query_by_lang: invalid language tag {k:?}"))?;
+        let q = v.trim();
+        if q.is_empty() || q.chars().count() > 400 {
+            return Err(format!(
+                "query_by_lang[{k}]: give a query of 1-400 characters"
+            ));
+        }
+        out.insert(tag, q.to_string());
+    }
+    Ok(out)
+}
+
 /// Primary subtag, lowercase (`zh-TW` → `zh`).
 pub fn primary(tag: &str) -> String {
     tag.trim()

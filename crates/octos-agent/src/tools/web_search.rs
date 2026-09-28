@@ -84,6 +84,8 @@ pub struct WebSearchTool {
     research_client: Client,
     config: Option<Arc<super::tool_config::ToolConfigStore>>,
     provider_keys: HashMap<String, String>,
+    /// octos metasearch, built on first use (it takes the provider keys).
+    metasearch: Arc<std::sync::OnceLock<octos_research::metasearch::Metasearch>>,
 }
 
 impl WebSearchTool {
@@ -105,6 +107,7 @@ impl WebSearchTool {
                 .unwrap_or_else(|_| Client::new()),
             config: None,
             provider_keys: HashMap::new(),
+            metasearch: Arc::default(),
         }
     }
 
@@ -116,6 +119,29 @@ impl WebSearchTool {
     pub fn with_provider_keys(mut self, provider_keys: HashMap<String, String>) -> Self {
         self.provider_keys = provider_keys;
         self
+    }
+
+    /// Use this metasearch instead of the default one (tests, embedders
+    /// with their own fetcher or engines).
+    pub fn with_metasearch(self, metasearch: octos_research::metasearch::Metasearch) -> Self {
+        let _ = self.metasearch.set(metasearch);
+        self
+    }
+
+    /// The metasearch, sharing the process-wide rate limits and cache.
+    /// Profile provider keys (e.g. `brave`) are passed to keyed engines.
+    fn metasearch(&self) -> &octos_research::metasearch::Metasearch {
+        self.metasearch.get_or_init(|| {
+            let keys = self
+                .provider_keys
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            octos_research::metasearch::Metasearch::from_env(
+                Arc::new(octos_research::metasearch::ReqwestFetch::new()),
+                &keys,
+            )
+        })
     }
 
     fn provider_key(&self, provider_id: &str, env_var: &str) -> Option<String> {
@@ -140,13 +166,16 @@ struct Input {
     /// BCP-47 language(s): a string, a list, or comma-separated.
     #[serde(default)]
     lang: octos_research::OneOrMany,
+    /// The query per language (tag → query).
+    #[serde(default)]
+    query_by_lang: std::collections::BTreeMap<String, String>,
     /// ISO 3166-1 alpha-2 region (Google News edition).
     #[serde(default)]
     region: Option<String>,
     /// ISO date/datetime or `24h` / `7d` / `2w` / `3m` / `1y`.
     #[serde(default)]
     since: Option<String>,
-    /// `news`, `general` or `auto` (default).
+    /// `auto` (default), `news`, `general`, `science`, `it` or `social`.
     #[serde(default)]
     category: Option<String>,
 }
@@ -154,8 +183,12 @@ struct Input {
 /// Parsed free-tier controls.
 pub(crate) struct FreeTierControls {
     pub filters: octos_research::Filters,
+    /// Per-language queries (normalized tag → query).
+    pub query_by_lang: std::collections::BTreeMap<String, String>,
     pub region: Option<String>,
     pub news: bool,
+    /// Metasearch category (`news`, `general`, `science`, `it`, `social`).
+    pub category: &'static str,
     pub now: chrono::DateTime<chrono::Utc>,
 }
 
@@ -166,15 +199,15 @@ impl FreeTierControls {
             None | Some("") => None,
             Some(s) => Some(octos_research::date::Since::parse(s, now)?),
         };
-        let filters = octos_research::Filters::new(
-            input.lang.clone().into_vec(),
-            since,
-            Vec::new(),
-            Vec::new(),
-            None,
-        )?;
+        let query_by_lang = octos_research::lang::parse_query_by_lang(&input.query_by_lang)?;
+        let mut langs = input.lang.clone().into_vec();
+        if !langs.is_empty() {
+            langs.extend(query_by_lang.keys().cloned());
+        }
+        let filters = octos_research::Filters::new(langs, since, Vec::new(), Vec::new(), None)?;
         let category = octos_research::Category::parse(input.category.as_deref())?;
         let news = category.is_news(&input.query, filters.since.as_ref(), now);
+        let ms_category = category.metasearch_category(&input.query, filters.since.as_ref(), now);
         let region = input
             .region
             .as_deref()
@@ -182,19 +215,32 @@ impl FreeTierControls {
             .filter(|r| r.len() == 2);
         Ok(Self {
             filters,
+            query_by_lang,
             region,
             news,
+            category: ms_category,
             now,
         })
     }
 
     /// Languages to query: requested ones, else a script guess, else default.
     fn langs(&self, query: &str) -> Vec<Option<String>> {
-        if self.filters.langs.is_empty() {
+        let mut langs: Vec<Option<String>> = if self.filters.langs.is_empty() {
             vec![octos_research::lang::guess_from_script(query).map(String::from)]
         } else {
             self.filters.langs.iter().cloned().map(Some).collect()
+        };
+        for l in self.query_by_lang.keys() {
+            if !langs.iter().flatten().any(|x| x == l) {
+                langs.push(Some(l.clone()));
+            }
         }
+        langs
+    }
+
+    /// The query for one language.
+    fn query_for<'a>(&'a self, query: &'a str, lang: Option<&str>) -> &'a str {
+        octos_research::lang::query_for(query, &self.query_by_lang, lang)
     }
 }
 
@@ -205,11 +251,22 @@ pub(crate) fn serp_scrape_opted_in(lookup: impl Fn(&str) -> Option<String>) -> b
     octos_research::serp_scrape_allowed(lookup)
 }
 
-/// Free-tier providers in order: GDELT + Google News for news-ish queries,
-/// then SearXNG when configured.
-pub(crate) fn free_tier_providers(news: bool, searxng: bool) -> Vec<octos_research::Provider> {
+/// Whether the octos metasearch is on (`OCTOS_METASEARCH`, default on).
+fn metasearch_on() -> bool {
+    octos_research::metasearch::enabled(|k| std::env::var(k).ok())
+}
+
+/// Free-tier providers in order: the octos metasearch (every category), or
+/// GDELT + Google News for news-ish queries when it is off; then SearXNG
+/// when configured.
+pub(crate) fn free_tier_providers(
+    news: bool,
+    metasearch: bool,
+    searxng: bool,
+) -> Vec<octos_research::Provider> {
     octos_research::plan::plan(&octos_research::plan::PlanInput {
         news,
+        metasearch,
         searxng_configured: searxng,
         ..Default::default()
     })
@@ -347,6 +404,11 @@ impl Tool for WebSearchTool {
                         {"type": "array", "items": {"type": "string"}}
                     ]
                 },
+                "query_by_lang": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "The query in each language's own words, keyed by BCP-47 tag, e.g. {\"zh\": \"人工智能 监管\"}; each language is searched with its own query. Translate the query yourself when searching several languages."
+                },
                 "region": {
                     "type": "string",
                     "description": "ISO 3166-1 alpha-2 region for the Google News edition, e.g. US, TW"
@@ -357,8 +419,8 @@ impl Tool for WebSearchTool {
                 },
                 "category": {
                     "type": "string",
-                    "enum": ["auto", "news", "general"],
-                    "description": "news uses GDELT + Google News first; auto (default) = news when since <= 31 days or the query mentions news/latest/today"
+                    "enum": ["auto", "news", "general", "science", "it", "social"],
+                    "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (Wikipedia, Wikidata; web results need a key), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
                 }
             },
             "required": ["query"]
@@ -683,10 +745,11 @@ impl WebSearchTool {
     /// Providers this search would have called, in order (for the
     /// no-results message).
     fn tried_providers(&self, c: &FreeTierControls, serp_scrape: bool) -> Vec<String> {
-        let mut tried: Vec<String> = free_tier_providers(c.news, self.searxng_base().is_some())
-            .iter()
-            .map(|p| p.id().to_string())
-            .collect();
+        let mut tried: Vec<String> =
+            free_tier_providers(c.news, metasearch_on(), self.searxng_base().is_some())
+                .iter()
+                .map(|p| p.id().to_string())
+                .collect();
         let has = |id: &str, env: &str| {
             self.provider_key(id, env)
                 .is_some_and(|k| !k.trim().is_empty())
@@ -739,6 +802,25 @@ impl WebSearchTool {
         Ok(body)
     }
 
+    async fn metasearch_search(
+        &self,
+        query: &str,
+        count: u8,
+        c: &FreeTierControls,
+        langs: &[Option<String>],
+    ) -> octos_research::metasearch::SearchResponse {
+        let mut req = octos_research::metasearch::SearchRequest::new(query, c.category);
+        req.query_by_lang = c.query_by_lang.clone();
+        req.langs = langs.iter().flatten().cloned().collect();
+        req.region = c.region.clone();
+        req.since = c.filters.since.clone();
+        req.count = count as usize;
+        req.limit = count as usize * langs.len().max(1) * 2;
+        req.filters = c.filters.clone();
+        req.now = c.now;
+        self.metasearch().search(&req).await
+    }
+
     async fn free_provider(
         &self,
         provider: octos_research::Provider,
@@ -783,18 +865,49 @@ impl WebSearchTool {
         count: u8,
         c: &FreeTierControls,
     ) -> Option<ToolResult> {
-        let providers = free_tier_providers(c.news, self.searxng_base().is_some());
+        let providers = free_tier_providers(c.news, metasearch_on(), self.searxng_base().is_some());
         if providers.is_empty() {
             return None;
         }
         let langs = c.langs(query);
+        let mut hits = Vec::new();
+        let mut used: Vec<&str> = Vec::new();
+        let mut note = None;
+        // The metasearch covers every requested language in one call.
+        if providers.contains(&octos_research::Provider::Metasearch) {
+            let resp = self.metasearch_search(query, count, c, &langs).await;
+            for e in &resp.engines {
+                info!(
+                    provider = "metasearch",
+                    engine = %e.engine,
+                    status = ?e.status,
+                    hits = e.hits,
+                    error = e.error.as_deref().unwrap_or(""),
+                    "web_search metasearch engine"
+                );
+            }
+            if !resp.items.is_empty() {
+                used.push("metasearch");
+                hits.extend(resp.hits());
+            }
+            note = resp.note;
+        }
         let mut calls = Vec::new();
         for lang in &langs {
-            for p in &providers {
+            for p in providers
+                .iter()
+                .filter(|p| **p != octos_research::Provider::Metasearch)
+            {
                 calls.push(async move {
                     let r = tokio::time::timeout(
                         Duration::from_secs(40),
-                        self.free_provider(*p, query, lang.as_deref(), count, c),
+                        self.free_provider(
+                            *p,
+                            c.query_for(query, lang.as_deref()),
+                            lang.as_deref(),
+                            count,
+                            c,
+                        ),
                     )
                     .await
                     .unwrap_or_else(|_| Err("timed out".to_string()));
@@ -802,8 +915,6 @@ impl WebSearchTool {
                 });
             }
         }
-        let mut hits = Vec::new();
-        let mut used: Vec<&str> = Vec::new();
         for (p, r) in futures::future::join_all(calls).await {
             match r {
                 Ok(h) if !h.is_empty() => {
@@ -836,8 +947,13 @@ impl WebSearchTool {
         }
         info!(provider = %used.join("+"), used_provider = %used.join("+"), query = %query, "web_search");
         let mut output = octos_research::providers::format_hits(query, &kept);
+        if let Some(note) = note.filter(|_| c.category == "general") {
+            output.push_str(&format!("Note: {note}\n"));
+        }
         if octos_research::respect_robots(|k| std::env::var(k).ok())
-            && kept.iter().any(|h| h.provider == "google_news_rss")
+            && kept.iter().any(|h| {
+                h.provider == "google_news_rss" || h.engines.iter().any(|e| e == "google_news")
+            })
         {
             output.push_str(
                 "Note: news.google.com links are redirects whose robots.txt disallows automated fetching; cite them as headlines (publisher and date above) rather than fetching them.\n",
@@ -1968,11 +2084,24 @@ mod tests {
     fn should_try_free_news_sources_before_keyed_providers() {
         use octos_research::Provider;
         assert_eq!(
-            free_tier_providers(true, true),
+            free_tier_providers(true, true, true),
+            vec![Provider::Metasearch, Provider::Searxng]
+        );
+        assert_eq!(
+            free_tier_providers(false, true, false),
+            vec![Provider::Metasearch],
+            "metasearch serves general queries too"
+        );
+        // With OCTOS_METASEARCH=0: the direct news sources.
+        assert_eq!(
+            free_tier_providers(true, false, true),
             vec![Provider::Gdelt, Provider::GoogleNewsRss, Provider::Searxng]
         );
-        assert_eq!(free_tier_providers(false, true), vec![Provider::Searxng]);
-        assert!(free_tier_providers(false, false).is_empty());
+        assert_eq!(
+            free_tier_providers(false, false, true),
+            vec![Provider::Searxng]
+        );
+        assert!(free_tier_providers(false, false, false).is_empty());
     }
 
     #[test]
@@ -2009,7 +2138,7 @@ mod tests {
 
     /// With no key, no SearXNG and no opt-in, a general query must not fall
     /// back to scraping DuckDuckGo: it returns an empty result with guidance
-    /// (and makes no network call at all).
+    /// (the metasearch is given an offline fetcher, so no network call).
     #[tokio::test]
     async fn should_not_use_duckduckgo_by_default() {
         let configured = [
@@ -2025,13 +2154,36 @@ mod tests {
         if configured.iter().any(|k| std::env::var(k).is_ok()) {
             return; // developer machine with keys: not the keyless case
         }
-        let tool = WebSearchTool::new();
+        struct Offline;
+        impl octos_research::metasearch::Fetch for Offline {
+            fn fetch(
+                &self,
+                _: octos_research::metasearch::HttpRequest,
+            ) -> octos_research::metasearch::FetchFuture<'_> {
+                Box::pin(async { Err("offline".to_string()) })
+            }
+        }
+        let metasearch = octos_research::metasearch::Metasearch::new(
+            octos_research::metasearch::Registry::builtin(),
+            Arc::new(Offline),
+            Default::default(),
+        );
+        let tool = WebSearchTool::new().with_metasearch(metasearch);
         let r = tool
             .execute(&serde_json::json!({"query": "rust borrow checker", "category": "general"}))
             .await
             .unwrap();
         assert!(r.success, "empty result, not an error");
-        assert!(r.output.contains("Providers tried: none"), "{}", r.output);
+        if metasearch_on() {
+            assert!(
+                r.output.contains("Providers tried: metasearch."),
+                "{}",
+                r.output
+            );
+        } else {
+            assert!(r.output.contains("Providers tried: none"), "{}", r.output);
+        }
+        assert!(!r.output.contains("duckduckgo"), "{}", r.output);
         assert!(r.output.contains("SEARXNG_URL"));
         assert!(!r.output.contains("Results for:"));
     }
@@ -2060,6 +2212,24 @@ mod tests {
         let bad: Input =
             serde_json::from_value(serde_json::json!({"query": "q", "since": "soon"})).unwrap();
         assert!(FreeTierControls::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn should_search_each_language_in_its_own_words() {
+        let input: Input = serde_json::from_value(serde_json::json!({
+            "query": "AI regulation",
+            "lang": "en",
+            "query_by_lang": {"zh-cn": "人工智能 监管"}
+        }))
+        .unwrap();
+        let c = FreeTierControls::parse(&input).unwrap();
+        assert_eq!(c.filters.langs, vec!["en", "zh-CN"]);
+        assert_eq!(
+            c.langs(&input.query),
+            vec![Some("en".to_string()), Some("zh-CN".to_string())]
+        );
+        assert_eq!(c.query_for(&input.query, Some("zh-CN")), "人工智能 监管");
+        assert_eq!(c.query_for(&input.query, Some("en")), "AI regulation");
     }
 
     #[tokio::test]

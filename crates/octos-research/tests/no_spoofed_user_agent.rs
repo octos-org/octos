@@ -2,7 +2,8 @@
 //! fetch paths must not pose as a desktop browser. No hard-coded browser
 //! User-Agent (`Mozilla/5.0 (...) ... Chrome/...`, `AppleWebKit`, `Safari/`)
 //! may appear in the research crates or the built-in search tools — including
-//! behind the opt-in search-results scrapers.
+//! behind the opt-in search-results scrapers — nor in the metasearch engine
+//! scripts and manifests.
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +12,8 @@ fn sources() -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in [
         "octos-research/src",
+        "octos-research/engines",
+        "octos-research/examples",
         "app-skills/deep-search/src",
         "app-skills/deep-crawl/src",
     ] {
@@ -19,6 +22,9 @@ fn sources() -> Vec<PathBuf> {
     for file in [
         "octos-agent/src/tools/web_search.rs",
         "octos-agent/src/tools/deep_search.rs",
+        "octos-agent/src/tools/site_crawl.rs",
+        "app-skills/news/src/main.rs",
+        "octos-cli/src/api/bilibili.rs",
     ] {
         out.push(crates.join(file));
     }
@@ -29,8 +35,14 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
         let path = entry.unwrap().path();
         if path.is_dir() {
-            collect(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
+            // Recorded provider responses are data, not requests we send.
+            if path.file_name().is_some_and(|n| n != "fixtures") {
+                collect(&path, out);
+            }
+        } else if path
+            .extension()
+            .is_some_and(|e| e == "rs" || e == "octoscript" || e == "json")
+        {
             out.push(path);
         }
     }

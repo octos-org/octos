@@ -1,0 +1,56 @@
+{
+  "body_file": "news_en.body",
+  "expect": [
+    {
+      "lang": "en-US",
+      "published": "2026-09-23T07:00:00Z",
+      "source": "Welcome to the United Nations",
+      "title": "Climate Summit 2026",
+      "url": "https://news.google.com/rss/articles/CBMiZkFVX3lxTE9ZaGstUTg3YUVENEdhTUVrcDdvV2ZhZXJKUlpJaWFzUG1wZG9wZ01Rc1BtWVVGN0hWSWRYRDg2TEc4VnFEbFl2dkNPZDFFMU1uT21wNEJ0SjIxblhNN1gzM0VXenhJQQ?oc=5"
+    },
+    {
+      "lang": "en-US",
+      "published": "2026-09-21T13:31:30Z",
+      "source": "Reuters",
+      "title": "Turkey launches AI initiative ahead of COP31 climate summit",
+      "url": "https://news.google.com/rss/articles/CBMisAFBVV95cUxQY0xSMUdUcld5cDRtc3BONVJrLW1neXVaRDVxcE50UjFKcDFsTE5aUUo3VmdDalJyd2dHMF90bFRxcFlqZVJoT3Z0aGZxb25yejJHN3ZkZmw4Mm9DcGx5V3QxSHVYSE1IdUFsSlFoLVZTNzJCaXRwX1JsaEw5RDhPNzJSUXRaeTJscVdoaWZBc0kxNmJsWUY5Z044MkdsaGwwUllaWlF0TmpQWlItZk5IXw?oc=5"
+    },
+    {
+      "lang": "en-US",
+      "published": "2026-09-24T08:00:32Z",
+      "source": "Climate Home News",
+      "title": "UN Climate Summit: UN chief says world has tools to end fossil fuel age",
+      "url": "https://news.google.com/rss/articles/CBMiuAFBVV95cUxOaXBkN2lxVWxsdld3bV9sTk1neE1QVGIyaWYwRGh5WGZVY2NmUmg3a2loN3U3dENISTZtbUtJQWtZMFFyRWxHdUpCQ09rM0x3RExNOVplOTcxVmRhd1FaazlJUHloVVpZdjVOdXdZaEZqenZBUTM0Rkl6U0ZTTy12M1pPdkdtYlplZnluUzJnNnZ5M1dsdTFGNEQ1Ukk4eWdTX0Jkc3F0eXFTdkZvcGNBWG9aMHZKa3I3?oc=5"
+    },
+    {
+      "lang": "en-US",
+      "published": "2026-09-25T17:23:06Z",
+      "source": "Chemical & Engineering News",
+      "title": "At Climate Week, C&EN reporters found that technology is still seen as a solution to our climate problem",
+      "url": "https://news.google.com/rss/articles/CBMikwFBVV95cUxQNEJMSnVIZ3RrOWUtdllaR3h4cXR6Vl96dWdGcTdiR19BcTBNY0twN0IzSlZla1QwRU9PYmlueVQtcTltUGlCRjVnT0VNOE4xdlU4QnlSZXp0SExSRTVGUVByZUxWUlQtUFdRLWU1Z0M0S0E5eFhvMEVCcVVyRXE5MWZuRldMQnNiWVh6Z3lzaEhNa00?oc=5"
+    },
+    {
+      "lang": "en-US",
+      "published": "2026-09-21T07:00:00Z",
+      "source": "Carbon Brief",
+      "title": "Q&A: Where do the UN secretary general candidates stand on climate change?",
+      "url": "https://news.google.com/rss/articles/CBMioAFBVV95cUxNWWc0SHdxcEtiNGc2azktcW1oSG9wbUtvYVgwNjZXZmppbXhpajJnclp0T3Z0Y25KdllBaldfYU5nLWU0Zms0NWhmRjl3eHQwVU9YazRfMGo0OTN3a0dxMkZCc2dvaXN4UFAtaVlXa1E3a1RIWVhnOVNZdThQQjVwQjZ4VEQzODUzUlU1UTNNeWNncmZZR3M4Q1AzLThsWGRf?oc=5"
+    }
+  ],
+  "http": {
+    "headers": {},
+    "method": "GET",
+    "url": "https://news.google.com/rss/search?q=climate+summit+when%3A7d&hl=en-US&gl=US&ceid=US%3Aen"
+  },
+  "recorded": "live, 2026-09-27",
+  "request": {
+    "category": "news",
+    "count": 5,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-27T23:00:00Z",
+    "query": "climate summit",
+    "since": "7d"
+  }
+}

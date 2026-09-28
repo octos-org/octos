@@ -60,7 +60,27 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
                 || v6
                     .to_ipv4()
                     .is_some_and(|v4| is_private_ip(&IpAddr::V4(v4)))
+                // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215).
+                || v6.segments()[..3] == [0x64, 0xff9b, 1]
+                || embedded_v4(v6).is_some_and(|v4| is_private_ip(&IpAddr::V4(v4)))
         }
+    }
+}
+
+/// The IPv4 address a translation prefix carries: NAT64 well-known prefix
+/// 64:ff9b::/96 (RFC 6052) or 6to4 2002::/16 (RFC 3056). A private address
+/// behind either is still private.
+fn embedded_v4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let s = v6.segments();
+    let from = |hi: u16, lo: u16| {
+        std::net::Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8)
+    };
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        Some(from(s[6], s[7]))
+    } else if s[0] == 0x2002 {
+        Some(from(s[1], s[2]))
+    } else {
+        None
     }
 }
 
@@ -144,6 +164,38 @@ pub struct PinnedFetch<'a> {
     pub pre_check: Option<HostGate<'a>>,
 }
 
+/// Build the per-hop client: pinned to `host`'s validated addresses (IP
+/// literals need no pinning), following no redirects, with an identifiable
+/// User-Agent.
+fn pinned_builder(
+    host: &str,
+    addrs: &[SocketAddr],
+    timeout: Duration,
+    user_agent: &str,
+) -> reqwest::ClientBuilder {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(user_agent)
+        .redirect(reqwest::redirect::Policy::none());
+    // Pin all validated addresses at once (a looped `resolve()` would keep
+    // only the last one). IP literals need no pinning.
+    if host.parse::<IpAddr>().is_err() {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+    builder
+}
+
+/// A client for one request to `url`: the URL passes [`check_url`] and the
+/// client is pinned to the validated addresses (no DNS rebinding between the
+/// check and the connection), follows no redirects and sends the octos
+/// User-Agent. Build errors are returned, never replaced by a default client.
+pub async fn pinned_client(url: &str, timeout: Duration) -> Result<reqwest::Client, String> {
+    let (host, addrs) = check_url(url).await?;
+    pinned_builder(&host, &addrs, timeout, crate::USER_AGENT)
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))
+}
+
 /// GET `initial_url`, re-validating and DNS-pinning every redirect hop.
 ///
 /// The one pinned-fetch loop in the workspace: [`safe_get`] and the
@@ -167,16 +219,7 @@ pub async fn pinned_get(
             pre_check(&host)?;
         }
         let (host, addrs) = check_url(&current).await?;
-        let mut builder = reqwest::Client::builder()
-            .timeout(cfg.timeout)
-            .user_agent(cfg.user_agent)
-            .redirect(reqwest::redirect::Policy::none());
-        // Pin all validated addresses at once (a looped `resolve()` would
-        // keep only the last one). IP literals need no pinning.
-        if host.parse::<IpAddr>().is_err() {
-            builder = builder.resolve_to_addrs(&host, &addrs);
-        }
-        let client = builder
+        let client = pinned_builder(&host, &addrs, cfg.timeout, cfg.user_agent)
             .build()
             .map_err(|e| format!("HTTP client error: {e}"))?;
         let response = client
@@ -271,10 +314,21 @@ mod tests {
             "fe80::1",
             "::ffff:169.254.169.254",
             "::ffff:10.0.0.1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::1",
+            "2002:a9fe:a9fe::1",
+            "2002:c0a8:0101::1",
         ] {
             assert!(is_private_ip(&ip.parse().unwrap()), "{ip}");
         }
-        for ip in ["8.8.8.8", "93.184.216.34", "2606:4700::1111"] {
+        for ip in [
+            "8.8.8.8",
+            "93.184.216.34",
+            "2606:4700::1111",
+            "64:ff9b::808:808",
+            "2002:0808:0808::1",
+        ] {
             assert!(!is_private_ip(&ip.parse().unwrap()), "{ip}");
         }
         assert!(is_private_host("localhost"));

@@ -10,8 +10,8 @@ use super::AppState;
 
 const BILIBILI_SEARCH_API: &str = "https://api.bilibili.com/x/web-interface/search/type";
 const BILIBILI_REFERER: &str = "https://search.bilibili.com/";
-const BILIBILI_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
+/// Identifiable, never a disguised desktop browser (ADR 0002).
+const BILIBILI_USER_AGENT: &str = "octos/1.0 (+https://github.com/octos-org/octos)";
 
 #[derive(Debug, Deserialize)]
 pub struct FirstVideoQuery {

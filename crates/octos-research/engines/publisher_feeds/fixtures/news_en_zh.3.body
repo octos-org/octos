@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss xmlns:npr="https://www.npr.org/rss/" xmlns:nprml="https://api.npr.org/nprml" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:media="http://search.yahoo.com/mrss/" version="2.0">
+  <channel>
+    <title>NPR Topics: News</title>
+    <link>https://www.npr.org/templates/story/story.php?storyId=1001</link>
+    <description>NPR news, audio, and podcasts. Coverage of breaking stories, national and world news, politics, business, science, technology, and extended coverage of major national and world events.</description>
+    <language>en</language>
+    <copyright>Copyright 2024 NPR - For Personal Use Only</copyright>
+    <generator>Story API Shim 1.2.24</generator>
+    <lastBuildDate>Sun, 27 Sep 2026 22:35:57 -0400</lastBuildDate>
+    <image>
+      <url>https://media.npr.org/images/podcasts/primary/npr_generic_image_300.jpg?s=200</url>
+      <title>NPR Topics: News</title>
+      <link>https://www.npr.org/sections/news/</link>
+    </image>
+    <item>
+      <title>Nantucket shipwreck uncovered by Nor&apos;easter</title>
+      <description>The local newspaper in Nantucket got a tip: &apos;I found what I believe to be a shipwreck uncovered by the storm.&apos;</description>
+      <pubDate>Sun, 27 Sep 2026 20:30:26 -0400</pubDate>
+      <link>https://www.npr.org/2026/09/27/nx-s1-5982785/nantucket-shipwreck-uncovered-by-noreaster</link>
+      <guid>https://www.npr.org/2026/09/27/nx-s1-5982785/nantucket-shipwreck-uncovered-by-noreaster</guid>
+      <content:encoded><![CDATA[<img src='https://npr.brightspotcdn.com/dims3/default/strip/false/crop/1920x1440+0+0/resize/1920x1440!/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F94%2F63%2Ff5bfedf34c00b0b82f7920875b9c%2Fwarren-sawyer-remains-1.jfif' alt='A tip from a Nantucket resident led to the discovery of ship remains that may trace back to 1884.'/><p>The local newspaper in Nantucket got a tip: 'I found what I believe to be a shipwreck uncovered by the storm.'</p><p>(Image credit: Jason Graziadei)</p><img src='https://media.npr.org/include/images/tracking/npr-rss-pixel.png?story=nx-s1-5982785' />]]></content:encoded>
+      <dc:creator>Isabella Gomez Sarmiento</dc:creator>
+    </item>
+    <item>
+      <title>Scientists discover two new species of sea spiders along Canadian coastline</title>
+      <description>So far, scientists have identified more than 1,300 species of sea spiders. &lt;br&gt;</description>
+      <pubDate>Sun, 27 Sep 2026 18:31:16 -0400</pubDate>
+      <link>https://www.npr.org/2026/09/27/nx-s1-5982026/new-sea-spider-species</link>
+      <guid>https://www.npr.org/2026/09/27/nx-s1-5982026/new-sea-spider-species</guid>
+      <content:encoded><![CDATA[<img src='https://npr.brightspotcdn.com/dims3/default/strip/false/crop/1443x1311+0+0/resize/1443x1311!/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F81%2F4f%2F2dc031084489a7ad6e15c762a037%2Fa-photo-of-a-new-species-of-sea-spider-tanystylum-kiixin-credit-cormac-toler-scott.tif' alt='Tanystylum kiixin, a new species of sea spider, with round eggs inside its legs.'/><p>So far, scientists have identified more than 1,300 species of sea spiders. <br></p><p>(Image credit: Cormac Toler-Scott)</p><img src='https://media.npr.org/include/images/tracking/npr-rss-pixel.png?story=nx-s1-5982026' />]]></content:encoded>
+      <dc:creator>Chandelis Duster</dc:creator>
+    </item>
+    <item>
+      <title>South Africa reels from spate of mass shootings that killed 38 people in a week</title>
+      <description>On Saturday night, there were separate mass shootings near South Africa&apos;s two largest cities.</description>
+      <pubDate>Sun, 27 Sep 2026 09:01:27 -0400</pubDate>
+      <link>https://www.npr.org/2026/09/27/nx-s1-5982488/south-africa-mass-shootings-killed-38-week</link>
+      <guid>https://www.npr.org/2026/09/27/nx-s1-5982488/south-africa-mass-shootings-killed-38-week</guid>
+      <content:encoded><![CDATA[<img src='https://npr.brightspotcdn.com/dims3/default/strip/false/crop/5198x3465+0+0/resize/5198x3465!/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F8c%2Fc1%2Feda1dc9c4621a61891b03e6b3fb7%2Fap26270463217392.jpg' alt='Community members stand at scene of a mass shooting on Saturday night when suspects opened fire at a bar in Wedela township, southwest of Johannesburg, South Africa, Sunday, Sept. 27, 2026.'/><p>On Saturday night, there were separate mass shootings near South Africa's two largest cities.</p><p>(Image credit: STR)</p><img src='https://media.npr.org/include/images/tracking/npr-rss-pixel.png?story=nx-s1-5982488' />]]></content:encoded>
+      <dc:creator>Kate Bartlett</dc:creator>
+    </item>
+    <item>
+      <title>Trump wants to remove a question about race in the census. We look back at the history</title>
+      <description>The Trump administration wants to stop asking about race and ethnicity on the next U.S. census. Since 1790, the topic has been used to exclude people of color, and, more recently, for inclusion.</description>
+      <pubDate>Sun, 27 Sep 2026 08:17:31 -0400</pubDate>
+      <link>https://www.npr.org/2026/09/27/nx-s1-5966883/trump-wants-to-remove-a-question-about-race-in-the-census-we-look-back-at-the-history</link>
+      <guid>https://www.npr.org/2026/09/27/nx-s1-5966883/trump-wants-to-remove-a-question-about-race-in-the-census-we-look-back-at-the-history</guid>
+      <content:encoded><![CDATA[<p>The Trump administration wants to stop asking about race and ethnicity on the next U.S. census. Since 1790, the topic has been used to exclude people of color, and, more recently, for inclusion.</p><img src='https://media.npr.org/include/images/tracking/npr-rss-pixel.png?story=nx-s1-5966883' />]]></content:encoded>
+      <dc:creator>Hansi Lo Wang</dc:creator>
+    </item>
+    <item>
+      <title>As Congress debates college sports, athletes-turned-senators have a seat at the table</title>
+      <description>The Protect College Sports Act is on the brink of passing in the Senate, where a handful of former college athletes who are now senators on both sides of the aisle have an extra say in the debate.</description>
+      <pubDate>Sun, 27 Sep 2026 08:06:24 -0400</pubDate>
+      <link>https://www.npr.org/2026/09/27/nx-s1-5978973/protect-college-sports-act-senators-athletes</link>
+      <guid>https://www.npr.org/2026/09/27/nx-s1-5978973/protect-college-sports-act-senators-athletes</guid>
+      <content:encoded><![CDATA[<img src='https://npr.brightspotcdn.com/dims3/default/strip/false/crop/3000x2240+0+0/resize/3000x2240!/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F6c%2F47%2F2523993d4246b70e381ef216d272%2Fgettyimages-77431049.jpg' alt='Tommy Tuberville led Auburn to an undefeated season in 2004, and now the Alabama Republican senator is championing the Protect College Sports Act in Congress. He's one of a number of former collegiate athletes who are now Senators helping to shape the legislation.'/><p>The Protect College Sports Act is on the brink of passing in the Senate, where a handful of former college athletes who are now senators on both sides of the aisle have an extra say in the debate.</p><p>(Image credit: Doug Benc)</p><img src='https://media.npr.org/include/images/tracking/npr-rss-pixel.png?story=nx-s1-5978973' />]]></content:encoded>
+      <dc:creator>Becky Sullivan</dc:creator>
+    </item>
+    <item>
+      <title>Ohio governor&apos;s race: Ramaswamy and Acton clash in rare Democratic pickup opportunity</title>
+      <description>The Ohio governor&apos;s race pits former presidential candidate Vivek Ramaswamy against Democrat Amy Acton, a former state health advisor. Democrats see a chance to win a state that usually votes Republican.</description>
+      <pubDate>Sun, 27 Sep 2026 08:06:23 -0400</pubDate>
+      <link>https://www.npr.org/2026/09/27/nx-s1-5976743/ohio-governors-race-ramaswamy-and-acton-clash-in-rare-democratic-pickup-opportunity</link>
+      <guid>https://www.npr.org/2026/09/27/nx-s1-5976743/ohio-governors-race-ramaswamy-and-acton-clash-in-rare-democratic-pickup-opportunity</guid>
+      <content:encoded><![CDATA[<p>The Ohio governor's race pits former presidential candidate Vivek Ramaswamy against Democrat Amy Acton, a former state health advisor. Democrats see a chance to win a state that usually votes Republican.</p><img src='https://media.npr.org/include/images/tracking/npr-rss-pixel.png?story=nx-s1-5976743' />]]></content:encoded>
+      <dc:creator>Sarah Donaldson</dc:creator>
+    </item>
+    <item>
+      <title>Playing &apos;La Bamba&apos; for an hour? Must be a Mexican fandango!</title>
+      <description>A 300-year-old Mexican musical tradition is finding new life around the world — one sweaty, joyous, all-night fandango at a time.</description>
+      <pubDate>Sun, 27 Sep 2026 08:00:00 -0400</pubDate>
+      <link>https://www.npr.org/2026/09/27/nx-s1-5973237/la-bamba-mexico-fandango</link>
+      <guid>https://www.npr.org/2026/09/27/nx-s1-5973237/la-bamba-mexico-fandango</guid>
+      <content:encoded><![CDATA[<img src='https://npr.brightspotcdn.com/dims3/default/strip/false/crop/4022x2681+0+0/resize/4022x2681!/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F7f%2F87%2F15ad2677400dad94ad2cadcd065e%2Ffandango-2.JPG' alt='Jarana players join a mass jam session at a Veracruz fandango while the dancers pound out rhythms with their heels on the wooden tarima. '/><p>A 300-year-old Mexican musical tradition is finding new life around the world — one sweaty, joyous, all-night fandango at a time.</p><p>(Image credit: John Burnett for NPR)</p><img src='https://media.npr.org/include/images/tracking/npr-rss-pixel.png?story=nx-s1-5973237' />]]></content:encoded>
+      <dc:creator>John Burnett</dc:creator>
+    </item>
+    <item>
+      <title>Photos: This may be the most inspirational night school on Earth</title>
+      <description>Many thousands of boys and men in Lesotho take up the vital profession of herding but have to give up their education. A small network of schools on a shoestring budget is teaching them the ABCs.</description>
+      <pubDate>Sun, 27 Sep 2026 07:53:42 -0400</pubDate>
+      <link>https://www.npr.org/2026/09/27/g-s1-143582/night-school-shepherds-lesotho</link>
+      <guid>https://www.npr.org/2026/09/27/g-s1-143582/night-school-shepherds-lesotho</guid>
+      <content:encoded><![CDATA[<img src='https://npr.brightspotcdn.com/dims3/default/strip/false/crop/6240x4160+0+0/resize/6240x4160!/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F42%2F76%2F8c3ef0e44c1cbce3b20fea03b1b2%2Flesotho-shepherds-73.jpg' alt='Shepherds attend a part-time night school near Mokhotlong, Lesotho. For many, these classes are the only form of education they can access.'/><p>Many thousands of boys and men in Lesotho take up the vital profession of herding but have to give up their education. A small network of schools on a shoestring budget is teaching them the ABCs.</p><p>(Image credit: Tommy Trenchard for NPR)</p><img src='https://media.npr.org/include/images/tracking/npr-rss-pixel.png?story=g-s1-143582' />]]></content:encoded>
+      <dc:creator>Julie Bourdin </dc:creator>
+    </item>
+    <item>
+      <title>From professor to patient: One man&apos;s journey on the frontier of lung cancer treatment</title>
+      <description>Lung cancer is still the top cancer killer, but new developments are shifting what the future might hold for patients.</description>
+      <pubDate>Sun, 27 Sep 2026 07:00:00 -0400</pubDate>
+      <link>https://www.npr.org/2026/09/27/nx-s1-5981264/lung-cancer-treatment-mrna-affordability</link>
+      <guid>https://www.npr.org/2026/09/27/nx-s1-5981264/lung-cancer-treatment-mrna-affordability</guid>
+      <content:encoded><![CDATA[<img src='https://npr.brightspotcdn.com/dims3/default/strip/false/crop/1280x720+0+0/resize/1280x720!/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F6f%2Fa9%2F5f70cc58499f8584baaff6edf5ed%2Fimg-3507.jpeg' alt='Dr. Bryant Lin teaches a lung cancer class in fall 2024. He says he was very nervous to teach the first class and share his story.'/><p>Lung cancer is still the top cancer killer, but new developments are shifting what the future might hold for patients.</p><p>(Image credit: The Lin family)</p><img src='https://media.npr.org/include/images/tracking/npr-rss-pixel.png?story=nx-s1-5981264' />]]></content:encoded>
+      <dc:creator>Yuki Noguchi</dc:creator>
+    </item>
+    <item>
+      <title>5 arrested near a U.K. air base used by U.S. on suspicion of preparing a terrorist act</title>
+      <description>Police evacuated homes Sunday near an air base in England used by the U.S. and arrested several men over suspected explosives offenses.</description>
+      <pubDate>Sun, 27 Sep 2026 06:49:36 -0400</pubDate>
+      <link>https://www.npr.org/2026/09/27/nx-s1-5982480/multiple-arrests-suspicion-explosives-offenses-uk-base-us-forces</link>
+      <guid>https://www.npr.org/2026/09/27/nx-s1-5982480/multiple-arrests-suspicion-explosives-offenses-uk-base-us-forces</guid>
+      <content:encoded><![CDATA[<img src='https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2200x1467+0+0/resize/2200x1467!/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F87%2F5a%2F1f5228364c83bd096fa574d4952c%2Fap26270349850586.jpg' alt='Emergency services at the scene of an incident close to RAF Fairford,, in Whelford, England, Sunday, Sept. 27, 2026.'/><p>Police evacuated homes Sunday near an air base in England used by the U.S. and arrested several men over suspected explosives offenses.</p><p>(Image credit: Ben Birchall)</p><img src='https://media.npr.org/include/images/tracking/npr-rss-pixel.png?story=nx-s1-5982480' />]]></content:encoded>
+      <dc:creator>The Associated Press</dc:creator>
+    </item>
+  </channel>
+</rss>

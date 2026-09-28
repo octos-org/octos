@@ -68,6 +68,13 @@
               }
             ]
           },
+          "query_by_lang": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The query in each language's own words, keyed by BCP-47 tag, e.g. {\"zh\": \"人工智能 监管\"} alongside query \"AI regulation\". Each language is searched with its own query (and searched even if not listed in lang). Translate the query yourself when researching several languages."
+          },
           "region": {
             "type": "string",
             "description": "ISO 3166-1 alpha-2 region, e.g. US or TW (Google News edition, Brave/Serper country)."
@@ -78,8 +85,8 @@
           },
           "category": {
             "type": "string",
-            "enum": ["auto", "news", "general"],
-            "description": "news enables the GDELT + Google News free tier; auto (default) = news when since <= 31 days or the query mentions news/latest/today."
+            "enum": ["auto", "news", "general", "science", "it", "social"],
+            "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (Wikipedia, Wikidata; web results need a key), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
           },
           "max_per_domain": {
             "type": "integer",

@@ -1,0 +1,21 @@
+{
+  "id": "stackexchange",
+  "name": "Stack Exchange",
+  "categories": ["it"],
+  "languages": ["en"],
+  "hosts": ["api.stackexchange.com"],
+  "auth": {"query": {"name": "key"}},
+  "key_env": "STACKEXCHANGE_KEY",
+  "rate_limit": {
+    "min_interval_ms": 2000,
+    "source": "https://api.stackexchange.com/docs/throttle (under 30 requests per second; honour `backoff`; 300 requests per day per IP without a key; identical requests at most once a minute)"
+  },
+  "docs_url": ["https://api.stackexchange.com/docs/advanced-search", "https://api.stackexchange.com/docs/throttle", "https://api.stackexchange.com/docs/compression"],
+  "license_note": "User contributions are CC BY-SA (https://stackoverflow.com/help/licensing); attribute and link to the question.",
+  "weight": 0.9,
+  "cache_ttl_secs": 900,
+  "timeout_secs": 10,
+  "settings": {
+    "site": {"description": "Stack Exchange site to search", "default": "stackoverflow"}
+  }
+}

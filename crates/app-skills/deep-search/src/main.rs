@@ -49,6 +49,10 @@ struct Input {
     /// them (unknown-language results are kept).
     #[serde(default)]
     lang: research::LangInput,
+    /// The query in each language's own words, e.g. `{"zh": "人工智能 监管"}`.
+    /// Its languages are searched too.
+    #[serde(default)]
+    query_by_lang: std::collections::BTreeMap<String, String>,
     /// ISO 3166-1 alpha-2 region (Google News edition, Brave/Serper country).
     #[serde(default)]
     region: Option<String>,
@@ -310,6 +314,7 @@ struct SearchLog {
     providers: Vec<String>,
     tried: Vec<String>,
     errors: Vec<String>,
+    notes: Vec<String>,
     dump: String,
     answer: String,
 }
@@ -327,6 +332,11 @@ impl SearchLog {
             }
         }
         self.errors.extend(round.errors);
+        for n in round.notes {
+            if !self.notes.contains(&n) {
+                self.notes.push(n);
+            }
+        }
         for t in round.tried {
             if !self.tried.contains(&t) {
                 self.tried.push(t);
@@ -486,6 +496,8 @@ fn source_item(s: &CitedSource, citation: usize, cited: bool, file: &str) -> Res
         },
         fetched_at: Some(s.page.fetched_at.clone()),
         provider: s.hit.provider.clone(),
+        engines: s.hit.engines.clone(),
+        score: s.hit.score,
         read: true,
         rendered: s.page.rendered,
         citation: (citation > 0).then_some(citation),
@@ -521,6 +533,8 @@ fn unread_item(hit: &SearchHit, citation: Option<usize>, cited: bool) -> Researc
         snippet: hit.snippet.clone(),
         fetched_at: None,
         provider: hit.provider.clone(),
+        engines: hit.engines.clone(),
+        score: hit.score,
         read: false,
         rendered: false,
         citation,
@@ -602,8 +616,9 @@ async fn run_deep_search(
     // -----------------------------------------------------------------------
     progress(1, max_rounds, &format!("Searching: \"{query}\""));
     for lang in &langs {
-        let round = research::search_round(opts, engine, query, lang.as_deref(), max_results).await;
-        log.add(query, lang.as_deref(), round);
+        let q = opts.query_for(query, lang.as_deref());
+        let round = research::search_round(opts, engine, q, lang.as_deref(), max_results).await;
+        log.add(q, lang.as_deref(), round);
     }
     if log.hits.is_empty() {
         // Empty result, not a scrape: say what was tried and how to get
@@ -929,6 +944,9 @@ async fn run_deep_search(
         .unwrap_or_default();
     let items_path = items_path_for(&report_path);
     let mut doc = ItemsDocument::new(query, opts.controls_json());
+    if !log.notes.is_empty() {
+        doc.note = Some(log.notes.join(" "));
+    }
     for (i, s) in st.sources.iter().enumerate() {
         doc.items.push(source_item(
             s,
@@ -1082,6 +1100,9 @@ fn assemble_output(
 /// Empty (successful) result when no allowed provider returned anything.
 fn no_results_output(query: &str, log: &SearchLog, opts: &research::Options) -> Output {
     let mut message = octos_research::no_results_message(query, &log.tried);
+    for n in &log.notes {
+        message.push_str(&format!("\n{n}\n"));
+    }
     if !log.errors.is_empty() {
         message.push_str("\nProvider notes:\n- ");
         message.push_str(&log.errors.join("\n- "));

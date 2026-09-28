@@ -1,0 +1,56 @@
+{
+  "body_file": "science_since.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": "2026-02-10",
+      "source": "Nature Communications",
+      "title": "Severe and widespread coral reef damage during the 2014-2017 Global Coral Bleaching Event",
+      "url": "https://doi.org/10.1038/s41467-025-67506-w"
+    },
+    {
+      "lang": "en",
+      "published": "2025-04-30",
+      "source": "Journal of Maritime Policy Science.",
+      "title": "Coral Reef Bleaching Crisis: Impacts on Indonesia's Marine Ecosystems and Coastal Economy",
+      "url": "https://doi.org/10.31629/jmps.v2i1.7351"
+    },
+    {
+      "lang": "en",
+      "published": "2025-08-06",
+      "source": "",
+      "title": "Coral Reef Bleaching Prediction: A Machine Learning Approach Using Environmental Factors",
+      "url": "https://doi.org/10.1109/icscds65426.2025.11166756"
+    },
+    {
+      "lang": "en",
+      "published": "2025-09-30",
+      "source": "Deep Sea Research Part II Topical Studies in Oceanography",
+      "title": "Studying the impact of sea surface temperature (SST) changes and El Niño phenomenon on coral reefs bleaching around Kish Island in the northern Persian Gulf: A remote sensing approach",
+      "url": "https://doi.org/10.1016/j.dsr2.2025.105550"
+    },
+    {
+      "lang": "en",
+      "published": "2025-01-16",
+      "source": "Limnology and Oceanography Letters",
+      "title": "Catastrophic bleaching in protected reefs of the Southern Great Barrier Reef",
+      "url": "https://doi.org/10.1002/lol2.10456"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/json"
+    },
+    "method": "GET",
+    "url": "https://api.openalex.org/works?search=coral+reef+bleaching&per-page=5&page=1&select=id%2Cdoi%2Cdisplay_name%2Cpublication_date%2Clanguage%2Cprimary_location%2Cabstract_inverted_index&filter=from_publication_date%3A2025-01-01"
+  },
+  "recorded": "live, 2026-09-27",
+  "request": {
+    "category": "science",
+    "count": 5,
+    "langs": [],
+    "now": "2026-09-27T22:00:00Z",
+    "query": "coral reef bleaching",
+    "since": "2025-01-01"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "id": "github",
+  "name": "GitHub repositories",
+  "categories": ["it"],
+  "languages": ["*"],
+  "hosts": ["api.github.com"],
+  "auth": "bearer",
+  "key_env": "GITHUB_TOKEN",
+  "rate_limit": {
+    "min_interval_ms": 6000,
+    "source": "https://docs.github.com/en/rest/search/search#rate-limit (10 search requests per minute unauthenticated, 30 with a token)"
+  },
+  "docs_url": ["https://docs.github.com/en/rest/search/search#search-repositories", "https://docs.github.com/en/search-github/searching-on-github/searching-for-repositories"],
+  "license_note": "GitHub REST API; repository content keeps its own licence. An optional token stays in the host.",
+  "weight": 0.8,
+  "cache_ttl_secs": 900,
+  "timeout_secs": 10
+}

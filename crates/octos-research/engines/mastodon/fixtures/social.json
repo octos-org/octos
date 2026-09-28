@@ -1,0 +1,56 @@
+{
+  "body_file": "social.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": "2026-09-27T22:19:53Z",
+      "source": "@orhun@fosstodon.org on mastodon.social",
+      "title": "Voice chat in the terminal!? 🤯 🥫 **tincan** — Serverless P2P voice & text chat for your terminal 🔥 No accounts, no po...",
+      "url": "https://fosstodon.org/@orhun/117345327084337960"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-27T21:10:08Z",
+      "source": "@ekuber@hachyderm.io on mastodon.social",
+      "title": "https://tako8ki.com/posts/looking-for-a-new-role/ #Rust #Rustlang #FediHire",
+      "url": "https://hachyderm.io/@ekuber/117345052829374264"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-27T20:37:48Z",
+      "source": "@haitchfive@oldbytes.space on mastodon.social",
+      "title": "One little known paradox is that systems programmers who develop programming languages in the early years of their pr...",
+      "url": "https://oldbytes.space/@haitchfive/117344925701533802"
+    },
+    {
+      "lang": "de",
+      "published": "2026-09-27T20:33:05Z",
+      "source": "@cehteh@social.tchncs.de on mastodon.social",
+      "title": "Specialization is a often asked but highly unstable feature. There exists dtolnays autoref trick and some improvement...",
+      "url": "https://social.tchncs.de/@cehteh/117344907101086561"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-27T18:15:04Z",
+      "source": "@infoq@techhub.social on mastodon.social",
+      "title": "#Cloudflare just redesigned the in-memory representation of its Big Pineapple DNS cache, dropping memory footprint by...",
+      "url": "https://techhub.social/@infoq/117344364440726558"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/json"
+    },
+    "method": "GET",
+    "url": "https://mastodon.social/api/v1/timelines/tag/rustlang?limit=5"
+  },
+  "recorded": "live, 2026-09-27",
+  "request": {
+    "category": "social",
+    "count": 5,
+    "langs": [],
+    "now": "2026-09-27T23:00:00Z",
+    "query": "rustlang",
+    "since": null
+  }
+}

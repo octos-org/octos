@@ -117,6 +117,7 @@ pub fn parse_gdelt(body: &str) -> Result<Vec<SearchHit>, String> {
                     .and_then(|d| d.as_str())
                     .and_then(date::to_iso),
                 provider: "gdelt".to_string(),
+                ..Default::default()
             })
         })
         .collect())
@@ -172,6 +173,7 @@ struct FeedEntry {
     description: String,
     source: String,
     source_url: String,
+    authors: Vec<String>,
 }
 
 /// Parse an RSS 2.0 or Atom feed into hits. `default_lang` is used when the
@@ -182,6 +184,42 @@ pub fn parse_feed(
     provider: &str,
     default_lang: Option<&str>,
 ) -> Result<Vec<SearchHit>, String> {
+    Ok(parse_feed_items(xml, provider, default_lang)?
+        .into_iter()
+        .map(|(hit, _)| hit)
+        .collect())
+}
+
+/// Feed entries as JSON records for metasearch engine scripts:
+/// `{url, title, snippet, source, source_url, lang, published, authors}`.
+pub fn parse_feed_entries(
+    xml: &str,
+    default_lang: Option<&str>,
+) -> Result<Vec<serde_json::Value>, String> {
+    Ok(parse_feed_items(xml, "", default_lang)?
+        .into_iter()
+        .map(|(h, authors)| {
+            serde_json::json!({
+                "url": h.url,
+                "title": h.title,
+                "snippet": h.snippet,
+                "source": h.source,
+                "source_url": h.source_url,
+                "lang": h.lang,
+                "published": h.published,
+                "authors": authors,
+            })
+        })
+        .collect())
+}
+
+type FeedItem = (SearchHit, Vec<String>);
+
+fn parse_feed_items(
+    xml: &str,
+    provider: &str,
+    default_lang: Option<&str>,
+) -> Result<Vec<FeedItem>, String> {
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
@@ -272,6 +310,20 @@ fn on_text(
     channel_lang: &mut Option<String>,
 ) {
     let Some(leaf) = path.last() else { return };
+    // Atom `<author><name>` (arXiv lists every author this way).
+    if leaf == "name"
+        && path.len() >= 3
+        && path[path.len() - 2] == "author"
+        && matches!(path[path.len() - 3].as_str(), "item" | "entry")
+    {
+        if let Some(en) = entry.as_mut() {
+            let name = collapse_ws(text);
+            if !name.is_empty() {
+                en.authors.push(name);
+            }
+        }
+        return;
+    }
     // Only direct children of <item>/<entry> (ignores e.g. media:title).
     let parent_is_entry =
         path.len() >= 2 && matches!(path[path.len() - 2].as_str(), "item" | "entry");
@@ -301,7 +353,7 @@ fn on_text(
     }
 }
 
-fn finish_entry(en: FeedEntry, provider: &str, lang_tag: Option<&str>) -> Option<SearchHit> {
+fn finish_entry(en: FeedEntry, provider: &str, lang_tag: Option<&str>) -> Option<FeedItem> {
     let url = en.link.trim().to_string();
     if !url.starts_with("http") {
         return None;
@@ -320,7 +372,7 @@ fn finish_entry(en: FeedEntry, provider: &str, lang_tag: Option<&str>) -> Option
     if snippet.chars().count() > 400 {
         snippet = snippet.chars().take(400).collect::<String>() + "…";
     }
-    Some(SearchHit {
+    let hit = SearchHit {
         url,
         title,
         snippet,
@@ -329,7 +381,9 @@ fn finish_entry(en: FeedEntry, provider: &str, lang_tag: Option<&str>) -> Option
         lang: lang_tag.map(String::from),
         published: date::to_iso(&en.published),
         provider: provider.to_string(),
-    })
+        ..Default::default()
+    };
+    Some((hit, en.authors))
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +455,7 @@ pub fn parse_searxng(body: &str) -> Result<Vec<SearchHit>, String> {
                     .and_then(|d| date::to_iso(&d)),
                 provider: "searxng".to_string(),
                 url,
+                ..Default::default()
             })
         })
         .collect())
@@ -426,9 +481,16 @@ pub fn format_hits(query: &str, hits: &[SearchHit]) -> String {
         .flatten()
         .collect();
         let mut meta_line = meta.join(" · ");
+        let via = if h.engines.is_empty() {
+            h.provider.clone()
+        } else {
+            format!("{}: {}", h.provider, h.engines.join(", "))
+        };
         if !meta_line.is_empty() {
-            meta_line = format!("{meta_line} · via {}", h.provider);
+            meta_line = format!("{meta_line} · via {via}");
             out.push_str(&format!("   {meta_line}\n"));
+        } else if !h.engines.is_empty() {
+            out.push_str(&format!("   via {via}\n"));
         }
         if !h.snippet.is_empty() {
             out.push_str(&format!("   {}\n", h.snippet));
@@ -465,10 +527,127 @@ pub fn strip_tags(html: &str) -> String {
         .replace("&#39;", "'")
 }
 
+/// Plain text of an HTML fragment: tags removed, named and numeric
+/// character references decoded, whitespace collapsed.
+pub fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let Some(end) = rest[i..].find('>') else {
+            rest = &rest[i..];
+            break;
+        };
+        let tag = rest[i + 1..i + end]
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        // Block-level tags separate words; inline ones (a, span, b, em...)
+        // do not.
+        if matches!(
+            tag.as_str(),
+            "br" | "p"
+                | "div"
+                | "li"
+                | "ul"
+                | "ol"
+                | "tr"
+                | "td"
+                | "th"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "blockquote"
+                | "pre"
+                | "hr"
+        ) {
+            out.push(' ');
+        }
+        rest = &rest[i + end + 1..];
+    }
+    out.push_str(rest);
+    collapse_ws(&decode_entities(&out))
+}
+
+/// Decode numeric (`&#39;`, `&#x27;`) and common named character references.
+pub fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let end = tail[1..].find(';').map(|e| e + 1).filter(|e| *e <= 10);
+        let decoded = end.and_then(|e| {
+            let name = &tail[1..e];
+            let ch = if let Some(hex) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X"))
+            {
+                u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+            } else if let Some(dec) = name.strip_prefix('#') {
+                dec.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                match name {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "nbsp" => Some(' '),
+                    "hellip" => Some('…'),
+                    "mdash" => Some('—'),
+                    "ndash" => Some('–'),
+                    "rsquo" => Some('’'),
+                    "lsquo" => Some('‘'),
+                    "rdquo" => Some('”'),
+                    "ldquo" => Some('“'),
+                    _ => None,
+                }
+            };
+            ch.map(|c| (c, e))
+        });
+        match decoded {
+            Some((c, e)) => {
+                out.push(c);
+                rest = &tail[e + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn should_turn_html_fragments_into_text() {
+        assert_eq!(
+            html_to_text(
+                "<p>Rust&#39;s <b>async</b> &amp; &#x201C;await&#x201D;</p>\n<p>ok&nbsp;now</p>"
+            ),
+            "Rust's async & “await” ok now"
+        );
+        assert_eq!(
+            html_to_text(
+                "<strong>octos</strong>: see <a href=\"x\"><span>https://</span><span>a.org/x</span></a><br/>next"
+            ),
+            "octos: see https://a.org/x next"
+        );
+        assert_eq!(
+            decode_entities("a & b &unknown; &#xZZ;"),
+            "a & b &unknown; &#xZZ;"
+        );
+    }
 
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 27, 12, 0, 0).unwrap()

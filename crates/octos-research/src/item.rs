@@ -27,6 +27,12 @@ pub struct SearchHit {
     pub published: Option<String>,
     /// Provider id (`gdelt`, `google_news_rss`, `searxng`, `brave`, ...).
     pub provider: String,
+    /// Metasearch engines that returned this result, best first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engines: Vec<String>,
+    /// Metasearch rank score (higher is better), when ranked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
 impl SearchHit {
@@ -85,6 +91,12 @@ pub struct ResearchItem {
     /// Which provider found it (`gdelt`, `google_news_rss`, `searxng`,
     /// a keyed API, or `reference` / `site_crawl` for chased links).
     pub provider: String,
+    /// Metasearch engines that found it, best first (provider `metasearch`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engines: Vec<String>,
+    /// Metasearch rank score, when the item came from the metasearch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
     /// Whether the page main text was read (plain HTTP or browser).
     pub read: bool,
     /// Whether a real browser rendered the page (JS-heavy pages).
@@ -217,6 +229,8 @@ mod tests {
             snippet: String::new(),
             fetched_at: Some("2026-09-27T00:00:00Z".into()),
             provider: "gdelt".into(),
+            engines: Vec::new(),
+            score: None,
             read: true,
             rendered: false,
             citation: Some(1),

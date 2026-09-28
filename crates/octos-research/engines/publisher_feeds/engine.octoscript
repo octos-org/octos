@@ -1,0 +1,166 @@
+// Publishers' own RSS/Atom feeds, filtered by the query.
+// Feeds cannot be searched, so this engine reads the feeds for the
+// requested languages (each cached for 15 minutes by the core) and keeps
+// the entries whose headline or summary mention the query terms.
+// Written from each publisher's feed and its RSS/terms pages (docs_url in
+// the manifest); publishers that forbid AI or automated use are left out.
+use mod.markup
+use mod.net
+use mod.std.array
+use mod.std.object
+use mod.std.text
+
+fn feeds() {
+    let f = []
+    array.push(f, {lang: "en", source: "NPR", url: "https://feeds.npr.org/1001/rss.xml"})
+    array.push(f, {lang: "en", source: "France 24", url: "https://www.france24.com/en/rss"})
+    array.push(f, {lang: "en", source: "CNA", url: "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml"})
+    array.push(f, {lang: "zh-CN", source: "RFI 中文", url: "https://www.rfi.fr/cn/rss"})
+    array.push(f, {lang: "zh-CN", source: "自由亚洲电台", url: "https://www.rfa.org/arc/outboundfeeds/mandarin/rss/"})
+    array.push(f, {lang: "zh-TW", source: "中央通訊社", url: "https://feeds.feedburner.com/rsscna/intworld"})
+    array.push(f, {lang: "zh-TW", source: "中央通訊社", url: "https://feeds.feedburner.com/rsscna/mainland"})
+    array.push(f, {lang: "zh-TW", source: "中央通訊社", url: "https://feeds.feedburner.com/rsscna/technology"})
+    array.push(f, {lang: "zh-TW", source: "端傳媒", url: "https://theinitium.com/rss/"})
+    return f
+}
+
+fn primary(tag) {
+    let i = text.index_of(tag, "-")
+    if i < 0 {
+        return text.lower(tag)
+    }
+    return text.lower(text.slice(tag, 0, i))
+}
+
+fn build_request(query, opts) {
+    let wanted = []
+    for l in opts.langs {
+        array.push(wanted, l.primary)
+    }
+    if array.len(wanted) == 0 {
+        wanted = ["en"]
+    }
+    let out = []
+    for f in feeds() {
+        if array.contains(wanted, primary(f.lang)) {
+            array.push(out, net.request({url: f.url, headers: {accept: "application/rss+xml, application/atom+xml, application/xml"}}))
+        }
+    }
+    return out
+}
+
+fn separators() {
+    return [",", ".", ":", ";", "!", "?", "\"", "'", "(", ")", "[", "]", "/", "-", "–", "—", "|", "&", "，", "。", "：", "；", "！", "？", "、", "“", "”", "「", "」", "《", "》"]
+}
+
+// Lowercase words, with punctuation treated as spaces.
+fn words(s) {
+    let q = text.lower(s)
+    for p in separators() {
+        q = text.replace_all(q, p, " ")
+    }
+    let out = []
+    for w in text.split(q, " ") {
+        if w != "" {
+            array.push(out, w)
+        }
+    }
+    return out
+}
+
+// Query terms: words of two or more characters (Chinese words are the
+// space-separated parts of the query).
+fn terms(query) {
+    let out = []
+    for w in words(query) {
+        if text.len(w) >= 2 && !array.contains(out, w) {
+            array.push(out, w)
+        }
+    }
+    return out
+}
+
+fn is_latin_char(c) {
+    return c != "" && text.contains("abcdefghijklmnopqrstuvwxyz0123456789", c)
+}
+
+fn is_latin_word(w) {
+    for i in array.range(0, text.len(w)) {
+        if !is_latin_char(text.slice(w, i, i + 1)) {
+            return false
+        }
+    }
+    return true
+}
+
+// A letters/digits term must not sit inside a longer word ("ai" must not
+// match "said"), but Chinese characters count as boundaries ("AI能力"
+// matches "ai"). Other terms (Chinese) match anywhere.
+fn matches(term, hay) {
+    if !is_latin_word(term) {
+        return text.contains(hay, term)
+    }
+    let parts = text.split(hay, term)
+    for i in array.range(0, array.len(parts) - 1) {
+        let a = parts[i]
+        let b = parts[i + 1]
+        let before = if a == "" {
+            ""
+        } else {
+            text.slice(a, text.len(a) - 1, text.len(a))
+        }
+        let after = if b == "" {
+            ""
+        } else {
+            text.slice(b, 0, 1)
+        }
+        if !is_latin_char(before) && !is_latin_char(after) {
+            return true
+        }
+    }
+    return false
+}
+
+fn parse_response(response, opts) {
+    let feed = nil
+    for f in feeds() {
+        if f.url == response.url {
+            feed = f
+        }
+    }
+    if feed == nil {
+        return []
+    }
+    let t = terms(opts.query)
+    if array.len(t) == 0 {
+        return []
+    }
+    let all = []
+    let some = []
+    for e in markup.feed({lang: feed.lang}).entries {
+        let hay = text.lower(object.get(e, "title", "") + " " + object.get(e, "snippet", ""))
+        let n = 0
+        for w in t {
+            if matches(w, hay) {
+                n += 1
+            }
+        }
+        if n == 0 {
+            continue
+        }
+        let item = {
+            url: e.url,
+            title: object.get(e, "title", ""),
+            snippet: object.get(e, "snippet", ""),
+            source: feed.source,
+            lang: feed.lang,
+            published: object.get(e, "published", nil)
+        }
+        if n == array.len(t) {
+            array.push(all, item)
+        } else {
+            array.push(some, item)
+        }
+    }
+    return array.concat(all, some)
+}

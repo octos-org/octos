@@ -1,0 +1,49 @@
+{
+  "body_file": "it.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": "2022-01-22T10:02:22Z",
+      "source": "Hacker News",
+      "title": "Using Rustlang’s Async Tokio Runtime for CPU-Bound Tasks",
+      "url": "https://thenewstack.io/using-rustlangs-async-tokio-runtime-for-cpu-bound-tasks"
+    },
+    {
+      "lang": "en",
+      "published": "2024-10-07T14:55:12Z",
+      "source": "Hacker News",
+      "title": "Audioscrape: Building in Rust When Everyone Said I Shouldn't",
+      "url": "https://news.ycombinator.com/item?id=41766633"
+    },
+    {
+      "lang": "en",
+      "published": "2026-01-15T20:47:16Z",
+      "source": "Hacker News",
+      "title": "Using Tokio with CPU-Bound Tasks in Rust (2022)",
+      "url": "https://www.influxdata.com/blog/using-rustlangs-async-tokio-runtime-for-cpu-bound-tasks"
+    },
+    {
+      "lang": "en",
+      "published": "2021-01-07T04:16:40Z",
+      "source": "Hacker News",
+      "title": "Rust Asynchronous Runtime Tokio Reaches 1.0",
+      "url": "https://www.infoq.com/news/2021/01/rust-tokio-async-runtime"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/json"
+    },
+    "method": "GET",
+    "url": "https://hn.algolia.com/api/v1/search?query=tokio+async+runtime&tags=story&hitsPerPage=5&page=0"
+  },
+  "recorded": "live, 2026-09-27",
+  "request": {
+    "category": "it",
+    "count": 5,
+    "langs": [],
+    "now": "2026-09-27T23:00:00Z",
+    "query": "tokio async runtime",
+    "since": null
+  }
+}

@@ -1,7 +1,9 @@
 //! Search providers, controls and the polite page reader for deep-search.
 //!
-//! Provider order (see `octos_research::plan`): free structured sources
-//! first (GDELT + Google News RSS, for news-ish queries), then a
+//! Provider order (see `octos_research::plan`): the octos metasearch first
+//! (key-less OctoScript engines over official APIs and feeds: GDELT, Hacker
+//! News, Wikipedia, arXiv, ...; disable with `OCTOS_METASEARCH=0` to call
+//! GDELT + Google News RSS directly for news), then a
 //! self-hosted SearXNG (`SEARXNG_URL`), then search APIs with keys. Scraping
 //! search-results pages (DuckDuckGo HTML, Bing in headless Chrome) is not in
 //! the default order; both need `OCTOS_ALLOW_SERP_SCRAPE=1` (alias
@@ -37,6 +39,8 @@ const READ_CONCURRENCY: usize = 8;
 /// Parsed research controls.
 pub(crate) struct Options {
     pub items_mode: bool,
+    /// Per-language queries (normalized tag → query).
+    pub query_by_lang: std::collections::BTreeMap<String, String>,
     pub filters: Filters,
     pub region: Option<String>,
     pub category: Category,
@@ -62,8 +66,15 @@ impl Options {
             None | Some("") => None,
             Some(s) => Some(Since::parse(s, now)?),
         };
+        let query_by_lang = octos_research::lang::parse_query_by_lang(&input.query_by_lang)?;
+        let mut langs = input.lang.clone().into_vec();
+        // Languages with their own query are searched (and, when the caller
+        // restricted languages, kept) too.
+        if !langs.is_empty() {
+            langs.extend(query_by_lang.keys().cloned());
+        }
         let filters = Filters::new(
-            input.lang.clone().into_vec(),
+            langs,
             since,
             input.domains_allow.clone(),
             input.domains_deny.clone(),
@@ -88,6 +99,7 @@ impl Options {
         };
         Ok(Self {
             items_mode,
+            query_by_lang,
             filters,
             region,
             category: Category::parse(input.category.as_deref())?,
@@ -100,11 +112,22 @@ impl Options {
     /// Languages to search in: the requested ones, else a guess from the
     /// query script, else "provider default" (`None`).
     pub fn search_langs(&self, query: &str) -> Vec<Option<String>> {
-        if self.filters.langs.is_empty() {
+        let mut langs: Vec<Option<String>> = if self.filters.langs.is_empty() {
             vec![octos_research::lang::guess_from_script(query).map(String::from)]
         } else {
             self.filters.langs.iter().cloned().map(Some).collect()
+        };
+        for l in self.query_by_lang.keys() {
+            if !langs.iter().flatten().any(|x| x == l) {
+                langs.push(Some(l.clone()));
+            }
         }
+        langs
+    }
+
+    /// The query for one language round.
+    pub fn query_for<'a>(&'a self, query: &'a str, lang: Option<&str>) -> &'a str {
+        octos_research::lang::query_for(query, &self.query_by_lang, lang)
     }
 
     pub fn is_news(&self, query: &str) -> bool {
@@ -137,6 +160,9 @@ pub(crate) struct ProviderOut {
     /// Model-written answer text (Perplexity, Tavily, Serper knowledge
     /// graph), used for the overview fallback and follow-up topics.
     pub answer: String,
+    /// Provider notes worth passing on (e.g. the metasearch saying key-less
+    /// general search is limited).
+    pub notes: Vec<String>,
 }
 
 /// Result of one search round across providers.
@@ -148,6 +174,7 @@ pub(crate) struct RoundOut {
     pub errors: Vec<String>,
     /// Every provider called this round (with or without results).
     pub tried: Vec<String>,
+    pub notes: Vec<String>,
 }
 
 pub(crate) fn api_client() -> &'static reqwest::Client {
@@ -195,6 +222,7 @@ pub(crate) fn serp_scrape_allowed() -> bool {
 pub(crate) fn auto_plan(news: bool, allow_serp_scrape: bool) -> Vec<Provider> {
     plan::plan(&PlanInput {
         news,
+        metasearch: octos_research::metasearch::enabled(|k| std::env::var(k).ok()),
         searxng_configured: env_nonempty(octos_research::SEARXNG_URL_ENV).is_some(),
         keyed: keyed_available(),
         allow_serp_scrape,
@@ -306,6 +334,11 @@ async fn run_parallel(
                     continue;
                 }
                 out.providers.push(p.id().to_string());
+                for n in po.notes {
+                    if !out.notes.contains(&n) {
+                        out.notes.push(n);
+                    }
+                }
                 if !po.answer.trim().is_empty() {
                     if !out.answer.is_empty() {
                         out.answer.push_str("\n\n");
@@ -351,6 +384,7 @@ async fn run_provider(
     let lang_primary = lang.map(octos_research::lang::primary);
     let key = |k: &str| env_nonempty(k).ok_or_else(|| format!("{k} not set"));
     let hits = match p {
+        Provider::Metasearch => metasearch_round(opts, query, lang, count).await?,
         Provider::Gdelt => {
             gdelt_throttle().wait("api.gdeltproject.org", None).await;
             let url = free::gdelt_request_url(query, lang, since, count as usize, opts.now);
@@ -358,6 +392,7 @@ async fn run_provider(
             ProviderOut {
                 hits: free::parse_gdelt(&body)?,
                 answer: String::new(),
+                ..Default::default()
             }
         }
         Provider::GoogleNewsRss => {
@@ -369,6 +404,7 @@ async fn run_provider(
             ProviderOut {
                 hits,
                 answer: String::new(),
+                ..Default::default()
             }
         }
         Provider::Searxng => {
@@ -380,6 +416,7 @@ async fn run_provider(
             ProviderOut {
                 hits,
                 answer: String::new(),
+                ..Default::default()
             }
         }
         Provider::Serper => {
@@ -487,6 +524,7 @@ async fn run_provider(
             ProviderOut {
                 hits: crate::ddg_search(query, count).await?,
                 answer: String::new(),
+                ..Default::default()
             }
         }
         Provider::BingBrowser => {
@@ -496,11 +534,66 @@ async fn run_provider(
             ProviderOut {
                 hits: crate::bing_cdp_search(query, count).await?,
                 answer: String::new(),
+                ..Default::default()
             }
         }
         Provider::Exa => return Err("not supported by deep-search".to_string()),
     };
     Ok(hits)
+}
+
+/// The process-wide metasearch (shares rate limits, cache and engine
+/// health across rounds).
+fn metasearch() -> &'static octos_research::metasearch::Metasearch {
+    static M: OnceLock<octos_research::metasearch::Metasearch> = OnceLock::new();
+    M.get_or_init(|| {
+        octos_research::metasearch::Metasearch::from_env(
+            std::sync::Arc::new(octos_research::metasearch::ReqwestFetch::new()),
+            &Default::default(),
+        )
+    })
+}
+
+/// One metasearch call for `query` in `lang`.
+async fn metasearch_round(
+    opts: &Options,
+    query: &str,
+    lang: Option<&str>,
+    count: u8,
+) -> Result<ProviderOut, String> {
+    let since = opts.filters.since.as_ref();
+    let mut req = octos_research::metasearch::SearchRequest::new(
+        query,
+        opts.category.metasearch_category(query, since, opts.now),
+    );
+    req.langs = lang.map(|l| vec![l.to_string()]).unwrap_or_default();
+    req.region = opts.region.clone();
+    req.since = opts.filters.since.clone();
+    req.count = count as usize;
+    req.limit = count as usize * 2;
+    req.filters = opts.filters.clone();
+    req.now = opts.now;
+    let resp = metasearch().search(&req).await;
+    if resp.items.is_empty() {
+        let engines: Vec<String> = resp
+            .engines
+            .iter()
+            .map(|e| match &e.error {
+                Some(err) => format!("{} {:?}: {err}", e.engine, e.status),
+                None => format!("{} {:?}", e.engine, e.status),
+            })
+            .collect();
+        let mut msg = format!("no results ({})", engines.join("; "));
+        if let Some(note) = resp.note {
+            msg.push_str(&format!(". {note}"));
+        }
+        return Err(msg);
+    }
+    Ok(ProviderOut {
+        hits: resp.hits(),
+        answer: String::new(),
+        notes: resp.note.into_iter().collect(),
+    })
 }
 
 fn hit(url: &str, title: &str, snippet: &str, provider: &str) -> Option<SearchHit> {
@@ -543,7 +636,11 @@ pub(crate) fn parse_serper(text: &str) -> Result<ProviderOut, String> {
             Some(h)
         })
         .collect();
-    Ok(ProviderOut { hits, answer })
+    Ok(ProviderOut {
+        hits,
+        answer,
+        ..Default::default()
+    })
 }
 
 pub(crate) fn parse_tavily(text: &str) -> Result<ProviderOut, String> {
@@ -562,7 +659,11 @@ pub(crate) fn parse_tavily(text: &str) -> Result<ProviderOut, String> {
             Some(h)
         })
         .collect();
-    Ok(ProviderOut { hits, answer })
+    Ok(ProviderOut {
+        hits,
+        answer,
+        ..Default::default()
+    })
 }
 
 pub(crate) fn parse_brave(text: &str) -> Result<ProviderOut, String> {
@@ -581,6 +682,7 @@ pub(crate) fn parse_brave(text: &str) -> Result<ProviderOut, String> {
     Ok(ProviderOut {
         hits,
         answer: String::new(),
+        ..Default::default()
     })
 }
 
@@ -601,6 +703,7 @@ pub(crate) fn parse_you(text: &str) -> Result<ProviderOut, String> {
     Ok(ProviderOut {
         hits,
         answer: String::new(),
+        ..Default::default()
     })
 }
 
@@ -628,7 +731,11 @@ pub(crate) fn parse_perplexity(text: &str) -> Result<ProviderOut, String> {
             .filter_map(|c| hit(c.as_str()?, "", "", "perplexity"))
             .collect();
     }
-    Ok(ProviderOut { hits, answer })
+    Ok(ProviderOut {
+        hits,
+        answer,
+        ..Default::default()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +908,42 @@ mod tests {
     }
 
     #[test]
+    fn should_search_each_language_in_its_own_words() {
+        let o = Options::from_input(
+            &input(serde_json::json!({
+                "query": "AI regulation",
+                "query_by_lang": {"zh-cn": "人工智能 监管"}
+            })),
+            now(),
+        )
+        .unwrap();
+        assert!(o.filters.langs.is_empty(), "no lang filter was asked for");
+        let langs = o.search_langs("AI regulation");
+        assert!(langs.contains(&Some("zh-CN".to_string())), "{langs:?}");
+        assert_eq!(o.query_for("AI regulation", Some("zh-CN")), "人工智能 监管");
+        assert_eq!(o.query_for("AI regulation", Some("zh")), "人工智能 监管");
+        assert_eq!(o.query_for("AI regulation", None), "AI regulation");
+
+        let o = Options::from_input(
+            &input(serde_json::json!({
+                "query": "AI regulation",
+                "lang": "en",
+                "query_by_lang": {"zh": "人工智能 监管"}
+            })),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(o.filters.langs, vec!["en", "zh"], "kept, not filtered out");
+
+        for bad in [
+            serde_json::json!({"query": "q", "query_by_lang": {"chinese!": "x"}}),
+            serde_json::json!({"query": "q", "query_by_lang": {"zh": "  "}}),
+        ] {
+            assert!(Options::from_input(&input(bad), now()).is_err());
+        }
+    }
+
+    #[test]
     fn should_parse_controls_from_input() {
         let o = Options::from_input(
             &input(serde_json::json!({
@@ -938,7 +1081,14 @@ mod tests {
                 "no search-results scraping in the default order: {order:?}"
             );
         }
-        assert_eq!(auto_plan(true, false)[0], Provider::Gdelt);
+        // The metasearch is the first free provider for every category
+        // (GDELT runs inside it), unless OCTOS_METASEARCH=0.
+        if octos_research::metasearch::enabled(|k| std::env::var(k).ok()) {
+            assert_eq!(auto_plan(true, false)[0], Provider::Metasearch);
+            assert_eq!(auto_plan(false, false)[0], Provider::Metasearch);
+        } else {
+            assert_eq!(auto_plan(true, false)[0], Provider::Gdelt);
+        }
     }
 
     #[test]
