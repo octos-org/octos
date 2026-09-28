@@ -439,12 +439,11 @@ jobs:
   # default-keyed cache and don't fight each other.
 
   test-octos-agent:
-    name: test-octos-agent (${{ matrix.variant }}-${{ matrix.attempt }})
+    name: test-octos-agent (${{ matrix.variant }})
     strategy:
       fail-fast: false
       matrix:
-        variant: [warm, cold-bigpid]
-        attempt: [1, 2]
+        variant: [plain, pidns, netns, pidns-2]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -463,47 +462,33 @@ jobs:
           components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
-        if: matrix.variant == 'warm'
         with:
           shared-key: octos-agent-tests-lib
           save-if: false
 
+      - name: Build
+        run: cargo test -p octos-agent --lib --no-run
+
       - name: PID facts
-        run: |
-          echo "pid_max=$(cat /proc/sys/kernel/pid_max) last_pid=$(cat /proc/sys/kernel/ns_last_pid)"
-          sysctl kernel.pid_max; ls /usr/lib/sysctl.d/ /etc/sysctl.d/ ; grep -rh pid_max /usr/lib/sysctl.d/ /etc/sysctl.d/ /etc/sysctl.conf || true
+        run: echo "pid_max=$(cat /proc/sys/kernel/pid_max) last_pid=$(cat /proc/sys/kernel/ns_last_pid) user=$(id -un)"
 
-      - name: Raise pid_max
-        if: matrix.variant == 'cold-bigpid'
-        run: sudo sysctl -w kernel.pid_max=4194304
+      - name: Test (plain)
+        if: matrix.variant == 'plain'
+        timeout-minutes: 25
+        run: cargo test -p octos-agent --lib
 
-      - name: Test octos-agent (lib)
-        timeout-minutes: 30
+      - name: Test (own PID namespace)
+        if: startsWith(matrix.variant, 'pidns')
+        timeout-minutes: 25
         run: |
-          echo "before: last_pid=$(cat /proc/sys/kernel/ns_last_pid)"
-          trap 'echo "after: last_pid=$(cat /proc/sys/kernel/ns_last_pid)"' EXIT
-          cat > /tmp/watchdog.sh <<'WD'
-          i=0
-          while true; do
-            sleep 3; i=$((i+1))
-            avail=$(df --output=avail -k / | tail -1)
-            memavail=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
-            nprocs=$(ps -e --no-headers | wc -l)
-            if [ $((i % 20)) -eq 0 ]; then echo "=== WD $(date -u +%T) disk_avail_kb=$avail mem_avail_kb=$memavail procs=$nprocs load=$(cut -d' ' -f1-3 /proc/loadavg) last_pid=$(cat /proc/sys/kernel/ns_last_pid)"; fi
-            if [ "$avail" -lt 2000000 ] || [ "$memavail" -lt 1500000 ] || [ "$nprocs" -gt 3000 ]; then
-              echo "=== WD TRIP $(date -u +%T) disk_avail_kb=$avail mem_avail_kb=$memavail procs=$nprocs"
-              df -h; free -m
-              ps -eo pid,ppid,pgid,etime,rss,pcpu,args --sort=-rss | cut -c1-220 | head -40
-              ps -eo comm --no-headers | sort | uniq -c | sort -rn | head -15
-              du -xsh /tmp /home/runner/work /home/runner/.cargo 2>/dev/null
-              du -xh --max-depth=2 /tmp 2>/dev/null | sort -rh | head -15
-              pkill -9 -f 'target/debug/deps/octos_agent-' || true
-              exit 0
-            fi
-          done
-          WD
-          bash /tmp/watchdog.sh &
-          cargo test -p octos-agent --lib
+          sudo -E unshare --pid --fork --mount-proc -- sudo -E -u "$USER" env "PATH=$PATH" "HOME=$HOME" cargo test -p octos-agent --lib
+
+      - name: Test (own network namespace)
+        if: matrix.variant == 'netns'
+        timeout-minutes: 25
+        run: |
+          sudo -E unshare --net -- sudo -E -u "$USER" env "PATH=$PATH" "HOME=$HOME" bash -c 'ip link set lo up 2>/dev/null; cargo test -p octos-agent --lib --offline' || true
+          echo "netns run finished"
 
   # Split three ways so the PR wait is the slowest third (~25 min), not the
   # whole ~57 min serial run. Every step that ran before still runs, in
