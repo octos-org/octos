@@ -33,7 +33,7 @@ Sessions are stored as rolling JSONL segments, not one ever-growing file. When t
 
 **Memory planning**: the budget bounds the file bytes one resident session holds; parsed rows cost roughly 1.5–3× their file size, so a process caching N long sessions needs up to about `N × 32 MiB × 3`. Memory-limited hosts should lower the budget (e.g. `OCTOS_SESSION_LOAD_BUDGET_BYTES=16777216`) or the session cache size (`gateway.max_sessions`).
 
-**Mixed-version overlap** (e.g. a Kubernetes rolling upgrade on a shared data directory): an old binary does not see `.segments/`; its `*.jsonl` walks show only the active file, which looks like a short session. Nothing is lost — the sealed segments are untouched and the new binary reads them — but avoid long overlaps on a shared data directory, and never let an old binary *rewrite* (rename, summary) a rolled session: it would record `sealed_segments: 0` and orphan the segments.
+**Mixed-version overlap** (e.g. a Kubernetes rolling upgrade on a shared data directory): an old binary does not see `.segments/`; its `*.jsonl` walks show only the active file, which looks like a short session. Sessions this build has written carry schema version 2, which older builds refuse to load — but never let an old binary *rewrite* (rename, summary) any rolled session: a rewrite replaces the active file with whatever the old build could read. For an older (schema 1) session, a legacy rewrite that erases `sealed_segments` makes the sealed segments invisible to loads; while that unnamed state stands, rewrites refuse and the seal refuses to replace the unnamed segments, so the files stay on disk but the session stops rolling until the state is reconciled.
 
 ---
 

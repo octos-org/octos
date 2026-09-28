@@ -1377,6 +1377,234 @@ async fn should_not_read_a_merged_segment_twice_when_a_rewrite_left_it_behind() 
     );
 }
 
+/// #2481: a build that predates segments rewrites the active file with the
+/// meta IT knows — no `sealed_segments` key — so the count reads as zero
+/// while real segment files still sit in the segments directory. The next
+/// seal then computed `owned + 1 = 1`, found 000001 occupied by that real
+/// history, and removed it. The seal must refuse to replace a segment the
+/// active meta never named and keep the row in the active file instead.
+#[tokio::test]
+async fn should_not_replace_sealed_history_after_a_legacy_rewrite_erases_the_count() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "legacy");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    let sealed = segment_path(&segments_dir(&active), 1);
+    let real_history = std::fs::read(&sealed).unwrap();
+
+    // The legacy rewrite: same rows, but a meta line of the pre-segments
+    // shape, which carries no `sealed_segments`.
+    let rows = std::fs::read_to_string(&active).unwrap();
+    let body = rows.split_once('\n').unwrap().1.to_owned();
+    let legacy_meta = format!(
+        "{{\"schema_version\":1,\"session_key\":\"{}\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}}",
+        key.0
+    );
+    std::fs::write(&active, format!("{legacy_meta}\n{body}")).unwrap();
+
+    // The erased count hides the sealed history from loads, too — that much
+    // is legacy behavior — but the files must stay on disk.
+    mgr.cache.pop(&key.0);
+    let loaded = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        contents(&loaded),
+        vec!["after the roll"],
+        "the legacy meta owns zero segments, so the sealed rows are orphaned"
+    );
+
+    // The next seal lands on `owned + 1 = 1` — occupied by real history.
+    mgr.cache.put(key.0.clone(), loaded);
+    mgr.add_message(&key, oversize_row()).await.unwrap();
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "later"))
+        .await
+        .unwrap();
+    assert_eq!(
+        seq, 2,
+        "appends continue from the orphaned view's next_seq; the refused seal does not reset the chain"
+    );
+
+    assert!(
+        std::fs::read(&sealed).unwrap() == real_history,
+        "the sealed segment survives the refused seal byte for byte"
+    );
+    assert!(
+        !segment_path(&segments_dir(&active), 2).is_file(),
+        "the refused seal does not chain a segment behind the history it would have destroyed"
+    );
+    let active_rows = std::fs::read_to_string(&active).unwrap();
+    assert!(
+        active_rows.contains("\"later\""),
+        "the refused roll keeps the row in the active file"
+    );
+
+    // The orphaned history stays orphaned — refusal preserves it on disk
+    // but does not adopt it; reconciling that is an operator action.
+    mgr.cache.pop(&key.0);
+    let still = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        contents(&still),
+        vec!["after the roll", "<8389632 bytes>", "later"],
+        "loads keep reading the active file the refused seal appended to"
+    );
+}
+
+/// #2481: the schema bump is what keeps pre-segments builds from re-erasing
+/// the count — every reader refuses a newer version, so a version-2 file is
+/// skipped whole by them. A version-1 file must keep loading here, and the
+/// next meta this build stamps must carry the new version.
+#[tokio::test]
+async fn a_schema_one_session_still_loads_and_the_next_meta_is_stamped_two() {
+    let tmp = TempDir::new().unwrap();
+    let active = tmp.path().join("sessions").join("cli%3Aold.jsonl");
+    std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+    std::fs::write(
+        &active,
+        concat!(
+            "{\"schema_version\":1,\"session_key\":\"cli:old\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+            "{\"role\":\"user\",\"content\":\"seed\",\"timestamp\":\"2026-01-01T00:00:01Z\"}\n"
+        ),
+    )
+    .unwrap();
+
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "old");
+    let loaded = mgr.load_from_disk(&key).await.unwrap();
+    assert_eq!(contents(&loaded), vec!["seed"]);
+    mgr.cache.put(key.0.clone(), loaded);
+    mgr.add_message(&key, oversize_row()).await.unwrap();
+    mgr.add_message(&key, make_message(MessageRole::User, "next"))
+        .await
+        .unwrap();
+
+    // The oversize row triggered a roll; the fresh active meta is stamped
+    // with the new version and the sealed segment kept its original one.
+    let meta = read_session_meta(&active).unwrap();
+    assert_eq!(meta.sealed_segments, 1);
+    let sealed_meta = read_session_meta(&segment_path(&segments_dir(&active), 1)).unwrap();
+    assert_eq!(
+        sealed_meta.schema_version, 1,
+        "the sealed rows keep loading"
+    );
+    mgr.cache.pop(&key.0);
+    let full = mgr.load_full(&key).await.unwrap();
+    assert_eq!(contents(&full), vec!["seed", "<8389632 bytes>", "next"]);
+}
+
+/// A rewrite must not launder a meta that does not name its count. Stamping a
+/// trusted-looking `sealed_segments: 0` over the unnamed state would re-arm
+/// the very seal replacement the guard refuses, and the next roll would
+/// destroy the orphaned history (#2481).
+#[tokio::test]
+async fn a_rewrite_does_not_launder_an_unnamed_sealed_count() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "launder");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    let sealed = segment_path(&segments_dir(&active), 1);
+    let real_history = std::fs::read(&sealed).unwrap();
+
+    // The legacy rewrite erases the count; the segments become orphans.
+    let rows = std::fs::read_to_string(&active).unwrap();
+    let body = rows.split_once('\n').unwrap().1.to_owned();
+    let legacy_meta = format!(
+        "{{\"schema_version\":1,\"session_key\":\"{}\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}}",
+        key.0
+    );
+    std::fs::write(&active, format!("{legacy_meta}\n{body}")).unwrap();
+    mgr.cache.pop(&key.0);
+    let loaded = mgr.load_full(&key).await.unwrap();
+    mgr.cache.put(key.0.clone(), loaded);
+
+    // The rewrite refuses instead of stamping a trusted count over the
+    // unnamed state, and the meta line on disk stays unnamed.
+    assert!(
+        mgr.rewrite(&key).await.is_err(),
+        "rewriting an unnamed count with segments on disk is refused"
+    );
+    let meta_line = std::fs::read_to_string(&active).unwrap();
+    assert!(
+        meta_line.contains("\"schema_version\":1"),
+        "the refused rewrite left the legacy meta line untouched: {meta_line}"
+    );
+
+    // With the laundering path closed, the seal guard still holds.
+    mgr.cache
+        .put(key.0.clone(), mgr.load_full(&key).await.unwrap());
+    mgr.add_message(&key, oversize_row()).await.unwrap();
+    mgr.add_message(&key, make_message(MessageRole::User, "later"))
+        .await
+        .unwrap();
+    assert!(
+        std::fs::read(&sealed).unwrap() == real_history,
+        "the orphaned history survives the refused seal"
+    );
+}
+
+/// A pre-segments single file — a meta without the key and no segments on
+/// disk — rewrites normally. That is the upgrade path, and the rewritten
+/// meta is the first one that names its (empty) count.
+#[tokio::test]
+async fn a_legacy_single_file_session_still_rewrites() {
+    let tmp = TempDir::new().unwrap();
+    let active = tmp.path().join("sessions").join("cli%3Anc.jsonl");
+    std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+    std::fs::write(
+        &active,
+        concat!(
+            "{\"schema_version\":1,\"session_key\":\"cli:nc\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+            "{\"role\":\"user\",\"content\":\"seed\",\"timestamp\":\"2026-01-01T00:00:01Z\"}\n"
+        ),
+    )
+    .unwrap();
+
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "nc");
+    let loaded = mgr.load_from_disk(&key).await.unwrap();
+    assert_eq!(contents(&loaded), vec!["seed"]);
+    mgr.cache.put(key.0.clone(), loaded);
+
+    mgr.rewrite(&key).await.unwrap();
+    let meta_line = std::fs::read_to_string(&active).unwrap();
+    assert!(
+        meta_line.starts_with("{\"schema_version\":2"),
+        "the rewritten meta is stamped with the current version: {meta_line}"
+    );
+    assert!(
+        meta_line.contains("\"sealed_segments\":0"),
+        "the rewritten meta names its count: {meta_line}"
+    );
+    mgr.cache.pop(&key.0);
+    assert_eq!(mgr.load_full(&key).await.unwrap().messages.len(), 1);
+}
+
+#[test]
+fn meta_line_naming_checks() {
+    let dir = TempDir::new().unwrap();
+    let write_first_line = |line: &str| {
+        let path = dir.path().join("probe.jsonl");
+        std::fs::write(&path, format!("{line}\n{{\"role\":\"user\"}}")).unwrap();
+        path
+    };
+
+    let named = write_first_line("{\"schema_version\":2,\"sealed_segments\":0}");
+    assert!(active_meta_records_sealed_segments(&named));
+    let unnamed = write_first_line("{\"schema_version\":1}");
+    assert!(!active_meta_records_sealed_segments(&unnamed));
+    let null_count = write_first_line("{\"schema_version\":2,\"sealed_segments\":null}");
+    assert!(!active_meta_records_sealed_segments(&null_count));
+    let corrupt = write_first_line("not json at all");
+    assert!(!active_meta_records_sealed_segments(&corrupt));
+    let empty = dir.path().join("empty.jsonl");
+    std::fs::write(&empty, "").unwrap();
+    assert!(!active_meta_records_sealed_segments(&empty));
+    assert!(!active_meta_records_sealed_segments(
+        &dir.path().join("missing.jsonl")
+    ));
+}
+
 /// F2: a crash after the seal's rename but before the fresh meta line is
 /// durable leaves sealed segments and no usable active file. The session must
 /// not vanish, and the seq chain must continue from the sealed rows.

@@ -12,8 +12,11 @@ use octos_core::{Message, MessageRole, SessionKey};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-/// Current schema version for session JSONL files.
-const CURRENT_SESSION_SCHEMA: u32 = 1;
+/// Current schema version for session JSONL files. Version 2 is the sealed
+/// segments era: every reader refuses a newer version, so a build from
+/// before segments skips a version-2 file whole instead of rewriting it with
+/// a meta line that erases `sealed_segments` (#2481).
+const CURRENT_SESSION_SCHEMA: u32 = 2;
 
 /// Observer callback invoked AFTER a successful durable commit by
 /// [`SessionManager::add_message_with_seq`] (and the equivalent
@@ -915,37 +918,52 @@ fn append_row_rolling(
         let owned = read_session_meta(active)
             .map(|meta| meta.sealed_segments)
             .unwrap_or(sealed);
-        drop(file);
-        std::fs::create_dir_all(&dir)?;
         let next_index = owned + 1;
         let sealed_path = segment_path(&dir, next_index);
-        if sealed_path.exists() {
+        // A meta line that never names its sealed count cannot prove the
+        // file at `next_index` is residue: a build that predates segments
+        // rewrites the count away (#2481), so the file in the way is real
+        // history and replacing it would destroy it. Refuse the seal and
+        // keep the row in the active file. A meta that names its count may
+        // still be short of the directory — the residue of an interrupted
+        // rewrite, which the replacement below exists for.
+        if sealed_path.exists() && !active_meta_records_sealed_segments(active) {
             warn!(
                 key,
                 segment = next_index,
-                "replacing a sealed session segment the active meta did not own"
+                "refusing to seal: the active meta does not name its sealed count, so the segment in the way may be real history"
             );
-            std::fs::remove_file(&sealed_path)?;
+        } else {
+            drop(file);
+            std::fs::create_dir_all(&dir)?;
+            if sealed_path.exists() {
+                warn!(
+                    key,
+                    segment = next_index,
+                    "replacing a sealed session segment the active meta did not own"
+                );
+                std::fs::remove_file(&sealed_path)?;
+            }
+            std::fs::rename(active, &sealed_path)?;
+            fsync_dir(&dir);
+            if let Some(parent) = active.parent() {
+                fsync_dir(parent);
+            }
+            debug!(
+                key,
+                segment = next_index,
+                bytes = file_len,
+                "sealed session segment"
+            );
+            sealed = next_index;
+            rolled = true;
+            file = std::fs::OpenOptions::new()
+                .read(true)
+                .create(true)
+                .append(true)
+                .open(active)?;
+            file_len = 0;
         }
-        std::fs::rename(active, &sealed_path)?;
-        fsync_dir(&dir);
-        if let Some(parent) = active.parent() {
-            fsync_dir(parent);
-        }
-        debug!(
-            key,
-            segment = next_index,
-            bytes = file_len,
-            "sealed session segment"
-        );
-        sealed = next_index;
-        rolled = true;
-        file = std::fs::OpenOptions::new()
-            .read(true)
-            .create(true)
-            .append(true)
-            .open(active)?;
-        file_len = 0;
     }
 
     if file_len == 0 {
@@ -970,6 +988,24 @@ fn append_row_rolling(
 /// rewrite. Returns the sealed count the rewritten file records.
 fn rewrite_active_from_window(active: &Path, session: &Session, meta: SessionMeta) -> Result<u32> {
     use std::io::Write;
+    // A meta line that does not name its sealed count may be hiding segments
+    // the loader ignored (#2481). Stamping this window's count over it would
+    // make the unnamed state look trusted, and the next seal would then
+    // replace the files the count does not name — real history. Refuse while
+    // the unnamed state stands. A session with no segments on disk is just a
+    // pre-segments file and rewrites normally.
+    if !active_meta_records_sealed_segments(active)
+        && sealed_segment_count(&segments_dir(active)) > 0
+    {
+        warn!(
+            key = %session.key,
+            "refusing to rewrite: the active meta does not name its sealed count while sealed segments are on disk"
+        );
+        return Err(eyre::eyre!(
+            "session {} has sealed segments its meta line does not name; reconcile the segments directory before rewriting",
+            session.key
+        ));
+    }
     let remaining_sealed = session
         .sealed_segments
         .saturating_sub(session.loaded_sealed);
@@ -1029,6 +1065,27 @@ fn read_session_meta(path: &Path) -> Option<SessionMeta> {
     let mut first = String::new();
     BufReader::new(file).read_line(&mut first).ok()?;
     serde_json::from_str(first.trim_end()).ok()
+}
+
+/// Whether a session file's meta line records `sealed_segments` as a usable
+/// count. Serde defaults the field, so [`read_session_meta`] cannot tell a
+/// genuine zero from a build that predates segments and never wrote the key —
+/// only the raw line can (#2481).
+fn active_meta_records_sealed_segments(path: &Path) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut first = String::new();
+    if BufReader::new(file).read_line(&mut first).unwrap_or(0) == 0 {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(first.trim_end()).is_ok_and(
+        |meta| {
+            meta.get("sealed_segments")
+                .is_some_and(|count| count.is_u64())
+        },
+    )
 }
 
 /// Delete a session's sealed segments (with the directory) beside `active`.
@@ -1160,8 +1217,11 @@ struct SessionMeta {
     updated_at: DateTime<Utc>,
     /// How many sealed segments precede this file (see [`segments_dir`]).
     /// Zero for a session that never rolled — and for every file written
-    /// before segments existed, which is why the field defaults.
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    /// before segments existed, which is why the field defaults. Always
+    /// serialized: the seal and the rewrite both refuse to act on a meta
+    /// line that does not name its count, so a genuine zero must still be
+    /// on record (#2481).
+    #[serde(default)]
     sealed_segments: u32,
     /// Visible (rollback-folded) messages held by the segments before this
     /// file: the seq of this file's first row. Zero when nothing precedes it.
@@ -1493,10 +1553,6 @@ fn sealed_segment_count(dir: &Path) -> u32 {
         n += 1;
     }
     n
-}
-
-fn is_zero_u32(v: &u32) -> bool {
-    *v == 0
 }
 
 fn is_zero_usize(v: &usize) -> bool {
