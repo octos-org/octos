@@ -865,6 +865,14 @@ jobs:
     # `#[cfg(unix)]` over re-muting the whole job — a check that cannot fail
     # tells you nothing.
     runs-on: windows-latest
+    env:
+      # Test threads run on whatever stack the harness hands out — on Windows
+      # that is too small for the deep agent poll chains in octos-cli's
+      # local-runtime tests, and a stack overflow does not fail one test: it
+      # aborts the whole test binary, losing every other test's result with it
+      # (the octos-cli lib step died this way on 6/6 consecutive main pushes,
+      # #2581). 8 MiB is what every production runtime hands the same futures.
+      RUST_MIN_STACK: "8388608"
     # The full Windows suite runs ~82 min when it passes (octos-cli integration
     # ~19 min and lib ~13 min, two builds ~20 min, doc tests ~6 min), so 90 left
     # almost no headroom: once the stack-overflow abort that used to end the

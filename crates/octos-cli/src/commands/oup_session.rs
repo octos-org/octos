@@ -1058,13 +1058,14 @@ mod tests {
 
     /// The local runtime's turn path polls deep agent futures, which need the
     /// 8 MiB stacks every production entry point sets (chat, ACP, gateway,
-    /// MCP); `#[tokio::test]` drives this future on the test thread itself,
-    /// and a Windows debug build overflows that default stack — which aborts
-    /// the whole test binary, taking every other test's result with it.
-    /// Reproducible on any platform by running the test binary under
-    /// `RUST_MIN_STACK=1048576`. Same class as the stdio dispatch test in
+    /// MCP, embedded serve); `#[tokio::test]` drives this future on the test
+    /// thread itself, and a Windows debug build overflows that default stack —
+    /// which aborts the whole test binary, taking every other test's result
+    /// with it (#2581). Same class as the stdio dispatch test in
     /// `api::ui_protocol_tests`, same treatment: run it on a thread with an
-    /// 8 MiB stack instead of whatever stack the harness hands out.
+    /// 8 MiB stack instead of whatever stack the harness hands out. Before the
+    /// wrapper, running the test binary under `RUST_MIN_STACK=1048576`
+    /// reproduced the abort on any platform.
     #[test]
     fn local_frontends_share_oup_persistence_and_reopen_context() {
         std::thread::Builder::new()
@@ -1072,6 +1073,7 @@ mod tests {
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 tokio::runtime::Builder::new_current_thread()
+                    .thread_stack_size(8 * 1024 * 1024)
                     .enable_all()
                     .build()
                     .expect("test runtime")
@@ -1079,7 +1081,7 @@ mod tests {
             })
             .expect("spawn big-stack test thread")
             .join()
-            .expect("local oup reopen test body panicked");
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
     }
 
     async fn local_frontends_share_oup_persistence_and_reopen_context_body() {
