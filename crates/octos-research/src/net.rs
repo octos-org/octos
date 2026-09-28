@@ -367,4 +367,47 @@ mod tests {
             "private answers must be reported with the module's taxonomy"
         );
     }
+
+    // --- pinned_get's pre-check ordering ---
+
+    /// The per-host gate must fire BEFORE [`check_url`]: a refused host
+    /// never reaches DNS. (The name here would fail closed at `check_url`
+    /// anyway — the error must be the gate's, not the resolver's.)
+    #[tokio::test]
+    async fn pinned_get_runs_the_pre_check_before_any_dns() {
+        let deny_all = |_host: &str| -> Result<(), String> { Err("gate said no".to_string()) };
+        let err = pinned_get(
+            "https://this-domain-does-not-exist-ssrf-test.invalid/",
+            PinnedFetch {
+                timeout: Duration::from_secs(1),
+                user_agent: "octos-research-test",
+                pre_check: Some(&deny_all),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "gate said no");
+    }
+
+    /// Once the gate admits a host, [`check_url`] owns the verdict: the same
+    /// name must come back as the module's fail-closed DNS error, never a
+    /// fetched response.
+    #[tokio::test]
+    async fn pinned_get_passes_the_gate_then_fails_closed_at_check_url() {
+        let allow_all = |_host: &str| -> Result<(), String> { Ok(()) };
+        let err = pinned_get(
+            "https://this-domain-does-not-exist-ssrf-test.invalid/",
+            PinnedFetch {
+                timeout: Duration::from_secs(1),
+                user_agent: "octos-research-test",
+                pre_check: Some(&allow_all),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("fail closed"),
+            "after the gate, check_url's fail-closed DNS verdict applies: {err}"
+        );
+    }
 }

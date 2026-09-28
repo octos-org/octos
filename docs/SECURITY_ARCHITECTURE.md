@@ -32,7 +32,7 @@ Not all defensive layers provide equal guarantees. This table classifies each la
 | Layer | Type | Enforcement | Bypass Resistance |
 |-------|------|-------------|-------------------|
 | **Sandbox** (bwrap, sandbox-exec, Docker, Windows AppContainer) | Hard | Kernel namespaces / SBPL / container / AppContainer | Requires kernel exploit |
-| **SSRF filter** (`ssrf.rs`) | Hard | DNS resolution + IP validation, fail-closed | Requires DNS rebinding race or redirect bypass (see known gaps) |
+| **SSRF filter** (`octos_research::net`) | Hard | DNS resolution + IP validation, fail-closed | Requires DNS rebinding race or redirect bypass (see known gaps) |
 | **`O_NOFOLLOW` file I/O** | Hard | Kernel (atomic open flag) | No known bypass |
 | **`BLOCKED_ENV_VARS`** | Hard | Process environment (set before exec) | Requires parent process compromise |
 | **Tool Policy** (allow/deny lists) | Hard | Application (deny-wins, checked at dispatch) | Requires code bug in policy enforcement |
@@ -243,11 +243,11 @@ All backends remove these from the child process environment before execution.
 
 ### 3.5 SSRF Protection
 
-`octos-agent/src/tools/ssrf.rs` provides shared SSRF validation for `web_fetch`, `browser`, and MCP HTTP transports.
+`octos_research::net::check_url` is the workspace's one SSRF validation; `octos-agent/src/tools/ssrf.rs` adapts it for `web_fetch`, `browser`, `site_crawl`, and MCP HTTP transports, and adds the fleet host allowlist `web_fetch` enforces per redirect hop.
 
-**Two-phase check** (`check_ssrf`):
-1. **Hostname validation** (`is_private_host`): Blocks `localhost`, `localhost.`, and any IP literal that resolves to a private range.
-2. **DNS resolution check**: After hostname passes, resolves via `tokio::net::lookup_host` and checks all returned addresses against `is_private_ip`.
+**Two-phase check** (`check_url`):
+1. **Hostname validation** (`is_private_host`): Blocks `localhost`, `localhost.`, and any IP literal that resolves to a private range; non-http(s) schemes are refused outright.
+2. **DNS resolution check**: After hostname passes, resolves via `tokio::net::lookup_host` and checks all returned addresses against `is_private_ip` — the answer set must be non-empty (fail closed) and every address public.
 
 **Blocked IP ranges** (`is_private_ip`):
 - IPv4: loopback (127/8), private (10/8, 172.16/12, 192.168/16), link-local (169.254/16 -- AWS metadata), unspecified (0.0.0.0).

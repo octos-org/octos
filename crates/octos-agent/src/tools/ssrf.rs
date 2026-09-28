@@ -2,8 +2,10 @@
 //!
 //! A thin agent-facing adapter over `octos_research::net` — the one SSRF
 //! implementation in the workspace (host/IP classification, fail-closed DNS
-//! validation, per-hop pinned fetching). Used by the `web_fetch`, `browser`
-//! and `site_crawl` tools and the MCP remote dispatcher.
+//! validation, per-hop pinned fetching). Used by the `browser` and
+//! `site_crawl` tools and the MCP remote dispatcher; `web_fetch` takes its
+//! fleet allowlist gate ([`check_host_allowlist`]) from here and its URL
+//! safety directly from `octos_research::net`.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -334,10 +336,10 @@ mod tests {
 
     // --- adapter parity with the shared implementation ---
 
-    /// The adapter must classify exactly like `octos_research::net::check_url`
-    /// — it is the same implementation underneath, and this pins that the two
-    /// faces cannot drift apart again (pre-consolidation, `ftp://` public
-    /// literals were admitted here and rejected there).
+    /// The adapter maps errors and narrows pin sets but must never invert a
+    /// verdict: everything `check_url` blocks stays blocked, with this
+    /// module's messages. The listed URLs double as the module's blocking
+    /// matrix (each row also asserts through the adapter's real code path).
     #[tokio::test]
     async fn adapter_classifies_in_parity_with_check_url() {
         for url in [
@@ -365,10 +367,10 @@ mod tests {
 
     #[tokio::test]
     async fn adapter_returns_no_pins_for_public_ipv6_literals() {
-        // A public IPv6 literal is validated structurally by `check_url` (no
-        // DNS round-trip) and connects directly — empty pin set, like every
-        // literal host. Pre-consolidation this resolved the bracketed host
-        // through DNS and pinned from that answer.
+        // A public IPv6 literal is validated structurally by `check_url` —
+        // no name resolution at all — and connects directly: empty pin set,
+        // like every literal host. Pre-consolidation this resolved the
+        // bracketed host through `getaddrinfo` and pinned from that answer.
         let result = check_ssrf_with_addrs("http://[2606:4700::1111]/").await;
         let result = result.expect("public IPv6 literal must be allowed");
         assert!(
