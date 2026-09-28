@@ -1,10 +1,10 @@
 //! Provider order. octos's own metasearch first (key-less engines over
 //! official APIs and feeds, see [`crate::metasearch`]), then a configured
 //! SearXNG, then search APIs the person added keys for. When the metasearch
-//! is turned off, GDELT and Google News RSS are called directly for news. Scraping a search
-//! engine's results page (DuckDuckGo HTML, Bing in headless Chrome) is never
-//! part of the default order; both are appended only when an operator opts
-//! in with [`crate::SERP_SCRAPE_ENV`].
+//! is turned off, GDELT and Google News RSS are called directly for news.
+//! Results-page search (DuckDuckGo HTML, then Bing in headless Chrome) comes
+//! last for general web results; it is on unless the operator turns it off
+//! ([`crate::SERP_SCRAPE_ENV`]`=0`).
 
 use serde::{Deserialize, Serialize};
 
@@ -24,11 +24,11 @@ pub enum Provider {
     Perplexity,
     Brave,
     You,
-    /// DuckDuckGo's HTML results page. Opt-in only (see
+    /// DuckDuckGo's HTML results page (on unless turned off, see
     /// [`crate::SERP_SCRAPE_ENV`]).
     #[serde(rename = "duckduckgo")]
     DuckDuckGo,
-    /// Bing rendered in headless Chrome. Opt-in only (see
+    /// Bing rendered in headless Chrome (on unless turned off, see
     /// [`crate::SERP_SCRAPE_ENV`]).
     #[serde(rename = "bing_cdp")]
     BingBrowser,
@@ -196,8 +196,8 @@ pub struct PlanInput {
     pub searxng_configured: bool,
     /// Keyed providers that have a key, in the caller's priority order.
     pub keyed: Vec<Provider>,
-    /// Operator opt-in for scraping search-results pages (DuckDuckGo HTML,
-    /// then Bing in headless Chrome), appended as the last resorts.
+    /// Results-page search (DuckDuckGo HTML, then Bing in headless Chrome),
+    /// appended as the last resorts; on unless the operator turned it off.
     pub allow_serp_scrape: bool,
 }
 
@@ -205,8 +205,9 @@ pub struct PlanInput {
 ///
 /// `metasearch` first for every category (its engines include GDELT and,
 /// if enabled, Google News); without it, news → `[gdelt, google_news_rss]`.
-/// Then `searxng` if configured, then the keyed providers. `duckduckgo` and
-/// `bing_cdp` only when explicitly allowed.
+/// Then `searxng` if configured, then the keyed providers, then `duckduckgo`
+/// and `bing_cdp` (results-page search: on unless the operator turned it
+/// off).
 pub fn plan(input: &PlanInput) -> Vec<Provider> {
     let mut out = Vec::new();
     if input.metasearch {
@@ -282,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn should_append_ddg_then_bing_when_scraping_is_opted_in() {
+    fn should_append_ddg_then_bing_when_results_page_search_is_on() {
         let order = plan(&PlanInput {
             keyed: vec![Provider::Brave],
             allow_serp_scrape: true,

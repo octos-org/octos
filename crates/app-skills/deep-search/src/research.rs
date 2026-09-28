@@ -46,7 +46,7 @@ pub(crate) struct Options {
     pub category: Category,
     /// Render JS-heavy pages with the browser when plain HTTP has no text.
     pub render: bool,
-    /// Operator opt-in (env) for scraping search-results pages.
+    /// Results-page search on (env; on unless turned off).
     pub allow_serp_scrape: bool,
     pub now: DateTime<Utc>,
 }
@@ -212,8 +212,8 @@ fn keyed_available() -> Vec<Provider> {
     .collect()
 }
 
-/// Operator opt-in for scraping search-results pages (DuckDuckGo HTML,
-/// Bing in headless Chrome).
+/// Whether results-page search (DuckDuckGo HTML, Bing in headless Chrome)
+/// is on: yes unless `OCTOS_ALLOW_SERP_SCRAPE=0`.
 pub(crate) fn serp_scrape_allowed() -> bool {
     octos_research::serp_scrape_allowed(|k| std::env::var(k).ok())
 }

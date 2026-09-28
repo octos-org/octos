@@ -1231,9 +1231,8 @@ fn build_client() -> reqwest::Client {
 // DuckDuckGo HTML search (keyless last resort)
 // ---------------------------------------------------------------------------
 
-/// DuckDuckGo's no-JavaScript HTML results page. **Opt-in only**
-/// (`OCTOS_ALLOW_SERP_SCRAPE=1`): it is a search-results page, which ADR
-/// 0002 rules out scraping by default. Requested with the identifiable
+/// DuckDuckGo's no-JavaScript HTML results page, for general web results
+/// (on unless `OCTOS_ALLOW_SERP_SCRAPE=0`). Requested with the identifiable
 /// research User-Agent; if DuckDuckGo declines, that is a clean miss.
 async fn ddg_search(query: &str, count: u8) -> Result<Vec<SearchHit>, String> {
     let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoded(query));
@@ -1476,10 +1475,9 @@ async fn run_deep_crawl(
 
 /// Bing results page rendered in headless Chrome, then scraped.
 ///
-/// **Opt-in only** (`OCTOS_ALLOW_SERP_SCRAPE=1`): scraping a search
-/// engine's results page with a browser is the "disguised search" OctoSense
-/// ADR 0002 §6 rules out, so it is never part of the automatic provider
-/// order. Kept for operators who explicitly accept that on their own box.
+/// On unless `OCTOS_ALLOW_SERP_SCRAPE=0` (ADR 0002 §6). Honest: the
+/// browser's own User-Agent plus the octos token, no stealth; a challenge
+/// page is a miss, never solved.
 async fn bing_cdp_search(query: &str, count: u8) -> Result<Vec<SearchHit>, String> {
     if !research::serp_scrape_allowed() {
         return Err("disabled".to_string());
@@ -1929,7 +1927,7 @@ fn truncate_utf8(s: &str, max_chars: usize, suffix: &str) -> String {
 /// and de-duplicates by normalized URL.
 ///
 /// The returned strings are pre-formatted as `- <title>\n  <url>`, which
-/// `bing_cdp_search` splits into hits. (Opt-in provider only.)
+/// `bing_cdp_search` splits into hits.
 fn extract_bing_results(text: &str) -> Vec<String> {
     use regex::Regex;
     // URL terminator set chosen empirically against Bing's inline SERP:

@@ -3,10 +3,11 @@
 //!
 //! Policy (OctoSense ADR 0002, section 6): free structured sources first
 //! (GDELT, Google News RSS), then a self-hosted SearXNG if one is configured,
-//! then search API keys the person chose to add. Pages that will be cited are
-//! *read* (optionally rendered by a real browser) at a polite rate that
-//! respects robots.txt, with an identifiable User-Agent. Nothing here disguises
-//! automation or scrapes a search-results page.
+//! then search API keys the person chose to add, then the DuckDuckGo and Bing
+//! results pages for general web search (on by default; an operator can turn
+//! them off). Pages that will be cited are *read* (optionally rendered by a
+//! real browser) at a polite rate, with an identifiable User-Agent. Nothing
+//! here disguises automation, imitates a person or solves CAPTCHAs.
 //!
 //! This crate is deliberately network-free: it builds provider request URLs,
 //! parses provider responses, filters and caps results, parses robots.txt and
@@ -54,9 +55,11 @@ pub const USER_AGENT: &str = "octos-research/1.0 (+https://github.com/octos-org/
 
 /// Environment variable that opts in to scraping search-engine results
 /// pages: the keyless DuckDuckGo HTML endpoint and the Bing results page
-/// rendered in headless Chrome. Off unless set to `1`/`true`/`yes`.
-/// ADR 0002 rules out scraping search results pages, so this exists only for
-/// operators who explicitly accept that trade-off on their own machine.
+/// rendered in headless Chrome. **On by default** (OctoSense ADR 0002 §6:
+/// general web search for a personal assistant); set it to
+/// `0`/`false`/`no`/`off` to turn results-page search off. It is always
+/// honest: identifiable User-Agent, no stealth, no CAPTCHA solving; a
+/// challenge page ends that provider's attempt.
 pub const SERP_SCRAPE_ENV: &str = "OCTOS_ALLOW_SERP_SCRAPE";
 
 /// Earlier name of [`SERP_SCRAPE_ENV`], still honoured as an alias.
@@ -81,20 +84,23 @@ pub fn respect_robots(lookup: impl Fn(&str) -> Option<String>) -> bool {
 /// (e.g. `http://127.0.0.1:8888`).
 pub const SEARXNG_URL_ENV: &str = "SEARXNG_URL";
 
-/// Whether search-results-page scraping (DuckDuckGo HTML, Bing in a
-/// browser) is explicitly enabled, via [`SERP_SCRAPE_ENV`] or its alias
-/// [`BROWSER_SERP_ENV`]. The env lookup is injected so tests never touch
-/// process env.
+/// Whether results-page search (DuckDuckGo HTML, Bing in a browser) is on:
+/// yes unless [`SERP_SCRAPE_ENV`] or its alias [`BROWSER_SERP_ENV`] is set
+/// to `0`/`false`/`no`/`off`. The env lookup is injected so tests never
+/// touch process env.
 pub fn serp_scrape_allowed(lookup: impl Fn(&str) -> Option<String>) -> bool {
-    [SERP_SCRAPE_ENV, BROWSER_SERP_ENV].iter().any(|k| {
-        lookup(k)
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
+    ![SERP_SCRAPE_ENV, BROWSER_SERP_ENV].iter().any(|k| {
+        lookup(k).is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
     })
 }
 
-/// Message for a search where no allowed provider returned anything: what
-/// was tried and how to get results without scraping search pages.
+/// Message for a search where no provider returned anything: what was tried
+/// and how to widen the search.
 pub fn no_results_message(query: &str, tried: &[String]) -> String {
     let tried = if tried.is_empty() {
         "none (the query is not news-ish and no SearXNG or search API key is configured)"
@@ -104,13 +110,13 @@ pub fn no_results_message(query: &str, tried: &[String]) -> String {
     };
     format!(
         "No results for: {query}\n\nProviders tried: {tried}.\n\n\
-         Search-results pages are not scraped by default (OctoSense ADR 0002). To get \
-         results for general queries, either set {SEARXNG_URL_ENV} to a self-hosted \
-         SearXNG instance (with the `json` format enabled), or add a search API key \
-         (SERPER_API_KEY, TAVILY_API_KEY, BRAVE_API_KEY, YDC_API_KEY or \
-         PERPLEXITY_API_KEY). For news, use category \"news\" or a recent `since` so \
-         GDELT and Google News are used. An operator can opt in to scraping \
-         DuckDuckGo/Bing results pages with {SERP_SCRAPE_ENV}=1 (not recommended).\n"
+         For more results on general queries, add a search API key (BRAVE_API_KEY, \
+         SERPER_API_KEY, TAVILY_API_KEY, YDC_API_KEY or PERPLEXITY_API_KEY) or set \
+         {SEARXNG_URL_ENV} to a self-hosted SearXNG instance (with the `json` format \
+         enabled). For news, use category \"news\" or a recent `since`. Results-page \
+         search (DuckDuckGo, Bing) is on unless {SERP_SCRAPE_ENV}=0; if it was tried, \
+         the engines may have answered with a challenge page, which octos does not \
+         bypass.\n"
     )
 }
 
@@ -119,16 +125,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_keep_serp_scraping_off_unless_opted_in() {
-        assert!(!serp_scrape_allowed(|_| None));
-        assert!(!serp_scrape_allowed(|_| Some("0".into())));
-        assert!(!serp_scrape_allowed(|_| Some("".into())));
+    fn should_keep_results_page_search_on_unless_turned_off() {
+        assert!(serp_scrape_allowed(|_| None), "on by default");
         let only =
             |key: &'static str, v: &'static str| move |k: &str| (k == key).then(|| v.to_string());
         assert!(serp_scrape_allowed(only(SERP_SCRAPE_ENV, "1")));
-        assert!(serp_scrape_allowed(only(SERP_SCRAPE_ENV, "TRUE")));
-        assert!(serp_scrape_allowed(only(BROWSER_SERP_ENV, "1")), "alias");
-        assert!(!serp_scrape_allowed(only("OTHER", "1")));
+        assert!(
+            serp_scrape_allowed(only(SERP_SCRAPE_ENV, "")),
+            "empty is not a no"
+        );
+        for off in ["0", "false", "NO", "off"] {
+            assert!(!serp_scrape_allowed(only(SERP_SCRAPE_ENV, off)), "{off}");
+        }
+        assert!(!serp_scrape_allowed(only(BROWSER_SERP_ENV, "0")), "alias");
+        assert!(serp_scrape_allowed(only("OTHER", "0")));
     }
 
     #[test]
