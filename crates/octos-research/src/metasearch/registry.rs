@@ -83,6 +83,22 @@ pub const BUILTIN: &[(&str, &str, &str)] = builtin![
     "brave",
 ];
 
+/// Read a pins file (`{"<engine id>": "sha256:<hex>"}`) for [`Registry::load_dir`].
+/// Refused when the file lies inside `engines_dir`: pins must be kept where
+/// the engine files' writer cannot also change them.
+pub fn read_pins(pins_file: &Path, engines_dir: &Path) -> Result<BTreeMap<String, String>, String> {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canon(pins_file).starts_with(canon(engines_dir)) {
+        return Err(format!(
+            "{} is inside the engines directory; keep pins outside it",
+            pins_file.display()
+        ));
+    }
+    let text =
+        std::fs::read_to_string(pins_file).map_err(|e| format!("{}: {e}", pins_file.display()))?;
+    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", pins_file.display()))
+}
+
 /// A skipped engine and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejected {
@@ -119,23 +135,12 @@ impl Registry {
     }
 
     /// Load `dir/<id>/{manifest.json, engine.octoscript}`. Each engine must be
-    /// pinned: its digest must appear in `pins` (id → digest) or in
-    /// `dir/pins.json`. A pinned engine replaces a built-in with the same id.
-    pub fn load_dir(&mut self, dir: &Path, pins: &BTreeMap<String, String>) {
-        let mut pins = pins.clone();
-        if let Ok(text) = std::fs::read_to_string(dir.join("pins.json")) {
-            match serde_json::from_str::<BTreeMap<String, String>>(&text) {
-                Ok(file_pins) => {
-                    for (k, v) in file_pins {
-                        pins.entry(k).or_insert(v);
-                    }
-                }
-                Err(e) => self.rejected.push(Rejected {
-                    path: dir.join("pins.json").display().to_string(),
-                    reason: format!("unreadable pins.json: {e}"),
-                }),
-            }
-        }
+    /// pinned: its digest must equal `pins[id]`. Pins come from the host
+    /// (see [`read_pins`]), never from the engine directory itself, so write
+    /// access to the directory is not enough to add or change an engine.
+    /// An engine whose id matches a built-in is rejected unless
+    /// `allow_override` is set.
+    pub fn load_dir(&mut self, dir: &Path, pins: &BTreeMap<String, String>, allow_override: bool) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -174,6 +179,17 @@ impl Registry {
                 self.rejected.push(Rejected {
                     path: shown,
                     reason: format!("directory name must equal the engine id {:?}", engine.id()),
+                });
+                continue;
+            }
+            let shadows_builtin = BUILTIN.iter().any(|(id, _, _)| *id == engine.id());
+            if shadows_builtin && !allow_override {
+                self.rejected.push(Rejected {
+                    path: shown,
+                    reason: format!(
+                        "id {:?} is a built-in engine; replacing it needs the host's override setting",
+                        engine.id()
+                    ),
                 });
                 continue;
             }
@@ -221,55 +237,95 @@ mod tests {
     }
 
     #[test]
-    fn should_load_only_pinned_engines_from_a_directory() {
-        let dir = std::env::temp_dir().join(format!("octos-engines-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let (_, manifest, source) = BUILTIN
+    fn should_load_only_engines_the_host_pinned() {
+        let root = std::env::temp_dir().join(format!("octos-engines-{}", std::process::id()));
+        let dir = root.join("engines");
+        let _ = std::fs::remove_dir_all(&root);
+        let (_, hn_manifest, source) = BUILTIN
             .iter()
             .find(|(id, _, _)| *id == "hackernews")
             .unwrap();
-        for name in ["hackernews", "wrongname"] {
+        // A third-party engine: the Hacker News engine under another id.
+        let manifest = hn_manifest.replace("\"id\": \"hackernews\"", "\"id\": \"hn_mirror\"");
+        for name in ["hn_mirror", "wrongname"] {
             std::fs::create_dir_all(dir.join(name)).unwrap();
-            std::fs::write(dir.join(name).join("manifest.json"), manifest).unwrap();
+            std::fs::write(dir.join(name).join("manifest.json"), &manifest).unwrap();
             std::fs::write(dir.join(name).join("engine.octoscript"), source).unwrap();
         }
-        let good = digest(manifest, source);
+        let good = digest(&manifest, source);
 
+        // Unpinned: not loaded.
         let mut r = Registry::default();
-        r.load_dir(&dir, &BTreeMap::new());
-        assert!(
-            r.get("hackernews").is_none(),
-            "unpinned engines are not loaded"
-        );
+        r.load_dir(&dir, &BTreeMap::new(), false);
+        assert!(r.get("hn_mirror").is_none());
         assert!(
             r.rejected
                 .iter()
                 .any(|x| x.reason.starts_with("not pinned"))
         );
 
+        // A pins.json inside the engine directory is not trusted.
+        std::fs::write(
+            dir.join("pins.json"),
+            serde_json::json!({ "hn_mirror": good }).to_string(),
+        )
+        .unwrap();
         let mut r = Registry::default();
-        let pins = BTreeMap::from([("hackernews".to_string(), "sha256:00".to_string())]);
-        r.load_dir(&dir, &pins);
-        assert!(r.get("hackernews").is_none());
+        r.load_dir(&dir, &BTreeMap::new(), false);
+        assert!(r.get("hn_mirror").is_none(), "directory writers cannot pin");
+        assert!(read_pins(&dir.join("pins.json"), &dir).is_err());
+
+        // Wrong digest.
+        let mut r = Registry::default();
+        let pins = BTreeMap::from([("hn_mirror".to_string(), "sha256:00".to_string())]);
+        r.load_dir(&dir, &pins, false);
+        assert!(r.get("hn_mirror").is_none());
         assert!(
             r.rejected
                 .iter()
                 .any(|x| x.reason.contains("does not match"))
         );
 
-        let mut r = Registry::default();
+        // Host pins kept outside the directory.
+        let pins_file = root.join("pins.json");
         std::fs::write(
-            dir.join("pins.json"),
-            serde_json::json!({ "hackernews": good }).to_string(),
+            &pins_file,
+            serde_json::json!({ "hn_mirror": good }).to_string(),
         )
         .unwrap();
-        r.load_dir(&dir, &BTreeMap::new());
-        let e = r.get("hackernews").expect("pinned engine loads");
-        assert_eq!(e.origin, EngineOrigin::Dir(dir.join("hackernews")));
+        let pins = read_pins(&pins_file, &dir).unwrap();
+        let mut r = Registry::default();
+        r.load_dir(&dir, &pins, false);
+        let e = r.get("hn_mirror").expect("pinned engine loads");
+        assert_eq!(e.origin, EngineOrigin::Dir(dir.join("hn_mirror")));
         assert!(
             r.rejected
                 .iter()
                 .any(|x| x.reason.contains("directory name"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn should_not_let_a_directory_engine_shadow_a_builtin_by_default() {
+        let dir = std::env::temp_dir().join(format!("octos-shadow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_, manifest, source) = BUILTIN.iter().find(|(id, _, _)| *id == "gdelt").unwrap();
+        std::fs::create_dir_all(dir.join("gdelt")).unwrap();
+        std::fs::write(dir.join("gdelt").join("manifest.json"), manifest).unwrap();
+        std::fs::write(dir.join("gdelt").join("engine.octoscript"), source).unwrap();
+        let pins = BTreeMap::from([("gdelt".to_string(), digest(manifest, source))]);
+
+        let mut r = Registry::builtin();
+        r.load_dir(&dir, &pins, false);
+        assert_eq!(r.get("gdelt").unwrap().origin, EngineOrigin::Builtin);
+        assert!(r.rejected.iter().any(|x| x.reason.contains("built-in")));
+
+        let mut r = Registry::builtin();
+        r.load_dir(&dir, &pins, true);
+        assert_eq!(
+            r.get("gdelt").unwrap().origin,
+            EngineOrigin::Dir(dir.join("gdelt"))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

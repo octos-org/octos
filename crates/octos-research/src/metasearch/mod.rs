@@ -66,8 +66,16 @@ pub const METASEARCH_ENV: &str = "OCTOS_METASEARCH";
 /// Contact address for polite pools (OpenAlex `mailto`). Optional.
 pub const CONTACT_ENV: &str = "OCTOS_RESEARCH_CONTACT";
 
-/// Directory with extra, pinned engines (see [`Registry::load_dir`]).
+/// Directory with extra engines (see [`Registry::load_dir`]).
 pub const ENGINES_DIR_ENV: &str = "OCTOS_METASEARCH_ENGINES";
+
+/// Pins file for [`ENGINES_DIR_ENV`] engines (`{"id": "sha256:..."}`); must
+/// live outside that directory.
+pub const PINS_ENV: &str = "OCTOS_METASEARCH_PINS";
+
+/// Lets a pinned directory engine replace a built-in with the same id
+/// (`1`/`true`/`yes`; off by default).
+pub const ALLOW_OVERRIDE_ENV: &str = "OCTOS_METASEARCH_ALLOW_OVERRIDE";
 
 /// Whether the metasearch is enabled (default on).
 pub fn enabled(lookup: impl Fn(&str) -> Option<String>) -> bool {
@@ -352,7 +360,20 @@ impl Metasearch {
         let lookup = |k: &str| std::env::var(k).ok();
         let mut registry = Registry::builtin();
         if let Some(dir) = lookup(ENGINES_DIR_ENV).filter(|d| !d.trim().is_empty()) {
-            registry.load_dir(std::path::Path::new(dir.trim()), &BTreeMap::new());
+            let dir = std::path::Path::new(dir.trim());
+            let pins = match lookup(PINS_ENV).filter(|p| !p.trim().is_empty()) {
+                Some(p) => {
+                    registry::read_pins(std::path::Path::new(p.trim()), dir).unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "metasearch pins not loaded");
+                        BTreeMap::new()
+                    })
+                }
+                None => BTreeMap::new(),
+            };
+            let allow_override = lookup(ALLOW_OVERRIDE_ENV).is_some_and(|v| {
+                matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+            });
+            registry.load_dir(dir, &pins, allow_override);
             for r in &registry.rejected {
                 tracing::warn!(path = %r.path, reason = %r.reason, "metasearch engine rejected");
             }

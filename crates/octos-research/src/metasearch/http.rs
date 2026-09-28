@@ -205,27 +205,20 @@ impl ResponseCache {
     }
 }
 
-/// A [`Fetch`] over reqwest with the identifiable octos User-Agent.
+/// A [`Fetch`] over reqwest, through the crate's one SSRF implementation:
+/// every request goes through [`crate::net::pinned_client`] (http(s) only,
+/// public host, DNS resolved fail-closed and pinned, no redirects, octos
+/// User-Agent). There is no fallback client.
 #[cfg(feature = "http")]
 #[derive(Clone)]
 pub struct ReqwestFetch {
-    client: reqwest::Client,
     max_body_bytes: usize,
 }
 
 #[cfg(feature = "http")]
 impl ReqwestFetch {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent(crate::USER_AGENT)
-            .connect_timeout(Duration::from_secs(10))
-            // Provider APIs answer directly; a redirect to another host would
-            // leave the engine's declared host list.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            client,
             max_body_bytes: 4 * 1024 * 1024,
         }
     }
@@ -244,7 +237,8 @@ impl Fetch for ReqwestFetch {
         Box::pin(async move {
             let method = reqwest::Method::from_bytes(req.method.as_bytes())
                 .map_err(|e| format!("bad method: {e}"))?;
-            let mut rb = self.client.request(method, &req.url).timeout(req.timeout);
+            let client = crate::net::pinned_client(&req.url, req.timeout).await?;
+            let mut rb = client.request(method, &req.url);
             for (k, v) in &req.headers {
                 rb = rb.header(k, v);
             }
@@ -352,5 +346,31 @@ mod tests {
             Duration::from_secs(60),
         );
         assert!(matches!(c.lookup("e"), CacheLookup::Miss));
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn should_refuse_private_and_metadata_targets_before_connecting() {
+        let f = ReqwestFetch::new();
+        for url in [
+            "http://127.0.0.1/",
+            "https://localhost/x",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+            "http://10.0.0.1/",
+            "file:///etc/passwd",
+        ] {
+            let err = f
+                .fetch(HttpRequest {
+                    method: "GET".into(),
+                    url: url.into(),
+                    headers: Vec::new(),
+                    body: None,
+                    timeout: Duration::from_secs(2),
+                })
+                .await
+                .unwrap_err();
+            assert!(err.contains("blocked"), "{url}: {err}");
+        }
     }
 }

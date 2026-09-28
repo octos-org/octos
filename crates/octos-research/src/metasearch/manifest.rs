@@ -187,16 +187,26 @@ impl EngineManifest {
     }
 }
 
-/// A plain DNS host name (no scheme, port, path, wildcard or IP literal
-/// check beyond the character set).
+/// A public DNS host name an engine may reach: no scheme, port, path or
+/// wildcard, not an IP literal, not `localhost`, and not a name that
+/// `net::is_private_host` classifies as internal. (Each request is also
+/// checked after DNS resolution, so a name that resolves to a private
+/// address is refused at fetch time.)
 pub fn is_host_name(h: &str) -> bool {
-    !h.is_empty()
+    let shaped = !h.is_empty()
         && h.len() <= 253
         && h.contains('.')
         && !h.starts_with('.')
         && !h.ends_with('.')
         && h.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
+    let ip_literal = h.parse::<std::net::IpAddr>().is_ok()
+        // Dotted numbers that are not a valid address still look like one.
+        || h.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit()));
+    let internal_suffix = [".local", ".internal", ".localdomain", ".home.arpa", ".lan"]
+        .iter()
+        .any(|s| h.ends_with(s));
+    shaped && !ip_literal && !internal_suffix && !crate::net::is_private_host(h)
 }
 
 #[cfg(test)]
@@ -231,6 +241,13 @@ mod tests {
             ("categories", serde_json::json!(["shopping"])),
             ("hosts", serde_json::json!(["*.example.org"])),
             ("hosts", serde_json::json!(["https://example.org"])),
+            ("hosts", serde_json::json!(["169.254.169.254"])),
+            ("hosts", serde_json::json!(["127.0.0.1"])),
+            ("hosts", serde_json::json!(["10.0.0.8"])),
+            ("hosts", serde_json::json!(["999.1.1.1"])),
+            ("hosts", serde_json::json!(["metadata.google.internal"])),
+            ("hosts", serde_json::json!(["printer.local"])),
+            ("hosts", serde_json::json!(["dev.localhost"])),
             ("docs_url", serde_json::json!(["http://example.org"])),
             ("needs_key", serde_json::json!(true)),
             ("rate_limit", serde_json::json!({"min_interval_ms": 0})),

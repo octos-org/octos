@@ -112,23 +112,31 @@ fn check_literal(ip: IpAddr, port: u16) -> Result<(String, Vec<SocketAddr>), Str
     Ok((ip.to_string(), vec![SocketAddr::new(ip, port)]))
 }
 
+/// A client for one request to `url`: the URL passes [`check_url`] and the
+/// client is pinned to the validated addresses (no DNS rebinding between the
+/// check and the connection), follows no redirects and sends the octos
+/// User-Agent. Build errors are returned, never replaced by a default client.
+pub async fn pinned_client(url: &str, timeout: Duration) -> Result<reqwest::Client, String> {
+    let (host, addrs) = check_url(url).await?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(crate::USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none());
+    // Pin all validated addresses at once (a looped `resolve()` would
+    // keep only the last one). IP literals need no pinning.
+    if host.parse::<IpAddr>().is_err() {
+        builder = builder.resolve_to_addrs(&host, &addrs);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))
+}
+
 /// GET `url`, re-validating and DNS-pinning every redirect hop.
 pub async fn safe_get(url: &str, timeout: Duration) -> Result<reqwest::Response, String> {
     let mut current = url.to_string();
     for _ in 0..MAX_REDIRECTS {
-        let (host, addrs) = check_url(&current).await?;
-        let mut builder = reqwest::Client::builder()
-            .timeout(timeout)
-            .user_agent(crate::USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none());
-        // Pin all validated addresses at once (a looped `resolve()` would
-        // keep only the last one). IP literals need no pinning.
-        if host.parse::<IpAddr>().is_err() {
-            builder = builder.resolve_to_addrs(&host, &addrs);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| format!("HTTP client error: {e}"))?;
+        let client = pinned_client(&current, timeout).await?;
         let response = client
             .get(&current)
             .send()

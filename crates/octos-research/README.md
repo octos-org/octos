@@ -25,7 +25,7 @@ octos-research (Rust, trusted)                      engines/<id>/ (sandboxed Oct
 
 ### The engine contract
 
-- **Only the core does HTTP.** `build_request` describes a request and the core performs it. `parse_response` gets `response = {status, headers, json, body}`: `json` is the body decoded by the host, and `body` holds the raw text only when the response is not JSON.
+- **Only the core does HTTP.** `build_request` describes a request and the core performs it. With the bundled fetcher, every request goes through the crate's one SSRF implementation (`net::pinned_client`): public hosts only, DNS resolved fail-closed and pinned, no redirects. Manifests may not declare IP literals, `localhost`, private addresses or internal suffixes (`.local`, `.internal`, …), and the same check applies to host settings such as the Mastodon instance. `parse_response` gets `response = {status, headers, json, body}`: `json` is the body decoded by the host, and `body` holds the raw text only when the response is not JSON.
 - **Installed modules.** The sandbox provides exactly these, plus the frozen `mod.std.*`:
   - `net.request({url, method, headers, body})` checks a request against the hosts the manifest declares. It refuses any other host, port, scheme, credentials, and the host-owned headers (User-Agent, Authorization, cookies, key headers).
   - `net.url({base, query})` builds a percent-encoded URL on a declared host.
@@ -38,7 +38,7 @@ octos-research (Rust, trusted)                      engines/<id>/ (sandboxed Oct
   - the `backoff` value an engine reads from the response, as Stack Exchange's API sends.
 
   A search skips an engine whose next slot would miss its deadline.
-- **Discovery.** Built-in engines are compiled in. Extra engines are loaded from `OCTOS_METASEARCH_ENGINES/<id>/`, and each must be pinned by the digest `sha256(manifest.json ‖ 0x00 ‖ engine.octoscript)`, given in `pins.json` or by the host. A pinned engine replaces a built-in with the same id.
+- **Discovery.** Built-in engines are compiled in. Extra engines are loaded from `OCTOS_METASEARCH_ENGINES/<id>/`, and each must be pinned by the digest `sha256(manifest.json ‖ 0x00 ‖ engine.octoscript)`. Pins come only from the host: a file named by `OCTOS_METASEARCH_PINS`, which must live outside the engine directory, so write access to that directory is not enough to add or change an engine. A directory engine may not replace a built-in with the same id unless `OCTOS_METASEARCH_ALLOW_OVERRIDE=1`.
 
 ### Engines
 
@@ -73,7 +73,9 @@ SearXNG (AGPL-3.0) was only the conceptual model: engines as small modules, para
 |---|---|
 | `OCTOS_RESPECT_ROBOTS=1` | Operator opt-in: check robots.txt for engines whose manifest sets `robots` (off by default; octos agents act for one person). |
 | `OCTOS_METASEARCH=0` | Turn the metasearch off; news falls back to direct GDELT and Google News RSS calls. |
-| `OCTOS_METASEARCH_ENGINES` | Directory of extra, pinned engines. |
+| `OCTOS_METASEARCH_ENGINES` | Directory of extra engines. |
+| `OCTOS_METASEARCH_PINS` | Pins file for those engines (`{"id": "sha256:…"}`), kept outside the engine directory. |
+| `OCTOS_METASEARCH_ALLOW_OVERRIDE=1` | Let a pinned directory engine replace a built-in with the same id. |
 | `OCTOS_METASEARCH_<ENGINE>_<SETTING>` | Engine setting, e.g. `OCTOS_METASEARCH_MASTODON_INSTANCE=fosstodon.org`. |
 | `<key_env>` from each manifest | Keys: `BRAVE_API_KEY`, `GITHUB_TOKEN`, `OPENALEX_API_KEY`, `STACKEXCHANGE_KEY`. Profile provider keys win. |
 

@@ -548,3 +548,54 @@ fn should_read_keys_settings_and_contact_from_the_environment() {
     assert!(enabled(|_| None));
     assert!(!enabled(|_| Some("0".into())));
 }
+
+#[tokio::test(start_paused = true)]
+async fn should_not_let_a_host_setting_point_at_a_private_address() {
+    let fetch = MockFetch::default();
+    fetch.on("169.254.169.254", ok(hits(&[("https://x.org/", "X")])));
+    fetch.on("public.example.org", ok(hits(&[("https://y.org/", "Y")])));
+    let source = r#"use mod.net
+
+fn build_request(query, opts) {
+    return net.request({url: "https://" + opts.settings.instance + "/search?q=" + query})
+}
+
+fn parse_response(response, opts) {
+    return response.json.hits
+}
+"#;
+    let manifest = serde_json::json!({
+        "id": "inst",
+        "name": "inst",
+        "categories": ["news"],
+        "hosts": [],
+        "rate_limit": {"min_interval_ms": 1000},
+        "docs_url": ["https://example.org/docs"],
+        "license_note": "test",
+        "settings": {"instance": {"description": "host", "default": "public.example.org", "host": true}}
+    });
+    let engine = || Engine::load(&manifest.to_string(), source, EngineOrigin::Builtin).unwrap();
+
+    let mut config = Config::default();
+    config
+        .settings
+        .entry("inst".into())
+        .or_default()
+        .insert("instance".into(), "169.254.169.254".into());
+    let ms = search(vec![engine()], &fetch, config);
+    let resp = ms.search(&request("q")).await;
+    let r = &resp.engines[0];
+    assert_eq!(r.status, EngineStatus::Error, "{r:?}");
+    assert!(
+        r.error.as_deref().unwrap().contains("not declared"),
+        "{r:?}"
+    );
+    assert!(fetch.calls_to("169.254.169.254").is_empty());
+
+    // The default public instance works.
+    let ms = search(vec![engine()], &fetch, Config::default());
+    assert_eq!(
+        ms.search(&request("q")).await.engines[0].status,
+        EngineStatus::Ok
+    );
+}

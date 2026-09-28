@@ -387,6 +387,18 @@ jobs:
       - name: Test octos-services
         run: cargo test -p octos-services
 
+      # Same #2055/#2558 failure mode: the research crates (octos-research,
+      # including the metasearch sandbox and per-engine fixture replays, and
+      # the deep-search / deep-crawl skills) were absent from this list, so
+      # their suites never ran in PR CI. No network: live engine tests are
+      # #[ignore]d and need `--features http`.
+      - name: Test research crates
+        run: |
+          cargo test -p octos-research
+          cargo test -p octos-research --no-default-features
+          cargo test -p deep-search
+          cargo test -p deep-crawl
+
       # Bundled harness starter skills (each has small lib + 1 smoke test)
       - name: Test harness starter skills
         run: |

@@ -591,6 +591,31 @@ fn parse_response(response, opts) {
     }
 
     #[test]
+    fn should_stop_scripts_that_exhaust_heap_or_strings() {
+        let hosts = vec!["api.example.org".to_string()];
+        let grow = "fn build_request(query, opts) {\nlet s = \"xxxxxxxxxxxxxxxx\"\nwhile true {\ns += s\n}\nreturn nil\n}\nfn parse_response(response, opts) {\nreturn []\n}\n";
+        let err = build_request(&engine(grow, &hosts), "q", &json!({})).unwrap_err();
+        assert!(
+            err.contains("script failed") && err.contains("limit"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn should_enforce_host_function_call_budgets_and_bridge_bounds() {
+        let hosts = vec!["api.example.org".to_string()];
+        // net.url allows 32 calls per run.
+        let many = "use mod.net\nuse mod.std.array\nfn build_request(query, opts) {\nlet u = nil\nfor i in array.range(0, 40) {\nu = net.url({base: \"https://api.example.org/\"})\n}\nreturn net.request({url: u.url})\n}\nfn parse_response(response, opts) {\nreturn []\n}\n";
+        let err = build_request(&engine(many, &hosts), "q", &json!({})).unwrap_err();
+        assert!(err.contains("call budget"), "{err}");
+
+        // A record larger than the bridge bound (256 KiB) is refused.
+        let big = "use mod.net\nfn build_request(query, opts) {\nlet s = \"xxxxxxxxxxxxxxxx\"\nlet i = 0\nwhile i < 15 {\ns += s\ni += 1\n}\nreturn net.request({url: \"https://api.example.org/\", body: s})\n}\nfn parse_response(response, opts) {\nreturn []\n}\n";
+        let err = build_request(&engine(big, &hosts), "q", &json!({})).unwrap_err();
+        assert!(err.contains("bounded JSON"), "{err}");
+    }
+
+    #[test]
     fn should_require_both_engine_functions() {
         assert!(check_engine_source("fn build_request(q, o) {\nreturn nil\n}\n").is_err());
         assert!(check_engine_source("fn build_request(q, o) { return nil }").is_err());

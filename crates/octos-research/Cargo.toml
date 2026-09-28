@@ -38,7 +38,9 @@ extract = ["dep:dom_smoothie"]
 # SSRF checks + DNS-pinned GET (`net`), and with `extract` the polite
 # `reader`. deep-crawl uses `fetch` without `extract`.
 fetch = ["dep:reqwest"]
+# `fetch` provides the private-address checks applied to engine hosts.
 metasearch = [
+    "fetch",
     "dep:octoscript-core",
     "dep:makepad-script",
     "dep:sha2",
@@ -54,6 +56,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 [[example]]
 name = "record_engine_fixtures"
 required-features = ["http"]
+
+[[test]]
+name = "engine_fixtures"
+required-features = ["metasearch"]
 
 [[test]]
 name = "engines_live"
