@@ -1,0 +1,63 @@
+{
+  "exchanges": [
+    {
+      "body_file": "news_en_zh.3.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://feeds.npr.org/1001/rss.xml"
+    },
+    {
+      "body_file": "news_en_zh.5.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml"
+    },
+    {
+      "body_file": "news_en_zh.6.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://www.france24.com/en/rss"
+    }
+  ],
+  "expect": [
+    {
+      "lang": "en",
+      "published": "2026-09-27T10:49:36Z",
+      "source": "NPR",
+      "title": "5 arrested near a U.K. air base used by U.S. on suspicion of preparing a terrorist act",
+      "url": "https://www.npr.org/2026/09/27/nx-s1-5982480/multiple-arrests-suspicion-explosives-offenses-uk-base-us-forces"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-27T14:55:13Z",
+      "source": "France 24",
+      "title": "UK: Police arrest 5 on suspicion of preparing a terrorist act",
+      "url": "https://www.france24.com/en/uk-police-arrest-5-on-suspicion-of-preparing-a-terrorist-act"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-27T13:49:45Z",
+      "source": "France 24",
+      "title": "Major incident at UK airbase used by US",
+      "url": "https://www.france24.com/en/major-incident-at-uk-airbase-used-by-us"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/rss+xml, application/atom+xml, application/xml"
+    },
+    "method": "GET",
+    "url": "https://feeds.npr.org/1001/rss.xml"
+  },
+  "recorded": "live, 2026-09-28 (the news_en_zh feeds)",
+  "request": {
+    "category": "news",
+    "count": 5,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-28T02:00:00Z",
+    "query": "terrorist act",
+    "since": null
+  }
+}

@@ -7,14 +7,9 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{NodeData, RcDom};
-use reqwest::Client;
-use reqwest::redirect::Policy;
 use serde::Deserialize;
 
 use super::{Tool, ToolResult};
-
-/// Maximum number of redirects to follow (with SSRF validation per hop).
-const MAX_REDIRECTS: usize = 10;
 
 pub struct WebFetchTool {
     config: Option<Arc<super::tool_config::ToolConfigStore>>,
@@ -225,67 +220,25 @@ impl Tool for WebFetchTool {
 /// Validate a URL against SSRF rules, build a pinned client, and fetch.
 /// Redirects are followed manually with SSRF validation on each hop.
 /// DNS failures are treated as blocked (fail-closed).
+///
+/// The hop loop itself is `octos_research::net::pinned_get` — the one
+/// pinned-fetch loop in the workspace, shared with the research readers.
+/// This wrapper adds the PR A fleet grant's host allowlist, checked BEFORE
+/// any DNS or socket on every hop, and the tool's own User-Agent.
 async fn ssrf_safe_fetch(
     initial_url: &str,
     host_allowlist: Option<&[String]>,
 ) -> Result<reqwest::Response, String> {
-    let mut current_url = initial_url.to_string();
-
-    for _ in 0..MAX_REDIRECTS {
-        let parsed = reqwest::Url::parse(&current_url).map_err(|_| "Invalid URL".to_string())?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| "URL has no host".to_string())?
-            .to_string();
-
-        // PR A — enforce the fleet grant's host allowlist BEFORE any DNS or
-        // socket, so a refused host never touches the network (and the
-        // deterministic "not in the granted network allowlist" error is
-        // returned, not a DNS/connection error). Empty allowlist = unrestricted.
-        super::ssrf::check_host_allowlist(&host, host_allowlist)?;
-
-        // Validate the URL and resolve DNS (fail-closed on DNS error).
-        let check = super::ssrf::check_ssrf_with_addrs(&current_url).await?;
-
-        // Build a per-request client with redirects disabled and DNS pinned.
-        let mut builder = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("octos/0.1 (web-fetch-tool)")
-            .redirect(Policy::none());
-        // Pin ALL validated addresses at once. `resolve()` called in a loop
-        // overwrites the per-host entry each time, leaving only the last address
-        // pinned — so a host whose last DNS answer is unreachable would fail even
-        // when another validated address works. `resolve_to_addrs` keeps them all.
-        if !check.resolved_addrs.is_empty() {
-            builder = builder.resolve_to_addrs(&host, &check.resolved_addrs);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| format!("HTTP client error: {e}"))?;
-
-        let response = client
-            .get(&current_url)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch URL: {e}"))?;
-
-        if !response.status().is_redirection() {
-            return Ok(response);
-        }
-
-        let location = response
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| "Redirect with no Location header".to_string())?;
-        // Resolve relative redirects against the current URL.
-        current_url = parsed
-            .join(location)
-            .map_err(|_| format!("Invalid redirect URL: {location}"))?
-            .to_string();
-    }
-
-    Err(format!("Too many redirects (max {MAX_REDIRECTS})"))
+    let check_allowlist = move |host: &str| super::ssrf::check_host_allowlist(host, host_allowlist);
+    octos_research::net::pinned_get(
+        initial_url,
+        octos_research::net::PinnedFetch {
+            timeout: Duration::from_secs(30),
+            user_agent: "octos/0.1 (web-fetch-tool)",
+            pre_check: Some(&check_allowlist),
+        },
+    )
+    .await
 }
 
 fn extract_markdown(html: &str) -> String {
@@ -532,6 +485,26 @@ mod tests {
             err.contains("DNS resolution failed") || err.contains("fail closed"),
             "error should indicate DNS failure: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn should_block_a_host_managed_servers_own_port_and_loopback_spellings() {
+        // `octos serve --host-managed` (UPCR-2026-036) keeps web_fetch in an
+        // external client's turns: it must never reach the server itself or
+        // anything else on loopback, link-local or metadata addresses.
+        for url in [
+            "http://127.0.0.1:50080/api/admin/overview",
+            "http://127.0.0.1:50080/pair/info",
+            "http://localhost:50080/",
+            "http://[::1]:50080/",
+            "http://2130706433/",
+            "http://0x7f.0.0.1/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://0.0.0.0:50080/",
+        ] {
+            assert!(ssrf_safe_fetch(url, None).await.is_err(), "{url}");
+        }
     }
 
     #[tokio::test]

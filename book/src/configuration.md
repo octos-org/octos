@@ -385,6 +385,13 @@ like Robrix render native Approve/Deny buttons, others show a text fallback):
 |----------|-------------|
 | `OMINIX_API_URL` | OminiX ASR/TTS API URL |
 
+### Session Storage
+
+| Variable | Description |
+|----------|-------------|
+| `OCTOS_SESSION_SEGMENT_BYTES` | Active session file size at which it seals into a segment (default 8 MiB) |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | Session history bytes a plain load reads, newest first (default 32 MiB; `0` = unlimited) |
+
 ### System
 
 | Variable | Description |

@@ -16,7 +16,7 @@
  * with a diagnostic, so the spec can land before W1+W2+W3 ship and
  * auto-promote as they merge.
  *
- * Run from /Users/yuechen/home/octos/e2e:
+ * Run from ~/home/octos/e2e:
  *
  *   OCTOS_TEST_URL=https://dspfac.bot.ominix.io \
  *   OCTOS_AUTH_TOKEN=octos-admin-2026 \
@@ -42,12 +42,18 @@ if (BASE.includes('dspfac.ocean.ominix.io')) {
   );
 }
 
-const HOST_MAP: Record<string, string> = {
-  'dspfac.crew.ominix.io': 'cloud@69.194.3.128',
-  'dspfac.bot.ominix.io': 'cloud@69.194.3.129',
-  'dspfac.octos.ominix.io': 'cloud@69.194.3.203',
-  'dspfac.river.ominix.io': 'cloud@69.194.3.66',
-};
+// SSH targets per fleet host come from the environment so no host
+// addresses live in the repo, e.g.
+//   OCTOS_FLEET_SSH_MAP='dspfac.crew.ominix.io=cloud@<host>,dspfac.bot.ominix.io=cloud@<host>'
+const HOST_MAP: Record<string, string> = Object.fromEntries(
+  (process.env.OCTOS_FLEET_SSH_MAP || '')
+    .split(',')
+    .map((pair): [string, string] => {
+      const [k = '', v = ''] = pair.trim().split('=');
+      return [k, v];
+    })
+    .filter(([k, v]) => k !== '' && v !== ''),
+);
 const SSH_HOST =
   process.env.OCTOS_TEST_SSH_HOST ||
   (() => {

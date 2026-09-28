@@ -153,7 +153,7 @@ The entity bank is a structured knowledge store at `.octos/memory/bank/entities/
 │   ├── 2025-02-10.md        # Daily note (manual or write_file)
 │   └── bank/
 │       └── entities/        # Entity bank (managed by save/recall tools)
-│           ├── yuechen.md   # Entity: "who is the user"
+│           ├── alice.md   # Entity: "who is the user"
 │           └── octos.md     # Entity: "what is this project"
 ├── skills/                  # Custom skills
 ├── episodes.redb            # Episodic memory DB (auto-populated)

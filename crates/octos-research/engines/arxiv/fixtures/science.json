@@ -1,0 +1,56 @@
+{
+  "body_file": "science.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": "2025-06-08T01:33:05Z",
+      "source": "arXiv · Jingyuan Qi, Zhiyang Xu, Qifan Wang et al.",
+      "title": "AR-RAG: Autoregressive Retrieval Augmentation for Image Generation",
+      "url": "https://arxiv.org/abs/2506.06962v3"
+    },
+    {
+      "lang": "en",
+      "published": "2024-11-27T18:27:07Z",
+      "source": "arXiv · Nurshat Fateh Ali, Md. Mahdi Mohtasim, Shakil Mosharrof et al.",
+      "title": "Automated Literature Review Using NLP Techniques and LLM-Based Retrieval-Augmented Generation",
+      "url": "https://arxiv.org/abs/2411.18583v1"
+    },
+    {
+      "lang": "en",
+      "published": "2024-02-19T17:37:28Z",
+      "source": "arXiv · Hongjin Su, Shuyang Jiang, Yuhang Lai et al.",
+      "title": "EVOR: Evolving Retrieval for Code Generation",
+      "url": "https://arxiv.org/abs/2402.12317v2"
+    },
+    {
+      "lang": "en",
+      "published": "2025-02-01T04:01:18Z",
+      "source": "arXiv · Ali Naseh, Yuefeng Peng, Anshuman Suri et al.",
+      "title": "Riddle Me This! Stealthy Membership Inference for Retrieval-Augmented Generation",
+      "url": "https://arxiv.org/abs/2502.00306v2"
+    },
+    {
+      "lang": "en",
+      "published": "2023-09-26T19:23:54Z",
+      "source": "arXiv · Shahul Es, Jithin James, Luis Espinosa-Anke et al.",
+      "title": "Ragas: Automated Evaluation of Retrieval Augmented Generation",
+      "url": "https://arxiv.org/abs/2309.15217v2"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/atom+xml"
+    },
+    "method": "GET",
+    "url": "https://export.arxiv.org/api/query?search_query=all%3Aretrieval+AND+all%3Aaugmented+AND+all%3Ageneration&start=0&max_results=5&sortBy=relevance&sortOrder=descending"
+  },
+  "recorded": "live, 2026-09-27",
+  "request": {
+    "category": "science",
+    "count": 5,
+    "langs": [],
+    "now": "2026-09-27T22:00:00Z",
+    "query": "retrieval augmented generation",
+    "since": null
+  }
+}

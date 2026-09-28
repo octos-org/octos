@@ -1945,7 +1945,7 @@ OctosCode's scope-barrier and assistant-projection specs carry the revised
 contracts. Markdown fixtures now supply the same identities as production
 commits; their prefix/suffix and fence-separator assertions are unchanged.
 
-Follow-up verification on `Mrandi5.local` (arm64):
+Follow-up verification on a local arm64 dev machine (arm64):
 
 | Target | Verification | Result |
 | --- | --- | --- |
@@ -3561,7 +3561,7 @@ The client includes the previously committed paste-editing and mixed-projection
 dedup fixes on which the reviewed worktree depended.
 
 Local integration evidence is retained under
-`/Users/ychen/.octos/outer/oup-rc-20260905.Igc2Dj/`:
+`~/.octos/outer/oup-rc-20260905.Igc2Dj/`:
 
 - `octos-tests-3.log`: 8,354 passing tests across 94 suites, 62 ignored,
   covering CLI, agent, core, LLM, bus and services with all targets.

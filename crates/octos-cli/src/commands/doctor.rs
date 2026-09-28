@@ -39,10 +39,10 @@
 //! - `Skills` / `MCP` / `Channels`: discovered skill manifests, MCP stdio
 //!   command PATH-resolution, configured gateway channels.
 //! - `Sessions` (Stage 4): a CONTENT-FREE inventory per store — counts,
-//!   total size, newest/oldest age, transcripts near octos-bus's 10 MiB
-//!   write cap, and transcripts whose final line no longer parses (the
-//!   crash-mid-write signature that breaks resume). The tail probe parses
-//!   and immediately discards; no transcript content reaches the report.
+//!   total size, newest/oldest age, and transcripts whose final line no
+//!   longer parses (the crash-mid-write signature that breaks resume). The
+//!   tail probe parses and immediately discards; no transcript content
+//!   reaches the report.
 //!
 //! Stage-3 contract: octos state is never created, migrated, or modified, and
 //! no secret value reaches the report or the JSON bundle (env var NAMES only;
@@ -1482,9 +1482,8 @@ fn scan_session_dir(dir: &Path, inventory: &mut SessionInventory) {
         // Skip SIDECARS (`<key>.tasks.jsonl` task ledgers, and any future
         // dotted suffix): session keys are fully percent-encoded
         // (`encode_path_component` encodes `.` as %2E), so a literal dot in
-        // the stem can only be a sidecar — not a transcript, not governed by
-        // the 10 MiB session cap, and it must not consume the scan budget or
-        // trigger resume/fork advice (codex r2).
+        // the stem can only be a sidecar — not a transcript, and it must not
+        // consume the scan budget or trigger resume advice (codex r2).
         if path
             .file_stem()
             .is_some_and(|stem| stem.to_string_lossy().contains('.'))
@@ -1613,8 +1612,8 @@ fn humanize_age(secs: u64) -> String {
 /// One inventory row per session store: the serve-level store at the data-dir
 /// root plus each profile's store (same roots the disk-usage walk covers;
 /// per-project `sessions_in_cwd` stores live in unknown project dirs and stay
-/// out of scope). Rows are informational; unparseable tails and near-cap
-/// transcripts WARN with the offending session keys (bounded).
+/// out of scope). Rows are informational; unparseable tails WARN with the
+/// offending session keys (bounded).
 fn session_checks(data_dir: &Path, profiles: &[DiscoveredProfile]) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut stores: Vec<(String, PathBuf)> = vec![("server".to_string(), data_dir.to_path_buf())];
@@ -2661,7 +2660,7 @@ mod tests {
     #[test]
     fn should_skip_task_ledger_sidecars() {
         // `<key>.tasks.jsonl` sidecars are task ledgers, not transcripts —
-        // they must not count, consume budget, or trigger resume/fork advice
+        // they must not count, consume budget, or trigger resume advice
         // (session keys are percent-encoded, so a dotted stem = sidecar).
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("sessions");

@@ -17,7 +17,7 @@
 #   --key <keyfile>       SSH key auth
 #   --serve-port <port>   octos serve port on Mini (default: 8080)
 #   --domain <domain>     Base tunnel domain (default: octos-cloud.org)
-#   --server <addr>       frps VPS address (default: 163.192.33.32)
+#   --server <addr>       frps relay address (required; or set FRPS_SERVER)
 #   --frps-port <port>    frps control port (default: 7000)
 #   --frps-token <tok>    per-tenant tunnel token (default: read from ~/home/orcl-vps/frps-token.txt)
 #   --auth-token <tok>    Dashboard auth token (default: auto-generated)
@@ -30,7 +30,7 @@ set -euo pipefail
 # ── Defaults ──────────────────────────────────────────────────────────
 SERVE_PORT=8080
 DOMAIN="octos-cloud.org"
-FRPS_SERVER="163.192.33.32"
+FRPS_SERVER="${FRPS_SERVER:-}"
 FRPS_PORT=7000
 FRPS_TOKEN=""
 AUTH_TOKEN=""
@@ -55,7 +55,7 @@ if [ $# -lt 2 ]; then
     echo "  --key <keyfile>       SSH key auth"
     echo "  --serve-port <port>   octos serve port (default: 8080)"
     echo "  --domain <domain>     Tunnel domain (default: octos-cloud.org)"
-    echo "  --server <addr>       frps address (default: 163.192.33.32)"
+    echo "  --server <addr>       frps relay address (required; or set FRPS_SERVER)"
     echo "  --frps-token <tok>    per-tenant tunnel token"
     echo "  --auth-token <tok>    Dashboard auth token"
     echo "  --skip-build          Use existing binaries"
@@ -83,6 +83,11 @@ while [ $# -gt 0 ]; do
         *)              echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if [ -z "$FRPS_SERVER" ]; then
+    echo "ERROR: no frps relay server given; pass --server <addr> or set FRPS_SERVER"
+    exit 1
+fi
 
 # Resolve frps token
 if [ -z "$FRPS_TOKEN" ]; then

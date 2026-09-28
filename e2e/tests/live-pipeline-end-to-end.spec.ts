@@ -17,7 +17,7 @@
  * land the spec early and have it auto-promote from skip→pass as the
  * tracks merge.
  *
- * Run from /Users/yuechen/home/octos/e2e:
+ * Run from ~/home/octos/e2e:
  *
  *   OCTOS_TEST_URL=https://dspfac.bot.ominix.io \
  *   OCTOS_AUTH_TOKEN=octos-admin-2026 \

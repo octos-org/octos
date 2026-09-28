@@ -409,6 +409,16 @@ const APPUI_METHOD_PEER_PREPARE: &str = "peer/prepare";
 /// session. Read-only; results survive client crashes/reconnects because
 /// they are files, not connection state.
 const APPUI_METHOD_PEER_GATHER: &str = "peer/gather";
+/// UPCR-2026-034 `peer/model/set`: the ORIGINATOR changes (or clears) an
+/// existing peer's configured model lane; applies from the peer's next turn.
+const APPUI_METHOD_PEER_MODEL_SET: &str = "peer/model/set";
+/// UPCR-2026-034 `peer/context/open`: open (idempotently) a bound request
+/// context of a host-owned app peer — a separate transcript, workspace and
+/// child memory namespace under the peer, with a kernel-derived session key.
+const APPUI_METHOD_PEER_CONTEXT_OPEN: &str = "peer/context/open";
+/// UPCR-2026-034 `peer/context/close`: close a request context for good,
+/// interrupting its in-flight turn; the context session never runs again.
+const APPUI_METHOD_PEER_CONTEXT_CLOSE: &str = "peer/context/close";
 /// `turn/steer` — mid-turn prompt injection into the ACTIVE turn (codex
 /// parity: app-server `turn/steer` → `Session::steer_input`). Params
 /// `{session_id, expected_turn_id?, input}`; result `{turn_id, steered}`.
@@ -519,6 +529,9 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_SNAPSHOT_RESTORE,
     APPUI_METHOD_PEER_PREPARE,
     APPUI_METHOD_PEER_GATHER,
+    APPUI_METHOD_PEER_MODEL_SET,
+    APPUI_METHOD_PEER_CONTEXT_OPEN,
+    APPUI_METHOD_PEER_CONTEXT_CLOSE,
     APPUI_METHOD_TURN_STEER,
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
@@ -711,6 +724,11 @@ pub(crate) struct WsConnection {
     /// [`update_live_features`]). Reads are far more frequent than
     /// writes, so `RwLock` is the right fit.
     live_features: Arc<std::sync::RwLock<ConnectionUiFeatures>>,
+    /// `octos serve --host-managed`: this connection is an external client
+    /// (anything but the host token). Turns it starts get no tool that
+    /// executes code, administers the server or reaches peers
+    /// (`host_managed::external_turn_tool_allowed`).
+    external: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WsConnection {
@@ -723,7 +741,19 @@ impl WsConnection {
             failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             failed_notify: Arc::new(tokio::sync::Notify::new()),
             live_features: Arc::new(std::sync::RwLock::new(ConnectionUiFeatures::default())),
+            external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Mark (or clear) this connection as an external client.
+    pub(crate) fn set_external(&self, external: bool) {
+        self.external.store(external, Ordering::Release);
+    }
+
+    /// Whether this connection is an external client of a host-managed
+    /// server.
+    pub(crate) fn is_external(&self) -> bool {
+        self.external.load(Ordering::Acquire)
     }
 
     fn new_stdio(writer: std::sync::mpsc::SyncSender<WsMessage>) -> Self {
@@ -738,6 +768,7 @@ impl WsConnection {
             live_features: Arc::new(std::sync::RwLock::new(
                 ConnectionUiFeatures::stdio_defaults(),
             )),
+            external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -793,7 +824,6 @@ impl WsConnection {
         self.failure_signal().mark_failed();
     }
 
-    #[cfg(test)]
     pub(crate) fn connection_id(&self) -> ConnectionId {
         self.connection_id
     }
@@ -1878,6 +1908,8 @@ enum InterruptOrigin {
     Client,
     /// `peer_close` retired the peer while this turn was still running.
     PeerClose,
+    /// UPCR-2026-034 `peer/context/close` released the request context.
+    ContextClose,
 }
 
 impl InterruptOrigin {
@@ -1888,6 +1920,10 @@ impl InterruptOrigin {
             Self::PeerClose => {
                 "turn interrupted by peer_close — the peer was retired while this \
                  turn was still running, so its in-flight work was discarded"
+            }
+            Self::ContextClose => {
+                "turn interrupted by peer/context/close — the request context was \
+                 released, so its in-flight work was discarded"
             }
         }
     }
@@ -2032,6 +2068,12 @@ struct ActiveTurn {
     /// codex's `ActiveTurnNotSteerable` for review/compact turn kinds.
     steer: Option<octos_agent::SharedSteerBuffer>,
     abort: AbortHandle,
+    /// The connection whose request started the turn (`turn/start`,
+    /// `review/start`); `None` for server-initiated turns (continuations).
+    /// `octos serve --host-managed` lets an external connection steer,
+    /// interrupt and answer only turns it owns (UPCR-2026-036): turn ids are
+    /// client-chosen, so a bare id proves nothing.
+    owner: Option<ConnectionId>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -6092,7 +6134,10 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
             return ToolApprovalDecision::Deny;
         }
 
-        let response_rx = self.contracts.approvals.request_runtime(event.clone());
+        let response_rx = self
+            .contracts
+            .approvals
+            .request_runtime_owned(event.clone(), Some(self.ws.connection_id().0));
 
         // #1449 drop-guard: arm a guard keyed to THIS pending approval the
         // instant it is registered. If our future is dropped before a clean
@@ -6434,7 +6479,10 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
             return UserQuestionOutcome::Cancelled;
         }
 
-        let response_rx = self.contracts.user_questions.request_runtime(event.clone());
+        let response_rx = self
+            .contracts
+            .user_questions
+            .request_runtime_owned(event.clone(), Some(self.ws.connection_id().0));
 
         // #2 — RAII drop-guard. Arm a guard keyed to THIS pending entry the
         // instant it is registered. If our future is dropped before a clean
@@ -6696,11 +6744,59 @@ fn decide_ws_origin_gate(
     }
 }
 
+/// `octos serve --host-managed`: the WS upgrade Origin gate.
+///
+/// Only the host's configured origins are trusted (no legacy, development or
+/// per-tenant entries). A browser always sends `Origin` on a WebSocket
+/// handshake, so an upgrade carrying the browser-only `Sec-Fetch-*` headers
+/// WITHOUT `Origin` is refused; a non-browser client (the host itself, a
+/// terminal UI) sends neither and is admitted to the token check.
+///
+/// Origin is only a guard against other web pages driving a browser that
+/// holds a token. It is not authentication: any local process can send any
+/// Origin. The token is the control.
+fn decide_host_managed_ws_origin_gate(headers: &HeaderMap, state: &AppState) -> WsOriginDecision {
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .map(|value| value.to_str().map(str::trim));
+    match origin {
+        Some(Err(_)) => WsOriginDecision::RejectMalformed,
+        Some(Ok(origin)) if !origin.is_empty() => {
+            if state
+                .appui_allowed_origins
+                .iter()
+                .any(|allowed| allowed == origin)
+            {
+                WsOriginDecision::Allow
+            } else {
+                WsOriginDecision::RejectDisallowed {
+                    origin: origin.to_owned(),
+                }
+            }
+        }
+        _ => {
+            let browser = ["sec-fetch-mode", "sec-fetch-site", "sec-fetch-dest"]
+                .iter()
+                .any(|name| headers.contains_key(*name));
+            if browser {
+                WsOriginDecision::RejectDisallowed {
+                    origin: String::new(),
+                }
+            } else {
+                WsOriginDecision::Allow
+            }
+        }
+    }
+}
+
 fn decide_ui_ws_origin_gate(
     headers: &HeaderMap,
     state: &AppState,
     is_authenticated: bool,
 ) -> WsOriginDecision {
+    if state.host_managed.is_some() {
+        return decide_host_managed_ws_origin_gate(headers, state);
+    }
     decide_ws_origin_gate(
         headers,
         state.base_domain.as_deref(),
@@ -6715,6 +6811,9 @@ fn decide_session_ingress_ws_origin_gate(
 ) -> WsOriginDecision {
     // The work secret authenticates and scopes the session independently.
     // It does not replace the browser Origin gate.
+    if state.host_managed.is_some() {
+        return decide_host_managed_ws_origin_gate(headers, state);
+    }
     decide_ws_origin_gate(
         headers,
         state.base_domain.as_deref(),
@@ -6789,6 +6888,10 @@ pub async fn ws_handler(
         Ok(ws) => ws,
         Err(rejection) => return rejection.into_response(),
     };
+    // A browser that sent its bearer as `octos.bearer.<token>` also offered
+    // `octos-ui`; select that so the handshake succeeds without echoing the
+    // token entry. Clients that offer no subprotocol are unaffected.
+    let ws = ws.protocols([super::router::UI_WS_SUBPROTOCOL]);
     let features = ConnectionUiFeatures::from_headers_and_query(&headers, uri.query());
     // M12 Phase D-1: auxiliary REST→WS dispatchers reuse the same REST
     // handlers in `handlers.rs` for business logic, which means they
@@ -6902,6 +7005,15 @@ async fn ui_protocol_connection(
     // Protocol connection. Later client_hello renegotiation does not create a
     // second connection and therefore must not increment this counter again.
     record_ui_protocol_connection_mode(features, "ws");
+    // `octos serve --host-managed`: anything but the host token (including a
+    // work-secret session-ingress connection) is an external client.
+    let connection_is_external =
+        super::host_managed::is_external(&state, connection_identity.as_ref());
+    // Sessions this external connection opened; it answers prompts only there.
+    let mut external_opened_sessions: HashSet<String> = HashSet::new();
+    // Turn ownership is NOT tracked here by turn id (ids are client-chosen):
+    // the active-turn registry and each pending approval or question record
+    // the owning connection, and the handlers check it (UPCR-2026-036).
     let (ws_sink, mut ws_rx) = socket.split();
     // Decouple the network sink from request handlers via a bounded channel
     // and a dedicated drainer task. No handler ever holds a lock across an
@@ -6909,6 +7021,10 @@ async fn ui_protocol_connection(
     let (writer_tx, writer_rx) = mpsc::channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
     let writer_handle = tokio::spawn(WsConnection::writer_loop(ws_sink, writer_rx));
     let ws = WsConnection::new(writer_tx);
+    ws.set_external(connection_is_external);
+    if connection_is_external {
+        features.session_workspace_cwd = false;
+    }
     // Codex #1336 round-2 BLOCKER 1: seed the per-connection feature
     // snapshot from the negotiated `features` so direct-sends apply
     // the same capability filter the broadcast forwarder uses BEFORE
@@ -7045,18 +7161,25 @@ async fn ui_protocol_connection(
                 ) {
                     appui_keep_open_sessions_alive(&state, &open_sessions).await;
                 }
-                drain_appui_due_master_continuations(
-                    &ws,
-                    &state,
-                    &ledger,
-                    &contracts,
-                    &active_turns,
-                    &connection_turns,
-                    profile_filter,
-                    &open_sessions,
-                    false,
-                    features,
-                ).await;
+                // `octos serve --host-managed`: an external connection never
+                // runs background continuations (the system agent's wakes,
+                // loops, goals); they would run with its restricted tools and
+                // stream to it. The host's connection or the global drain
+                // runs them.
+                if !connection_is_external {
+                    drain_appui_due_master_continuations(
+                        &ws,
+                        &state,
+                        &ledger,
+                        &contracts,
+                        &active_turns,
+                        &connection_turns,
+                        profile_filter,
+                        &open_sessions,
+                        false,
+                        features,
+                    ).await;
+                }
                 emit_session_orchestration_updates(
                     &ws,
                     &ledger,
@@ -7163,6 +7286,19 @@ async fn ui_protocol_connection(
             );
             continue;
         }
+        // `octos serve --host-managed`: an external client may call only an
+        // allowlist of methods, never on a host-owned app peer's session,
+        // and answers prompts only on sessions it opened (UPCR-2026-036).
+        if connection_is_external {
+            if let Err(error) = super::host_managed::external_gate(
+                &request.method,
+                &request.params,
+                &external_opened_sessions,
+            ) {
+                let _ = send_rpc_error(&ws, Some(id), error);
+                continue;
+            }
+        }
         if handle_raw_appui_rpc(
             &ws,
             &state,
@@ -7227,6 +7363,7 @@ async fn ui_protocol_connection(
                     .profile_id
                     .clone()
                     .or_else(|| params.session_id.profile_id().map(ToOwned::to_owned));
+                let opened_session = params.session_id.0.clone();
                 let opened = handle_session_open(
                     &ws,
                     &state,
@@ -7244,6 +7381,11 @@ async fn ui_protocol_connection(
                     session_ingress_scope.is_some(),
                 )
                 .await;
+                if opened && connection_is_external {
+                    // Only a successful open lets an external client answer
+                    // this session's prompts.
+                    external_opened_sessions.insert(opened_session);
+                }
                 if opened {
                     // codex P2 (re-review): a successful open always resolves to
                     // a concrete runtime — a profile-less default open resolves
@@ -7285,6 +7427,7 @@ async fn ui_protocol_connection(
                     &ledger,
                     &contracts,
                     connection_profile_id,
+                    connection_is_external.then(|| ws.connection_id()),
                     id,
                     params,
                 )
@@ -7301,8 +7444,15 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::UserQuestionRespond(params) => {
-                handle_user_question_respond(&ws, &contracts, connection_profile_id, id, params)
-                    .await;
+                handle_user_question_respond(
+                    &ws,
+                    &contracts,
+                    connection_profile_id,
+                    connection_is_external.then(|| ws.connection_id()),
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::DiffPreviewGet(params) => {
                 let store = diff_preview_store(&state, contracts.as_ref()).await;
@@ -8178,12 +8328,14 @@ where
                         .await;
                 }
                 UiCommand::ApprovalRespond(params) => {
+                    // The stdio peer is the process owner, never external.
                     handle_approval_respond(
                         &ws,
                         &state,
                         &ledger,
                         &contracts,
                         connection_profile_id_owned.as_deref(),
+                        None,
                         id,
                         params,
                     )
@@ -8204,6 +8356,7 @@ where
                         &ws,
                         &contracts,
                         connection_profile_id_owned.as_deref(),
+                        None,
                         id,
                         params,
                     )
@@ -14588,6 +14741,163 @@ struct RawPeerPrepareParams {
     session_id: Option<SessionKey>,
     #[serde(default)]
     profile_id: Option<String>,
+    /// UPCR-2026-034 — `peer_handoff` parity: an optional model LANE key
+    /// naming a configured `sub_provider`. A valid lane is recorded for the
+    /// peer; an unknown lane is reported in `model_note` and the peer runs on
+    /// the primary model. The result's `model` reports the effective choice.
+    #[serde(default)]
+    model: Option<String>,
+    /// UPCR-2026-034 — marks a HOST-OWNED APP PEER and binds it to this
+    /// app/account memory namespace. Requires `session_id` (the owning system
+    /// agent session, recorded as originator), `cwd` (the app's host-owned
+    /// workspace), exactly one name and no worktree. Every session of the
+    /// peer then runs only in `cwd` and on the namespace's memory stores.
+    #[serde(default)]
+    memory_namespace: Option<String>,
+    /// UPCR-2026-034 — create-or-resume for a host-owned app peer: when the
+    /// named peer already exists with the SAME originator, namespace and
+    /// workspace, return it (`resumed: true`) instead of refusing the name.
+    #[serde(default)]
+    resume: bool,
+    /// UPCR-2026-034 — the host token returned when this host-owned app peer
+    /// was created. Required to resume it.
+    #[serde(default)]
+    host_token: Option<String>,
+}
+
+/// UPCR-2026-034 — the profile's configured model lanes, from the
+/// bootstrapped runtime when there is one (what turns actually resolve
+/// against) and otherwise from the stored profile.
+fn profile_model_lanes(
+    state: &AppState,
+    profile_id: &str,
+) -> Vec<crate::config::SubProviderConfig> {
+    if let Some(runtime) = resolve_session_profile_runtime(state, Some(profile_id)) {
+        return runtime.config.sub_providers.clone();
+    }
+    profile_store(state)
+        .ok()
+        .and_then(|store| store.get(profile_id).ok().flatten())
+        .map(|profile| profile.config.sub_providers.clone())
+        .unwrap_or_default()
+}
+
+/// UPCR-2026-034 — the effective model of a peer: its recorded lane's
+/// provider/model, or `{"lane": "primary"}`. Never carries credentials.
+fn peer_effective_model_json(
+    lanes: &[crate::config::SubProviderConfig],
+    lane: Option<&str>,
+) -> Value {
+    match lane.and_then(|lane| lanes.iter().rev().find(|sp| sp.key == lane)) {
+        Some(sp) => json!({ "lane": sp.key, "provider": sp.provider, "model": sp.model }),
+        None => json!({ "lane": "primary" }),
+    }
+}
+
+fn host_peer_error(kind: &str, message: String) -> RpcError {
+    RpcError::invalid_params(message).with_data(json!({ "kind": kind }))
+}
+
+/// UPCR-2026-034 — authorize a host call against a peer: the caller must be
+/// the peer's recorded originator. Resolves a name or slug.
+fn authorize_host_peer_call(
+    peers_root: &Path,
+    peer: &str,
+    caller: &SessionKey,
+    host_token: Option<&str>,
+) -> Result<String, RpcError> {
+    let slug = resolve_peer_name_to_slug(peers_root, peer)
+        .ok_or_else(|| host_peer_error("peer_not_found", format!("no peer named '{peer}'")))?;
+    peer_send_input_authorized(peers_root, &slug, &caller.0).map_err(|_| {
+        RpcError::permission_denied(format!(
+            "only the session that owns peer '{peer}' may do this"
+        ))
+        .with_data(json!({ "kind": "peer_originator_mismatch" }))
+    })?;
+    // A host-owned app peer is controlled by the credential minted with it,
+    // not by the (self-reported) originator session alone.
+    if let Some(binding) = crate::peers::app_binding::read_peer_host_binding(peers_root, &slug) {
+        if !crate::peers::app_binding::host_token_matches(&binding, host_token) {
+            return Err(host_token_error(&slug));
+        }
+    }
+    Ok(slug)
+}
+
+fn host_token_error(slug: &str) -> RpcError {
+    RpcError::permission_denied(format!(
+        "peer '{slug}' is a host-owned app peer: present the host token it was created with"
+    ))
+    .with_data(json!({ "kind": "peer_host_token_mismatch" }))
+}
+
+/// UPCR-2026-034 — resume an existing host-owned app peer after checking
+/// that the caller owns it and that its durable binding is unchanged.
+#[allow(clippy::too_many_arguments)]
+fn resume_host_peer(
+    peers_root: &Path,
+    slug: &str,
+    originator: &SessionKey,
+    namespace: &str,
+    workspace_root: &Path,
+    requested_model: Option<&str>,
+    lanes: &[crate::config::SubProviderConfig],
+    profile_id: &str,
+    host_token: Option<&str>,
+) -> Result<Value, RpcError> {
+    let Some(dir) = staged_peer_dir(peers_root, slug) else {
+        return Err(host_peer_error(
+            "peer_not_found",
+            format!("peer '{slug}' is not staged"),
+        ));
+    };
+    let Some(binding) = crate::peers::app_binding::read_host_binding_in(&dir) else {
+        return Err(host_peer_error(
+            "peer_binding_mismatch",
+            format!("peer '{slug}' exists but is not a host-owned app peer"),
+        ));
+    };
+    peer_send_input_authorized(peers_root, slug, &originator.0).map_err(|_| {
+        RpcError::permission_denied(format!("peer '{slug}' is owned by another session"))
+            .with_data(json!({ "kind": "peer_originator_mismatch" }))
+    })?;
+    if !crate::peers::app_binding::host_token_matches(&binding, host_token) {
+        return Err(host_token_error(slug));
+    }
+    if peer_is_closed(peers_root, slug) {
+        return Err(host_peer_error(
+            "peer_closed",
+            format!("peer '{slug}' was closed; stage a new peer under a new name"),
+        ));
+    }
+    if binding.memory_namespace != namespace || binding.cwd != workspace_root {
+        return Err(host_peer_error(
+            "peer_binding_mismatch",
+            format!("peer '{slug}' is bound to a different workspace or memory namespace"),
+        ));
+    }
+    let lane_keys: Vec<String> = lanes.iter().map(|sp| sp.key.clone()).collect();
+    let model_note = match requested_model {
+        Some(model) => record_peer_model_lane(peers_root, slug, Some(model), &lane_keys),
+        None => None,
+    };
+    let lane = read_peer_model_lane(peers_root, slug);
+    let entry = json!({
+        "slug": slug,
+        "topic": format!("peer-{slug}"),
+        "brief_path": dir.join("brief.md").to_string_lossy(),
+        "cwd": binding.cwd.to_string_lossy(),
+        "worktree_branch": Value::Null,
+        "profile_id": profile_id,
+        "token_budget": Value::Null,
+        "model": peer_effective_model_json(lanes, lane.as_deref()),
+        "model_note": model_note,
+        "memory_namespace": binding.memory_namespace,
+        "resumed": true,
+    });
+    let mut result = entry.as_object().cloned().unwrap_or_default();
+    result.insert("peers".into(), Value::Array(vec![entry]));
+    Ok(Value::Object(result))
 }
 
 /// `peer/prepare` (#1800): stage a peer-agent spin-off. Writes the durable
@@ -14617,10 +14927,62 @@ async fn raw_peer_prepare(
     )?;
     let (_, data_dir) = resolve_profile_data_dir(state, Some(&profile_id))?;
 
+    // UPCR-2026-034 — a host-owned app peer: the host names the owning
+    // system session, the app workspace and the memory namespace.
+    let host_namespace = match params.memory_namespace.as_deref() {
+        Some(raw) => Some(
+            crate::runtime::memory_namespace::validate_memory_namespace(raw)
+                .map_err(RpcError::invalid_params)?,
+        ),
+        None => None,
+    };
+    if params.resume && host_namespace.is_none() {
+        return Err(RpcError::invalid_params(
+            "resume is only for host-owned app peers: pass memory_namespace",
+        ));
+    }
+    if host_namespace.is_some() {
+        if params.session_id.is_none() {
+            return Err(RpcError::invalid_params(
+                "a host-owned app peer needs session_id: the system agent session that owns it",
+            ));
+        }
+        if params.worktree {
+            return Err(RpcError::invalid_params(
+                "a host-owned app peer runs in its app workspace; worktree is not supported",
+            ));
+        }
+        if params.n.unwrap_or(1) != 1 || params.names.as_ref().is_none_or(|names| names.len() != 1)
+        {
+            return Err(RpcError::invalid_params(
+                "a host-owned app peer is staged alone, with exactly one name",
+            ));
+        }
+    }
+    let model_lanes = profile_model_lanes(state, &profile_id);
+    let model_lane_keys: Vec<String> = model_lanes.iter().map(|sp| sp.key.clone()).collect();
+
     // Workspace root: explicit cwd (validated like a session open) beats the
     // calling session's root. A worktree needs SOME root; a plain peer does
     // too (its session open will carry it as cwd).
-    let workspace_root = match params.cwd.as_deref() {
+    // UPCR-2026-034 — a host-owned app peer without `cwd` gets a
+    // KERNEL-provisioned workspace under the profile data dir, named by its
+    // namespace. This is how a remote client (whose local paths mean nothing
+    // here) obtains a scoped workspace instead of broadening access.
+    let provisioned_cwd = match (host_namespace.as_deref(), params.cwd.as_deref()) {
+        (Some(namespace), None) => {
+            let dir = crate::runtime::memory_namespace::app_workspace_root(&data_dir, namespace);
+            std::fs::create_dir_all(&dir).map_err(|err| {
+                RpcError::internal_error(format!(
+                    "failed to provision the app workspace {}: {err}",
+                    dir.display()
+                ))
+            })?;
+            Some(dir.to_string_lossy().into_owned())
+        }
+        _ => None,
+    };
+    let workspace_root = match params.cwd.as_deref().or(provisioned_cwd.as_deref()) {
         Some(cwd) => {
             let path = PathBuf::from(cwd);
             // dunce strips the `\\?\` prefix std canonicalize returns on
@@ -14717,6 +15079,62 @@ async fn raw_peer_prepare(
         None => None,
     };
 
+    let peers_root_for_host = peers_root.clone();
+    if let (Some(namespace), true) = (host_namespace.as_deref(), params.resume) {
+        let name = &names.as_ref().expect("validated above")[0];
+        if let Some(slug) = resolve_peer_name_to_slug(&peers_root_for_host, name) {
+            return resume_host_peer(
+                &peers_root_for_host,
+                &slug,
+                params.session_id.as_ref().expect("validated above"),
+                namespace,
+                &workspace_root,
+                params.model.as_deref(),
+                &model_lanes,
+                &profile_id,
+                params.host_token.as_deref(),
+            );
+        }
+    }
+    // A new host-owned app peer must not share state with another: its
+    // namespace may not equal or nest with another app peer's (whose request
+    // contexts live under it), its workspace may not nest with another's,
+    // and it may not sit inside the kernel's memory stores.
+    let mut minted_token = None;
+    if let Some(namespace) = host_namespace.as_deref() {
+        let stores = dunce::canonicalize(&data_dir)
+            .unwrap_or_else(|_| data_dir.clone())
+            .join(crate::runtime::memory_namespace::MEMORY_NAMESPACES_DIR);
+        if workspace_root.starts_with(&stores) {
+            return Err(host_peer_error(
+                "peer_binding_conflict",
+                "an app workspace cannot be inside the kernel's memory stores".to_owned(),
+            ));
+        }
+        if let Some(conflict) = crate::peers::app_binding::binding_conflict(
+            &peers_root,
+            namespace,
+            &workspace_root,
+            None,
+        ) {
+            return Err(host_peer_error("peer_binding_conflict", conflict));
+        }
+        minted_token =
+            Some(crate::peers::app_binding::mint_host_token().map_err(RpcError::internal_error)?);
+    }
+    let host_binding =
+        host_namespace
+            .as_ref()
+            .map(|namespace| crate::peers::app_binding::PeerHostBinding {
+                version: 1,
+                cwd: workspace_root.clone(),
+                memory_namespace: namespace.clone(),
+                token_sha256: minted_token
+                    .as_ref()
+                    .map(|(_, digest)| digest.clone())
+                    .unwrap_or_default(),
+            });
+
     // Fleet staging is ALL-OR-NOTHING: each member goes through `stage_peer`
     // (reserve → optional worktree fence → atomic brief write; the failing
     // member rolls ITSELF back inside the helper), and any member failure
@@ -14740,6 +15158,7 @@ async fn raw_peer_prepare(
             .session_id
             .as_ref()
             .map(|session| session.to_string());
+        let member_host_binding = host_binding.clone();
         let member = tokio::task::spawn_blocking(move || {
             stage_peer_with_budget(
                 &member_peers_root,
@@ -14756,6 +15175,7 @@ async fn raw_peer_prepare(
                 None,
                 None,
                 member_token_budget,
+                member_host_binding.as_ref(),
             )
         })
         .await
@@ -14781,6 +15201,16 @@ async fn raw_peer_prepare(
         // Track the member for the fleet-level rollback: the reserved dir is
         // the brief's parent (`peers/<slug>`), same claim `stage_peer` made.
         staged.push((member.slug.clone(), peers_root.join(&member.slug)));
+        // UPCR-2026-034 — `peer_handoff` model parity: record the lane the
+        // caller named (an unknown lane is a truthful note, never a failure)
+        // and report the EFFECTIVE model.
+        let model_note = record_peer_model_lane(
+            &peers_root,
+            &member.slug,
+            params.model.as_deref(),
+            &model_lane_keys,
+        );
+        let lane = read_peer_model_lane(&peers_root, &member.slug);
         entries.push(json!({
             "slug": member.slug,
             "topic": member.topic,
@@ -14789,6 +15219,13 @@ async fn raw_peer_prepare(
             "worktree_branch": member.worktree_branch,
             "profile_id": profile_id.clone(),
             "token_budget": member_token_budget,
+            "model": peer_effective_model_json(&model_lanes, lane.as_deref()),
+            "model_note": model_note,
+            "memory_namespace": host_namespace.clone(),
+            "resumed": false,
+            // Returned ONCE, at creation: the credential for every later
+            // control call on this host-owned app peer.
+            "host_token": minted_token.as_ref().map(|(token, _)| token.clone()),
         }));
     }
 
@@ -14833,6 +15270,315 @@ async fn cleanup_staged_peers(workspace_root: &Path, staged: &[(String, PathBuf)
         }
     })
     .await;
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPeerModelSetParams {
+    /// The peer's originator (owning) session.
+    session_id: SessionKey,
+    /// Peer name or slug.
+    peer: String,
+    /// A configured `sub_provider` lane key; `null`/empty returns the peer to
+    /// the profile's primary model.
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    profile_id: Option<String>,
+    /// Required for a host-owned app peer.
+    #[serde(default)]
+    host_token: Option<String>,
+}
+
+/// UPCR-2026-034 `peer/model/set` — change an existing peer's model lane.
+/// Originator-only. An unknown lane is REFUSED (nothing changes), unlike the
+/// staging paths, because the caller asked for this change explicitly. The
+/// lane is read at each turn start, so the change applies between turns;
+/// the profile default and credentials are untouched.
+fn raw_peer_model_set(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let params: RawPeerModelSetParams = parse_raw_params(request)?;
+    let profile_id = raw_scoped_llm_profile_id(
+        params.profile_id.clone(),
+        Some(&params.session_id),
+        connection_profile_id,
+    )?;
+    let (_, data_dir) = resolve_profile_data_dir(state, Some(&profile_id))?;
+    let peers_root = data_dir.join("peers");
+    let slug = authorize_host_peer_call(
+        &peers_root,
+        &params.peer,
+        &params.session_id,
+        params.host_token.as_deref(),
+    )?;
+    if peer_is_closed(&peers_root, &slug) {
+        return Err(host_peer_error(
+            "peer_closed",
+            format!("peer '{slug}' is closed"),
+        ));
+    }
+    let lanes = profile_model_lanes(state, &profile_id);
+    let requested = params
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|lane| !lane.is_empty() && *lane != "primary");
+    let dir = staged_peer_dir(&peers_root, &slug)
+        .ok_or_else(|| host_peer_error("peer_not_found", format!("peer '{slug}' is not staged")))?;
+    match requested {
+        Some(lane) => {
+            if !lanes.iter().any(|sp| sp.key == lane) {
+                let available: Vec<&str> = lanes.iter().map(|sp| sp.key.as_str()).collect();
+                return Err(RpcError::invalid_params(format!(
+                    "model lane '{lane}' is not configured for this profile"
+                ))
+                .with_data(json!({ "kind": "peer_model_unknown", "available": available })));
+            }
+            peer_io::write_peer_file_atomic(&dir, "model", lane).map_err(|err| {
+                RpcError::internal_error(format!("failed to record peer model lane: {err}"))
+            })?;
+        }
+        None => {
+            peer_io::write_peer_file_atomic(&dir, "model", "").map_err(|err| {
+                RpcError::internal_error(format!("failed to clear peer model lane: {err}"))
+            })?;
+        }
+    }
+    let lane = read_peer_model_lane(&peers_root, &slug);
+    Ok(json!({
+        "slug": slug,
+        "profile_id": profile_id,
+        "model": peer_effective_model_json(&lanes, lane.as_deref()),
+        "applies": "next_turn",
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPeerContextParams {
+    /// The owning peer's originator session.
+    session_id: SessionKey,
+    /// Peer name or slug.
+    peer: String,
+    /// `[a-z0-9][a-z0-9-]{0,63}`, chosen by the host (one per client
+    /// instance and generation).
+    context_id: String,
+    /// Optional workspace, which must lie inside the peer's workspace.
+    /// Defaults to `<peer cwd>/contexts/<context_id>`.
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    profile_id: Option<String>,
+    /// The host token of the owning app peer.
+    #[serde(default)]
+    host_token: Option<String>,
+}
+
+fn host_peer_context_prelude(
+    state: &Arc<AppState>,
+    params: &RawPeerContextParams,
+    connection_profile_id: Option<&str>,
+) -> Result<
+    (
+        String,
+        PathBuf,
+        String,
+        String,
+        crate::peers::app_binding::PeerHostBinding,
+    ),
+    RpcError,
+> {
+    let profile_id = raw_scoped_llm_profile_id(
+        params.profile_id.clone(),
+        Some(&params.session_id),
+        connection_profile_id,
+    )?;
+    let (_, data_dir) = resolve_profile_data_dir(state, Some(&profile_id))?;
+    let peers_root = data_dir.join("peers");
+    let context_id = crate::peers::app_binding::validate_context_id(&params.context_id)
+        .map_err(RpcError::invalid_params)?;
+    let slug = authorize_host_peer_call(
+        &peers_root,
+        &params.peer,
+        &params.session_id,
+        params.host_token.as_deref(),
+    )?;
+    let Some(binding) = crate::peers::app_binding::read_peer_host_binding(&peers_root, &slug)
+    else {
+        return Err(host_peer_error(
+            "peer_not_host_bound",
+            format!("peer '{slug}' is not a host-owned app peer"),
+        ));
+    };
+    Ok((profile_id, peers_root, slug, context_id, binding))
+}
+
+/// UPCR-2026-034 `peer/context/open` — open a bound request context of a
+/// host-owned app peer. Idempotent for an open context; a closed context id
+/// is never reopened (the host mints a new id per client generation).
+fn raw_peer_context_open(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    use crate::peers::app_binding::{
+        PeerContextBinding, context_memory_namespace, context_session_key, read_context_binding,
+        write_context_binding,
+    };
+    let params: RawPeerContextParams = parse_raw_params(request)?;
+    let (profile_id, peers_root, slug, context_id, peer) =
+        host_peer_context_prelude(state, &params, connection_profile_id)?;
+    if peer_is_closed(&peers_root, &slug) {
+        return Err(host_peer_error(
+            "peer_closed",
+            format!("peer '{slug}' is closed"),
+        ));
+    }
+    let namespace = crate::runtime::memory_namespace::validate_memory_namespace(
+        &context_memory_namespace(&peer.memory_namespace, &context_id),
+    )
+    .map_err(|err| host_peer_error("peer_context_namespace_too_long", err))?;
+    let peer_root = dunce::canonicalize(&peer.cwd).map_err(|err| {
+        RpcError::internal_error(format!(
+            "peer workspace {} is not usable: {err}",
+            peer.cwd.display()
+        ))
+    })?;
+    let requested_cwd = match params.cwd.as_deref() {
+        Some(cwd) => {
+            let canonical = dunce::canonicalize(cwd).map_err(|err| {
+                RpcError::invalid_params(format!("cwd {cwd} is not usable: {err}"))
+            })?;
+            if !canonical.is_dir() {
+                return Err(RpcError::invalid_params(format!(
+                    "cwd {cwd} is not a directory"
+                )));
+            }
+            canonical
+        }
+        None => {
+            let default = peer_root.join("contexts").join(&context_id);
+            std::fs::create_dir_all(&default).map_err(|err| {
+                RpcError::internal_error(format!(
+                    "failed to create context workspace {}: {err}",
+                    default.display()
+                ))
+            })?;
+            dunce::canonicalize(&default).map_err(|err| {
+                RpcError::internal_error(format!("context workspace is not usable: {err}"))
+            })?
+        }
+    };
+    if requested_cwd == peer_root
+        || !crate::peers::app_binding::path_is_within(&peer_root, &requested_cwd)
+    {
+        return Err(host_peer_error(
+            "peer_context_workspace_escape",
+            format!(
+                "a request context's workspace must be inside the peer's workspace {}",
+                peer_root.display()
+            ),
+        ));
+    }
+    validate_session_workspace_path_safety(&requested_cwd)?;
+    let created = match read_context_binding(&peers_root, &slug, &context_id) {
+        Some(existing) if existing.closed => {
+            return Err(host_peer_error(
+                "peer_context_closed",
+                format!("request context '{context_id}' was closed; open a new context id"),
+            ));
+        }
+        Some(existing) => {
+            if params.cwd.is_some() && existing.cwd != requested_cwd {
+                return Err(host_peer_error(
+                    "peer_binding_mismatch",
+                    format!("request context '{context_id}' is bound to another workspace"),
+                ));
+            }
+            false
+        }
+        None => {
+            write_context_binding(
+                &peers_root,
+                &slug,
+                &context_id,
+                &PeerContextBinding {
+                    version: 1,
+                    cwd: requested_cwd.clone(),
+                    memory_namespace: namespace.clone(),
+                    closed: false,
+                },
+            )
+            .map_err(RpcError::internal_error)?;
+            true
+        }
+    };
+    let binding = read_context_binding(&peers_root, &slug, &context_id).ok_or_else(|| {
+        RpcError::internal_error("request context binding vanished after it was written")
+    })?;
+    let session_id = context_session_key(&params.session_id, &slug, &context_id);
+    let lanes = profile_model_lanes(state, &profile_id);
+    let lane = read_peer_model_lane(&peers_root, &slug);
+    Ok(json!({
+        "session_id": session_id,
+        "topic": session_id.topic(),
+        "slug": slug,
+        "context_id": context_id,
+        "cwd": binding.cwd.to_string_lossy(),
+        "memory_namespace": binding.memory_namespace,
+        "model": peer_effective_model_json(&lanes, lane.as_deref()),
+        "profile_id": profile_id,
+        "created": created,
+    }))
+}
+
+/// UPCR-2026-034 `peer/context/close` — close a request context for good and
+/// interrupt its in-flight turn. Idempotent. The transcript and workspace
+/// stay on disk (the host decides retention); the session never runs again.
+async fn raw_peer_context_close(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    use crate::peers::app_binding::{
+        context_session_key, read_context_binding, write_context_binding,
+    };
+    let params: RawPeerContextParams = parse_raw_params(request)?;
+    let (profile_id, peers_root, slug, context_id, _peer) =
+        host_peer_context_prelude(state, &params, connection_profile_id)?;
+    let Some(mut binding) = read_context_binding(&peers_root, &slug, &context_id) else {
+        return Err(host_peer_error(
+            "peer_context_not_found",
+            format!("request context '{context_id}' of peer '{slug}' was never opened"),
+        ));
+    };
+    let was_open = !binding.closed;
+    if was_open {
+        binding.closed = true;
+        write_context_binding(&peers_root, &slug, &context_id, &binding)
+            .map_err(RpcError::internal_error)?;
+    }
+    let session_id = context_session_key(&params.session_id, &slug, &context_id);
+    // Marker first (refuses every later turn start), then abort the live turn.
+    let interrupted = matches!(
+        interrupt_active_turn_for_session(
+            &active_turns_registry(),
+            &session_id,
+            InterruptOrigin::ContextClose,
+        )
+        .await,
+        InterruptOutcome::Captured { .. }
+    );
+    Ok(json!({
+        "session_id": session_id,
+        "slug": slug,
+        "context_id": context_id,
+        "profile_id": profile_id,
+        "closed": true,
+        "was_open": was_open,
+        "interrupted": interrupted,
+    }))
 }
 
 /// #peer-model — select the `sub_provider` for a lane KEY. LAST match wins,
@@ -14929,7 +15675,18 @@ fn peer_lane_provider_for(
     session_id: &SessionKey,
     session_runtime: &crate::runtime::SessionRuntime,
 ) -> Option<Arc<dyn octos_llm::LlmProvider>> {
-    let (_profile_id, slug) = peer_slug_and_profile(session_id)?;
+    // UPCR-2026-034 — a request context runs on its owning peer's lane.
+    let slug = match peer_slug_and_profile(session_id) {
+        Some((_profile_id, slug)) => slug,
+        None => {
+            let (slug, _context) =
+                crate::peers::app_binding::parse_context_topic(session_id.topic()?)?;
+            if !peer_slug_is_safe(slug) {
+                return None;
+            }
+            slug
+        }
+    };
     let peers_root = session_runtime.profile.data_dir.join("peers");
     resolve_peer_lane_provider(&peers_root, slug, &session_runtime.profile.config)
 }
@@ -14960,6 +15717,10 @@ enum PeerAwaitingWakeOutcome {
     /// malformed/hostile originator can never strand a continuation on the wrong
     /// or an unanswerable session.
     InvalidOriginator,
+    /// ADR 0007 — a host-owned app peer parked on a tool APPROVAL. That is the
+    /// person's decision, made in the app's own UI; the owning system agent is
+    /// never asked (and `peer_respond` refuses it). Questions still wake.
+    HostOwnedApproval,
 }
 
 /// Short, single-line summary of what a peer is blocked on, for the wake nudge.
@@ -15005,6 +15766,13 @@ fn enqueue_peer_awaiting_input_wake(
     let Some(peer_dir) = staged_peer_dir(peers_root, slug) else {
         return PeerAwaitingWakeOutcome::NoStagedPeer;
     };
+    // ADR 0007 — never ask the system agent to answer a host-owned app peer's
+    // tool approval: the person answers it in the app.
+    if park_kind == PeerPendingKind::Approval
+        && crate::peers::app_binding::peer_is_host_owned(peers_root, slug)
+    {
+        return PeerAwaitingWakeOutcome::HostOwnedApproval;
+    }
     let Some(master) =
         peer_io::read_peer_file(&peer_dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
     else {
@@ -15474,6 +16242,58 @@ mod peer_awaiting_wake_tests {
         assert!(
             prompt.contains("peer_list") && prompt.contains("peer_respond"),
             "prompt directs peer_list/peer_respond: {prompt}"
+        );
+    }
+
+    /// ADR 0007 — a host-owned app peer parking on a tool APPROVAL must not
+    /// wake its owning system agent: the person answers it in the app. The
+    /// same peer's QUESTION still wakes the system agent.
+    #[test]
+    fn host_owned_peer_approval_park_does_not_wake_the_system_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path();
+        let profile = "tenant-wake-host-appr";
+        let master = "tenant-wake-host-appr:api:octosense#system";
+        stage_peer_with_originator(peers_root, "rinx", Some(master));
+        crate::peers::app_binding::write_host_binding_in(
+            &peers_root.join("rinx"),
+            &crate::peers::app_binding::PeerHostBinding {
+                version: 1,
+                cwd: peers_root.join("work"),
+                memory_namespace: "app/rinx".to_owned(),
+                token_sha256: crate::peers::app_binding::token_digest("t"),
+            },
+        )
+        .unwrap();
+        let session = peer_session(profile, "rinx-wire", "rinx");
+        let master_key = SessionKey(master.to_owned());
+        let orchestrator = default_agent_orchestrator();
+
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "approval-host-1",
+            PeerPendingKind::Approval,
+            "shell: rm -rf build",
+        );
+        assert_eq!(outcome, PeerAwaitingWakeOutcome::HostOwnedApproval);
+        assert_eq!(
+            orchestrator.pending_continuation_count_for_session_for_test(&master_key, profile),
+            0,
+            "no wake is queued on the system agent for a host-owned approval",
+        );
+
+        let outcome = enqueue_peer_awaiting_input_wake(
+            peers_root,
+            &session,
+            "question-host-1",
+            PeerPendingKind::Question,
+            "Which number?",
+        );
+        assert_eq!(
+            outcome,
+            PeerAwaitingWakeOutcome::Woke,
+            "the host-owned peer's question still wakes the system agent"
         );
     }
 
@@ -18775,6 +19595,13 @@ async fn handle_raw_appui_rpc(
         }
         APPUI_METHOD_PEER_PREPARE => raw_peer_prepare(state, request, connection_profile_id).await,
         APPUI_METHOD_PEER_GATHER => raw_peer_gather(state, request, connection_profile_id),
+        APPUI_METHOD_PEER_MODEL_SET => raw_peer_model_set(state, request, connection_profile_id),
+        APPUI_METHOD_PEER_CONTEXT_OPEN => {
+            raw_peer_context_open(state, request, connection_profile_id)
+        }
+        APPUI_METHOD_PEER_CONTEXT_CLOSE => {
+            raw_peer_context_close(state, request, connection_profile_id).await
+        }
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
         }
@@ -19035,6 +19862,11 @@ fn handle_client_hello_rpc(
     // broadcast forwarder uses — without this sync a connection that
     // negotiated `projection.envelope.v1` mid-session would still
     // receive legacy frames on direct sends.
+    // `octos serve --host-managed`: an external client never chooses a
+    // workspace; its sessions stay in the workspace octos bound them to.
+    if ws.is_external() {
+        features.session_workspace_cwd = false;
+    }
     ws.update_live_features(*features);
     let transport = if features.stdio_transport {
         "stdio"
@@ -19208,6 +20040,9 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_SNAPSHOT_RESTORE
             | APPUI_METHOD_PEER_PREPARE
             | APPUI_METHOD_PEER_GATHER
+            | APPUI_METHOD_PEER_MODEL_SET
+            | APPUI_METHOD_PEER_CONTEXT_OPEN
+            | APPUI_METHOD_PEER_CONTEXT_CLOSE
             | APPUI_METHOD_PROFILE_SKILLS_LIST
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL
@@ -19386,7 +20221,7 @@ fn validate_session_ingress_command_scope(
     }
 }
 
-fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
+pub(crate) fn ui_protocol_server_supported_methods() -> Vec<&'static str> {
     let mut methods = octos_core::ui_protocol::UI_PROTOCOL_FIRST_SERVER_METHODS.to_vec();
     methods.extend(APPUI_EXTRA_METHODS.iter().copied());
     methods
@@ -20692,6 +21527,9 @@ async fn open_session_result(
                 // this session's turns later append) under the per-cwd
                 // storage identity. No-op when the store wasn't relocated.
                 register_session_ledger_scope(state, ledger, &runtime);
+                if let Some(commands) = &params.client_commands {
+                    runtime.apply_client_commands(commands);
+                }
                 open_context_provider = Some(
                     peer_lane_provider_for(&params.session_id, &runtime)
                         .unwrap_or_else(|| runtime.profile.llm.clone()),
@@ -22851,21 +23689,16 @@ async fn handle_review_start(
         .await;
     });
 
-    // `None` => admitted. `Some(turn_id)` => refused, carrying the id of the
-    // turn that actually holds the session. The id is captured in the SAME
+    // `None` => admitted. `Some(refusal)` => refused; an occupied session
+    // carries the id of the turn that actually holds it. The id is captured in the SAME
     // lock scope that makes the decision (never by re-acquiring the registry
     // afterwards, which could name a different turn) and it costs no new
     // await under the lock — it is a clone of a field already in hand.
     let occupied_by = {
         let mut active = active_turns.lock().await;
-        let occupied = match active.get(&session_id) {
-            Some(existing) => {
-                let existing_state = existing.state.lock().await;
-                (!matches!(*existing_state, TurnState::Terminal(_)))
-                    .then(|| existing.turn_id.clone())
-            }
-            None => None,
-        };
+        let occupied =
+            turn_admission_refusal(&active, &session_id, &turn_id, state.host_managed.is_some())
+                .await;
         if occupied.is_none() {
             // Client-supplied turn ids carry no uniqueness guarantee — a
             // reused id must not inherit a prior turn's `session/btw` draft.
@@ -22881,14 +23714,15 @@ async fn handle_review_start(
                     // `ActiveTurnNotSteerable` for the Review turn kind).
                     steer: None,
                     abort: handle.abort_handle(),
+                    owner: Some(ws.connection_id()),
                 },
             );
         }
         occupied
     };
-    if let Some(running_turn_id) = occupied_by {
+    if let Some(refusal) = occupied_by {
         handle.abort();
-        let _ = send_rpc_error(ws, Some(id), turn_in_progress_refusal(&running_turn_id));
+        let _ = send_rpc_error(ws, Some(id), refusal.into_error(ws.is_external()));
         return;
     }
 
@@ -22936,8 +23770,8 @@ async fn handle_turn_start(
     features: ConnectionUiFeatures,
     id: String,
     params: TurnStartParams,
-) {
-    let _ = handle_turn_start_with_accept(
+) -> bool {
+    handle_turn_start_with_accept(
         ws,
         state,
         ledger,
@@ -22952,7 +23786,7 @@ async fn handle_turn_start(
         json!({ "accepted": true }),
         None,
     )
-    .await;
+    .await
 }
 
 fn voice_media_paths(media: &[FileRef]) -> Vec<String> {
@@ -23132,7 +23966,7 @@ async fn await_superseded_turn(
     };
     match decide_interrupt(active_turns, &params).await {
         InterruptOutcome::Unknown | InterruptOutcome::AlreadyTerminal(_) => Ok(()),
-        InterruptOutcome::Mismatch => Err(RpcError::invalid_request(
+        InterruptOutcome::Mismatch | InterruptOutcome::NotOwner => Err(RpcError::invalid_request(
             "the superseded turn is not the active turn for this session",
         )),
         InterruptOutcome::Captured { ack_rx } => {
@@ -23538,8 +24372,8 @@ async fn handle_turn_start_with_accept(
         }
     });
 
-    // `None` => admitted. `Some(turn_id)` => refused, carrying the id of the
-    // turn that actually holds the session. The id is captured in the SAME
+    // `None` => admitted. `Some(refusal)` => refused; an occupied session
+    // carries the id of the turn that actually holds it. The id is captured in the SAME
     // lock scope that makes the decision (never by re-acquiring the registry
     // afterwards, which could name a different turn) and it costs no new
     // await under the lock — it is a clone of a field already in hand.
@@ -23549,14 +24383,9 @@ async fn handle_turn_start_with_accept(
         // we keep the entry only so a follow-up `turn/interrupt` can return
         // `terminal_state` instead of `unknown_turn`. Any non-terminal entry
         // means there is still a turn running for this session.
-        let occupied = match active.get(&session_id) {
-            Some(existing) => {
-                let existing_state = existing.state.lock().await;
-                (!matches!(*existing_state, TurnState::Terminal(_)))
-                    .then(|| existing.turn_id.clone())
-            }
-            None => None,
-        };
+        let occupied =
+            turn_admission_refusal(&active, &session_id, &turn_id, state.host_managed.is_some())
+                .await;
         if occupied.is_none() {
             // Client-supplied turn ids carry no uniqueness guarantee — a
             // reused id must not inherit a prior turn's `session/btw` draft.
@@ -23570,14 +24399,15 @@ async fn handle_turn_start_with_accept(
                     interrupt_tx,
                     steer: steer_buffer,
                     abort: handle.abort_handle(),
+                    owner: Some(ws.connection_id()),
                 },
             );
         }
         occupied
     };
-    if let Some(running_turn_id) = occupied_by {
+    if let Some(refusal) = occupied_by {
         handle.abort();
-        let _ = send_rpc_error(ws, Some(id), turn_in_progress_refusal(&running_turn_id));
+        let _ = send_rpc_error(ws, Some(id), refusal.into_error(ws.is_external()));
         return false;
     }
 
@@ -23699,6 +24529,9 @@ enum TurnSteerDecision {
     /// A live turn exists but registered no steer buffer (code review / M9
     /// fixture turns) — codex `ActiveTurnNotSteerable`.
     NotSteerable,
+    /// `octos serve --host-managed`: an external connection named a session
+    /// whose turn another connection owns.
+    NotOwner,
     /// No live turn — fall back to the ordinary `turn/start` path (codex
     /// `NoActiveTurn` → `spawn_task(RegularTask)`).
     NoActiveTurn,
@@ -23747,6 +24580,9 @@ async fn handle_turn_steer(
         return;
     };
 
+    // `octos serve --host-managed`: an external connection steers only turns
+    // it started, judged under the same lock as the push.
+    let required_owner = ws.is_external().then(|| ws.connection_id());
     let decision = {
         let active = active_turns.lock().await;
         match active.get(&params.session_id) {
@@ -23773,6 +24609,8 @@ async fn handle_turn_steer(
                 let interrupting = matches!(*state, TurnState::Interrupting { .. });
                 if terminal {
                     TurnSteerDecision::NoActiveTurn
+                } else if required_owner.is_some_and(|owner| existing.owner != Some(owner)) {
+                    TurnSteerDecision::NotOwner
                 } else if params
                     .expected_turn_id
                     .as_ref()
@@ -23815,6 +24653,13 @@ async fn handle_turn_steer(
                     "expected_turn_id does not match the active turn ({})",
                     active_turn_id.0
                 )),
+            );
+        }
+        TurnSteerDecision::NotOwner => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                super::host_managed::external_turn_denied("turn/steer"),
             );
         }
         TurnSteerDecision::NotSteerable => {
@@ -24343,6 +25188,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
             interrupt_tx,
             steer: Some(steer_buffer),
             abort: handle.abort_handle(),
+            owner: None,
         },
     );
     drop(active);
@@ -24484,9 +25330,72 @@ async fn drain_appui_due_master_continuations(
 /// condition. `turn_id` names the turn that actually holds the session, so a
 /// client can address it (`turn/interrupt`, or just "the other window is busy
 /// on turn X") instead of guessing.
-fn turn_in_progress_refusal(running_turn_id: &TurnId) -> RpcError {
-    RpcError::invalid_request("a turn is already running for this session")
-        .with_data(json!({ "kind": "turn_in_progress", "turn_id": running_turn_id }))
+///
+/// `octos serve --host-managed` (UPCR-2026-036): an external connection gets
+/// the refusal without `turn_id`. The session it collided with may be the
+/// host's, and a host turn's id is not the external client's to address.
+fn turn_in_progress_refusal(running_turn_id: Option<&TurnId>) -> RpcError {
+    let data = match running_turn_id {
+        Some(turn_id) => json!({ "kind": "turn_in_progress", "turn_id": turn_id }),
+        None => json!({ "kind": "turn_in_progress" }),
+    };
+    RpcError::invalid_request("a turn is already running for this session").with_data(data)
+}
+
+/// `data.kind` of a `turn/start` refused because its client-chosen `turn_id`
+/// names a turn still running in another session (`octos serve
+/// --host-managed`, UPCR-2026-036).
+pub(crate) const TURN_ID_IN_USE: &str = "turn_id_in_use";
+
+/// Why a turn admission (`turn/start`, `review/start`) was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TurnAdmissionRefusal {
+    /// The session already runs this turn.
+    Occupied(TurnId),
+    /// The turn id is live in another session.
+    TurnIdInUse,
+}
+
+impl TurnAdmissionRefusal {
+    fn into_error(self, external: bool) -> RpcError {
+        match self {
+            Self::Occupied(running) => turn_in_progress_refusal((!external).then_some(&running)),
+            Self::TurnIdInUse => RpcError::invalid_request(
+                "turn_id is already in use by a running turn; choose a fresh turn_id",
+            )
+            .with_data(json!({ "kind": TURN_ID_IN_USE })),
+        }
+    }
+}
+
+/// Decide a turn admission under the active-turn registry lock. A session
+/// holds one live (non-`Terminal`) turn. With `unique_turn_ids` (`octos serve
+/// --host-managed`) a live turn id also may not be reused in ANY session:
+/// client-chosen ids are not unique, and a reused id must never make one
+/// client's turn look like another's.
+async fn turn_admission_refusal(
+    active: &HashMap<SessionKey, ActiveTurn>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    unique_turn_ids: bool,
+) -> Option<TurnAdmissionRefusal> {
+    if let Some(existing) = active.get(session_id) {
+        let existing_state = existing.state.lock().await;
+        if !matches!(*existing_state, TurnState::Terminal(_)) {
+            return Some(TurnAdmissionRefusal::Occupied(existing.turn_id.clone()));
+        }
+    }
+    if unique_turn_ids {
+        for (other_session, other) in active {
+            if other_session == session_id || other.turn_id != *turn_id {
+                continue;
+            }
+            if !matches!(*other.state.lock().await, TurnState::Terminal(_)) {
+                return Some(TurnAdmissionRefusal::TurnIdInUse);
+            }
+        }
+    }
+    None
 }
 
 /// Snapshot of sessions that currently have an in-flight (non-terminal) turn in
@@ -25054,10 +25963,12 @@ async fn handle_turn_interrupt(
     // task-turn-interrupt-steer-correlation-logs: make the interrupt's
     // receipt, decision and ack reconstructible from the log alone.
     crate::turn_trace::log_interrupt_received(&params.session_id, &params.turn_id);
-    let outcome = decide_interrupt(active_turns, &params).await;
+    let required_owner = ws.is_external().then(|| ws.connection_id());
+    let outcome = decide_interrupt_as(active_turns, &params, required_owner).await;
     let outcome_label: String = match &outcome {
         InterruptOutcome::Unknown => "unknown".into(),
         InterruptOutcome::Mismatch => "mismatch".into(),
+        InterruptOutcome::NotOwner => "not_owner".into(),
         InterruptOutcome::AlreadyTerminal(reason) => {
             format!("already_terminal:{}", reason.as_str())
         }
@@ -25068,6 +25979,13 @@ async fn handle_turn_interrupt(
     match outcome {
         InterruptOutcome::Unknown => {
             let _ = send_rpc_error(ws, Some(id), unknown_turn_error(&params.turn_id));
+        }
+        InterruptOutcome::NotOwner => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                super::host_managed::external_turn_denied("turn/interrupt"),
+            );
         }
         InterruptOutcome::Mismatch => {
             // Codified by accepted UPCR-2026-008: typed `reason` field on
@@ -25149,19 +26067,38 @@ fn send_typed_interrupt_result(
 enum InterruptOutcome {
     Unknown,
     Mismatch,
+    /// `octos serve --host-managed`: the turn belongs to another connection.
+    NotOwner,
     AlreadyTerminal(TerminalReason),
     AlreadyInterrupting,
-    Captured { ack_rx: oneshot::Receiver<()> },
+    Captured {
+        ack_rx: oneshot::Receiver<()>,
+    },
 }
 
 async fn decide_interrupt(
     active_turns: &SharedActiveTurns,
     params: &TurnInterruptParams,
 ) -> InterruptOutcome {
+    decide_interrupt_as(active_turns, params, None).await
+}
+
+/// [`decide_interrupt`] for a caller that may interrupt only turns it owns
+/// (`required_owner`: an external connection of `octos serve --host-managed`).
+/// Ownership is judged in the same registry lock scope as the id match, so a
+/// turn replaced in between can never be interrupted on another's behalf.
+async fn decide_interrupt_as(
+    active_turns: &SharedActiveTurns,
+    params: &TurnInterruptParams,
+    required_owner: Option<ConnectionId>,
+) -> InterruptOutcome {
     let registry = active_turns.lock().await;
     let Some(active) = registry.get(&params.session_id) else {
         return InterruptOutcome::Unknown;
     };
+    if required_owner.is_some_and(|owner| active.owner != Some(owner)) {
+        return InterruptOutcome::NotOwner;
+    }
     if active.turn_id != params.turn_id {
         return InterruptOutcome::Mismatch;
     }
@@ -25289,18 +26226,51 @@ fn audit_approval_decided(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_approval_respond(
     ws: &WsConnection,
     state: &Arc<AppState>,
     ledger: &Arc<UiProtocolLedger>,
     contracts: &Arc<UiProtocolContractStores>,
     connection_profile_id: Option<&str>,
+    external_owner: Option<ConnectionId>,
     id: String,
-    params: octos_core::ui_protocol::ApprovalRespondParams,
+    mut params: octos_core::ui_protocol::ApprovalRespondParams,
 ) {
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
         send_scope_error(ws, id, error);
         return;
+    }
+    // `octos serve --host-managed`: a host-owned app peer's approvals belong
+    // to the person, in the app (UPCR-2026-034). An external client (web or
+    // terminal UI on the external token) never answers them; the approval
+    // stays parked. UPCR-2026-036.
+    if let Some(owner) = external_owner {
+        if super::host_managed::is_peer_session(&params.session_id) {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                super::host_managed::peer_answer_denied("approval"),
+            );
+            return;
+        }
+        // Only an approval raised by a turn this external connection owns
+        // (recorded on the approval, never inferred from a client-chosen turn
+        // id), and once: an external answer never records a session-wide
+        // scope.
+        let own = contracts
+            .approvals
+            .pending_owner(&params.session_id, &params.approval_id)
+            == Some(Some(owner.0));
+        if !own {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                super::host_managed::external_turn_denied("approval"),
+            );
+            return;
+        }
+        params.approval_scope = None;
     }
 
     let session_id = params.session_id.clone();
@@ -25377,12 +26347,37 @@ async fn handle_user_question_respond(
     ws: &WsConnection,
     contracts: &Arc<UiProtocolContractStores>,
     connection_profile_id: Option<&str>,
+    external_owner: Option<ConnectionId>,
     id: String,
     params: UserQuestionRespondParams,
 ) {
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
         send_scope_error(ws, id, error);
         return;
+    }
+    // Same rule as `handle_approval_respond` for a host-owned peer's
+    // questions (UPCR-2026-036).
+    if let Some(owner) = external_owner {
+        if super::host_managed::is_peer_session(&params.session_id) {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                super::host_managed::peer_answer_denied("question"),
+            );
+            return;
+        }
+        let own = contracts
+            .user_questions
+            .pending_owner(&params.session_id, &params.question_id)
+            == Some(Some(owner.0));
+        if !own {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                super::host_managed::external_turn_denied("question"),
+            );
+            return;
+        }
     }
 
     let outcome = match contracts.user_questions.respond_with_context(&params) {
@@ -32747,7 +33742,7 @@ async fn run_native_code_review_turn(
             .map(|template| template.runtime_policy_stamp("supervisor", "native_review", None));
     let workspace_root = session_runtime.workspace_root.clone();
     let llm_provider = session_runtime.profile.llm.clone();
-    let memory_store = session_runtime.profile.memory.clone();
+    let memory_store = session_runtime.memory.episodes.clone();
     // #2055 review round 2 (hole c) — the review specialists run on a FRESH
     // snapshot registry whose supervisor used to carry no observers, so
     // their `native_agent` registrations were invisible to the goal ledger.
@@ -34613,6 +35608,21 @@ fn interrupted_goal_charge(
     }
 }
 
+/// The dedupe occurrence of one `peer_send_input` call: the calling session,
+/// its turn, then the tool's own occurrence id (the provider's tool-call id).
+/// A provider's tool-call id is unique only within one response — scripted
+/// and some OpenAI-compatible servers reuse `call_1` on every turn — so the
+/// bare id let a later turn's send collapse onto an earlier, already-drained
+/// one and be dropped. Scoped this way, a retry of the same call in the same
+/// turn still dedupes, and a new turn never collides with an old one.
+pub(crate) fn peer_send_input_occurrence_id(
+    calling_session: &str,
+    turn_id: &TurnId,
+    tool_occurrence_id: &str,
+) -> String {
+    format!("{calling_session}/{}/{tool_occurrence_id}", turn_id.0)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_standalone_turn(
     ws: WsConnection,
@@ -34931,6 +35941,31 @@ async fn run_standalone_turn(
     // its frame instead, to stay inside the 5s interrupt-ack deadline.
     // Resolved once here from the same profile the turn's agent hooks come
     // from; `None` (no hooks configured) makes each fire a no-op.
+    // UPCR-2026-034 — a cached runtime outlives its binding: re-check it at
+    // every turn start so a closed app peer or request context never runs
+    // again, even when its runtime is still cached.
+    if let crate::peers::app_binding::SessionAppBinding::Refused(reason) =
+        crate::peers::app_binding::resolve_session_app_binding(
+            &session_runtime.profile.data_dir.join("peers"),
+            &session_id,
+        )
+    {
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Errored,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            Some(("session_binding_closed", &reason)),
+            None,
+            steer_buffer.as_ref(),
+            None,
+        )
+        .await;
+        contracts.scopes.evict_turn(&session_id, &turn_id);
+        return;
+    }
     let turn_end_hooks = session_runtime.profile.hook_executor.clone();
     let turn_end_hook_ctx = octos_agent::HookContext {
         session_id: Some(session_id.to_string()),
@@ -35148,7 +36183,7 @@ async fn run_standalone_turn(
     let llm_provider: Arc<dyn octos_llm::LlmProvider> =
         peer_lane_provider_for(&session_id, &session_runtime)
             .unwrap_or_else(|| session_runtime.profile.llm.clone());
-    let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.profile.memory.clone();
+    let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.memory.episodes.clone();
     let mut agent_config = session_runtime.agent.agent_config();
     // A human-driven turn does not become unattended merely because it
     // arrived over OUP. Local chat/ACP and remote interactive clients share
@@ -35220,10 +36255,10 @@ async fn run_standalone_turn(
         .unwrap_or_default();
     let volatile_memory_context = octos_agent::volatile_memory_content(
         &combined_memory_segment,
-        session_runtime.profile.memory_refresh_enabled,
+        session_runtime.memory.refresh_enabled,
     );
     let stable_memory_policy =
-        octos_agent::stable_memory_instructions(session_runtime.profile.memory_refresh_enabled);
+        octos_agent::stable_memory_instructions(session_runtime.memory.refresh_enabled);
     let agent_snapshot = session_runtime
         .agent
         .system_prompt_snapshot_replacing_segment(
@@ -36114,7 +37149,14 @@ async fn run_standalone_turn(
         // `ProfileRuntime::bootstrap` (see `runtime/profile.rs`), and we
         // clone the `Arc` here for every spawn-tool child closure
         // invocation.
-        if let Some(pipeline_factory) = session_runtime.profile.pipeline_factory.clone() {
+        // UPCR-2026-034: pipelines capture into the PROFILE's memory, so a
+        // namespaced (app-bound) session's children do not get them.
+        if let Some(pipeline_factory) = session_runtime
+            .profile
+            .pipeline_factory
+            .clone()
+            .filter(|_| session_runtime.memory.namespace.is_none())
+        {
             // #1607 (codex round 4): bind spawn-child `run_pipeline` instances to
             // the SESSION-effective sandbox (`session_runtime.sandbox`, set by
             // `bootstrap_with_permissions_and_sandbox`), NOT the profile-time
@@ -36316,6 +37358,7 @@ async fn run_standalone_turn(
             // captured at wire time. Only the session that staged the peer may
             // inject into it.
             let send_origin_session = session_id.to_string();
+            let send_turn_id = turn_id.clone();
             let send_input: octos_agent::PeerSendInputCallback =
                 Arc::new(move |req: octos_agent::PeerSendInputRequest| {
                     // Resolve the identifier (peer NAME or slug) to the actual
@@ -36383,9 +37426,12 @@ async fn run_standalone_turn(
                             attachment_media: vec![],
                             attachment_prompt: None,
                         };
-                        return tx.try_send(actor_msg).map_err(|e| {
-                            format!("peer session '{slug}' inbox is full or closed: {e}")
-                        });
+                        return tx
+                            .try_send(actor_msg)
+                            .map(|()| octos_agent::PeerSendInputDelivery::Queued)
+                            .map_err(|e| {
+                                format!("peer session '{slug}' inbox is full or closed: {e}")
+                            });
                     }
 
                     // Path 2: serve continuation queue.
@@ -36413,7 +37459,11 @@ async fn run_standalone_turn(
                             &target,
                             &send_profile_id,
                             &slug,
-                            &req.occurrence_id,
+                            &peer_send_input_occurrence_id(
+                                &send_origin_session,
+                                &send_turn_id,
+                                &req.occurrence_id,
+                            ),
                             &req.message,
                         )
                         .into_callback_result(&slug)
@@ -36602,6 +37652,14 @@ async fn run_standalone_turn(
     session_runtime
         .profile
         .apply_tool_envelope(&mut tool_registry);
+    // `octos serve --host-managed`: an external client's turn keeps only the
+    // external tool allowlist, applied to the FINISHED registry so nothing
+    // registered above (spawn, peer_*, send_file, task tools, MCP, plugins)
+    // survives, and only compiled-in tools: a plugin or MCP tool with an
+    // allowlisted name is dropped too (UPCR-2026-036).
+    if ws.is_external() {
+        super::host_managed::confine_external_turn_tools(&mut tool_registry);
+    }
     let tool_registry = Arc::new(tool_registry);
 
     // C1 fix: `progress_tx` / `progress_dropped` are now created earlier
@@ -37703,8 +38761,8 @@ async fn run_standalone_turn(
                 // exactly like `final_assistant_message_id`.
                 let mut final_assistant_committed_seq: Option<u64> = None;
                 // #1158 codex P2 rev2 follow-up: `add_message_with_seq`
-                // can fail (e.g. JSONL at MAX_SESSION_FILE_SIZE, I/O
-                // error). Track whether the assistant row carrying
+                // can fail (e.g. a session JSONL I/O error). Track whether
+                // the assistant row carrying
                 // `response.content` actually persisted. If not, the
                 // captured reply must NOT be released to the post-turn
                 // reschedule block — that would let it call
@@ -43944,3 +45002,7 @@ fn flush_replay_lossy(
 #[cfg(test)]
 #[path = "ui_protocol_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_host_app_peer_tests.rs"]
+mod host_app_peer_tests;

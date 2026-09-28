@@ -32,7 +32,7 @@ Not all defensive layers provide equal guarantees. This table classifies each la
 | Layer | Type | Enforcement | Bypass Resistance |
 |-------|------|-------------|-------------------|
 | **Sandbox** (bwrap, sandbox-exec, Docker, Windows AppContainer) | Hard | Kernel namespaces / SBPL / container / AppContainer | Requires kernel exploit |
-| **SSRF filter** (`ssrf.rs`) | Hard | DNS resolution + IP validation, fail-closed | Requires DNS rebinding race or redirect bypass (see known gaps) |
+| **SSRF filter** (`octos_research::net`) | Hard | DNS resolution + IP validation, fail-closed | Requires DNS rebinding race or redirect bypass (see known gaps) |
 | **`O_NOFOLLOW` file I/O** | Hard | Kernel (atomic open flag) | No known bypass |
 | **`BLOCKED_ENV_VARS`** | Hard | Process environment (set before exec) | Requires parent process compromise |
 | **Tool Policy** (allow/deny lists) | Hard | Application (deny-wins, checked at dispatch) | Requires code bug in policy enforcement |
@@ -80,11 +80,11 @@ Within a profile, each user (identified by `channel:chat_id`) gets a dedicated `
 
 **Backward compatibility**: `SessionHandle::open()` tries the new per-user path first, then falls back to the legacy flat path (`{data_dir}/sessions/{encoded_key}.jsonl`). On successful legacy load, the file is auto-migrated to the new path and the old file is removed.
 
-#### Session-level isolation (JSONL file)
+#### Session-level isolation (JSONL store)
 
-Each session is an independent JSONL file with the following protections:
+Each session is an independent JSONL store (an active file plus sealed `<name>.segments/` segments) with the following protections:
 
-- File size limit: 10 MB per session file (`MAX_SESSION_FILE_SIZE`). Prevents OOM on adversarial files.
+- Bounded memory without a size cliff: the active file seals into 8 MiB segments (`OCTOS_SESSION_SEGMENT_BYTES`), and loads read at most `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB, 0 = unlimited) of newest-first history.
 - Atomic write-then-rename for crash safety.
 - No cross-session file access — `SessionHandle` only reads/writes within its `sessions_dir`.
 
@@ -243,11 +243,11 @@ All backends remove these from the child process environment before execution.
 
 ### 3.5 SSRF Protection
 
-`octos-agent/src/tools/ssrf.rs` provides shared SSRF validation for `web_fetch`, `browser`, and MCP HTTP transports.
+`octos_research::net::check_url` is the workspace's one SSRF validation; `octos-agent/src/tools/ssrf.rs` adapts it for `web_fetch`, `browser`, `site_crawl`, and MCP HTTP transports, and adds the fleet host allowlist `web_fetch` enforces per redirect hop.
 
-**Two-phase check** (`check_ssrf`):
-1. **Hostname validation** (`is_private_host`): Blocks `localhost`, `localhost.`, and any IP literal that resolves to a private range.
-2. **DNS resolution check**: After hostname passes, resolves via `tokio::net::lookup_host` and checks all returned addresses against `is_private_ip`.
+**Two-phase check** (`check_url`):
+1. **Hostname validation** (`is_private_host`): Blocks `localhost`, `localhost.`, and any IP literal that resolves to a private range; non-http(s) schemes are refused outright.
+2. **DNS resolution check**: After hostname passes, resolves via `tokio::net::lookup_host` and checks all returned addresses against `is_private_ip` — the answer set must be non-empty (fail closed) and every address public.
 
 **Blocked IP ranges** (`is_private_ip`):
 - IPv4: loopback (127/8), private (10/8, 172.16/12, 192.168/16), link-local (169.254/16 -- AWS metadata), unspecified (0.0.0.0).
@@ -409,7 +409,7 @@ Shared resources such as deployment-scoped skills, platform skills, global confi
 
 **Issue**: `read_no_follow` reads the entire file into memory before any slicing or offset is applied. A large file (e.g., multi-GB log) can cause OOM.
 
-**Mitigation**: Session files have a 10 MB limit. For general file reads, the tool should implement streaming or size-check-before-read. Currently relies on the LLM not targeting excessively large files.
+**Mitigation**: Session files roll into segments at `OCTOS_SESSION_SEGMENT_BYTES` (8 MiB), so no single session file grows unbounded. For general file reads, the tool should implement streaming or size-check-before-read. Currently relies on the LLM not targeting excessively large files.
 
 ### 4.7 Sandbox Enabled by Default
 
@@ -677,7 +677,7 @@ Currently each profile runs as a native OS process on the host. The next evoluti
 
 **Current model** (shell sandbox only):
 ```
-Profile "sales" (host process, PID 1001, uid=yuechen)
+Profile "sales" (host process, PID 1001, uid=alice)
 └── shell("curl api.moonshot.ai") → docker run --rm alpine sh -c "curl ..."
     ↑ only shell commands are containerized
     ↑ profile process itself runs on host with full access

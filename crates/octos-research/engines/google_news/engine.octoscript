@@ -1,0 +1,78 @@
+// Google News search feed (RSS 2.0). Google does not document it; the
+// parameters are the ones its own feed links use (q, hl, gl, ceid).
+// Headlines only: article links are news.google.com redirects, cited but
+// never fetched. robots.txt (which disallows /rss) applies only when the
+// operator sets OCTOS_RESPECT_ROBOTS=1.
+use mod.markup
+use mod.net
+use mod.std.math
+use mod.std.object
+use mod.std.text
+
+fn default_region(p) {
+    let table = {en: "US", ja: "JP", ko: "KR", de: "DE", fr: "FR", es: "ES", pt: "BR", it: "IT", ru: "RU", ar: "EG", hi: "IN", nl: "NL", sv: "SE", pl: "PL", tr: "TR", uk: "UA", vi: "VN", th: "TH", id: "ID", he: "IL"}
+    return object.get(table, p, "US")
+}
+
+fn locale(l, region) {
+    if l == nil {
+        return {hl: "en-US", gl: "US", ceid: "US:en", lang: "en"}
+    }
+    let r = if region != nil {
+        region
+    } else {
+        l.region
+    }
+    if l.primary == "zh" {
+        let hant = r == "TW" || r == "HK" || r == "MO" || text.contains(l.tag, "Hant")
+        if hant {
+            let gl = if r == nil {
+                "TW"
+            } else {
+                r
+            }
+            return {hl: "zh-TW", gl: gl, ceid: gl + ":zh-Hant", lang: "zh-TW"}
+        }
+        let gl = if r == nil {
+            "CN"
+        } else {
+            r
+        }
+        return {hl: "zh-CN", gl: gl, ceid: gl + ":zh-Hans", lang: "zh-CN"}
+    }
+    let gl = if r == nil {
+        default_region(l.primary)
+    } else {
+        r
+    }
+    let hl = if l.primary == "en" || l.primary == "pt" || l.primary == "es" {
+        l.primary + "-" + gl
+    } else {
+        l.primary
+    }
+    return {hl: hl, gl: gl, ceid: gl + ":" + l.primary, lang: l.primary}
+}
+
+fn build_request(query, opts) {
+    let loc = locale(opts.lang, opts.region)
+    let q = query
+    if opts.since != nil {
+        if opts.since.relative {
+            if opts.since.hours <= 48 {
+                q = q + " when:" + opts.since.hours + "h"
+            } else {
+                q = q + " when:" + math.floor(opts.since.hours / 24) + "d"
+            }
+        } else {
+            q = q + " after:" + opts.since.date
+        }
+    }
+    let u = net.url({base: "https://news.google.com/rss/search", query: [["q", q], ["hl", loc.hl], ["gl", loc.gl], ["ceid", loc.ceid]]})
+    return net.request({url: u.url})
+}
+
+fn parse_response(response, opts) {
+    let loc = locale(opts.lang, opts.region)
+    let feed = markup.feed({lang: loc.lang})
+    return feed.entries
+}

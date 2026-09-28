@@ -49,7 +49,7 @@ jobs:
       # parallelism; ci.yml runs them in a dedicated serial step (see the #21
       # outer-loop ruling there).
       - name: Test
-        run: cargo test --workspace -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard
+        run: cargo test --workspace -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
 
       # ci-api-filter-test.sh fails the step when a filter selects zero
       # tests — a bare `cargo test <filter>` would report `ok` (#2029).
@@ -91,7 +91,7 @@ jobs:
           cargo test --workspace --no-run
           # serve_sigterm / serve_ws_liveness / serve_solo_gateway_guard e2e:
           # serial-only (see the ci.yml #21 ruling); the broad run skips them.
-          cargo test --workspace -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard
+          cargo test --workspace -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
 
   windows:
     name: windows

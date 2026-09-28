@@ -3566,10 +3566,10 @@ pub async fn system_version(
     };
 
     let current_semver = env!("CARGO_PKG_VERSION");
-    let update_available = latest
-        .get("version")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v != current_semver);
+    let update_available = update_available_for(
+        current_semver,
+        latest.get("version").and_then(|v| v.as_str()),
+    );
 
     Ok(Json(serde_json::json!({
         "current": current,
@@ -3587,6 +3587,27 @@ pub struct UpdateRequest {
 }
 fn default_version() -> String {
     "latest".to_string()
+}
+
+/// Whether `latest` is strictly newer than the running `current` release,
+/// with full semver precedence: `2.0.3-rc.12 < 2.0.3-rc.13 < 2.0.3`. This is
+/// deliberately pre-release-aware — unlike `octos_diagnostics`' planner, whose
+/// `parse_version` strips pre-releases — because the admin channel installs
+/// pinned rc tags and must keep the rc train flowing forward while still
+/// refusing downgrades. Unparseable on either side means "can't tell" and
+/// counts as up to date — never push a spurious (or backwards) update off an
+/// unparseable version.
+fn update_available_for(current: &str, latest: Option<&str>) -> bool {
+    let Some(latest) = latest else {
+        return false;
+    };
+    let (Ok(current), Ok(latest)) = (
+        semver::Version::parse(current.trim().trim_start_matches('v')),
+        semver::Version::parse(latest.trim().trim_start_matches('v')),
+    ) else {
+        return false;
+    };
+    latest > current
 }
 
 /// POST /api/admin/system/update — download and apply an update
@@ -3609,6 +3630,17 @@ pub async fn system_update(
         updater.check_version(&tag).await
     }
     .map_err(|e| (StatusCode::BAD_REQUEST, format!("Release not found: {e}")))?;
+
+    // Refuse anything that is not strictly newer — an update channel that
+    // accepts equal or older releases is a downgrade vector.
+    let current = env!("CARGO_PKG_VERSION");
+    let new_version = &release.version;
+    if !update_available_for(current, Some(new_version)) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("refusing update: {new_version} is not newer than the running {current}"),
+        ));
+    }
 
     // Perform the update
     let result = updater.update(&release).await.map_err(|e| {
@@ -4550,6 +4582,21 @@ pub async fn delete_tenant(
     }))
 }
 
+/// The tunnel relay (frps) address this node hands out in setup scripts.
+/// There is no built-in default: it must be set as `frps_server` in the
+/// node config, otherwise tenant setup is refused with a clear error.
+fn required_frps_server(state: &AppState) -> Result<&str, (StatusCode, String)> {
+    state
+        .frps_server
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tunnel relay not configured: set `frps_server` in this node's config".into(),
+        ))
+}
+
 /// GET /api/admin/tenants/{id}/setup-script — returns a bash one-liner that
 /// installs octos + frpc on a fresh Mac Mini.
 pub async fn tenant_setup_script(
@@ -4566,7 +4613,7 @@ pub async fn tenant_setup_script(
         .ok_or((StatusCode::NOT_FOUND, format!("tenant '{id}' not found")))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_admin_tenant_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -4686,6 +4733,9 @@ pub async fn register_tenant(
         ));
     }
 
+    // Fail before creating the tenant if this node has no tunnel relay.
+    let server = required_frps_server(&state)?;
+
     let ssh_port = store
         .next_ssh_port()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -4714,7 +4764,6 @@ pub async fn register_tenant(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
     let dashboard_url = format!("https://{}.{}", tenant.subdomain, domain);
 
     let mut email_sent = false;
@@ -4823,7 +4872,7 @@ pub async fn register_setup_script(
     ))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_register_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -4854,7 +4903,7 @@ pub async fn register_setup_script_public(
     }
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_register_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -4991,7 +5040,7 @@ mod register_setup_script_tests {
             updated_at: Utc::now(),
         };
 
-        let script = build_register_setup_script(&tenant, "octos-cloud.org", "163.192.33.32");
+        let script = build_register_setup_script(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert!(script.contains("managed tenant bootstrap"));
         assert!(script.contains("--tunnel"));
@@ -5000,7 +5049,7 @@ mod register_setup_script_tests {
         assert!(script.contains("--frps-token \"per-tenant-uuid\""));
         assert!(script.contains("--ssh-port 6001"));
         assert!(script.contains("--domain \"octos-cloud.org\""));
-        assert!(script.contains("--frps-server \"163.192.33.32\""));
+        assert!(script.contains("--frps-server \"relay.example.com\""));
         assert!(!script.contains("$FRPS_TOKEN"));
     }
 
@@ -5021,7 +5070,7 @@ mod register_setup_script_tests {
         };
 
         let (_subject, html) =
-            build_register_setup_email(&tenant, "octos-cloud.org", "163.192.33.32");
+            build_register_setup_email(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert!(html.contains("/api/register/setup-script/alice/"));
         assert!(html.contains("install.ps1"));
@@ -5049,7 +5098,7 @@ mod register_setup_script_tests {
 
         let unix_command = build_register_setup_command_unix(&tenant, "octos-cloud.org");
         let windows_command =
-            build_register_setup_command_windows(&tenant, "octos-cloud.org", "163.192.33.32");
+            build_register_setup_command_windows(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert_eq!(
             unix_command,
@@ -5085,7 +5134,7 @@ mod register_tenant_email_tests {
             )),
             tunnel_domain: Some("octos-cloud.org".into()),
             base_domain: None,
-            frps_server: Some("163.192.33.32".into()),
+            frps_server: Some("relay.example.com".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,
             ..AppState::empty_for_tests()
@@ -5223,7 +5272,7 @@ mod register_flow_tests {
             )),
             tunnel_domain: Some("octos-cloud.org".into()),
             base_domain: None,
-            frps_server: Some("163.192.33.32".into()),
+            frps_server: Some("relay.example.com".into()),
             frps_port: Some(7000),
             deployment_mode: mode,
             ..AppState::empty_for_tests()
@@ -5508,7 +5557,7 @@ mod register_flow_tests {
 
         assert!(script.contains("--tenant-name \"macmini\""));
         assert!(script.contains("--domain \"octos-cloud.org\""));
-        assert!(script.contains("--frps-server \"163.192.33.32\""));
+        assert!(script.contains("--frps-server \"relay.example.com\""));
         assert!(script.contains("--ssh-port"));
         assert!(
             script.contains(&format!("--frps-token \"{saved_tunnel_token}\"")),
@@ -5637,6 +5686,29 @@ mod register_flow_tests {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    /// Strictly-newer only, with full semver precedence: the rc train flows
+    /// forward (rc.12 → rc.13), an rc graduates to its stable, but the older
+    /// July stable never shows as an "update" over a newer rc build — which
+    /// the string `!=` used to advertise.
+    #[test]
+    fn should_only_advertise_strictly_newer_releases() {
+        assert!(update_available_for("2.0.3-rc.13", Some("2.0.4")));
+        assert!(update_available_for("2.0.2", Some("2.0.3")));
+        // The rc train: forward allowed, backward refused.
+        assert!(update_available_for("2.0.3-rc.12", Some("2.0.3-rc.13")));
+        assert!(update_available_for("2.0.3-rc.13", Some("2.0.3")));
+        assert!(!update_available_for("2.0.3-rc.13", Some("2.0.3-rc.12")));
+        // Stable beats the pre-release of the same core version…
+        assert!(!update_available_for("2.0.3", Some("2.0.3-rc.13")));
+        // …and plain downgrades, which `!=` used to count as updates.
+        assert!(!update_available_for("2.0.3-rc.13", Some("2.0.2")));
+        assert!(!update_available_for("2.0.3", Some("2.0.3")));
+        // Unparseable on either side → never claim an update.
+        assert!(!update_available_for("2.0.3", None));
+        assert!(!update_available_for("2.0.3", Some("garbage")));
+        assert!(!update_available_for("garbage", Some("2.0.4")));
+    }
 
     /// The guard blocks exactly the link-local (metadata) ranges and nothing
     /// a local model server legitimately uses (loopback, RFC1918, hostnames).

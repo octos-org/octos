@@ -1,0 +1,26 @@
+{
+  "id": "google_news",
+  "name": "Google News RSS",
+  "categories": [
+    "news"
+  ],
+  "languages": [
+    "*"
+  ],
+  "hosts": [
+    "news.google.com"
+  ],
+  "rate_limit": {
+    "min_interval_ms": 2000,
+    "source": "No published limit; spaced conservatively."
+  },
+  "docs_url": [
+    "https://news.google.com/rss",
+    "https://news.google.com/robots.txt"
+  ],
+  "license_note": "Google News search feed: headlines, publisher and date only; article redirect links are cited, never fetched. Google does not document the feed; the feed text limits it to personal, non-commercial feed-reader use, which is how an octos agent acting for one person uses it. news.google.com/robots.txt disallows /rss; it is honoured when the operator sets OCTOS_RESPECT_ROBOTS=1.",
+  "weight": 1.0,
+  "cache_ttl_secs": 600,
+  "timeout_secs": 10,
+  "robots": true
+}

@@ -624,6 +624,7 @@ async fn session_open_snapshot_waits_for_runtime_window_before_compacting() {
             cwd: None,
             sandbox: None,
             after: None,
+            client_commands: None,
         },
     )
     .await
@@ -3738,6 +3739,16 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             "session_id": session_id,
         }),
         APPUI_METHOD_PEER_GATHER => json!({ "session_id": session_id }),
+        APPUI_METHOD_PEER_MODEL_SET => json!({
+            "session_id": session_id,
+            "peer": "probe",
+            "model": null,
+        }),
+        APPUI_METHOD_PEER_CONTEXT_OPEN | APPUI_METHOD_PEER_CONTEXT_CLOSE => json!({
+            "session_id": session_id,
+            "peer": "probe",
+            "context_id": "probe",
+        }),
         APPUI_METHOD_TURN_STEER => json!({
             "session_id": session_id,
             "input": [{ "kind": "text", "text": "steer probe" }],
@@ -4137,6 +4148,7 @@ async fn stdio_shutdown_drain_waits_for_turn_finalization() {
     active_turns.lock().await.insert(
         session.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -4179,6 +4191,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
     active_turns.lock().await.insert(
         SessionKey("local:foreign".into()),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: TurnId::new(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -4203,6 +4216,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
     active_turns.lock().await.insert(
         session.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -4346,6 +4360,7 @@ async fn stdio_cleanup_aborts_active_turns_and_live_forwarders() {
 #[test]
 fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("coding:local:test".into()),
         topic: None,
         profile_id: None,
@@ -4359,6 +4374,7 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     );
 
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("local:test".into()),
         topic: None,
         profile_id: Some("explicit".into()),
@@ -4372,6 +4388,7 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     );
 
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("local:test".into()),
         topic: None,
         profile_id: None,
@@ -7983,6 +8000,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
     let mut binding = Some("ada".to_owned());
 
     let missing_params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("local:missing-binding".into()),
         topic: None,
         profile_id: Some("missing".into()),
@@ -8039,6 +8057,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
     assert_eq!(status["runtime_policy_stamp"]["profile_id"], json!("ada"));
 
     let grace_params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("local:grace-binding".into()),
         topic: None,
         profile_id: Some("grace".into()),
@@ -8248,6 +8267,44 @@ async fn raw_session_status_read_includes_model_object_when_model_resolved() {
 }
 
 #[tokio::test]
+async fn session_open_client_commands_reach_the_session_agent_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(dir.path(), "coding").await;
+    let session_id = SessionKey("local:tui#coding".into());
+
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        Some("coding"),
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+            client_commands: Some(vec!["/model".into(), "/add-model".into()]),
+        },
+    )
+    .await
+    .expect("session/open succeeds");
+
+    let session = state
+        .session_cache
+        .get_or_init(&runtime, session_id, None)
+        .await
+        .expect("opened session is cached");
+    let prompt = session.agent.system_prompt_snapshot();
+    assert!(prompt.contains("`/model`"), "{prompt}");
+    assert!(prompt.contains("`/add-model`"), "{prompt}");
+}
+
+#[tokio::test]
 async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state_with_sessions(dir.path());
@@ -8280,6 +8337,7 @@ async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() 
             None,
             features,
             SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 profile_id: None,
@@ -8396,6 +8454,7 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
                 None,
                 features,
                 SessionOpenParams {
+                    client_commands: None,
                     session_id,
                     topic: None,
                     profile_id: None,
@@ -11170,6 +11229,7 @@ async fn newly_configured_local_profile_allows_session_open_cwd_validation() {
 
     let workspace = tempfile::tempdir().unwrap();
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding"),
         topic: None,
         profile_id: Some(profile_id.clone()),
@@ -12313,6 +12373,79 @@ async fn peer_send_input_injects_continuation_for_peer_session() {
     );
 }
 
+/// A provider that reuses tool-call ids (`call_1` on every response — scripted
+/// servers, some OpenAI-compatible ones) must not lose a follow-up input. The
+/// occurrence is scoped to the calling session and turn, so a second turn's
+/// `peer_send_input` with the SAME tool-call id queues even after the first
+/// was drained (inside the scheduler's recent-claim window), while a retry of
+/// the same call within one turn still dedupes and is reported as such.
+#[tokio::test]
+async fn peer_send_input_with_a_reused_tool_call_id_queues_on_each_turn() {
+    use crate::autonomy::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let profile_id = "test-peer-send-input-reused-call-id";
+    let slug = "reused-otter";
+    let peer_key =
+        SessionKey::with_profile_topic(profile_id, "api", "tab-3", &format!("peer-{slug}"));
+    let state = Arc::new(AppState::empty_for_tests());
+    register_peer_wire_session(&state, &peer_key);
+    let target = peer_wire_registry()
+        .resolve(&peer_wire_key(profile_id, slug))
+        .expect("opened peer resolves");
+    let system = format!("{profile_id}:api:octosense#system");
+    let (turn_1, turn_2) = (TurnId::new(), TurnId::new());
+    let orchestrator = default_agent_orchestrator();
+    let idle = crate::autonomy::master_continuation_scheduler::MasterContinuationRuntimeState::idle;
+    let send = |turn: &TurnId, message: &str| {
+        orchestrator.enqueue_peer_send_input_continuation(
+            &target,
+            profile_id,
+            slug,
+            &peer_send_input_occurrence_id(&system, turn, "call_1"),
+            message,
+        )
+    };
+
+    assert_eq!(send(&turn_1, "FIRST"), PeerSendInputEnqueueOutcome::Queued);
+    // Same call retried within the turn: dedupes, reported as already queued.
+    let retry = send(&turn_1, "FIRST");
+    assert_eq!(retry, PeerSendInputEnqueueOutcome::Duplicate);
+    assert_eq!(
+        retry.into_callback_result(slug),
+        Ok(octos_agent::PeerSendInputDelivery::AlreadyQueued),
+        "a genuine retry is not reported as a fresh send"
+    );
+    // The peer runs the first input (dequeue starts the recent-claim window).
+    let drained =
+        orchestrator.drain_ready_continuations_for_session(&peer_key, profile_id, idle(), 8);
+    assert_eq!(drained.len(), 1);
+    assert_eq!(master_continuation_prompt(&drained[0]), "FIRST");
+    // A retry after the drain is still the same occurrence: still deduped.
+    assert_eq!(
+        send(&turn_1, "FIRST"),
+        PeerSendInputEnqueueOutcome::Duplicate
+    );
+
+    // The NEXT turn reuses `call_1`: it is a new input and must queue.
+    let second = send(&turn_2, "SECOND");
+    assert_eq!(
+        second,
+        PeerSendInputEnqueueOutcome::Queued,
+        "a later turn's send with a reused tool-call id must not be dropped"
+    );
+    assert_eq!(
+        second.into_callback_result(slug),
+        Ok(octos_agent::PeerSendInputDelivery::Queued)
+    );
+    let drained =
+        orchestrator.drain_ready_continuations_for_session(&peer_key, profile_id, idle(), 8);
+    assert_eq!(
+        drained.len(),
+        1,
+        "the second input runs as the peer's next turn"
+    );
+    assert_eq!(master_continuation_prompt(&drained[0]), "SECOND");
+}
+
 /// #436 P1 #6 — only the peer's recorded ORIGINATOR may inject. A different
 /// same-profile session (or a peer with no recorded owner) is rejected.
 #[test]
@@ -13350,10 +13483,10 @@ fn peer_send_input_persist_failure_maps_to_error_not_success() {
             .into_callback_result("slugz")
             .is_ok()
     );
-    assert!(
-        PeerSendInputEnqueueOutcome::Duplicate
-            .into_callback_result("slugz")
-            .is_ok()
+    assert_eq!(
+        PeerSendInputEnqueueOutcome::Duplicate.into_callback_result("slugz"),
+        Ok(octos_agent::PeerSendInputDelivery::AlreadyQueued),
+        "a retry is a success, but reported as already queued"
     );
 }
 
@@ -13844,7 +13977,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
         title: "Approve shell command".into(),
         body: "Command:\ncargo test".into(),
         command: Some("cargo test".into()),
-        cwd: Some("/Users/yuechen/home/octos".into()),
+        cwd: Some("/workspace/octos".into()),
     };
     let session_id = SessionKey("local:test".into());
     let approval_id = ApprovalId::new();
@@ -13910,7 +14043,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
         .and_then(|details| details.command.as_ref())
         .expect("typed command details");
     assert_eq!(command.command_line.as_deref(), Some("cargo test"));
-    assert_eq!(command.cwd.as_deref(), Some("/Users/yuechen/home/octos"));
+    assert_eq!(command.cwd.as_deref(), Some("/workspace/octos"));
     assert_eq!(command.tool_call_id.as_deref(), Some("tool-1"));
     clear_tool_risk_registry_for_test();
 }
@@ -15831,6 +15964,7 @@ async fn should_retain_only_same_profile_goal_events_when_open_session_result_re
         Some("alpha"),
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -15922,6 +16056,7 @@ async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_pr
         ConnectionUiFeatures::default(),
         "open-alpha".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -16036,6 +16171,7 @@ async fn should_replay_main_and_legacy_goal_frames_when_connection_is_unprofiled
         ConnectionUiFeatures::default(),
         "open-main".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -16527,6 +16663,7 @@ async fn should_drop_cross_profile_loop_and_monitor_frames_when_connection_scope
         ConnectionUiFeatures::default(),
         "open-alpha-autonomy".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -16789,6 +16926,7 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
         ConnectionUiFeatures::default(),
         "open-alpha-shared".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -16906,6 +17044,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
         features,
         "open-alpha-activity".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -17056,6 +17195,7 @@ async fn should_deliver_routed_profile_frames_when_the_connection_scope_is_not_a
         features,
         "open-routed-admin".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -17157,6 +17297,7 @@ async fn should_deliver_later_profile_frames_when_an_unscoped_connection_opened_
     // No routing header anywhere: this connection is plain unscoped.
     let open = |session_id: SessionKey, profile_id: Option<&str>, rpc_id: &str| {
         let params = SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: profile_id.map(ToOwned::to_owned),
@@ -17633,6 +17774,7 @@ async fn test_connection_turn(
 fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
+        owner: None,
         turn_id,
         profile_id: MAIN_PROFILE_ID.to_owned(),
         state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -17673,6 +17815,7 @@ async fn session_open_replays_notifications_after_cursor_and_returns_ledger_curs
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -17737,6 +17880,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: base_session.clone(),
             topic: Some("alpha".into()),
             profile_id: None,
@@ -17769,6 +17913,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: base_session.clone(),
             topic: None,
             profile_id: None,
@@ -17810,6 +17955,7 @@ async fn session_open_rejects_after_cursor_from_other_stream() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -17872,6 +18018,7 @@ async fn session_open_rejects_stale_after_cursor() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -17930,6 +18077,7 @@ async fn session_open_replays_pending_approval_after_reconnect_without_cursor() 
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -18014,6 +18162,7 @@ async fn session_open_replays_pending_question_for_negotiated_client() {
         None,
         features_with_user_question_v1(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -18365,6 +18514,7 @@ async fn session_open_does_not_duplicate_pending_question_already_in_cursor_repl
         None,
         features_with_user_question_v1(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -18604,6 +18754,7 @@ async fn session_open_does_not_duplicate_pending_approval_already_in_cursor_repl
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -18684,6 +18835,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             stdio_transport: false,
         },
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -18737,6 +18889,7 @@ async fn session_open_rejects_cwd_without_negotiated_feature() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id,
             topic: None,
             profile_id: None,
@@ -18777,6 +18930,7 @@ async fn session_open_result_advertises_full_protocol_when_no_header() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -18851,6 +19005,7 @@ async fn session_open_result_advertises_intersection_when_header_subset() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id,
             topic: None,
             profile_id: None,
@@ -20691,6 +20846,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Terminal(
@@ -20726,6 +20882,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: "someone-else".to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -20761,6 +20918,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -20881,6 +21039,7 @@ fn session_ingress_scope_rejects_global_methods_and_mismatched_sessions() {
     assert!(validate_session_ingress_command_scope(&global, &allowed).is_err());
 
     let mismatched = UiCommand::SessionOpen(SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("other:local:tui".into()),
         topic: None,
         profile_id: None,
@@ -22050,6 +22209,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -22077,6 +22237,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -23607,6 +23768,7 @@ async fn approval_respond_ledgers_decided_before_unblocked_turn_completion() {
             &handler_ledger,
             &handler_contracts,
             None,
+            None,
             "approval-respond".into(),
             ApprovalRespondParams::new(
                 handler_session,
@@ -24617,6 +24779,7 @@ async fn reconnect_after_decision_replays_decided_event() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -25559,6 +25722,7 @@ async fn session_rollback_rejects_when_turn_in_progress() {
         guard.insert(
             session_id.clone(),
             ActiveTurn {
+                owner: None,
                 turn_id: TurnId::new(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -27144,6 +27308,7 @@ async fn turn_state_get_returns_active_for_in_flight() {
         guard.insert(
             session_id.clone(),
             ActiveTurn {
+                owner: None,
                 turn_id: turn_id.clone(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -31204,6 +31369,7 @@ async fn cold_scope_admission_case(case: &str) {
             Some(&profile),
             ConnectionUiFeatures::stdio_defaults(),
             SessionOpenParams {
+                client_commands: None,
                 session_id: session.clone(),
                 topic: None,
                 profile_id: Some(profile.clone()),
@@ -31227,6 +31393,7 @@ async fn cold_scope_admission_case(case: &str) {
             Some(&profile),
             ConnectionUiFeatures::stdio_defaults(),
             SessionOpenParams {
+                client_commands: None,
                 session_id: session.clone(),
                 topic: None,
                 profile_id: Some(profile.clone()),
@@ -31627,6 +31794,7 @@ async fn open_peer_with_active_turn(
     let handle = tokio::spawn(async { std::future::pending::<()>().await });
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let entry = ActiveTurn {
+        owner: None,
         turn_id: TurnId::new(),
         profile_id: profile.to_owned(),
         state: turn_state.clone(),
@@ -32340,6 +32508,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("m11e-custom-cwd".into()),
@@ -32395,6 +32564,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
 #[test]
 fn session_sandbox_requires_negotiated_feature() {
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::new("api", "sandbox-feature-required"),
         topic: None,
         profile_id: None,
@@ -32431,6 +32601,7 @@ fn session_sandbox_can_narrow_network_but_not_widen() {
         ..ConnectionUiFeatures::default()
     };
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::new("api", "sandbox-network-narrow"),
         topic: None,
         profile_id: None,
@@ -32453,6 +32624,7 @@ fn session_sandbox_can_narrow_network_but_not_widen() {
     assert!(!narrowed.allow_network);
 
     let widening = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::new("api", "sandbox-network-widen"),
         topic: None,
         profile_id: None,
@@ -32499,6 +32671,7 @@ fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
     };
 
     let narrowed = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::new("api", "sandbox-read-narrow"),
         topic: None,
         profile_id: None,
@@ -32517,6 +32690,7 @@ fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
     assert!(Path::new(&sandbox.read_allow_paths[0]).ends_with("nested"));
 
     let widening = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::new("api", "sandbox-read-widen"),
         topic: None,
         profile_id: None,
@@ -32573,6 +32747,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: gamma.clone(),
             topic: None,
             profile_id: Some("m11-session-sandbox".into()),
@@ -32597,6 +32772,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: delta.clone(),
             topic: None,
             profile_id: Some("m11-session-sandbox".into()),
@@ -32667,6 +32843,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_a.clone(),
             topic: None,
             profile_id: Some("m11e-multi-cwd".into()),
@@ -32689,6 +32866,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_b.clone(),
             topic: None,
             profile_id: Some("m11e-multi-cwd".into()),
@@ -32840,6 +33018,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("m11e-rebind-attempt".into()),
@@ -32861,6 +33040,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("m11e-rebind-attempt".into()),
@@ -32938,6 +33118,7 @@ async fn session_open_with_cwd_for_unregistered_profile_is_rejected() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id,
             topic: None,
             profile_id: None,
@@ -33008,6 +33189,7 @@ async fn parent_directory_symlink_escapes_per_session_workspace_documents_gap() 
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_a.clone(),
             topic: None,
             profile_id: Some("m11e-symlink".into()),
@@ -33134,6 +33316,7 @@ async fn appui_session_without_client_cwd_respects_operator_default_session_cwd(
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("m11f-tier2-default".into()),
@@ -33232,6 +33415,7 @@ async fn appui_no_cwd_workspace_does_not_become_a_transcript_store_hint() {
             ..ConnectionUiFeatures::default()
         },
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some(profile_id.into()),
@@ -33297,6 +33481,7 @@ async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
             ..ConnectionUiFeatures::default()
         },
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some(profile_id.into()),
@@ -37828,6 +38013,165 @@ fn peer_respond_resolves_pending_approval_deny() {
     assert_eq!(rx.try_recv().unwrap(), ApprovalDecision::Deny);
 }
 
+/// Mark a staged peer as a host-owned app peer (UPCR-2026-034) by writing its
+/// host binding, as `peer/prepare` with `memory_namespace` does.
+fn bind_peer_to_host(peers_root: &std::path::Path, slug: &str) {
+    crate::peers::app_binding::write_host_binding_in(
+        &peers_root.join(slug),
+        &crate::peers::app_binding::PeerHostBinding {
+            version: 1,
+            cwd: peers_root.parent().unwrap().join("work"),
+            memory_namespace: "app/test".to_owned(),
+            token_sha256: crate::peers::app_binding::token_digest("host-token"),
+        },
+    )
+    .unwrap();
+}
+
+/// ADR 0007 — a host-owned app peer's tool approval is the person's, answered
+/// in the app's own UI. The owning system agent (the originator) must not be
+/// able to approve or deny it through `peer_respond`, whether it names the
+/// approval's id or relies on the single-pending default; the approval stays
+/// parked and nothing is decided.
+#[test]
+fn peer_respond_refuses_a_host_owned_peers_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let system = octos_core::SessionKey::with_profile_topic("dev", "api", "octosense", "system");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-hostappr", "rinx", &system);
+    bind_peer_to_host(&peers_root, &slug);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+    let decided = std::cell::RefCell::new(0usize);
+    let sink = |_event: &ApprovalDecidedEvent, _tool: Option<&str>| {
+        *decided.borrow_mut() += 1;
+    };
+
+    let approval_id_text = approval_id.0.to_string();
+    for (label, id, decision) in [
+        ("default approve", None, "approve"),
+        (
+            "targeted approve",
+            Some(approval_id_text.as_str()),
+            "approve",
+        ),
+        ("targeted deny", Some(approval_id_text.as_str()), "deny"),
+    ] {
+        let err = peer_respond_resolve(
+            &peers_root,
+            &system.0,
+            "prof-hostappr",
+            &contracts,
+            &sink,
+            octos_agent::PeerRespondRequest {
+                slug: slug.clone(),
+                id: id.map(ToOwned::to_owned),
+                decision: Some(decision.to_owned()),
+                answers: None,
+            },
+        )
+        .expect_err(label);
+        assert!(
+            err.contains("host-owned app peer") && err.contains("person in the app"),
+            "{label}: a clear refusal naming who answers: {err}"
+        );
+    }
+    assert!(rx.try_recv().is_err(), "the approval is still parked");
+    assert_eq!(*decided.borrow(), 0, "no approval/decided was emitted");
+    assert_eq!(
+        peer_pending_summaries(&contracts, &peer_key).len(),
+        1,
+        "the approval is still pending for the person"
+    );
+
+    // peer_list does not offer it to the system agent as input to give.
+    let contracts = Arc::new(contracts);
+    let list = build_peer_list_callback(
+        peers_root.clone(),
+        Vec::new(),
+        contracts.clone(),
+        "prof-hostappr".to_owned(),
+    );
+    let text = list().unwrap();
+    assert!(
+        !text.contains(&approval_id_text),
+        "a host-owned peer's approval is not listed for the originator: {text}"
+    );
+}
+
+/// ADR 0007 — the system agent still answers a host-owned app peer's
+/// QUESTION, and with an approval also parked the default target is the
+/// question, never the approval.
+#[test]
+fn peer_respond_answers_a_host_owned_peers_question_beside_a_parked_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let system = octos_core::SessionKey::with_profile_topic("dev", "api", "octosense", "system");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-hostq", "rinx", &system);
+    bind_peer_to_host(&peers_root, &slug);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut approval_rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+    let question_id = QuestionId::new();
+    let mut question_rx = contracts.user_questions.request_runtime(question_event(
+        &peer_key,
+        &question_id,
+        one_free_text_question(),
+    ));
+
+    peer_respond_resolve(
+        &peers_root,
+        &system.0,
+        "prof-hostq",
+        &contracts,
+        &no_decided_sink(),
+        answer_req(&slug, &["postgres"]),
+    )
+    .expect("the system agent answers the host-owned peer's question");
+    assert!(question_rx.try_recv().is_ok(), "the question is answered");
+    assert!(approval_rx.try_recv().is_err(), "the approval is untouched");
+}
+
+/// Ordinary (agent-staged) peers are unchanged: the originator still answers
+/// their approvals, and peer_list still lists them.
+#[test]
+fn peer_respond_still_resolves_an_ordinary_peers_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-ordappr", "ordinary", &master);
+
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+    let list = build_peer_list_callback(
+        peers_root.clone(),
+        Vec::new(),
+        contracts.clone(),
+        "prof-ordappr".to_owned(),
+    );
+    assert!(list().unwrap().contains(&approval_id.0.to_string()));
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-ordappr",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, Some(&approval_id.0.to_string())),
+    )
+    .expect("an ordinary peer's approval is still the originator's to answer");
+    assert_eq!(rx.try_recv().unwrap(), ApprovalDecision::Approve);
+}
+
 /// (C) peer_respond resolves a single-question prompt with a free-text answer.
 #[test]
 fn peer_respond_resolves_pending_question_answer() {
@@ -39896,6 +40240,7 @@ fn synthetic_active_turn(
     let dummy_handle = tokio::spawn(async {});
     (
         ActiveTurn {
+            owner: None,
             turn_id: turn_id.clone(),
             profile_id: MAIN_PROFILE_ID.to_owned(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -42122,6 +42467,7 @@ async fn session_open_goal_frames_gated_when_goal_runtime_not_negotiated() {
         features,
         "open-no-goal-runtime".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -45690,4 +46036,425 @@ async fn should_treat_an_idle_stream_as_alive_and_a_closed_one_as_gone() {
         gone,
         "a closed stream must end the connection like a read error"
     );
+}
+
+// ── UPCR-2026-036: `octos serve --host-managed` ─────────────────────────────
+
+fn host_managed_peer_session(topic: &str) -> SessionKey {
+    SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "octosense", topic)
+}
+
+async fn external_approval_respond(
+    external: bool,
+    session_id: SessionKey,
+) -> (Value, tokio::sync::oneshot::Receiver<ApprovalDecision>) {
+    external_approval_respond_as(external, session_id, true).await
+}
+
+/// `own_turn`: whether the pending approval was raised by a turn of the
+/// answering connection (the server records the owner on the approval).
+async fn external_approval_respond_as(
+    external: bool,
+    session_id: SessionKey,
+    own_turn: bool,
+) -> (Value, tokio::sync::oneshot::Receiver<ApprovalDecision>) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let (ws, mut rx) = ws_connection_for_test(32);
+    let (host_ws, _host_rx) = ws_connection_for_test(32);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let approval_id = ApprovalId::new();
+    // The same client-chosen turn id either way: ownership is the
+    // connection's, never the id's.
+    let turn_id = TurnId::new();
+    let owner = if own_turn { &ws } else { &host_ws };
+    let decision_rx = contracts.approvals.request_runtime_owned(
+        ApprovalRequestedEvent::generic(
+            session_id.clone(),
+            approval_id.clone(),
+            turn_id,
+            "shell",
+            "Run command",
+            "cargo test",
+        ),
+        Some(owner.connection_id().0),
+    );
+    let external_owner = external.then(|| ws.connection_id());
+    let mut respond =
+        ApprovalRespondParams::new(session_id.clone(), approval_id, ApprovalDecision::Approve);
+    respond.approval_scope = Some("approve_for_session".into());
+    handle_approval_respond(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        external_owner,
+        "respond".into(),
+        respond,
+    )
+    .await;
+    if external {
+        assert!(
+            contracts.scopes.list_for_session(&session_id).is_empty(),
+            "an external answer never records a session-wide scope"
+        );
+    }
+    (recv_rpc_json(&mut rx).await, decision_rx)
+}
+
+#[tokio::test]
+async fn should_refuse_an_external_answer_to_a_host_owned_peer_approval() {
+    for topic in ["peer-rinx", "peerctx-rinx.app-a"] {
+        let (reply, mut decision) =
+            external_approval_respond(true, host_managed_peer_session(topic)).await;
+        assert_eq!(
+            reply["error"]["data"]["kind"],
+            json!(super::super::host_managed::HOST_OWNED_PEER_ANSWER_DENIED),
+            "{topic}: {reply}"
+        );
+        assert!(
+            decision.try_recv().is_err(),
+            "{topic}: the approval stays parked for the person"
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_let_the_host_answer_a_host_owned_peer_approval() {
+    let (reply, decision) =
+        external_approval_respond(false, host_managed_peer_session("peer-rinx")).await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(decision.await.unwrap(), ApprovalDecision::Approve);
+}
+
+#[tokio::test]
+async fn should_let_an_external_client_answer_only_its_own_turns_approvals_once() {
+    let session = host_managed_peer_session("system");
+    // A host turn's approval on the shared system conversation: refused.
+    let (reply, mut decision) = external_approval_respond_as(true, session.clone(), false).await;
+    assert_eq!(
+        reply["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{reply}"
+    );
+    assert!(
+        decision.try_recv().is_err(),
+        "the host's approval stays pending"
+    );
+    // Its own turn's approval: answered, once (no scope recorded).
+    let (reply, decision) = external_approval_respond_as(true, session, true).await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(decision.await.unwrap(), ApprovalDecision::Approve);
+}
+
+#[tokio::test]
+async fn should_refuse_an_external_answer_to_a_host_owned_peer_question() {
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = host_managed_peer_session("peerctx-rinx.app-a");
+    let question_id = QuestionId::new();
+    let mut waiter = contracts
+        .user_questions
+        .request_runtime(sample_pending_question(
+            session_id.clone(),
+            question_id.clone(),
+            TurnId::new(),
+        ));
+    let answer = || {
+        vec![UserQuestionAnswer {
+            selected_labels: vec!["axum".into()],
+            free_text: None,
+        }]
+    };
+    let (ws, mut rx) = ws_connection_for_test(32);
+    handle_user_question_respond(
+        &ws,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        Some(ws.connection_id()),
+        "q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id.clone(), answer()),
+    )
+    .await;
+    let reply = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        reply["error"]["data"]["kind"],
+        json!(super::super::host_managed::HOST_OWNED_PEER_ANSWER_DENIED),
+        "{reply}"
+    );
+    assert!(waiter.try_recv().is_err(), "the question stays pending");
+    // The host still answers it.
+    handle_user_question_respond(
+        &ws,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        None,
+        "q2".into(),
+        UserQuestionRespondParams::new(session_id, question_id, answer()),
+    )
+    .await;
+    let reply = recv_rpc_json(&mut rx).await;
+    assert!(reply.get("error").is_none(), "{reply}");
+}
+
+#[test]
+fn should_admit_only_configured_origins_on_a_host_managed_ws_upgrade() {
+    let state = AppState {
+        appui_allowed_origins: vec!["https://web.example".into()],
+        host_managed: Some(Arc::new(
+            super::super::host_managed::HostManaged::new("h".repeat(40), None, 4000).unwrap(),
+        )),
+        ..AppState::empty_for_tests()
+    };
+    let headers = |pairs: &[(&'static str, &str)]| {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().unwrap());
+        }
+        map
+    };
+    assert_eq!(
+        decide_ui_ws_origin_gate(&headers(&[("origin", "https://web.example")]), &state, true),
+        WsOriginDecision::Allow
+    );
+    // The built-in development and legacy origins are not trusted here.
+    for origin in [
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://app.ominix.io",
+    ] {
+        assert!(matches!(
+            decide_ui_ws_origin_gate(&headers(&[("origin", origin)]), &state, true),
+            WsOriginDecision::RejectDisallowed { .. }
+        ));
+    }
+    // A browser-style upgrade must carry Origin; a native client sends none.
+    assert!(matches!(
+        decide_ui_ws_origin_gate(&headers(&[("sec-fetch-mode", "websocket")]), &state, true),
+        WsOriginDecision::RejectDisallowed { .. }
+    ));
+    assert_eq!(
+        decide_ui_ws_origin_gate(&HeaderMap::new(), &state, true),
+        WsOriginDecision::Allow
+    );
+}
+
+#[test]
+fn stdio_default_feature_list_matches_the_stdio_defaults() {
+    // Hosts moving a native client from stdio to the host-managed WebSocket
+    // request exactly `UI_PROTOCOL_STDIO_DEFAULT_FEATURES` (UPCR-2026-036).
+    let requested = ConnectionUiFeatures::from_requested_feature_tokens(
+        octos_core::ui_protocol::UI_PROTOCOL_STDIO_DEFAULT_FEATURES,
+        true,
+    );
+    assert_eq!(requested, ConnectionUiFeatures::stdio_defaults());
+}
+
+fn owned_active_turn(turn_id: &TurnId, owner: ConnectionId) -> ActiveTurn {
+    let (mut entry, _buffer) = synthetic_active_turn(turn_id, true);
+    entry.owner = Some(owner);
+    entry
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_let_an_external_client_steer_and_interrupt_only_turns_it_owns() {
+    let host_session = host_managed_peer_session("system");
+    let own_session = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web", "mine");
+    // The same client-chosen turn id in both sessions: ownership is the
+    // connection's, never the id's.
+    let turn_id = TurnId::new();
+    let (host_ws, _host_rx) = ws_connection_for_test(32);
+    let (ws, mut rx) = ws_connection_for_test(32);
+    ws.set_external(true);
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    active_turns.lock().await.insert(
+        host_session.clone(),
+        owned_active_turn(&turn_id, host_ws.connection_id()),
+    );
+    active_turns.lock().await.insert(
+        own_session.clone(),
+        owned_active_turn(&turn_id, ws.connection_id()),
+    );
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let steer = |session: &SessionKey, id: &str| {
+        steer_request(
+            id,
+            json!({
+                "session_id": session,
+                "expected_turn_id": turn_id,
+                "input": [{ "kind": "text", "text": "steer" }],
+            }),
+        )
+    };
+    for (session, id, owned) in [
+        (&host_session, "steer-host", false),
+        (&own_session, "steer-own", true),
+    ] {
+        handle_turn_steer(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active_turns,
+            &connection_turns,
+            Some(MAIN_PROFILE_ID),
+            ConnectionUiFeatures::stdio_defaults(),
+            id.into(),
+            &steer(session, id),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        if owned {
+            assert_eq!(frame["result"]["steered"], true, "{frame}");
+        } else {
+            assert_eq!(
+                frame["error"]["data"]["kind"],
+                json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+                "{frame}"
+            );
+        }
+    }
+    let host_steer = active_turns.lock().await[&host_session]
+        .steer
+        .clone()
+        .expect("steerable");
+    assert!(
+        host_steer.drain().is_empty(),
+        "the host's turn was not steered"
+    );
+
+    handle_turn_interrupt(
+        &ws,
+        &ledger,
+        &active_turns,
+        &contracts,
+        "interrupt-host".into(),
+        TurnInterruptParams {
+            session_id: host_session.clone(),
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{frame}"
+    );
+    let state_now = active_turns.lock().await[&host_session].state.clone();
+    assert!(
+        matches!(*state_now.lock().await, TurnState::Active),
+        "the host's turn keeps running"
+    );
+}
+
+#[tokio::test]
+async fn should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_server() {
+    let first = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "octosense", "system");
+    let second = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web", "mine");
+    let turn_id = TurnId::new();
+    let (host_ws, _rx) = ws_connection_for_test(8);
+    let mut active = HashMap::new();
+    active.insert(
+        first.clone(),
+        owned_active_turn(&turn_id, host_ws.connection_id()),
+    );
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &turn_id, true).await,
+        Some(TurnAdmissionRefusal::TurnIdInUse)
+    );
+    // Only in host-managed mode; a fresh id is admitted either way.
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &turn_id, false).await,
+        None
+    );
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &TurnId::new(), true).await,
+        None
+    );
+    assert_eq!(
+        turn_admission_refusal(&active, &first, &TurnId::new(), true).await,
+        Some(TurnAdmissionRefusal::Occupied(turn_id.clone()))
+    );
+    // A finished turn frees its id.
+    *active[&first].state.lock().await = TurnState::Terminal(TerminalReason::Completed);
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &turn_id, true).await,
+        None
+    );
+    // The refusals as the wire shows them: an external client never learns
+    // the id of the turn that holds a session.
+    let external =
+        serde_json::to_value(TurnAdmissionRefusal::Occupied(turn_id.clone()).into_error(true))
+            .unwrap();
+    assert_eq!(external["data"], json!({ "kind": "turn_in_progress" }));
+    let host =
+        serde_json::to_value(TurnAdmissionRefusal::Occupied(turn_id.clone()).into_error(false))
+            .unwrap();
+    assert_eq!(
+        host["data"]["turn_id"],
+        serde_json::to_value(&turn_id).unwrap()
+    );
+    let in_use = serde_json::to_value(TurnAdmissionRefusal::TurnIdInUse.into_error(true)).unwrap();
+    assert_eq!(in_use["data"], json!({ "kind": TURN_ID_IN_USE }));
+}
+
+#[tokio::test]
+async fn should_let_an_external_client_answer_only_its_own_turns_questions() {
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = host_managed_peer_session("system");
+    let turn_id = TurnId::new();
+    let (host_ws, _host_rx) = ws_connection_for_test(32);
+    let (ws, mut rx) = ws_connection_for_test(32);
+    let answer = || {
+        vec![UserQuestionAnswer {
+            selected_labels: vec!["axum".into()],
+            free_text: None,
+        }]
+    };
+    // The host's question and the external client's, same turn id.
+    let host_question = QuestionId::new();
+    let mut host_waiter = contracts.user_questions.request_runtime_owned(
+        sample_pending_question(session_id.clone(), host_question.clone(), turn_id.clone()),
+        Some(host_ws.connection_id().0),
+    );
+    let own_question = QuestionId::new();
+    let _own_waiter = contracts.user_questions.request_runtime_owned(
+        sample_pending_question(session_id.clone(), own_question.clone(), turn_id),
+        Some(ws.connection_id().0),
+    );
+    handle_user_question_respond(
+        &ws,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        Some(ws.connection_id()),
+        "q-host".into(),
+        UserQuestionRespondParams::new(session_id.clone(), host_question, answer()),
+    )
+    .await;
+    let reply = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        reply["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{reply}"
+    );
+    assert!(
+        host_waiter.try_recv().is_err(),
+        "the host's question stays pending"
+    );
+    handle_user_question_respond(
+        &ws,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        Some(ws.connection_id()),
+        "q-own".into(),
+        UserQuestionRespondParams::new(session_id, own_question, answer()),
+    )
+    .await;
+    let reply = recv_rpc_json(&mut rx).await;
+    assert!(reply.get("error").is_none(), "{reply}");
 }

@@ -1184,7 +1184,7 @@ JSONL persistence at `.octos/sessions/{key}.jsonl`.
 
 - **In-memory cache**: LRU with disk sync on write
 - **Filenames**: Percent-encoded SessionKey, truncated to 183 chars with `_{hash:016X}` suffix on truncation to prevent collisions
-- **File size limit**: 10MB max (`MAX_SESSION_FILE_SIZE`); oversized files skipped on load
+- **Rolling segments**: Files roll into `<name>.segments/NNNNNN.jsonl` at `OCTOS_SESSION_SEGMENT_BYTES` (8MB); loads read the newest segments up to `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32MB, 0 = all)
 - **Crash safety**: Atomic write-then-rename
 - **Forking**: `fork()` creates child session with `parent_key` tracking, copies last N messages
 
@@ -1602,7 +1602,7 @@ crates/
 - Tool policies: allow/deny with deny-wins semantics, group support, provider-specific filtering
 - Tool argument size limit: 1MB per invocation (non-allocating `estimate_json_size` with escape char accounting)
 - Path traversal prevention + symlink-safe file I/O via `O_NOFOLLOW` (Unix) eliminating TOCTOU races
-- SSRF protection in shared `ssrf.rs` module: blocks private IPs (10/8, 172.16/12, 192.168/16, 169.254/16, IPv6 ULA/link-local, IPv4-mapped/compatible). Used by web_fetch and browser.
+- SSRF protection via `octos_research::net::check_url` — the one shared implementation, adapted for the agent tools by `octos-agent/src/tools/ssrf.rs`: blocks private IPs (10/8, 172.16/12, 192.168/16, 169.254/16, IPv6 ULA/link-local, IPv4-mapped/compatible). Used by web_fetch and browser.
 - Browser: URL scheme allowlist (http/https only), 10s JS execution timeout, zombie process reaping, secure tempfiles for screenshots
 - MCP: input schema validation (max depth 10, max size 64KB) prevents malicious tool definitions
 
@@ -1610,7 +1610,7 @@ crates/
 - Tool output sanitization: strips base64 data URIs and long hex strings (`sanitize.rs`)
 - UTF-8 safe truncation via `truncate_utf8()` across all tool outputs and email bodies
 - Session file collision prevention via percent-encoded filenames with hash suffix on truncation
-- Session file size limit: 10MB max prevents OOM on corrupted files
+- Session files roll into 8MB segments and loads stop at `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32MB), preventing OOM on oversized histories
 - Atomic write-then-rename for session persistence (crash safety)
 - API server binds to 127.0.0.1 by default (not 0.0.0.0)
 - Channel access control via `allowed_senders` lists
@@ -1734,7 +1734,7 @@ Highlights of the current suite:
 - **Plugin contract**: `crates/octos-plugin/tests/lifecycle_sandbox.rs` — protocol v2 events
 - **Swarm contract**: `crates/octos-swarm/tests/{subtask_contracts,swarm_dispatch}.rs`
 - **Integration**: CLI commands, file tools, cron jobs, session forking, plugin loading
-- **Security**: sandbox path injection, env sanitization, SSRF blocking, symlink rejection (O_NOFOLLOW), private IP detection, dedup overflow, tool argument size limits, session file size limits, circuit breaker threshold edge cases, MCP schema validation, prompt-injection corpus (67 cases)
+- **Security**: sandbox path injection, env sanitization, SSRF blocking, symlink rejection (O_NOFOLLOW), private IP detection, dedup overflow, tool argument size limits, session segment rolling and load budget, circuit breaker threshold edge cases, MCP schema validation, prompt-injection corpus (67 cases)
 - **Channel**: allowed_senders, message parsing, dedup logic, email address extraction, Matrix MSC4357 finish_stream
 
 Local CI: `./scripts/ci.sh` (mirrors GitHub Actions + focused subsystem tests). See [TESTING.md](./TESTING.md).

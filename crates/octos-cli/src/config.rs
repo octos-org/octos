@@ -230,7 +230,8 @@ pub struct Config {
     #[serde(default)]
     pub base_domain: Option<String>,
 
-    /// frps server address for cloud/tenant mode (e.g. "163.192.33.32").
+    /// frps relay server address for cloud/tenant mode (e.g. "relay.example.com").
+    /// No default: tenant setup scripts are refused until this is set.
     /// Also read from FRPS_SERVER env var.
     #[serde(default)]
     pub frps_server: Option<String>,

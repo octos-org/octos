@@ -255,7 +255,7 @@ Source: `crates/octos-cli/src/api/admin_setup.rs`, `dashboard/src/pages/wizard/`
   sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
   ```
 
-- **`server/shutdown` (WebSocket, local solo only)** — a UI Protocol client connected over the authenticated WebSocket at `/api/ui-protocol/ws` can stop the server the same way Ctrl+C does: connections drain, gateways stop, the process exits. The call is idempotent, and the stop fires ~250 ms after the request is handled; under outbound backpressure the client may miss the acknowledgement, but the stop still happens. It is accepted only on a local deployment (`config.mode = "local"`) with solo login opted in (`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`) and only by an HTTP serve (`octos serve` without `--stdio`); fleet/hosted servers and `--stdio` serve answer `invalid_request` (-32600) with `data.kind: "server_shutdown_unavailable"` and keep running, and session-scoped connections can never call it. One call stops the process for every connected client — their running turns are cancelled. On a solo serve this follows the local-solo trust model: any local process that can reach the WebSocket can stop the server.
+- **`server/shutdown` (WebSocket, local solo only)** — a UI Protocol client connected over the authenticated WebSocket at `/api/ui-protocol/ws` can stop the server the same way Ctrl+C does: connections drain, gateways stop, the process exits. The call is idempotent, and the stop fires ~250 ms after the request is handled; under outbound backpressure the client may miss the acknowledgement, but the stop still happens. It is accepted only on a local deployment (`config.mode = "local"`) with solo login opted in (`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`) and only by an HTTP serve (`octos serve` without `--stdio`); fleet/hosted servers and `--stdio` serve answer `invalid_request` (-32600) with `data.kind: "server_shutdown_unavailable"` and keep running, and session-scoped connections can never call it. One call stops the process for every connected client — their running turns are cancelled. On a solo serve this follows the local-solo trust model: any local process that can reach the WebSocket can stop the server. A host-managed serve (`octos serve --host-managed`, see `docs/HOST_MANAGED_SERVE.md`) never offers it: its host stops it by closing stdin.
 
 ---
 
@@ -2299,6 +2299,9 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | **Voice** | |
 | `ASR_API_URL` | Dedicated batch-ASR service base URL; overrides OMiniX for transcription |
 | `OMINIX_API_URL` | OminiX ASR/TTS API URL |
+| **Session storage** | |
+| `OCTOS_SESSION_SEGMENT_BYTES` | Active session file size at which it seals into a segment (default 8 MiB) |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | Session history bytes a plain load reads, newest first (default 32 MiB; `0` = unlimited) |
 | **System** | |
 | `RUST_LOG` | Log level (error/warn/info/debug/trace) |
 | `OCTOS_LOG_JSON` | Enable JSON-formatted logs (set to any value) |

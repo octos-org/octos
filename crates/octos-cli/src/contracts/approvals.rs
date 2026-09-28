@@ -15,6 +15,10 @@ struct ApprovalEntry {
     request: Option<ApprovalRequestedEvent>,
     runtime_resumable: bool,
     response_tx: Option<tokio::sync::oneshot::Sender<ApprovalDecision>>,
+    /// The UI Protocol connection whose turn raised the approval (its
+    /// `ConnectionId`), when known. `octos serve --host-managed` lets an
+    /// external connection answer only approvals it owns (UPCR-2026-036).
+    owner_connection: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -228,6 +232,7 @@ impl PendingApprovalStore {
                 request: None,
                 runtime_resumable: false,
                 response_tx: None,
+                owner_connection: None,
             },
         );
     }
@@ -242,6 +247,7 @@ impl PendingApprovalStore {
                 request: Some(event.clone()),
                 runtime_resumable: false,
                 response_tx: None,
+                owner_connection: None,
             },
         );
         event
@@ -250,6 +256,16 @@ impl PendingApprovalStore {
     pub(crate) fn request_runtime(
         &self,
         event: ApprovalRequestedEvent,
+    ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
+        self.request_runtime_owned(event, None)
+    }
+
+    /// [`Self::request_runtime`], recording the connection that owns the
+    /// approval (see [`Self::pending_owner`]).
+    pub(crate) fn request_runtime_owned(
+        &self,
+        event: ApprovalRequestedEvent,
+        owner_connection: Option<u64>,
     ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
@@ -261,9 +277,28 @@ impl PendingApprovalStore {
                 request: Some(event),
                 runtime_resumable: true,
                 response_tx: Some(tx),
+                owner_connection,
             },
         );
         rx
+    }
+
+    /// The owning connection of a PENDING approval of `session_id`: `None`
+    /// when no such approval is pending, `Some(None)` when it has no recorded
+    /// owner.
+    pub(crate) fn pending_owner(
+        &self,
+        session_id: &SessionKey,
+        approval_id: &ApprovalId,
+    ) -> Option<Option<u64>> {
+        let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
+        entries
+            .get(approval_id)
+            .filter(|entry| {
+                entry.session_id == *session_id
+                    && matches!(&entry.state, ApprovalEntryState::Pending)
+            })
+            .map(|entry| entry.owner_connection)
     }
 
     pub(crate) fn pending_for_session(

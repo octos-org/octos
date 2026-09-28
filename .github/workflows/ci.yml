@@ -384,6 +384,21 @@ jobs:
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
 
+      - name: Test octos-services
+        run: cargo test -p octos-services
+
+      # Same #2055/#2558 failure mode: the research crates (octos-research,
+      # including the metasearch sandbox and per-engine fixture replays, and
+      # the deep-search / deep-crawl skills) were absent from this list, so
+      # their suites never ran in PR CI. No network: live engine tests are
+      # #[ignore]d and need `--features http`.
+      - name: Test research crates
+        run: |
+          cargo test -p octos-research
+          cargo test -p octos-research --no-default-features
+          cargo test -p deep-search
+          cargo test -p deep-crawl
+
       # Bundled harness starter skills (each has small lib + 1 smoke test)
       - name: Test harness starter skills
         run: |
@@ -516,7 +531,7 @@ jobs:
 
       - name: Test octos-cli (integration, excluding serve process e2e)
         if: matrix.part == 'integration'
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
 
       - name: OUP runtime and C/Python contracts
         if: matrix.part == 'oup'
@@ -524,16 +539,18 @@ jobs:
 
       # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe),
       # SIGTERM gateway-reap e2e (serve_sigterm), WS half-open
-      # liveness e2e (serve_ws_liveness), and solo manual-start
-      # guard e2e (serve_solo_gateway_guard). These spawn real
+      # liveness e2e (serve_ws_liveness), solo manual-start
+      # guard e2e (serve_solo_gateway_guard), and the host-managed ownership
+      # e2e (serve_host_managed: stdin EOF, host SIGKILL, inherited listener).
+      # These spawn real
       # `octos serve` children that contend for model catalog / profile
       # store resources with other test binaries; under the default
       # thread-per-core parallelism the children starve and the 15s port
       # barrier times out. Dedicated serial step per the #21 outer-loop
       # ruling (2026-08-27): layer at the CI command level, never #[ignore].
-      - name: serve BrokenPipe/SIGTERM/WS-liveness/solo-guard process e2e (serial)
+      - name: serve BrokenPipe/SIGTERM/WS-liveness/solo-guard/host-managed process e2e (serial)
         if: matrix.part == 'integration'
-        run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_sigterm --test serve_ws_liveness --test serve_solo_gateway_guard -- --test-threads=1
+        run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_sigterm --test serve_ws_liveness --test serve_solo_gateway_guard --test serve_host_managed -- --test-threads=1
 
       # In the `unit` part, so they reuse its warm octos-cli build cache.
       # All api-feature filter steps below go through ci-api-filter-test.sh:
@@ -654,14 +671,18 @@ jobs:
   # job lean, but the Dockerfile and several release configurations enable it.
   # Without this job, feature-gated compile errors (e.g. an identifier referenced
   # only inside `#[cfg(feature = "matrix")]`) slip past PR CI and only surface
-  # during docker builds. Keep this job intentionally tiny: no tests.
-  # It also carries the clippy gate for the feature-gated api/serve/ui_protocol
-  # modules: octos-cli has `default = []`, so the workspace clippy in `check`
-  # never lints them — and clippy subsumes `cargo check`.
+  # during docker builds. It also carries the clippy gate for the feature-gated
+  # channel modules: the non-api channels stay outside octos-cli's default
+  # features, so the workspace clippy in `check` never lints them — and clippy
+  # subsumes `cargo check`. And it runs the feature-gated octos-bus matrix
+  # test suite: with the feature off (as in `check`'s `cargo test -p
+  # octos-bus`) the whole suite is cfg'd out, and the workspace-wide runs that
+  # do execute it only exist in the nightly and self-hosted lanes.
   check-matrix:
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v6
 
@@ -681,6 +702,21 @@ jobs:
 
       - name: Clippy octos-cli with matrix feature
         run: cargo clippy -p octos-cli --all-targets --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3 -- -D warnings
+
+      # The suite itself: its only PR-time execution. Floor-check the listing
+      # first so the gate fails loudly if the suite silently drops to zero
+      # (the #2029 lesson), and skip the known nightly failure
+      # test_handle_room_query_requires_token (#2267: fails on the slow
+      # runner lanes) so the gate stays deterministic; lift the skip with the
+      # #2267 fix.
+      - name: Test octos-bus with the matrix feature
+        run: |
+          count=$(cargo test -p octos-bus --features matrix -- --list matrix_ | grep -c ': test$')
+          if [ "$count" -lt 100 ]; then
+            echo "::error::only $count matrix-gated tests listed; expected the suite floor of 100"
+            exit 1
+          fi
+          cargo test -p octos-bus --features matrix -- --skip test_handle_room_query_requires_token
 
   check-arm:
     # Deliberately NOT on PRs, unlike check-windows: the workspace has ZERO
@@ -748,7 +784,7 @@ jobs:
       # test-octos-cli; skipping here keeps this manual lane's coverage
       # semantics identical to the PR lane's.
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
@@ -827,7 +863,7 @@ jobs:
       # Same serve-process exclusions as the test-octos-cli PR job (see the
       # matching comment in check-arm).
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
@@ -865,6 +901,14 @@ jobs:
     # `#[cfg(unix)]` over re-muting the whole job — a check that cannot fail
     # tells you nothing.
     runs-on: windows-latest
+    env:
+      # Test threads run on whatever stack the harness hands out — on Windows
+      # that is too small for the deep agent poll chains in octos-cli's
+      # local-runtime tests, and a stack overflow does not fail one test: it
+      # aborts the whole test binary, losing every other test's result with it
+      # (the octos-cli lib step died this way on 6/6 consecutive main pushes,
+      # #2581). 8 MiB is what every production runtime hands the same futures.
+      RUST_MIN_STACK: "8388608"
     # The full Windows suite runs ~82 min when it passes (octos-cli integration
     # ~19 min and lib ~13 min, two builds ~20 min, doc tests ~6 min), so 90 left
     # almost no headroom: once the stack-overflow abort that used to end the
@@ -1011,6 +1055,13 @@ jobs:
 
       - name: Check octos-cli + all features (all targets)
         run: cargo check -p octos-cli --all-targets --features ${{ env.FEATURES }}
+
+      # The updater's signature-preservation behavior (#2559) lives in
+      # macOS-gated code, so the ubuntu `cargo test -p octos-services` lane
+      # never executes it — coverage that prints nothing and looks like
+      # passing coverage (#2055).
+      - name: Test octos-services (macOS behavior)
+        run: cargo test -p octos-services
 
   # ── Release artifact builds (main only) ──────────────────────────
   build-macos-arm:

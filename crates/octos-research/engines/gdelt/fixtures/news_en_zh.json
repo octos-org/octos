@@ -1,0 +1,52 @@
+{
+  "body_file": "news_en_zh.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": "2026-09-26T10:15:00Z",
+      "source": "reuters.com",
+      "title": "Climate summit negotiators publish first draft text",
+      "url": "https://www.reuters.com/sustainability/cop/climate-summit-draft-text-2026-09-26"
+    },
+    {
+      "lang": "zh",
+      "published": "2026-09-26T08:30:00Z",
+      "source": "xinhuanet.com",
+      "title": "气候峰会发布首份草案文本",
+      "url": "https://www.xinhuanet.com/world/20260926/climate-summit.html"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-25T19:00:00Z",
+      "source": "theguardian.com",
+      "title": "Rich nations under pressure over climate finance at summit",
+      "url": "https://www.theguardian.com/environment/2026/sep/25/climate-summit-finance"
+    },
+    {
+      "lang": "zh",
+      "published": "2026-09-25T12:00:00Z",
+      "source": "zaobao.com.sg",
+      "title": "气候峰会：发达国家面临气候融资压力",
+      "url": "https://www.zaobao.com.sg/news/world/story20260925-climate"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/json"
+    },
+    "method": "GET",
+    "url": "https://api.gdeltproject.org/api/v2/doc/doc?query=climate+summit+%28sourcelang%3Aenglish+OR+sourcelang%3Achinese%29&mode=ArtList&format=json&maxrecords=10&sort=DateDesc&timespan=7d"
+  },
+  "recorded": "synthetic body, shaped after a live ArtList response (GDELT answered HTTP 429 while recording)",
+  "request": {
+    "category": "news",
+    "count": 5,
+    "langs": [
+      "en",
+      "zh"
+    ],
+    "now": "2026-09-27T22:00:00Z",
+    "query": "climate summit",
+    "since": "7d"
+  }
+}

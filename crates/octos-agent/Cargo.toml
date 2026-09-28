@@ -71,6 +71,7 @@ webbrowser = "1"
 keyring = { workspace = true }
 url = { workspace = true }
 htmd = { workspace = true }
+octos-research = { workspace = true, features = ["http"] }
 html5ever = { workspace = true }
 markup5ever_rcdom = { workspace = true }
 dirs = { workspace = true }

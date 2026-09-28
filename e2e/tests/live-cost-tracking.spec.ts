@@ -14,7 +14,7 @@
  * with a diagnostic, so the spec can land before the relevant tracks
  * merge and auto-promote as they ship.
  *
- * Run from /Users/yuechen/home/octos/e2e:
+ * Run from ~/home/octos/e2e:
  *
  *   OCTOS_TEST_URL=https://dspfac.bot.ominix.io \
  *   OCTOS_AUTH_TOKEN=octos-admin-2026 \

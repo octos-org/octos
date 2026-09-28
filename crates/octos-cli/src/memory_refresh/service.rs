@@ -376,6 +376,14 @@ pub(crate) async fn run_extraction_pass(
 
     let manager = SessionManager::open(data_dir).wrap_err("failed to open session manager")?;
     let now = SystemTime::now();
+    // UPCR-2026-034 — a host-owned app peer (or one of its request contexts)
+    // captures only into its own memory namespace: the profile-level sweep
+    // must never read its transcript into the profile's memory.
+    let peers_root = data_dir.join("peers");
+    let app_bound = |key: &octos_core::SessionKey| {
+        crate::peers::app_binding::resolve_session_app_binding(&peers_root, key)
+            .is_bound_or_refused()
+    };
 
     // Pre-upgrade cursor backfill — INDEPENDENT of extraction eligibility
     // (idle windows, age caps, budgets): a watermarked session without a
@@ -385,7 +393,7 @@ pub(crate) async fn run_extraction_pass(
     // files already changed since the old watermark accept a one-time
     // full re-read (we cannot know the consumed prefix).
     for session in manager.list_for_analysis() {
-        if session.internal || session.files.is_empty() {
+        if session.internal || session.files.is_empty() || app_bound(&session.key) {
             continue;
         }
         if state.extracted_counts.contains_key(&session.key.0) {
@@ -428,7 +436,7 @@ pub(crate) async fn run_extraction_pass(
 
     let mut candidates: Vec<(octos_bus::AnalysisSession, Vec<FileSnap>, SystemTime)> = Vec::new();
     for session in manager.list_for_analysis() {
-        if session.internal || session.files.is_empty() {
+        if session.internal || session.files.is_empty() || app_bound(&session.key) {
             continue;
         }
         if state
@@ -1032,6 +1040,51 @@ mod tests {
             Some(octos_llm::CacheRetention::None),
             "one-shot memory extraction must not request cache writes"
         );
+    }
+
+    #[tokio::test]
+    async fn should_never_extract_an_app_bound_session_into_the_profile_memory() {
+        // UPCR-2026-034: a host-owned app peer and its request contexts
+        // capture only into their own namespace.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        let peer_dir = dir.path().join("peers/rinx");
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        crate::peers::app_binding::write_host_binding_in(
+            &peer_dir,
+            &crate::peers::app_binding::PeerHostBinding {
+                version: 1,
+                cwd: dir.path().join("apps/rinx"),
+                memory_namespace: "app/rinx/acct-1".into(),
+                token_sha256: String::new(),
+            },
+        )
+        .unwrap();
+        std::fs::write(peer_dir.join("brief.md"), "brief").unwrap();
+        seed_session(
+            dir.path(),
+            "dev:api:host#peer-rinx",
+            "my Matrix password hint is X",
+        )
+        .await;
+        seed_session(
+            dir.path(),
+            "dev:api:host#peerctx-rinx.mini-a",
+            "mini app secret",
+        )
+        .await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[{"kind":"fact","content":"leak","evidence":[0]}]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let report = run_extraction_pass(dir.path(), &store, &provider, &knobs_for_test())
+            .await
+            .unwrap();
+        assert_eq!(report.candidates, 0, "bound sessions are not candidates");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.count_staging_extractions().await, 0);
     }
 
     #[tokio::test]

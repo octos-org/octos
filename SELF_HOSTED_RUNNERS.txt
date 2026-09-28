@@ -47,7 +47,7 @@ Prerequisites
 Fast Linux Runner Example
 -------------------------
 
-    cd /Users/yuechen/home/crew-rs-port
+    cd ~/home/crew-rs-port
 
     scripts/setup-github-runner.sh \
       --name mini3-octos-fast \
@@ -59,7 +59,7 @@ Then launch it:
 
 If you want it as a Linux service:
 
-    cd /Users/yuechen/home/crew-rs-port
+    cd ~/home/crew-rs-port
 
     scripts/setup-github-runner.sh \
       --name mini3-octos-fast \
@@ -69,7 +69,7 @@ If you want it as a Linux service:
 ARM64 Runner Example
 --------------------
 
-    cd /Users/yuechen/home/crew-rs-port
+    cd ~/home/crew-rs-port
 
     scripts/setup-github-runner.sh \
       --name arm-builder \

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/octos-core",
     "crates/octos-diagnostics",
+    "crates/octos-research",
     "crates/octos-memory",
     "crates/octos-llm",
     "crates/octos-agent",
@@ -55,6 +56,7 @@ rpassword = "7"
 # Internal crates
 octos-core = { path = "crates/octos-core" }
 octos-diagnostics = { path = "crates/octos-diagnostics" }
+octos-research = { path = "crates/octos-research" }
 octos-memory = { path = "crates/octos-memory" }
 octos-llm = { path = "crates/octos-llm" }
 octos-agent = { path = "crates/octos-agent" }
@@ -104,6 +106,7 @@ clap_complete = "4"
 colored = "2"
 dirs = "5"
 rustyline = "15"
+semver = "1"
 open = "5"
 # Keychain (platform-native secure credential storage)
 keyring = { version = "3", default-features = false }

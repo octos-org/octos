@@ -240,8 +240,8 @@
 
 | 测试 | 验证内容 |
 |------|-----------------|
-| `test_load_rejects_oversized_file` | 超过 10 MB 的文件被拒绝 |
-| `test_append_respects_file_size_limit` | 文件达到 10 MB 限制时追加被跳过 |
+| `should_seal_the_active_file_into_a_segment_at_the_segment_size` | 活跃文件在 `OCTOS_SESSION_SEGMENT_BYTES`（8 MiB）时封存为分段 |
+| `should_load_only_the_newest_segments_within_the_budget` | 普通加载读取活跃文件，并按新到旧纳入不超过 `OCTOS_SESSION_LOAD_BUDGET_BYTES`（32 MiB）的封存分段 |
 | `test_load_rejects_future_schema_version` | 拒绝未知的 schema 版本 |
 | `test_purge_stale_sessions` | 删除超过 N 天的会话 |
 

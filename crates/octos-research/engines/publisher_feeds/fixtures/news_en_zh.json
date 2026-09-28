@@ -1,0 +1,107 @@
+{
+  "exchanges": [
+    {
+      "body_file": "news_en_zh.0.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://feeds.feedburner.com/rsscna/intworld"
+    },
+    {
+      "body_file": "news_en_zh.1.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://feeds.feedburner.com/rsscna/mainland"
+    },
+    {
+      "body_file": "news_en_zh.2.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://feeds.feedburner.com/rsscna/technology"
+    },
+    {
+      "body_file": "news_en_zh.3.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://feeds.npr.org/1001/rss.xml"
+    },
+    {
+      "body_file": "news_en_zh.4.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://theinitium.com/rss/"
+    },
+    {
+      "body_file": "news_en_zh.5.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml"
+    },
+    {
+      "body_file": "news_en_zh.6.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://www.france24.com/en/rss"
+    },
+    {
+      "body_file": "news_en_zh.7.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://www.rfa.org/arc/outboundfeeds/mandarin/rss/"
+    },
+    {
+      "body_file": "news_en_zh.8.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://www.rfi.fr/cn/rss"
+    }
+  ],
+  "expect": [
+    {
+      "lang": "en",
+      "published": "2026-09-27T23:31:00Z",
+      "source": "CNA",
+      "title": "Trump confirms meeting with Anthropic's Amodei, repeats dismissal of AI fears",
+      "url": "https://www.channelnewsasia.com/world/us-trump-meet-anthropic-amodei-ai-regulation-6413916"
+    },
+    {
+      "lang": "zh-CN",
+      "published": "2026-09-24T17:24:08Z",
+      "source": "自由亚洲电台",
+      "title": "多方预测美中峰会聚焦AI”护栏”及稀土供应",
+      "url": "https://rfa.org/mandarin/guoji/2026/09/24/aiguardrails-rareearth-us-china-sullit"
+    },
+    {
+      "lang": "zh-TW",
+      "published": "2026-09-27T14:28:34Z",
+      "source": "中央通訊社",
+      "title": "AI能力強大 比爾蓋茲：落入惡人手上可殺害10億人",
+      "url": "https://www.cna.com.tw/news/aopl/202609270199.aspx"
+    },
+    {
+      "lang": "zh-TW",
+      "published": "2026-09-25T09:30:36Z",
+      "source": "端傳媒",
+      "title": "Google投資A24，AI將成為好萊塢的未來？｜端聞 Podcast",
+      "url": "https://theinitium.com/20260925-initium-audio-international-google-investment-in-a24"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/rss+xml, application/atom+xml, application/xml"
+    },
+    "method": "GET",
+    "url": "https://feeds.feedburner.com/rsscna/intworld"
+  },
+  "recorded": "live, 2026-09-28",
+  "request": {
+    "category": "news",
+    "count": 5,
+    "langs": [
+      "en",
+      "zh"
+    ],
+    "now": "2026-09-28T02:00:00Z",
+    "query": "AI",
+    "since": null
+  }
+}

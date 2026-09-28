@@ -240,7 +240,8 @@ Options:
   --no-tunnel        即使在 --full 模式下也跳过 frpc 隧道配置
   --tenant-name NAME 租户子域名（例如 "alice"）
   --frps-token TOKEN frps 认证令牌
-  --frps-server ADDR frps 服务器地址（默认：163.192.33.32）
+  --frps-server ADDR frps 中继服务器地址（隧道必需，无默认值；也可设置 FRPS_SERVER，
+                     例如 frps.example.com。未设置时跳过隧道配置）
   --ssh-port PORT    SSH 隧道远端端口（默认：6001）
   --domain DOMAIN    隧道域名（默认：octos-cloud.org）
   --auth-token TOKEN 仪表板认证令牌（默认：自动生成）

@@ -20,15 +20,15 @@ other only loosely; W4 ties them all together with end-to-end specs.
 
 ## 1. Fleet topology
 
-Mini hosts (per `~/.claude/projects/-Users-yuechen-home-octos/memory/reference_minis_ssh.md`):
+Mini hosts (addresses are kept in the maintainers' private host notes, not in this repo):
 
 | Host  | IP            | Tree        | Role for this rollout |
 |-------|---------------|-------------|------------------------|
-| mini1 | 69.194.3.128  | yellow      | Canary (deploy first). |
-| mini2 | 69.194.3.129  | yellow      | Live-test target (`https://dspfac.bot.ominix.io`). |
-| mini3 | 69.194.3.203  | yellow      | Standby (deploy after mini2 green). |
-| mini4 | 69.194.3.66   | blue        | Standby (deploy with mini3). |
-| mini5 | 69.194.3.19   | yellow      | **DO NOT DEPLOY** — reserved for coding-green tests. |
+| mini1 | <mini1-ip>  | yellow      | Canary (deploy first). |
+| mini2 | <mini2-ip>  | yellow      | Live-test target (`https://dspfac.bot.ominix.io`). |
+| mini3 | <mini3-ip>  | yellow      | Standby (deploy after mini2 green). |
+| mini4 | <mini4-ip>   | blue        | Standby (deploy with mini3). |
+| mini5 | <mini5-ip>   | yellow      | **DO NOT DEPLOY** — reserved for coding-green tests. |
 
 All hosts run as user `cloud` (key-based SSH). The deploy daemon runs as
 **root**: per the user-memory note `reference_minis_deploy_daemon.md`,
@@ -129,7 +129,7 @@ hours before promoting.
 ### 4.1 Build the release artifact
 
 ```bash
-cd /Users/yuechen/home/octos
+cd ~/home/octos
 cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
 # Artifact: target/release/octos
 ```
@@ -137,7 +137,7 @@ cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram"
 If the merge changes web assets, rebuild the dashboard bundle first:
 
 ```bash
-cd /Users/yuechen/home/octos/dashboard
+cd ~/home/octos/dashboard
 pnpm install --frozen-lockfile
 pnpm build
 # Bundle output is consumed by octos-cli's static admin assets.
@@ -146,23 +146,23 @@ pnpm build
 ### 4.2 Stop the running gateway on a mini
 
 ```bash
-ssh cloud@69.194.3.128 'sudo launchctl unload /Library/LaunchDaemons/com.octos.gateway.plist'
-ssh cloud@69.194.3.128 'pkill -TERM -x octos || true'
-ssh cloud@69.194.3.128 'sleep 5; pgrep -x octos || echo stopped'
+ssh cloud@<mini1-ip> 'sudo launchctl unload /Library/LaunchDaemons/com.octos.gateway.plist'
+ssh cloud@<mini1-ip> 'pkill -TERM -x octos || true'
+ssh cloud@<mini1-ip> 'sleep 5; pgrep -x octos || echo stopped'
 ```
 
 ### 4.3 Push the binary
 
 ```bash
-scp target/release/octos cloud@69.194.3.128:/tmp/octos.new
-ssh cloud@69.194.3.128 'sudo install -m 755 /tmp/octos.new /usr/local/bin/octos'
+scp target/release/octos cloud@<mini1-ip>:/tmp/octos.new
+ssh cloud@<mini1-ip> 'sudo install -m 755 /tmp/octos.new /usr/local/bin/octos'
 ```
 
 ### 4.4 Restart
 
 ```bash
-ssh cloud@69.194.3.128 'sudo launchctl load /Library/LaunchDaemons/com.octos.gateway.plist'
-ssh cloud@69.194.3.128 'sleep 8; pgrep -x octos && echo running'
+ssh cloud@<mini1-ip> 'sudo launchctl load /Library/LaunchDaemons/com.octos.gateway.plist'
+ssh cloud@<mini1-ip> 'sleep 8; pgrep -x octos && echo running'
 ```
 
 ### 4.5 Confirm health
@@ -184,7 +184,7 @@ fleet-wide deploy (§6).
 ### 5.1 Quick smoke (5 minutes)
 
 ```bash
-cd /Users/yuechen/home/octos/e2e
+cd ~/home/octos/e2e
 OCTOS_TEST_URL=https://dspfac.bot.ominix.io \
 OCTOS_AUTH_TOKEN=octos-admin-2026 \
 OCTOS_PROFILE=dspfac \
@@ -197,7 +197,7 @@ events, slides project init, cross-session isolation. ~3 minutes.
 ### 5.2 Targeted M8 invariants (8 minutes)
 
 ```bash
-cd /Users/yuechen/home/octos/e2e
+cd ~/home/octos/e2e
 OCTOS_TEST_URL=https://dspfac.bot.ominix.io \
 OCTOS_PROFILE=dspfac \
   npx playwright test tests/m8-runtime-invariants-live.spec.ts --workers=1
@@ -225,7 +225,7 @@ Run after the fleet-wide deploy (every mini except mini5 has the new
 binary). This is the final gate before declaring the epic done.
 
 ```bash
-cd /Users/yuechen/home/octos/e2e
+cd ~/home/octos/e2e
 OCTOS_TEST_URL=https://dspfac.bot.ominix.io \
 OCTOS_AUTH_TOKEN=octos-admin-2026 \
 OCTOS_PROFILE=dspfac \
@@ -258,7 +258,7 @@ Pick the merge commit that introduced the regression. Note its hash.
 ### 7.2 Revert (preferred)
 
 ```bash
-cd /Users/yuechen/home/octos
+cd ~/home/octos
 git checkout main
 git pull --ff-only
 git revert <commit-hash>
@@ -293,10 +293,10 @@ If only the binary needs to roll back and the revert is in flight, push
 the previous binary directly:
 
 ```bash
-ssh cloud@69.194.3.128 'sudo cp /usr/local/bin/octos /usr/local/bin/octos.failed'
-scp target/release/octos.previous cloud@69.194.3.128:/tmp/octos.rollback
-ssh cloud@69.194.3.128 'sudo install -m 755 /tmp/octos.rollback /usr/local/bin/octos'
-ssh cloud@69.194.3.128 'sudo launchctl unload /Library/LaunchDaemons/com.octos.gateway.plist && sudo launchctl load /Library/LaunchDaemons/com.octos.gateway.plist'
+ssh cloud@<mini1-ip> 'sudo cp /usr/local/bin/octos /usr/local/bin/octos.failed'
+scp target/release/octos.previous cloud@<mini1-ip>:/tmp/octos.rollback
+ssh cloud@<mini1-ip> 'sudo install -m 755 /tmp/octos.rollback /usr/local/bin/octos'
+ssh cloud@<mini1-ip> 'sudo launchctl unload /Library/LaunchDaemons/com.octos.gateway.plist && sudo launchctl load /Library/LaunchDaemons/com.octos.gateway.plist'
 ```
 
 Then file a follow-up issue, revert at the source, and re-build cleanly.
@@ -463,7 +463,7 @@ on each mini picks up the new binary automatically.
 After all four tracks merge, redeploy the entire fleet (skip mini5):
 
 ```bash
-for host in 69.194.3.128 69.194.3.129 69.194.3.203 69.194.3.66; do
+for host in <mini1-ip> <mini2-ip> <mini3-ip> <mini4-ip>; do
   echo "=== deploying to $host ==="
   scp target/release/octos cloud@$host:/tmp/octos.new
   ssh cloud@$host 'sudo install -m 755 /tmp/octos.new /usr/local/bin/octos'
@@ -472,7 +472,7 @@ for host in 69.194.3.128 69.194.3.129 69.194.3.203 69.194.3.66; do
   ssh cloud@$host 'sudo launchctl load /Library/LaunchDaemons/com.octos.gateway.plist'
   ssh cloud@$host 'sleep 8; pgrep -x octos && echo $host running'
 done
-# DO NOT touch mini5 (69.194.3.19) — reserved for coding-green tests.
+# DO NOT touch mini5 (<mini5-ip>) — reserved for coding-green tests.
 ```
 
 Verify all four hosts respond healthy before declaring the deploy done:
@@ -496,7 +496,7 @@ Once the fleet-wide deploy is green and the cross-track live spec suite
 (§6) is green:
 
 - [ ] Update `~/home/octos/CLAUDE.md` to reflect any architecture changes.
-- [ ] Update `~/.claude/projects/-Users-yuechen-home-octos/memory/reference_minis_ssh.md`
+- [ ] Update the maintainers' private host notes
       with anything operationally new.
 - [ ] Close the umbrella issue (`#591`) with the final test matrix.
 - [ ] Tag the final fleet build: `git tag m8-parity-final && git push origin m8-parity-final`.

@@ -1098,7 +1098,7 @@ JSONL persistence at `.octos/sessions/{key}.jsonl`.
 
 - **In-memory cache**: LRU with disk sync on write
 - **Filenames**: Percent-encoded SessionKey, truncated to 183 chars with `_{hash:016X}` suffix on truncation to prevent collisions
-- **File size limit**: 10MB max (`MAX_SESSION_FILE_SIZE`); oversized files skipped on load
+- **Rolling segments**: Files roll into `<name>.segments/NNNNNN.jsonl` at `OCTOS_SESSION_SEGMENT_BYTES` (8 MiB); loads read the newest segments up to `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB, 0 = all)
 - **Crash safety**: Atomic write-then-rename
 - **Forking**: `fork()` creates child session with `parent_key` tracking, copies last N messages
 
@@ -1369,7 +1369,7 @@ crates/
 - Tool policies: allow/deny with deny-wins semantics, 8 named groups (`group:fs`, `group:runtime`, `group:web`, `group:search`, `group:sessions`, etc.), wildcard matching, provider-specific filtering via `tools.byProvider`
 - Tool argument size limit: 1MB per invocation (non-allocating `estimate_json_size` with escape char accounting)
 - Symlink-safe file I/O via `O_NOFOLLOW` on Unix (atomic kernel-level check, eliminates TOCTOU races); metadata-based symlink check fallback on Windows
-- SSRF protection in shared `ssrf.rs` module: DNS resolution with fail-closed behavior (blocks on DNS failure), private IP blocking (10/8, 172.16/12, 192.168/16, 169.254/16), IPv6 coverage (ULA `fc00::/7`, link-local `fe80::/10`, site-local `fec0::/10`, IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`), loopback blocking. Used by web_fetch and browser.
+- SSRF protection via `octos_research::net::check_url` — the one shared implementation, adapted for the agent tools by `octos-agent/src/tools/ssrf.rs`: DNS resolution with fail-closed behavior (blocks on DNS failure), private IP blocking (10/8, 172.16/12, 192.168/16, 169.254/16), IPv6 coverage (ULA `fc00::/7`, link-local `fe80::/10`, site-local `fec0::/10`, IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`), loopback blocking. Used by web_fetch and browser.
 - Browser: URL scheme allowlist (http/https only), 10s JS execution timeout, zombie process reaping, secure tempfiles for screenshots
 - MCP: input schema validation (max depth 10, max size 64KB) prevents malicious tool definitions
 - Prompt injection guard (`prompt_guard.rs`): 5 threat categories (SystemOverride, RoleConfusion, ToolCallInjection, SecretExtraction, InstructionInjection), 10 detection patterns. Sanitizes threats by wrapping in `[injection-blocked:...]`.
@@ -1378,7 +1378,7 @@ crates/
 - Tool output sanitization (`sanitize.rs`): strips base64 data URIs, long hex strings (64+ chars), and **credential redaction** with 7 regex patterns covering OpenAI (`sk-...`), Anthropic (`sk-ant-...`), AWS (`AKIA...`), GitHub (`ghp_/gho_/ghs_/ghr_/github_pat_...`), GitLab (`glpat-...`), Bearer tokens, and generic `password`/`api_key` assignments
 - UTF-8 safe truncation via `truncate_utf8()` across all tool outputs and email bodies
 - Session file collision prevention via percent-encoded filenames with hash suffix on truncation
-- Session file size limit: 10MB max prevents OOM on corrupted files
+- Session files roll into 8 MiB segments and loads stop at `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB), preventing OOM on oversized histories
 - Atomic write-then-rename for session persistence (crash safety)
 - API server binds to 127.0.0.1 by default (not 0.0.0.0)
 - Channel access control via `allowed_senders` lists
@@ -1487,7 +1487,7 @@ Each profile has its own LLM provider, API keys, channels, data directory, and `
 - **Queue modes**: Followup, Collect, Latest, Interrupt, Speculative overflow, auto-escalation/deescalation (9 tests)
 - **Session persistence**: JSONL storage, LRU eviction, fork, rewrite, timestamp sort, concurrent access (28 tests)
 - **Integration**: CLI commands, file tools, cron jobs, session forking, plugin loading
-- **Security**: sandbox path injection, env sanitization, SSRF blocking, symlink rejection (O_NOFOLLOW), private IP detection, dedup overflow, tool argument size limits, session file size limits, circuit breaker threshold edge cases, MCP schema validation
+- **Security**: sandbox path injection, env sanitization, SSRF blocking, symlink rejection (O_NOFOLLOW), private IP detection, dedup overflow, tool argument size limits, session segment rolling and load budget, circuit breaker threshold edge cases, MCP schema validation
 - **Channel**: allowed_senders, message parsing, dedup logic, email address extraction
 
 Local CI: `./scripts/ci.sh` (mirrors GitHub Actions + focused subsystem tests). See [TESTING.md](./TESTING.md).

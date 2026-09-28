@@ -271,6 +271,7 @@ mod tests {
             None,
             None,
             Some(10),
+            None,
         )
         .unwrap();
         let host = OupPeerHost::new(

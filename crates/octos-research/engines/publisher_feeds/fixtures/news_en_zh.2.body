@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+     <title>中央社即時新聞 科技新聞</title>
+     <link>https://www.cna.com.tw/list/ait.aspx</link>
+     <description>中央社即時新聞 科技新聞</description>
+     <language>zh-tw</language>
+     <copyright>中央通訊社</copyright>
+     <lastBuildDate>Mon, 28 Sep 2026 10:20:16 +0800</lastBuildDate>
+     <ttl>15</ttl>
+     <image>
+       <title>中央社即時新聞 科技新聞</title>
+       <width>114</width>
+       <height>67</height>
+       <link>https://www.cna.com.tw/list/ait.aspx</link>
+       <url>https://imgcdn.cna.com.tw/www/images/cna_info/cnalogo_176x117.jpg</url>
+     </image>
+     <item>
+     <title>AI能力強大　比爾蓋茲：落入惡人手上可殺害10億人</title>
+     <link>https://www.cna.com.tw/news/aopl/202609270199.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-27/202609270199</guid>
+     <pubDate>Sun, 27 Sep 2026 22:28:34 +0800</pubDate>
+     <description><![CDATA[（中央社紐約27日綜合外電報導）微軟（Microsoft）創辦人比爾蓋茲（Bill Gates）近日受訪說，人工智慧（AI）公司自我監管並不夠，各國政府也應參與監督，而且AI若落入惡人手中，足以引發10億人死亡的事件。]]></description>
+     </item>
+     <item>
+     <title>津田健次郎告TikTok案9/30宣判　日本保護個人聲音特徵免受AI侵害訴訟首例</title>
+     <link>https://www.cna.com.tw/news/ait/202609270068.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-27/202609270068</guid>
+     <pubDate>Sun, 27 Sep 2026 12:21:41 +0800</pubDate>
+     <description><![CDATA[（中央社東京27日綜合外電報導）日本知名動畫配音員津田健次郎將TikTok告上法庭，指控TikTok發布的影片使用人工智慧（AI）仿造他「渾厚」的男中音聲線，法院預定於30日宣判。]]></description>
+     </item>
+     <item>
+     <title>中國綠能輸出帶來全球減碳量　超越英國全年排放</title>
+     <link>https://www.cna.com.tw/news/ait/202609270067.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-27/202609270067</guid>
+     <pubDate>Sun, 27 Sep 2026 12:10:39 +0800</pubDate>
+     <description><![CDATA[（中央社北京/新德里27日綜合外電報導）最新分析顯示，中國去年潔淨科技出口所帶來的碳排放減量，超過英國一年的碳排量，凸顯中國綠色科技熱潮對全球氣候產生的影響日益擴大。]]></description>
+     </item>
+     <item>
+     <title>科技巨擘掀代理式AI大戰　競逐全天候個人助理</title>
+     <link>https://www.cna.com.tw/news/ait/202609270039.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-27/202609270039</guid>
+     <pubDate>Sun, 27 Sep 2026 10:56:39 +0800</pubDate>
+     <description><![CDATA[（中央社記者吳家豪台北27日電）社群巨擘Meta於9月9日推出個人智慧代理Muse後不到2週，就登上美國App Store的iPhone免費App下載排行榜首，掀起全球代理式人工智慧（Agentic AI）熱潮。AI正從過往被動回答問題的聊天機器人，加速邁向能全天候主動替使用者處理日常瑣事的全新時代。]]></description>
+     </item>
+     <item>
+     <title>直擊柏林電競新體驗　德國玩家買PC精打細算更重長期價值</title>
+     <link>https://www.cna.com.tw/news/ait/202609270010.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-27/202609270010</guid>
+     <pubDate>Sun, 27 Sep 2026 08:04:34 +0800</pubDate>
+     <description><![CDATA[（中央社記者吳家豪台北27日電）歐洲消費電子通路MediaMarkt在德國開設電競空間Xperion，打破傳統零售店面的陳列模式，以高階硬體免費試玩的模式吸客。從門市第一線觀察發現，隨著個人電腦（PC）換機成本提高，德國消費者更加精打細算，已從單純追求低價，轉向鎖定能滿足未來數年需求的產品。]]></description>
+     </item>
+     <item>
+     <title>OpenAI證實AI代理外洩用戶圖片　曾造訪美政府網站</title>
+     <link>https://www.cna.com.tw/news/ait/202609260076.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-26/202609260076</guid>
+     <pubDate>Sat, 26 Sep 2026 13:19:49 +0800</pubDate>
+     <description><![CDATA[（中央社舊金山25日綜合外電報導）OpenAI今天坦承，旗下AI工具在公司不知情的情況下，將ChatGPT用戶的圖片發布於線上網站，這是AI代理超出其限制運作的最新例子，同時證實AI工具曾造訪美國聯邦政府網站。]]></description>
+     </item>
+     <item>
+     <title>涉危害兒少健康　TikTok與阿拉巴馬州達成和解</title>
+     <link>https://www.cna.com.tw/news/aopl/202609260064.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-26/202609260064</guid>
+     <pubDate>Sat, 26 Sep 2026 12:10:20 +0800</pubDate>
+     <description><![CDATA[（中央社華盛頓25日綜合外電報導）美國阿拉巴馬州今天宣布與短影音平台TikTok及其中國母公司字節跳動（ByteDance）達成和解，要求平台限制青少年使用時間並加強年齡驗證，以解決危害兒童及誤導消費者相關指控。]]></description>
+     </item>
+     <item>
+     <title>微軟Copilot迎3大功能　主打自主AI代理與低門檻開發</title>
+     <link>https://www.cna.com.tw/news/ait/202609250235.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-25/202609250235</guid>
+     <pubDate>Fri, 25 Sep 2026 21:17:05 +0800</pubDate>
+     <description><![CDATA[（中央社記者吳家豪台北25日電）微軟今天宣布推出全新Microsoft Copilot應用程式，主打整合工作起點Home、非開發人員也能打造工具的Code，以及使用者離線時仍能自主推進任務的AI代理人Autopilot等3大全新核心功能，宣示AI助理正式從單純的聊天對話，邁向自主執行與低門檻開發的新階段。]]></description>
+     </item>
+     <item>
+     <title>Anthropic砸百億美元擴算力　Akamai拿下雲端大單</title>
+     <link>https://www.cna.com.tw/news/ait/202609250065.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-25/202609250065</guid>
+     <pubDate>Fri, 25 Sep 2026 11:03:51 +0800</pubDate>
+     <description><![CDATA[（中央社舊金山24日綜合外電報導）Anthropic承諾向阿卡邁科技（Akamai Technologies）支付116億美元購買雲端服務，作為最新人工智慧（AI）基礎設施交易的一部分。阿卡邁將發行認股權證，Anthropic未來持股比例最高可達5%。]]></description>
+     </item>
+     <item>
+     <title>Meta推3大系列AI眼鏡　年底前合計破百款</title>
+     <link>https://www.cna.com.tw/news/ait/202609240254.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-24/202609240254</guid>
+     <pubDate>Thu, 24 Sep 2026 17:04:20 +0800</pubDate>
+     <description><![CDATA[（中央社記者江明晏台北24日電）Meta今天在Connect 2026大會上發表首款音訊眼鏡Ray-Ban Meta Audio，並透過與EssilorLuxottica 的合作，推出歷來最大規模的AI眼鏡款式陣容，年底前將在Ray-Ban、Oakley與Meta Glasses 3大系列中合計提供超過100種眼鏡選擇。]]></description>
+     </item>
+     <item>
+     <title>AI巨頭警示失控風險　安理會討論國際治理</title>
+     <link>https://www.cna.com.tw/news/aopl/202609240111.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-24/202609240111</guid>
+     <pubDate>Thu, 24 Sep 2026 12:37:11 +0800</pubDate>
+     <description><![CDATA[（中央社紐約聯合國總部23日綜合外電報導）全球主要人工智慧（AI）業者今天在聯合國安全理事會警告，日益強大的AI技術對人類構成潛在風險，並呼籲各國政府攜手合作，共同管理這項快速發展的科技。]]></description>
+     </item>
+     <item>
+     <title>黃仁勳：AI業者不應要求反托拉斯及產品責任法豁免</title>
+     <link>https://www.cna.com.tw/news/ait/202609240071.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-24/202609240071</guid>
+     <pubDate>Thu, 24 Sep 2026 11:19:45 +0800</pubDate>
+     <description><![CDATA[（中央社舊金山23日綜合外電報導）輝達（Nvidia）執行長黃仁勳在今天發布的Podcast節目中表示，人工智慧（AI）公司不應獲得反托拉斯法或產品責任法相關豁免。]]></description>
+     </item>
+     <item>
+     <title>Meta新品齊發　AI手持裝置到輕量VR眼鏡登場</title>
+     <link>https://www.cna.com.tw/news/ait/202609240069.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-24/202609240069</guid>
+     <pubDate>Thu, 24 Sep 2026 11:16:41 +0800</pubDate>
+     <description><![CDATA[（中央社孟羅公園23日綜合外電報導）Meta執行長祖克柏（Mark Zuckerberg）今天在年度裝置發表會上驚喜宣布，推出一款名為Meta Charm的小型手持裝置，供使用者搭配全新的Muse AI助理使用。]]></description>
+     </item>
+     <item>
+     <title>晶圓代工到晶片設計　台灣半導體產業鏈擴大領先韓國</title>
+     <link>https://www.cna.com.tw/news/ait/202609240049.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-24/202609240049</guid>
+     <pubDate>Thu, 24 Sep 2026 09:51:57 +0800</pubDate>
+     <description><![CDATA[（中央社首爾24日綜合外電報導）「朝鮮日報」旗下媒體Chosun Biz報導，台灣在鞏固全球半導體晶圓代工強國地位後，正進一步擴大在半導體設計（無晶圓廠，fabless）領域的影響力。]]></description>
+     </item>
+     <item>
+     <title>面臨隱私反彈浪潮　Meta推出無鏡頭AI智慧眼鏡</title>
+     <link>https://www.cna.com.tw/news/ait/202609240043.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-24/202609240043</guid>
+     <pubDate>Thu, 24 Sep 2026 09:21:44 +0800</pubDate>
+     <description><![CDATA[（中央社孟羅公園24日綜合外電報導）全球對於隱私問題及偷拍女性與女童疑慮高漲之際，社群媒體巨頭Meta今天發表多款配備AI功能的穿戴裝置，其中包括一款僅具音訊功能、無鏡頭的智慧型眼鏡。]]></description>
+     </item>
+     <item>
+     <title>夏普研發通用衛星天線　挑戰星鏈市場主導地位</title>
+     <link>https://www.cna.com.tw/news/ait/202609230125.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-23/202609230125</guid>
+     <pubDate>Wed, 23 Sep 2026 12:25:07 +0800</pubDate>
+     <description><![CDATA[（中央社大阪23日綜合外電報導）日本夏普公司（Sharp）計劃研發能連接多個不同衛星通訊網路的通用天線，讓用戶能更輕易在不同服務間切換，無須依賴太空探索科技公司（SpaceX）等特定供應商。]]></description>
+     </item>
+     <item>
+     <title>安全疑慮升溫之際　Anthropic、OpenAI推低價模型</title>
+     <link>https://www.cna.com.tw/news/ait/202609230032.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-23/202609230032</guid>
+     <pubDate>Wed, 23 Sep 2026 08:31:44 +0800</pubDate>
+     <description><![CDATA[（中央社舊金山22日綜合外電報導）Anthropic今天推出新的人工智慧（AI）模型Claude Opus 5.5，表示效能可與頂級的Fable 5.1相媲美，但運行成本要比前一代模型低40%；OpenAI則擴大GPT-6產品線，推出較便宜的Sol與Luna模型。]]></description>
+     </item>
+     <item>
+     <title>帛琉副總統歐宜樓訪災防科技中心　借鏡台灣經驗、深化合作</title>
+     <link>https://www.cna.com.tw/news/ait/202609220307.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-22/202609220307</guid>
+     <pubDate>Tue, 22 Sep 2026 19:30:26 +0800</pubDate>
+     <description><![CDATA[（中央社記者趙敏雅台北22日電）帛琉共和國副總統兼衛生暨公共服務部長歐宜樓（Raynold Oilouch）今天率團訪問國科會國家災害防救科技中心，歐宜樓表示，盼透過分享帛琉在災害管理與公共服務的優先需求，並借鏡台灣的經驗，探討防災科技支援民眾安全與增進社會福祉的實際應用。]]></description>
+     </item>
+     <item>
+     <title>蔡英文：台灣要和世界保持緊密連結　有能力幫助夥伴</title>
+     <link>https://www.cna.com.tw/news/ait/202609220264.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-22/202609220264</guid>
+     <pubDate>Tue, 22 Sep 2026 17:30:53 +0800</pubDate>
+     <description><![CDATA[（中央社記者王揚宇台北22日電）前總統蔡英文表示，台灣有製造能力、工程經驗及長時間累積的供應鏈，可以和美國及理念相近夥伴，一起面對快速變動的科技環境。台灣需要朋友、需要和世界保持緊密連結，也有能力幫助夥伴。]]></description>
+     </item>
+     <item>
+     <title>加國卑詩省赴美提告　控OpenAI壓下警告釀校園慘案</title>
+     <link>https://www.cna.com.tw/news/ait/202609220179.aspx</link>
+     <guid isPermaLink="false">CNA/2026-09-22/202609220179</guid>
+     <pubDate>Tue, 22 Sep 2026 14:59:49 +0800</pubDate>
+     <description><![CDATA[（中央社多倫多21日綜合外電報導）加拿大卑詩省今年2月發生校園槍擊慘案，由於槍手曾利用ChatGPT策劃這起屠殺行動，卑詩省政府今天在美國加州控告OpenAI內部曾建議通報警方，卻遭高層駁回，未能阻止憾事。]]></description>
+     </item>
+  </channel>
+</rss>

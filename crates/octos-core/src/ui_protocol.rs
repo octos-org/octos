@@ -327,6 +327,44 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
 ];
 
+/// The features an `octos serve --stdio` connection has without negotiating.
+///
+/// A host that moves a native client from the stdio pipe to the WebSocket of
+/// `octos serve --host-managed` sends exactly these in `X-Octos-Ui-Features`
+/// to keep that client's contract. `voice.asr_admission.v1`,
+/// `skill.actions.v1` and `skill.action_jobs.v1` are server-local AppUI
+/// features without an entry in [`UI_PROTOCOL_KNOWN_FEATURES`]. octos-cli
+/// tests that this list and its stdio defaults stay equal.
+pub const UI_PROTOCOL_STDIO_DEFAULT_FEATURES: &[&str] = &[
+    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
+    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
+    "voice.asr_admission.v1",
+    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
+    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    "skill.actions.v1",
+    "skill.action_jobs.v1",
+    UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+];
+
 /// Returns the feature flag that gates `method` per spec § 7 capability
 /// negotiation, or `None` if the method is unconditionally available.
 ///
@@ -2006,6 +2044,8 @@ pub struct SessionOpenParams {
     pub sandbox: Option<SessionSandboxParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<UiCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_commands: Option<Vec<String>>,
 }
 
 /// Optional session-scoped sandbox narrowing requested by `session/open`.

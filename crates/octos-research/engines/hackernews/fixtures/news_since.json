@@ -1,0 +1,58 @@
+{
+  "body_file": "news_since.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": "2026-09-22T15:38:24Z",
+      "source": "Hacker News",
+      "title": "Writing Rust code that's fast by asking agents to make the code faster",
+      "url": "https://minimaxir.com/2026/09/agentic-iteration"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-25T09:59:40Z",
+      "source": "Hacker News",
+      "title": "Topcoat is pushing the boundary of server applications with Rust",
+      "url": "https://tokio.rs/blog/2026-09-24-topcoat-server-applications"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-27T08:59:59Z",
+      "source": "Hacker News",
+      "title": "Rusty thoughts on \"Parse, don't validate\"",
+      "url": "https://eli.thegreenplace.net/2026/rusty-thoughts-on-parse-dont-validate"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-25T13:46:34Z",
+      "source": "Hacker News",
+      "title": "The state of SIMD in Rust in 2026",
+      "url": "https://shnatsel.github.io/state-of-simd-rust-2026"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-26T16:03:13Z",
+      "source": "Hacker News",
+      "title": "Neomacs: GPU rendered Rust hard fork of Emacs",
+      "url": "https://github.com/eval-exec/neomacs"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/json"
+    },
+    "method": "GET",
+    "url": "https://hn.algolia.com/api/v1/search?query=rust&tags=story&hitsPerPage=5&page=0&numericFilters=created_at_i%3E1789945200"
+  },
+  "recorded": "live, 2026-09-27",
+  "request": {
+    "category": "news",
+    "count": 5,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-27T23:00:00Z",
+    "query": "rust",
+    "since": "7d"
+  }
+}

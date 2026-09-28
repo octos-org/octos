@@ -43,6 +43,12 @@ const FIRST_PARTY_SKILL_ENV_VARS: &[&str] = &[
     "DASHSCOPE_BASE_URL",
     "ARK_API_KEY",
     "ARK_BASE_URL",
+    // Research tool operator settings (deep-search / deep-crawl):
+    // self-hosted SearXNG base URL, robots.txt (default off) and the
+    // search-results scrape opt-in (default off).
+    "SEARXNG_URL",
+    "OCTOS_RESPECT_ROBOTS",
+    "OCTOS_ALLOW_SERP_SCRAPE",
 ];
 
 /// Google / Vertex credential material: the raw service-account JSON, the
@@ -100,6 +106,9 @@ pub(crate) fn canonical_search_env(provider_id: &str) -> Option<&'static str> {
         "brave" => Some("BRAVE_API_KEY"),
         "you" => Some("YDC_API_KEY"),
         "serper" => Some("SERPER_API_KEY"),
+        // Not a secret: the base URL of a self-hosted SearXNG instance
+        // (profile `search.providers.searxng.api_key_env` names the variable).
+        "searxng" => Some("SEARXNG_URL"),
         _ => None,
     }
 }

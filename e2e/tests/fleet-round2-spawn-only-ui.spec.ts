@@ -26,7 +26,7 @@
  * Run sequentially per spec (workers=1) so the 12-min trial budget per
  * mini is observed cleanly:
  *
- *   cd /Users/yuechen/home/octos/e2e
+ *   cd ~/home/octos/e2e
  *   OCTOS_AUTH_TOKEN=octos-admin-2026 OCTOS_PROFILE=dspfac \
  *     npx playwright test tests/fleet-round2-spawn-only-ui.spec.ts \
  *     --reporter=list --workers=1 \

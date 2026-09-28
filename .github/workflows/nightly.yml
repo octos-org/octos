@@ -79,7 +79,7 @@ jobs:
       # parallelism; ci.yml runs them in a dedicated serial step (see the #21
       # outer-loop ruling there).
       - name: Test the workspace
-        run: cargo test --workspace --locked -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard
+        run: cargo test --workspace --locked -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
 
   check-windows:
     name: Windows workspace tests

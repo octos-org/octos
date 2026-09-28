@@ -5,7 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 
 run_id="${OCTOS_M16_CONTEXT_TMUX_RUN_ID:-m16-context-reconnect-tmux-$(date -u +%Y%m%dT%H%M%SZ)}"
-tui_repo="${OCTOSCODE_REPO:-/Users/yuechen/home/octoscode}"
+tui_repo="${OCTOSCODE_REPO:-$(dirname "$repo_root")/octoscode}"
 tui_runner="${OCTOS_M16_CONTEXT_TUI_RUNNER:-$tui_repo/scripts/run-m15-live-tmux-ux-soak.sh}"
 out_root="${OCTOS_M16_CONTEXT_TMUX_OUT_ROOT:-$repo_root/e2e/test-results-m16-context-restart-tmux}"
 out_dir="${OCTOS_M16_CONTEXT_TMUX_OUT_DIR:-$out_root/$run_id}"

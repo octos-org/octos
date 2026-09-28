@@ -1,27 +1,36 @@
 //! Web search tool with multiple provider support.
 //!
-//! Provider priority (best quality first, DDG as free fallback):
+//! Provider priority (free structured sources first, OctoSense ADR 0002 §6):
+//! 0a. GDELT DOC 2.0 + Google News RSS (no key) — for news-ish queries
+//!     (`category: "news"`, a `since` of 31 days or less, or news words)
+//! 0b. SearXNG (`SEARXNG_URL`, or the profile's `searxng` search provider) —
+//!     a self-hosted instance, when configured
 //! 1. Tavily (`TAVILY_API_KEY`) — AI-optimized search, 1k free/month
 //! 2. Exa (`EXA_API_KEY`) — neural/semantic search, 1k free/month
-//! 3. DuckDuckGo (no key) — free HTML search
-//! 4. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
-//! 5. You.com (`YDC_API_KEY`) — rich JSON results with snippets
-//! 6. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
-//! 7. Headless-Chrome (CDP) Bing — **last resort**, `browser` feature only
+//! 3. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
+//! 4. You.com (`YDC_API_KEY`) — rich JSON results with snippets
+//! 5. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
+//! 6. DuckDuckGo HTML results page — **opt-in only** (`OCTOS_ALLOW_SERP_SCRAPE=1`)
+//! 7. Headless-Chrome (CDP) Bing — **opt-in only** (same flag)
 //!
 //! Each provider is tried in order. If a provider returns no results or fails,
-//! the next one is attempted. Perplexity is last among the HTTP providers
+//! the next one is attempted. Perplexity is last among the keyed providers
 //! because it costs the most but gives the best answers (AI-synthesized with
-//! citations).
+//! citations). `lang` / `region` / `since` go to the free tier (GDELT
+//! `sourcelang`/`timespan`, Google News edition and `when:`, SearXNG
+//! `language`/`time_range`) and filter its results. If no allowed provider
+//! returns anything, the result is empty and says which providers were tried
+//! and how to add SearXNG or a search key.
 //!
-//! The headless-Chrome (CDP) provider runs only when the whole HTTP chain
-//! yields nothing — the common keyless-box case where DuckDuckGo HTTP-403s as a
-//! bot. It drives a Bing SERP through the same in-process `chromiumoxide`
-//! headless browser the `browser` tool uses (no external `deep_crawl` binary),
-//! and is gated behind the default-on `browser` cargo feature. On any box with
-//! no Chrome/Chromium it degrades to a fast, clean miss (detected up-front via
-//! `chromiumoxide::detection::default_executable`, never a launch attempt), so
-//! the search terminates instead of hanging.
+//! DuckDuckGo HTML and Bing-in-Chrome scrape search-engine results pages,
+//! which ADR 0002 rules out. They are not part of the default chain: they run
+//! only when the operator sets `OCTOS_ALLOW_SERP_SCRAPE=1` (alias
+//! `OCTOS_ALLOW_BROWSER_SERP=1`), after every keyed provider. Bing drives the
+//! same in-process `chromiumoxide`
+//! headless browser the `browser` tool uses and is gated behind the `browser`
+//! cargo feature. On any box with no Chrome/Chromium it degrades to a fast,
+//! clean miss (detected up-front via
+//! `chromiumoxide::detection::default_executable`, never a launch attempt).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,8 +79,13 @@ pub(crate) fn is_quota_or_rate_limit_error(result: &ToolResult) -> bool {
 
 pub struct WebSearchTool {
     client: Client,
+    /// Identifiable client for the free providers (GDELT, Google News,
+    /// SearXNG): these are APIs/feeds, requested as octos, not as a browser.
+    research_client: Client,
     config: Option<Arc<super::tool_config::ToolConfigStore>>,
     provider_keys: HashMap<String, String>,
+    /// octos metasearch, built on first use (it takes the provider keys).
+    metasearch: Arc<std::sync::OnceLock<octos_research::metasearch::Metasearch>>,
 }
 
 impl WebSearchTool {
@@ -80,11 +94,20 @@ impl WebSearchTool {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10))
-                .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+                // Identifiable, never a disguised desktop browser (ADR 0002),
+                // including for the opt-in DuckDuckGo scrape.
+                .user_agent(octos_research::USER_AGENT)
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+            research_client: Client::builder()
+                .timeout(Duration::from_secs(20))
+                .connect_timeout(Duration::from_secs(10))
+                .user_agent(octos_research::USER_AGENT)
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             config: None,
             provider_keys: HashMap::new(),
+            metasearch: Arc::default(),
         }
     }
 
@@ -96,6 +119,29 @@ impl WebSearchTool {
     pub fn with_provider_keys(mut self, provider_keys: HashMap<String, String>) -> Self {
         self.provider_keys = provider_keys;
         self
+    }
+
+    /// Use this metasearch instead of the default one (tests, embedders
+    /// with their own fetcher or engines).
+    pub fn with_metasearch(self, metasearch: octos_research::metasearch::Metasearch) -> Self {
+        let _ = self.metasearch.set(metasearch);
+        self
+    }
+
+    /// The metasearch, sharing the process-wide rate limits and cache.
+    /// Profile provider keys (e.g. `brave`) are passed to keyed engines.
+    fn metasearch(&self) -> &octos_research::metasearch::Metasearch {
+        self.metasearch.get_or_init(|| {
+            let keys = self
+                .provider_keys
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            octos_research::metasearch::Metasearch::from_env(
+                Arc::new(octos_research::metasearch::ReqwestFetch::new()),
+                &keys,
+            )
+        })
     }
 
     fn provider_key(&self, provider_id: &str, env_var: &str) -> Option<String> {
@@ -117,6 +163,121 @@ struct Input {
     query: String,
     #[serde(default)]
     count: Option<u8>,
+    /// BCP-47 language(s): a string, a list, or comma-separated.
+    #[serde(default)]
+    lang: octos_research::OneOrMany,
+    /// The query per language (tag → query).
+    #[serde(default)]
+    query_by_lang: std::collections::BTreeMap<String, String>,
+    /// ISO 3166-1 alpha-2 region (Google News edition).
+    #[serde(default)]
+    region: Option<String>,
+    /// ISO date/datetime or `24h` / `7d` / `2w` / `3m` / `1y`.
+    #[serde(default)]
+    since: Option<String>,
+    /// `auto` (default), `news`, `general`, `science`, `it` or `social`.
+    #[serde(default)]
+    category: Option<String>,
+}
+
+/// Parsed free-tier controls.
+pub(crate) struct FreeTierControls {
+    pub filters: octos_research::Filters,
+    /// Per-language queries (normalized tag → query).
+    pub query_by_lang: std::collections::BTreeMap<String, String>,
+    pub region: Option<String>,
+    pub news: bool,
+    /// Metasearch category (`news`, `general`, `science`, `it`, `social`).
+    pub category: &'static str,
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+impl FreeTierControls {
+    fn parse(input: &Input) -> Result<Self, String> {
+        let now = chrono::Utc::now();
+        let since = match input.since.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(s) => Some(octos_research::date::Since::parse(s, now)?),
+        };
+        let query_by_lang = octos_research::lang::parse_query_by_lang(&input.query_by_lang)?;
+        let mut langs = input.lang.clone().into_vec();
+        if !langs.is_empty() {
+            langs.extend(query_by_lang.keys().cloned());
+        }
+        let filters = octos_research::Filters::new(langs, since, Vec::new(), Vec::new(), None)?;
+        let category = octos_research::Category::parse(input.category.as_deref())?;
+        let news = category.is_news(&input.query, filters.since.as_ref(), now);
+        let ms_category = category.metasearch_category(&input.query, filters.since.as_ref(), now);
+        let region = input
+            .region
+            .as_deref()
+            .map(|r| r.trim().to_ascii_uppercase())
+            .filter(|r| r.len() == 2);
+        Ok(Self {
+            filters,
+            query_by_lang,
+            region,
+            news,
+            category: ms_category,
+            now,
+        })
+    }
+
+    /// Languages to query: requested ones, else a script guess, else default.
+    fn langs(&self, query: &str) -> Vec<Option<String>> {
+        let mut langs: Vec<Option<String>> = if self.filters.langs.is_empty() {
+            vec![octos_research::lang::guess_from_script(query).map(String::from)]
+        } else {
+            self.filters.langs.iter().cloned().map(Some).collect()
+        };
+        for l in self.query_by_lang.keys() {
+            if !langs.iter().flatten().any(|x| x == l) {
+                langs.push(Some(l.clone()));
+            }
+        }
+        langs
+    }
+
+    /// The query for one language.
+    fn query_for<'a>(&'a self, query: &'a str, lang: Option<&str>) -> &'a str {
+        octos_research::lang::query_for(query, &self.query_by_lang, lang)
+    }
+}
+
+/// Whether the operator opted in to scraping search-results pages
+/// (DuckDuckGo HTML, Bing in headless Chrome). Off by default: ADR 0002
+/// rules out scraping search results pages.
+pub(crate) fn serp_scrape_opted_in(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    octos_research::serp_scrape_allowed(lookup)
+}
+
+/// Whether the octos metasearch is on (`OCTOS_METASEARCH`, default on).
+fn metasearch_on() -> bool {
+    octos_research::metasearch::enabled(|k| std::env::var(k).ok())
+}
+
+/// Free-tier providers in order: the octos metasearch (every category), or
+/// GDELT + Google News for news-ish queries when it is off; then SearXNG
+/// when configured.
+pub(crate) fn free_tier_providers(
+    news: bool,
+    metasearch: bool,
+    searxng: bool,
+) -> Vec<octos_research::Provider> {
+    octos_research::plan::plan(&octos_research::plan::PlanInput {
+        news,
+        metasearch,
+        searxng_configured: searxng,
+        ..Default::default()
+    })
+}
+
+/// GDELT asks for at most one request every 5 seconds (process-wide).
+fn gdelt_throttle() -> &'static octos_research::HostThrottle {
+    static T: std::sync::OnceLock<octos_research::HostThrottle> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        octos_research::HostThrottle::new(octos_research::providers::GDELT_MIN_INTERVAL)
+    })
 }
 
 // --- Brave types ---
@@ -217,7 +378,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web for information. Supports Tavily, Exa, Brave, You.com, Perplexity, and DuckDuckGo (auto-detected from environment)."
+        "Search the web for information. Free sources first: GDELT and Google News RSS for news (dated, multi-language), a self-hosted SearXNG if configured; then Tavily, Exa, Brave, You.com, Perplexity (auto-detected from keys). Search-results pages are not scraped unless the operator enables it; with nothing configured a general query returns no results plus how to add SearXNG or a key. Optional lang, region, since, category."
     }
 
     fn tags(&self) -> &[&str] {
@@ -235,6 +396,31 @@ impl Tool for WebSearchTool {
                 "count": {
                     "type": "integer",
                     "description": "Number of results (1-10, default: 5)"
+                },
+                "lang": {
+                    "description": "BCP-47 language(s), e.g. \"en\" or [\"en\", \"zh-CN\"]: each is searched separately by the free news sources and results are kept to those languages",
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}}
+                    ]
+                },
+                "query_by_lang": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "The query in each language's own words, keyed by BCP-47 tag, e.g. {\"zh\": \"人工智能 监管\"}; each language is searched with its own query. Translate the query yourself when searching several languages."
+                },
+                "region": {
+                    "type": "string",
+                    "description": "ISO 3166-1 alpha-2 region for the Google News edition, e.g. US, TW"
+                },
+                "since": {
+                    "type": "string",
+                    "description": "Only results published since an ISO date (2026-09-01) or a span: 24h, 7d, 2w, 3m, 1y"
+                },
+                "category": {
+                    "type": "string",
+                    "enum": ["auto", "news", "general", "science", "it", "social"],
+                    "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (Wikipedia, Wikidata; web results need a key), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
                 }
             },
             "required": ["query"]
@@ -251,13 +437,32 @@ impl Tool for WebSearchTool {
         };
         let count = input.count.or(config_count).unwrap_or(5).clamp(1, 10);
 
-        // Provider priority: Tavily first (best quality), then free/cheap, Perplexity last.
+        let controls = match FreeTierControls::parse(&input) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult {
+                    output: format!("Invalid web_search input: {e}"),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+
+        let serp_scrape = serp_scrape_opted_in(|k| std::env::var(k).ok());
+
+        // Free structured sources first (ADR 0002 §6): GDELT + Google News
+        // for news-ish queries, then a configured SearXNG.
+        if let Some(result) = self.free_tier_search(&input.query, count, &controls).await {
+            return Ok(result);
+        }
+
+        // Keyed providers: Tavily first (best quality), Perplexity last.
         // 1. Tavily (AI-optimized, 1k free/month)
-        // 2. DuckDuckGo (free, always available)
-        // 3. Exa (neural search)
-        // 4. Brave Search (free tier: 2k queries/month)
-        // 5. You.com (API key required)
-        // 6. Perplexity Sonar (AI-synthesized, most expensive — fallback only)
+        // 2. Exa (neural search)
+        // 3. Brave Search (free tier: 2k queries/month)
+        // 4. You.com (API key required)
+        // 5. Perplexity Sonar (AI-synthesized, most expensive — fallback only)
+        // Then, only with OCTOS_ALLOW_SERP_SCRAPE=1: DuckDuckGo HTML, Bing CDP.
 
         // Tavily (AI-optimized search — best for recent/niche topics)
         if let Some(api_key) = self.provider_key("tavily", "TAVILY_API_KEY") {
@@ -295,43 +500,6 @@ impl Tool for WebSearchTool {
                         "web_search rotation"
                     );
                 }
-            }
-        }
-
-        // Try DuckDuckGo (free, no key needed)
-        let ddg_result = self.ddg_search(&input.query, count).await;
-        if let Ok(ref r) = ddg_result {
-            if r.success && !r.output.contains("No results found") {
-                info!(
-                    provider = "duckduckgo",
-                    used_provider = "duckduckgo",
-                    query = %input.query,
-                    "web_search"
-                );
-                return ddg_result;
-            }
-            if is_quota_or_rate_limit_error(r) {
-                let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
-                warn!(
-                    provider = "duckduckgo",
-                    fallback_reason = "quota",
-                    error = %snippet,
-                    "web_search rotation"
-                );
-            } else if !r.success {
-                let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
-                warn!(
-                    provider = "duckduckgo",
-                    fallback_reason = "error",
-                    error = %snippet,
-                    "web_search rotation"
-                );
-            } else {
-                info!(
-                    provider = "duckduckgo",
-                    fallback_reason = "empty",
-                    "web_search rotation"
-                );
             }
         }
 
@@ -496,18 +664,38 @@ impl Tool for WebSearchTool {
             }
         }
 
-        // Headless-Chrome (CDP) fallback — last resort. Only meaningful when the
-        // HTTP chain produced nothing usable (e.g. keyless box where DuckDuckGo
-        // bot-403s). Drives Bing through the in-process headless browser. On a
-        // box with no Chrome this is a fast, clean miss (see
-        // `browser_cdp_search`), so the search terminates instead of hanging.
+        // DuckDuckGo HTML results page: a search-results scrape, so opt-in
+        // only (ADR 0002). Last resort after every keyed provider.
+        let ddg_result = if serp_scrape {
+            Some(self.ddg_search(&input.query, count).await)
+        } else {
+            None
+        };
+        if let Some(Ok(ref r)) = ddg_result {
+            if r.success && !r.output.contains("No results found") {
+                info!(
+                    provider = "duckduckgo",
+                    used_provider = "duckduckgo",
+                    query = %input.query,
+                    "web_search"
+                );
+                return ddg_result.expect("checked Some");
+            }
+            let snippet = octos_core::truncated_utf8(&r.output, 120, "...");
+            warn!(
+                provider = "duckduckgo",
+                fallback_reason = if r.success { "empty" } else { "error" },
+                error = %snippet,
+                "web_search rotation"
+            );
+        }
+
+        // Headless-Chrome (CDP) Bing — opt-in only, after DuckDuckGo. Drives
+        // Bing through the in-process headless browser. On a box with no
+        // Chrome this is a fast, clean miss (see `browser_cdp_search`).
         #[cfg(feature = "browser")]
-        {
-            let http_chain_empty = ddg_result
-                .as_ref()
-                .map(|r| !r.success || r.output.contains("No results found"))
-                .unwrap_or(true);
-            if http_chain_empty {
+        if serp_scrape {
+            {
                 // Bound a touch above the per-action browser default headroom so
                 // launch + Bing nav fit, but a wedged Chrome can't block forever.
                 let cdp = self
@@ -534,20 +722,250 @@ impl Tool for WebSearchTool {
             }
         }
 
+        // Every allowed provider was exhausted. Return an empty result that
+        // says what was tried and how to get results (SearXNG or a key), not
+        // a silent scrape. The caller LLM should not retry with identical
+        // args (worker.txt guidance).
+        let tried = self.tried_providers(&controls, serp_scrape);
         info!(
-            provider = "duckduckgo (fallback)",
-            used_provider = "duckduckgo (fallback)",
+            provider = "none",
+            tried = %tried.join(","),
             query = %input.query,
-            "web_search"
+            "web_search: no results from allowed providers"
         );
-        // Return whatever DDG gave us (even if empty / quota-flagged); all
-        // configured providers were exhausted. The caller LLM should see this
-        // and not retry with identical args (worker.txt guidance).
-        ddg_result
+        Ok(ToolResult {
+            output: octos_research::no_results_message(&input.query, &tried),
+            success: true,
+            ..Default::default()
+        })
     }
 }
 
 impl WebSearchTool {
+    /// Providers this search would have called, in order (for the
+    /// no-results message).
+    fn tried_providers(&self, c: &FreeTierControls, serp_scrape: bool) -> Vec<String> {
+        let mut tried: Vec<String> =
+            free_tier_providers(c.news, metasearch_on(), self.searxng_base().is_some())
+                .iter()
+                .map(|p| p.id().to_string())
+                .collect();
+        let has = |id: &str, env: &str| {
+            self.provider_key(id, env)
+                .is_some_and(|k| !k.trim().is_empty())
+        };
+        for (id, env) in [
+            ("tavily", "TAVILY_API_KEY"),
+            ("exa", "EXA_API_KEY"),
+            ("brave", "BRAVE_API_KEY"),
+            ("you", "YDC_API_KEY"),
+            ("perplexity", "PERPLEXITY_API_KEY"),
+        ] {
+            if has(id, env) {
+                tried.push(id.to_string());
+            }
+        }
+        if serp_scrape {
+            tried.push("duckduckgo".to_string());
+            if cfg!(feature = "browser") {
+                tried.push("bing_cdp".to_string());
+            }
+        }
+        tried
+    }
+
+    // --- Free tier: GDELT, Google News RSS, SearXNG ---
+
+    /// SearXNG base URL from the profile's `searxng` search provider or
+    /// `SEARXNG_URL`. Operator configuration, so a private address (a
+    /// localhost instance) is allowed here.
+    fn searxng_base(&self) -> Option<String> {
+        self.provider_key("searxng", octos_research::SEARXNG_URL_ENV)
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    async fn fetch_text(&self, url: &str, label: &str) -> std::result::Result<String, String> {
+        let resp = self
+            .research_client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("{label} error: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "{label} HTTP {status}: {}",
+                octos_core::truncated_utf8(&body, 160, "...")
+            ));
+        }
+        Ok(body)
+    }
+
+    async fn metasearch_search(
+        &self,
+        query: &str,
+        count: u8,
+        c: &FreeTierControls,
+        langs: &[Option<String>],
+    ) -> octos_research::metasearch::SearchResponse {
+        let mut req = octos_research::metasearch::SearchRequest::new(query, c.category);
+        req.query_by_lang = c.query_by_lang.clone();
+        req.langs = langs.iter().flatten().cloned().collect();
+        req.region = c.region.clone();
+        req.since = c.filters.since.clone();
+        req.count = count as usize;
+        req.limit = count as usize * langs.len().max(1) * 2;
+        req.filters = c.filters.clone();
+        req.now = c.now;
+        self.metasearch().search(&req).await
+    }
+
+    async fn free_provider(
+        &self,
+        provider: octos_research::Provider,
+        query: &str,
+        lang: Option<&str>,
+        count: u8,
+        c: &FreeTierControls,
+    ) -> std::result::Result<Vec<octos_research::SearchHit>, String> {
+        use octos_research::Provider as P;
+        use octos_research::providers as free;
+        let since = c.filters.since.as_ref();
+        match provider {
+            P::Gdelt => {
+                gdelt_throttle().wait("api.gdeltproject.org", None).await;
+                let url = free::gdelt_request_url(query, lang, since, count as usize, c.now);
+                free::parse_gdelt(&self.fetch_text(&url, "GDELT").await?)
+            }
+            P::GoogleNewsRss => {
+                let url = free::google_news_rss_url(query, lang, c.region.as_deref(), since);
+                let body = self.fetch_text(&url, "Google News RSS").await?;
+                let default_lang = free::google_news_lang(lang, c.region.as_deref());
+                let mut hits = free::parse_feed(&body, "google_news_rss", Some(&default_lang))?;
+                hits.truncate(count as usize);
+                Ok(hits)
+            }
+            P::Searxng => {
+                let base = self.searxng_base().ok_or("SearXNG not configured")?;
+                let url = free::searxng_request_url(&base, query, lang, since, c.news, c.now)?;
+                let mut hits = free::parse_searxng(&self.fetch_text(&url, "SearXNG").await?)?;
+                hits.truncate(count as usize);
+                Ok(hits)
+            }
+            other => Err(format!("{} is not a free-tier provider", other.id())),
+        }
+    }
+
+    /// Run the free tier for every requested language. Returns `None` when
+    /// it produced nothing usable, so the keyed/keyless chain continues.
+    async fn free_tier_search(
+        &self,
+        query: &str,
+        count: u8,
+        c: &FreeTierControls,
+    ) -> Option<ToolResult> {
+        let providers = free_tier_providers(c.news, metasearch_on(), self.searxng_base().is_some());
+        if providers.is_empty() {
+            return None;
+        }
+        let langs = c.langs(query);
+        let mut hits = Vec::new();
+        let mut used: Vec<&str> = Vec::new();
+        let mut note = None;
+        // The metasearch covers every requested language in one call.
+        if providers.contains(&octos_research::Provider::Metasearch) {
+            let resp = self.metasearch_search(query, count, c, &langs).await;
+            for e in &resp.engines {
+                info!(
+                    provider = "metasearch",
+                    engine = %e.engine,
+                    status = ?e.status,
+                    hits = e.hits,
+                    error = e.error.as_deref().unwrap_or(""),
+                    "web_search metasearch engine"
+                );
+            }
+            if !resp.items.is_empty() {
+                used.push("metasearch");
+                hits.extend(resp.hits());
+            }
+            note = resp.note;
+        }
+        let mut calls = Vec::new();
+        for lang in &langs {
+            for p in providers
+                .iter()
+                .filter(|p| **p != octos_research::Provider::Metasearch)
+            {
+                calls.push(async move {
+                    let r = tokio::time::timeout(
+                        Duration::from_secs(40),
+                        self.free_provider(
+                            *p,
+                            c.query_for(query, lang.as_deref()),
+                            lang.as_deref(),
+                            count,
+                            c,
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err("timed out".to_string()));
+                    (*p, r)
+                });
+            }
+        }
+        for (p, r) in futures::future::join_all(calls).await {
+            match r {
+                Ok(h) if !h.is_empty() => {
+                    if !used.contains(&p.id()) {
+                        used.push(p.id());
+                    }
+                    hits.extend(h);
+                }
+                Ok(_) => info!(
+                    provider = p.id(),
+                    fallback_reason = "empty",
+                    "web_search rotation"
+                ),
+                Err(e) => {
+                    let snippet = octos_core::truncated_utf8(&e, 120, "...");
+                    warn!(provider = p.id(), fallback_reason = "error", error = %snippet, "web_search rotation");
+                }
+            }
+        }
+        let (kept, _skipped) = c.filters.apply(hits);
+        let mut kept = octos_research::filter::interleave_by(kept, |h| {
+            h.lang
+                .as_deref()
+                .map(octos_research::lang::primary)
+                .unwrap_or_default()
+        });
+        kept.truncate(count as usize * langs.len().max(1));
+        if kept.is_empty() {
+            return None;
+        }
+        info!(provider = %used.join("+"), used_provider = %used.join("+"), query = %query, "web_search");
+        let mut output = octos_research::providers::format_hits(query, &kept);
+        if let Some(note) = note.filter(|_| c.category == "general") {
+            output.push_str(&format!("Note: {note}\n"));
+        }
+        if octos_research::respect_robots(|k| std::env::var(k).ok())
+            && kept.iter().any(|h| {
+                h.provider == "google_news_rss" || h.engines.iter().any(|e| e == "google_news")
+            })
+        {
+            output.push_str(
+                "Note: news.google.com links are redirects whose robots.txt disallows automated fetching; cite them as headlines (publisher and date above) rather than fetching them.\n",
+            );
+        }
+        Some(ToolResult {
+            output,
+            success: true,
+            ..Default::default()
+        })
+    }
+
     // --- Tavily (AI-optimized search) ---
 
     async fn tavily_search(&self, query: &str, count: u8, api_key: &str) -> Result<ToolResult> {
@@ -686,8 +1104,9 @@ impl WebSearchTool {
     async fn perplexity_search(&self, query: &str, api_key: &str) -> Result<ToolResult> {
         let body = serde_json::json!({
             "model": "sonar",
-            "messages": [{"role": "user", "content": query}],
-            "max_tokens": 1024
+            "messages": [{"role": "user", "content": query}]
+            // No max_tokens: output size is left to the provider (standing
+            // decision: no hard-coded output caps on model calls).
         });
 
         let response = self
@@ -1024,11 +1443,23 @@ impl WebSearchTool {
 /// paths). Returns `None` when no browser exists so callers degrade cleanly
 /// instead of attempting (and blocking on) a doomed launch.
 #[cfg(feature = "browser")]
-fn detect_browser_executable() -> Option<std::path::PathBuf> {
+pub(super) fn detect_browser_executable() -> Option<std::path::PathBuf> {
     chromiumoxide::detection::default_executable(
         chromiumoxide::detection::DetectionOptions::default(),
     )
     .ok()
+}
+
+/// Keep the browser's own User-Agent (HeadlessChrome) and append the
+/// `octos-research` product token, so sites can identify the reader.
+#[cfg(feature = "browser")]
+pub(super) async fn set_identifiable_user_agent(page: &chromiumoxide::Page) {
+    use chromiumoxide::cdp::browser_protocol::network::SetUserAgentOverrideParams;
+    let base = page.user_agent().await.unwrap_or_default();
+    let ua = format!("{base} octos-research/1.0 (+https://github.com/octos-org/octos)");
+    let _ = page
+        .set_user_agent(SetUserAgentOverrideParams::new(ua.trim().to_string()))
+        .await;
 }
 
 /// Launch headless Chrome, navigate to a Bing SERP for `query`, pull the
@@ -1081,7 +1512,13 @@ async fn render_and_parse_bing(
 
     let outcome = async {
         let page = browser
-            .new_page(search_url.as_str())
+            .new_page("about:blank")
+            .await
+            .map_err(|e| eyre::eyre!("failed to open Bing page: {e}"))?;
+        // Honest UA even on this opt-in scrape: the flag enables it, it does
+        // not license disguise.
+        set_identifiable_user_agent(&page).await;
+        page.goto(search_url.as_str())
             .await
             .map_err(|e| eyre::eyre!("failed to open Bing page: {e}"))?;
         let _ = page.wait_for_navigation().await;
@@ -1624,11 +2061,12 @@ mod tests {
     /// Structural invariant for the rotation order in `execute`:
     ///
     /// The `execute` method MUST iterate providers in the documented priority
-    /// (Tavily → DDG → Exa → Brave → You.com → Perplexity) and treat any
+    /// (Tavily → Exa → Brave → You.com → Perplexity, then the opt-in DDG /
+    /// Bing scrapers) and treat any
     /// `is_quota_or_rate_limit_error(&r) == true` outcome as "fall through to
     /// next provider", identical to the empty-results path. Perplexity must
     /// NOT short-circuit unconditionally; on quota error it must fall through
-    /// to the DDG fallback at the bottom of `execute`.
+    /// to the no-results message at the bottom of `execute`.
     ///
     /// This invariant is enforced by code review + the per-provider guards in
     /// `execute`. Mocking the HTTP layer would require restructuring the tool
@@ -1638,14 +2076,170 @@ mod tests {
         // This test is a structural anchor: if anyone changes the rotation
         // order or removes the per-provider quota guard, they must read the
         // doc comment above and update intentionally.
-        let providers = [
-            "tavily",
-            "duckduckgo",
-            "exa",
-            "brave",
-            "you.com",
-            "perplexity",
+        let providers = ["tavily", "exa", "brave", "you.com", "perplexity"];
+        assert_eq!(providers.len(), 5);
+    }
+
+    #[test]
+    fn should_try_free_news_sources_before_keyed_providers() {
+        use octos_research::Provider;
+        assert_eq!(
+            free_tier_providers(true, true, true),
+            vec![Provider::Metasearch, Provider::Searxng]
+        );
+        assert_eq!(
+            free_tier_providers(false, true, false),
+            vec![Provider::Metasearch],
+            "metasearch serves general queries too"
+        );
+        // With OCTOS_METASEARCH=0: the direct news sources.
+        assert_eq!(
+            free_tier_providers(true, false, true),
+            vec![Provider::Gdelt, Provider::GoogleNewsRss, Provider::Searxng]
+        );
+        assert_eq!(
+            free_tier_providers(false, false, true),
+            vec![Provider::Searxng]
+        );
+        assert!(free_tier_providers(false, false, false).is_empty());
+    }
+
+    #[test]
+    fn should_gate_both_serp_scrapers_on_one_opt_in_flag() {
+        assert!(!serp_scrape_opted_in(|_| None));
+        assert!(!serp_scrape_opted_in(|_| Some("false".into())));
+        for key in [
+            octos_research::SERP_SCRAPE_ENV,
+            octos_research::BROWSER_SERP_ENV,
+        ] {
+            assert!(serp_scrape_opted_in(|k| (k == key).then(|| "1".to_string())));
+        }
+    }
+
+    #[test]
+    fn should_list_ddg_as_tried_only_with_the_flag() {
+        let tool = WebSearchTool::new();
+        let input: Input =
+            serde_json::from_value(serde_json::json!({"query": "rust", "category": "general"}))
+                .unwrap();
+        let c = FreeTierControls::parse(&input).unwrap();
+        assert!(
+            !tool
+                .tried_providers(&c, false)
+                .iter()
+                .any(|p| p == "duckduckgo" || p == "bing_cdp")
+        );
+        assert!(
+            tool.tried_providers(&c, true)
+                .iter()
+                .any(|p| p == "duckduckgo")
+        );
+    }
+
+    /// With no key, no SearXNG and no opt-in, a general query must not fall
+    /// back to scraping DuckDuckGo: it returns an empty result with guidance
+    /// (the metasearch is given an offline fetcher, so no network call).
+    #[tokio::test]
+    async fn should_not_use_duckduckgo_by_default() {
+        let configured = [
+            "TAVILY_API_KEY",
+            "EXA_API_KEY",
+            "BRAVE_API_KEY",
+            "YDC_API_KEY",
+            "PERPLEXITY_API_KEY",
+            octos_research::SEARXNG_URL_ENV,
+            octos_research::SERP_SCRAPE_ENV,
+            octos_research::BROWSER_SERP_ENV,
         ];
-        assert_eq!(providers.len(), 6);
+        if configured.iter().any(|k| std::env::var(k).is_ok()) {
+            return; // developer machine with keys: not the keyless case
+        }
+        struct Offline;
+        impl octos_research::metasearch::Fetch for Offline {
+            fn fetch(
+                &self,
+                _: octos_research::metasearch::HttpRequest,
+            ) -> octos_research::metasearch::FetchFuture<'_> {
+                Box::pin(async { Err("offline".to_string()) })
+            }
+        }
+        let metasearch = octos_research::metasearch::Metasearch::new(
+            octos_research::metasearch::Registry::builtin(),
+            Arc::new(Offline),
+            Default::default(),
+        );
+        let tool = WebSearchTool::new().with_metasearch(metasearch);
+        let r = tool
+            .execute(&serde_json::json!({"query": "rust borrow checker", "category": "general"}))
+            .await
+            .unwrap();
+        assert!(r.success, "empty result, not an error");
+        if metasearch_on() {
+            assert!(
+                r.output.contains("Providers tried: metasearch."),
+                "{}",
+                r.output
+            );
+        } else {
+            assert!(r.output.contains("Providers tried: none"), "{}", r.output);
+        }
+        assert!(!r.output.contains("duckduckgo"), "{}", r.output);
+        assert!(r.output.contains("SEARXNG_URL"));
+        assert!(!r.output.contains("Results for:"));
+    }
+
+    #[test]
+    fn should_parse_lang_since_and_category_controls() {
+        let input: Input = serde_json::from_value(serde_json::json!({
+            "query": "rust release",
+            "lang": ["en", "zh-cn"],
+            "since": "7d",
+            "region": "tw",
+        }))
+        .unwrap();
+        let c = FreeTierControls::parse(&input).unwrap();
+        assert_eq!(c.filters.langs, vec!["en", "zh-CN"]);
+        assert!(c.news, "a 7-day window is news-ish");
+        assert_eq!(c.region.as_deref(), Some("TW"));
+        assert_eq!(c.langs("rust release").len(), 2);
+
+        let general: Input = serde_json::from_value(serde_json::json!({
+            "query": "rust borrow checker", "category": "general", "lang": "en"
+        }))
+        .unwrap();
+        assert!(!FreeTierControls::parse(&general).unwrap().news);
+
+        let bad: Input =
+            serde_json::from_value(serde_json::json!({"query": "q", "since": "soon"})).unwrap();
+        assert!(FreeTierControls::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn should_search_each_language_in_its_own_words() {
+        let input: Input = serde_json::from_value(serde_json::json!({
+            "query": "AI regulation",
+            "lang": "en",
+            "query_by_lang": {"zh-cn": "人工智能 监管"}
+        }))
+        .unwrap();
+        let c = FreeTierControls::parse(&input).unwrap();
+        assert_eq!(c.filters.langs, vec!["en", "zh-CN"]);
+        assert_eq!(
+            c.langs(&input.query),
+            vec![Some("en".to_string()), Some("zh-CN".to_string())]
+        );
+        assert_eq!(c.query_for(&input.query, Some("zh-CN")), "人工智能 监管");
+        assert_eq!(c.query_for(&input.query, Some("en")), "AI regulation");
+    }
+
+    #[tokio::test]
+    async fn should_report_invalid_controls_without_searching() {
+        let tool = WebSearchTool::new();
+        let r = tool
+            .execute(&serde_json::json!({"query": "q", "lang": "english"}))
+            .await
+            .unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("invalid language tag"), "{}", r.output);
     }
 }

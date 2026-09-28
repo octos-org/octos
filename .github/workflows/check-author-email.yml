@@ -15,14 +15,21 @@ jobs:
           fetch-depth: 0
       - name: scan commits for blocked emails
         shell: bash
+        env:
+          BLOCKED_EMAIL_DOMAINS: ${{ vars.BLOCKED_EMAIL_DOMAINS }}
         run: |
           set -euo pipefail
-          # Block the whole domain; naming individuals was redundant — the
-          # domain alternative already matches their addresses. The `@`
-          # prefix anchors the local-part boundary and `$` the end, so
-          # `user@futurewei.com.evil.tld` and `x@notfuturewei.com` are both
-          # handled correctly.
-          BLOCKED='@futurewei\.com$'
+          # Blocked email domains come from the BLOCKED_EMAIL_DOMAINS Actions
+          # variable (space- or comma-separated, e.g. "example.com other.org"),
+          # so the list itself is not published in this repo. Each domain is
+          # matched as `@<domain>` anchored at the end, so `user@<domain>.evil.tld`
+          # and `x@not<domain>` are handled correctly.
+          BLOCKED_DOMAINS="${BLOCKED_EMAIL_DOMAINS:-}"
+          if [ -z "${BLOCKED_DOMAINS//[ ,]/}" ]; then
+            echo "::warning::BLOCKED_EMAIL_DOMAINS is not set; skipping the blocked-domain check."
+            exit 0
+          fi
+          BLOCKED=$(printf '%s\n' "${BLOCKED_DOMAINS}" | tr ', ' '\n\n' | awk 'NF { d = tolower($0); gsub(/\./, "\\.", d); printf "%s@%s$", (n++ ? "|" : ""), d }')
 
           if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
             BASE="origin/${GITHUB_BASE_REF}"
@@ -39,7 +46,7 @@ jobs:
           fi
 
           echo "Scanning range: ${RANGE}"
-          OFFENDERS=$(git log "${RANGE}" --format='%H|%ae|%ce|%s' | awk -F'|' -v re="${BLOCKED}" '$2 ~ re || $3 ~ re')
+          OFFENDERS=$(git log "${RANGE}" --format='%H|%ae|%ce|%s' | awk -F'|' -v re="${BLOCKED}" 'tolower($2) ~ re || tolower($3) ~ re')
           if [ -n "${OFFENDERS}" ]; then
             echo ""
             echo "FAIL: the following commits carry blocked author/committer emails:"

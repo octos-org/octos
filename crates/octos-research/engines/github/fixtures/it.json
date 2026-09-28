@@ -1,0 +1,57 @@
+{
+  "body_file": "it.body",
+  "expect": [
+    {
+      "lang": null,
+      "published": "2026-08-22T22:02:20Z",
+      "source": "GitHub · Rust · 113 stars",
+      "title": "MikeLuu99/metasearch-rust",
+      "url": "https://github.com/MikeLuu99/metasearch-rust"
+    },
+    {
+      "lang": null,
+      "published": "2026-06-27T04:12:04Z",
+      "source": "GitHub · Rust · 4 stars",
+      "title": "sempervictus/searxng-rs",
+      "url": "https://github.com/sempervictus/searxng-rs"
+    },
+    {
+      "lang": null,
+      "published": "2026-03-01T22:12:19Z",
+      "source": "GitHub · HTML · 0 stars",
+      "title": "najmus-sakib-hossain/metasearch",
+      "url": "https://github.com/najmus-sakib-hossain/metasearch"
+    },
+    {
+      "lang": null,
+      "published": "2026-06-17T12:29:09Z",
+      "source": "GitHub · Rust · 0 stars",
+      "title": "Pughal77/searxng-mcp-server-rust",
+      "url": "https://github.com/Pughal77/searxng-mcp-server-rust"
+    },
+    {
+      "lang": null,
+      "published": "2025-04-27T14:44:57Z",
+      "source": "GitHub · Rust · 0 stars",
+      "title": "ashwinvin/anvesh",
+      "url": "https://github.com/ashwinvin/anvesh"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/vnd.github+json",
+      "x-github-api-version": "2022-11-28"
+    },
+    "method": "GET",
+    "url": "https://api.github.com/search/repositories?q=metasearch+engine+rust&per_page=5&page=1"
+  },
+  "recorded": "live, 2026-09-27",
+  "request": {
+    "category": "it",
+    "count": 5,
+    "langs": [],
+    "now": "2026-09-27T22:00:00Z",
+    "query": "metasearch engine rust",
+    "since": null
+  }
+}

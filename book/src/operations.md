@@ -27,6 +27,16 @@ sudo systemctl restart octos-serve
 
 ---
 
+## Session Storage Capacity
+
+Sessions are stored as rolling JSONL segments, not one ever-growing file. When the active file reaches `OCTOS_SESSION_SEGMENT_BYTES` (default 8 MiB), it is sealed into a sibling `<name>.segments/NNNNNN.jsonl` and a fresh active file starts. A plain load reads the active file plus as many sealed segments, newest first, as fit within `OCTOS_SESSION_LOAD_BUDGET_BYTES` (default 32 MiB; `0` = unlimited) — history beyond the budget stays on disk and remains reachable through full-history loads and `/undo`.
+
+**Memory planning**: the budget bounds the file bytes one resident session holds; parsed rows cost roughly 1.5–3× their file size, so a process caching N long sessions needs up to about `N × 32 MiB × 3`. Memory-limited hosts should lower the budget (e.g. `OCTOS_SESSION_LOAD_BUDGET_BYTES=16777216`) or the session cache size (`gateway.max_sessions`).
+
+**Mixed-version overlap** (e.g. a Kubernetes rolling upgrade on a shared data directory): an old binary does not see `.segments/`; its `*.jsonl` walks show only the active file, which looks like a short session. Sessions this build has written carry schema version 2, which older builds refuse to load — but never let an old binary *rewrite* (rename, summary) any rolled session: a rewrite replaces the active file with whatever the old build could read. For an older (schema 1) session, a legacy rewrite that erases `sealed_segments` makes the sealed segments invisible to loads; while that unnamed state stands, rewrites refuse and the seal refuses to replace the unnamed segments, so the files stay on disk but the session stops rolling until the state is reconciled.
+
+---
+
 ## Keychain Integration
 
 Octos supports storing API keys in the OS secret store instead of plaintext in profile JSON files: the macOS Keychain on macOS (hardware-backed, per-user access control), a 0600 file under `~/.octos/secrets` on Linux, and no store on Windows yet — use the process environment or plain `env_vars` there. The diagram below shows the macOS backend.

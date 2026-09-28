@@ -32,8 +32,19 @@ const MIN_USEFUL_TEXT_LEN: usize = 200;
 /// Maximum retries for near-empty pages.
 const MAX_EMPTY_RETRIES: u32 = 2;
 
-/// Common user agent to avoid headless detection.
-const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// Minimum spacing between page loads on the crawled site.
+const PAGE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Chrome flags for the crawler. Automation is not hidden (OctoSense
+/// ADR 0002): no `AutomationControlled` switches, no spoofed `--user-agent`,
+/// no `--disable-infobars`, no script that rewrites `navigator.webdriver`.
+/// The tab identifies itself with Chrome's own User-Agent plus the octos
+/// product token (see [`identify`]).
+const CRAWL_ARGS: &[&str] = &[
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-background-networking",
+];
 
 /// CDP-based recursive site crawler.
 pub struct DeepCrawlTool {
@@ -80,16 +91,10 @@ async fn launch_browser() -> Result<(
         .tempdir()
         .wrap_err("failed to create temp dir for Chrome")?;
 
-    let mut builder = BrowserConfig::builder()
-        .user_data_dir(temp_dir.path())
-        .arg("--disable-dev-shm-usage")
-        .arg("--disable-extensions")
-        .arg("--disable-background-networking")
-        // Stealth: avoid headless detection by bot-protection services
-        .arg("--disable-blink-features=AutomationControlled")
-        .arg(format!("--user-agent={STEALTH_USER_AGENT}"))
-        .arg("--disable-features=AutomationControlled")
-        .arg("--disable-infobars");
+    let mut builder = BrowserConfig::builder().user_data_dir(temp_dir.path());
+    for arg in CRAWL_ARGS {
+        builder = builder.arg(*arg);
+    }
 
     for var in BLOCKED_ENV_VARS {
         builder = builder.env(*var, "");
@@ -109,17 +114,28 @@ async fn launch_browser() -> Result<(
         .new_page("about:blank")
         .await
         .map_err(|e| eyre::eyre!("failed to create page: {e}"))?;
+    identify(&page).await;
 
     Ok((browser, page, handle, temp_dir))
 }
 
-/// JS to remove automation indicators (navigator.webdriver, etc.)
-const STEALTH_JS: &str = r#"
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    window.chrome = { runtime: {} };
-"#;
+/// The browser's own User-Agent with the octos product token appended, so
+/// sites can tell who is crawling (never a disguised desktop browser).
+fn identifiable_user_agent(base: &str) -> String {
+    format!("{} {}", base.trim(), octos_research::USER_AGENT)
+        .trim()
+        .to_string()
+}
+
+async fn identify(page: &Page) {
+    use chromiumoxide::cdp::browser_protocol::network::SetUserAgentOverrideParams;
+    let base = page.user_agent().await.unwrap_or_default();
+    let _ = page
+        .set_user_agent(SetUserAgentOverrideParams::new(identifiable_user_agent(
+            &base,
+        )))
+        .await;
+}
 
 /// JS to extract links from the page.
 const EXTRACT_LINKS_JS: &str = r#"
@@ -170,11 +186,9 @@ fn is_bot_blocked(text: &str) -> bool {
 }
 
 /// Crawl a single page: navigate, wait for JS render, extract text and links.
-/// Retries with longer wait if the page is near-empty or bot-blocked.
+/// A near-empty page gets a longer wait (slow single-page apps); a bot
+/// challenge is reported, not bypassed.
 async fn crawl_single_page(page: &Page, url: &str, page_settle_ms: u64) -> CrawledPage {
-    // Inject stealth JS before navigation
-    let _ = page.evaluate(STEALTH_JS).await;
-
     // Navigate
     if let Err(e) = page.goto(url).await {
         return CrawledPage {
@@ -194,9 +208,6 @@ async fn crawl_single_page(page: &Page, url: &str, page_settle_ms: u64) -> Crawl
     .await;
     tokio::time::sleep(Duration::from_millis(page_settle_ms)).await;
 
-    // Re-inject stealth after navigation (some sites check post-load)
-    let _ = page.evaluate(STEALTH_JS).await;
-
     // Extract text with retry for near-empty or bot-blocked pages
     let mut text = match extract_text(page).await {
         Ok(t) => t,
@@ -211,24 +222,30 @@ async fn crawl_single_page(page: &Page, url: &str, page_settle_ms: u64) -> Crawl
         }
     };
 
-    // Retry if page looks empty or bot-blocked
+    // A bot challenge is the site saying no: record it, do not wait it out.
+    if is_bot_blocked(&text) {
+        return challenged(url);
+    }
+    // Slow single-page apps: give a near-empty page more time.
     for retry in 0..MAX_EMPTY_RETRIES {
         let trimmed_len = text.trim().len();
-        if trimmed_len >= MIN_USEFUL_TEXT_LEN && !is_bot_blocked(&text) {
+        if trimmed_len >= MIN_USEFUL_TEXT_LEN {
             break;
         }
         warn!(
             url = %url,
             text_len = trimmed_len,
             retry = retry + 1,
-            bot_blocked = is_bot_blocked(&text),
-            "page looks empty or bot-blocked, retrying with longer wait"
+            "page looks empty, waiting longer"
         );
         tokio::time::sleep(Duration::from_millis(PAGE_SETTLE_RETRY_MS)).await;
         text = match extract_text(page).await {
             Ok(t) => t,
             Err(_) => break,
         };
+        if is_bot_blocked(&text) {
+            return challenged(url);
+        }
     }
 
     // Extract links
@@ -244,6 +261,40 @@ async fn crawl_single_page(page: &Page, url: &str, page_settle_ms: u64) -> Crawl
         links,
         error: None,
     }
+}
+
+fn challenged(url: &str) -> CrawledPage {
+    CrawledPage {
+        url: url.to_string(),
+        depth: 0,
+        text: String::new(),
+        links: vec![],
+        error: Some("bot challenge: the site asked to verify a human; not bypassed".to_string()),
+    }
+}
+
+/// robots.txt verdict for `url` when the operator turned robots checks on
+/// (`OCTOS_RESPECT_ROBOTS`); `None` = allowed or checks off.
+async fn robots_refusal(cache: &octos_research::RobotsCache, url: &str) -> Option<String> {
+    if !octos_research::respect_robots(|k| std::env::var(k).ok()) {
+        return None;
+    }
+    let decision = cache
+        .check(url, octos_research::AGENT_TOKEN, |robots_url| async move {
+            match octos_research::net::safe_get(&robots_url, Duration::from_secs(10)).await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = octos_research::net::read_capped(resp, 512 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    (Some(status), body)
+                }
+                Err(_) => (None, String::new()),
+            }
+        })
+        .await;
+    (!decision.allowed)
+        .then(|| format!("skipped: {} (OCTOS_RESPECT_ROBOTS is on)", decision.reason))
 }
 
 /// Normalize a URL: remove fragment, trailing slash, lowercase scheme+host.
@@ -407,10 +458,27 @@ impl Tool for DeepCrawlTool {
             "starting deep crawl"
         );
 
+        let robots = octos_research::RobotsCache::new();
+        let throttle = octos_research::HostThrottle::new(PAGE_INTERVAL);
         while let Some((url, depth)) = queue.pop_front() {
             if results.len() >= max_pages as usize {
                 break;
             }
+            if let Some(reason) = robots_refusal(&robots, &url).await {
+                results.push(CrawledPage {
+                    url: url.clone(),
+                    depth,
+                    text: String::new(),
+                    links: vec![],
+                    error: Some(reason),
+                });
+                continue;
+            }
+            let host = reqwest::Url::parse(&url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_default();
+            throttle.wait(&host, None).await;
 
             info!(
                 url = %url,
@@ -558,6 +626,33 @@ impl Tool for DeepCrawlTool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn should_not_hide_automation_or_spoof_the_user_agent() {
+        let args = super::CRAWL_ARGS.join(" ");
+        for banned in ["AutomationControlled", "--user-agent", "--disable-infobars"] {
+            assert!(!args.contains(banned), "{banned} in {args}");
+        }
+        let src = include_str!("site_crawl.rs");
+        let webdriver_patch = ["defineProperty(navigator, ", "'webdriver'"].concat();
+        assert!(
+            !src.contains(&webdriver_patch),
+            "no webdriver-hiding script"
+        );
+        let ua = super::identifiable_user_agent("Mozilla/5.0 HeadlessChrome/131.0");
+        assert!(ua.starts_with("Mozilla/5.0 HeadlessChrome/131.0 "), "{ua}");
+        assert!(ua.ends_with(octos_research::USER_AGENT), "{ua}");
+    }
+
+    #[test]
+    fn should_report_bot_challenges_instead_of_waiting_them_out() {
+        assert!(super::is_bot_blocked(
+            "Just a moment... checking your browser"
+        ));
+        let page = super::challenged("https://example.com/");
+        assert!(page.error.unwrap().contains("not bypassed"));
+        assert!(page.text.is_empty() && page.links.is_empty());
+    }
+
     use super::*;
 
     #[test]

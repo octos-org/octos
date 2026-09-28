@@ -135,6 +135,9 @@ spec and UPCR documents. The authoritative source remains code:
 | `snapshot/restore` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `peer/prepare` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `peer/gather` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `peer/model/set` | shipped; UPCR-2026-034 host-owned app peers |
+| `peer/context/open` | shipped; UPCR-2026-034 host-owned app peers |
+| `peer/context/close` | shipped; UPCR-2026-034 host-owned app peers |
 | `turn/steer` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `session/compact` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `session/compact/mode/set` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |

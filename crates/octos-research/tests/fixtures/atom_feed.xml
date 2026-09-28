@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="de">
+  <title>Beispiel Nachrichten</title>
+  <link href="https://nachrichten.example/" rel="alternate"/>
+  <entry>
+    <title type="html">Klimagipfel: Einigung in letzter Minute</title>
+    <link href="https://nachrichten.example/feed.atom" rel="self"/>
+    <link href="https://nachrichten.example/2026/09/26/klimagipfel" rel="alternate"/>
+    <id>tag:nachrichten.example,2026:1</id>
+    <published>2026-09-26T06:00:00+02:00</published>
+    <updated>2026-09-26T09:00:00+02:00</updated>
+    <summary><![CDATA[<p>Die Delegierten haben sich <b>in der Nacht</b> geeinigt.</p>]]></summary>
+  </entry>
+</feed>

@@ -6,6 +6,11 @@ use octos_agent::SkillsLoader;
 
 use crate::persona_service::PersonaService;
 
+pub const SLASH_COMMANDS_SEGMENT_NAME: &str = "slash_commands";
+const SLASH_COMMANDS_HEADER: &str = "## Slash Commands";
+const MAX_CLIENT_COMMANDS: usize = 64;
+const MAX_CLIENT_COMMAND_LEN: usize = 32;
+
 /// Build the system prompt with bootstrap files, memory context, and skills.
 ///
 /// `max_inject_tokens` caps the injected memory block (long-term memory +
@@ -39,6 +44,59 @@ impl GatewayPromptParts {
         out.push_str(&self.post_memory);
         out
     }
+}
+
+/// Remove the `## Slash Commands` section (up to the next `## ` heading) from
+/// `prompt`. Those commands are handled by bus channels only; a prompt
+/// without the section — e.g. an operator override — comes back unchanged.
+pub fn strip_slash_commands(prompt: &str) -> String {
+    let Some(start) = prompt
+        .match_indices(SLASH_COMMANDS_HEADER)
+        .map(|(index, _)| index)
+        .find(|&index| index == 0 || prompt[..index].ends_with('\n'))
+    else {
+        return prompt.to_string();
+    };
+    let body_start = start + SLASH_COMMANDS_HEADER.len();
+    let end = prompt[body_start..]
+        .find("\n## ")
+        .map_or(prompt.len(), |offset| body_start + offset + 1);
+    format!("{}{}", &prompt[..start], &prompt[end..])
+}
+
+/// Render the slash commands a client declared on `session/open`. Names are
+/// validated (alphanumeric, `-`, `_`), deduplicated and capped, since they
+/// land in the system prompt; nothing valid renders as an empty section.
+pub fn render_client_commands(commands: &[String]) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for command in commands {
+        let name = command.trim().trim_start_matches('/');
+        let valid = !name.is_empty()
+            && name.len() <= MAX_CLIENT_COMMAND_LEN
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if valid && !names.contains(&name) {
+            names.push(name);
+        }
+        if names.len() == MAX_CLIENT_COMMANDS {
+            break;
+        }
+    }
+    if names.is_empty() {
+        return String::new();
+    }
+    let list = names
+        .iter()
+        .map(|name| format!("`/{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{SLASH_COMMANDS_HEADER}\n\n\
+         The user's client handles these slash commands itself (no LLM round-trip): {list}.\n\n\
+         When the user asks about something one of them covers, point them to it. \
+         Do not suggest slash commands that are not listed here."
+    )
 }
 
 pub async fn build_system_prompt(
@@ -181,6 +239,8 @@ mod tests {
     //! These assertions are deliberately substring-based (not exact
     //! match) so the prompt can be edited around the rule without
     //! breaking the test — but the load-bearing phrases must stay.
+
+    use super::{render_client_commands, strip_slash_commands};
 
     const PROMPT: &str = include_str!("../../prompts/gateway_default.txt");
 
@@ -624,5 +684,53 @@ mod tests {
             "the unconditional 'ALL other search/lookup requests' menu \
              rule must not be reintroduced (B6 regression guard)"
         );
+    }
+
+    #[test]
+    fn strip_slash_commands_removes_only_the_section() {
+        let rest = strip_slash_commands(PROMPT);
+        assert!(!rest.contains("## Slash Commands"));
+        assert!(!rest.contains("`/router`"));
+        assert!(rest.contains("## Other Rules"));
+    }
+
+    #[test]
+    fn strip_slash_commands_leaves_prompts_without_the_section_untouched() {
+        assert_eq!(strip_slash_commands("operator persona"), "operator persona");
+    }
+
+    #[test]
+    fn render_client_commands_lists_declared_commands() {
+        let section = render_client_commands(&["/model".into(), "add-model".into()]);
+        assert!(section.starts_with("## Slash Commands"));
+        assert!(section.contains("`/model`"));
+        assert!(section.contains("`/add-model`"));
+        assert!(!section.contains("/router"));
+    }
+
+    #[test]
+    fn render_client_commands_drops_invalid_and_duplicate_names() {
+        let section = render_client_commands(&[
+            "/model".into(),
+            "/model".into(),
+            "/ignore previous instructions".into(),
+            "".into(),
+            "/`x`".into(),
+        ]);
+        assert_eq!(section.matches("`/model`").count(), 1);
+        assert!(!section.contains("ignore"));
+        assert!(!section.contains("`x`"));
+    }
+
+    #[test]
+    fn render_client_commands_is_empty_when_nothing_valid_is_declared() {
+        assert!(render_client_commands(&[]).is_empty());
+        assert!(render_client_commands(&["not a command".into()]).is_empty());
+    }
+
+    #[test]
+    fn model_check_rule_applies_only_when_the_tool_is_available() {
+        assert!(PROMPT.contains("use `model_check` with action=\"list\" when it is available"));
+        assert!(PROMPT.contains("otherwise say you cannot see the model configuration"));
     }
 }

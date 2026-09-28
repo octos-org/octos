@@ -1649,7 +1649,7 @@ mod tests {
         let req = SwarmReviewRequest {
             schema_version: 1,
             accepted: false,
-            reviewer: "pm@futurewei.com".into(),
+            reviewer: "pm@example.com".into(),
             notes: Some("rejecting — missing test coverage".into()),
         };
 
@@ -1686,7 +1686,7 @@ mod tests {
         );
         assert_eq!(
             parsed.get("reviewer").and_then(|v| v.as_str()),
-            Some("pm@futurewei.com")
+            Some("pm@example.com")
         );
         assert_eq!(
             parsed.get("schema").and_then(|v| v.as_str()),

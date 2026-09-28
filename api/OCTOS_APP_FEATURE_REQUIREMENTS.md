@@ -210,7 +210,7 @@ for this contract:
 
 Known operational issue:
 
-- `/Users/yuechen/home/octos-app` is currently not a git repository in this
+- `~/home/octos-app` is currently not a git repository in this
   environment. Before release work, restore or reclone it as a real checkout so
   diffs, branches, commits, and PRs are auditable.
 

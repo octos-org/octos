@@ -48,6 +48,7 @@ use crate::autonomy::agent_orchestrator::default_agent_orchestrator;
 use crate::build_cache::pool::{BuildCacheConfig, Slot, SlotOutcome};
 use crate::contracts::UiProtocolContractStores;
 
+pub(crate) mod app_binding;
 mod recovery;
 pub(crate) use recovery::*;
 // task-evo-peer-turn-status — the typed lifetime projection lives in
@@ -3140,6 +3141,7 @@ pub(crate) fn stage_peer(
         goal_id,
         task_id,
         None,
+        None,
     )
 }
 
@@ -3157,6 +3159,10 @@ pub(crate) fn stage_peer_with_budget(
     goal_id: Option<&str>,
     task_id: Option<&str>,
     token_budget: Option<u64>,
+    // UPCR-2026-034 — a host-owned app peer's durable binding (workspace +
+    // memory namespace), written BEFORE `brief.md` so the peer never becomes
+    // visible unbound. `None` for every agent-staged peer.
+    host_binding: Option<&app_binding::PeerHostBinding>,
 ) -> Result<StagedPeer, RpcError> {
     if token_budget == Some(0) {
         return Err(RpcError::invalid_params(
@@ -3288,6 +3294,15 @@ pub(crate) fn stage_peer_with_budget(
             cleanup_staged_peer(workspace_root, &slug, &peer_dir);
             return Err(RpcError::internal_error(format!(
                 "failed to record peer originator: {err}"
+            )));
+        }
+    }
+
+    if let Some(binding) = host_binding {
+        if let Err(err) = app_binding::write_host_binding_in(&peer_dir, binding) {
+            cleanup_staged_peer(workspace_root, &slug, &peer_dir);
+            return Err(RpcError::internal_error(format!(
+                "failed to record the peer's host binding: {err}"
             )));
         }
     }
@@ -3601,9 +3616,9 @@ pub(crate) const PEER_HANDOFFS_PER_TURN_MAX: u32 = 4;
 /// recursively, and the tool is not even visible to the model there.
 #[cfg(any(feature = "api", test))]
 pub(crate) fn peer_handoff_allowed_for_session(session_id: &SessionKey) -> bool {
-    !session_id
-        .topic()
-        .is_some_and(|topic| topic.starts_with("peer-"))
+    !session_id.topic().is_some_and(|topic| {
+        topic.starts_with("peer-") || topic.starts_with(app_binding::PEER_CONTEXT_TOPIC_PREFIX)
+    })
 }
 
 /// #20a (smart worktree fencing) — a collision risk REASON. When the model
@@ -3776,6 +3791,7 @@ pub(crate) fn build_peer_handoff_callback(
             resolved_goal_id.as_deref(),
             request.task_id.as_deref(),
             request.token_budget,
+            None,
         )
         .map_err(|err| err.message)?;
         // #peer-model — optional model lane. Record a VALID lane symlink-safely
@@ -4076,6 +4092,33 @@ pub(crate) fn peer_pending_summaries(
     approvals
 }
 
+/// The part of a peer's parked set its ORIGINATOR may answer. A host-owned app
+/// peer's tool approvals belong to the person in the app's own UI (ADR 0007,
+/// UPCR-2026-034): they are dropped here, so neither `peer_list` nor
+/// `peer_respond` offers them to the owning system agent. Every other peer's
+/// set is returned unchanged.
+pub(crate) fn peer_pending_answerable_by_originator(
+    peers_root: &Path,
+    slug: &str,
+    pendings: Vec<PeerPendingSummary>,
+) -> Vec<PeerPendingSummary> {
+    if !app_binding::peer_is_host_owned(peers_root, slug) {
+        return pendings;
+    }
+    pendings
+        .into_iter()
+        .filter(|pending| pending.kind != PeerPendingKind::Approval)
+        .collect()
+}
+
+/// The refusal `peer_respond` returns for a host-owned app peer's approval.
+fn host_owned_approval_refusal(slug: &str) -> String {
+    format!(
+        "peer '{slug}' is a host-owned app peer: its tool approvals are answered \
+         only by the person in the app, not via peer_respond — leave it to them"
+    )
+}
+
 /// The peer's TRUSTED session key (#P1-1): the wire it runs its turns under,
 /// recorded server-side at `session/open`. `None` when the peer is not currently
 /// open — it then has no live oneshot to answer or cancel. This is the ONLY
@@ -4169,7 +4212,28 @@ pub(crate) fn peer_respond_resolve(
     };
 
     // The AUTHORITATIVE parked set for this peer, straight from the store.
-    let pendings = peer_pending_summaries(contracts, &peer_session);
+    let all_pendings = peer_pending_summaries(contracts, &peer_session);
+    // ADR 0007 — a host-owned app peer's approvals are the person's, answered
+    // in the app's own UI. The originator (the system agent) may answer the
+    // peer's questions but never approve its tools: refuse a targeted
+    // approval, and never select one by default.
+    if app_binding::peer_is_host_owned(peers_root, &slug) {
+        let targets_approval = match req.id.as_deref() {
+            Some(id) => all_pendings
+                .iter()
+                .any(|p| p.id == id && p.kind == PeerPendingKind::Approval),
+            None => {
+                req.decision.is_some()
+                    && all_pendings
+                        .iter()
+                        .any(|p| p.kind == PeerPendingKind::Approval)
+            }
+        };
+        if targets_approval {
+            return Err(host_owned_approval_refusal(&slug));
+        }
+    }
+    let pendings = peer_pending_answerable_by_originator(peers_root, &slug, all_pendings);
     if pendings.is_empty() {
         return Err(format!(
             "peer '{slug}' is not awaiting input — nothing to respond to \
@@ -4958,7 +5022,13 @@ pub(crate) fn build_peer_list_callback(
             .filter(|row| !row.closed)
             .filter_map(|row| {
                 let session = peer_trusted_session(&profile_id, &row.slug)?;
-                let pending = peer_pending_summaries(&contracts, &session);
+                // ADR 0007 — a host-owned app peer's approvals are the
+                // person's; they are not shown to the originator as input to give.
+                let pending = peer_pending_answerable_by_originator(
+                    &peers_root,
+                    &row.slug,
+                    peer_pending_summaries(&contracts, &session),
+                );
                 (!pending.is_empty()).then(|| (row.slug.clone(), pending))
             })
             .collect();

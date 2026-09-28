@@ -390,11 +390,15 @@ pub(crate) enum PeerSendInputEnqueueOutcome {
 
 impl PeerSendInputEnqueueOutcome {
     /// The tool callback maps a real delivery status to its `Result`: a
-    /// persist failure is an ERROR (do not ack success), everything else is a
-    /// queued-for-delivery success.
-    pub(crate) fn into_callback_result(self, slug: &str) -> Result<(), String> {
+    /// persist failure is an ERROR (do not ack success); a genuine retry of
+    /// the same call is reported as already queued, not as a fresh send.
+    pub(crate) fn into_callback_result(
+        self,
+        slug: &str,
+    ) -> Result<octos_agent::PeerSendInputDelivery, String> {
         match self {
-            Self::Queued | Self::Duplicate => Ok(()),
+            Self::Queued => Ok(octos_agent::PeerSendInputDelivery::Queued),
+            Self::Duplicate => Ok(octos_agent::PeerSendInputDelivery::AlreadyQueued),
             Self::PersistFailed => Err(format!(
                 "failed to durably queue input for peer '{slug}' (storage write \
                  error) — the injection was not delivered; try again"

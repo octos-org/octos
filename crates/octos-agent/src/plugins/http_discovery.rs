@@ -179,7 +179,18 @@ pub async fn install_http_tools_from_catalog(
         // `register_arc` is infallible / overwrites, but the ordering is the
         // safer invariant to lock in.
         let tool_name = sanitized_name.clone();
-        registry.register_arc(Arc::new(bridge) as Arc<dyn Tool>);
+        // A catalog entry never takes a compiled-in tool's name.
+        if registry.is_builtin_name(&tool_name) {
+            tracing::warn!(
+                tool = %tool_name,
+                "HTTP catalog tool name collides with a built-in tool, skipping"
+            );
+            continue;
+        }
+        registry.register_arc_with_origin(
+            Arc::new(bridge) as Arc<dyn Tool>,
+            crate::tools::ToolOrigin::Plugin,
+        );
         robot_groups::with_registry_mut(|reg| {
             reg.insert(tool_name.clone(), tier);
         });

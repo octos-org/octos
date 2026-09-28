@@ -10,7 +10,7 @@
 #
 # Usage:
 #   scripts/fleet-install-skills.sh
-#   scripts/fleet-install-skills.sh --host 69.194.3.128,69.194.3.129
+#   scripts/fleet-install-skills.sh --host <host-a>,<host-b>
 #   scripts/fleet-install-skills.sh --profile dspfac --skill mofa-cli,mofa-cards
 #   scripts/fleet-install-skills.sh --dry-run
 #
@@ -36,7 +36,7 @@
 set -eEuo pipefail
 
 # ─── Defaults ────────────────────────────────────────────────────────────
-DEFAULT_HOSTS="69.194.3.128 69.194.3.129 69.194.3.203 69.194.3.66 69.194.3.19"
+DEFAULT_HOSTS="${OCTOS_FLEET_DEFAULT_HOSTS:-}"  # no built-in host list
 DEFAULT_MOFA_DIR="$HOME/home/mofa-skills"
 DEFAULT_REMOTE_BIN="/Users/cloud/.octos/bin/octos"
 DEFAULT_REMOTE_USER="cloud"
@@ -92,10 +92,10 @@ Examples:
 
   # Single host, single profile, single skill
   scripts/fleet-install-skills.sh \
-      --host 69.194.3.129 --profile dspfac --skill mofa-cli
+      --host <host> --profile dspfac --skill mofa-cli
 
   # Override host list via env
-  OCTOS_FLEET_HOSTS=69.194.3.66 scripts/fleet-install-skills.sh
+  OCTOS_FLEET_HOSTS=<host> scripts/fleet-install-skills.sh
 USAGE
 }
 
