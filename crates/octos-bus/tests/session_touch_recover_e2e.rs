@@ -7,6 +7,10 @@
 //! replaced (deleted) the segment the meta does not name. The touch must
 //! recover the active file exactly as the loader does instead, and only a
 //! session with nothing sealed materializes empty.
+//!
+//! The gateway's `/new <name>` is the only production caller and its name
+//! passes `validate_topic_name`, so the touched sessions here use a named
+//! topic — the `{base_key}#{topic}` arm the gateway actually drives.
 
 use std::path::Path;
 
@@ -74,14 +78,14 @@ fn active_file(data_dir: &Path) -> std::path::PathBuf {
     files.pop().unwrap()
 }
 
-#[tokio::test]
-async fn touch_over_recoverable_seal_state_does_not_rearm_segment_replacement() {
+/// Drive the history to the interrupted-seal crash state through the
+/// production write path: `[seed, oversize]` seals as 000001 together,
+/// "after the roll" starts the fresh active file, and deleting that file
+/// leaves the crash's on-disk shape (rename landed, fresh file never
+/// durable). Returns the data dir, the active path, and the sealed bytes.
+async fn interrupted_seal_state(base: &str) -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
     let tmp = tempfile::tempdir().unwrap();
-    let mgr = SessionManager::open(tmp.path()).unwrap();
-    let key = SessionKey::new("cli", "e2e-touch");
-
-    // Roll once through the handle: [seed, oversize] seals as 000001 and
-    // "after the roll" starts the fresh active file.
+    let key = SessionKey(format!("{base}#research"));
     let mut handle = SessionHandle::open(tmp.path(), &key);
     handle
         .add_message_with_seq(message(MessageRole::User, "seed"))
@@ -94,26 +98,38 @@ async fn touch_over_recoverable_seal_state_does_not_rearm_segment_replacement() 
         .unwrap();
     drop(handle);
 
-    // The interrupted-seal crash state (#2466's F2): the seal's rename
-    // landed, the fresh active file never became durable.
     let active = active_file(tmp.path());
     let sealed = sealed_segment_path(&active, 1);
     assert!(sealed.is_file(), "the first roll sealed a segment");
     let real_history = std::fs::read(&sealed).unwrap();
     std::fs::remove_file(&active).unwrap();
+    (tmp, active, real_history)
+}
 
-    // `/new <topic>` touches the session before any load — the window the
+#[tokio::test]
+async fn touch_over_recoverable_seal_state_does_not_rearm_segment_replacement() {
+    let base = "cli:e2e-touch";
+    let (tmp, active, real_history) = interrupted_seal_state(base).await;
+    let mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey(format!("{base}#research"));
+    let sealed = sealed_segment_path(&active, 1);
+
+    // `/new research` touches the session before any load — the window the
     // issue describes (gateway_dispatcher.rs:184).
-    mgr.touch_user_session(key.base_key(), "");
+    mgr.touch_user_session(base, "research");
 
     // The touch must not write a meta that names zero segments while the
     // sealed history sits beside the path: it recovers the active file the
-    // same way the loader does.
+    // same way the loader does, keeping the session's topic identity.
     let meta_line = std::fs::read_to_string(&active).unwrap();
     let meta = meta_line.split_once('\n').unwrap().0;
     assert!(
         meta.contains("\"sealed_segments\":1"),
         "the touch materialized the recovered active file: {meta}"
+    );
+    assert!(
+        meta.contains("\"topic\":\"research\""),
+        "the recovered meta keeps the topic identity: {meta}"
     );
 
     // The recovered session loads with its real history, and the next seal
@@ -146,6 +162,11 @@ async fn touch_over_recoverable_seal_state_does_not_rearm_segment_replacement() 
     assert_eq!(loaded.messages.len(), 4, "all four visible rows load");
     assert_eq!(loaded.messages[0].content, "seed");
     assert_eq!(loaded.messages[3].content, "later");
+    let listed = mgr.list_top_level_sessions();
+    assert!(
+        listed.iter().any(|(id, _)| id == &key.0),
+        "the touched topic session is discoverable: {listed:?}"
+    );
 }
 
 #[tokio::test]
@@ -171,5 +192,69 @@ async fn touch_still_materializes_a_fresh_empty_session() {
             .iter()
             .any(|(id, _)| id == &key.0 || id.starts_with(&format!("{}#", key.0))),
         "the touched session is discoverable: {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn touch_over_noncontiguous_segments_keeps_the_fresh_zero_meta() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = SessionManager::open(tmp.path()).unwrap();
+    let base = "cli:e2e-gap";
+    let key = SessionKey(format!("{base}#research"));
+
+    // A lone 000002 with no 000001 is the loader's residue shape: the
+    // contiguous count is zero, so a fresh meta naming zero is truthful and
+    // the next seal rolls into 000001 without touching the strayed file.
+    // This pins the contiguity contract the recover-or-fresh decision rides
+    // on — counting non-contiguous files here would flip the touch into
+    // recovering from a directory the loader never loads.
+    let active = tmp
+        .path()
+        .join("users")
+        .join(octos_bus::session::encode_path_component(base))
+        .join("sessions")
+        .join("research.jsonl");
+    std::fs::create_dir_all(active.with_extension("segments")).unwrap();
+    std::fs::write(sealed_segment_path(&active, 2), "{\"row\":true}\n").unwrap();
+
+    mgr.touch_user_session(base, "research");
+
+    let meta_line = std::fs::read_to_string(&active).unwrap();
+    let meta = meta_line.split_once('\n').unwrap().0;
+    assert!(
+        meta.contains("\"sealed_segments\":0"),
+        "a noncontiguous segments dir leaves the fresh zero meta in place: {meta}"
+    );
+    let _loaded = mgr.load_full(&key).await.unwrap();
+    assert!(
+        sealed_segment_path(&active, 2).is_file(),
+        "the stray segment stays on disk"
+    );
+}
+
+/// The recovery-write failure path: when the recovered active file cannot be
+/// written, the touch leaves the state for the loader instead of falling
+/// back to the zeroed meta the deletion vector needs.
+#[cfg(unix)]
+#[tokio::test]
+async fn touch_with_unwritable_sessions_dir_leaves_the_state_for_the_loader() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = "cli:e2e-ro";
+    let (tmp, active, _real_history) = interrupted_seal_state(base).await;
+    let mgr = SessionManager::open(tmp.path()).unwrap();
+    let sessions_dir = active.parent().unwrap().to_path_buf();
+
+    std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    mgr.touch_user_session(base, "research");
+    std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        !active.exists(),
+        "the failed recovery does not fall back to the zeroed meta"
+    );
+    assert!(
+        sealed_segment_path(&active, 1).is_file(),
+        "the sealed history is untouched"
     );
 }

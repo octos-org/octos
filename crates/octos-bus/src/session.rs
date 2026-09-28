@@ -3052,6 +3052,12 @@ impl SessionManager {
     /// `list_user_sessions` can discover it.  Creates an empty JSONL
     /// (metadata-only) if the file does not already exist.
     ///
+    /// When the active file is missing but sealed segments sit beside it —
+    /// the interrupted-seal crash state — the touch recovers the active file
+    /// the same way a load does, so `/new <topic>` on a recoverable topic
+    /// resumes its history rather than starting empty. That matches `/new`
+    /// on an intact topic, which never erases either; erasing is `/clear`.
+    ///
     /// `base_key` must match the value passed to `list_user_sessions`
     /// (e.g. `"_main:telegram:8516089817"` or `"telegram:8516089817"`).
     pub fn touch_user_session(&self, base_key: &str, topic: &str) {
@@ -3082,7 +3088,9 @@ impl SessionManager {
             // that count does not name. Recover the active file exactly as
             // the loader would (#2597); if that recovery fails to write,
             // leave the state for the loader instead of falling back to the
-            // zeroed meta.
+            // zeroed meta. Like the loader's recovery, this write is not
+            // serialized against an in-flight seal by the persist lock —
+            // the same unsynchronized window the load path has always had.
             let dir = segments_dir(&path);
             if sealed_segment_count(&dir) > 0 {
                 let _ = recover_active_after_seal(&path, &SessionKey(session_key_str), &dir);
