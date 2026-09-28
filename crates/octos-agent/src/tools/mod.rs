@@ -809,7 +809,7 @@ pub trait Tool: Send + Sync {
 pub(crate) mod read_paging_probe;
 pub(crate) mod read_window;
 mod registry;
-pub use registry::ToolRegistry;
+pub use registry::{RESERVED_BUILTIN_TOOL_NAMES, ToolOrigin, ToolRegistry};
 
 // Tool policy
 pub mod policy;

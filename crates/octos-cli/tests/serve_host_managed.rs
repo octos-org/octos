@@ -257,6 +257,13 @@ mod serve_host_managed {
     /// A scripted OpenAI-compatible model: records the tool names of every
     /// request and answers "ok" (streamed or not).
     fn mock_model() -> (u16, std::sync::Arc<Mutex<Vec<Vec<String>>>>) {
+        mock_model_with_delay(Duration::ZERO)
+    }
+
+    #[cfg(feature = "api")]
+    /// [`mock_model`] that holds every completion for `delay` first, so a
+    /// turn stays running.
+    fn mock_model_with_delay(delay: Duration) -> (u16, std::sync::Arc<Mutex<Vec<Vec<String>>>>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -309,6 +316,7 @@ mod serve_host_managed {
                         })
                         .unwrap_or_default();
                     record.lock().unwrap().push(tools);
+                    std::thread::sleep(delay);
                     if request["stream"] == true {
                         let chunk = r#"{"id":"c1","object":"chat.completion.chunk","model":"mock-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}"#;
                         let done = r#"{"id":"c1","object":"chat.completion.chunk","model":"mock-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
@@ -328,6 +336,122 @@ mod serve_host_managed {
             }
         });
         (port, seen)
+    }
+
+    #[cfg(feature = "api")]
+    fn write_mock_profile(dir: &std::path::Path, model_port: u16) {
+        std::fs::create_dir_all(dir.join("profiles")).unwrap();
+        std::fs::write(
+            dir.join("profiles/_main.json"),
+            serde_json::json!({
+                "id": "_main", "name": "Main", "enabled": true,
+                "created_at": "2026-09-28T00:00:00Z", "updated_at": "2026-09-28T00:00:00Z",
+                "config": {"llm": {"primary": {"family_id": "local", "model_id": "mock-model",
+                    "route": {"base_url": format!("http://127.0.0.1:{model_port}/v1"), "api_type": "openai"}}}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "api")]
+    type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    #[cfg(feature = "api")]
+    async fn connect(port: u16, token: &str) -> Socket {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://127.0.0.1:{port}/api/ui-protocol/ws")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+
+    #[cfg(feature = "api")]
+    /// One JSON-RPC call; the response frame (result or error).
+    async fn rpc(
+        socket: &mut Socket,
+        id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let frame =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        socket
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .unwrap();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(60), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+                if value["id"] == id {
+                    return value;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "api")]
+    #[test]
+    fn serve_host_managed_refuses_an_external_turn_reusing_a_host_turn_id() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        // The model holds every completion, so the host's turn keeps running.
+        let (model_port, _seen) = mock_model_with_delay(Duration::from_secs(90));
+        write_mock_profile(dir.path(), model_port);
+        let mut child = command(dir.path(), &["--port", "0"]).spawn().unwrap();
+        send_tokens(&mut child);
+        let (port, _lines) = announced_port(&mut child);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let system = "_main:api:octosense#system";
+            let other = "_main:api:web#mine";
+            let host_turn = uuid::Uuid::now_v7().to_string();
+            let mut host = connect(port, HOST).await;
+            let opened = rpc(&mut host, "open", "session/open", serde_json::json!({"session_id": system, "profile_id": "_main"})).await;
+            assert!(opened.get("error").is_none(), "{opened}");
+            let started = rpc(&mut host, "turn", "turn/start", serde_json::json!({"session_id": system, "turn_id": host_turn, "input": [{"kind": "text", "text": "hello"}]})).await;
+            assert!(started.get("error").is_none(), "{started}");
+
+            let mut external = connect(port, EXTERNAL).await;
+            for (id, session) in [("open-other", other), ("open-system", system)] {
+                let opened = rpc(&mut external, id, "session/open", serde_json::json!({"session_id": session, "profile_id": "_main"})).await;
+                assert!(opened.get("error").is_none(), "{opened}");
+            }
+            // The host's turn id, reused in the external client's own session.
+            let reused = rpc(&mut external, "reuse", "turn/start", serde_json::json!({"session_id": other, "turn_id": host_turn, "input": [{"kind": "text", "text": "hi"}]})).await;
+            assert_eq!(reused["error"]["data"]["kind"], "turn_id_in_use", "{reused}");
+            // A turn on the busy shared conversation: refused, without the
+            // host turn's id.
+            let busy = rpc(&mut external, "busy", "turn/start", serde_json::json!({"session_id": system, "turn_id": uuid::Uuid::now_v7().to_string(), "input": [{"kind": "text", "text": "hi"}]})).await;
+            assert_eq!(busy["error"]["data"], serde_json::json!({"kind": "turn_in_progress"}), "{busy}");
+            // The host's turn cannot be steered or interrupted by id.
+            let steer = rpc(&mut external, "steer", "turn/steer", serde_json::json!({"session_id": system, "expected_turn_id": host_turn, "input": [{"kind": "text", "text": "leak"}]})).await;
+            assert_eq!(steer["error"]["data"]["kind"], "external_turn_denied", "{steer}");
+            let interrupt = rpc(&mut external, "interrupt", "turn/interrupt", serde_json::json!({"session_id": system, "turn_id": host_turn})).await;
+            assert_eq!(interrupt["error"]["data"]["kind"], "external_turn_denied", "{interrupt}");
+            // The host still owns and stops its turn.
+            let stopped = rpc(&mut host, "stop", "turn/interrupt", serde_json::json!({"session_id": system, "turn_id": host_turn})).await;
+            assert!(stopped.get("error").is_none(), "{stopped}");
+        });
+        drop(child.stdin.take());
+        if exits_within(&mut child, Duration::from_secs(30)).is_none() {
+            let _ = child.kill();
+        }
     }
 
     #[cfg(feature = "api")]
@@ -382,18 +506,7 @@ mod serve_host_managed {
         let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let (model_port, seen) = mock_model();
-        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
-        std::fs::write(
-            dir.path().join("profiles/_main.json"),
-            serde_json::json!({
-                "id": "_main", "name": "Main", "enabled": true,
-                "created_at": "2026-09-28T00:00:00Z", "updated_at": "2026-09-28T00:00:00Z",
-                "config": {"llm": {"primary": {"family_id": "local", "model_id": "mock-model",
-                    "route": {"base_url": format!("http://127.0.0.1:{model_port}/v1"), "api_type": "openai"}}}}
-            })
-            .to_string(),
-        )
-        .unwrap();
+        write_mock_profile(dir.path(), model_port);
         let mut child = command(dir.path(), &["--port", "0"]).spawn().unwrap();
         send_tokens(&mut child);
         let (port, _lines) = announced_port(&mut child);

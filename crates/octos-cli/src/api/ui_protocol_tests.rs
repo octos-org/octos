@@ -4148,6 +4148,7 @@ async fn stdio_shutdown_drain_waits_for_turn_finalization() {
     active_turns.lock().await.insert(
         session.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -4190,6 +4191,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
     active_turns.lock().await.insert(
         SessionKey("local:foreign".into()),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: TurnId::new(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -4214,6 +4216,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
     active_turns.lock().await.insert(
         session.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -17771,6 +17774,7 @@ async fn test_connection_turn(
 fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
+        owner: None,
         turn_id,
         profile_id: MAIN_PROFILE_ID.to_owned(),
         state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -20842,6 +20846,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Terminal(
@@ -20877,6 +20882,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: "someone-else".to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -20912,6 +20918,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -25715,6 +25722,7 @@ async fn session_rollback_rejects_when_turn_in_progress() {
         guard.insert(
             session_id.clone(),
             ActiveTurn {
+                owner: None,
                 turn_id: TurnId::new(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -27300,6 +27308,7 @@ async fn turn_state_get_returns_active_for_in_flight() {
         guard.insert(
             session_id.clone(),
             ActiveTurn {
+                owner: None,
                 turn_id: turn_id.clone(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -31785,6 +31794,7 @@ async fn open_peer_with_active_turn(
     let handle = tokio::spawn(async { std::future::pending::<()>().await });
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let entry = ActiveTurn {
+        owner: None,
         turn_id: TurnId::new(),
         profile_id: profile.to_owned(),
         state: turn_state.clone(),
@@ -40230,6 +40240,7 @@ fn synthetic_active_turn(
     let dummy_handle = tokio::spawn(async {});
     (
         ActiveTurn {
+            owner: None,
             turn_id: turn_id.clone(),
             profile_id: MAIN_PROFILE_ID.to_owned(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -45946,39 +45957,39 @@ async fn external_approval_respond(
     external: bool,
     session_id: SessionKey,
 ) -> (Value, tokio::sync::oneshot::Receiver<ApprovalDecision>) {
-    external_approval_respond_as(external.then(HashSet::new), session_id, true).await
+    external_approval_respond_as(external, session_id, true).await
 }
 
-/// `own_turn`: whether the pending approval belongs to a turn the external
-/// connection started (its id is in the connection's set).
+/// `own_turn`: whether the pending approval was raised by a turn of the
+/// answering connection (the server records the owner on the approval).
 async fn external_approval_respond_as(
-    external_turns: Option<HashSet<String>>,
+    external: bool,
     session_id: SessionKey,
     own_turn: bool,
 ) -> (Value, tokio::sync::oneshot::Receiver<ApprovalDecision>) {
     let temp = tempfile::tempdir().expect("tempdir");
     let state = state_with_sessions(temp.path());
     let (ws, mut rx) = ws_connection_for_test(32);
+    let (host_ws, _host_rx) = ws_connection_for_test(32);
     let ledger = Arc::new(UiProtocolLedger::new(32));
     let contracts = Arc::new(UiProtocolContractStores::default());
     let approval_id = ApprovalId::new();
+    // The same client-chosen turn id either way: ownership is the
+    // connection's, never the id's.
     let turn_id = TurnId::new();
-    let mut external_turns = external_turns;
-    if own_turn {
-        if let Some(turns) = external_turns.as_mut() {
-            turns.insert(turn_id.0.to_string());
-        }
-    }
-    let decision_rx = contracts
-        .approvals
-        .request_runtime(ApprovalRequestedEvent::generic(
+    let owner = if own_turn { &ws } else { &host_ws };
+    let decision_rx = contracts.approvals.request_runtime_owned(
+        ApprovalRequestedEvent::generic(
             session_id.clone(),
             approval_id.clone(),
             turn_id,
             "shell",
             "Run command",
             "cargo test",
-        ));
+        ),
+        Some(owner.connection_id().0),
+    );
+    let external_owner = external.then(|| ws.connection_id());
     let mut respond =
         ApprovalRespondParams::new(session_id.clone(), approval_id, ApprovalDecision::Approve);
     respond.approval_scope = Some("approve_for_session".into());
@@ -45988,12 +45999,12 @@ async fn external_approval_respond_as(
         &ledger,
         &contracts,
         Some(MAIN_PROFILE_ID),
-        external_turns.as_ref(),
+        external_owner,
         "respond".into(),
         respond,
     )
     .await;
-    if external_turns.is_some() {
+    if external {
         assert!(
             contracts.scopes.list_for_session(&session_id).is_empty(),
             "an external answer never records a session-wide scope"
@@ -46031,8 +46042,7 @@ async fn should_let_the_host_answer_a_host_owned_peer_approval() {
 async fn should_let_an_external_client_answer_only_its_own_turns_approvals_once() {
     let session = host_managed_peer_session("system");
     // A host turn's approval on the shared system conversation: refused.
-    let (reply, mut decision) =
-        external_approval_respond_as(Some(HashSet::new()), session.clone(), false).await;
+    let (reply, mut decision) = external_approval_respond_as(true, session.clone(), false).await;
     assert_eq!(
         reply["error"]["data"]["kind"],
         json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
@@ -46043,7 +46053,7 @@ async fn should_let_an_external_client_answer_only_its_own_turns_approvals_once(
         "the host's approval stays pending"
     );
     // Its own turn's approval: answered, once (no scope recorded).
-    let (reply, decision) = external_approval_respond_as(Some(HashSet::new()), session, true).await;
+    let (reply, decision) = external_approval_respond_as(true, session, true).await;
     assert!(reply.get("error").is_none(), "{reply}");
     assert_eq!(decision.await.unwrap(), ApprovalDecision::Approve);
 }
@@ -46067,12 +46077,11 @@ async fn should_refuse_an_external_answer_to_a_host_owned_peer_question() {
         }]
     };
     let (ws, mut rx) = ws_connection_for_test(32);
-    let empty = HashSet::new();
     handle_user_question_respond(
         &ws,
         &contracts,
         Some(MAIN_PROFILE_ID),
-        Some(&empty),
+        Some(ws.connection_id()),
         "q".into(),
         UserQuestionRespondParams::new(session_id.clone(), question_id.clone(), answer()),
     )
@@ -46149,4 +46158,212 @@ fn stdio_default_feature_list_matches_the_stdio_defaults() {
         true,
     );
     assert_eq!(requested, ConnectionUiFeatures::stdio_defaults());
+}
+
+fn owned_active_turn(turn_id: &TurnId, owner: ConnectionId) -> ActiveTurn {
+    let (mut entry, _buffer) = synthetic_active_turn(turn_id, true);
+    entry.owner = Some(owner);
+    entry
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_let_an_external_client_steer_and_interrupt_only_turns_it_owns() {
+    let host_session = host_managed_peer_session("system");
+    let own_session = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web", "mine");
+    // The same client-chosen turn id in both sessions: ownership is the
+    // connection's, never the id's.
+    let turn_id = TurnId::new();
+    let (host_ws, _host_rx) = ws_connection_for_test(32);
+    let (ws, mut rx) = ws_connection_for_test(32);
+    ws.set_external(true);
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    active_turns.lock().await.insert(
+        host_session.clone(),
+        owned_active_turn(&turn_id, host_ws.connection_id()),
+    );
+    active_turns.lock().await.insert(
+        own_session.clone(),
+        owned_active_turn(&turn_id, ws.connection_id()),
+    );
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let steer = |session: &SessionKey, id: &str| {
+        steer_request(
+            id,
+            json!({
+                "session_id": session,
+                "expected_turn_id": turn_id,
+                "input": [{ "kind": "text", "text": "steer" }],
+            }),
+        )
+    };
+    for (session, id, owned) in [
+        (&host_session, "steer-host", false),
+        (&own_session, "steer-own", true),
+    ] {
+        handle_turn_steer(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active_turns,
+            &connection_turns,
+            Some(MAIN_PROFILE_ID),
+            ConnectionUiFeatures::stdio_defaults(),
+            id.into(),
+            &steer(session, id),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        if owned {
+            assert_eq!(frame["result"]["steered"], true, "{frame}");
+        } else {
+            assert_eq!(
+                frame["error"]["data"]["kind"],
+                json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+                "{frame}"
+            );
+        }
+    }
+    let host_steer = active_turns.lock().await[&host_session]
+        .steer
+        .clone()
+        .expect("steerable");
+    assert!(
+        host_steer.drain().is_empty(),
+        "the host's turn was not steered"
+    );
+
+    handle_turn_interrupt(
+        &ws,
+        &ledger,
+        &active_turns,
+        &contracts,
+        "interrupt-host".into(),
+        TurnInterruptParams {
+            session_id: host_session.clone(),
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{frame}"
+    );
+    let state_now = active_turns.lock().await[&host_session].state.clone();
+    assert!(
+        matches!(*state_now.lock().await, TurnState::Active),
+        "the host's turn keeps running"
+    );
+}
+
+#[tokio::test]
+async fn should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_server() {
+    let first = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "octosense", "system");
+    let second = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web", "mine");
+    let turn_id = TurnId::new();
+    let (host_ws, _rx) = ws_connection_for_test(8);
+    let mut active = HashMap::new();
+    active.insert(
+        first.clone(),
+        owned_active_turn(&turn_id, host_ws.connection_id()),
+    );
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &turn_id, true).await,
+        Some(TurnAdmissionRefusal::TurnIdInUse)
+    );
+    // Only in host-managed mode; a fresh id is admitted either way.
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &turn_id, false).await,
+        None
+    );
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &TurnId::new(), true).await,
+        None
+    );
+    assert_eq!(
+        turn_admission_refusal(&active, &first, &TurnId::new(), true).await,
+        Some(TurnAdmissionRefusal::Occupied(turn_id.clone()))
+    );
+    // A finished turn frees its id.
+    *active[&first].state.lock().await = TurnState::Terminal(TerminalReason::Completed);
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &turn_id, true).await,
+        None
+    );
+    // The refusals as the wire shows them: an external client never learns
+    // the id of the turn that holds a session.
+    let external =
+        serde_json::to_value(TurnAdmissionRefusal::Occupied(turn_id.clone()).into_error(true))
+            .unwrap();
+    assert_eq!(external["data"], json!({ "kind": "turn_in_progress" }));
+    let host =
+        serde_json::to_value(TurnAdmissionRefusal::Occupied(turn_id.clone()).into_error(false))
+            .unwrap();
+    assert_eq!(
+        host["data"]["turn_id"],
+        serde_json::to_value(&turn_id).unwrap()
+    );
+    let in_use = serde_json::to_value(TurnAdmissionRefusal::TurnIdInUse.into_error(true)).unwrap();
+    assert_eq!(in_use["data"], json!({ "kind": TURN_ID_IN_USE }));
+}
+
+#[tokio::test]
+async fn should_let_an_external_client_answer_only_its_own_turns_questions() {
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = host_managed_peer_session("system");
+    let turn_id = TurnId::new();
+    let (host_ws, _host_rx) = ws_connection_for_test(32);
+    let (ws, mut rx) = ws_connection_for_test(32);
+    let answer = || {
+        vec![UserQuestionAnswer {
+            selected_labels: vec!["axum".into()],
+            free_text: None,
+        }]
+    };
+    // The host's question and the external client's, same turn id.
+    let host_question = QuestionId::new();
+    let mut host_waiter = contracts.user_questions.request_runtime_owned(
+        sample_pending_question(session_id.clone(), host_question.clone(), turn_id.clone()),
+        Some(host_ws.connection_id().0),
+    );
+    let own_question = QuestionId::new();
+    let _own_waiter = contracts.user_questions.request_runtime_owned(
+        sample_pending_question(session_id.clone(), own_question.clone(), turn_id),
+        Some(ws.connection_id().0),
+    );
+    handle_user_question_respond(
+        &ws,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        Some(ws.connection_id()),
+        "q-host".into(),
+        UserQuestionRespondParams::new(session_id.clone(), host_question, answer()),
+    )
+    .await;
+    let reply = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        reply["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{reply}"
+    );
+    assert!(
+        host_waiter.try_recv().is_err(),
+        "the host's question stays pending"
+    );
+    handle_user_question_respond(
+        &ws,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        Some(ws.connection_id()),
+        "q-own".into(),
+        UserQuestionRespondParams::new(session_id, own_question, answer()),
+    )
+    .await;
+    let reply = recv_rpc_json(&mut rx).await;
+    assert!(reply.get("error").is_none(), "{reply}");
 }

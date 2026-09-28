@@ -74,38 +74,59 @@ An external identity:
   `external_parameter_denied`. `session.workspace_cwd.v1` is never negotiated
   for it, so its sessions stay in the workspace octos bound them to (for a
   new session, `<data dir>/users/<session>/workspace`);
-- steers (`turn/steer` with `expected_turn_id`), interrupts, and answers
-  approvals and questions only for turns its own connection started:
-  `external_turn_denied` for the host's turns on a shared conversation. Its
-  approval answers are once-only; it never records an approval scope;
+- steers, interrupts, and answers approvals and questions only for turns its
+  own connection started: `external_turn_denied` for any other turn, such as
+  the host's on a shared conversation. Ownership is the connection's, never
+  the turn id's (turn ids are client-chosen): the server records the starting
+  connection on the running turn and on every approval and question that turn
+  raises, and checks it on `turn/steer`, `turn/interrupt`, `approval/respond`
+  and `user_question/respond`. Its approval answers are once-only; it never
+  records an approval scope;
+- learns no other turn's id from a refusal: a `turn/start` on a session that
+  is already running a turn fails with `data.kind: "turn_in_progress"` and no
+  `data.turn_id` (the host's connection still gets it);
 - never runs background continuations (the system agent's wakes, loops and
   goals); the host's connection or the global drain runs them with the
   full tool set;
 - names no profile but `_main`: any `profile_id` (at any depth) or session
   key of another profile is refused (`external_profile_denied`);
-- starts turns with a fixed set of built-in tools only (default-deny):
+- starts turns with a fixed set of compiled-in tools only (default-deny):
   `read_file`, `write_file`, `edit_file`, `diff_edit`, `apply_patch`, `glob`,
   `grep`, `list_dir`, `code_structure`, `check_workspace_contract`, `web_search`, `web_fetch`,
   `ask_user_question`, `recall`, `recall_memory`, `memory_search`,
   `memory_load`, `view_image`, `view_video` and `tool_search`. The filter is
   applied to the finished per-turn registry, after every tool the turn
-  builder adds (`spawn`, `peer_*`, `send_file`, task tools, MCP, plugins).
-  No command or code execution (the `workspace_*` git tools included),
+  builder adds (`spawn`, `peer_*`, `send_file`, task tools, MCP, plugins),
+  and it checks each tool's origin, not only its name: the registry records
+  whether a tool is compiled in, a plugin's or an MCP server's, and only a
+  compiled-in tool survives. A plugin or MCP tool named `memory_search` (or
+  any other allowlisted name) is dropped. Plugins may not register a
+  compiled-in tool's name at all, and MCP tools may not shadow one. No
+  command or code execution (the `workspace_*` git tools included),
   delegation, administration, peers, MCP server or plugin tool, whatever its
   name. The memory tools read the system agent's own memory, not the apps'.
   The model cannot reach the apps' assistants or the host's processes
   through such a turn;
+
+On a host-managed server a live turn id is also unique across sessions, for
+every connection: a `turn/start` or `review/start` reusing the id of a turn
+still running in another session fails with `data.kind: "turn_id_in_use"`
+(retry with a fresh id).
 
 For every session, no file tool opens a process's private view, however it
 is spelled: `/proc/self`, `/proc/thread-self` or `/proc/<pid>` and anything
 under them (environment, command line, `fd/`, `root/`, …), or `/dev/fd` and
 `/dev/std*`. The raw path, its normalization and its canonical target are all
 judged, so `..` and workspace symlinks cannot reach them. The shell policy
-refuses commands naming `/proc/<pid>/environ` or `cmdline`. `web_fetch` and
-the search tools go through the shared SSRF check (`octos_research::net`):
-loopback (including this server's own port), private, link-local and metadata
-addresses are refused, each redirect hop is re-checked, and DNS answers are
-pinned.
+also refuses commands that name a process's `/proc/<pid>` view, reading their
+words as paths (quotes dropped, `..` folded, globs such as `/pro[c]/1/env*`
+and `cd /proc && cat 1/environ` followed). That check is best-effort defense
+in depth: a shell can always build a path it cannot see. The control for
+external clients is that their turns have no shell or code execution at all.
+`web_fetch` and the search tools go through the shared SSRF check
+(`octos_research::net`): loopback (including this server's own port),
+private, link-local and metadata addresses are refused, each redirect hop is
+re-checked, and DNS answers are pinned.
 
 ## Network guards
 

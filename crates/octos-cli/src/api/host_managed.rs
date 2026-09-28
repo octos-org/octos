@@ -246,7 +246,6 @@ pub fn external_gate(
     method: &str,
     params: &serde_json::Value,
     opened_sessions: &std::collections::HashSet<String>,
-    own_turns: &std::collections::HashSet<String>,
 ) -> Result<(), octos_core::ui_protocol::RpcError> {
     use octos_core::ui_protocol::RpcError;
     if !EXTERNAL_ALLOWED_METHODS.contains(&method) {
@@ -280,19 +279,11 @@ pub fn external_gate(
         ))
         .with_data(serde_json::json!({ "kind": HOST_OWNED_PEER_SESSION_DENIED })));
     }
-    // Turn control only for this connection's own turns: the shared system
-    // conversation also runs the host's turns.
-    let turn_param = match method {
-        "turn/interrupt" => Some("turn_id"),
-        "turn/steer" => Some("expected_turn_id"),
-        _ => None,
-    };
-    if let Some(key) = turn_param {
-        let turn = params.get(key).and_then(serde_json::Value::as_str);
-        if !turn.is_some_and(|turn| own_turns.contains(turn)) {
-            return Err(external_turn_denied(method));
-        }
-    }
+    // Turn control and answers only for this connection's own turns (the
+    // shared system conversation also runs the host's turns) are decided by
+    // the handlers against the owner the server recorded, never against a
+    // client-chosen turn id: `turn/interrupt`, `turn/steer`,
+    // `approval/respond` and `user_question/respond`.
     if EXTERNAL_ANSWER_METHODS.contains(&method) {
         let session = params.get("session_id").and_then(serde_json::Value::as_str);
         if !session.is_some_and(|session| opened_sessions.contains(session)) {
@@ -336,6 +327,14 @@ pub const EXTERNAL_TURN_TOOLS: &[&str] = &[
 /// Whether an external turn keeps the tool `name` ([`EXTERNAL_TURN_TOOLS`]).
 pub fn external_turn_tool_allowed(name: &str) -> bool {
     EXTERNAL_TURN_TOOLS.contains(&name)
+}
+
+/// Confine an external turn's finished registry: only compiled-in tools
+/// ([`octos_agent::ToolOrigin::Builtin`]) named in [`EXTERNAL_TURN_TOOLS`]
+/// survive. The names alone would not do: a plugin or MCP server can offer a
+/// tool under an allowlisted name.
+pub fn confine_external_turn_tools(registry: &mut octos_agent::ToolRegistry) {
+    registry.retain_builtin(external_turn_tool_allowed);
 }
 
 /// Host-managed authentication and lifecycle state (`AppState::host_managed`).

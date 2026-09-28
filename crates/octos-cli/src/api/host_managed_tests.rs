@@ -450,7 +450,6 @@ fn should_allow_external_clients_only_the_allowlisted_methods() {
     }
     let opened: std::collections::HashSet<String> = ["_main:api:web".to_owned()].into();
     let params = json!({"session_id": "_main:api:web", "turn_id": "t1", "expected_turn_id": "t1"});
-    let own_turns: std::collections::HashSet<String> = ["t1".to_owned()].into();
     // Every dispatched method is refused unless it is on the allowlist.
     let mut sensitive = supported.clone();
     sensitive.extend([
@@ -464,14 +463,14 @@ fn should_allow_external_clients_only_the_allowlisted_methods() {
         "session/workspace.get",
     ]);
     for method in sensitive {
-        let allowed = external_gate(method, &params, &opened, &own_turns).is_ok();
+        let allowed = external_gate(method, &params, &opened).is_ok();
         assert_eq!(
             allowed,
             EXTERNAL_ALLOWED_METHODS.contains(&method),
             "{method}"
         );
         if !allowed {
-            let error = external_gate(method, &params, &opened, &own_turns).unwrap_err();
+            let error = external_gate(method, &params, &opened).unwrap_err();
             assert_eq!(
                 error.data.unwrap()["kind"],
                 json!(EXTERNAL_METHOD_DENIED),
@@ -492,10 +491,7 @@ fn should_allow_external_clients_only_the_allowlisted_methods() {
         "server/shutdown",
         "profile/local/create",
     ] {
-        assert!(
-            external_gate(method, &params, &opened, &std::collections::HashSet::new()).is_err(),
-            "{method}"
-        );
+        assert!(external_gate(method, &params, &opened).is_err(), "{method}");
     }
 }
 
@@ -524,8 +520,7 @@ fn should_refuse_external_calls_on_host_owned_peer_sessions() {
                 kind(external_gate(
                     method,
                     &json!({"session_id": session}),
-                    &opened,
-                    &std::collections::HashSet::new()
+                    &opened
                 )),
                 json!(HOST_OWNED_PEER_SESSION_DENIED),
                 "{method}"
@@ -535,8 +530,7 @@ fn should_refuse_external_calls_on_host_owned_peer_sessions() {
             kind(external_gate(
                 "approval/respond",
                 &json!({"session_id": session}),
-                &opened,
-                &std::collections::HashSet::new()
+                &opened
             )),
             json!(HOST_OWNED_PEER_ANSWER_DENIED)
         );
@@ -546,8 +540,7 @@ fn should_refuse_external_calls_on_host_owned_peer_sessions() {
         kind(external_gate(
             "approval/respond",
             &json!({"session_id": "_main:api:other"}),
-            &opened,
-            &std::collections::HashSet::new()
+            &opened
         )),
         json!(EXTERNAL_SESSION_NOT_OPENED)
     );
@@ -556,8 +549,7 @@ fn should_refuse_external_calls_on_host_owned_peer_sessions() {
         external_gate(
             "approval/respond",
             &json!({"session_id": "_main:api:octosense#system"}),
-            &mine,
-            &std::collections::HashSet::new()
+            &mine
         )
         .is_ok()
     );
@@ -565,8 +557,7 @@ fn should_refuse_external_calls_on_host_owned_peer_sessions() {
         external_gate(
             "turn/start",
             &json!({"session_id": "_main:api:octosense#system"}),
-            &mine,
-            &std::collections::HashSet::new()
+            &mine
         )
         .is_ok()
     );
@@ -620,8 +611,7 @@ fn should_confine_external_calls_to_the_main_profile_at_any_depth() {
         kind(external_gate(
             "session/status/read",
             &json!({"profile_id": "dev"}),
-            &none,
-            &std::collections::HashSet::new()
+            &none
         )),
         json!(EXTERNAL_PROFILE_DENIED)
     );
@@ -629,8 +619,7 @@ fn should_confine_external_calls_to_the_main_profile_at_any_depth() {
         kind(external_gate(
             "session/open",
             &json!({"session_id": "dev:api:x"}),
-            &none,
-            &std::collections::HashSet::new()
+            &none
         )),
         json!(EXTERNAL_PROFILE_DENIED)
     );
@@ -638,8 +627,7 @@ fn should_confine_external_calls_to_the_main_profile_at_any_depth() {
         external_gate(
             "session/status/read",
             &json!({"profile_id": "_main"}),
-            &none,
-            &std::collections::HashSet::new()
+            &none
         )
         .is_ok()
     );
@@ -648,8 +636,7 @@ fn should_confine_external_calls_to_the_main_profile_at_any_depth() {
         kind(external_gate(
             "turn/start",
             &json!({"session_id": "_main:api:web", "context": {"target": {"session_id": "_main:api:octosense#peer-rinx"}}}),
-            &none,
-            &std::collections::HashSet::new()
+            &none
         )),
         json!(HOST_OWNED_PEER_SESSION_DENIED)
     );
@@ -657,8 +644,7 @@ fn should_confine_external_calls_to_the_main_profile_at_any_depth() {
         kind(external_gate(
             "turn/start",
             &json!({"sessions": ["_main:api:octosense#peerctx-rinx.a"]}),
-            &none,
-            &std::collections::HashSet::new()
+            &none
         )),
         json!(HOST_OWNED_PEER_SESSION_DENIED)
     );
@@ -694,7 +680,7 @@ fn should_catch_peer_topics_sandbox_overrides_and_local_media() {
         json!({"session_id": "_main:api:octosense", "TOPIC": " PeerCtx-rinx.a"}),
     ] {
         assert_eq!(
-            kind(external_gate("session/open", &params, &none, &none)),
+            kind(external_gate("session/open", &params, &none)),
             json!(EXTERNAL_PARAMETER_DENIED),
             "{params}"
         );
@@ -706,7 +692,7 @@ fn should_catch_peer_topics_sandbox_overrides_and_local_media() {
         json!({"session": ["_main:api:octosense#peerctx-rinx.a"]}),
     ] {
         assert_eq!(
-            kind(external_gate("session/hydrate", &params, &none, &none)),
+            kind(external_gate("session/hydrate", &params, &none)),
             json!(HOST_OWNED_PEER_SESSION_DENIED),
             "{params}"
         );
@@ -715,29 +701,9 @@ fn should_catch_peer_topics_sandbox_overrides_and_local_media() {
         kind(external_gate(
             "session/open",
             &json!({"session_id": "_main:api:web", "cwd": "/tmp"}),
-            &none,
             &none
         )),
         json!(EXTERNAL_PARAMETER_DENIED)
-    );
-    // Turn control only for this connection's own turns.
-    assert_eq!(
-        kind(external_gate(
-            "turn/interrupt",
-            &json!({"session_id": "_main:api:web", "turn_id": "host-turn"}),
-            &none,
-            &none
-        )),
-        json!(super::EXTERNAL_TURN_DENIED)
-    );
-    assert_eq!(
-        kind(external_gate(
-            "turn/steer",
-            &json!({"session_id": "_main:api:web", "input": []}),
-            &none,
-            &none
-        )),
-        json!(super::EXTERNAL_TURN_DENIED)
     );
     for params in [
         json!({"session_id": "_main:api:web", "sandbox": {"read_allow_paths": ["/"]}}),
@@ -751,12 +717,7 @@ fn should_catch_peer_topics_sandbox_overrides_and_local_media() {
             "session/open"
         };
         assert_eq!(
-            kind(external_gate(
-                method,
-                &params,
-                &none,
-                &std::collections::HashSet::new()
-            )),
+            kind(external_gate(method, &params, &none)),
             json!(EXTERNAL_PARAMETER_DENIED),
             "{params}"
         );
@@ -764,8 +725,7 @@ fn should_catch_peer_topics_sandbox_overrides_and_local_media() {
     assert!(external_gate(
         "turn/start",
         &json!({"session_id": "_main:api:web", "turn_id": "t", "input": [], "media": [{"path": "up/abc/photo.png", "mime": "image/png", "size_bytes": 1}]}),
-        &none,
-    &std::collections::HashSet::new())
+        &none)
     .is_ok());
 }
 
@@ -903,4 +863,50 @@ async fn should_audit_the_pairing_ceremony_without_the_code() {
         "{audit}"
     );
     assert!(!audit.contains(&code) && !audit.contains(EXTERNAL) && !audit.contains(HOST));
+}
+
+#[test]
+fn should_drop_plugin_and_mcp_tools_with_allowlisted_names_from_an_external_turn() {
+    use octos_agent::{Tool, ToolOrigin, ToolRegistry, ToolResult};
+
+    struct Impostor(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for Impostor {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "not the built-in"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult::default())
+        }
+    }
+
+    let workspace = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::with_builtins(workspace.path());
+    assert_eq!(registry.origin("read_file"), Some(ToolOrigin::Builtin));
+    // An MCP server's and a plugin's tool, each under an allowlisted name.
+    registry.register_with_origin(Impostor("memory_search"), ToolOrigin::Mcp);
+    registry.mark_as_plugin("memory_load");
+    registry.register(Impostor("memory_load"));
+    super::confine_external_turn_tools(&mut registry);
+    assert!(
+        registry.get("memory_search").is_none(),
+        "an MCP memory_search never reaches an external turn"
+    );
+    assert!(
+        registry.get("memory_load").is_none(),
+        "a plugin memory_load never reaches an external turn"
+    );
+    assert!(registry.get("read_file").is_some());
+    assert!(registry.get("shell").is_none());
+    for name in registry.tool_names() {
+        assert!(super::external_turn_tool_allowed(&name), "{name}");
+        assert_eq!(registry.origin(&name), Some(ToolOrigin::Builtin), "{name}");
+    }
 }

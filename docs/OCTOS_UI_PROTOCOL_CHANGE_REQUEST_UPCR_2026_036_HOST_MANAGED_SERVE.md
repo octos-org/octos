@@ -8,8 +8,11 @@
 - Status: implemented
 - Scope: transport authentication (a WebSocket bearer subprotocol) on every
   server; for `octos serve --host-managed` only, the external-client identity,
-  its refusal to answer host-owned app peers, and the unavailability of
-  `server/shutdown`. No method, event or field is added or removed.
+  its refusal to answer host-owned app peers, turn ownership, and the
+  unavailability of `server/shutdown`. No method, event or field is added or
+  removed. Revised after the post-merge review: turn ownership is the
+  connection's (not the turn id's), a live turn id is unique across sessions,
+  and `turn_in_progress` omits `data.turn_id` for external clients.
 - Origin: OctoSense shells share one kernel between native apps and an
   external web or terminal client (see `docs/HOST_MANAGED_SERVE.md`).
 
@@ -85,10 +88,15 @@ Moreover:
 - a `sandbox` override, a `cwd`, any key containing `topic`, or turn `media`
   that are not upload handles fail with `external_parameter_denied`;
   `session.workspace_cwd.v1` is never negotiated for such a connection;
-- `turn/interrupt` (`turn_id`), `turn/steer` (`expected_turn_id`),
-  `approval/respond` and `user_question/respond` are accepted only for turns
-  this connection started (`external_turn_denied`), and an external
-  approval never records an approval scope;
+- `turn/interrupt`, `turn/steer`, `approval/respond` and
+  `user_question/respond` are accepted only for turns this connection started
+  (`external_turn_denied`). Turn ids are client-chosen, so ownership is never
+  inferred from one: the server records the starting connection on the
+  running turn and on each approval and question the turn raises, and checks
+  that. An external approval never records an approval scope;
+- a `turn/start` refused because the session already runs a turn carries
+  `data: {"kind": "turn_in_progress"}` without the running turn's
+  `turn_id` (the host's connection still receives `turn_id`);
 - an external connection drains no background continuations;
 - a call naming a profile other than `_main` (a `profile_id` at any depth,
   or another profile's session key) fails with `external_profile_denied`;
@@ -97,7 +105,16 @@ Moreover:
   per-turn registry (default-deny: no command or code execution, git,
   delegation, administration, peers, `send_file`, task, MCP or plugin tools),
   so the model cannot drive the host-owned peers or read the host's
-  processes through it.
+  processes through it. The filter checks each tool's recorded origin as
+  well as its name: only compiled-in tools survive, so a plugin or MCP tool
+  under an allowlisted name (say `memory_search`) is dropped.
+
+### Unique live turn ids (every connection)
+
+On a host-managed server, a `turn/start` or `review/start` whose `turn_id`
+names a turn still running in another session fails with
+`invalid_request`, `data: {"kind": "turn_id_in_use"}`; the client retries
+with a fresh id. A finished turn frees its id. Other servers are unchanged.
 
 This extends UPCR-2026-034's "Approvals belong to the person" from the owning
 system agent to external clients, and keeps the apps' memory and workspaces
@@ -149,6 +166,22 @@ never enables. The host stops the server by closing its stdin.
 - `should_catch_peer_topics_sandbox_overrides_and_local_media`
 - `should_refuse_an_external_session_open_in_a_foreign_workspace`
 - `should_let_an_external_client_answer_only_its_own_turns_approvals_once`
+  (the same turn id on the host's approval: still refused)
+- `should_let_an_external_client_answer_only_its_own_turns_questions`
+- `should_let_an_external_client_steer_and_interrupt_only_turns_it_owns`
+- `should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_server`
+  (also the `turn_in_progress` payload with and without `turn_id`)
+- `should_drop_plugin_and_mcp_tools_with_allowlisted_names_from_an_external_turn`
+- `tests/serve_host_managed.rs`
+  `serve_host_managed_refuses_an_external_turn_reusing_a_host_turn_id`: over
+  the real socket, an external client that reuses the running host turn's id
+  in another session is refused (`turn_id_in_use`), and cannot steer or
+  interrupt the host's turn
+- octos-agent: `should_record_where_each_tool_came_from`,
+  `should_keep_only_builtin_tools_whatever_their_names`,
+  `should_refuse_a_plugin_tool_named_like_a_builtin`,
+  `protected_names_cover_every_reserved_builtin`,
+  `should_deny_process_secrets_behind_globs_and_relative_paths`
 - `tests/serve_host_managed.rs`
   `serve_host_managed_gives_an_external_turn_only_the_allowlisted_tools`:
   a real WS turn on `#system` with a scripted model; the model receives

@@ -124,6 +124,61 @@ fn estimate_json_size(value: &serde_json::Value) -> usize {
     }
 }
 
+/// Where a registered tool came from.
+///
+/// Compiled-in tools are [`ToolOrigin::Builtin`]; tools a plugin binary or an
+/// MCP server provides are not, whatever their names. A caller that trusts
+/// only compiled-in behaviour (for example the external-client turns of
+/// `octos serve --host-managed`) filters on [`ToolRegistry::origin`], never on
+/// a name alone: a name says nothing about who implements it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolOrigin {
+    /// Compiled into this binary.
+    Builtin,
+    /// Provided by a plugin binary (see [`ToolRegistry::mark_as_plugin`]).
+    Plugin,
+    /// Provided by an MCP server.
+    Mcp,
+}
+
+/// Names of compiled-in tools that no plugin may register (and no MCP server
+/// may shadow, see `McpClient::PROTECTED_NAMES`): the core file, shell, web,
+/// memory, messaging and delegation tools, and every tool an external client
+/// of `octos serve --host-managed` keeps.
+pub const RESERVED_BUILTIN_TOOL_NAMES: &[&str] = &[
+    "shell",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "diff_edit",
+    "apply_patch",
+    "glob",
+    "grep",
+    "list_dir",
+    "code_structure",
+    "check_workspace_contract",
+    "web_search",
+    "web_fetch",
+    "browser",
+    "git",
+    "message",
+    "send_file",
+    "spawn",
+    "spawn_agent",
+    "delegate",
+    "ask_user_question",
+    "save_memory",
+    "recall",
+    "recall_memory",
+    "record_memory_use",
+    "memory_search",
+    "memory_load",
+    "view_image",
+    "view_video",
+    "tool_search",
+    "configure_tool",
+];
+
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -146,6 +201,10 @@ pub struct ToolRegistry {
     cached_specs: std::sync::Mutex<Option<Vec<ToolSpec>>>,
     /// Tool names that came from plugin binaries (for auto-send hook filtering).
     plugin_tools: HashSet<String>,
+    /// Origin of every registered tool that is NOT [`ToolOrigin::Builtin`].
+    /// Absent means built in. A name marked as a plugin stays non-built-in
+    /// even when something registers over it (fail closed).
+    non_builtin_origins: HashMap<String, ToolOrigin>,
     /// Live MCP transport handles, owned for the registry's whole lifetime.
     ///
     /// `McpService` is an `Arc<RunningService<..>>` and every `McpTool` holds a
@@ -249,6 +308,7 @@ impl ToolRegistry {
             active_context: None,
             cached_specs: std::sync::Mutex::new(None),
             plugin_tools: HashSet::new(),
+            non_builtin_origins: HashMap::new(),
             mcp_services: Vec::new(),
             spawn_only: HashSet::new(),
             spawn_only_messages: HashMap::new(),
@@ -547,10 +607,38 @@ impl ToolRegistry {
         self.plugin_tools.contains(name)
     }
 
-    /// Register a tool.
+    /// Register a compiled-in tool ([`ToolOrigin::Builtin`], unless the name
+    /// was marked as a plugin's with [`Self::mark_as_plugin`]).
     pub fn register(&mut self, tool: impl Tool + 'static) {
+        self.register_arc_as(Arc::new(tool), ToolOrigin::Builtin);
+    }
+
+    /// Register a tool from an existing Arc (for keeping a separate reference).
+    /// Origin as for [`Self::register`].
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
+        self.register_arc_as(tool, ToolOrigin::Builtin);
+    }
+
+    /// Register a tool with an explicit origin. The origin does not touch
+    /// [`Self::is_plugin`] (which only [`Self::mark_as_plugin`] sets), and a
+    /// name marked as a plugin's stays [`ToolOrigin::Plugin`].
+    pub fn register_with_origin(&mut self, tool: impl Tool + 'static, origin: ToolOrigin) {
+        self.register_arc_as(Arc::new(tool), origin);
+    }
+
+    /// [`Self::register_with_origin`] for an existing Arc.
+    pub fn register_arc_with_origin(&mut self, tool: Arc<dyn Tool>, origin: ToolOrigin) {
+        self.register_arc_as(tool, origin);
+    }
+
+    fn register_arc_as(&mut self, tool: Arc<dyn Tool>, origin: ToolOrigin) {
         let name = tool.name().to_string();
-        let tool: Arc<dyn Tool> = Arc::new(tool);
+        let origin = if self.plugin_tools.contains(&name) {
+            ToolOrigin::Plugin
+        } else {
+            origin
+        };
+        self.set_origin(&name, origin);
         self.tools.insert(name.clone(), tool.clone());
         if name == "spawn" {
             let spawn_agent: Arc<dyn Tool> = Arc::new(SpawnAgentTool::with_delegate(tool));
@@ -565,26 +653,52 @@ impl ToolRegistry {
                     spawn_agent,
                 )),
             );
+            // The aliases wrap `spawn`: they share its origin.
+            self.set_origin("spawn_agent", origin);
+            self.set_origin("delegate", origin);
         }
         self.invalidate_cache();
     }
 
-    /// Register a tool from an existing Arc (for keeping a separate reference).
-    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
-        let name = tool.name().to_string();
-        self.tools.insert(name.clone(), tool.clone());
-        if name == "spawn" {
-            let spawn_agent: Arc<dyn Tool> = Arc::new(SpawnAgentTool::with_delegate(tool));
-            self.tools
-                .insert("spawn_agent".to_string(), spawn_agent.clone());
-            self.tools.insert(
-                "delegate".to_string(),
-                Arc::new(super::coding_tools::DelegateAliasTool::with_spawn_agent(
-                    spawn_agent,
-                )),
-            );
+    fn set_origin(&mut self, name: &str, origin: ToolOrigin) {
+        if origin == ToolOrigin::Builtin {
+            self.non_builtin_origins.remove(name);
+        } else {
+            self.non_builtin_origins.insert(name.to_string(), origin);
         }
-        self.invalidate_cache();
+    }
+
+    /// Where the registered tool `name` came from; `None` when no such tool
+    /// is registered.
+    pub fn origin(&self, name: &str) -> Option<ToolOrigin> {
+        self.tools.contains_key(name).then(|| {
+            self.non_builtin_origins
+                .get(name)
+                .copied()
+                .unwrap_or(ToolOrigin::Builtin)
+        })
+    }
+
+    /// Whether `name` belongs to a compiled-in tool: a reserved built-in name
+    /// ([`RESERVED_BUILTIN_TOOL_NAMES`]) or a built-in already registered
+    /// here. A plugin must not register such a name.
+    pub fn is_builtin_name(&self, name: &str) -> bool {
+        RESERVED_BUILTIN_TOOL_NAMES.contains(&name)
+            || self.origin(name) == Some(ToolOrigin::Builtin)
+    }
+
+    /// Keep only compiled-in tools ([`ToolOrigin::Builtin`]) for which `keep`
+    /// holds. A plugin or MCP tool never survives, whatever its name.
+    pub fn retain_builtin(&mut self, keep: impl Fn(&str) -> bool) {
+        let kept: HashSet<String> = self
+            .tools
+            .keys()
+            .filter(|name| {
+                keep(name.as_str()) && self.origin(name.as_str()) == Some(ToolOrigin::Builtin)
+            })
+            .cloned()
+            .collect();
+        self.retain(|name| kept.contains(name));
     }
 
     /// Return the names of every registered tool.
@@ -813,6 +927,8 @@ impl ToolRegistry {
 
     pub fn retain(&mut self, f: impl Fn(&str) -> bool) {
         self.tools.retain(|name, _| f(name));
+        self.non_builtin_origins
+            .retain(|name, _| self.tools.contains_key(name));
         self.spawn_only.retain(|name| self.tools.contains_key(name));
         self.spawn_only_messages
             .retain(|name, _| self.tools.contains_key(name));
@@ -1043,6 +1159,7 @@ impl ToolRegistry {
             active_context: self.active_context.clone(),
             cached_specs: std::sync::Mutex::new(None),
             plugin_tools: self.plugin_tools.clone(),
+            non_builtin_origins: self.non_builtin_origins.clone(),
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
             background_result_sender: None,
@@ -3606,5 +3723,80 @@ mod spec_order_tests {
         assert!(notebook_turn.is_tool_visible("notebook_only"));
         assert!(!ordinary_turn.is_tool_visible("notebook_only"));
         assert!(!base.is_tool_visible("notebook_only"));
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::super::{Tool, ToolResult};
+    use super::*;
+    use async_trait::async_trait;
+    use eyre::Result;
+
+    struct Named(&'static str);
+
+    #[async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "test-only"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+            Ok(ToolResult::default())
+        }
+    }
+
+    #[test]
+    fn should_record_where_each_tool_came_from() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Named("read_file"));
+        registry.register_with_origin(Named("mcp_memory"), ToolOrigin::Mcp);
+        registry.mark_as_plugin("plugin_tool");
+        registry.register(Named("plugin_tool"));
+        assert_eq!(registry.origin("read_file"), Some(ToolOrigin::Builtin));
+        assert_eq!(registry.origin("mcp_memory"), Some(ToolOrigin::Mcp));
+        assert_eq!(registry.origin("plugin_tool"), Some(ToolOrigin::Plugin));
+        assert_eq!(registry.origin("absent"), None);
+        // A plugin-marked name stays non-built-in whatever registers over it.
+        registry.register(Named("plugin_tool"));
+        assert_eq!(registry.origin("plugin_tool"), Some(ToolOrigin::Plugin));
+        // A snapshot keeps the origins.
+        let snapshot = registry.snapshot_excluding(&[]);
+        assert_eq!(snapshot.origin("mcp_memory"), Some(ToolOrigin::Mcp));
+    }
+
+    #[test]
+    fn should_keep_only_builtin_tools_whatever_their_names() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Named("read_file"));
+        registry.register(Named("shell"));
+        // A plugin and an MCP server each offer an allowlisted name.
+        registry.register_with_origin(Named("memory_search"), ToolOrigin::Mcp);
+        registry.mark_as_plugin("recall");
+        registry.register(Named("recall"));
+        let allow = ["read_file", "memory_search", "recall"];
+        registry.retain_builtin(|name| allow.contains(&name));
+        let mut names = registry.tool_names();
+        names.sort();
+        assert_eq!(names, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn should_treat_reserved_and_registered_builtins_as_builtin_names() {
+        let mut registry = ToolRegistry::new();
+        assert!(registry.is_builtin_name("memory_search"), "reserved");
+        assert!(!registry.is_builtin_name("weather_now"));
+        registry.register(Named("weather_now"));
+        assert!(
+            registry.is_builtin_name("weather_now"),
+            "registered built-in"
+        );
+        registry.register_with_origin(Named("mcp_only"), ToolOrigin::Mcp);
+        assert!(!registry.is_builtin_name("mcp_only"));
     }
 }
