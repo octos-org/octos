@@ -8302,6 +8302,55 @@ async fn session_open_client_commands_reach_the_session_agent_prompt() {
 }
 
 #[tokio::test]
+async fn session_reopen_without_client_commands_clears_the_previous_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(dir.path(), "coding").await;
+    let session_id = SessionKey("local:tui#coding".into());
+    let ledger = UiProtocolLedger::new(16);
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let open = |client_commands: Option<Vec<String>>| {
+        open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            ConnectionId::next(),
+            Some("coding"),
+            None,
+            ConnectionUiFeatures::stdio_defaults(),
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                topic: None,
+                profile_id: None,
+                cwd: None,
+                sandbox: None,
+                after: None,
+                client_commands,
+            },
+        )
+    };
+
+    open(Some(vec!["/model".into()]))
+        .await
+        .expect("first session/open succeeds");
+    open(None)
+        .await
+        .expect("reopen without declaration succeeds");
+
+    let session = state
+        .session_cache
+        .get_or_init(&runtime, session_id, None)
+        .await
+        .expect("opened session is cached");
+    let prompt = session.agent.system_prompt_snapshot();
+    assert!(
+        !prompt.contains("`/model`"),
+        "a client that declares nothing must not inherit another client's commands: {prompt}"
+    );
+}
+
+#[tokio::test]
 async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state_with_sessions(dir.path());
