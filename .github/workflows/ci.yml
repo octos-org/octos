@@ -471,7 +471,10 @@ jobs:
 
       - name: Test octos-agent (lib)
         if: matrix.test-mode == 'lib'
-        run: cargo test -p octos-agent --lib
+        timeout-minutes: 25
+        run: |
+          (while true; do sleep 60; echo "=== DIAG $(date -u +%T)"; free -m; df -h / /tmp | tail -2; ps -eo pid,ppid,etime,rss,pcpu,args --sort=-rss | cut -c1-200 | head -30; done) &
+          cargo test -p octos-agent --lib
 
       - name: Test octos-agent (integration)
         if: matrix.test-mode == 'integration'
