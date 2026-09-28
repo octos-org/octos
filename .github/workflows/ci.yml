@@ -439,19 +439,13 @@ jobs:
   # default-keyed cache and don't fight each other.
 
   test-octos-agent:
-    name: test-octos-agent (${{ matrix.shard.name }})
+    name: test-octos-agent (${{ matrix.variant }})
     strategy:
       fail-fast: false
       matrix:
-        shard:
-          - { name: "lib-agent", args: "agent::" }
-          - { name: "lib-coding", args: "tools::coding_tools tools::shell tools::check format::" }
-          - { name: "lib-spawn", args: "tools::spawn tools::delegate tools::registry" }
-          - { name: "lib-plugins", args: "plugins::" }
-          - { name: "lib-supervisor", args: "task_supervisor validators snapshot exec_env sandbox" }
-          - { name: "lib-rest", args: "--skip agent:: --skip tools::coding_tools --skip tools::shell --skip tools::check --skip format:: --skip tools::spawn --skip tools::delegate --skip tools::registry --skip plugins:: --skip task_supervisor --skip validators --skip snapshot --skip exec_env --skip sandbox" }
+        variant: [full, full-nodocker, seq-shards]
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: "1"
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
@@ -474,11 +468,76 @@ jobs:
       - name: Build
         run: cargo test -p octos-agent --lib --no-run
 
-      - name: Test octos-agent (lib shard)
-        timeout-minutes: 20
+      - name: Host facts
         run: |
-          (while true; do sleep 60; echo "=== DIAG $(date -u +%T)"; free -m | head -2; df -h / | tail -1; ps -eo pid,ppid,pgid,etime,rss,args --sort=-rss | cut -c1-160 | head -15; done) &
-          cargo test -p octos-agent --lib -- ${{ matrix.shard.args }}
+          which docker bwrap google-chrome chromium || true
+          docker version --format '{{.Server.Version}}' || true
+          docker images; nproc; free -m; cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns || true
+
+      - name: Hide docker
+        if: matrix.variant == 'full-nodocker'
+        run: |
+          sudo mv "$(command -v docker)" /usr/local/docker-hidden
+          ! command -v docker
+
+      - name: Full suite
+        if: matrix.variant != 'seq-shards'
+        timeout-minutes: 25
+        run: cargo test -p octos-agent --lib
+
+      - name: "after full: docker state"
+        if: always() && matrix.variant == 'full'
+        run: |
+          echo "containers running: $(docker ps -q | wc -l) all: $(docker ps -aq | wc -l)"; docker ps -a --format '{{.Image}} {{.Status}} {{.Command}}' | head -20; free -m; uptime
+
+      - name: "shard agent"
+        if: matrix.variant == 'seq-shards'
+        timeout-minutes: 15
+        run: "cargo test -p octos-agent --lib -- agent::"
+      - name: "after agent: docker state"
+        if: always() && matrix.variant == 'seq-shards'
+        run: |
+          echo "containers running: $(docker ps -q | wc -l) all: $(docker ps -aq | wc -l)"; docker ps -a --format '{{.Image}} {{.Status}} {{.Command}}' | head -20; docker images; free -m; uptime
+      - name: "shard coding"
+        if: matrix.variant == 'seq-shards'
+        timeout-minutes: 15
+        run: "cargo test -p octos-agent --lib -- tools::coding_tools tools::shell tools::check format::"
+      - name: "after coding: docker state"
+        if: always() && matrix.variant == 'seq-shards'
+        run: |
+          echo "containers running: $(docker ps -q | wc -l) all: $(docker ps -aq | wc -l)"; docker ps -a --format '{{.Image}} {{.Status}} {{.Command}}' | head -20; docker images; free -m; uptime
+      - name: "shard spawn"
+        if: matrix.variant == 'seq-shards'
+        timeout-minutes: 15
+        run: "cargo test -p octos-agent --lib -- tools::spawn tools::delegate tools::registry"
+      - name: "after spawn: docker state"
+        if: always() && matrix.variant == 'seq-shards'
+        run: |
+          echo "containers running: $(docker ps -q | wc -l) all: $(docker ps -aq | wc -l)"; docker ps -a --format '{{.Image}} {{.Status}} {{.Command}}' | head -20; docker images; free -m; uptime
+      - name: "shard plugins"
+        if: matrix.variant == 'seq-shards'
+        timeout-minutes: 15
+        run: "cargo test -p octos-agent --lib -- plugins::"
+      - name: "after plugins: docker state"
+        if: always() && matrix.variant == 'seq-shards'
+        run: |
+          echo "containers running: $(docker ps -q | wc -l) all: $(docker ps -aq | wc -l)"; docker ps -a --format '{{.Image}} {{.Status}} {{.Command}}' | head -20; docker images; free -m; uptime
+      - name: "shard supervisor"
+        if: matrix.variant == 'seq-shards'
+        timeout-minutes: 15
+        run: "cargo test -p octos-agent --lib -- task_supervisor validators snapshot exec_env sandbox"
+      - name: "after supervisor: docker state"
+        if: always() && matrix.variant == 'seq-shards'
+        run: |
+          echo "containers running: $(docker ps -q | wc -l) all: $(docker ps -aq | wc -l)"; docker ps -a --format '{{.Image}} {{.Status}} {{.Command}}' | head -20; docker images; free -m; uptime
+      - name: "shard rest"
+        if: matrix.variant == 'seq-shards'
+        timeout-minutes: 15
+        run: "cargo test -p octos-agent --lib -- --skip agent:: --skip tools::coding_tools --skip tools::shell --skip tools::check --skip format:: --skip tools::spawn --skip tools::delegate --skip tools::registry --skip plugins:: --skip task_supervisor --skip validators --skip snapshot --skip exec_env --skip sandbox"
+      - name: "after rest: docker state"
+        if: always() && matrix.variant == 'seq-shards'
+        run: |
+          echo "containers running: $(docker ps -q | wc -l) all: $(docker ps -aq | wc -l)"; docker ps -a --format '{{.Image}} {{.Status}} {{.Command}}' | head -20; docker images; free -m; uptime
 
   # Split three ways so the PR wait is the slowest third (~25 min), not the
   # whole ~57 min serial run. Every step that ran before still runs, in
