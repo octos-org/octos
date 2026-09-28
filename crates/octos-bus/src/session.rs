@@ -3075,6 +3075,19 @@ impl SessionManager {
             } else {
                 format!("{base_key}#{topic}")
             };
+            // An interrupted seal leaves the real history in the segments
+            // directory with no active file. A fresh meta here would name
+            // `sealed_segments: 0` over it — a count the seal and rewrite
+            // guards trust (#2481) — so the next seal would replace segments
+            // that count does not name. Recover the active file exactly as
+            // the loader would (#2597); if that recovery fails to write,
+            // leave the state for the loader instead of falling back to the
+            // zeroed meta.
+            let dir = segments_dir(&path);
+            if sealed_segment_count(&dir) > 0 {
+                let _ = recover_active_after_seal(&path, &SessionKey(session_key_str), &dir);
+                return;
+            }
             let meta = SessionMeta {
                 schema_version: CURRENT_SESSION_SCHEMA,
                 session_key: session_key_str,
