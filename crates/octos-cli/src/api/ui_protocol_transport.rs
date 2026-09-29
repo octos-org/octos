@@ -6046,6 +6046,18 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
         // UPCR-2026-035: a once-only approval (a host-routed app tool's exact
         // call) is never answered by a remembered scope.
         let once_only = request.once_only;
+        // UPCR-2026-036 (OctoSense ADR 0004 G1): an external client's
+        // approval belongs to that client. The host and every other
+        // connection neither see it (live, on replay, in pending lists and
+        // hydrate) nor answer it. Registered before anything about it
+        // reaches the ledger.
+        let external_turn = self.ws.is_external();
+        if external_turn {
+            super::host_managed::register_external_approval(
+                &approval_id.0.to_string(),
+                self.ws.connection_id().0,
+            );
+        }
         let event = approval_event_from_tool_request(
             request,
             self.session_id.clone(),
@@ -6067,6 +6079,10 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
         // The audit log writer also runs here so auto-resolved decisions
         // appear in the JSON-Lines log next to manual ones (compliance
         // requirement: every decision is recorded).
+        //
+        // An external client's answer never records a scope, so a scope that
+        // matches its turn was recorded by someone else (the host): it may
+        // deny for the external client (fail closed) but never approve.
         if let Some(hit) = (!once_only)
             .then(|| {
                 self.contracts
@@ -6074,6 +6090,7 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
                     .lookup(&self.session_id, &event.tool_name, &self.turn_id)
             })
             .flatten()
+            .filter(|hit| !(external_turn && hit.decision == ApprovalDecision::Approve))
         {
             // FIX-01: `ApprovalDecision` is non-Copy because of `Unknown(String)`;
             // clone for the wire payload so the original survives for the
@@ -21533,16 +21550,33 @@ async fn invalidate_bound_topics<'a>(state: &AppState, entries: impl Iterator<It
     }
 }
 
-/// UPCR-2026-035: whether `connection` may see this ledger event. Only the
-/// approval events of host-routed calls are restricted (to the peer's host
-/// connection); every other event is visible.
+/// Whether `connection` may see the `approval/requested` event `event` (live,
+/// on replay, in pending lists and hydrate): an external client's approval
+/// only by that client (UPCR-2026-036), a host-routed call's only by the
+/// peer's host connection (UPCR-2026-035), every other approval by anyone.
+fn approval_event_visible_to_connection(event: &ApprovalRequestedEvent, connection: u64) -> bool {
+    super::host_managed::external_approval_visible(&event.approval_id.0.to_string(), connection)
+        && crate::peers::host_tools::host_approval_event_visible(event, connection)
+}
+
+/// Whether `connection` may see or answer approval `approval_id`: the
+/// same rules as [`approval_event_visible_to_connection`], from the id alone.
+fn approval_id_visible_to_connection(approval_id: &str, connection: u64) -> bool {
+    super::host_managed::external_approval_visible(approval_id, connection)
+        && crate::peers::host_tools::host_approval_visible(approval_id, connection)
+}
+
+/// Whether `connection` may see this ledger event. Only approval events are
+/// restricted: those of an external client's turn to that client
+/// (UPCR-2026-036), those of host-routed calls to the peer's host connection
+/// (UPCR-2026-035). Every other event is visible.
 fn ledger_event_visible_to_connection(
     event: &UiProtocolLedgerEvent,
     connection: ConnectionId,
 ) -> bool {
     let approval_id = match event {
         UiProtocolLedgerEvent::Notification(UiNotification::ApprovalRequested(e)) => {
-            return crate::peers::host_tools::host_approval_event_visible(e, connection.0);
+            return approval_event_visible_to_connection(e, connection.0);
         }
         UiProtocolLedgerEvent::Notification(UiNotification::ApprovalDecided(e)) => &e.approval_id,
         UiProtocolLedgerEvent::Notification(UiNotification::ApprovalCancelled(e)) => &e.approval_id,
@@ -21551,7 +21585,7 @@ fn ledger_event_visible_to_connection(
         }
         _ => return true,
     };
-    crate::peers::host_tools::host_approval_visible(&approval_id.0.to_string(), connection.0)
+    approval_id_visible_to_connection(&approval_id.0.to_string(), connection.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22344,9 +22378,7 @@ async fn open_session_result(
             ledger_event_matches_topic_scope(&event, topic_scope.as_deref())
         })
         .filter(|approval| !replayed_approval_ids.contains(&approval.approval_id))
-        .filter(|approval| {
-            crate::peers::host_tools::host_approval_event_visible(approval, connection_id.0)
-        })
+        .filter(|approval| approval_event_visible_to_connection(approval, connection_id.0))
         .collect::<Vec<_>>();
 
     // UPCR-2026-023: replay still-pending structured user-questions on
@@ -27091,6 +27123,20 @@ async fn handle_approval_respond(
         }
         params.approval_scope = None;
     }
+    // UPCR-2026-036 (OctoSense ADR 0004 G1): an external client's approval
+    // is answered by that client only, never by the host (whose automation
+    // must not decide for an external client) or any other connection.
+    if !super::host_managed::external_approval_visible(
+        &params.approval_id.0.to_string(),
+        ws.connection_id.0,
+    ) {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            super::host_managed::external_approval_owner_only(),
+        );
+        return;
+    }
     // UPCR-2026-035: a host-routed call's approval is answered only on the
     // connection that raised it or the peer's current host connection.
     // Every other approval on a host peer's session (a kernel tool's, in a
@@ -28431,10 +28477,7 @@ async fn handle_session_hydrate(
                 .pending_for_session(&params.session_id)
                 .into_iter()
                 .filter(|approval| {
-                    crate::peers::host_tools::host_approval_event_visible(
-                        approval,
-                        ws.connection_id.0,
-                    )
+                    approval_event_visible_to_connection(approval, ws.connection_id.0)
                 })
                 .collect(),
         )

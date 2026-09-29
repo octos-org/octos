@@ -1244,22 +1244,22 @@ pub(crate) struct CompleteError {
 }
 
 /// A small insertion-ordered map that evicts its oldest entry when full.
-struct BoundedMap {
+pub(crate) struct BoundedMap<V = String> {
     order: std::collections::VecDeque<String>,
-    map: HashMap<String, String>,
+    map: HashMap<String, V>,
 }
 
-impl BoundedMap {
+impl<V> BoundedMap<V> {
     const MAX: usize = 4_096;
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             order: std::collections::VecDeque::new(),
             map: HashMap::new(),
         }
     }
 
-    fn insert(&mut self, key: String, value: String) {
+    pub(crate) fn insert(&mut self, key: String, value: V) {
         if self.map.insert(key.clone(), value).is_none() {
             self.order.push_back(key);
             while self.order.len() > Self::MAX {
@@ -1270,7 +1270,7 @@ impl BoundedMap {
         }
     }
 
-    fn get(&self, key: &str) -> Option<&String> {
+    pub(crate) fn get(&self, key: &str) -> Option<&V> {
         self.map.get(key)
     }
 }

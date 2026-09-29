@@ -82,6 +82,13 @@ An external identity:
   raises, and checks it on `turn/steer`, `turn/interrupt`, `approval/respond`
   and `user_question/respond`. Its approval answers are once-only; it never
   records an approval scope;
+- keeps its own turns' approvals to itself: an approval an external turn
+  raises goes only to that connection (live, replay, `session/open` pending
+  approvals, `session/hydrate`), never to the host or another client, and an
+  `approval/respond` for it from any other connection, the host included,
+  fails with `external_approval_owner_only`. A remembered approve scope never
+  answers it. So the host's automation (developer mode, standing rules) never
+  decides for an external client (OctoSense ADR 0004, gap G1);
 - learns no other turn's id from a refusal: a `turn/start` on a session that
   is already running a turn fails with `data.kind: "turn_in_progress"` and no
   `data.turn_id` (the host's connection still gets it);

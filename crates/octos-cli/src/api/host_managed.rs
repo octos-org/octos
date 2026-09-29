@@ -25,6 +25,8 @@
 //! - the browser `Origin` allowlist is only the configured origins;
 //! - an external identity cannot answer approvals or questions of the
 //!   host-owned app-peer sessions (`peer-…`, `peerctx-…`);
+//! - an approval raised by an external client's turn reaches only that client,
+//!   and only that client answers it (never the host);
 //! - pairing is off until the host asks for a code;
 //! - `server/shutdown` is never offered: the host owns the lifecycle, and the
 //!   process stops when its stdin reaches EOF (the host exited or closed it).
@@ -84,6 +86,51 @@ pub fn external_turn_denied(what: &str) -> octos_core::ui_protocol::RpcError {
         "an external client may answer or steer only its own turns ({what})"
     ))
     .with_data(serde_json::json!({ "kind": EXTERNAL_TURN_DENIED }))
+}
+
+/// `data.kind` of an `approval/respond` from any connection but the external
+/// client whose turn raised the approval (the host included).
+pub const EXTERNAL_APPROVAL_OWNER_ONLY: &str = "external_approval_owner_only";
+
+/// The refusal for an answer to an external client's approval from any other
+/// connection.
+pub fn external_approval_owner_only() -> octos_core::ui_protocol::RpcError {
+    octos_core::ui_protocol::RpcError::permission_denied(
+        "this approval was raised by an external client's turn; only that client answers it",
+    )
+    .with_data(serde_json::json!({ "kind": EXTERNAL_APPROVAL_OWNER_ONLY }))
+}
+
+/// Approvals raised by an external connection's turn: approval id → that
+/// connection. In memory, like the host-routed approvals of UPCR-2026-035.
+static EXTERNAL_APPROVALS: std::sync::LazyLock<Mutex<crate::peers::host_tools::BoundedMap<u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(crate::peers::host_tools::BoundedMap::new()));
+
+/// Record that approval `approval_id` was raised by a turn of the external
+/// connection `connection`: only that connection sees it (live, on replay,
+/// in pending lists and hydrate) or answers it. Registered before the
+/// approval reaches the ledger.
+pub(crate) fn register_external_approval(approval_id: &str, connection: u64) {
+    EXTERNAL_APPROVALS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(approval_id.to_owned(), connection);
+}
+
+/// The external connection whose turn raised `approval_id`, if any.
+pub(crate) fn external_approval_owner(approval_id: &str) -> Option<u64> {
+    EXTERNAL_APPROVALS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(approval_id)
+        .copied()
+}
+
+/// Whether `connection` may see or answer approval `approval_id` under the
+/// external-client rule: only its owner for an external client's approval,
+/// anyone (subject to the other rules) for every other approval.
+pub(crate) fn external_approval_visible(approval_id: &str, connection: u64) -> bool {
+    external_approval_owner(approval_id).is_none_or(|owner| owner == connection)
 }
 
 /// `data.kind` of an external answer on a session it did not open.

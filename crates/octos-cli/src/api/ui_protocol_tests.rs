@@ -46391,6 +46391,552 @@ async fn should_let_an_external_client_steer_and_interrupt_only_turns_it_owns() 
     );
 }
 
+// ---------------------------------------------------------------------------
+// OctoSense ADR 0004 G1 (kernel half): an external client's approvals go only
+// to that client (UPCR-2026-036).
+// ---------------------------------------------------------------------------
+
+/// A fresh system-like session per call: the approval side tables are
+/// process-wide, so tests never share a session key.
+fn g1_system_session() -> SessionKey {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    SessionKey(format!(
+        "local:g1-octosense-{}#system",
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Run one approval request of a turn on `ws` in the background; return the
+/// task and the approval once it is pending.
+async fn g1_raise_approval(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+) -> (tokio::task::JoinHandle<ToolApprovalDecision>, ApprovalId) {
+    let turn_id = TurnId::new();
+    let requester = UiProtocolApprovalRequester {
+        ws: ws.clone(),
+        ledger: Arc::clone(ledger),
+        contracts: Arc::clone(contracts),
+        state: Arc::clone(state),
+        // Not a `peer-` topic, so the #1842 park gate never resolves.
+        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        features: ConnectionUiFeatures::default(),
+    };
+    let task = tokio::spawn(async move {
+        <UiProtocolApprovalRequester as octos_agent::ToolApprovalRequester>::request_approval(
+            &requester,
+            ToolApprovalRequest {
+                tool_id: "shell-1".into(),
+                tool_name: "shell".into(),
+                title: "Run command".into(),
+                body: "ls".into(),
+                command: Some("ls".into()),
+                cwd: None,
+                once_only: false,
+                host_tool: None,
+            },
+        )
+        .await
+    });
+    for _ in 0..500 {
+        if let Some(pending) = contracts
+            .approvals
+            .pending_for_session(session_id)
+            .into_iter()
+            .find(|approval| approval.turn_id == turn_id)
+        {
+            return (task, pending.approval_id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("the approval never became pending");
+}
+
+/// The ledgered `approval/requested` event for `approval_id`.
+fn g1_requested_event(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    approval_id: &ApprovalId,
+) -> LedgeredUiProtocolEvent {
+    ledger
+        .replay_after(
+            session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|entry| {
+            matches!(
+                &entry.event,
+                UiProtocolLedgerEvent::Notification(UiNotification::ApprovalRequested(e))
+                    if e.approval_id == *approval_id
+            )
+        })
+        .expect("the approval is in the shared ledger")
+}
+
+/// The approval ids `session/hydrate` (pending approvals) returns to `ws`.
+async fn g1_hydrated_pending(
+    ws: &WsConnection,
+    rx: &mut mpsc::Receiver<WsMessage>,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    session_id: &SessionKey,
+) -> Vec<Value> {
+    use octos_core::ui_protocol::hydrate_sections;
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    handle_session_hydrate(
+        ws,
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        &active_turns,
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        "g1-hydrate".into(),
+        SessionHydrateParams {
+            session_id: session_id.clone(),
+            after: None,
+            include: vec![hydrate_sections::PENDING_APPROVALS.into()],
+        },
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(rx, "g1-hydrate").await;
+    frame["result"]["pending_approvals"]
+        .as_array()
+        .unwrap_or_else(|| panic!("pending_approvals: {frame}"))
+        .iter()
+        .map(|approval| approval["approval_id"].clone())
+        .collect()
+}
+
+/// The approval ids `session/open` lists as pending for `connection`.
+async fn g1_opened_pending(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    contracts: &UiProtocolContractStores,
+    connection: ConnectionId,
+    session_id: &SessionKey,
+) -> Vec<ApprovalId> {
+    open_session_result(
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        connection,
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+            client_commands: None,
+        },
+    )
+    .await
+    .expect("session/open")
+    .pending_approvals
+    .into_iter()
+    .map(|approval| approval.approval_id)
+    .collect()
+}
+
+async fn g1_state(temp: &std::path::Path, session_id: &SessionKey) -> Arc<AppState> {
+    let state = state_with_sessions(temp);
+    let sessions = state.sessions.as_ref().expect("sessions");
+    sessions.lock().await.get_or_create(session_id).await;
+    state
+}
+
+#[tokio::test]
+async fn should_show_an_external_clients_approval_only_to_that_client() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let requested = g1_requested_event(&ledger, &session_id, &approval_id);
+    // The external client got it directly.
+    let direct = recv_rpc_json(&mut ext_rx).await;
+    assert_eq!(direct["method"], json!("approval/requested"), "{direct}");
+
+    // Live: the host's forwarder drops it; the owner would get it.
+    assert!(!ledger_event_visible_to_connection(
+        &requested.event,
+        host_ws.connection_id
+    ));
+    assert!(ledger_event_visible_to_connection(
+        &requested.event,
+        ext_ws.connection_id
+    ));
+    forward_live_ledger_event(
+        &host_ws,
+        &ledger,
+        requested.clone(),
+        0,
+        host_ws.connection_id,
+        ConnectionUiFeatures::stdio_defaults(),
+        session_id.topic(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        host_rx.try_recv().is_err(),
+        "not forwarded live to the host"
+    );
+    // Nor to another external client.
+    let (other_ext, mut other_ext_rx) = ws_connection_for_test(64);
+    other_ext.set_external(true);
+    forward_live_ledger_event(
+        &other_ext,
+        &ledger,
+        requested,
+        0,
+        other_ext.connection_id,
+        ConnectionUiFeatures::stdio_defaults(),
+        session_id.topic(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(other_ext_rx.try_recv().is_err(), "not forwarded to others");
+
+    // Pending list (`session/open`) and hydrate: the host sees nothing.
+    assert!(
+        g1_opened_pending(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        g1_opened_pending(
+            &state,
+            &ledger,
+            &contracts,
+            ext_ws.connection_id,
+            &session_id
+        )
+        .await,
+        vec![approval_id.clone()]
+    );
+    assert!(
+        g1_hydrated_pending(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        g1_hydrated_pending(
+            &ext_ws,
+            &mut ext_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await,
+        vec![json!(approval_id.0.to_string())]
+    );
+
+    // Its decision stays with the client too.
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-answer".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Deny,
+        ),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Deny);
+    let decided = ledger
+        .replay_after(
+            &session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|entry| {
+            matches!(
+                &entry.event,
+                UiProtocolLedgerEvent::Notification(UiNotification::ApprovalDecided(e))
+                    if e.approval_id == approval_id
+            )
+        })
+        .expect("decided");
+    assert!(!ledger_event_visible_to_connection(
+        &decided.event,
+        host_ws.connection_id
+    ));
+}
+
+#[tokio::test]
+async fn should_let_only_the_external_client_answer_its_approval() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut ext_rx).await;
+    let respond = |decision: ApprovalDecision| {
+        ApprovalRespondParams::new(session_id.clone(), approval_id.clone(), decision)
+    };
+
+    // The host (its automation included): refused, typed.
+    handle_approval_respond(
+        &host_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        None,
+        "host-answer".into(),
+        respond(ApprovalDecision::Approve),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-answer").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_APPROVAL_OWNER_ONLY),
+        "{frame}"
+    );
+    // Another external client: refused.
+    let (other_ext, mut other_ext_rx) = ws_connection_for_test(64);
+    other_ext.set_external(true);
+    handle_approval_respond(
+        &other_ext,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(other_ext.connection_id()),
+        "other-answer".into(),
+        respond(ApprovalDecision::Approve),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut other_ext_rx, "other-answer").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{frame}"
+    );
+    assert_eq!(
+        contracts.approvals.pending_for_session(&session_id).len(),
+        1
+    );
+    assert!(!task.is_finished(), "still waiting for its own client");
+
+    // The external client that owns the turn: accepted.
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-answer".into(),
+        respond(ApprovalDecision::Approve),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut ext_rx, "ext-answer").await;
+    assert!(frame.get("error").is_none(), "{frame}");
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Approve);
+}
+
+#[tokio::test]
+async fn should_never_apply_a_host_recorded_approve_scope_to_an_external_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    // The host chose "approve shell for this session" earlier.
+    contracts.scopes.record(
+        &session_id,
+        ApprovalScopeKind::ApproveForSession,
+        match_key_for(
+            ApprovalScopeKind::ApproveForSession,
+            "shell",
+            &TurnId::new(),
+        ),
+        ApprovalDecision::Approve,
+    );
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    // The external turn's approval still parks for the external client...
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    assert!(!task.is_finished());
+    let _ = recv_rpc_json(&mut ext_rx).await;
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-answer".into(),
+        ApprovalRespondParams::new(session_id.clone(), approval_id, ApprovalDecision::Deny),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Deny);
+    // ...while a host turn on the same session is still auto-approved.
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let requester = UiProtocolApprovalRequester {
+        ws: host_ws,
+        ledger: Arc::clone(&ledger),
+        contracts: Arc::clone(&contracts),
+        state: Arc::clone(&state),
+        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
+        session_id: session_id.clone(),
+        turn_id: TurnId::new(),
+        features: ConnectionUiFeatures::default(),
+    };
+    assert_eq!(
+        <UiProtocolApprovalRequester as octos_agent::ToolApprovalRequester>::request_approval(
+            &requester,
+            ToolApprovalRequest {
+                tool_id: "shell-2".into(),
+                tool_name: "shell".into(),
+                title: "Run command".into(),
+                body: "ls".into(),
+                command: Some("ls".into()),
+                cwd: None,
+                once_only: false,
+                host_tool: None,
+            },
+        )
+        .await,
+        ToolApprovalDecision::Approve
+    );
+}
+
+#[tokio::test]
+async fn should_keep_a_host_turns_approval_on_the_host_as_before() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (turn_ws, mut turn_rx) = ws_connection_for_test(64);
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, _ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+
+    let (task, approval_id) =
+        g1_raise_approval(&turn_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut turn_rx).await;
+    let requested = g1_requested_event(&ledger, &session_id, &approval_id);
+    // Every host-side connection sees it, as before this rule.
+    assert!(ledger_event_visible_to_connection(
+        &requested.event,
+        host_ws.connection_id
+    ));
+    forward_live_ledger_event(
+        &host_ws,
+        &ledger,
+        requested,
+        0,
+        host_ws.connection_id,
+        ConnectionUiFeatures::stdio_defaults(),
+        session_id.topic(),
+        None,
+    )
+    .await
+    .unwrap();
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_rpc_json(&mut host_rx),
+    )
+    .await
+    .expect("forwarded live to the host");
+    assert_eq!(live["method"], json!("approval/requested"), "{live}");
+    assert_eq!(
+        g1_opened_pending(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await,
+        vec![approval_id.clone()]
+    );
+    assert_eq!(
+        g1_hydrated_pending(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await,
+        vec![json!(approval_id.0.to_string())]
+    );
+    // And the host answers it.
+    handle_approval_respond(
+        &host_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        None,
+        "host-answer".into(),
+        ApprovalRespondParams::new(session_id.clone(), approval_id, ApprovalDecision::Approve),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Approve);
+}
+
 #[tokio::test]
 async fn should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_server() {
     let first = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "octosense", "system");

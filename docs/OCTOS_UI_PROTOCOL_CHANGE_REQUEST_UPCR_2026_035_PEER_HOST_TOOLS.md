@@ -516,7 +516,9 @@ connection that raised it or the peer's current host connection
 (`peer_host_connection_only`); this is read from the approval itself, so it
 never fails open. An external client answers only approvals raised on its
 own connection by its own turns: a turn id alone is not enough, since turn
-ids are client-chosen.
+ids are client-chosen. The reverse also holds: an approval raised by an
+external client's turn goes only to that client and is answered only by it,
+never by the host (`external_approval_owner_only`; UPCR-2026-036).
 
 ## One declaration source: `tools.json`
 
@@ -539,8 +541,9 @@ never declares its tools a second way.
   risk; the host authorizes every call against its grants (from `app` and
   `caller` on `peer/tool/call`). There is no second, agent-level consent.
   The system agent gets app tools the same way when it runs as a host-owned
-  app peer; registering tools on a session that is not a peer is not part of
-  this change.
+  app peer, or on its own (non-peer) session: `peer/tools/register` without
+  `peer` registers a set on the host's session (see "Host session
+  target" under `peer/tools/register`), added only to the turns the registering connection drives there.
 - **The host renders every approval.** A host-routed call's approval is sent
   only to the host connection, with `approval_kind: "host_tool"` and
   `typed_details.host_tool` = `{app, tool, args, risk, outward,
