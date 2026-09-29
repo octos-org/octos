@@ -112,10 +112,14 @@ Moreover:
   ledger events, so an evicted table entry never makes a pending prompt
   visible or answerable to anyone else. When the external connection closes,
   its turns are aborted and their pending prompts cancelled
-  (`turn_interrupted`), as for any connection. Pending prompts do not
-  survive a restart; a replayed historical record of an external prompt is,
-  after a restart, no longer filtered (a durable marker is tracked in
-  #2625). Approvals and questions of the host's own turns are unchanged;
+  (`turn_interrupted`), as for any connection. Ownership is per
+  connection, not per client identity: a client that reconnects cannot
+  answer the prompts of its previous connection (they were cancelled when
+  that connection closed). Pending prompts do not survive a restart; a
+  replayed historical record of an external prompt (its `requested`,
+  `decided` or `cancelled` event) is no longer filtered once the prompt has
+  left the pending store and its side-table entry was evicted, or after a
+  restart. It is read-only (a durable marker is tracked in #2625). Approvals and questions of the host's own turns are unchanged;
 - a `turn/start` refused because the session already runs a turn carries
   `data: {"kind": "turn_in_progress"}` without the running turn's
   `turn_id` (the host's connection still receives `turn_id`);
