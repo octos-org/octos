@@ -312,6 +312,8 @@ All backends remove these from the child process environment before execution.
 
 **Unauthenticated routes**: Auth endpoints (`/api/auth/*`), webhook proxy (`/webhook/*`), static files.
 
+**Session-ingress work secrets** (`/v1/session_ingress/ws/{session_id}`): external CLI agents attach to a single session with a short-lived work secret instead of a dashboard bearer (#296). This route sits outside the two middleware layers above and authenticates bearer-header-first against the SHA-256 grant hashes persisted in `work_secrets.json` (the token itself is never stored). Unlike the dashboard `?token=` fallback above, the ingress `?token=` form is a deprecated fallback for header-less WebSocket clients and is logged server-side once the grant validates; the former `_token` / `session_ingress_token` query aliases were removed, and a request that presents only a removed alias is rejected with a remediation message (#2410). The grant is revalidated before every client request — a grant that no longer validates (revoked, expired, or replaced) closes the live socket with close code `1008` — and the method surface is confined to the granted session (non-session global methods and raw non-session-routed requests are refused). Walkthrough: `docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md`.
+
 ### 3.9 Hook Security
 
 `octos-agent/src/hooks.rs` runs lifecycle hooks with multiple safety measures:

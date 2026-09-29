@@ -257,6 +257,31 @@ Source: `crates/octos-cli/src/api/admin_setup.rs`, `dashboard/src/pages/wizard/`
 
 - **`server/shutdown` (WebSocket, local solo only)** — a UI Protocol client connected over the authenticated WebSocket at `/api/ui-protocol/ws` can stop the server the same way Ctrl+C does: connections drain, gateways stop, the process exits. The call is idempotent, and the stop fires ~250 ms after the request is handled; under outbound backpressure the client may miss the acknowledgement, but the stop still happens. It is accepted only on a local deployment (`config.mode = "local"`) with solo login opted in (`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`) and only by an HTTP serve (`octos serve` without `--stdio`); fleet/hosted servers and `--stdio` serve answer `invalid_request` (-32600) with `data.kind: "server_shutdown_unavailable"` and keep running, and session-scoped connections can never call it. One call stops the process for every connected client — their running turns are cancelled. On a solo serve this follows the local-solo trust model: any local process that can reach the WebSocket can stop the server. A host-managed serve (`octos serve --host-managed`, see `docs/HOST_MANAGED_SERVE.md`) never offers it: its host stops it by closing stdin.
 
+### 2.6 Giving an External Agent Session Access (Work Secrets)
+
+An external CLI or scripted agent should not hold your dashboard bearer token. A *work secret* is a short-lived credential that grants one agent access to exactly one session, over the session-ingress WebSocket route (`/v1/session_ingress/ws/{session_id}`):
+
+```bash
+# Operator notes go to stderr, the encoded secret to stdout
+octos auth issue-work-secret \
+  --session "dspfac:local:tui#coding" \
+  --profile dspfac \
+  --ttl 1h \
+  --api-base-url http://127.0.0.1:50080
+
+# List recorded grants (SHA-256 hash prefixes only; the token is never stored)
+octos auth list-work-secrets
+
+# Revoke before expiry
+octos auth revoke-work-secret '<secret>'
+```
+
+- `--ttl` accepts values like `15m`, `1h`, or `3600s` (default `1h`); re-issuing for the same session replaces the earlier grant.
+- The guest decodes the secret and connects with `Authorization: Bearer <token>`. The `?token=` query form still works for WebSocket clients that cannot set headers, but it is deprecated and logged by the server.
+- The grant is revalidated before every client request; a revoked, expired, or replaced grant closes the live socket with close code 1008. Only methods scoped to the granted session are accepted.
+
+Full walkthrough (including a minimal Python client): `docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md`.
+
 ---
 
 ## 3. Setting Up LLM Providers

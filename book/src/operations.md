@@ -195,6 +195,30 @@ sudo chmod 600 /Library/LaunchDaemons/io.octos.serve.plist
 
 ---
 
+## Work Secrets (Session Ingress)
+
+An external CLI or scripted agent should not hold your dashboard bearer token. A *work secret* is a short-lived credential that grants one agent access to exactly one session, over the session-ingress WebSocket route (`/v1/session_ingress/ws/{session_id}`).
+
+Issue one (operator notes go to stderr, the encoded secret to stdout):
+
+```bash
+octos auth issue-work-secret \
+  --session "dspfac:local:tui#coding" \
+  --profile dspfac \
+  --ttl 1h \
+  --api-base-url http://127.0.0.1:50080
+```
+
+- `--ttl` accepts values like `15m`, `1h`, or `3600s` (default `1h`).
+- Re-issuing for the same session replaces the earlier grant; grants are persisted as SHA-256 hashes in the serve data directory (`~/.octos/work_secrets.json` by default — the token itself is never stored).
+- `octos auth list-work-secrets` lists recorded grants; `octos auth revoke-work-secret '<secret>'` revokes one.
+
+The guest decodes the secret and connects to `/v1/session_ingress/ws/<url-encoded session id>` with `Authorization: Bearer <token>`. WebSocket clients that cannot set headers may fall back to `?token=<token>`; that form is deprecated and logged by the server. The socket speaks normal UI Protocol frames, the grant is revalidated before every client request, and the socket closes with code 1008 once the grant no longer validates (revoked, expired, or replaced). Only methods scoped to the granted session are accepted.
+
+Full walkthrough (including a minimal Python client): `docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md`.
+
+---
+
 ## Service Management
 
 ### macOS (launchd)

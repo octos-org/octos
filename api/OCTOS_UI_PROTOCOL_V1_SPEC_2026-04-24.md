@@ -95,6 +95,35 @@ Stdio transport rules:
   then the server default profile. Clients should pass `profile_id` explicitly
   before `session/open`.
 
+Session-ingress transport rules:
+
+- `/v1/session_ingress/ws/{session_id}` is the second WebSocket route. It
+  speaks the same UI Protocol v1 JSON-RPC frames as `/api/ui-protocol/ws`,
+  but authenticates with a short-lived, session-scoped work secret instead
+  of the dashboard credential. The full walkthrough lives in
+  [OCTOS_WORK_SECRET_SESSION_INGRESS.md](../docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md).
+- Credentials: clients send `Authorization: Bearer {session_ingress_token}`.
+  WebSocket clients that cannot set headers may fall back to
+  `?token={session_ingress_token}`; the server logs that deprecated form
+  once the grant validates. The former `_token` and `session_ingress_token`
+  query aliases are removed; a request that presents only a removed alias
+  is rejected with a remediation message.
+- Grants: `octos auth issue-work-secret` writes a SHA-256 grant hash (the
+  token itself is never stored) and prints the encoded secret;
+  re-issuing for the same session replaces the earlier grant.
+  `octos auth revoke-work-secret` revokes one.
+- The server revalidates the grant before every client request and closes
+  the socket with close code `1008` whenever the grant no longer validates
+  (revoked, expired, or replaced).
+- The method surface is confined to the granted session: every
+  session-scoped method must carry the granted `session_id`, and
+  non-session global methods (for example `session/list`,
+  `system/status.get`, `content/*`, `memory/*`, `cron/*`) as well as raw
+  non-session-routed requests are refused with `invalid_request`.
+- The browser Origin gate that applies to `/api/ui-protocol/ws` upgrades
+  also applies to session-ingress upgrades; the work secret authenticates
+  and scopes the session independently and does not bypass that gate.
+
 ## 4. Versioning
 
 Protocol identifier:

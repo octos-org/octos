@@ -195,6 +195,30 @@ sudo chmod 600 /Library/LaunchDaemons/io.octos.serve.plist
 
 ---
 
+## 工作密钥（会话入口）
+
+外部 CLI 或脚本代理不应持有你的仪表盘 bearer 令牌。*工作密钥*（work secret）是一种短生命周期凭证，只授予一个代理对**单个会话**的访问权，走会话入口 WebSocket 路由（`/v1/session_ingress/ws/{session_id}`）。
+
+签发一条（运维提示走 stderr，编码后的密钥走 stdout）：
+
+```bash
+octos auth issue-work-secret \
+  --session "dspfac:local:tui#coding" \
+  --profile dspfac \
+  --ttl 1h \
+  --api-base-url http://127.0.0.1:50080
+```
+
+- `--ttl` 接受 `15m`、`1h`、`3600s` 这类值（默认 `1h`）。
+- 对同一会话重新签发会替换早先的授权；授权以 SHA-256 哈希形式持久化在 serve 数据目录（默认 `~/.octos/work_secrets.json`，令牌本身从不落盘）。
+- `octos auth list-work-secrets` 列出已记录的授权；`octos auth revoke-work-secret '<secret>'` 撤销一条。
+
+访客解码密钥后连到 `/v1/session_ingress/ws/<URL 编码后的会话 id>`，带 `Authorization: Bearer <token>`。无法设置请求头的 WebSocket 客户端可退回 `?token=<token>`；该形式已弃用且会被服务端记录。套接字使用普通 UI Protocol 帧，每个客户端请求前都会重验授权，授权被撤销、过期或被重签替换后以 1008 关闭。只接受限定在被授权会话内的方法。
+
+完整走查（含最小 Python 客户端）：`docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md`。
+
+---
+
 ## 服务管理
 
 ### macOS (launchd)
