@@ -189,4 +189,51 @@ mod tests {
             Some("out/index.html")
         );
     }
+
+    #[test]
+    fn workspace_policy_completion_validators_cover_every_template() {
+        for (slug, output_dir) in [
+            ("astro-site", "dist"),
+            ("nextjs-app", "out"),
+            ("react-vite", "dist"),
+            ("quarto-lesson", "docs"),
+        ] {
+            let policy = workspace_policy_for_template(slug);
+            assert_eq!(
+                policy.validation.on_completion,
+                vec![format!("file_exists:{output_dir}/index.html")],
+                "slug: {slug}"
+            );
+            let entrypoint = format!("{output_dir}/index.html");
+            assert_eq!(
+                policy.artifacts.entries.get("entrypoint"),
+                Some(&entrypoint),
+                "slug: {slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_policy_declares_site_workspace_contract() {
+        let policy = workspace_policy_for_template_kind(SiteTemplate::AstroSite);
+        assert!(matches!(policy.workspace.kind, WorkspacePolicyKind::Sites));
+        assert_eq!(
+            policy.version_control.provider,
+            WorkspaceVersionControlProvider::Git
+        );
+        assert!(policy.version_control.auto_init);
+        assert!(matches!(
+            policy.version_control.trigger,
+            WorkspaceSnapshotTrigger::TurnEnd
+        ));
+        assert!(policy.version_control.fail_on_error);
+        assert_eq!(
+            policy.validation.on_turn_end,
+            vec![
+                "file_exists:mofa-site-session.json".to_string(),
+                "file_exists:site-plan.json".to_string(),
+                "file_exists:optimized-prompt.md".to_string(),
+            ]
+        );
+    }
 }

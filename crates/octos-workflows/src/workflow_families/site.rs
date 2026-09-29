@@ -74,3 +74,58 @@ impl SitePlan {
         crate::workflows::site_delivery::workspace_policy_for_template_kind(self.template)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_slug_strict_accepts_known_scaffolder_slugs() {
+        assert_eq!(
+            SiteTemplate::from_slug_strict("astro-site"),
+            Some(SiteTemplate::AstroSite)
+        );
+        assert_eq!(
+            SiteTemplate::from_slug_strict("nextjs-app"),
+            Some(SiteTemplate::NextjsApp)
+        );
+        assert_eq!(
+            SiteTemplate::from_slug_strict("react-vite"),
+            Some(SiteTemplate::ReactVite)
+        );
+        assert_eq!(
+            SiteTemplate::from_slug_strict("quarto-lesson"),
+            Some(SiteTemplate::Docs)
+        );
+    }
+
+    #[test]
+    fn from_slug_strict_rejects_unknown_slugs() {
+        // The strict gate (issue #996 follow-up) must let the preview
+        // validator distinguish "unknown" from the Docs fallback — even
+        // for a slug that merely *looks* like the Docs output directory.
+        assert_eq!(SiteTemplate::from_slug_strict("anything-goes"), None);
+        assert_eq!(SiteTemplate::from_slug_strict(""), None);
+        assert_eq!(SiteTemplate::from_slug_strict("docs"), None);
+    }
+
+    #[test]
+    fn from_slug_strict_normalizes_case_and_surrounding_whitespace() {
+        assert_eq!(
+            SiteTemplate::from_slug_strict("  Astro-Site  "),
+            Some(SiteTemplate::AstroSite)
+        );
+        assert_eq!(
+            SiteTemplate::from_slug_strict("NextJS-App"),
+            Some(SiteTemplate::NextjsApp)
+        );
+    }
+
+    #[test]
+    fn output_dir_covers_every_template() {
+        assert_eq!(SiteTemplate::AstroSite.output_dir(), "dist");
+        assert_eq!(SiteTemplate::NextjsApp.output_dir(), "out");
+        assert_eq!(SiteTemplate::ReactVite.output_dir(), "dist");
+        assert_eq!(SiteTemplate::Docs.output_dir(), "docs");
+    }
+}
