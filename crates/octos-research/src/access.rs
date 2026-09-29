@@ -402,6 +402,9 @@ const CHALLENGE_PHRASES: &[&str] = &[
     "attention required! | cloudflare",
     "enable javascript and cookies to continue",
     "unusual traffic from your computer network",
+    // Results pages (#2607): DuckDuckGo's HTML-endpoint check and Bing's.
+    "unfortunately, bots use duckduckgo too",
+    "please solve the challenge below to continue",
 ];
 
 /// Titles challenge pages use.
@@ -421,6 +424,12 @@ fn challenge_marker(lower_html: &str, title: &str) -> Option<&'static str> {
     }
     if lower_html.contains("id=\"px-captcha\"") || lower_html.contains("px-captcha") {
         return Some("a HUMAN (PerimeterX) challenge");
+    }
+    if lower_html.contains("anomaly-modal") || lower_html.contains("duckduckgo.com/anomaly.js") {
+        return Some("a DuckDuckGo bot check");
+    }
+    if lower_html.contains("bing.com/turing/captcha") || lower_html.contains("\"/turing/captcha") {
+        return Some("a Bing challenge");
     }
     if CHALLENGE_TITLES.iter().any(|t| title.trim() == *t) {
         return Some("a bot-challenge page");
@@ -987,6 +996,39 @@ mod tests {
         assert_eq!(e.reason, ReadFailure::BotChallenge);
         assert!(e.detail.contains("DataDome") && e.detail.contains("not bypassed"));
         assert_eq!(e.final_url.as_deref(), Some(ARTICLE));
+    }
+
+    fn serp_fixture(name: &str) -> String {
+        let path = format!("{}/tests/fixtures/serp/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    #[test]
+    fn should_report_bot_challenge_when_a_results_page_answers_with_one() {
+        // #2607: results-page search treats these as a miss, never solves them.
+        assert!(is_bot_challenge(&serp_fixture("ddg_anomaly.html")));
+        assert!(is_bot_challenge(&serp_fixture("bing_challenge.html")));
+        // The rendered-text form deep-search's Bing path reads.
+        assert!(is_bot_challenge(&serp_fixture("bing_challenge.txt")));
+    }
+
+    #[test]
+    fn should_not_take_a_results_page_about_bot_checks_for_a_challenge() {
+        // Results for "anomaly detection" or about DuckDuckGo's bot check:
+        // the words appear, the challenge markup does not, and the page has
+        // far more text than a challenge.
+        let row = |i: usize| {
+            format!(
+                "<div class=\"result\"><a class=\"result__a\" href=\"https://example.org/{i}\">Anomaly detection {i}</a>\
+                 <a class=\"result__snippet\">Unfortunately, bots use DuckDuckGo too, one post says; \
+                 others explain isolation forests and time-series anomaly scores in depth.</a></div>"
+            )
+        };
+        let page = format!(
+            "<html><head><title>anomaly detection at DuckDuckGo</title></head><body>{}</body></html>",
+            (0..10).map(row).collect::<String>()
+        );
+        assert!(!is_bot_challenge(&page));
     }
 
     #[test]

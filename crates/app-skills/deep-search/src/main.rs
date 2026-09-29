@@ -1245,6 +1245,10 @@ async fn ddg_search(query: &str, count: u8) -> Result<Vec<SearchHit>, String> {
         return Err(format!("DuckDuckGo HTTP {}", response.status()));
     }
     let html = response.text().await.unwrap_or_default();
+    // Its bot check (often HTTP 202) is a miss: never parsed, never solved.
+    if octos_research::access::is_bot_challenge(&html) {
+        return Err("DuckDuckGo answered with a bot check (not solved)".to_string());
+    }
     Ok(parse_ddg_results(&html, count as usize)
         .into_iter()
         .map(|(title, url, snippet)| SearchHit {
@@ -1500,6 +1504,16 @@ async fn bing_cdp_search(query: &str, count: u8) -> Result<Vec<SearchHit>, Strin
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .map_err(|_| format!("unparseable deep_crawl output ({} bytes)", stdout.len()))?;
     let text = parsed.get("output").and_then(|v| v.as_str()).unwrap_or("");
+    bing_hits_from_text(text, count)
+}
+
+/// Hits from the rendered text of a Bing results page. A challenge page is a
+/// miss: its links (a captcha provider's privacy page, help pages) are not
+/// results.
+fn bing_hits_from_text(text: &str, count: u8) -> Result<Vec<SearchHit>, String> {
+    if octos_research::access::is_bot_challenge(text) {
+        return Err("Bing answered with a challenge (not solved)".to_string());
+    }
     Ok(extract_bing_results(text)
         .iter()
         .take(count as usize)
@@ -3054,6 +3068,34 @@ mod tests {
         assert_eq!(slugify("  spaces  "), "spaces");
         // CJK preserved
         assert!(slugify("伊朗哈梅内伊").contains("伊朗"));
+    }
+
+    fn serp_fixture(name: &str) -> String {
+        let path = format!(
+            "{}/../../octos-research/tests/fixtures/serp/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    #[test]
+    fn should_treat_a_bing_challenge_as_a_miss_not_as_results() {
+        // #2607: the text extractor alone would return the challenge page's
+        // own links (a captcha provider's privacy page, a help page) as hits.
+        let text = serp_fixture("bing_challenge.txt");
+        assert!(!extract_bing_results(&text).is_empty());
+        let err = bing_hits_from_text(&text, 5).unwrap_err();
+        assert!(err.contains("challenge"), "{err}");
+        // A real results page still yields hits.
+        let serp = "About 50 results...thesaurus.comhttps://www.thesaurus.com › browse › hatesHATES Synonyms - 113 wordsthesaurus.comhttps://www.thesaurus.comSynonyms and Antonyms of Words | Thesaurus.com";
+        assert!(!bing_hits_from_text(serp, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn should_treat_a_duckduckgo_bot_check_as_a_miss() {
+        let html = serp_fixture("ddg_anomaly.html");
+        assert!(octos_research::access::is_bot_challenge(&html));
+        assert!(parse_ddg_results(&html, 5).is_empty());
     }
 
     #[test]

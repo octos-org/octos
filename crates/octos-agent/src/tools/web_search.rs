@@ -1323,6 +1323,14 @@ impl WebSearchTool {
         }
 
         let html = response.text().await.unwrap_or_default();
+        // Its bot check (often HTTP 202) is a miss: never parsed, never solved.
+        if octos_research::access::is_bot_challenge(&html) {
+            return Ok(ToolResult {
+                output: "DuckDuckGo answered with a bot check (not solved)".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
         let results = parse_ddg_results(&html, count as usize);
 
         if results.is_empty() {
@@ -1547,6 +1555,10 @@ async fn render_and_parse_bing(
             .content()
             .await
             .map_err(|e| eyre::eyre!("failed to read Bing HTML: {e}"))?;
+        // A challenge is a miss: never parsed, never solved.
+        if octos_research::access::is_bot_challenge(&html) {
+            eyre::bail!("Bing answered with a challenge (not solved)");
+        }
         Ok::<_, eyre::Report>(parse_bing_results(&html, count as usize))
     }
     .await;
@@ -1827,6 +1839,34 @@ mod tests {
         assert_eq!(results[0].0, "Example Title");
         assert_eq!(results[0].1, "https://example.com/page");
         assert_eq!(results[0].2, "This is a snippet.");
+    }
+
+    fn serp_fixture(name: &str) -> String {
+        let path = format!(
+            "{}/../octos-research/tests/fixtures/serp/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    #[test]
+    fn should_treat_a_duckduckgo_bot_check_as_a_miss() {
+        // #2607: the check is detected (ddg_search then reports an error and
+        // the rotation moves on) and yields no results even if parsed.
+        let html = serp_fixture("ddg_anomaly.html");
+        assert!(octos_research::access::is_bot_challenge(&html));
+        assert!(parse_ddg_results(&html, 5).is_empty());
+        // A real results page is not taken for one.
+        let results = r#"<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&amp;rut=abc123">Example Title</a><a class="result__snippet">This is a snippet.</a>"#;
+        assert!(!octos_research::access::is_bot_challenge(results));
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn should_treat_a_bing_challenge_as_a_miss() {
+        let html = serp_fixture("bing_challenge.html");
+        assert!(octos_research::access::is_bot_challenge(&html));
+        assert!(parse_bing_results(&html, 5).is_empty());
     }
 
     #[test]
