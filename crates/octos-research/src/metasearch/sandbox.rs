@@ -73,6 +73,9 @@ pub struct SandboxEngine<'a> {
     pub source: &'a str,
     pub allowed_hosts: &'a [String],
     pub allow_http: bool,
+    /// The manifest declares `renders`: requests may load in the person's
+    /// browser.
+    pub renders: bool,
 }
 
 /// Headers the host owns; a script cannot set them.
@@ -565,6 +568,13 @@ fn checked_request(engine: &SandboxEngine<'_>, v: &Value) -> Result<ScriptReques
     // instead of going through net.request.
     let checked = request_tool(v, engine.allowed_hosts, engine.allow_http)
         .map_err(|e| format!("{}: {e}", engine.id))?;
+    let render = checked["render"].as_bool().unwrap_or(false);
+    if render && !engine.renders {
+        return Err(format!(
+            "{}: a rendered request needs `renders` in the manifest",
+            engine.id
+        ));
+    }
     Ok(ScriptRequest {
         method: checked["method"].as_str().unwrap_or("GET").to_string(),
         url: checked["url"].as_str().unwrap_or_default().to_string(),
@@ -577,7 +587,7 @@ fn checked_request(engine: &SandboxEngine<'_>, v: &Value) -> Result<ScriptReques
             })
             .unwrap_or_default(),
         body: checked["body"].as_str().map(String::from),
-        render: checked["render"].as_bool().unwrap_or(false),
+        render,
     })
 }
 
@@ -688,6 +698,7 @@ mod tests {
             source,
             allowed_hosts: hosts,
             allow_http: false,
+            renders: false,
         }
     }
 
@@ -820,6 +831,20 @@ fn parse_response(response, opts) {
         let ua = "use mod.net\nfn build_request(query, opts) {\nreturn net.request({url: \"https://api.example.org/\", headers: {user_agent: \"SomeBrowser/1.0\"}})\n}\nfn parse_response(response, opts) {\nreturn []\n}\n";
         let err = build_request(&engine(ua, &hosts), "q", &json!({})).unwrap_err();
         assert!(err.contains("set by the host"), "{err}");
+    }
+
+    #[test]
+    fn should_refuse_a_browser_load_the_manifest_did_not_declare() {
+        let hosts = vec!["api.example.org".to_string()];
+        let src = "use mod.net\nfn build_request(query, opts) {\nreturn net.request({url: \"https://api.example.org/\", render: true})\n}\nfn parse_response(response, opts) {\nreturn []\n}\n";
+        let err = build_request(&engine(src, &hosts), "q", &json!({})).unwrap_err();
+        assert!(err.contains("needs `renders`"), "{err}");
+        let declared = SandboxEngine {
+            renders: true,
+            ..engine(src, &hosts)
+        };
+        let reqs = build_request(&declared, "q", &json!({})).unwrap();
+        assert!(reqs[0].render);
     }
 
     #[test]

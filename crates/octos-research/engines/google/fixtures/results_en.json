@@ -1,0 +1,70 @@
+{
+  "recorded": "live, 2026-09-28: Google's results page as rendered in the person's browser (octos profile, signed in, headless); trimmed to the #search block with scripts and styles removed so no account details are kept",
+  "request": {
+    "query": "rust async runtime comparison",
+    "langs": [
+      "en"
+    ],
+    "since": null,
+    "category": "general",
+    "count": 10,
+    "now": "2026-09-28T23:30:00Z"
+  },
+  "http": {
+    "method": "GET",
+    "url": "https://www.google.com/search?q=rust+async+runtime+comparison&num=10&start=0&hl=en",
+    "headers": {}
+  },
+  "body_file": "results_en.body",
+  "expect": [
+    {
+      "url": "https://vorner.github.io/async-bench.html",
+      "title": "Benchmark of different Async approaches in Rust",
+      "source": "",
+      "lang": "en",
+      "published": null
+    },
+    {
+      "url": "https://corrode.dev/blog/async",
+      "title": "The State of Async Rust: Runtimes",
+      "source": "",
+      "lang": "en",
+      "published": null
+    },
+    {
+      "url": "https://rustify.rs/articles/rust-async-runtimes-tokio-vs-async-std-2026",
+      "title": "Rust Async Runtimes: Tokio vs async-std vs smol 2026",
+      "source": "",
+      "lang": "en",
+      "published": null
+    },
+    {
+      "url": "https://rust-trends.com/posts/rust-async-runtimes-compared",
+      "title": "Rust Async Runtimes Compared: Tokio vs Smol in 2026",
+      "source": "",
+      "lang": "en",
+      "published": null
+    },
+    {
+      "url": "https://rust-lang.github.io/async-book/08_ecosystem/00_chapter.html",
+      "title": "The Async Ecosystem - Asynchronous Programming in Rust",
+      "source": "",
+      "lang": "en",
+      "published": null
+    },
+    {
+      "url": "https://news.ycombinator.com/item?id=37436274",
+      "title": "Yes, async is effectively a much harder version of Rust, and ...",
+      "source": "",
+      "lang": "en",
+      "published": null
+    },
+    {
+      "url": "https://blog.jetbrains.com/rust/2026/02/17/the-evolution-of-async-rust-from-tokio-to-high-level-applications",
+      "title": "The Evolution of Async Rust: From Tokio to High-Level ...",
+      "source": "",
+      "lang": "en",
+      "published": null
+    }
+  ]
+}

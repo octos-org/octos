@@ -81,10 +81,12 @@ pub struct EngineManifest {
     /// [`crate::SERP_SCRAPE_ENV`]).
     #[serde(default)]
     pub results_page: bool,
-    /// The engine's requests load in a real browser
-    /// (`net.request({render: true})`). It is left out where the host has
-    /// no browser ([`super::Fetch::can_render`]). Only results-page engines
-    /// may declare it.
+    /// The engine's requests load in the person's browser
+    /// (`net.request({render: true})`). Only such engines may ask for it,
+    /// only results-page engines may be such engines, and they are left out
+    /// where the host has no browser ([`super::Fetch::can_render`]). The
+    /// soft deadline waits for them: a browser load is slower than an API
+    /// call.
     #[serde(default)]
     pub renders: bool,
     /// The engine lists entries it did not search for (feeds): the core

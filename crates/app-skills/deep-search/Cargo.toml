@@ -20,7 +20,9 @@ ego-tree = "0.10"
 regex = "1"
 url = "2"
 chrono = "0.4"
-octos-research = { path = "../../octos-research", features = ["http"] }
+# `browser`: metasearch engines that render (Google) load in the person's
+# browser (`octos_research::browser`).
+octos-research = { path = "../../octos-research", features = ["http", "browser"] }
 
 [package.metadata.release]
 release = false

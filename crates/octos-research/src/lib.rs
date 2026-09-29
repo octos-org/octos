@@ -16,6 +16,8 @@
 //! from fixtures.
 
 pub mod access;
+#[cfg(feature = "browser")]
+pub mod browser;
 pub mod date;
 #[cfg(feature = "extract")]
 pub mod extract;
@@ -79,6 +81,20 @@ pub fn respect_robots(lookup: impl Fn(&str) -> Option<String>) -> bool {
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
 }
+
+/// Person's-browser mode for results pages that need a real browser
+/// (Google): `auto` (default) | `window` | `headless` | `off`. See
+/// `octos_research::browser` (feature `browser`).
+pub const BROWSER_ENV: &str = "OCTOS_BROWSER";
+
+/// Shown with results whenever a search used the person's browser (and
+/// logged once when the browser starts): what that means for their account
+/// and how to turn it off.
+pub const BROWSER_SEARCH_NOTICE: &str = "Some results were loaded in the octos browser profile \
+     (~/.octos/browser-profile). If you signed in to Google there, those searches ran as your \
+     Google account: results may be personalised and are saved to its search activity. Search \
+     engines' terms may not allow automated queries. Set OCTOS_BROWSER=off to stop using the \
+     browser.";
 
 /// Environment variable naming a self-hosted SearXNG base URL
 /// (e.g. `http://127.0.0.1:8888`).
@@ -180,6 +196,14 @@ mod tests {
         assert!(m.contains(SEARXNG_URL_ENV) && m.contains("TAVILY_API_KEY"));
         assert!(m.contains(SERP_SCRAPE_ENV));
         assert!(no_results_message("q", &[]).contains("Providers tried: none"));
+    }
+
+    #[test]
+    fn should_say_what_browser_search_means_and_how_to_stop_it() {
+        let n = BROWSER_SEARCH_NOTICE;
+        assert!(n.contains("Google account") && n.contains("search activity"));
+        assert!(n.contains("terms may not allow"));
+        assert!(n.contains(&format!("{BROWSER_ENV}=off")));
     }
 
     #[test]

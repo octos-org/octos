@@ -40,6 +40,9 @@ impl HttpResponse {
 
 pub type FetchFuture<'a> = Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + 'a>>;
 
+/// Resolves to whether a challenge page was put in front of the person.
+pub type HandOverFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
 /// Performs one HTTP request. The metasearch has no HTTP client of its own:
 /// callers plug in theirs (see `ReqwestFetch` with the `http` feature), and
 /// tests plug in recorded responses.
@@ -58,6 +61,15 @@ pub trait Fetch: Send + Sync {
     /// browser are skipped quietly (no error, no backoff) where it does not.
     fn can_render(&self) -> bool {
         false
+    }
+
+    /// A page loaded with [`Fetch::render`] answered with a bot challenge:
+    /// show `url` to the person in their browser so they can deal with it
+    /// themselves. Never solve or work around it. Returns whether it was
+    /// shown; the default has no browser to show it in.
+    fn hand_over(&self, url: String) -> HandOverFuture<'_> {
+        let _ = url;
+        Box::pin(async { false })
     }
 }
 

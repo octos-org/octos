@@ -186,10 +186,10 @@ struct ResultCost {
 async fn main() {
     // Plugin-protocol-v2 SIGTERM handler (W3.C3): on SIGTERM we stop
     // scheduling new work and exit cleanly within the 10-second host
-    // budget. We don't carry long-lived browsers in-process here
-    // (deep_crawl spawns its own), so the cleanup path is light: emit
-    // a final progress event, kill in-flight HTTP via dropping the
-    // client, and exit 130 (128 + SIGTERM=2).
+    // budget: emit a final progress event, close the browser the
+    // metasearch may have launched for Google (deep_crawl spawns its own),
+    // kill in-flight HTTP via dropping the client, and exit 130
+    // (128 + SIGTERM=2).
     install_sigterm_handler();
 
     let mut stdin_buf = String::new();
@@ -266,6 +266,9 @@ async fn main() {
             ..Default::default()
         }),
     }
+    // A browser the metasearch launched (Google) would outlive this
+    // process: statics are never dropped.
+    octos_research::browser::close_shared().await;
 }
 
 /// Install a SIGTERM handler that emits a final v2 progress event and
@@ -293,6 +296,13 @@ fn install_sigterm_handler() {
                 "SIGTERM received, shutting down deep_search",
                 None,
             );
+            // Close a browser the metasearch launched, inside the host's
+            // 10-second budget.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(4),
+                octos_research::browser::close_shared(),
+            )
+            .await;
             // 130 = 128 + SIGTERM(2). Convention for "killed by signal 2".
             std::process::exit(130);
         }
