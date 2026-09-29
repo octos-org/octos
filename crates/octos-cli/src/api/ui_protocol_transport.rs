@@ -24640,6 +24640,13 @@ async fn handle_voice_admit(
         send_scope_error(ws, id, error);
         return;
     }
+    // UPCR-2026-035: the admission only provisions the commit that starts
+    // the turn, so a registered host peer's session is admitted by its host
+    // connection only — the same confinement as the turn start it leads to.
+    if let Some(refused) = refuse_foreign_host_turn_control(state, &session_id, ws, "voice/admit") {
+        let _ = send_rpc_error(ws, Some(id), refused);
+        return;
+    }
     let audio_paths = voice_media_paths(&params.media);
     if audio_paths.is_empty() {
         let _ = send_rpc_error(
@@ -24836,12 +24843,24 @@ async fn handle_voice_commit_admission(
         );
         return;
     }
+    // UPCR-2026-035 (#2623): the commit starts the turn, so a registered
+    // host peer's session is committed by its host connection only. Placed
+    // after the idempotent short-circuit above, so a retry of an
+    // already-committed admission stays idempotent; the `turn/interrupt`
+    // semantics of `supersedes_turn_id` are covered by the same check. The
+    // claim is released so a refused caller cannot hold the admission
+    // against the host's own retry.
+    if let Some(refused) =
+        refuse_foreign_host_turn_control(state, &session_id, ws, "voice/commit_admission")
+    {
+        contracts
+            .voice_admissions
+            .release(&params.admission_id, &params.turn.turn_id);
+        let _ = send_rpc_error(ws, Some(id), refused);
+        return;
+    }
     if let Some(superseded) = params.supersedes_turn_id.as_ref() {
-        let refused = refuse_foreign_host_turn_control(state, &session_id, ws, "turn/interrupt");
-        let superseded = match refused {
-            Some(error) => Err(error),
-            None => await_superseded_turn(active_turns, &session_id, superseded).await,
-        };
+        let superseded = await_superseded_turn(active_turns, &session_id, superseded).await;
         if let Err(error) = superseded {
             contracts
                 .voice_admissions

@@ -3592,6 +3592,133 @@ async fn should_refuse_foreign_turn_controls_on_a_host_peer_session_when_its_set
     ));
 }
 
+#[tokio::test]
+async fn should_refuse_a_foreign_voice_admission_for_a_host_peer_session() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let key = peer_key(&fx);
+    let (host_ws, mut host_rx) = ws_connection_for_test(8);
+    let (other_ws, mut other_rx) = ws_connection_for_test(8);
+    // Before registration nothing is confined.
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &other_ws, "voice/admit").is_none());
+    register(&fx, &host_ws, &token, json!({ "tools": [] })).unwrap();
+
+    // The admission only provisions the commit that starts the turn, so a
+    // foreign connection must not mint one for the peer's session. The
+    // refusal comes before the request is even judged.
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    handle_voice_admit(
+        &other_ws,
+        &fx.state,
+        &contracts,
+        None,
+        "v0".into(),
+        &rpc(
+            "voice/admit",
+            json!({
+                "session_id": key,
+                "request_id": "voice-req-1",
+                "turn_id": TurnId::new(),
+                "media": [],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        rpc_error_kind(other_rx.recv().await.unwrap()),
+        "peer_host_connection_only"
+    );
+    // The host's own connection passes the gate and reaches the request
+    // validation instead.
+    handle_voice_admit(
+        &host_ws,
+        &fx.state,
+        &contracts,
+        None,
+        "v1".into(),
+        &rpc(
+            "voice/admit",
+            json!({
+                "session_id": key,
+                "request_id": "voice-req-2",
+                "turn_id": TurnId::new(),
+                "media": [],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        frame_json(host_rx.recv().await.unwrap())["error"]["message"],
+        "voice/admit requires at least one audio file"
+    );
+}
+
+#[tokio::test]
+async fn should_refuse_a_foreign_voice_commit_on_a_host_peer_session() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let key = peer_key(&fx);
+    let (host_ws, _host_rx) = ws_connection_for_test(8);
+    let (other_ws, mut other_rx) = ws_connection_for_test(8);
+    register(&fx, &host_ws, &token, json!({ "tools": [] })).unwrap();
+
+    // An admission issued before the peer registered its tools must not
+    // become a turn start from a foreign connection — this is the commit
+    // half of the voice bypass of the turn/start confinement.
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let turn_id = TurnId::new();
+    let audio_paths = vec!["voice-uploads/utterance.wav".to_owned()];
+    let issued = contracts.voice_admissions.issue(
+        "voice-req-1".into(),
+        key.clone(),
+        turn_id.clone(),
+        audio_paths.clone(),
+        "the person's spoken question".into(),
+    );
+    handle_voice_commit_admission(
+        &other_ws,
+        &fx.state,
+        &Arc::new(UiProtocolLedger::new(16)),
+        &contracts,
+        &Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        &Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        None,
+        ConnectionUiFeatures::default(),
+        "v1".into(),
+        &rpc(
+            "voice/commit_admission",
+            json!({
+                "admission_id": issued.admission_id,
+                "turn": {
+                    "session_id": key,
+                    "turn_id": turn_id,
+                    "input": [],
+                    "media": [{
+                        "path": audio_paths[0],
+                        "mime": "audio/wav",
+                        "size_bytes": 4,
+                    }],
+                },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        rpc_error_kind(other_rx.recv().await.unwrap()),
+        "peer_host_connection_only"
+    );
+    // The refused commit released its claim, so the host's own retry still
+    // commits (a foreign probe must not hold the admission).
+    assert_eq!(
+        contracts
+            .voice_admissions
+            .claim(&issued.admission_id, &key, &turn_id, &audio_paths),
+        Ok(VoiceAdmissionClaim::Start(
+            "the person's spoken question".into()
+        ))
+    );
+}
+
 fn register_on_session(
     fx: &Fx,
     ws: &WsConnection,
