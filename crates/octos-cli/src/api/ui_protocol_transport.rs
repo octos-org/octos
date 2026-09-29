@@ -18199,7 +18199,16 @@ fn gathered_peer_result(slug: &str, result: &str) -> Option<GatheredPeerResult> 
         .parse::<u64>()
         .ok()?;
     let round = lines.next()?.strip_prefix("turn: ")?.parse::<u32>().ok()?;
-    if round == 0 || lines.next().is_some() {
+    // The writer appends bookkeeping keys after `turn:` — `turn_id:` is
+    // always present (#2627), and host-owned conversation turns add
+    // `origin:` (#2626). Unknown keys still fail, so a foreign header
+    // cannot masquerade as ours.
+    for line in lines {
+        if !line.starts_with("turn_id: ") && !line.starts_with("origin: ") {
+            return None;
+        }
+    }
+    if round == 0 {
         return None;
     }
     Some(GatheredPeerResult {
