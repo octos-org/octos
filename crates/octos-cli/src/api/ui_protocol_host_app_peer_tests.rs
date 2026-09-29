@@ -772,7 +772,8 @@ async fn should_accept_only_a_contexts_own_folder_as_its_workspace() {
     };
     // The default folder, and a fresh `contexts/<name>`.
     let a = open("ctx-a", None).unwrap();
-    assert!(a["cwd"].as_str().unwrap().ends_with("contexts/ctx-a"));
+    // Compare by path components: the cwd carries platform separators.
+    assert!(std::path::Path::new(a["cwd"].as_str().unwrap()).ends_with("contexts/ctx-a"));
     open("ctx-b", Some(peer_root.join("contexts").join("named-b"))).unwrap();
     // Refused: `contexts/` itself, another context's folder, a sibling of
     // `contexts/`, a nested folder, and `..` tricks.
