@@ -927,6 +927,23 @@ mod tests {
             crate::approval::digest_tool_args(&a),
             crate::approval::digest_tool_args(&b)
         );
+        // Canonicalization must also reach objects nested inside arrays.
+        let c: Value = serde_json::from_str(r#"{"list": [{"y": 2, "x": 3}]}"#).unwrap();
+        let d: Value = serde_json::from_str(r#"{"list": [{"x": 3, "y": 2}]}"#).unwrap();
+        assert_eq!(
+            crate::approval::digest_tool_args(&c),
+            crate::approval::digest_tool_args(&d)
+        );
+    }
+
+    #[test]
+    fn should_still_digest_array_order_as_significant() {
+        let a = json!({"items": [1, 2, 3]});
+        let b = json!({"items": [3, 2, 1]});
+        assert_ne!(
+            crate::approval::digest_tool_args(&a),
+            crate::approval::digest_tool_args(&b)
+        );
     }
 
     #[tokio::test]

@@ -303,10 +303,36 @@ impl PendingApprovalStore {
     }
 }
 
+/// Digest tool arguments into a stable identity string. Object keys are
+/// canonicalized to sorted order first, so arguments hash the same no matter
+/// which key order the provider serialized them with.
 pub fn digest_tool_args(args: &serde_json::Value) -> String {
-    let encoded = serde_json::to_vec(args).unwrap_or_default();
+    let encoded = serde_json::to_vec(&canonicalize_tool_args(args)).unwrap_or_default();
     let digest = Sha256::digest(encoded);
     format!("sha256:{digest:x}")
+}
+
+/// Rebuild `args` with object keys in sorted order (arrays keep their order;
+/// it is significant). `serde_json` only sorts object keys when its
+/// `preserve_order` feature is off; with the feature on — octos-cli enables
+/// it through agent-client-protocol — maps keep insertion order and the same
+/// arguments under two key orders would hash differently.
+fn canonicalize_tool_args(args: &serde_json::Value) -> serde_json::Value {
+    match args {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            let mut sorted = serde_json::Map::with_capacity(map.len());
+            for key in keys {
+                sorted.insert(key.clone(), canonicalize_tool_args(&map[key]));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize_tool_args).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 fn approval_title_for_tool(tool_name: &str) -> String {
