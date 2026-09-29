@@ -126,10 +126,19 @@ Moreover:
   the live connection the server recorded as the prompt's owner. Once that
   record is gone (after a restart, or when the bounded side table evicted
   the id) a marked record goes to nobody, so the host never sees an old
-  external prompt again. A later event of an external prompt is marked
-  from the ledger's own record of it even if the side table evicted the id
-  in between. Records written before #2625 carry no marker and replay as
-  before. A prompt that was pending at shutdown still has no terminal
+  external prompt again. In replay and `session/hydrate` the owning
+  connection also matches through the owner recorded on the prompt itself,
+  so it still replays its own prompt after the side table evicted the id.
+  The live forwarder has no such fallback: once the id is evicted, the
+  owner no longer gets that prompt's later events from other connections
+  live (the requested event was sent to it directly, and replay shows
+  them). A later event of an external approval is marked from the ledger's
+  own set of unresolved external approvals. That set is rebuilt on reload
+  from every marked record in the retained logs and snapshot, not only the
+  in-memory ring. An id leaves the set at the approval's terminal event, so
+  the set needs no cap (evicting a pending id could write its terminal
+  event unmarked). Records written before #2625 carry no marker and replay
+  as before. A prompt that was pending at shutdown still has no terminal
   record (true of host prompts as well), and a turn is not told why an
   owner went away (its only way to lose one is a closed connection, which
   aborts the turn). Approvals and questions of the host's own turns are
@@ -233,6 +242,9 @@ never enables. The host stops the server by closing its stdin.
 - ledger: `should_write_the_external_prompt_marker_additively_to_logs_and_snapshots`
   (older readers parse marked log lines and snapshots; the unmarked record
   is unchanged), `should_mark_a_later_event_of_a_recovered_external_prompt`
+- `should_mark_a_reloaded_external_approvals_decision_after_its_request_left_the_ring`
+  (ring of 2, with and without a projection snapshot)
+- `should_replay_an_external_prompt_to_its_owner_after_the_side_table_forgot_it`
 - `should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_server`
   (also the `turn_in_progress` payload with and without `turn_id`)
 - `should_drop_plugin_and_mcp_tools_with_allowlisted_names_from_an_external_turn`

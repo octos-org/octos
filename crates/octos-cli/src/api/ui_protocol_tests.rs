@@ -48254,3 +48254,141 @@ async fn should_replay_an_unmarked_pre_2625_prompt_record_as_before() {
     .await;
     assert_eq!(seen, vec![approval_id.0.to_string()]);
 }
+
+#[tokio::test]
+async fn should_mark_a_reloaded_external_approvals_decision_after_its_request_left_the_ring() {
+    // #2625 review: after a reload with an empty owner table, the ledger
+    // must still know an approval is external when its `requested` record
+    // is no longer in the (here tiny) ring: from the full log scan, with
+    // and without a projection snapshot.
+    for snapshot_every_events in [0, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = g1_system_session();
+        let mut config = LedgerConfig::durable(temp.path().join("ledger-data"));
+        config.retained_per_session = 2;
+        config.snapshot_every_events = snapshot_every_events;
+        let approval_id = ApprovalId::new();
+        let turn_id = TurnId::new();
+        let host_approval = |id: ApprovalId| {
+            UiNotification::ApprovalRequested(ApprovalRequestedEvent::generic(
+                session_id.clone(),
+                id,
+                TurnId::new(),
+                "shell",
+                "Run command",
+                "ls",
+            ))
+        };
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            super::super::host_managed::register_external_prompt(&approval_id.0.to_string(), 42);
+            let requested = ledger.append_notification(UiNotification::ApprovalRequested(
+                ApprovalRequestedEvent::generic(
+                    session_id.clone(),
+                    approval_id.clone(),
+                    turn_id.clone(),
+                    "shell",
+                    "Run command",
+                    "ls",
+                ),
+            ));
+            assert!(requested.external_prompt);
+            // Push the request out of the ring (host prompts, unmarked).
+            for _ in 0..3 {
+                assert!(
+                    !ledger
+                        .append_notification(host_approval(ApprovalId::new()))
+                        .external_prompt
+                );
+            }
+            super::super::host_managed::forget_external_prompt(&approval_id.0.to_string());
+        }
+        // Reload: empty owner table, the request only on disk.
+        let ledger = UiProtocolLedger::recover(config).ledger;
+        let decided = ledger.append_notification(UiNotification::ApprovalDecided(
+            ApprovalDecidedEvent::manual(
+                session_id.clone(),
+                approval_id.clone(),
+                turn_id,
+                ApprovalDecision::Deny,
+                "external",
+            ),
+        ));
+        assert!(decided.external_prompt, "cadence {snapshot_every_events}");
+        let (host_ws, _host_rx) = ws_connection_for_test(8);
+        assert!(!ledgered_event_visible_to_connection(
+            &decided,
+            host_ws.connection_id
+        ));
+        // A terminal event ends the prompt: a new host approval stays
+        // unmarked.
+        assert!(
+            !ledger
+                .append_notification(host_approval(ApprovalId::new()))
+                .external_prompt
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_replay_an_external_prompt_to_its_owner_after_the_side_table_forgot_it() {
+    // #2625 review: the owner falls back to the owner recorded on the
+    // prompt itself, so it still replays its own prompt; the host does not.
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let (question_task, question_id) =
+        g1_ask_question(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut ext_rx).await;
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Deny,
+        ),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Deny);
+    super::super::host_managed::forget_external_prompt(&approval_id.0.to_string());
+    super::super::host_managed::forget_external_prompt(&question_id.0.to_string());
+
+    let owned = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        ext_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    let approval = approval_id.0.to_string();
+    assert_eq!(
+        owned.iter().filter(|id| **id == approval).count(),
+        2,
+        "requested and decided: {owned:?}"
+    );
+    assert!(owned.contains(&question_id.0.to_string()), "{owned:?}");
+    let hosted = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        host_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    assert!(hosted.is_empty(), "{hosted:?}");
+    question_task.abort();
+}

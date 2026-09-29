@@ -499,6 +499,10 @@ struct DiskSessionSnapshot {
     head_seq: u64,
     retained_entries: VecDeque<LedgerEntry>,
     replay_entries: Vec<LedgeredUiProtocolEvent>,
+    /// The session's unresolved external approvals (see
+    /// [`SessionLedger::external_prompts`]), rebuilt from EVERY marked
+    /// record of the retained logs and snapshot, not just the ring.
+    external_prompts: std::collections::HashSet<String>,
     /// Total records skipped across all scanned log files (unknown
     /// version + genuinely-malformed). Surfaced so callers/tests can
     /// assert the aggregation deterministically without depending on the
@@ -519,10 +523,22 @@ struct SessionLedger {
     /// Cached size of the active log file in bytes (so we don't `metadata`
     /// on every append).
     active_log_bytes: u64,
-    /// Ids of this session's external prompts (UPCR-2026-036, #2625), from
-    /// appended and recovered records marked `external_prompt`. A later
-    /// event of the same prompt is marked too, even if the transport's
-    /// bounded owner table has evicted the id meanwhile.
+    /// Ids of this session's unresolved external approvals (UPCR-2026-036,
+    /// #2625): added by a marked `approval/requested`, removed by its marked
+    /// `decided` / `cancelled` / `auto_resolved`. A later event of such an
+    /// approval is marked even if the transport's bounded owner table has
+    /// evicted the id meanwhile. Rebuilt on reload from every marked record
+    /// in the retained logs and snapshot (not only the ring), so a
+    /// `requested` that left the ring still counts.
+    ///
+    /// Bounded without a cap: an id leaves at its terminal event, so the set
+    /// holds only approvals still pending in this process plus those left
+    /// pending by an earlier process (orphans, at most one per external
+    /// approval pending at a shutdown, and only while their records are in
+    /// the retained logs). No cap, because evicting a pending id could let
+    /// its terminal event be written unmarked (fail open). Questions are
+    /// not tracked: `user_question/requested` is the only ledger event of
+    /// a question, so nothing later needs the marker.
     external_prompts: std::collections::HashSet<String>,
 }
 
@@ -1265,6 +1281,7 @@ impl UiProtocolLedger {
         let mut oldest_seq = None;
         let mut head_seq = 0u64;
         let mut retained_entries = VecDeque::new();
+        let mut external_prompts = std::collections::HashSet::new();
         let mut replay_entries = Vec::new();
         let mut skipped_records = 0u64;
         let cap = self.config.retained_per_session;
@@ -1334,6 +1351,14 @@ impl UiProtocolLedger {
                 // and snapshot_seeded_floor/oldest stay 0.
                 for record in snapshot.entries {
                     oldest_seq.get_or_insert(record.seq);
+                    // Seed the external-prompt set in seq order; the log
+                    // scan below re-applies the same records (and any whose
+                    // log file rotated away stay covered by this).
+                    track_external_prompt(
+                        &mut external_prompts,
+                        &record.event,
+                        record.external_prompt,
+                    );
                     // ymote P1: only the SHORTCUT path materialises the
                     // snapshot (retained ring + replay_entries). When the
                     // shortcut is disabled the FULL state (retained ring
@@ -1439,6 +1464,20 @@ impl UiProtocolLedger {
                         if seq <= skip_through_seq {
                             oldest_seq.get_or_insert(seq);
                             head_seq = head_seq.max(seq);
+                            // #2625: a marked record below the snapshot head
+                            // still feeds the external-prompt set, even if
+                            // the snapshot's ring no longer holds it. Only
+                            // marked lines (rare) pay the full parse.
+                            if line.contains(EXTERNAL_PROMPT_MARKER_JSON)
+                                && let Ok(ParsedLedgerDiskRecord::Record(record)) =
+                                    parse_ledger_disk_record(line)
+                            {
+                                track_external_prompt(
+                                    &mut external_prompts,
+                                    &record.event,
+                                    record.external_prompt,
+                                );
+                            }
                             continue;
                         }
                     }
@@ -1518,6 +1557,7 @@ impl UiProtocolLedger {
 
                 oldest_seq.get_or_insert(record.seq);
                 head_seq = head_seq.max(record.seq);
+                track_external_prompt(&mut external_prompts, &record.event, record.external_prompt);
 
                 if record.seq <= skip_through_seq {
                     // Already materialised from the projection snapshot
@@ -1575,6 +1615,7 @@ impl UiProtocolLedger {
             head_seq,
             retained_entries,
             replay_entries,
+            external_prompts,
             skipped_records,
         }))
     }
@@ -2468,13 +2509,10 @@ impl UiProtocolLedger {
         // first event reaches the ledger; the session's own set covers a
         // later event of the same prompt once that table has evicted it.
         let external_prompt = ledger_event_prompt_id(&stamped).is_some_and(|prompt_id| {
-            let external = session.external_prompts.contains(&prompt_id)
-                || super::host_managed::external_prompt_owner(&prompt_id).is_some();
-            if external {
-                session.external_prompts.insert(prompt_id);
-            }
-            external
+            session.external_prompts.contains(&prompt_id)
+                || super::host_managed::external_prompt_owner(&prompt_id).is_some()
         });
+        track_external_prompt(&mut session.external_prompts, &stamped, external_prompt);
 
         // Write-ahead to disk before signaling the wire — happens
         // inside the lock so two appends to the same session never
@@ -3518,6 +3556,41 @@ pub(crate) fn ledger_event_prompt_id(event: &UiProtocolLedgerEvent) -> Option<St
     }
 }
 
+/// `"external_prompt":true` as the disk writer emits it (see
+/// [`LedgerDiskRecord::external_prompt`]); a cheap pre-filter for lines the
+/// snapshot fast path does not otherwise parse.
+const EXTERNAL_PROMPT_MARKER_JSON: &str = "\"external_prompt\":true";
+
+/// Apply one record to a session's set of unresolved external approvals
+/// (see [`SessionLedger::external_prompts`]).
+fn track_external_prompt(
+    external_prompts: &mut std::collections::HashSet<String>,
+    event: &UiProtocolLedgerEvent,
+    external_prompt: bool,
+) {
+    if !external_prompt {
+        return;
+    }
+    let UiProtocolLedgerEvent::Notification(notification) = event else {
+        return;
+    };
+    match notification {
+        UiNotification::ApprovalRequested(e) => {
+            external_prompts.insert(e.approval_id.0.to_string());
+        }
+        UiNotification::ApprovalDecided(e) => {
+            external_prompts.remove(&e.approval_id.0.to_string());
+        }
+        UiNotification::ApprovalCancelled(e) => {
+            external_prompts.remove(&e.approval_id.0.to_string());
+        }
+        UiNotification::ApprovalAutoResolved(e) => {
+            external_prompts.remove(&e.approval_id.0.to_string());
+        }
+        _ => {}
+    }
+}
+
 fn hydrate_session_from_snapshot(session: &mut SessionLedger, snapshot: DiskSessionSnapshot) {
     session.next_seq = snapshot.head_seq;
     session.entries.clear();
@@ -3525,12 +3598,8 @@ fn hydrate_session_from_snapshot(session: &mut SessionLedger, snapshot: DiskSess
     session.last_touched_at = Instant::now();
     session.active_log_path = Some(snapshot.active_log_path);
     session.active_log_bytes = snapshot.active_log_bytes;
+    session.external_prompts = snapshot.external_prompts;
     for entry in snapshot.retained_entries {
-        if entry.external_prompt
-            && let Some(prompt_id) = ledger_event_prompt_id(&entry.event)
-        {
-            session.external_prompts.insert(prompt_id);
-        }
         session.in_memory_bytes = session.in_memory_bytes.saturating_add(entry.bytes);
         session.entries.push_back(entry);
     }

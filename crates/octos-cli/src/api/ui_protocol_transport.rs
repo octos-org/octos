@@ -21839,6 +21839,38 @@ fn ledgered_event_visible_to_connection(
             ))
 }
 
+/// [`ledgered_event_visible_to_connection`] for replay and hydrate, where
+/// the pending stores are at hand: a marked event is also shown to the
+/// owner the store recorded on the prompt itself, so the owning connection
+/// still replays its own prompt after the bounded owner table evicted the
+/// id. The host never matches (the store's owner is the external
+/// connection), and after a restart the stores are empty.
+fn replayed_event_visible_to_connection(
+    event: &LedgeredUiProtocolEvent,
+    connection: ConnectionId,
+    approvals: &PendingApprovalStore,
+    questions: &PendingQuestionStore,
+) -> bool {
+    if ledgered_event_visible_to_connection(event, connection) {
+        return true;
+    }
+    if !event.external_prompt || !ledger_event_visible_to_connection(&event.event, connection) {
+        return false;
+    }
+    let UiProtocolLedgerEvent::Notification(notification) = &event.event else {
+        return false;
+    };
+    let owner = match notification {
+        UiNotification::ApprovalRequested(e) => approvals.external_owner(&e.approval_id),
+        UiNotification::ApprovalDecided(e) => approvals.external_owner(&e.approval_id),
+        UiNotification::ApprovalCancelled(e) => approvals.external_owner(&e.approval_id),
+        UiNotification::ApprovalAutoResolved(e) => approvals.external_owner(&e.approval_id),
+        UiNotification::UserQuestionRequested(e) => questions.external_owner(&e.question_id),
+        _ => None,
+    };
+    owner == Some(Some(connection.0))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_live_ledger_event(
     ws: &WsConnection,
@@ -22611,7 +22643,7 @@ async fn open_session_result(
     replay.retain(|event| {
         ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
             && ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref())
-            && ledgered_event_visible_to_connection(event, connection_id)
+            && replayed_event_visible_to_connection(event, connection_id, approvals, questions)
     });
     let replayed_approval_ids = replay
         .iter()
@@ -28714,7 +28746,9 @@ async fn handle_session_hydrate(
                 return;
             }
         };
-    replayed.retain(|event| ledgered_event_visible_to_connection(event, ws.connection_id));
+    replayed.retain(|event| {
+        replayed_event_visible_to_connection(event, ws.connection_id, approvals, questions)
+    });
 
     let include_set = HydrateIncludeSet::from_request(&params.include);
     // #919.1: route to the profile's session manager when the connection
