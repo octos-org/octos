@@ -47814,3 +47814,443 @@ async fn should_let_an_external_client_answer_only_its_own_turns_questions() {
     let reply = recv_rpc_json(&mut rx).await;
     assert!(reply.get("error").is_none(), "{reply}");
 }
+
+// ---------------------------------------------------------------------------
+// #2625: an external client's prompts stay hidden from the host after a
+// restart, or once the transport's bounded owner table forgot them: their
+// ledger records carry a durable `external_prompt` marker (UPCR-2026-036).
+// ---------------------------------------------------------------------------
+
+fn r2625_cursor_zero(session_id: &SessionKey) -> UiCursor {
+    UiCursor {
+        stream: session_id.0.clone(),
+        seq: 0,
+    }
+}
+
+/// The prompt ids of the approval and question events `connection`'s
+/// `session/open` replays (from the beginning), plus the ids of its pending
+/// approvals and questions.
+async fn r2625_opened_prompt_ids(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    contracts: &UiProtocolContractStores,
+    connection: ConnectionId,
+    session_id: &SessionKey,
+) -> Vec<String> {
+    let outcome = open_session_result(
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        connection,
+        None,
+        None,
+        g1_question_features(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(r2625_cursor_zero(session_id)),
+            client_commands: None,
+        },
+    )
+    .await
+    .expect("session/open");
+    let mut ids = outcome
+        .replay
+        .iter()
+        .filter_map(|event| super::super::ui_protocol_ledger::ledger_event_prompt_id(&event.event))
+        .collect::<Vec<_>>();
+    ids.extend(
+        outcome
+            .pending_approvals
+            .iter()
+            .map(|approval| approval.approval_id.0.to_string()),
+    );
+    ids.extend(
+        outcome
+            .pending_questions
+            .iter()
+            .map(|question| question.question_id.0.to_string()),
+    );
+    ids
+}
+
+fn r2625_ledger_log(ledger_dir: &std::path::Path) -> String {
+    let mut text = String::new();
+    for session_dir in std::fs::read_dir(ledger_dir.join("ui-protocol")).unwrap() {
+        for file in std::fs::read_dir(session_dir.unwrap().path()).unwrap() {
+            let path = file.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "log") {
+                text.push_str(&std::fs::read_to_string(path).unwrap());
+            }
+        }
+    }
+    text
+}
+
+#[tokio::test]
+async fn should_hide_an_external_clients_prompts_from_everyone_after_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger_dir = temp.path().join("ledger-data");
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::with_config(LedgerConfig::durable(
+        ledger_dir.clone(),
+    )));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+
+    // Decided: approval A. Cancelled: approval B. Asked: question Q.
+    let (task_a, approval_a) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let (task_b, approval_b) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let (task_q, question_q) =
+        g1_ask_question(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_a.clone(),
+            ApprovalDecision::Deny,
+        ),
+    )
+    .await;
+    assert_eq!(task_a.await.unwrap(), ToolApprovalDecision::Deny);
+    ledger.append_notification(UiNotification::ApprovalCancelled(
+        ApprovalCancelledEvent::turn_interrupted(
+            session_id.clone(),
+            approval_b.clone(),
+            TurnId::new(),
+        ),
+    ));
+    let prompt_ids = [
+        approval_a.0.to_string(),
+        approval_b.0.to_string(),
+        question_q.0.to_string(),
+    ];
+    // Before the restart the owner replays them and the host does not.
+    let owned = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        ext_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    for id in &prompt_ids {
+        assert!(owned.contains(id), "the owner replays {id}: {owned:?}");
+    }
+    let hosted = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        host_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    assert!(hosted.is_empty(), "{hosted:?}");
+    // Every record of the three prompts carries the durable marker.
+    let log = r2625_ledger_log(&ledger_dir);
+    let marked = log
+        .lines()
+        .filter(|line| prompt_ids.iter().any(|id| line.contains(id.as_str())))
+        .collect::<Vec<_>>();
+    // requested + decided (A), requested + cancelled (B), requested (Q).
+    assert_eq!(marked.len(), 5, "{log}");
+    for line in marked {
+        assert!(line.ends_with(",\"external_prompt\":true}"), "{line}");
+    }
+
+    // Restart: a fresh process has an empty owner table, fresh stores and a
+    // ledger recovered from the same files.
+    task_b.abort();
+    task_q.abort();
+    drop(ext_rx.try_recv());
+    drop(ledger);
+    for id in &prompt_ids {
+        super::super::host_managed::forget_external_prompt(id);
+    }
+    let ledger = UiProtocolLedger::recover(LedgerConfig::durable(ledger_dir)).ledger;
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (new_ext, _new_ext_rx) = ws_connection_for_test(64);
+    new_ext.set_external(true);
+    for connection in [host_ws.connection_id, new_ext.connection_id] {
+        let seen =
+            r2625_opened_prompt_ids(&state, &ledger, &contracts, connection, &session_id).await;
+        for id in &prompt_ids {
+            assert!(
+                !seen.contains(id),
+                "{id} replayed after a restart: {seen:?}"
+            );
+        }
+    }
+    // Nor via hydrate or the live forwarder.
+    assert!(
+        g1_hydrated_pending(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    let replayed = ledger
+        .replay_after(&session_id, Some(&r2625_cursor_zero(&session_id)))
+        .unwrap();
+    let recovered = replayed
+        .iter()
+        .filter(|event| {
+            super::super::ui_protocol_ledger::ledger_event_prompt_id(&event.event)
+                .is_some_and(|id| prompt_ids.contains(&id))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recovered.len(), 5);
+    for event in recovered {
+        assert!(event.external_prompt);
+        assert!(!ledgered_event_visible_to_connection(
+            event,
+            host_ws.connection_id
+        ));
+        assert!(!ledgered_event_visible_to_connection(
+            event,
+            new_ext.connection_id
+        ));
+    }
+    // And the host cannot answer one.
+    handle_approval_respond(
+        &host_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        None,
+        "host-b".into(),
+        ApprovalRespondParams::new(session_id.clone(), approval_b, ApprovalDecision::Approve),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-b").await;
+    assert!(frame.get("error").is_some(), "{frame}");
+}
+
+#[tokio::test]
+async fn should_hide_a_resolved_external_prompt_from_the_host_once_the_side_table_forgets_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut ext_rx).await;
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Approve,
+        ),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Approve);
+    // The prompt left the pending store's pending list; now the bounded
+    // owner table evicts its id.
+    super::super::host_managed::forget_external_prompt(&approval_id.0.to_string());
+
+    // Neither the host's replay nor its live forwarder shows its requested
+    // or decided record.
+    let seen = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        host_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    assert!(!seen.contains(&approval_id.0.to_string()), "{seen:?}");
+    let events = ledger
+        .replay_after(&session_id, Some(&r2625_cursor_zero(&session_id)))
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            super::super::ui_protocol_ledger::ledger_event_prompt_id(&event.event)
+                == Some(approval_id.0.to_string())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2, "requested and decided");
+    for event in &events {
+        assert!(!ledgered_event_visible_to_connection(
+            event,
+            host_ws.connection_id
+        ));
+    }
+}
+
+#[tokio::test]
+async fn should_mark_later_events_of_an_external_prompt_after_the_side_table_forgot_it() {
+    // The owner table evicts the id while the prompt is still pending: its
+    // decision is still marked, from the ledger's own record of the prompt.
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut ext_rx).await;
+    super::super::host_managed::forget_external_prompt(&approval_id.0.to_string());
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Deny,
+        ),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Deny);
+    let decided = ledger
+        .replay_after(&session_id, Some(&r2625_cursor_zero(&session_id)))
+        .unwrap()
+        .into_iter()
+        .find(|event| {
+            matches!(
+                &event.event,
+                UiProtocolLedgerEvent::Notification(UiNotification::ApprovalDecided(e))
+                    if e.approval_id == approval_id
+            )
+        })
+        .expect("decided");
+    assert!(decided.external_prompt);
+    assert!(!ledgered_event_visible_to_connection(
+        &decided,
+        host_ws.connection_id
+    ));
+}
+
+#[tokio::test]
+async fn should_replay_a_host_turns_prompts_to_the_host_after_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger_dir = temp.path().join("ledger-data");
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::with_config(LedgerConfig::durable(
+        ledger_dir.clone(),
+    )));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (turn_ws, mut turn_rx) = ws_connection_for_test(64);
+    let (task, approval_id) =
+        g1_raise_approval(&turn_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut turn_rx).await;
+    handle_approval_respond(
+        &turn_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        None,
+        "host-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Approve,
+        ),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Approve);
+    assert!(
+        !r2625_ledger_log(&ledger_dir).contains("external_prompt"),
+        "a host turn's records are written exactly as before"
+    );
+
+    drop(ledger);
+    let ledger = UiProtocolLedger::recover(LedgerConfig::durable(ledger_dir)).ledger;
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let seen = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        host_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    let id = approval_id.0.to_string();
+    assert_eq!(
+        seen.iter().filter(|seen| **seen == id).count(),
+        2,
+        "requested and decided replay to the host: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn should_replay_an_unmarked_pre_2625_prompt_record_as_before() {
+    // A record written before the marker existed carries no
+    // `external_prompt` key: after a restart it replays as it always did.
+    let temp = tempfile::tempdir().unwrap();
+    let ledger_dir = temp.path().join("ledger-data");
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let approval_id = ApprovalId::new();
+    {
+        let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(ledger_dir.clone()));
+        ledger.append_notification(UiNotification::ApprovalRequested(
+            ApprovalRequestedEvent::generic(
+                session_id.clone(),
+                approval_id.clone(),
+                TurnId::new(),
+                "shell",
+                "Run command",
+                "ls",
+            ),
+        ));
+    }
+    let log = r2625_ledger_log(&ledger_dir);
+    assert!(log.contains(&approval_id.0.to_string()) && !log.contains("external_prompt"));
+    let ledger = UiProtocolLedger::recover(LedgerConfig::durable(ledger_dir)).ledger;
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let seen = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        host_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    assert_eq!(seen, vec![approval_id.0.to_string()]);
+}

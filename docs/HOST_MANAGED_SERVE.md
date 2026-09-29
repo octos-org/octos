@@ -90,7 +90,11 @@ An external identity:
   connection, the host included, fails with `external_approval_owner_only`
   or `external_question_owner_only`. A remembered approve scope never
   answers it. So the host's automation (developer mode, standing rules)
-  never decides for an external client (OctoSense ADR 0004, gap G1);
+  never decides for an external client (OctoSense ADR 0004, gap G1). The
+  ownership survives a restart: the ledger records of these prompts are
+  stored with an `external_prompt` marker, and after a restart they are
+  replayed to nobody, the host included. Records written by an octos
+  older than #2625 have no marker and replay as before;
 - learns no other turn's id from a refusal: a `turn/start` on a session that
   is already running a turn fails with `data.kind: "turn_in_progress"` and no
   `data.turn_id` (the host's connection still gets it);

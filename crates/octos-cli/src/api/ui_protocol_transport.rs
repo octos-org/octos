@@ -21819,6 +21819,26 @@ fn ledger_event_visible_to_connection(
     approval_id_visible_to_connection(&approval_id.0.to_string(), connection.0)
 }
 
+/// [`ledger_event_visible_to_connection`] for a ledgered (live, replayed or
+/// recovered) event, also honouring the durable external-prompt marker
+/// (UPCR-2026-036, #2625): a marked event is shown only to the live
+/// connection the transport recorded as the prompt's owner. Once that record
+/// is gone (a restart, or the bounded owner table evicted it) it is shown to
+/// nobody, so the replay of an old external prompt never fails open to the
+/// host. Unmarked (older) records behave as before.
+fn ledgered_event_visible_to_connection(
+    event: &LedgeredUiProtocolEvent,
+    connection: ConnectionId,
+) -> bool {
+    ledger_event_visible_to_connection(&event.event, connection)
+        && (!event.external_prompt
+            || super::ui_protocol_ledger::ledger_event_prompt_id(&event.event).is_some_and(
+                |prompt_id| {
+                    super::host_managed::external_prompt_owner(&prompt_id) == Some(connection.0)
+                },
+            ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_live_ledger_event(
     ws: &WsConnection,
@@ -21836,7 +21856,7 @@ async fn forward_live_ledger_event(
     if event.from_connection == Some(self_connection_id) {
         return Ok(());
     }
-    if !ledger_event_visible_to_connection(&event.event, self_connection_id) {
+    if !ledgered_event_visible_to_connection(&event, self_connection_id) {
         return Ok(());
     }
     if !ledger_event_matches_topic_scope(&event.event, topic_scope) {
@@ -22591,7 +22611,7 @@ async fn open_session_result(
     replay.retain(|event| {
         ledger_event_matches_topic_scope(&event.event, topic_scope.as_deref())
             && ledger_event_matches_profile_scope(&event.event, profile_scope.as_deref())
-            && ledger_event_visible_to_connection(&event.event, connection_id)
+            && ledgered_event_visible_to_connection(event, connection_id)
     });
     let replayed_approval_ids = replay
         .iter()
@@ -28694,7 +28714,7 @@ async fn handle_session_hydrate(
                 return;
             }
         };
-    replayed.retain(|event| ledger_event_visible_to_connection(&event.event, ws.connection_id));
+    replayed.retain(|event| ledgered_event_visible_to_connection(event, ws.connection_id));
 
     let include_set = HydrateIncludeSet::from_request(&params.include);
     // #919.1: route to the profile's session manager when the connection

@@ -12,7 +12,10 @@
   unavailability of `server/shutdown`. No method, event or field is added or
   removed. Revised after the post-merge review: turn ownership is the
   connection's (not the turn id's), a live turn id is unique across sessions,
-  and `turn_in_progress` omits `data.turn_id` for external clients.
+  and `turn_in_progress` omits `data.turn_id` for external clients. #2625
+  adds an optional `external_prompt` key to the stored ledger record (not to
+  any wire event), so an external client's prompts stay its own across a
+  restart.
 - Origin: OctoSense shells share one kernel between native apps and an
   external web or terminal client (see `docs/HOST_MANAGED_SERVE.md`).
 
@@ -115,11 +118,22 @@ Moreover:
   (`turn_interrupted`), as for any connection. Ownership is per
   connection, not per client identity: a client that reconnects cannot
   answer the prompts of its previous connection (they were cancelled when
-  that connection closed). Pending prompts do not survive a restart; a
-  replayed historical record of an external prompt (its `requested`,
-  `decided` or `cancelled` event) is no longer filtered once the prompt has
-  left the pending store and its side-table entry was evicted, or after a
-  restart. It is read-only (a durable marker is tracked in #2625). Approvals and questions of the host's own turns are unchanged;
+  that connection closed). Pending prompts do not survive a restart. The
+  ownership is also durable (#2625): each of these ledger records is
+  written with `"external_prompt": true` on its stored record (the
+  `events.jsonl` line and its snapshot entry, not the wire event), and
+  replay, `session/hydrate` and live fan-out show a marked record only to
+  the live connection the server recorded as the prompt's owner. Once that
+  record is gone (after a restart, or when the bounded side table evicted
+  the id) a marked record goes to nobody, so the host never sees an old
+  external prompt again. A later event of an external prompt is marked
+  from the ledger's own record of it even if the side table evicted the id
+  in between. Records written before #2625 carry no marker and replay as
+  before. A prompt that was pending at shutdown still has no terminal
+  record (true of host prompts as well), and a turn is not told why an
+  owner went away (its only way to lose one is a closed connection, which
+  aborts the turn). Approvals and questions of the host's own turns are
+  unchanged;
 - a `turn/start` refused because the session already runs a turn carries
   `data: {"kind": "turn_in_progress"}` without the running turn's
   `turn_id` (the host's connection still receives `turn_id`);
@@ -208,6 +222,17 @@ never enables. The host stops the server by closing its stdin.
   `external_turn_denied`; the owner: accepted)
 - `should_keep_a_host_turns_question_on_the_host_as_before`
 - `should_keep_external_prompts_from_the_host_when_the_side_table_forgets_them`
+- `should_hide_an_external_clients_prompts_from_everyone_after_a_restart`
+  (#2625: a decided and a cancelled approval and a question, recovered from
+  the same files into a fresh ledger, stores and side table: neither the
+  host nor a new external client replays them, the host cannot answer one)
+- `should_hide_a_resolved_external_prompt_from_the_host_once_the_side_table_forgets_it`
+- `should_mark_later_events_of_an_external_prompt_after_the_side_table_forgot_it`
+- `should_replay_a_host_turns_prompts_to_the_host_after_a_restart`
+- `should_replay_an_unmarked_pre_2625_prompt_record_as_before`
+- ledger: `should_write_the_external_prompt_marker_additively_to_logs_and_snapshots`
+  (older readers parse marked log lines and snapshots; the unmarked record
+  is unchanged), `should_mark_a_later_event_of_a_recovered_external_prompt`
 - `should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_server`
   (also the `turn_in_progress` payload with and without `turn_id`)
 - `should_drop_plugin_and_mcp_tools_with_allowlisted_names_from_an_external_turn`
