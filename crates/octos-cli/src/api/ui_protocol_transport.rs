@@ -8285,6 +8285,15 @@ where
                 connection_mode_recorded = true;
             }
             let connection_profile_id = connection_profile_id_owned.as_deref();
+            // UPCR-2026-035 (#2571): the same host-peer confinement as the WS
+            // loop, from the persisted tool set (so it holds after a restart,
+            // unlike the in-memory check inside the turn-control handlers).
+            if let Some(error) =
+                refuse_foreign_host_peer_session_call(&state, &ws, &request.method, &request.params)
+            {
+                let _ = send_rpc_error(&ws, Some(id), error);
+                continue;
+            }
 
             if handle_raw_appui_rpc(
                 &ws,
@@ -26997,6 +27006,11 @@ const HOST_PEER_SESSION_WRITE_METHODS: &[&str] = &[
     "session/goal/clear",
     "session/goal/operator_transition",
     "loop/create",
+    // A monitor's output wakes the session with its text.
+    "monitor/create",
+    "monitor/resume",
+    // Would remove the app peer's session.
+    "session/delete",
 ];
 
 /// UPCR-2026-035 (#2571): refuse a call that starts, steers, stops or
@@ -27014,11 +27028,20 @@ fn refuse_foreign_host_peer_session_call(
     if !HOST_PEER_SESSION_WRITE_METHODS.contains(&method) {
         return None;
     }
-    let session_id = params.get("session_id")?.as_str()?;
-    let session = session_key_with_optional_topic(
-        &SessionKey(session_id.to_owned()),
-        params.get("topic").and_then(Value::as_str),
-    );
+    // A monitor control names the monitor: its target is the monitor's own
+    // session, whatever session the caller names (a base key controls the
+    // monitors of every topic on it).
+    let monitor_session = (method == "monitor/resume")
+        .then(|| params.get("monitor_id").and_then(Value::as_str))
+        .flatten()
+        .and_then(|id| default_agent_orchestrator().monitor_session(id));
+    let session = match monitor_session {
+        Some(session) => session,
+        None => session_key_with_optional_topic(
+            &SessionKey(params.get("session_id")?.as_str()?.to_owned()),
+            params.get("topic").and_then(Value::as_str),
+        ),
+    };
     crate::peers::host_tools::host_peer_slug_of(&session)?;
     let (_, data_dir) = resolve_profile_data_dir(state, session.profile_id()).ok()?;
     let controller =

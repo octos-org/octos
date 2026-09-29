@@ -838,8 +838,29 @@ impl CallCancel {
 /// was interrupted). Each ends as `cancelled` for the host (`peer/tool/cancel`)
 /// and, unless it only read, as an unknown outcome that is not resent.
 /// Returns how many calls were cancelled.
+///
+/// The turn is also remembered as interrupted, under the same lock a call
+/// takes to enter the pending set: a call of that turn that had not reached
+/// the host yet (its tool task still in a before-tool hook, or its approval
+/// answered just before the interrupt) is refused and never sent.
 pub(crate) fn cancel_host_calls_for_turn(session: &SessionKey, turn_id: &str) -> usize {
     let pending = HUB.pending.lock().unwrap_or_else(|p| p.into_inner());
+    // This turn is always recorded; a full set forgets the OLDEST interrupt
+    // instead (thousands of interrupts back, whose tool tasks are long gone).
+    let evicted = HUB
+        .interrupted_turns
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mark(
+            interrupted_turn_key(session, turn_id),
+            INTERRUPTED_RETENTION,
+        );
+    if evicted {
+        tracing::warn!(
+            session = %session.0,
+            "interrupted-turn set full: forgot the oldest interrupt to record this one"
+        );
+    }
     let mut cancelled = 0;
     for call in pending.values() {
         if call.meta.session_id == *session && call.meta.turn_id == turn_id {
@@ -848,6 +869,14 @@ pub(crate) fn cancel_host_calls_for_turn(session: &SessionKey, turn_id: &str) ->
         }
     }
     cancelled
+}
+
+/// How long an interrupted turn is remembered (its tool tasks are long gone
+/// by then).
+const INTERRUPTED_RETENTION: Duration = Duration::from_secs(24 * 3_600);
+
+fn interrupted_turn_key(session: &SessionKey, turn_id: &str) -> String {
+    format!("{}\u{0}{turn_id}", session.0)
 }
 
 /// A peer's tool host: the connection that registered its set.
@@ -904,20 +933,24 @@ impl BoundedClaims {
     }
 
     /// Insert `key`, evicting the oldest claim when full (for markers whose
-    /// loss is preferable to refusing work).
-    fn mark(&mut self, key: String, retention: Duration) {
+    /// loss is preferable to refusing work). `key` itself is always recorded;
+    /// returns whether an unexpired claim had to be evicted for it.
+    fn mark(&mut self, key: String, retention: Duration) -> bool {
         let now = Instant::now();
         self.evict_expired(now, retention);
         if self.keys.contains(&key) {
-            return;
+            return false;
         }
+        let mut evicted = false;
         if self.order.len() >= Self::MAX {
             if let Some((oldest, _)) = self.order.pop_front() {
                 self.keys.remove(&oldest);
+                evicted = true;
             }
         }
         self.keys.insert(key.clone());
         self.order.push_back((key, now));
+        evicted
     }
 
     fn contains(&mut self, key: &str, retention: Duration) -> bool {
@@ -945,6 +978,9 @@ struct HostToolHub {
     /// The host starting such a turn runs the system agent's request, on
     /// the person's behalf: it counts as attended.
     input_turns: Mutex<BoundedClaims>,
+    /// `(session, turn)` pairs interrupted by the person: no call of theirs is
+    /// sent to the host any more. Written and read under the `pending` lock.
+    interrupted_turns: Mutex<BoundedClaims>,
     pending: Mutex<HashMap<String, PendingCall>>,
     finished: Mutex<HashMap<String, (CallMeta, Instant)>>,
     occurrences: Mutex<BoundedClaims>,
@@ -1168,13 +1204,34 @@ pub(crate) fn drop_routes_for_connection(connection: u64) {
 }
 
 /// Drop the route if it is still `send` (its connection closed).
+///
+/// Like a closed connection ([`drop_routes_for_connection`]), every call in
+/// flight to that route's connection ends at once (`host_gone`) instead of
+/// waiting out its timeout.
 fn drop_route_if(key: &str, send: &HostSend) {
-    let mut routes = HUB.routes.lock().unwrap_or_else(|p| p.into_inner());
-    if routes
-        .get(key)
-        .is_some_and(|current| Arc::ptr_eq(&current.send, send))
+    let dropped = {
+        let mut routes = HUB.routes.lock().unwrap_or_else(|p| p.into_inner());
+        if routes
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(&current.send, send))
+        {
+            routes.remove(key).map(|route| route.connection)
+        } else {
+            None
+        }
+    };
+    let Some(connection) = dropped else {
+        return;
+    };
+    for call in HUB
+        .pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
     {
-        routes.remove(key);
+        if call.meta.route_key == key && call.connection == connection {
+            call.cancel.fire("host_gone");
+        }
     }
 }
 
@@ -1683,6 +1740,23 @@ impl HostToolRouter for TurnHostToolRouter {
         let cancel = Arc::new(CallCancel::default());
         {
             let mut pending = HUB.pending.lock().unwrap_or_else(|p| p.into_inner());
+            // Checked under the lock `cancel_host_calls_for_turn` marks it
+            // under: either the interrupt sees this call pending and ends it,
+            // or this call sees the interrupt and is never sent.
+            if HUB
+                .interrupted_turns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(
+                    &interrupted_turn_key(&self.session_id, &self.turn_id),
+                    INTERRUPTED_RETENTION,
+                )
+            {
+                return Self::error(
+                    "cancelled",
+                    "the turn was interrupted; the call was not sent to the app",
+                );
+            }
             if pending.values().filter(|p| p.meta.route_key == key).count()
                 >= MAX_PENDING_CALLS_PER_PEER
             {
@@ -1905,6 +1979,22 @@ pub(crate) fn pending_calls_for(peers_root: &Path, slug: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_always_record_a_new_mark_when_the_set_is_full() {
+        // #2616 review nit: a full interrupted-turn set must never lose the
+        // interrupt being recorded (that would let its calls through); it
+        // forgets the oldest one instead, and says so.
+        let retention = Duration::from_secs(3_600);
+        let mut set = BoundedClaims::default();
+        for i in 0..BoundedClaims::MAX {
+            assert!(!set.mark(format!("t{i}"), retention));
+        }
+        assert!(set.mark("newest".into(), retention), "reports the eviction");
+        assert!(set.contains("newest", retention));
+        assert!(!set.contains("t0", retention));
+        assert!(set.contains("t1", retention));
+    }
 
     fn tool(name: &str, risk: &str) -> ToolInput {
         serde_json::from_value(json!({

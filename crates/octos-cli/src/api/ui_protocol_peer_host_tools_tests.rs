@@ -3791,3 +3791,226 @@ async fn should_offer_ask_user_question_on_a_peer_input_turn_when_the_host_lists
         ["ask_user_question", "news_list", "read_file"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2567 post-approval follow-ups (N1–N4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn should_never_send_a_call_of_a_turn_that_was_interrupted() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let key = peer_key(&fx);
+    let (ws, mut rx) = ws_connection_for_test(32);
+    register(
+        &fx,
+        &ws,
+        &token,
+        json!({ "tools": [news_list()], "call_timeout_ms": 300 }),
+    )
+    .unwrap();
+    let registry = turn_registry(&fx, &key, "turn-int").await;
+    // The person interrupted the turn before this call reached the host (its
+    // tool task was still in a hook, or its approval had just been answered).
+    crate::peers::host_tools::cancel_host_calls_for_turn(&key, "turn-int");
+    let result = registry
+        .execute_with_context(&call_ctx("c1"), "news_list", &json!({}))
+        .await
+        .unwrap();
+    assert!(!result.success);
+    assert!(result.output.contains("interrupted"), "{}", result.output);
+    assert!(rx.try_recv().is_err(), "no peer/tool/call was sent");
+    // Another turn of the same session is unaffected.
+    let host = spawn_fake_host(
+        &fx,
+        token.clone(),
+        rx,
+        |_| json!({ "ok": true, "data": [] }),
+    );
+    let later = turn_registry(&fx, &key, "turn-next").await;
+    assert!(
+        later
+            .execute_with_context(&call_ctx("c2"), "news_list", &json!({}))
+            .await
+            .unwrap()
+            .success
+    );
+    drop(ws);
+    crate::peers::host_tools::set_host_route(&peers_root(&fx), "news", 0, Arc::new(|_, _| false));
+    assert_eq!(host.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn should_refuse_foreign_monitors_and_deletes_on_a_host_peer_session() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator, MonitorControlKind, MonitorControlRequest, MonitorCreateRequest,
+    };
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let key = peer_key(&fx);
+    let (host_ws, _host_rx) = ws_connection_for_test(8);
+    let (other_ws, _other_rx) = ws_connection_for_test(8);
+    register(&fx, &host_ws, &token, json!({ "tools": [] })).unwrap();
+    for (method, params) in [
+        (
+            "monitor/create",
+            json!({ "session_id": key, "name": "m", "argv": ["true"] }),
+        ),
+        ("session/delete", json!({ "session_id": key })),
+        // An unknown monitor id falls back to the named session.
+        (
+            "monitor/resume",
+            json!({ "monitor_id": "mon-unknown", "session_id": key }),
+        ),
+    ] {
+        let error = refuse_foreign_host_peer_session_call(&fx.state, &other_ws, method, &params)
+            .unwrap_or_else(|| panic!("{method}"));
+        assert_eq!(error.data.unwrap()["kind"], "peer_host_connection_only");
+        assert!(
+            refuse_foreign_host_peer_session_call(&fx.state, &host_ws, method, &params).is_none()
+        );
+    }
+    // A monitor of the peer's session, resumed by naming the host's base
+    // session (a base key controls the monitors of its topics): its target
+    // is the monitor's session, so it is refused too.
+    let orchestrator = crate::autonomy::agent_orchestrator::default_agent_orchestrator();
+    let created = orchestrator
+        .create_monitor(MonitorCreateRequest {
+            session_id: key.clone(),
+            profile_id: "dev".into(),
+            spec: crate::autonomy::monitor_runtime::MonitorSpec {
+                name: "peer-monitor".into(),
+                argv: vec!["sh".into(), "-c".into(), "true".into()],
+                filter_regex: None,
+                batch_ms: crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
+                mode: crate::autonomy::monitor_runtime::MonitorMode::Poll {
+                    interval_secs: 3_600,
+                },
+                timeout_secs: None,
+                persistent: false,
+                max_events_per_hour: 1,
+                goal_id: None,
+                cwd: None,
+            },
+            data_dir: None,
+        })
+        .expect("create monitor");
+    let monitor_id = created["monitor_id"].as_str().unwrap().to_owned();
+    let resume = json!({ "monitor_id": monitor_id, "session_id": fx.system });
+    assert!(
+        refuse_foreign_host_peer_session_call(&fx.state, &other_ws, "monitor/resume", &resume)
+            .is_some()
+    );
+    assert!(
+        refuse_foreign_host_peer_session_call(&fx.state, &host_ws, "monitor/resume", &resume)
+            .is_none()
+    );
+    let _ = orchestrator.control_monitor(MonitorControlRequest {
+        monitor_id,
+        session_id: Some(key),
+        profile_id: "dev".into(),
+        kind: MonitorControlKind::Delete,
+    });
+}
+
+#[tokio::test]
+async fn should_refuse_a_foreign_stdio_turn_control_from_the_persisted_set() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let key = peer_key(&fx);
+    // The host registered on its own connection; nothing is in memory about
+    // the peer's session yet (as after a restart: no turn has run).
+    let (host_ws, _host_rx) = ws_connection_for_test(8);
+    register(&fx, &host_ws, &token, json!({ "tools": [] })).unwrap();
+    let (mut input_tx, input_rx) = tokio::io::duplex(8192);
+    let (mut output_rx, output_tx) = tokio::io::duplex(65536);
+    for (id, method, params) in [
+        (
+            "s1",
+            "turn/steer",
+            json!({ "session_id": key, "expected_turn_id": TurnId::new(), "input": [{"kind": "text", "text": "x"}] }),
+        ),
+        (
+            "s2",
+            "turn/interrupt",
+            json!({ "session_id": key, "turn_id": TurnId::new() }),
+        ),
+    ] {
+        let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        input_tx
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    drop(input_tx);
+    stdio_connection_with_io(
+        fx.state.clone(),
+        input_rx,
+        output_tx,
+        new_stdio_dispatch_count_for_test(),
+        None,
+    )
+    .await
+    .expect("connection exits on EOF");
+    let mut out = String::new();
+    output_rx.read_to_string(&mut out).await.unwrap();
+    for id in ["s1", "s2"] {
+        let reply: Value = out
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|frame| frame["id"] == id)
+            .unwrap_or_else(|| panic!("a reply to {id}: {out}"));
+        assert_eq!(
+            reply["error"]["data"]["kind"], "peer_host_connection_only",
+            "{id}: {reply}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_end_in_flight_calls_when_a_send_to_the_host_fails() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let key = peer_key(&fx);
+    let (ws, mut rx) = ws_connection_for_test(32);
+    register(&fx, &ws, &token, json!({ "tools": [news_topics_set()] })).unwrap();
+    let registry = Arc::new(turn_registry(&fx, &key, "turn-1").await);
+    let task = {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            registry
+                .execute_with_context(
+                    &call_ctx("c1"),
+                    "news_topics_set",
+                    &json!({"topics": ["rust"]}),
+                )
+                .await
+                .unwrap()
+        })
+    };
+    next_frame(&mut rx, "peer/tool/call").await;
+    // The host's socket is gone, but no close was observed yet: the next
+    // send to it (here a `peer/input`) fails and drops the route.
+    drop(rx);
+    assert!(
+        deliver_peer_send_input(
+            "dev",
+            &peers_root(&fx),
+            &fx.system.0,
+            &TurnId::new(),
+            send_input_request("hello", "call_9"),
+        )
+        .is_err()
+    );
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .expect("the in-flight call ends at once, not after its timeout")
+        .unwrap();
+    assert!(!result.success);
+    assert!(
+        result.output.contains("outcome_unknown"),
+        "{}",
+        result.output
+    );
+}

@@ -5907,6 +5907,16 @@ impl InProcessAgentOrchestrator {
             .count()
     }
 
+    /// The session a monitor belongs to (`None` for an unknown id). Used to
+    /// confine controls of a host-owned app peer's monitors to its host
+    /// (UPCR-2026-035).
+    pub(crate) fn monitor_session(&self, monitor_id: &str) -> Option<SessionKey> {
+        self.state()
+            .monitors
+            .get(monitor_id)
+            .map(|record| record.session_id.clone())
+    }
+
     /// codex #1 — true when peer `slug` (under `profile_id`) has a
     /// `peer_send_input` injection still QUEUED (a follow-up turn that has not
     /// run yet). Such a peer is NOT settled: the fleet-synthesis gate must not
