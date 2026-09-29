@@ -78,6 +78,10 @@ const SHOW_AGAIN_AFTER: Duration = Duration::from_secs(120);
 /// core allows 5 s); opening continues in the background after that.
 const HAND_OVER_WAIT: Duration = Duration::from_secs(4);
 
+/// Two-second waits for a self-clearing challenge page
+/// ([`crate::access::is_interstitial`]).
+const INTERSTITIAL_WAITS: u32 = 5;
+
 /// Pause after the load event for script-built results to settle.
 const SETTLE: Duration = Duration::from_millis(700);
 
@@ -469,10 +473,21 @@ impl PersonBrowser {
                 .await
                 .map_err(|e| format!("browser load: {e}"))?;
             tokio::time::sleep(SETTLE).await;
-            let html = page
+            let mut html = page
                 .content()
                 .await
                 .map_err(|e| format!("browser read: {e}"))?;
+            // A check that clears itself in a real browser: wait for it
+            // (up to ~10 s) rather than report it.
+            for _ in 0..INTERSTITIAL_WAITS {
+                if !crate::access::is_interstitial(&html) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if let Ok(h) = page.content().await {
+                    html = h;
+                }
+            }
             let final_url = page
                 .url()
                 .await

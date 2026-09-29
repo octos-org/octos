@@ -57,6 +57,10 @@ const CDP_CONNECT_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_MAX_DEPTH: u32 = 3;
 const DEFAULT_MAX_PAGES: u32 = 50;
 
+/// Two-second waits for a self-clearing challenge page (see
+/// `octos_research::access::interstitial_text`).
+const INTERSTITIAL_WAITS: u32 = 5;
+
 /// Largest rendered HTML returned per page when `include_html` is set.
 const MAX_PAGE_HTML_BYTES: usize = 2 * 1024 * 1024;
 /// Cap on a robots.txt `Crawl-delay` we will honour between pages.
@@ -564,7 +568,9 @@ async fn extract_links(ws: &mut WsStream, session_id: &str) -> Vec<String> {
 
 fn is_bot_blocked(text: &str) -> bool {
     let lower = text.to_lowercase();
-    lower.contains("performing security verification")
+    // The shared list (Chinese sites' WAF pages included), on short text.
+    octos_research::access::challenge_text(text)
+        || lower.contains("performing security verification")
         || lower.contains("press & hold to confirm you are")
         || lower.contains("please verify you are a human")
         || lower.contains("checking your browser")
@@ -837,6 +843,16 @@ async fn crawl_single_page(
         }
     };
 
+    // A check that clears itself in a real browser ("Just a moment…",
+    // "正在进行安全检测…"): wait for it, up to ~10 s, instead of giving up.
+    let mut waited = 0;
+    while waited < INTERSTITIAL_WAITS && octos_research::access::interstitial_text(&text) {
+        pump_events(ws, Duration::from_secs(2)).await;
+        waited += 1;
+        if let Ok(t) = extract_text(ws, session_id).await {
+            text = t;
+        }
+    }
     if is_bot_blocked(&text) {
         eprintln!("[deep_crawl] bot challenge, not bypassing: {url}");
         return CrawledPage {
@@ -1360,6 +1376,11 @@ async fn run() -> Output {
                     if !link_url.path().starts_with(prefix) {
                         continue;
                     }
+                }
+
+                // Sign-in, sign-up and account pages hold no content.
+                if octos_research::urls::is_account_link(&normalized) {
+                    continue;
                 }
 
                 // SSRF check on discovered links

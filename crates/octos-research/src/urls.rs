@@ -60,6 +60,74 @@ pub fn dedup_key(raw: &str) -> String {
 }
 
 /// Host without a leading `www.`, lowercase.
+/// Path segments of sign-in, sign-up and account pages. A crawl follows a
+/// site's content, not its account pages: they hold no article and are
+/// often where a site starts asking who is visiting.
+const ACCOUNT_SEGMENTS: &[&str] = &[
+    "login",
+    "log-in",
+    "logon",
+    "signin",
+    "sign-in",
+    "sign_in",
+    "signup",
+    "sign-up",
+    "sign_up",
+    "register",
+    "registration",
+    "logout",
+    "log-out",
+    "signout",
+    "sign-out",
+    "auth",
+    "oauth",
+    "oauth2",
+    "sso",
+    "account",
+    "accounts",
+    "my-account",
+    "myaccount",
+    "profile",
+    "settings",
+    "password",
+    "reset-password",
+    "forgot-password",
+    "subscribe",
+    "checkout",
+    "cart",
+    "usercenter",
+    "passport",
+];
+
+/// Whether `raw` is a sign-in, sign-up or account page (by its path, or an
+/// `accounts.`/`login.`/`auth.`/`passport.`/`sso.` host). Crawls skip these.
+pub fn is_account_link(raw: &str) -> bool {
+    let Ok(u) = url::Url::parse(raw) else {
+        return false;
+    };
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    if [
+        "accounts.",
+        "account.",
+        "login.",
+        "auth.",
+        "passport.",
+        "sso.",
+        "signin.",
+    ]
+    .iter()
+    .any(|p| host.starts_with(p))
+    {
+        return true;
+    }
+    u.path_segments().is_some_and(|mut segs| {
+        segs.any(|seg| {
+            let seg = seg.to_ascii_lowercase();
+            ACCOUNT_SEGMENTS.contains(&seg.as_str())
+        })
+    })
+}
+
 pub fn domain_of(raw: &str) -> Option<String> {
     let u = Url::parse(raw.trim()).ok()?;
     let host = u.host_str()?.to_ascii_lowercase();
@@ -115,5 +183,28 @@ mod tests {
             domain_of("https://www.BBC.co.uk/news").as_deref(),
             Some("bbc.co.uk")
         );
+    }
+
+    #[test]
+    fn should_recognise_account_pages() {
+        for u in [
+            "https://medium.com/m/signin?operation=login",
+            "https://www.theverge.com/auth/login?returnPath=%2F",
+            "https://36kr.com/usercenter/basicinfo",
+            "https://accounts.google.com/ServiceLogin",
+            "https://example.org/Sign-Up",
+            "https://shop.example/cart",
+        ] {
+            assert!(is_account_link(u), "{u}");
+        }
+        for u in [
+            "https://www.bbc.com/news/articles/c1",
+            "https://medium.com/tag/rust",
+            "https://example.org/blog/authors-we-like",
+            "https://example.org/login-tips-for-writers-2026",
+            "not a url",
+        ] {
+            assert!(!is_account_link(u), "{u}");
+        }
     }
 }

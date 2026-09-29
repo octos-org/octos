@@ -81,7 +81,7 @@ In category `news`, posts rank after every article. They stay in the results as 
 
 ## Reading pages
 
-The shared reader (`reader::Reader`, used by `deep-search`, the built-in `deep_search` tool and the toolbox's `web_read`) reads a page over plain HTTP first and asks a browser renderer only when that finds no article, as with Google News links, which reach the publisher only through a script. It never gets past a wall: a bot challenge over plain HTTP is not retried in the browser, and nothing in a rendered page is clicked.
+The shared reader (`reader::Reader`, used by `deep-search`, the built-in `deep_search` tool and the toolbox's `web_read`) reads a page over plain HTTP first and asks a browser renderer when that finds no article (as with Google News links, which reach the publisher only through a script) or when plain HTTP was blocked (a bot challenge, 401 or 403): a real browser, and especially a phone's WebView, is often let through where a plain client is not (`ReaderConfig::render_blocked`, on by default; OctoSense ADR 0002 §6 as amended). A renderer that meets a check which clears itself ("Just a moment…", "正在进行安全检测…", `access::is_interstitial`) waits for it. Nothing is solved or clicked: a challenge that asks a person, or one the browser meets too, is final.
 
 ### Failure reasons
 

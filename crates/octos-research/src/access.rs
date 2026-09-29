@@ -405,7 +405,78 @@ const CHALLENGE_PHRASES: &[&str] = &[
     // Results pages (#2607): DuckDuckGo's HTML-endpoint check and Bing's.
     "unfortunately, bots use duckduckgo too",
     "please solve the challenge below to continue",
+    // Chinese sites' WAF pages (Volcano Engine, Alibaba Cloud, Tencent
+    // Cloud and similar): "running a security check", "checking the current
+    // network environment", "human verification", "complete the security
+    // check", "slide to verify".
+    "正在进行安全检测",
+    "正在检测当前网络环境",
+    "人机验证",
+    "请完成安全验证",
+    "滑动验证",
+    "拖动滑块",
 ];
+
+/// Phrases of challenge pages that clear themselves after a few seconds in
+/// a real browser (a JavaScript check, no person needed). A renderer that
+/// meets one waits and reads the page again ([`is_interstitial`]).
+const INTERSTITIAL_PHRASES: &[&str] = &[
+    "just a moment...",
+    "checking your browser",
+    "performing security verification",
+    "enable javascript and cookies to continue",
+    "正在进行安全检测",
+    "正在检测当前网络环境",
+];
+
+/// Whether `html` is a challenge page that usually clears itself in a real
+/// browser within seconds ("Just a moment…", "正在进行安全检测…"). Renderers
+/// wait and read again instead of reporting it at once; one that asks a
+/// person (a CAPTCHA, a slider) is not an interstitial.
+pub fn is_interstitial(html: &str) -> bool {
+    if !is_bot_challenge(html) {
+        return false;
+    }
+    let head = head_of(html);
+    let text = visible_text(head);
+    let lower = text.to_lowercase();
+    let title = page_title(head).to_lowercase();
+    !asks_person(&lower)
+        && INTERSTITIAL_PHRASES
+            .iter()
+            .any(|p| title.contains(p) || lower.contains(p))
+}
+
+/// Whether a page's visible text (short, as challenge pages are) reads as a
+/// bot challenge. For renderers that see text rather than HTML.
+pub fn challenge_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    text.chars().filter(|c| !c.is_whitespace()).count() <= MAX_CHALLENGE_TEXT_CHARS
+        && CHALLENGE_PHRASES.iter().any(|p| lower.contains(p))
+}
+
+/// Whether a page's visible text reads as a challenge that clears itself in
+/// a real browser (see [`is_interstitial`]).
+pub fn interstitial_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    challenge_text(text)
+        && !asks_person(&lower)
+        && INTERSTITIAL_PHRASES.iter().any(|p| lower.contains(p))
+}
+
+/// Challenge wording that asks a person to act (never done for them).
+fn asks_person(lower: &str) -> bool {
+    [
+        "captcha",
+        "人机验证",
+        "滑动验证",
+        "拖动滑块",
+        "请完成安全验证",
+        "press & hold",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+}
 
 /// Titles challenge pages use.
 const CHALLENGE_TITLES: &[&str] = &[
@@ -1408,5 +1479,25 @@ mod tests {
         assert!(!is_google_news_article(
             "https://news.google.com.example.org/rss/articles/x"
         ));
+    }
+
+    #[test]
+    fn should_recognise_chinese_challenge_pages_and_which_clear_themselves() {
+        let volc = serp_or_read_fixture("read/volcengine_security_check.html");
+        assert!(
+            is_bot_challenge(&volc),
+            "Volcano Engine WAF check is a challenge"
+        );
+        assert!(is_interstitial(&volc), "and it clears itself in a browser");
+        let slider = serp_or_read_fixture("read/slider_captcha_zh.html");
+        assert!(is_bot_challenge(&slider));
+        assert!(!is_interstitial(&slider), "a slider asks a person");
+        let cf = serp_or_read_fixture("read/cloudflare_challenge.html");
+        assert!(is_bot_challenge(&cf));
+    }
+
+    fn serp_or_read_fixture(rel: &str) -> String {
+        let path = format!("{}/tests/fixtures/{rel}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 }
