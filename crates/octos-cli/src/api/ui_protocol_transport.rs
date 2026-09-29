@@ -24849,7 +24849,10 @@ async fn handle_voice_commit_admission(
     // already-committed admission stays idempotent; the `turn/interrupt`
     // semantics of `supersedes_turn_id` are covered by the same check. The
     // claim is released so a refused caller cannot hold the admission
-    // against the host's own retry.
+    // against the host's own retry. A foreign caller may therefore see an
+    // admission-shaped error (unknown, expired, mismatched) before the
+    // confinement error — that is the price of keeping the idempotent
+    // re-entry on every committed admission, and it starts nothing.
     if let Some(refused) =
         refuse_foreign_host_turn_control(state, &session_id, ws, "voice/commit_admission")
     {
@@ -27133,6 +27136,11 @@ fn host_session_answer_allowed(
 }
 
 /// Calls that start, steer, stop or rewrite the turns of a session.
+///
+/// The voice lane (`voice/admit`, `voice/commit_admission`) leads to the
+/// same turn start but is confined inside its handlers instead: its session
+/// rides at `params.turn.session_id` (not `params.session_id`), and the
+/// commit's check must sit behind the idempotent short-circuit.
 const HOST_PEER_SESSION_WRITE_METHODS: &[&str] = &[
     "turn/start",
     "turn/steer",
