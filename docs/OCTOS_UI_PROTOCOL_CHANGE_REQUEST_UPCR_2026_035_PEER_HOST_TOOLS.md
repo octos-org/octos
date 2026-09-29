@@ -324,8 +324,10 @@ registered set, or any `peerctx-<slug>.<context>` of it, every turn start:
   contexts, on the originator's base key), `turn/start`, `turn/steer`,
   `turn/interrupt` (including a voice turn's `supersedes_turn_id`),
   `session/rollback`, `session/goal/set`, `session/goal/clear`,
-  `session/goal/operator_transition` and `loop/create` are accepted only
-  from the peer's host connection (`peer_host_connection_only`): anything
+  `session/goal/operator_transition`, `loop/create`, `monitor/create`,
+  `monitor/resume` (judged by the monitor's own session) and `session/delete`
+  are accepted only from the peer's host connection, on the WebSocket and the
+  stdio/embedded transports alike (`peer_host_connection_only`): anything
   else written into such a session would be text in front of a turn that
   has the app's act tools. The rule is derived from the tool set on disk,
   so it holds from the first call after a kernel restart (then nobody
@@ -334,10 +336,14 @@ registered set, or any `peerctx-<slug>.<context>` of it, every turn start:
     own tool tasks; `turn/interrupt` (and a voice supersede) ends every call
     of the turn still waiting on the host: the host gets
     `peer/tool/cancel {reason: "cancelled"}`, and a non-`read` call is an
-    unknown outcome that is not resent.
+    unknown outcome that is not resent. The turn is remembered as
+    interrupted, so a call of it that had not reached the host yet (its tool
+    task still in a hook, or its approval answered just before) is refused
+    (`cancelled`) and never sent.
   - **A host connection that closes ends its calls.** Every call in flight
     to it ends at once (a `read` call as `host_unavailable`, any other as
-    `outcome_unknown`) instead of waiting out its timeout.
+    `outcome_unknown`) instead of waiting out its timeout; so does a failed
+    send to it (the socket gone before its close was seen).
 - **No host filesystem access.** A host-bound app session never runs with
   `Host` filesystem permissions (`danger_full_access`, e.g. a Solo profile
   with `--danger-full-access` or `permission/profile/set`): the kernel

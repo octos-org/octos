@@ -839,8 +839,20 @@ impl CallCancel {
 /// was interrupted). Each ends as `cancelled` for the host (`peer/tool/cancel`)
 /// and, unless it only read, as an unknown outcome that is not resent.
 /// Returns how many calls were cancelled.
+///
+/// The turn is also remembered as interrupted, under the same lock a call
+/// takes to enter the pending set: a call of that turn that had not reached
+/// the host yet (its tool task still in a before-tool hook, or its approval
+/// answered just before the interrupt) is refused and never sent.
 pub(crate) fn cancel_host_calls_for_turn(session: &SessionKey, turn_id: &str) -> usize {
     let pending = HUB.pending.lock().unwrap_or_else(|p| p.into_inner());
+    HUB.interrupted_turns
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mark(
+            interrupted_turn_key(session, turn_id),
+            INTERRUPTED_RETENTION,
+        );
     let mut cancelled = 0;
     for call in pending.values() {
         if call.meta.session_id == *session && call.meta.turn_id == turn_id {
@@ -849,6 +861,14 @@ pub(crate) fn cancel_host_calls_for_turn(session: &SessionKey, turn_id: &str) ->
         }
     }
     cancelled
+}
+
+/// How long an interrupted turn is remembered (its tool tasks are long gone
+/// by then).
+const INTERRUPTED_RETENTION: Duration = Duration::from_secs(24 * 3_600);
+
+fn interrupted_turn_key(session: &SessionKey, turn_id: &str) -> String {
+    format!("{}\u{0}{turn_id}", session.0)
 }
 
 /// A peer's tool host: the connection that registered its set.
@@ -946,6 +966,9 @@ struct HostToolHub {
     /// The host starting such a turn runs the system agent's request, on
     /// the person's behalf: it counts as attended.
     input_turns: Mutex<BoundedClaims>,
+    /// `(session, turn)` pairs interrupted by the person: no call of theirs is
+    /// sent to the host any more. Written and read under the `pending` lock.
+    interrupted_turns: Mutex<BoundedClaims>,
     pending: Mutex<HashMap<String, PendingCall>>,
     finished: Mutex<HashMap<String, (CallMeta, Instant)>>,
     occurrences: Mutex<BoundedClaims>,
@@ -1169,13 +1192,34 @@ pub(crate) fn drop_routes_for_connection(connection: u64) {
 }
 
 /// Drop the route if it is still `send` (its connection closed).
+///
+/// Like a closed connection ([`drop_routes_for_connection`]), every call in
+/// flight to that route's connection ends at once (`host_gone`) instead of
+/// waiting out its timeout.
 fn drop_route_if(key: &str, send: &HostSend) {
-    let mut routes = HUB.routes.lock().unwrap_or_else(|p| p.into_inner());
-    if routes
-        .get(key)
-        .is_some_and(|current| Arc::ptr_eq(&current.send, send))
+    let dropped = {
+        let mut routes = HUB.routes.lock().unwrap_or_else(|p| p.into_inner());
+        if routes
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(&current.send, send))
+        {
+            routes.remove(key).map(|route| route.connection)
+        } else {
+            None
+        }
+    };
+    let Some(connection) = dropped else {
+        return;
+    };
+    for call in HUB
+        .pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
     {
-        routes.remove(key);
+        if call.meta.route_key == key && call.connection == connection {
+            call.cancel.fire("host_gone");
+        }
     }
 }
 
@@ -1709,6 +1753,23 @@ impl HostToolRouter for TurnHostToolRouter {
         let cancel = Arc::new(CallCancel::default());
         {
             let mut pending = HUB.pending.lock().unwrap_or_else(|p| p.into_inner());
+            // Checked under the lock `cancel_host_calls_for_turn` marks it
+            // under: either the interrupt sees this call pending and ends it,
+            // or this call sees the interrupt and is never sent.
+            if HUB
+                .interrupted_turns
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(
+                    &interrupted_turn_key(&self.session_id, &self.turn_id),
+                    INTERRUPTED_RETENTION,
+                )
+            {
+                return Self::error(
+                    "cancelled",
+                    "the turn was interrupted; the call was not sent to the app",
+                );
+            }
             if pending.values().filter(|p| p.meta.route_key == key).count()
                 >= MAX_PENDING_CALLS_PER_PEER
             {
