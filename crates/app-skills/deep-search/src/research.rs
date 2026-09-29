@@ -4,11 +4,11 @@
 //! (key-less OctoScript engines over official APIs and feeds: GDELT, Hacker
 //! News, Wikipedia, arXiv, ...; disable with `OCTOS_METASEARCH=0` to call
 //! GDELT + Google News RSS directly for news), then a
-//! self-hosted SearXNG (`SEARXNG_URL`), then search APIs with keys. Scraping
-//! search-results pages (DuckDuckGo HTML, Bing in headless Chrome) is not in
-//! the default order; both need `OCTOS_ALLOW_SERP_SCRAPE=1` (alias
-//! `OCTOS_ALLOW_BROWSER_SERP`). With nothing configured, a general query
-//! returns an empty result that says how to add SearXNG or a key.
+//! self-hosted SearXNG (`SEARXNG_URL`), then search APIs with keys, then
+//! results-page search (DuckDuckGo HTML, Bing in headless Chrome) for general
+//! web results, on unless `OCTOS_ALLOW_SERP_SCRAPE=0` (alias
+//! `OCTOS_ALLOW_BROWSER_SERP`). If nothing returns anything, the result is
+//! empty and says how to add SearXNG or a key.
 //!
 //! Pages that will be cited are read with an identifiable User-Agent,
 //! after a robots.txt check, spaced per host, with size caps; JS-heavy pages

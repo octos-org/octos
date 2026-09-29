@@ -10,7 +10,7 @@ always: true
 
 ## Overview
 
-The `search` tool does multi-round research: octos's key-less metasearch first, then a self-hosted SearXNG if configured, then any search API key you added, polite page reading (honest User-Agent, per-host spacing, a real browser only to render JS-heavy pages), reference chasing, and a cited report plus structured items. News, science and software searches work with no API key; key-less general search covers only Wikipedia and Wikidata (add a Brave key or SearXNG for web results). This file is always in context, so it stays short; the tool's input schema lists every parameter.
+The `search` tool does multi-round research: octos's key-less metasearch first, then a self-hosted SearXNG if configured, then any search API key you added, polite page reading (honest User-Agent, per-host spacing, a real browser only to render JS-heavy pages), reference chasing, and a cited report plus structured items. News, science and software searches work with no API key; key-less general search gets web results from results-page search (DuckDuckGo, then Bing; on unless the operator turned it off) alongside Wikipedia and Wikidata. This file is always in context, so it stays short; the tool's input schema lists every parameter.
 
 ## Parameters
 

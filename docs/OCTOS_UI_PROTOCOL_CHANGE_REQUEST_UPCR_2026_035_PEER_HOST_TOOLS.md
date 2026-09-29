@@ -6,8 +6,9 @@
 - Date: 2026-09-27
 - Target protocol: `octos-ui/v1alpha1`
 - Status: implemented
-- Scope: two additive raw AppUI methods, `peer/tools/register` and
-  `peer/tool/result`; three additive server notifications, `peer/tool/call`,
+- Scope: three additive raw AppUI methods, `peer/tools/register`,
+  `peer/tool/result` and `peer/input/reject` (#2618); three additive server
+  notifications, `peer/tool/call`,
   `peer/tool/cancel` and `peer/input`; per-turn enforcement of a host-owned
   app peer's app tools and tool risk levels; the system agent's input to a
   host-owned peer delivered to its host
@@ -33,7 +34,8 @@ Discovery: a server that lists `peer/tools/register` in
 `config/capabilities/list` `supported_methods` implements this whole UPCR;
 `peer/tool/call`, `peer/tool/cancel` and `peer/input` are in
 `supported_notifications`.
-Both methods are raw-surface methods (a session-ingress connection cannot
+`peer/input/reject` is in `supported_methods` wherever `peer/input` is sent.
+All three methods are raw-surface methods (a session-ingress connection cannot
 call them), profile scoped, and authorized like UPCR-2026-034 control calls:
 the caller names the peer's originator `session_id` and presents the peer's
 `host_token`.
@@ -249,15 +251,70 @@ transcript carry the reply).
   `peer_send_input` fails with an error that says the app is not connected,
   and nothing is queued or run. External clients of `serve --host-managed`
   never receive it (they can never register).
-- `peer_send_input` reporting `queued` means the notification was written to
-  the host connection's socket, not that the host started (or will start)
-  the turn; the system agent follows the turn through the peer paths.
+- `peer_send_input` waits up to 5 s for the host's answer: a `turn/start`
+  with the input's `turn_id` ends the wait at once, and `peer/input/reject`
+  (below) fails the call with the host's reason. A host that does neither
+  within the wait leaves the call reporting `queued`, which means the
+  notification was written to the host connection's socket, not that the
+  host started (or will start) the turn; the system agent follows the turn
+  through the peer paths.
 - A turn the host starts with that `turn_id` on the peer's session is the
   system agent's request made for the person, so it counts as *attended*
   (below): the app's foreground tools run in it, as in a request context.
 
 Peers that are not host-owned keep today's behaviour (the gateway inbox or
 the serve continuation queue).
+
+### `peer/input/reject` (#2618)
+
+```
+{session_id, peer, host_token, profile_id?, input_id,
+ reason: "signed_out" | "no_consent" | "busy" | "other",
+ message?}
+→ {input_id, rejected: true, reported_to: "call" | "system_session"}
+```
+
+The host refuses a `peer/input` it cannot act on, so the system agent learns
+why the peer did not act instead of the refusal being only logged. OctoSense's
+reasons: the account is signed out or suspended (`signed_out`), the person has
+not granted the app consent (`no_consent`), the peer is busy past the host's
+queue limit (`busy`). `other` needs a `message` (one line, 1–256 bytes, no
+control characters, no app data); the other reasons take none. Unknown fields
+and unknown reasons are refused (`invalid_params`; a bad `reason` or `message`
+has `data.kind` `peer_input_reject_invalid`).
+
+Accepted only:
+
+- with the peer's originator `session_id` and `host_token`, like every host
+  call (`peer_originator_mismatch`, `peer_host_token_mismatch`);
+- from the connection the `peer/input` was sent to
+  (`peer_input_wrong_connection` otherwise);
+- for an input the kernel sent to that peer and still remembers (24 hours,
+  4 096 inputs; `peer_input_not_found` otherwise);
+- once per `input_id` (`peer_input_already_rejected`), and only while the
+  input is unanswered: no `turn/start` with its `turn_id` yet
+  (`peer_input_already_started`).
+
+Effect:
+
+- If the system agent's `peer_send_input` is still waiting (above), the call
+  fails with `peer_input_rejected: <reason>` (and, for `other`, the message
+  in parentheses); `reported_to: "call"`.
+- If the call already returned, the refusal is recorded on the peer's
+  blackboard (`peers/<slug>/input_rejections.jsonl`) and reported to the
+  system session (the peer's originator) at the start of its next turn, as
+  a `peer_results_ready` context event like the peer-results note, each
+  refusal once; `reported_to: "system_session"`.
+- The `turn_id` is released: a turn with it no longer counts as the system
+  agent's request (not attended), and a later `turn/start` with it on the
+  peer's session is refused (`peer_input_rejected`).
+- Audited in `tool_audit.jsonl` as `decision: "peer_input_rejected"` with
+  `outcome` (the reason), `message`, `input_id`, `turn_id` and
+  `reported_to`; each sent input is audited as `peer_input_sent`.
+
+Wire compatibility is additive: a host that never calls it behaves as
+before (its `turn/start` answers the input; the system agent's call returns
+as soon as it arrives, or after the wait).
 
 ### `peer/tool/cancel` (server → host notification)
 
@@ -324,8 +381,10 @@ registered set, or any `peerctx-<slug>.<context>` of it, every turn start:
   contexts, on the originator's base key), `turn/start`, `turn/steer`,
   `turn/interrupt` (including a voice turn's `supersedes_turn_id`),
   `session/rollback`, `session/goal/set`, `session/goal/clear`,
-  `session/goal/operator_transition` and `loop/create` are accepted only
-  from the peer's host connection (`peer_host_connection_only`): anything
+  `session/goal/operator_transition`, `loop/create`, `monitor/create`,
+  `monitor/resume` (judged by the monitor's own session) and `session/delete`
+  are accepted only from the peer's host connection, on the WebSocket and the
+  stdio/embedded transports alike (`peer_host_connection_only`): anything
   else written into such a session would be text in front of a turn that
   has the app's act tools. The rule is derived from the tool set on disk,
   so it holds from the first call after a kernel restart (then nobody
@@ -334,10 +393,14 @@ registered set, or any `peerctx-<slug>.<context>` of it, every turn start:
     own tool tasks; `turn/interrupt` (and a voice supersede) ends every call
     of the turn still waiting on the host: the host gets
     `peer/tool/cancel {reason: "cancelled"}`, and a non-`read` call is an
-    unknown outcome that is not resent.
+    unknown outcome that is not resent. The turn is remembered as
+    interrupted, so a call of it that had not reached the host yet (its tool
+    task still in a hook, or its approval answered just before) is refused
+    (`cancelled`) and never sent.
   - **A host connection that closes ends its calls.** Every call in flight
     to it ends at once (a `read` call as `host_unavailable`, any other as
-    `outcome_unknown`) instead of waiting out its timeout.
+    `outcome_unknown`) instead of waiting out its timeout; so does a failed
+    send to it (the socket gone before its close was seen).
 - **No host filesystem access.** A host-bound app session never runs with
   `Host` filesystem permissions (`danger_full_access`, e.g. a Solo profile
   with `--danger-full-access` or `permission/profile/set`): the kernel
@@ -690,6 +753,15 @@ never declares its tools a second way.
   `should_answer_a_host_tool_approval_only_on_its_connection_when_turn_ids_collide`,
   `should_refuse_a_host_tool_whose_model_name_is_a_kernel_tools`, and in
   octos-agent `should_mark_a_host_routed_tool_by_origin_whatever_its_name`
+- `peer/input/reject` (#2618, octos-cli `peer_host_tools_tests`):
+  `should_fail_the_waiting_peer_send_input_with_the_hosts_reason`,
+  `should_end_the_wait_without_an_error_when_the_host_starts_the_turn`,
+  `should_report_a_rejection_after_the_call_returned_on_the_system_session`,
+  `should_refuse_a_rejection_from_a_foreign_connection_with_a_bad_token_twice_or_after_the_turn_started`,
+  `should_refuse_an_unknown_reason_an_unknown_field_or_a_bad_message`,
+  `should_refuse_a_turn_start_with_a_rejected_inputs_turn_id` (also: the
+  released turn id no longer runs a foreground app tool); the method is in
+  the advertise/dispatch and external-refusal tests
 - Round 11 (octos-cli `peer_host_tools_tests`):
   `should_cancel_an_in_flight_host_call_when_the_turn_is_interrupted`
   (a real `turn/start` + `turn/interrupt`; fails without the fix),
@@ -697,5 +769,8 @@ never declares its tools a second way.
   `should_run_a_foreground_tool_in_a_host_turn_started_from_peer_input`,
   `should_hide_a_host_tool_approval_whose_host_is_unknown`,
   `should_refuse_foreign_writes_to_a_host_peer_session_when_its_set_is_on_disk`,
+  `should_refuse_foreign_turn_controls_on_a_host_peer_session_when_its_set_is_on_disk`
+  (no turn has run on the session; a corrupt `host_tools.json` is confined
+  too),
   `should_give_the_system_agent_the_app_tools_the_host_registers_on_its_session`
 - `spec_section6_catalog_lists_every_advertised_method`

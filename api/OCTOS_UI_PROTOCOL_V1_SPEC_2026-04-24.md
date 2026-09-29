@@ -602,6 +602,17 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   gated call's wait to the approval TTL; an unanswered non-read call ends as
   `outcome_unknown`; typed `data.kind` `peer_tool_call_not_found` for a
   finished, timed-out or cancelled call, whose late result is audited)
+- `peer/input/reject` (accepted `UPCR-2026-035`, #2618: the host refuses a
+  `peer/input`; `{session_id, peer, host_token, input_id, reason:
+  "signed_out" | "no_consent" | "busy" | "other", message?}` → `{input_id,
+  rejected, reported_to: "call" | "system_session"}`; only from the connection
+  the input was sent to, once, before a `turn/start` with its `turn_id`; the
+  system agent's waiting `peer_send_input` fails with `peer_input_rejected:
+  <reason>`, or the refusal is reported on the system session's next turn;
+  the `turn_id` is released and a later `turn/start` with it is refused;
+  typed `data.kind` `peer_input_reject_invalid`, `peer_input_not_found`,
+  `peer_input_wrong_connection`, `peer_input_already_rejected`,
+  `peer_input_already_started`)
 - `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
   latest `result.md` — written server-side on every peer-session turn
   terminal — with per-field truncation flags and `result_updated_unix`;
@@ -789,8 +800,9 @@ registered a host-owned app peer's tools with `peer/tools/register`):
 - `peer/input` — the system agent's `peer_send_input` to a host-owned peer:
   `{peer, session_id, input_id, turn_id, text}`. The host starts the peer's
   turn itself (`turn/start` on `session_id` with `turn_id` and the text, on
-  the same connection). Never run as a kernel-internal turn; with no host
-  connected `peer_send_input` fails and nothing is queued. Ephemeral.
+  the same connection), or refuses it with `peer/input/reject`. Never run as
+  a kernel-internal turn; with no host connected `peer_send_input` fails and
+  nothing is queued. Ephemeral.
 
 Background activity — the human sink (#2019, gate `event.background_activity.v1`):
 

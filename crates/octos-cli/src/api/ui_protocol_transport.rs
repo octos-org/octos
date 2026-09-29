@@ -424,6 +424,9 @@ const APPUI_METHOD_PEER_CONTEXT_CLOSE: &str = "peer/context/close";
 const APPUI_METHOD_PEER_TOOLS_REGISTER: &str = "peer/tools/register";
 /// UPCR-2026-035 `peer/tool/result`: the host answers a `peer/tool/call`.
 const APPUI_METHOD_PEER_TOOL_RESULT: &str = "peer/tool/result";
+/// `peer/input/reject` (UPCR-2026-035, #2618): the host refuses a
+/// `peer/input` it received; the system agent learns why.
+const APPUI_METHOD_PEER_INPUT_REJECT: &str = "peer/input/reject";
 /// `turn/steer` — mid-turn prompt injection into the ACTIVE turn (codex
 /// parity: app-server `turn/steer` → `Session::steer_input`). Params
 /// `{session_id, expected_turn_id?, input}`; result `{turn_id, steered}`.
@@ -539,6 +542,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PEER_CONTEXT_CLOSE,
     APPUI_METHOD_PEER_TOOLS_REGISTER,
     APPUI_METHOD_PEER_TOOL_RESULT,
+    APPUI_METHOD_PEER_INPUT_REJECT,
     APPUI_METHOD_TURN_STEER,
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
@@ -7477,7 +7481,8 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::TurnInterrupt(params) => {
-                handle_turn_interrupt(&ws, &ledger, &active_turns, &contracts, id, params).await;
+                handle_turn_interrupt(&ws, &state, &ledger, &active_turns, &contracts, id, params)
+                    .await;
             }
             UiCommand::ApprovalRespond(params) => {
                 handle_approval_respond(
@@ -7505,6 +7510,7 @@ async fn ui_protocol_connection(
             UiCommand::UserQuestionRespond(params) => {
                 handle_user_question_respond(
                     &ws,
+                    &state,
                     &contracts,
                     connection_profile_id,
                     connection_is_external.then(|| ws.connection_id()),
@@ -8283,6 +8289,14 @@ where
                 connection_mode_recorded = true;
             }
             let connection_profile_id = connection_profile_id_owned.as_deref();
+            // UPCR-2026-035 (#2571): the same host-peer confinement as the WS
+            // loop, from the persisted tool set (so it holds after a restart).
+            if let Some(error) =
+                refuse_foreign_host_peer_session_call(&state, &ws, &request.method, &request.params)
+            {
+                let _ = send_rpc_error(&ws, Some(id), error);
+                continue;
+            }
 
             if handle_raw_appui_rpc(
                 &ws,
@@ -8385,8 +8399,16 @@ where
                     .await;
                 }
                 UiCommand::TurnInterrupt(params) => {
-                    handle_turn_interrupt(&ws, &ledger, &active_turns, &contracts, id, params)
-                        .await;
+                    handle_turn_interrupt(
+                        &ws,
+                        &state,
+                        &ledger,
+                        &active_turns,
+                        &contracts,
+                        id,
+                        params,
+                    )
+                    .await;
                 }
                 UiCommand::ApprovalRespond(params) => {
                     // The stdio peer is the process owner, never external.
@@ -8415,6 +8437,7 @@ where
                 UiCommand::UserQuestionRespond(params) => {
                     handle_user_question_respond(
                         &ws,
+                        &state,
                         &contracts,
                         connection_profile_id_owned.as_deref(),
                         None,
@@ -15823,6 +15846,81 @@ fn deliver_peer_send_input(
         .into_callback_result(&slug)
 }
 
+/// The wait of a `peer_send_input` call of `origin_session` (turn `turn_id`)
+/// for the host's answer to the `peer/input` it sent: a `peer/input/reject`
+/// fails the call with the reason. Inputs that did not go to a host have no
+/// answer to wait for.
+fn peer_send_input_answer_callback(
+    origin_session: String,
+    turn_id: TurnId,
+    wait: std::time::Duration,
+) -> octos_agent::PeerSendInputAnswerCallback {
+    Arc::new(move |req: octos_agent::PeerSendInputRequest| {
+        let input_id = peer_send_input_occurrence_id(&origin_session, &turn_id, &req.occurrence_id);
+        Box::pin(async move {
+            crate::peers::host_tools::await_peer_input_answer(&input_id, wait)
+                .await
+                .map(|rejection| octos_agent::PeerSendInputRefusal(rejection.describe()))
+        })
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPeerInputRejectParams {
+    session_id: SessionKey,
+    peer: String,
+    #[serde(default)]
+    host_token: Option<String>,
+    #[serde(default)]
+    profile_id: Option<String>,
+    input_id: String,
+    reason: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// `peer/input/reject` — the host refuses a `peer/input` it received (the
+/// account is signed out, the person has not granted consent, the peer is
+/// busy, …), so the system agent learns why the peer did not act.
+fn raw_peer_input_reject(
+    connection: u64,
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    use crate::peers::host_tools::{PeerInputRejection, reject_peer_input};
+    let params: RawPeerInputRejectParams = parse_raw_params(request)?;
+    let profile_id = raw_scoped_llm_profile_id(
+        params.profile_id.clone(),
+        Some(&params.session_id),
+        connection_profile_id,
+    )?;
+    let (_, data_dir) = resolve_profile_data_dir(state, Some(&profile_id))?;
+    let peers_root = data_dir.join("peers");
+    let slug = authorize_host_peer_call(
+        &peers_root,
+        &params.peer,
+        &params.session_id,
+        params.host_token.as_deref(),
+    )?;
+    if crate::peers::app_binding::read_peer_host_binding(&peers_root, &slug).is_none() {
+        return Err(host_peer_error(
+            "peer_not_host_bound",
+            format!("peer '{slug}' is not a host-owned app peer"),
+        ));
+    }
+    let rejection = PeerInputRejection::parse(&params.reason, params.message)
+        .map_err(|message| host_peer_error("peer_input_reject_invalid", message))?;
+    let delivery = reject_peer_input(&peers_root, &slug, &params.input_id, connection, rejection)
+        .map_err(|err| host_peer_error(err.kind, err.message))?;
+    Ok(json!({
+        "input_id": params.input_id,
+        "rejected": true,
+        "reported_to": delivery.as_str(),
+    }))
+}
+
 /// The connection a turn counts as driven by for a host peer's tools
 /// (UPCR-2026-035). A kernel-internal continuation (a peer_send_input
 /// injection, a background result) is nobody's turn: it never gets a host
@@ -20218,7 +20316,11 @@ async fn handle_raw_appui_rpc(
         }
         // Defence in depth behind `external_gate`: an external client of a
         // host-managed server never registers or answers host tools.
-        APPUI_METHOD_PEER_TOOLS_REGISTER | APPUI_METHOD_PEER_TOOL_RESULT if ws.is_external() => {
+        APPUI_METHOD_PEER_TOOLS_REGISTER
+        | APPUI_METHOD_PEER_TOOL_RESULT
+        | APPUI_METHOD_PEER_INPUT_REJECT
+            if ws.is_external() =>
+        {
             Err(external_host_tools_denied(&request.method))
         }
         APPUI_METHOD_PEER_TOOLS_REGISTER => {
@@ -20226,6 +20328,9 @@ async fn handle_raw_appui_rpc(
         }
         APPUI_METHOD_PEER_TOOL_RESULT => {
             raw_peer_tool_result(ws.connection_id.0, state, request, connection_profile_id)
+        }
+        APPUI_METHOD_PEER_INPUT_REJECT => {
+            raw_peer_input_reject(ws.connection_id.0, state, request, connection_profile_id)
         }
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
@@ -20670,6 +20775,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_PEER_CONTEXT_CLOSE
             | APPUI_METHOD_PEER_TOOLS_REGISTER
             | APPUI_METHOD_PEER_TOOL_RESULT
+            | APPUI_METHOD_PEER_INPUT_REJECT
             | APPUI_METHOD_PROFILE_SKILLS_LIST
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL
@@ -24731,7 +24837,7 @@ async fn handle_voice_commit_admission(
         return;
     }
     if let Some(superseded) = params.supersedes_turn_id.as_ref() {
-        let refused = refuse_foreign_host_turn_control(&session_id, ws, "turn/interrupt");
+        let refused = refuse_foreign_host_turn_control(state, &session_id, ws, "turn/interrupt");
         let superseded = match refused {
             Some(error) => Err(error),
             None => await_superseded_turn(active_turns, &session_id, superseded).await,
@@ -24839,6 +24945,10 @@ async fn handle_turn_start_with_accept(
 
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
         send_scope_error(ws, id, error);
+        return false;
+    }
+    if let Err(error) = claim_peer_input_turn(state, &params.session_id, &params.turn_id) {
+        let _ = send_rpc_error(ws, Some(id), error);
         return false;
     }
 
@@ -25118,6 +25228,33 @@ async fn handle_turn_start_with_accept(
     true
 }
 
+/// A `turn/start` on a host-owned peer's own session with a turn id the
+/// kernel handed out in `peer/input` answers that input (UPCR-2026-035); if
+/// the host refused the input (`peer/input/reject`), the turn id is released
+/// and the start is refused.
+fn claim_peer_input_turn(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) -> Result<(), RpcError> {
+    let Some(slug) = session_id
+        .topic()
+        .and_then(|topic| topic.strip_prefix("peer-"))
+        .filter(|slug| peer_slug_is_safe(slug))
+    else {
+        return Ok(());
+    };
+    let Some(runtime) = resolve_session_profile_runtime(state, session_id.profile_id()) else {
+        return Ok(());
+    };
+    crate::peers::host_tools::start_peer_input_turn(
+        &runtime.data_dir.join("peers"),
+        slug,
+        &turn_id.0.to_string(),
+    )
+    .map_err(|err| host_peer_error(err.kind, err.message))
+}
+
 /// Turn starts currently being admitted in this process (`turn/start`,
 /// `review/start`, goal continuations), keyed `(session_id, turn_id)` — for a
 /// topic turn under both the raw and the folded session id. Between request
@@ -25247,7 +25384,9 @@ async fn handle_turn_steer(
         send_scope_error(ws, id, error);
         return;
     }
-    if let Some(error) = refuse_foreign_host_turn_control(&params.session_id, ws, "turn/steer") {
+    if let Some(error) =
+        refuse_foreign_host_turn_control(state, &params.session_id, ws, "turn/steer")
+    {
         let _ = send_rpc_error(ws, Some(id), error);
         return;
     }
@@ -26625,6 +26764,7 @@ pub(crate) fn spawn_global_master_continuation_drain(state: Arc<AppState>) {
 
 async fn handle_turn_interrupt(
     ws: &WsConnection,
+    state: &Arc<AppState>,
     _ledger: &Arc<UiProtocolLedger>,
     active_turns: &SharedActiveTurns,
     // FIX-06 + FIX-08: kept on the signature so callers don't need to know
@@ -26643,7 +26783,8 @@ async fn handle_turn_interrupt(
     // task-turn-interrupt-steer-correlation-logs: make the interrupt's
     // receipt, decision and ack reconstructible from the log alone.
     crate::turn_trace::log_interrupt_received(&params.session_id, &params.turn_id);
-    if let Some(error) = refuse_foreign_host_turn_control(&params.session_id, ws, "turn/interrupt")
+    if let Some(error) =
+        refuse_foreign_host_turn_control(state, &params.session_id, ws, "turn/interrupt")
     {
         let _ = send_rpc_error(ws, Some(id), error);
         return;
@@ -26957,19 +27098,19 @@ fn host_connection_only_error(method: &str) -> RpcError {
 /// Whether `ws` may answer a prompt (approval or question) owned by
 /// `owner` on `session_id`. On a registered host peer's session only the
 /// prompt's owning connection or the peer's host connection may; on every
-/// other session this adds no restriction.
+/// other session this adds no restriction. Decided from the persisted tool
+/// set, so it holds from the first call after a restart.
 fn host_session_answer_allowed(
+    state: &AppState,
     session_id: &SessionKey,
     owner: Option<u64>,
     ws: &WsConnection,
 ) -> bool {
-    match crate::peers::host_tools::host_session_controller(session_id) {
-        None => true,
-        Some(controller) => {
-            let me = ws.connection_id.0;
-            controller == Some(me) || owner == Some(me)
-        }
-    }
+    let Some(controller) = persisted_host_session_controller(state, session_id) else {
+        return true;
+    };
+    let me = ws.connection_id.0;
+    controller == Some(me) || owner == Some(me)
 }
 
 /// Calls that start, steer, stop or rewrite the turns of a session.
@@ -26982,6 +27123,11 @@ const HOST_PEER_SESSION_WRITE_METHODS: &[&str] = &[
     "session/goal/clear",
     "session/goal/operator_transition",
     "loop/create",
+    // A monitor's output wakes the session with its text.
+    "monitor/create",
+    "monitor/resume",
+    // Would remove the app peer's session.
+    "session/delete",
 ];
 
 /// UPCR-2026-035 (#2571): refuse a call that starts, steers, stops or
@@ -26999,26 +27145,47 @@ fn refuse_foreign_host_peer_session_call(
     if !HOST_PEER_SESSION_WRITE_METHODS.contains(&method) {
         return None;
     }
-    let session_id = params.get("session_id")?.as_str()?;
-    let session = session_key_with_optional_topic(
-        &SessionKey(session_id.to_owned()),
-        params.get("topic").and_then(Value::as_str),
-    );
-    crate::peers::host_tools::host_peer_slug_of(&session)?;
+    // A monitor control names the monitor: its target is the monitor's own
+    // session, whatever session the caller names (a base key controls the
+    // monitors of every topic on it).
+    let monitor_session = (method == "monitor/resume")
+        .then(|| params.get("monitor_id").and_then(Value::as_str))
+        .flatten()
+        .and_then(|id| default_agent_orchestrator().monitor_session(id));
+    let session = match monitor_session {
+        Some(session) => session,
+        None => session_key_with_optional_topic(
+            &SessionKey(params.get("session_id")?.as_str()?.to_owned()),
+            params.get("topic").and_then(Value::as_str),
+        ),
+    };
+    refuse_foreign_host_turn_control(state, &session, ws, method)
+}
+
+/// The controller of `session` when it is a registered host peer's session:
+/// from the persisted tool set and the peer's current host route, so it
+/// holds from the first call after a restart. The syntax check up front
+/// keeps every ordinary session off the profile resolution entirely.
+fn persisted_host_session_controller(
+    state: &AppState,
+    session: &SessionKey,
+) -> Option<Option<u64>> {
+    crate::peers::host_tools::host_peer_slug_of(session)?;
     let (_, data_dir) = resolve_profile_data_dir(state, session.profile_id()).ok()?;
-    let controller =
-        crate::peers::host_tools::host_peer_session_controller(&data_dir.join("peers"), &session)?;
-    (controller != Some(ws.connection_id.0)).then(|| host_connection_only_error(method))
+    crate::peers::host_tools::host_peer_session_controller(&data_dir.join("peers"), session)
 }
 
 /// Refuse a turn control of a registered host peer's session from any
-/// connection but its host connection.
+/// connection but its host connection. Decided from the persisted tool set
+/// and the peer's current host route, so it holds from the first call after
+/// a restart, not only once a turn of the session has run.
 fn refuse_foreign_host_turn_control(
-    session_id: &SessionKey,
+    state: &AppState,
+    session: &SessionKey,
     ws: &WsConnection,
     method: &str,
 ) -> Option<RpcError> {
-    let controller = crate::peers::host_tools::host_session_controller(session_id)?;
+    let controller = persisted_host_session_controller(state, session)?;
     (controller != Some(ws.connection_id.0)).then(|| host_connection_only_error(method))
 }
 
@@ -27079,6 +27246,7 @@ async fn handle_approval_respond(
             ws.connection_id.0,
         ),
         None => host_session_answer_allowed(
+            state,
             &params.session_id,
             contracts
                 .approvals
@@ -27166,6 +27334,7 @@ async fn handle_approval_respond(
 /// on miss), and return the ack result.
 async fn handle_user_question_respond(
     ws: &WsConnection,
+    state: &Arc<AppState>,
     contracts: &Arc<UiProtocolContractStores>,
     connection_profile_id: Option<&str>,
     external_owner: Option<ConnectionId>,
@@ -27204,6 +27373,7 @@ async fn handle_user_question_respond(
     // answered by its owning connection or the peer's host connection (the
     // system agent answers through `peer_respond`, not here).
     if !host_session_answer_allowed(
+        state,
         &params.session_id,
         contracts
             .user_questions
@@ -38303,7 +38473,13 @@ async fn run_standalone_turn(
                         req,
                     )
                 });
-            tool_registry.register(octos_agent::PeerSendInputTool::new(send_input));
+            let answer = peer_send_input_answer_callback(
+                session_id.to_string(),
+                turn_id.clone(),
+                crate::peers::host_tools::PEER_INPUT_ANSWER_WAIT,
+            );
+            tool_registry
+                .register(octos_agent::PeerSendInputTool::new(send_input).with_answer(answer));
 
             // `peer_close` — retire a running peer the caller created (#1842:
             // the close STOPS it — the callback interrupts its in-flight turn).
@@ -38636,6 +38812,18 @@ async fn run_standalone_turn(
         tail_context_events.push((
             ContextEventKind::PeerResultsReady,
             "peer-results-ready",
+            note,
+        ));
+    }
+    // #2618 — refusals of this session's `peer_send_input` that arrived
+    // after the call had returned.
+    if let Some(note) = crate::peers::host_tools::peer_input_rejections_note(
+        &session_runtime.profile.data_dir.join("peers"),
+        &session_id,
+    ) {
+        tail_context_events.push((
+            ContextEventKind::PeerResultsReady,
+            "peer-input-rejected",
             note,
         ));
     }
