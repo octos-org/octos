@@ -36050,6 +36050,36 @@ async fn peer_terminal_wake_should_not_wake_master_when_gathered_peer_is_closed(
     );
 }
 
+/// #2627: the receipt parser must accept the bookkeeping keys the writer
+/// emits after `turn:` — `turn_id:` (always present) and the host-owned
+/// conversation `origin:` — while still rejecting unknown keys and round 0.
+#[test]
+fn gathered_peer_result_accepts_writer_bookkeeping_headers() {
+    let with_turn_id =
+        "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 1\nturn_id: t-1\n---\n\nbody\n";
+    assert!(
+        gathered_peer_result("gx", with_turn_id).is_some(),
+        "the writer always emits turn_id; it must not void the receipt"
+    );
+    let with_origin = "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 2\nturn_id: t-2\norigin: person\n---\n\nbody\n";
+    assert!(
+        gathered_peer_result("gx", with_origin).is_some(),
+        "host-owned origin lines must not void the receipt"
+    );
+    let unknown_key =
+        "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 1\npivot: x\n---\n\nbody\n";
+    assert!(
+        gathered_peer_result("gx", unknown_key).is_none(),
+        "unknown header keys still void the receipt"
+    );
+    let round_zero =
+        "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 0\nturn_id: t-0\n---\n\nbody\n";
+    assert!(
+        gathered_peer_result("gx", round_zero).is_none(),
+        "round 0 still voids the receipt"
+    );
+}
+
 #[tokio::test]
 async fn peer_consumption_should_not_wake_when_foreground_gathers_and_completes() {
     let temp = tempfile::tempdir().unwrap();
@@ -40419,6 +40449,14 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
         std::fs::read_to_string(fault_dir.join("result.md")).unwrap(),
         recovered
     );
+
+    // #2627: the receipt parser must accept the header this writer actually
+    // emits — a kernel-written result.md must yield a consumption receipt,
+    // or `peer_result_was_consumed` never matches and every gather looks
+    // unread to the wake/continuation gates.
+    let receipt = current_peer_result(&peers_root, "lens-review-2")
+        .expect("writer-produced result.md must parse into a consumption receipt");
+    assert_eq!(receipt.round, 2, "the receipt carries the latest round");
 }
 
 // --- turn/steer: mid-turn prompt injection (codex parity) ---
