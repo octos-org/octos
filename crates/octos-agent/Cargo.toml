@@ -123,9 +123,11 @@ rustix = { workspace = true }
 # provider yields nothing). The underlying `chromiumoxide` dependency and the
 # `browser` tool itself are always compiled; this feature only toggles the new
 # CDP-backed `web_search` fallback so `--no-default-features` builds keep the
-# pre-existing HTTP-only `web_search` behaviour byte-for-byte.
+# pre-existing HTTP-only `web_search` behaviour byte-for-byte. It also lets
+# metasearch engines that render (Google) load in the person's browser
+# (`octos_research::browser`).
 default = ["browser"]
-browser = []
+browser = ["octos-research/browser"]
 git = ["dep:gix", "dep:similar"]
 ast = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript", "dep:tree-sitter-typescript"]
 # Enable MP3 decoding for the `AudioNonSilent` workspace-policy validator.

@@ -147,8 +147,9 @@ impl WebSearchTool {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+            // Engines that render (Google) load in the person's browser.
             octos_research::metasearch::Metasearch::from_env(
-                Arc::new(octos_research::metasearch::ReqwestFetch::new()),
+                octos_research::metasearch::default_fetch(),
                 &keys,
             )
         })
@@ -898,6 +899,7 @@ impl WebSearchTool {
         let mut hits = Vec::new();
         let mut used: Vec<&str> = Vec::new();
         let mut note = None;
+        let mut challenges = Vec::new();
         // The metasearch covers every requested language in one call.
         if providers.contains(&octos_research::Provider::Metasearch) {
             let resp = self.metasearch_search(query, count, c, &langs).await;
@@ -915,7 +917,8 @@ impl WebSearchTool {
                 used.push("metasearch");
                 hits.extend(resp.hits());
             }
-            note = resp.note;
+            note = resp.note.clone();
+            challenges = resp.challenges();
         }
         let mut calls = Vec::new();
         for lang in &langs {
@@ -974,6 +977,11 @@ impl WebSearchTool {
         let mut output = octos_research::providers::format_hits(query, &kept);
         if let Some(note) = note.filter(|_| c.category == "general") {
             output.push_str(&format!("Note: {note}\n"));
+        }
+        // A search engine asked to confirm a person is searching: tell the
+        // person (octos does not solve or work around these).
+        for line in &challenges {
+            output.push_str(&format!("Note: {line}\n"));
         }
         if octos_research::respect_robots(|k| std::env::var(k).ok())
             && kept.iter().any(|h| {

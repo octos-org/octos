@@ -4,11 +4,15 @@
 // holding an <h3> headline) and Google's search-operators help page
 // (docs_url): `q` query, `hl` interface language, `gl` country, `num`
 // results. An "unusual traffic" page is reported as a challenge for the
-// person to solve in their browser; it is never worked around.
+// person to solve in their browser; it is never worked around. The page the
+// browser ended on (`x-octos-final-url`) decides that: Google's normal
+// results pages also mention "/sorry/" in their scripts. Without it, the
+// page text counts only when no results were found.
 use mod.markup
 use mod.net
 use mod.std.array
 use mod.std.math
+use mod.std.object
 use mod.std.text
 
 fn build_request(query, opts) {
@@ -36,7 +40,8 @@ fn build_request(query, opts) {
 
 fn parse_response(response, opts) {
     let body = response.body
-    if text.contains(body, "unusual traffic") || text.contains(body, "/sorry/") || text.contains(body, "g-recaptcha") {
+    let final_url = object.get(response.headers, "x_octos_final_url", "")
+    if text.contains(final_url, "google.com/sorry/") {
         return {challenge: "Google reported unusual traffic"}
     }
     let found = markup.select({item: "#search a h3, #rso a h3", fields: {title: "", url: "^a@href"}})
@@ -50,6 +55,9 @@ fn parse_response(response, opts) {
             continue
         }
         array.push(out, {url: url, title: r.title})
+    }
+    if array.len(out) == 0 && (text.contains(body, "unusual traffic") || text.contains(body, "g-recaptcha")) {
+        return {challenge: "Google reported unusual traffic"}
     }
     return out
 }

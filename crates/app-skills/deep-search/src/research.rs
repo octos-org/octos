@@ -558,8 +558,9 @@ async fn run_provider(
 fn metasearch() -> &'static octos_research::metasearch::Metasearch {
     static M: OnceLock<octos_research::metasearch::Metasearch> = OnceLock::new();
     M.get_or_init(|| {
+        // Engines that render (Google) load in the person's browser.
         octos_research::metasearch::Metasearch::from_env(
-            std::sync::Arc::new(octos_research::metasearch::ReqwestFetch::new()),
+            octos_research::metasearch::default_fetch(),
             &Default::default(),
         )
     })
@@ -603,7 +604,7 @@ async fn metasearch_round(
     Ok(ProviderOut {
         hits: resp.hits(),
         answer: String::new(),
-        notes: resp.note.into_iter().collect(),
+        notes: resp.note.iter().cloned().chain(resp.challenges()).collect(),
     })
 }
 

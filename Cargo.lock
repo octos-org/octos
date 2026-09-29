@@ -5191,6 +5191,7 @@ name = "octos-research"
 version = "2.0.3-rc.13"
 dependencies = [
  "base64",
+ "chromiumoxide",
  "chrono",
  "dom_smoothie",
  "futures",

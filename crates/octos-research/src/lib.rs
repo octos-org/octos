@@ -16,6 +16,8 @@
 //! from fixtures.
 
 pub mod access;
+#[cfg(feature = "browser")]
+pub mod browser;
 pub mod date;
 #[cfg(feature = "extract")]
 pub mod extract;

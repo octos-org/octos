@@ -1053,6 +1053,47 @@ async fn should_leave_out_browser_engines_where_the_host_has_no_browser() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn should_wait_for_browser_engines_before_the_soft_deadline() {
+    let fetch = MockFetch::default();
+    for (host, url) in [
+        ("a.example.org", "https://a.org/1"),
+        ("b.example.org", "https://b.org/1"),
+        ("c.example.org", "https://c.org/1"),
+    ] {
+        fetch.on(host, ok(hits(&[(url, "Story")])));
+    }
+    // A cold browser start plus a page load: slower than an API.
+    delayed(&fetch, "g.example.org", Duration::from_secs(5));
+    let mut r = Registry::default();
+    for e in [
+        test_engine("a", "a.example.org", serde_json::json!({})),
+        test_engine("b", "b.example.org", serde_json::json!({})),
+        test_engine("c", "c.example.org", serde_json::json!({})),
+        test_engine(
+            "g",
+            "g.example.org",
+            serde_json::json!({"results_page": true, "renders": true, "timeout_secs": 15}),
+        ),
+    ] {
+        r.insert(e);
+    }
+    // A host with a browser (otherwise `renders` engines are left out).
+    let ms = Metasearch::new(
+        r,
+        Arc::new(RenderingFetch(fetch.clone())),
+        Config::default(),
+    );
+    let t0 = Instant::now();
+    let resp = ms.search(&request("q")).await;
+    assert!(t0.elapsed() >= Duration::from_secs(5), "{:?}", t0.elapsed());
+    assert_eq!(
+        status_of(&resp, "g"),
+        EngineStatus::Empty,
+        "waited for, not dropped"
+    );
+}
+
 #[test]
 fn should_let_only_results_page_engines_declare_renders() {
     let load = |extra: serde_json::Value| {
@@ -1072,4 +1113,129 @@ fn should_let_only_results_page_engines_declare_renders() {
             .contains("needs `results_page`")
     );
     assert!(load(serde_json::json!({"results_page": true, "renders": true})).is_ok());
+}
+
+const BROWSER_ENGINE: &str = r#"use mod.net
+
+fn build_request(query, opts) {
+    return net.request({url: "https://g.example.org/search", render: true})
+}
+
+fn parse_response(response, opts) {
+    return {challenge: "asked to confirm a person is searching"}
+}
+"#;
+
+/// A host with a browser: renders every page as `body`, records what it
+/// was asked to show the person.
+#[derive(Default)]
+struct BrowserHost {
+    can_show: bool,
+    shown: Mutex<Vec<String>>,
+}
+
+impl Fetch for BrowserHost {
+    fn fetch(&self, _req: HttpRequest) -> FetchFuture<'_> {
+        Box::pin(async { Err("plain fetch not expected".to_string()) })
+    }
+
+    fn render(&self, _req: HttpRequest) -> FetchFuture<'_> {
+        Box::pin(async {
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: "<html>check</html>".to_string(),
+            })
+        })
+    }
+
+    fn hand_over(&self, url: String) -> HandOverFuture<'_> {
+        Box::pin(async move {
+            self.shown.lock().unwrap().push(url);
+            self.can_show
+        })
+    }
+
+    fn can_render(&self) -> bool {
+        true
+    }
+}
+
+fn browser_search(host: Arc<BrowserHost>) -> Metasearch {
+    let manifest = serde_json::json!({
+        "id": "g", "name": "g", "categories": ["general"], "hosts": ["g.example.org"],
+        "results_page": true, "renders": true,
+        "rate_limit": {"min_interval_ms": 1000}, "docs_url": ["https://example.org/docs"],
+        "license_note": "test"
+    });
+    let mut r = Registry::default();
+    r.insert(Engine::load(&manifest.to_string(), BROWSER_ENGINE, EngineOrigin::Builtin).unwrap());
+    Metasearch::new(r, host, Config::default())
+}
+
+#[tokio::test(start_paused = true)]
+async fn should_hand_a_browser_challenge_to_the_person() {
+    let host = Arc::new(BrowserHost {
+        can_show: true,
+        ..Default::default()
+    });
+    let ms = browser_search(host.clone());
+    let mut req = request("q");
+    req.category = "general".into();
+    let resp = ms.search(&req).await;
+    let r = &resp.engines[0];
+    assert_eq!(r.status, EngineStatus::Challenge);
+    assert_eq!(
+        r.challenge_url.as_deref(),
+        Some("https://g.example.org/search")
+    );
+    assert!(
+        r.error
+            .as_deref()
+            .unwrap()
+            .contains("shown in your browser"),
+        "{r:?}"
+    );
+    assert_eq!(
+        *host.shown.lock().unwrap(),
+        ["https://g.example.org/search"]
+    );
+    let lines = resp.challenges();
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].starts_with("g: challenge (")
+            && lines[0].ends_with("(https://g.example.org/search)"),
+        "{lines:?}"
+    );
+
+    // A short fixed pause while the person deals with it, not a growing
+    // backoff: asked again once the pause is over, and again after the
+    // same pause.
+    for _ in 0..2 {
+        assert_eq!(
+            status_of(&ms.search(&req).await, "g"),
+            EngineStatus::Suspended
+        );
+        tokio::time::advance(Config::default().backoff_base).await;
+        assert_eq!(
+            status_of(&ms.search(&req).await, "g"),
+            EngineStatus::Challenge
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn should_ask_the_person_to_open_a_challenge_nothing_could_show() {
+    let host = Arc::new(BrowserHost::default());
+    let ms = browser_search(host.clone());
+    let mut req = request("q");
+    req.category = "general".into();
+    let resp = ms.search(&req).await;
+    let r = &resp.engines[0];
+    assert_eq!(r.status, EngineStatus::Challenge);
+    assert!(
+        r.error.as_deref().unwrap().contains("open the page"),
+        "{r:?}"
+    );
+    assert_eq!(host.shown.lock().unwrap().len(), 1, "offered to the host");
 }
