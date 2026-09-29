@@ -40325,6 +40325,17 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
 
     // Overwrite = latest state on result.md, versioned file for turn 2.
     let second_turn = TurnId::new();
+    // A recorded origin (host-owned conversation turn, #2626) must reach the
+    // header the writer emits, so the receipt parser is pinned against the
+    // full production shape, not a hand-copied one (#2627).
+    crate::peers::turn_origin::record_turn_origin(
+        &peer_key,
+        &second_turn,
+        octos_core::ui_protocol::TurnOrigin {
+            kind: octos_core::ui_protocol::TurnOriginKind::Person,
+            label: None,
+        },
+    );
     write_peer_result_if_peer_session(
         &state,
         &peer_key,
@@ -40343,6 +40354,10 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     );
     assert!(!rewritten.contains("All three lenses agree."));
     assert!(rewritten.contains(&format!("\nturn_id: {}\n", second_turn.0)));
+    assert!(
+        rewritten.contains("\norigin: person\n"),
+        "a recorded origin must reach the blackboard header"
+    );
     // #435: historical copy preserved.
     let turn1 =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result-1.md")).unwrap();

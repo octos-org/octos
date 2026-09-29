@@ -18201,8 +18201,9 @@ fn gathered_peer_result(slug: &str, result: &str) -> Option<GatheredPeerResult> 
     let round = lines.next()?.strip_prefix("turn: ")?.parse::<u32>().ok()?;
     // The writer appends bookkeeping keys after `turn:` — `turn_id:` is
     // always present (#2627), and host-owned conversation turns add
-    // `origin:` (#2626). Unknown keys still fail, so a foreign header
-    // cannot masquerade as ours.
+    // `origin:` (#2626). Unknown keys still fail, so foreign frontmatter
+    // is not mistaken for a writer receipt; the receipt's identity is the
+    // whole-body digest, so the bookkeeping values need no validation.
     for line in lines {
         if !line.starts_with("turn_id: ") && !line.starts_with("origin: ") {
             return None;
