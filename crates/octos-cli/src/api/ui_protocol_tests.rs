@@ -36055,8 +36055,7 @@ async fn peer_terminal_wake_should_not_wake_master_when_gathered_peer_is_closed(
 /// conversation `origin:` — while still rejecting unknown keys and round 0.
 #[test]
 fn gathered_peer_result_accepts_writer_bookkeeping_headers() {
-    let with_turn_id =
-        "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 1\nturn_id: t-1\n---\n\nbody\n";
+    let with_turn_id = "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 1\nturn_id: t-1\n---\n\nbody\n";
     assert!(
         gathered_peer_result("gx", with_turn_id).is_some(),
         "the writer always emits turn_id; it must not void the receipt"
@@ -36072,8 +36071,7 @@ fn gathered_peer_result_accepts_writer_bookkeeping_headers() {
         gathered_peer_result("gx", unknown_key).is_none(),
         "unknown header keys still void the receipt"
     );
-    let round_zero =
-        "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 0\nturn_id: t-0\n---\n\nbody\n";
+    let round_zero = "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 0\nturn_id: t-0\n---\n\nbody\n";
     assert!(
         gathered_peer_result("gx", round_zero).is_none(),
         "round 0 still voids the receipt"
