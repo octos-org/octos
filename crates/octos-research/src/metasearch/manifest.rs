@@ -81,6 +81,12 @@ pub struct EngineManifest {
     /// [`crate::SERP_SCRAPE_ENV`]).
     #[serde(default)]
     pub results_page: bool,
+    /// The engine's requests load in a real browser
+    /// (`net.request({render: true})`). It is left out where the host has
+    /// no browser ([`super::Fetch::can_render`]). Only results-page engines
+    /// may declare it.
+    #[serde(default)]
+    pub renders: bool,
     /// The engine lists entries it did not search for (feeds): the core
     /// keeps only hits whose title or snippet match the query (the phrase,
     /// or every significant term; see [`super::topic`]) and reports the rest
@@ -159,6 +165,9 @@ impl EngineManifest {
         }
         if self.categories.is_empty() {
             return Err(format!("{}: no categories", self.id));
+        }
+        if self.renders && !self.results_page {
+            return Err(format!("{}: `renders` needs `results_page`", self.id));
         }
         if let Some(c) = self
             .categories

@@ -5,6 +5,7 @@
   "languages": ["*"],
   "hosts": ["cse.google.com"],
   "results_page": true,
+  "renders": true,
   "needs_key": true,
   "auth": {"query": {"name": "cx"}},
   "key_env": "OCTOS_GOOGLE_CSE_CX",

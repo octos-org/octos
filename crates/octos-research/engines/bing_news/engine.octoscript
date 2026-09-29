@@ -92,10 +92,12 @@ fn age_to_unix(label, now) {
 
 fn parse_response(response, opts) {
     let body = response.body
-    if text.contains(body, "b_captcha") || text.contains(body, "solve the challenge") {
+    let found = markup.select({item: "div.news-card", fields: {url: "@data-url", title: "@data-title", source: "@data-author", snippet: ".snippet", age: "span[aria-label]@aria-label"}})
+    // Only a page without results is a challenge: results about bot checks
+    // carry the same words.
+    if array.len(found.items) == 0 && (text.contains(body, "b_captcha") || text.contains(body, "turing/captcha") || text.contains(body, "solve the challenge")) {
         return {challenge: "Bing asked to confirm a person is searching"}
     }
-    let found = markup.select({item: "div.news-card", fields: {url: "@data-url", title: "@data-title", source: "@data-author", snippet: ".snippet", age: "span[aria-label]@aria-label"}})
     let out = []
     for r in found.items {
         if r.url == nil || r.title == nil || !text.starts_with(r.url, "http") {

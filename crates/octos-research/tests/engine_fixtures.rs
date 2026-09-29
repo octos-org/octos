@@ -24,6 +24,10 @@ impl Fetch for Replay {
         self.fetch(req)
     }
 
+    fn can_render(&self) -> bool {
+        true
+    }
+
     fn fetch(&self, req: HttpRequest) -> FetchFuture<'_> {
         Box::pin(async move {
             // robots.txt (Google News asks for it): not found = no rules.

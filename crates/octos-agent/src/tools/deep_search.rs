@@ -167,7 +167,7 @@ impl Tool for DeepSearchTool {
                 "category": {
                     "type": "string",
                     "enum": ["auto", "news", "general", "science", "it", "social"],
-                    "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (Wikipedia, Wikidata; web results need a key), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
+                    "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (DuckDuckGo, Bing and Brave results pages, Google where a browser is available, Wikipedia, Wikidata), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
                 },
                 "max_per_domain": {
                     "type": "integer",

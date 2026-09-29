@@ -197,7 +197,9 @@ pub struct PlanInput {
     /// Keyed providers that have a key, in the caller's priority order.
     pub keyed: Vec<Provider>,
     /// Results-page search (DuckDuckGo HTML, then Bing in headless Chrome),
-    /// appended as the last resorts; on unless the operator turned it off.
+    /// appended as the last resorts when the metasearch is off (its own
+    /// DuckDuckGo and Bing engines cover them otherwise, sharing its rate
+    /// limits and backoff); on unless the operator turned it off.
     pub allow_serp_scrape: bool,
 }
 
@@ -205,9 +207,10 @@ pub struct PlanInput {
 ///
 /// `metasearch` first for every category (its engines include GDELT and,
 /// if enabled, Google News); without it, news → `[gdelt, google_news_rss]`.
-/// Then `searxng` if configured, then the keyed providers, then `duckduckgo`
-/// and `bing_cdp` (results-page search: on unless the operator turned it
-/// off).
+/// Then `searxng` if configured, then the keyed providers, then, only
+/// without the metasearch (whose engines already ask them), `duckduckgo` and
+/// `bing_cdp` (results-page search: on unless the operator turned it off).
+/// One search never asks the same results page twice.
 pub fn plan(input: &PlanInput) -> Vec<Provider> {
     let mut out = Vec::new();
     if input.metasearch {
@@ -224,7 +227,7 @@ pub fn plan(input: &PlanInput) -> Vec<Provider> {
             out.push(*p);
         }
     }
-    if input.allow_serp_scrape {
+    if input.allow_serp_scrape && !input.metasearch {
         out.push(Provider::DuckDuckGo);
         out.push(Provider::BingBrowser);
     }
@@ -293,6 +296,15 @@ mod tests {
             order,
             vec![Provider::Brave, Provider::DuckDuckGo, Provider::BingBrowser]
         );
+        // With the metasearch its own DuckDuckGo and Bing engines ask them:
+        // no second request to the same results pages.
+        let order = plan(&PlanInput {
+            metasearch: true,
+            keyed: vec![Provider::Brave],
+            allow_serp_scrape: true,
+            ..Default::default()
+        });
+        assert_eq!(order, vec![Provider::Metasearch, Provider::Brave]);
     }
 
     #[test]

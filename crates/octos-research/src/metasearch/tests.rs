@@ -995,3 +995,81 @@ async fn should_skip_hits_that_do_not_match_the_query_when_the_engine_lists_feed
             .query_match
     );
 }
+
+/// A mock that can also render (a host with a browser).
+#[derive(Clone, Default)]
+struct RenderingFetch(MockFetch);
+
+impl Fetch for RenderingFetch {
+    fn fetch(&self, req: HttpRequest) -> FetchFuture<'_> {
+        self.0.fetch(req)
+    }
+
+    fn render(&self, req: HttpRequest) -> FetchFuture<'_> {
+        self.0.fetch(req)
+    }
+
+    fn can_render(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn should_leave_out_browser_engines_where_the_host_has_no_browser() {
+    let fetch = MockFetch::default();
+    fetch.on("a.example.org", ok(hits(&[("https://a.org/1", "Story")])));
+    fetch.on("g.example.org", ok(hits(&[("https://g.org/1", "Story")])));
+    let engines = || {
+        vec![
+            test_engine("a", "a.example.org", serde_json::json!({})),
+            test_engine(
+                "g",
+                "g.example.org",
+                serde_json::json!({"results_page": true, "renders": true}),
+            ),
+        ]
+    };
+    // No browser: not called, not reported, no backoff.
+    let resp = search(engines(), &fetch, Config::default())
+        .search(&request("q"))
+        .await;
+    let ids: Vec<&str> = resp.engines.iter().map(|r| r.engine.as_str()).collect();
+    assert_eq!(ids, ["a"]);
+    assert!(fetch.calls_to("g.example.org").is_empty());
+
+    // With a browser it runs.
+    let mut r = Registry::default();
+    for e in engines() {
+        r.insert(e);
+    }
+    let ms = Metasearch::new(
+        r,
+        Arc::new(RenderingFetch(fetch.clone())),
+        Config::default(),
+    );
+    assert_eq!(
+        status_of(&ms.search(&request("q2")).await, "g"),
+        EngineStatus::Ok
+    );
+}
+
+#[test]
+fn should_let_only_results_page_engines_declare_renders() {
+    let load = |extra: serde_json::Value| {
+        let mut m = serde_json::json!({
+            "id": "g", "name": "g", "categories": ["general"], "hosts": ["g.example.org"],
+            "rate_limit": {"min_interval_ms": 1000}, "docs_url": ["https://example.org/docs"],
+            "license_note": "test"
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            m[k] = v.clone();
+        }
+        Engine::load(&m.to_string(), JSON_ENGINE, EngineOrigin::Builtin)
+    };
+    assert!(
+        load(serde_json::json!({"renders": true}))
+            .unwrap_err()
+            .contains("needs `results_page`")
+    );
+    assert!(load(serde_json::json!({"results_page": true, "renders": true})).is_ok());
+}

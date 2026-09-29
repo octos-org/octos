@@ -444,6 +444,11 @@ impl Metasearch {
         if m.results_page && !c.results_pages {
             return false;
         }
+        // Needs a browser the host does not have: left out quietly rather
+        // than failing (and backing off) on every search.
+        if m.renders && !self.inner.fetch.can_render() {
+            return false;
+        }
         !m.needs_key || c.keys.contains_key(&m.id)
     }
 

@@ -1139,7 +1139,12 @@ mod tests {
         let order = auto_plan(false, true);
         let ddg = order.iter().position(|p| *p == Provider::DuckDuckGo);
         let bing = order.iter().position(|p| *p == Provider::BingBrowser);
-        assert!(ddg.is_some() && bing.is_some() && ddg < bing, "{order:?}");
+        if octos_research::metasearch::enabled(|k| std::env::var(k).ok()) {
+            // The metasearch's own DuckDuckGo and Bing engines ask them.
+            assert!(ddg.is_none() && bing.is_none(), "{order:?}");
+        } else {
+            assert!(ddg.is_some() && bing.is_some() && ddg < bing, "{order:?}");
+        }
     }
 
     #[tokio::test]

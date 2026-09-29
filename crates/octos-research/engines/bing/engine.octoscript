@@ -31,10 +31,12 @@ fn build_request(query, opts) {
 
 fn parse_response(response, opts) {
     let body = response.body
-    if text.contains(body, "b_captcha") || text.contains(body, "solve the challenge") {
+    let found = markup.select({item: "li.b_algo", fields: {title: "h2 a", url: "h2 a@href", snippet: ".b_caption p", site: ".tptt"}})
+    // Only a page without results is a challenge: results about bot checks
+    // carry the same words.
+    if array.len(found.items) == 0 && (text.contains(body, "b_captcha") || text.contains(body, "turing/captcha") || text.contains(body, "solve the challenge")) {
         return {challenge: "Bing asked to confirm a person is searching"}
     }
-    let found = markup.select({item: "li.b_algo", fields: {title: "h2 a", url: "h2 a@href", snippet: ".b_caption p", site: ".tptt"}})
     let out = []
     for r in found.items {
         if r.url == nil || r.title == nil {

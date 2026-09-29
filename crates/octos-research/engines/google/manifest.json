@@ -5,6 +5,7 @@
   "languages": ["*"],
   "hosts": ["www.google.com"],
   "results_page": true,
+  "renders": true,
   "rate_limit": {
     "min_interval_ms": 5000,
     "source": "No published limit for the results page; kept to a person's pace."

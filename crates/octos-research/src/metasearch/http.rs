@@ -53,6 +53,12 @@ pub trait Fetch: Send + Sync {
         let _ = req;
         Box::pin(async { Err("no browser available to render this page".to_string()) })
     }
+
+    /// Whether [`Fetch::render`] works here. Engines whose requests need a
+    /// browser are skipped quietly (no error, no backoff) where it does not.
+    fn can_render(&self) -> bool {
+        false
+    }
 }
 
 /// Parse `Retry-After`: delta-seconds or an HTTP-date. Capped at one hour.

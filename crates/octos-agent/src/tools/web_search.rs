@@ -430,7 +430,7 @@ impl Tool for WebSearchTool {
                 "category": {
                     "type": "string",
                     "enum": ["auto", "news", "general", "science", "it", "social"],
-                    "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (Wikipedia, Wikidata; web results need a key), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
+                    "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (DuckDuckGo, Bing and Brave results pages, Google where a browser is available, Wikipedia, Wikidata), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
                 }
             },
             "required": ["query"]
@@ -687,8 +687,11 @@ impl Tool for WebSearchTool {
         }
 
         // DuckDuckGo HTML results page: general web results, last resort
-        // after every keyed provider (on unless turned off, ADR 0002).
-        let ddg_result = if serp_scrape {
+        // after every keyed provider (on unless turned off, ADR 0002). Only
+        // without the metasearch: its own DuckDuckGo and Bing engines have
+        // asked already, and one search never asks a results page twice.
+        let legacy_serp = serp_scrape && !metasearch_on();
+        let ddg_result = if legacy_serp {
             Some(self.ddg_search(&input.query, count).await)
         } else {
             None
@@ -716,7 +719,7 @@ impl Tool for WebSearchTool {
         // Bing through the in-process headless browser. On a box with no
         // Chrome this is a fast, clean miss (see `browser_cdp_search`).
         #[cfg(feature = "browser")]
-        if serp_scrape {
+        if legacy_serp {
             {
                 // Bound a touch above the per-action browser default headroom so
                 // launch + Bing nav fit, but a wedged Chrome can't block forever.
@@ -787,7 +790,7 @@ impl WebSearchTool {
                 tried.push(id.to_string());
             }
         }
-        if serp_scrape {
+        if serp_scrape && !metasearch_on() {
             tried.push("duckduckgo".to_string());
             if cfg!(feature = "browser") {
                 tried.push("bing_cdp".to_string());
@@ -2192,11 +2195,15 @@ mod tests {
                 .iter()
                 .any(|p| p == "duckduckgo" || p == "bing_cdp")
         );
-        assert!(
-            tool.tried_providers(&c, true)
-                .iter()
-                .any(|p| p == "duckduckgo")
-        );
+        let tried = tool.tried_providers(&c, true);
+        if metasearch_on() {
+            // The metasearch's own DuckDuckGo and Bing engines asked them;
+            // the standalone providers do not ask again.
+            assert!(tried.iter().any(|p| p == "metasearch"), "{tried:?}");
+            assert!(!tried.iter().any(|p| p == "duckduckgo"), "{tried:?}");
+        } else {
+            assert!(tried.iter().any(|p| p == "duckduckgo"), "{tried:?}");
+        }
     }
 
     /// With results-page search turned off and no key or SearXNG, a general

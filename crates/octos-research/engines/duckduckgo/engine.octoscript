@@ -62,10 +62,12 @@ fn build_request(query, opts) {
 
 fn parse_response(response, opts) {
     let body = response.body
-    if text.contains(body, "anomaly-modal") || text.contains(body, "bots use DuckDuckGo") {
+    let found = markup.select({item: "div.result:not(.result--ad)", fields: {title: "a.result__a", url: "a.result__a@href", snippet: ".result__snippet"}})
+    // Only a page without results is a bot check: results about bot checks
+    // carry the same words.
+    if array.len(found.items) == 0 && (text.contains(body, "anomaly-modal") || text.contains(body, "anomaly.js") || text.contains(body, "bots use DuckDuckGo")) {
         return {challenge: "DuckDuckGo asked to confirm a person is searching"}
     }
-    let found = markup.select({item: "div.result:not(.result--ad)", fields: {title: "a.result__a", url: "a.result__a@href", snippet: ".result__snippet"}})
     let out = []
     for r in found.items {
         if r.url == nil || r.title == nil {
