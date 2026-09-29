@@ -114,6 +114,7 @@ fn reasoning_effort_level_wire_shape() {
         reasoning_effort: Some(ReasoningEffortLevel::Max),
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let wire = serde_json::to_value(&params).unwrap();
     assert_eq!(wire["reasoning_effort"], json!("max"));
@@ -153,6 +154,7 @@ fn turn_start_live_video_roundtrips_and_is_omitted_when_false() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let wire = serde_json::to_value(&params).unwrap();
     assert!(wire.get("live_video").is_none());
@@ -1230,6 +1232,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     })
     .into_rpc_request("req-turn-start")
     .expect("serialize turn/start");
@@ -1993,6 +1996,7 @@ fn ui_command_builds_and_parses_json_rpc_request() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let request = command
@@ -2061,6 +2065,7 @@ fn turn_start_round_trips_with_media_field() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(
@@ -2103,6 +2108,7 @@ fn turn_start_round_trips_with_topic_field() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(
@@ -2145,6 +2151,7 @@ fn turn_start_round_trips_with_rewrite_for_field() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(
@@ -2192,6 +2199,7 @@ fn turn_start_round_trips_with_all_beta1_fields() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(

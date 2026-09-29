@@ -261,6 +261,16 @@ transcript carry the reply).
 - A turn the host starts with that `turn_id` on the peer's session is the
   system agent's request made for the person, so it counts as *attended*
   (below): the app's foreground tools run in it, as in a request context.
+- That turn is labelled `system_agent` by the kernel (UPCR-2026-034, "The
+  shared peer conversation"): the prompt starts with `[from the system
+  agent]` and its `result.md` says `origin: system_agent`. A `turn/start`
+  with that `turn_id` and any other `origin` is refused
+  (`turn_origin_mismatch`) without answering the input.
+- The peer's session is shared with the person's turns. While one runs,
+  starting the input's turn is refused with `turn_in_progress`; the host
+  queues the input (keeping its `turn_id`) and starts it after the running
+  turn ends, or refuses it with `peer/input/reject` reason `busy` when its
+  queue is full.
 
 Peers that are not host-owned keep today's behaviour (the gateway inbox or
 the serve continuation queue).
@@ -452,8 +462,9 @@ registered set, or any `peerctx-<slug>.<context>` of it, every turn start:
   an approval bridge (every AppUI `turn/start` does) and it comes from an
   open request context of the peer (one of the app's interactive clients,
   the app's own conversation, UPCR-2026-034), from a host turn started from
-  a kernel `peer/input` (the system agent's request made for the person), or
-  from a host session set (the host's own conversation). A call from any
+  a kernel `peer/input` (the system agent's request made for the person),
+  from the person's own turn on the peer's session (`origin: person`,
+  UPCR-2026-034), or from a host session set (the host's own conversation). A call from any
   other turn of the peer's own session (the app agent's background runs) or
   from a turn with no bridge is *unattended*.
 - **Risk.** A tool is *gated* when it is `destructive` or marked `outward`.

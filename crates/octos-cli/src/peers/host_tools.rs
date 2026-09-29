@@ -582,9 +582,11 @@ pub(crate) fn apply_session_host_tools(
             // An open request context is one of the app's interactive
             // clients; the peer's own session is not, except for a turn the
             // host started from the kernel's `peer/input` (the system
-            // agent's request, made on the person's behalf).
-            let interactive =
-                context_id.is_some() || is_peer_input_turn(&route_key(peers_root, slug), turn_id);
+            // agent's request, made on the person's behalf) and the person's
+            // own turn in the shared conversation (`origin: person`).
+            let interactive = context_id.is_some()
+                || is_peer_input_turn(&route_key(peers_root, slug), turn_id)
+                || super::turn_origin::is_person_turn_id(session_id, turn_id);
             for decl in &set.tools {
                 // A kernel tool of the same name wins: an app tool never
                 // shadows one (the model, the audit and every filter must be
@@ -1082,6 +1084,12 @@ fn is_peer_input_turn(route_key: &str, turn_id: &str) -> bool {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .contains(&format!("{route_key}\u{0}{turn_id}"), INPUT_RETENTION)
+}
+
+/// Whether `turn_id` is the turn the kernel handed out in a `peer/input` of
+/// the host-owned peer `slug` (a turn started with it is the system agent's).
+pub(crate) fn peer_input_turn(peers_root: &Path, slug: &str, turn_id: &str) -> bool {
+    is_peer_input_turn(&route_key(peers_root, slug), turn_id)
 }
 
 /// Result of [`deliver_peer_input`].

@@ -42,7 +42,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `session/hydrate` | shipped, UPCR-2026-009 |
 | `thread/graph/get` | shipped, UPCR-2026-010 |
 | `turn/state/get` | shipped, UPCR-2026-011; `running` field UPCR-2026-031 |
-| `turn/start` | shipped base method |
+| `turn/start` | shipped base method; optional `origin` on a host-owned app peer's session (UPCR-2026-034, shared peer conversation) |
 | `turn/interrupt` | shipped base method, UPCR-2026-008 typed fields |
 | `approval/respond` | shipped base method, UPCR-2026-001 optional fields |
 | `approval/scopes/list` | shipped, UPCR-2026-001 |

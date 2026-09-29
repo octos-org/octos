@@ -802,7 +802,9 @@ registered a host-owned app peer's tools with `peer/tools/register`):
   turn itself (`turn/start` on `session_id` with `turn_id` and the text, on
   the same connection), or refuses it with `peer/input/reject`. Never run as
   a kernel-internal turn; with no host connected `peer_send_input` fails and
-  nothing is queued. Ephemeral.
+  nothing is queued. Ephemeral. The kernel labels that turn `system_agent`
+  (a different `turn/start` `origin` is refused); the person's own turns
+  share the same session (`origin: person`, UPCR-2026-034).
 
 Background activity — the human sink (#2019, gate `event.background_activity.v1`):
 
@@ -962,11 +964,26 @@ Minimum params:
 - `turn_id`
 - `input`
 
+Optional params (among others):
+
+- `origin` `{kind: "person" | "system_agent" | "app", label?}` — who speaks
+  in this turn of a host-owned app peer's shared conversation
+  (UPCR-2026-034, amended 2026-09-28). Only on the peer's own session
+  `<originator base>#peer-<slug>`, only from the peer's host connection, and
+  never `system_agent` (the kernel labels a turn started from its
+  `peer/input` itself). The kernel prefixes the prompt with a stable marker
+  (`[from the person]`, `[from the system agent: …]`) and records
+  `origin:` in the peer's `result.md`. Typed `data.kind`:
+  `turn_origin_not_allowed`, `turn_origin_host_only`,
+  `turn_origin_mismatch`.
+
 Behavior:
 
 - server emits `turn/started`
 - server may emit zero or more `message/delta`, `tool/*`, `task/updated`, `warning`
 - server finishes with `turn/completed` or `turn/error`
+- one turn per session: a start while a turn runs is refused with
+  `data.kind: "turn_in_progress"`; the kernel does not queue
 
 ### `review/start`
 

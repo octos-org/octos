@@ -2118,6 +2118,7 @@ async fn e2e_turn_with(
             reasoning_effort: None,
             tool_context: None,
             live_video: false,
+            origin: None,
         },
     )
     .await;
@@ -2445,6 +2446,7 @@ async fn recorded_turn(
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let ledger = Arc::new(UiProtocolLedger::new(256));
     let contracts = Arc::new(UiProtocolContractStores::default());
@@ -3298,6 +3300,7 @@ async fn should_cancel_an_in_flight_host_call_when_the_turn_is_interrupted() {
             reasoning_effort: None,
             tool_context: None,
             live_video: false,
+            origin: None,
         },
     )
     .await;
@@ -4409,6 +4412,7 @@ async fn should_refuse_a_turn_start_with_a_rejected_inputs_turn_id() {
             reasoning_effort: None,
             tool_context: None,
             live_video: false,
+            origin: None,
         },
     )
     .await;
@@ -4453,4 +4457,626 @@ async fn should_refuse_a_turn_start_with_a_rejected_inputs_turn_id() {
         "{}",
         refused.output
     );
+}
+
+// ---------------------------------------------------------------------------
+// The shared peer conversation: the person and the system agent both drive
+// the host-owned peer's own session, and each turn says who is speaking.
+// ---------------------------------------------------------------------------
+
+fn origin(
+    kind: octos_core::ui_protocol::TurnOriginKind,
+    label: Option<&str>,
+) -> octos_core::ui_protocol::TurnOrigin {
+    octos_core::ui_protocol::TurnOrigin {
+        kind,
+        label: label.map(str::to_owned),
+    }
+}
+
+/// Every frame a connection receives, kept for inspection.
+type Frames = Arc<std::sync::Mutex<Vec<Value>>>;
+
+fn collect_frames(mut rx: mpsc::Receiver<WsMessage>) -> Frames {
+    let frames: Frames = Default::default();
+    let sink = frames.clone();
+    tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            if let WsMessage::Text(text) = message {
+                if let Ok(frame) = serde_json::from_str::<Value>(text.as_str()) {
+                    sink.lock().unwrap().push(frame);
+                }
+            }
+        }
+    });
+    frames
+}
+
+/// The first frame matching `pick`, waiting up to 10 s.
+async fn wait_frame(frames: &Frames, pick: impl Fn(&Value) -> bool) -> Value {
+    for _ in 0..500 {
+        if let Some(frame) = frames.lock().unwrap().iter().find(|f| pick(f)) {
+            return frame.clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("no matching frame in {:?}", frames.lock().unwrap());
+}
+
+/// `data.kind` of the error reply to request `id`.
+async fn error_kind_of(frames: &Frames, id: &str) -> Value {
+    let reply = wait_frame(frames, |f| f["id"] == id).await;
+    reply["error"]["data"]["kind"].clone()
+}
+
+/// One `turn/start` on `session` from `ws`; whether it was admitted.
+#[allow(clippy::too_many_arguments)]
+async fn start_turn(
+    e: &E2e,
+    ws: &WsConnection,
+    active_turns: &SharedActiveTurns,
+    request_id: &str,
+    session: &SessionKey,
+    turn_id: &TurnId,
+    text: &str,
+    origin: Option<octos_core::ui_protocol::TurnOrigin>,
+) -> bool {
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    handle_turn_start(
+        ws,
+        &e.state,
+        &Arc::new(UiProtocolLedger::new(256)),
+        &Arc::new(UiProtocolContractStores::default()),
+        active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        request_id.into(),
+        TurnStartParams {
+            session_id: session.clone(),
+            turn_id: turn_id.clone(),
+            input: vec![InputItem::Text { text: text.into() }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+            origin,
+        },
+    )
+    .await
+}
+
+/// The peer's `result.md` once turn `turn_id` wrote it.
+async fn wait_result(e: &E2e, turn_id: &TurnId) -> String {
+    let path = e.data_dir.join("peers/news/result.md");
+    let needle = format!("turn_id: {}", turn_id.0);
+    for _ in 0..1500 {
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            if body.contains(&needle) {
+                return body;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("turn {turn_id:?} never wrote the peer's result");
+}
+
+fn shared_peer(e: &E2e) -> SessionKey {
+    SessionKey(format!("{}#peer-news", e.system.base_key()))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_run_a_persons_turn_on_the_peer_session_labelled_with_its_origin() {
+    use octos_core::ui_protocol::TurnOriginKind;
+    let llm = Arc::new(RecordingLlm::default());
+    let mut e = e2e_fixture(llm.clone(), json!({ "tools": [] })).await;
+    let _frames = collect_frames(e.rx.take().unwrap());
+    let peer = shared_peer(&e);
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+
+    // The person, through the host, on the peer's own session.
+    let person_turn = TurnId::new();
+    assert!(
+        start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "p1",
+            &peer,
+            &person_turn,
+            "what's new?",
+            Some(origin(TurnOriginKind::Person, Some("Ada"))),
+        )
+        .await
+    );
+    let result = wait_result(&e, &person_turn).await;
+    assert!(result.contains("\norigin: person\n"), "{result}");
+    let first = llm.requests.lock().unwrap()[0].clone();
+    assert!(
+        first.contains("[from the person: Ada] what's new?"),
+        "{first}"
+    );
+    // The person's round alone never fires a synthesis on the system agent:
+    // it is recorded as covered.
+    let peers = e.data_dir.join("peers");
+    let mut covered = false;
+    for _ in 0..250 {
+        if matches!(
+            read_peer_fleet_synthesis_marks(&peers, &e.system.0),
+            FleetSynthesisMarks::Rounds(ref rounds) if rounds.get("news") == Some(&1)
+        ) {
+            covered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(covered, "the person's round is recorded as covered");
+    assert_eq!(
+        crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+            .pending_continuation_count_for_session_for_test(&e.system, "dev"),
+        0,
+        "no synthesis turn queued on the system agent"
+    );
+
+    // The next turn (the app's) sees the person's labelled row in the shared
+    // history, and its own label.
+    // (`result.md` lands just before the terminal: retry while the person's
+    // turn is still finishing.)
+    let app_turn = TurnId::new();
+    let mut admitted = false;
+    for attempt in 0..250 {
+        if start_turn(
+            &e,
+            &e.ws,
+            &active,
+            &format!("p2-{attempt}"),
+            &peer,
+            &app_turn,
+            "refresh the feed",
+            Some(origin(TurnOriginKind::App, None)),
+        )
+        .await
+        {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(admitted, "the app's turn starts once the person's ended");
+    let result = wait_result(&e, &app_turn).await;
+    assert!(result.contains("\norigin: app\n"), "{result}");
+    let second = llm.requests.lock().unwrap()[1].clone();
+    assert!(
+        second.contains("[from the person: Ada] what's new?"),
+        "{second}"
+    );
+    assert!(
+        second.contains("[from the app] refresh the feed"),
+        "{second}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_label_a_peer_input_turn_as_the_system_agents_and_refuse_a_relabel() {
+    use octos_core::ui_protocol::TurnOriginKind;
+    let llm = Arc::new(RecordingLlm::default());
+    let mut e = e2e_fixture(llm.clone(), json!({ "tools": [] })).await;
+    let frames = collect_frames(e.rx.take().unwrap());
+    let peer = shared_peer(&e);
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    deliver_peer_send_input(
+        "dev",
+        &e.data_dir.join("peers"),
+        &e.system.0,
+        &TurnId::new(),
+        send_input_request("SUMMARIZE_TODAY", "call_1"),
+    )
+    .expect("delivered to the host");
+    let input = wait_frame(&frames, |f| f["method"] == "peer/input").await;
+    let turn_id: TurnId = serde_json::from_value(input["params"]["turn_id"].clone()).unwrap();
+
+    // The host cannot pass the system agent's input off as the person's...
+    for (id, kind) in [("r1", TurnOriginKind::Person), ("r2", TurnOriginKind::App)] {
+        assert!(
+            !start_turn(
+                &e,
+                &e.ws,
+                &active,
+                id,
+                &peer,
+                &turn_id,
+                "SUMMARIZE_TODAY",
+                Some(origin(kind, None)),
+            )
+            .await
+        );
+        assert_eq!(error_kind_of(&frames, id).await, "turn_origin_mismatch");
+    }
+    // ...nor label its own turn as the system agent's.
+    assert!(
+        !start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "r3",
+            &peer,
+            &TurnId::new(),
+            "do it",
+            Some(origin(TurnOriginKind::SystemAgent, None)),
+        )
+        .await
+    );
+    assert_eq!(error_kind_of(&frames, "r3").await, "turn_origin_mismatch");
+
+    // Started as `peer/input` asks (no origin), the kernel labels it.
+    assert!(
+        start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "r4",
+            &peer,
+            &turn_id,
+            "SUMMARIZE_TODAY",
+            None
+        )
+        .await
+    );
+    let result = wait_result(&e, &turn_id).await;
+    assert!(result.contains("\norigin: system_agent\n"), "{result}");
+    let request = llm.requests.lock().unwrap()[0].clone();
+    assert!(
+        request.contains("[from the system agent] SUMMARIZE_TODAY"),
+        "{request}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_refuse_a_turn_origin_from_other_connections_and_on_other_sessions() {
+    use octos_core::ui_protocol::TurnOriginKind;
+    let llm = Arc::new(RecordingLlm::default());
+    let mut e = e2e_fixture(llm.clone(), json!({ "tools": [] })).await;
+    let host_frames = collect_frames(e.rx.take().unwrap());
+    let peer = shared_peer(&e);
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let person = || Some(origin(TurnOriginKind::Person, None));
+
+    // Another connection of the profile, and an external client.
+    let (foreign, foreign_rx) = ws_connection_for_test(64);
+    let foreign_frames = collect_frames(foreign_rx);
+    assert!(
+        !start_turn(
+            &e,
+            &foreign,
+            &active,
+            "f1",
+            &peer,
+            &TurnId::new(),
+            "hi",
+            person()
+        )
+        .await
+    );
+    assert_eq!(
+        error_kind_of(&foreign_frames, "f1").await,
+        "turn_origin_host_only"
+    );
+    let (external, external_rx) = external_ws(64);
+    let external_frames = collect_frames(external_rx);
+    assert!(
+        !start_turn(
+            &e,
+            &external,
+            &active,
+            "x1",
+            &peer,
+            &TurnId::new(),
+            "hi",
+            person()
+        )
+        .await
+    );
+    assert_eq!(
+        error_kind_of(&external_frames, "x1").await,
+        "turn_origin_host_only"
+    );
+    // The existing gates in front of the handler still refuse both outright.
+    let params = json!({
+        "session_id": peer,
+        "turn_id": TurnId::new(),
+        "input": [{"kind": "text", "text": "hi"}],
+        "origin": {"kind": "person"},
+    });
+    let refused = refuse_foreign_host_peer_session_call(&e.state, &foreign, "turn/start", &params)
+        .expect("a foreign turn/start on the host peer's session is refused");
+    assert_eq!(refused.data.unwrap()["kind"], "peer_host_connection_only");
+    // (The external identity is the `_main` profile: the same peer session
+    // there.)
+    let mut main_params = params.clone();
+    main_params["session_id"] = json!(SessionKey::with_profile_topic(
+        MAIN_PROFILE_ID,
+        "api",
+        &host_chat(),
+        "peer-news"
+    ));
+    let refused = super::super::host_managed::external_gate(
+        "turn/start",
+        &main_params,
+        &std::collections::HashSet::new(),
+    )
+    .expect_err("an external turn/start on a host peer's session is refused");
+    assert_eq!(
+        refused.data.unwrap()["kind"],
+        super::super::host_managed::HOST_OWNED_PEER_SESSION_DENIED
+    );
+
+    // Only the peer's own session takes an origin: not the system agent's
+    // session, and not a request context.
+    let opened = raw_peer_context_open(
+        &e.state,
+        &rpc(
+            APPUI_METHOD_PEER_CONTEXT_OPEN,
+            json!({"session_id": e.system, "peer": "news", "context_id": "ui-1",
+                   "host_token": e.token}),
+        ),
+        None,
+    )
+    .unwrap();
+    let context: SessionKey = serde_json::from_value(opened["session_id"].clone()).unwrap();
+    for (id, session) in [("o1", &e.system), ("o2", &context)] {
+        assert!(
+            !start_turn(
+                &e,
+                &e.ws,
+                &active,
+                id,
+                session,
+                &TurnId::new(),
+                "hi",
+                person()
+            )
+            .await
+        );
+        assert_eq!(
+            error_kind_of(&host_frames, id).await,
+            "turn_origin_not_allowed"
+        );
+    }
+    assert!(
+        llm.requests.lock().unwrap().is_empty(),
+        "no refused turn ran"
+    );
+}
+
+/// A model whose first call waits until the test releases it.
+#[derive(Default)]
+struct GatedLlm {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for GatedLlm {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        Ok(octos_llm::ChatResponse {
+            content: Some("ok".into()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: octos_llm::TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            provider_index: None,
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "gated"
+    }
+
+    fn provider_name(&self) -> &str {
+        "stub"
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_refuse_a_second_turn_while_the_shared_peer_session_is_busy() {
+    use octos_core::ui_protocol::TurnOriginKind;
+    let llm = Arc::new(GatedLlm::default());
+    let mut e = e2e_fixture(llm.clone(), json!({ "tools": [] })).await;
+    let frames = collect_frames(e.rx.take().unwrap());
+    let peer = shared_peer(&e);
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+
+    let person_turn = TurnId::new();
+    assert!(
+        start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "b1",
+            &peer,
+            &person_turn,
+            "hello",
+            Some(origin(TurnOriginKind::Person, None)),
+        )
+        .await
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), llm.entered.notified())
+        .await
+        .expect("the person's turn reached the model");
+
+    // The system agent's input arrives while the person's turn runs: the
+    // kernel admits one turn per session, so its start is refused and the
+    // host keeps it queued.
+    deliver_peer_send_input(
+        "dev",
+        &e.data_dir.join("peers"),
+        &e.system.0,
+        &TurnId::new(),
+        send_input_request("CHECK_MAIL", "call_1"),
+    )
+    .unwrap();
+    let input = wait_frame(&frames, |f| f["method"] == "peer/input").await;
+    let input_turn: TurnId = serde_json::from_value(input["params"]["turn_id"].clone()).unwrap();
+    assert!(
+        !start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "b2",
+            &peer,
+            &input_turn,
+            "CHECK_MAIL",
+            None
+        )
+        .await
+    );
+    assert_eq!(error_kind_of(&frames, "b2").await, "turn_in_progress");
+    // Another person's message is refused the same way.
+    assert!(
+        !start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "b3",
+            &peer,
+            &TurnId::new(),
+            "and another thing",
+            Some(origin(TurnOriginKind::Person, None)),
+        )
+        .await
+    );
+    assert_eq!(error_kind_of(&frames, "b3").await, "turn_in_progress");
+
+    // Once the person's turn ends, the host starts the queued input with the
+    // same turn id, still labelled as the system agent's.
+    llm.release.notify_one();
+    let result = wait_result(&e, &person_turn).await;
+    assert!(result.contains("\norigin: person\n"), "{result}");
+    let mut admitted = false;
+    for _ in 0..250 {
+        if start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "b4",
+            &peer,
+            &input_turn,
+            "CHECK_MAIL",
+            None,
+        )
+        .await
+        {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(admitted, "the queued input starts once the session is free");
+    let result = wait_result(&e, &input_turn).await;
+    assert!(result.contains("\norigin: system_agent\n"), "{result}");
+}
+
+#[tokio::test]
+async fn should_not_rearm_the_fleet_synthesis_for_a_persons_round_alone() {
+    let fx = fixture().await;
+    prepare_news(&fx).await;
+    let peers = peers_root(&fx);
+    let dir = peers.join("news");
+    let owed = || {
+        let marks = read_peer_fleet_synthesis_marks(&peers, &fx.system.0);
+        let fleet = collect_owned_peer_results(&peers, &fx.system.0).unwrap();
+        peer_fleet_synthesis_is_owed(&marks, &fleet)
+    };
+    let deliver = |round: u32| {
+        std::fs::write(dir.join(format!("result-{round}.md")), "r").unwrap();
+        std::fs::write(dir.join("result.md"), "r").unwrap();
+    };
+
+    // The person's first round: covered, nothing owed.
+    deliver(1);
+    absorb_person_round_into_fleet_marks(&peers, &dir, "news");
+    assert!(!owed(), "a person's round alone owes no synthesis");
+    // The system agent's round: owed as before.
+    deliver(2);
+    assert!(owed());
+    // A person's round while that is still owed leaves it owed (the
+    // synthesis then covers both).
+    deliver(3);
+    absorb_person_round_into_fleet_marks(&peers, &dir, "news");
+    assert!(owed(), "the system agent's owed round still fires");
+    assert!(matches!(
+        read_peer_fleet_synthesis_marks(&peers, &fx.system.0),
+        FleetSynthesisMarks::Rounds(ref rounds) if rounds.get("news") == Some(&1)
+    ));
+}
+
+#[tokio::test]
+async fn should_run_a_foreground_tool_in_the_persons_turn_on_the_peer_session() {
+    use octos_core::ui_protocol::TurnOriginKind;
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let key = peer_key(&fx);
+    let (ws, rx) = ws_connection_for_test(32);
+    let mut foreground = news_list();
+    foreground["background"] = json!(false);
+    register(&fx, &ws, &token, json!({ "tools": [foreground] })).unwrap();
+    let host = spawn_fake_host(
+        &fx,
+        token.clone(),
+        rx,
+        |_| json!({ "ok": true, "data": [] }),
+    );
+    let approver = app_approver(
+        &fx,
+        &key,
+        &Arc::new(UiProtocolContractStores::default()),
+        &TurnId::new(),
+    );
+    let run = |turn: TurnId, kind: TurnOriginKind| {
+        let fx = &fx;
+        let key = key.clone();
+        let approver = approver.clone();
+        async move {
+            crate::peers::turn_origin::record_turn_origin(&key, &turn, origin(kind, None));
+            let registry = turn_registry(fx, &key, &turn.0.to_string()).await;
+            octos_agent::tools::TOOL_APPROVAL_CTX
+                .scope(
+                    approver,
+                    registry.execute_with_context(&call_ctx("c1"), "news_list", &json!({})),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    // The person is in the app: their turn is attended.
+    let ran = run(TurnId::new(), TurnOriginKind::Person).await;
+    assert!(ran.success, "{}", ran.output);
+    // The app's own run on the same session is a background run.
+    let refused = run(TurnId::new(), TurnOriginKind::App).await;
+    assert!(
+        !refused.success && refused.output.contains("background"),
+        "{}",
+        refused.output
+    );
+    crate::peers::turn_origin::clear_turn_origin(&key);
+    drop(ws);
+    crate::peers::host_tools::set_host_route(&peers_root(&fx), "news", 0, Arc::new(|_, _| false));
+    assert_eq!(host.await.unwrap().len(), 1);
 }

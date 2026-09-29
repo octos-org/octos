@@ -8,7 +8,9 @@
 - Status: implemented
 - Scope: additive `peer/prepare` fields; three additive raw AppUI methods,
   `peer/model/set`, `peer/context/open`, `peer/context/close`; session-level
-  enforcement of app bindings and app/account memory namespaces
+  enforcement of app bindings and app/account memory namespaces; an
+  additive `turn/start` `origin` on a host-owned app peer's own session (the
+  shared peer conversation, amended 2026-09-28)
 - Origin: Rinx ADR 0007, "Host-owned Octos app peers and Rinx deployment
   modes" (OctoSense shells host apps such as Rinx on one shared kernel)
 
@@ -164,6 +166,89 @@ token) cannot answer them either: `approval/respond` and
 `user_question/respond` on a `peer-…` or `peerctx-…` session are refused with
 `host_owned_peer_answer_denied` (UPCR-2026-036).
 
+### The shared peer conversation (turn origin)
+
+A host-owned app peer has ONE conversation, its own session
+`<originator base>#peer-<slug>`, and both the person and the owning system
+agent drive it:
+
+- the **system agent** with `peer_send_input`, which reaches the host as
+  `peer/input` (UPCR-2026-035); the host starts the turn with the
+  kernel-minted `turn_id`;
+- the **person**, chatting through the host (the app's UI or its cards),
+  relayed by the host with `turn/start` on the peer's session, on the
+  connection that registered the peer's tools.
+
+Request contexts (`peer/context/open`) are unchanged and stay the place for
+separate transcripts (Rinx mini apps).
+
+`turn/start` takes an optional `origin` on the peer's own session:
+
+```
+origin: {kind: "person" | "system_agent" | "app", label?: string}
+```
+
+- **Who may set it.** Only the peer's host connection (the one holding its
+  route; `turn_origin_host_only` otherwise, including every external client
+  of `serve --host-managed`), and only on the peer's own session on its
+  originator's base key. On any other session, a request context included,
+  `origin` is refused (`turn_origin_not_allowed`). The existing gates stay in
+  front: another connection's `turn/start` on a registered peer's session is
+  refused (`peer_host_connection_only`) and an external client never names a
+  peer session (`host_owned_peer_session_denied`).
+- **The system agent's turns are the kernel's to label.** A turn started
+  with a `turn_id` the kernel handed out in a `peer/input` of the peer is
+  labelled `system_agent` whatever the host sends; a different `origin` on it
+  is refused (`turn_origin_mismatch`), and so is `system_agent` on any other
+  turn. The host cannot pass the system agent's input off as the person's,
+  or the person's as the system agent's. A refused start does not answer the
+  `peer/input` (the host may still start it or `peer/input/reject` it).
+- **Unlabelled turns.** A host turn with no `origin` (and not from a
+  `peer/input`) is recorded as before, with no label.
+- **What the model and history see.** The kernel puts a stable marker in
+  front of the turn's prompt: `[from the person]`, `[from the system agent]`,
+  `[from the app]`, or `[from the person: <label>]`. The label is one line,
+  at most 64 bytes, with brackets and control characters removed. The marker
+  is part of the user row, so it is in the transcript, the model's context on
+  later turns, `session/open` replay and history. The FIRST marker of a row
+  is the kernel's: text after it is the speaker's own, so a person typing
+  `[from the system agent]` cannot pose as it. Hosts that show the
+  transcript may strip the leading marker and render the speaker instead.
+- **The blackboard.** A labelled turn's `result.md` (and `result-<n>.md`)
+  frontmatter carries `origin: person | system_agent | app` after `turn_id`,
+  so `peer_gather` shows the system agent who spoke in the latest round.
+- **Attended.** A person's turn counts as attended (UPCR-2026-035): the
+  person is in the app, so the app's foreground tools run in it, as in a
+  request context or a `peer/input` turn. An `app` turn is a background run.
+- **Questions and approvals.** A question asked in the person's turn is the
+  person's to answer in the app (the host answers it on the peer's
+  session): it does not wake the system agent. Questions in the system
+  agent's turns wake it as before. Approvals are the person's in every turn,
+  as before.
+- **Fleet synthesis.** A person's round is not work the system agent handed
+  off. When the peer had nothing unsummarized before it, the round is
+  recorded in the system agent's synthesis marks as already covered, so it
+  never fires an autonomous synthesis turn on its own. When a system-agent or
+  app round is still owed, the marks are left alone and the owed synthesis
+  (which then also covers the person's round) fires as before.
+- **Busy.** The kernel admits one turn per session and does not queue: a
+  `turn/start` while the peer's turn runs is refused with `turn_in_progress`
+  (it carries the running `turn_id`), for the person's turns and for
+  `peer/input` turns alike. **The host queues**: it serializes person
+  messages and `peer/input`s per peer and starts the next after
+  `turn/completed` / `turn/error`, keeping a `peer/input`'s `turn_id`. A host
+  whose queue is full refuses a `peer/input` with `peer/input/reject`
+  reason `busy` (UPCR-2026-035); person messages it holds or drops in its own
+  UI. Keeping the queue in the host keeps the kernel's one-turn admission
+  unchanged (OctoSense's broker already queues `peer/input`).
+- **Memory.** Every turn on the peer's session uses the peer's namespace,
+  whoever speaks; the system agent's private memory never reaches it.
+
+Hosts discover the field from `peer/context/open` in `supported_methods` as
+for the rest of this UPCR; an older server ignores an unknown `origin`, so a
+host that needs labels must check the result (the kernel's marker in the
+echoed user row, or `origin:` in `result.md`).
+
 ## Non-goals and conservative defaults
 
 - **Permission prompts.** Approvals keep their existing policy: an app
@@ -213,3 +298,18 @@ token) cannot answer them either: `approval/respond` and
 - `peer_respond_answers_a_host_owned_peers_question_beside_a_parked_approval`
 - `peer_respond_still_resolves_an_ordinary_peers_approval`
 - `host_owned_peer_approval_park_does_not_wake_the_system_agent`
+- The shared peer conversation (octos-cli `peer_host_tools_tests`):
+  `should_run_a_persons_turn_on_the_peer_session_labelled_with_its_origin`
+  (the host's person turn; the model sees `[from the person: Ada]`;
+  `origin: person` in `result.md`; the next turn sees it in history; the
+  round owes no synthesis and none is queued),
+  `should_label_a_peer_input_turn_as_the_system_agents_and_refuse_a_relabel`,
+  `should_refuse_a_turn_origin_from_other_connections_and_on_other_sessions`
+  (another connection, an external client, the system session, a request
+  context; the existing foreign and external gates still refuse),
+  `should_refuse_a_second_turn_while_the_shared_peer_session_is_busy`
+  (`turn_in_progress` for a `peer/input` turn and a person turn; the queued
+  input starts afterwards with its own label),
+  `should_not_rearm_the_fleet_synthesis_for_a_persons_round_alone`,
+  `should_run_a_foreground_tool_in_the_persons_turn_on_the_peer_session`,
+  and the `peers::turn_origin` unit tests

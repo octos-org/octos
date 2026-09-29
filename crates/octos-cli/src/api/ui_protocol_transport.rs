@@ -6578,13 +6578,20 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
         // originator. The enqueue does NOT block; we await `response_rx` below
         // exactly as before, and the woken master resolves it from a different
         // task.
-        wake_master_on_peer_awaiting_input(
-            self.state.as_ref(),
-            &self.session_id,
-            &question_id.0.to_string(),
-            PeerPendingKind::Question,
-            &peer_pending_prompt_summary(&event.title, &event.body),
-        );
+        //
+        // The shared peer conversation: a question asked in the PERSON's turn
+        // of a host-owned app peer is theirs to answer in the app (the host
+        // answers it on the peer's session), so it does not wake the system
+        // agent.
+        if !crate::peers::turn_origin::is_person_turn(&self.session_id, &self.turn_id) {
+            wake_master_on_peer_awaiting_input(
+                self.state.as_ref(),
+                &self.session_id,
+                &question_id.0.to_string(),
+                PeerPendingKind::Question,
+                &peer_pending_prompt_summary(&event.title, &event.body),
+            );
+        }
 
         // The event is durable: if the WS drop strands the request, the ledger
         // still records it and a reconnecting client can rehydrate. We cancel
@@ -17410,8 +17417,15 @@ fn write_peer_result_if_peer_session(
     // the turn number so the caller doesn't need to track state.
     let turn_count = count_peer_result_versions(&peer_dir) + 1;
 
+    // The shared peer conversation: a host-owned peer's turn names who spoke
+    // (`origin: person | system_agent | app`), so `peer_gather` shows it.
+    let origin = crate::peers::turn_origin::turn_origin(session_id, turn_id);
+    let origin_line = origin
+        .as_ref()
+        .map(|origin| format!("origin: {}\n", origin.kind.as_str()))
+        .unwrap_or_default();
     let text = format!(
-        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\nturn_id: {}\n---\n\n{body}{truncated}\n",
+        "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {turn_count}\nturn_id: {}\n{origin_line}---\n\n{body}{truncated}\n",
         turn_id.0
     );
 
@@ -17498,6 +17512,11 @@ fn write_peer_result_if_peer_session(
     let index_line = format!("{turn_count} {outcome_str} {updated_unix}\n");
     if let Err(err) = peer_io::append_peer_line(&peer_dir, "turns.txt", &index_line) {
         tracing::warn!(?err, slug, turn_count, "failed to append to turns.txt");
+    }
+    // A person's turn is the app's own conversation, not work the system
+    // agent handed off: it must not re-arm the fleet synthesis on its own.
+    if origin.is_some_and(|origin| origin.kind == octos_core::ui_protocol::TurnOriginKind::Person) {
+        absorb_person_round_into_fleet_marks(&runtime.data_dir.join("peers"), &peer_dir, slug);
     }
 
     // Publish this turn's commits to the workspace repo NOW, not only on close.
@@ -18978,6 +18997,46 @@ fn reset_peer_fleet_synthesis_if_cleared(peers_root: &Path, master: &str) {
     // fresh fleet marked-but-unsynthesized. The disk marker and the in-memory
     // guard are cleared together so the next legitimate fire is not suppressed.
     default_agent_orchestrator().clear_peer_fleet_synthesis_claim(&SessionKey(master.to_owned()));
+}
+
+/// The shared peer conversation: a PERSON's turn on a host-owned app peer
+/// delivers a round (`result-<n>.md`) like any peer-session turn, and the
+/// system agent sees it through `peer_gather` (labelled `origin: person`).
+/// It is not work the system agent handed off, so on its own it must not
+/// fire a fleet synthesis (an autonomous system-agent turn after every chat
+/// message). When the peer had nothing unsummarized before this round, the
+/// round is recorded as already covered; when a system-agent or app round is
+/// still owed, the marks are left alone and the owed synthesis (which then
+/// also covers this round) fires as before. Best-effort, like the marks.
+fn absorb_person_round_into_fleet_marks(peers_root: &Path, peer_dir: &Path, slug: &str) {
+    let Some(master) =
+        peer_io::read_peer_file(peer_dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL)
+    else {
+        return;
+    };
+    let master = master.trim();
+    if master.is_empty() {
+        return;
+    }
+    let Some((_, peer)) = read_owned_peer_entry(peers_root, slug.to_owned()) else {
+        return;
+    };
+    let mut rounds = match read_peer_fleet_synthesis_marks(peers_root, master) {
+        // A legacy stamp already reads every current round as covered.
+        FleetSynthesisMarks::Legacy => return,
+        FleetSynthesisMarks::None => HashMap::new(),
+        FleetSynthesisMarks::Rounds(rounds) => rounds,
+    };
+    let covered = rounds.get(slug).copied().unwrap_or(0);
+    if peer.round == 0 || covered >= peer.round || covered + 1 < peer.round {
+        return;
+    }
+    rounds.insert(slug.to_owned(), peer.round);
+    let mut marks: Vec<(String, u32)> = rounds.into_iter().collect();
+    marks.sort();
+    if let Err(error) = write_peer_fleet_synthesis_marks(peers_root, master, &marks) {
+        tracing::warn!(%error, slug, "failed to record a person's round as covered");
+    }
 }
 
 /// Enumerate every peer OWNED by `master` under `peers_root`, each paired with
@@ -24947,6 +25006,23 @@ async fn handle_turn_start_with_accept(
         send_scope_error(ws, id, error);
         return false;
     }
+    // The shared peer conversation: who speaks in this turn of a host-owned
+    // app peer's own session (decided before the `peer/input` claim below,
+    // so a refused relabel does not answer the input). The kernel's marker
+    // leads the prompt, so the model, the transcript and history/replay all
+    // carry it.
+    let peer_turn_origin = match resolve_peer_turn_origin(
+        state,
+        ws,
+        &params,
+        connection_profile_id.or(routed_profile_id),
+    ) {
+        Ok(origin) => origin,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return false;
+        }
+    };
     if let Err(error) = claim_peer_input_turn(state, &params.session_id, &params.turn_id) {
         let _ = send_rpc_error(ws, Some(id), error);
         return false;
@@ -24976,6 +25052,13 @@ async fn handle_turn_start_with_accept(
                 return false;
             }
         }
+    };
+    let prompt = match peer_turn_origin
+        .as_ref()
+        .and_then(|decided| decided.origin.as_ref())
+    {
+        Some(origin) => crate::peers::turn_origin::label_prompt(origin, &prompt),
+        None => prompt,
     };
 
     let fixture = m9_protocol_fixture_for_prompt(&prompt);
@@ -25195,6 +25278,17 @@ async fn handle_turn_start_with_accept(
         handle.abort();
         let _ = send_rpc_error(ws, Some(id), refusal.into_error(ws.is_external()));
         return false;
+    }
+    // Admitted: remember who speaks (the turn's terminal labels its
+    // blackboard result with it, and a person's question does not wake the
+    // system agent).
+    if let Some(decided) = &peer_turn_origin {
+        match &decided.origin {
+            Some(origin) => {
+                crate::peers::turn_origin::record_turn_origin(&session_id, &turn_id, origin.clone())
+            }
+            None => crate::peers::turn_origin::clear_turn_origin(&session_id),
+        }
     }
 
     connection_turns.lock().await.insert(
@@ -25508,6 +25602,7 @@ async fn handle_turn_steer(
                 reasoning_effort: None,
                 tool_context: None,
                 live_video: false,
+                origin: None,
             };
             let _ = handle_turn_start_with_accept(
                 ws,
@@ -25778,6 +25873,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let prompt = prompt_text(&params.input).unwrap_or_default();
     let routed_profile_id = Some(profile_id.clone());
@@ -27187,6 +27283,112 @@ fn refuse_foreign_host_turn_control(
 ) -> Option<RpcError> {
     let controller = persisted_host_session_controller(state, session)?;
     (controller != Some(ws.connection_id.0)).then(|| host_connection_only_error(method))
+}
+
+/// The origin of one turn of a host-owned app peer's shared conversation,
+/// decided at `turn/start` admission (see [`resolve_peer_turn_origin`]).
+#[derive(Debug, Clone)]
+struct PeerTurnOrigin {
+    /// `None`: an unlabelled turn (a host turn that set no origin).
+    origin: Option<octos_core::ui_protocol::TurnOrigin>,
+}
+
+fn turn_origin_error(kind: &str, message: impl Into<String>) -> RpcError {
+    RpcError::permission_denied(message.into()).with_data(json!({ "kind": kind }))
+}
+
+/// Decide who speaks in `params`'s turn (UPCR-2026-034, the shared
+/// peer conversation). `None` for a session that is not a host-owned app
+/// peer's own session.
+///
+/// - A turn whose id the kernel handed out in a `peer/input` of the peer is
+///   the system agent's: labelled `system_agent` whoever starts it, and a
+///   different requested origin is refused (`turn_origin_mismatch`).
+/// - Any other `origin` may be set only by the peer's host connection (the
+///   one holding its route; `turn_origin_host_only`), never as
+///   `system_agent` (`turn_origin_mismatch`), and only on the peer's own
+///   session on its originator's base key (`turn_origin_not_allowed`
+///   elsewhere, including request contexts and ordinary sessions).
+fn resolve_peer_turn_origin(
+    state: &AppState,
+    ws: &WsConnection,
+    params: &TurnStartParams,
+    routed_profile_id: Option<&str>,
+) -> Result<Option<PeerTurnOrigin>, RpcError> {
+    use octos_core::ui_protocol::{TurnOrigin, TurnOriginKind};
+    let requested = params.origin.as_ref();
+    let not_allowed = || {
+        turn_origin_error(
+            "turn_origin_not_allowed",
+            "turn/start origin is accepted only on a host-owned app peer's own session",
+        )
+    };
+    let slug = params
+        .session_id
+        .topic()
+        .and_then(|topic| topic.strip_prefix("peer-"))
+        .filter(|slug| peer_slug_is_safe(slug));
+    let Some(slug) = slug else {
+        return match requested {
+            Some(_) => Err(not_allowed()),
+            None => Ok(None),
+        };
+    };
+    let profile = params.session_id.profile_id().or(routed_profile_id);
+    let peers_root = match resolve_profile_data_dir(state, profile) {
+        Ok((_, data_dir)) => data_dir.join("peers"),
+        Err(error) => {
+            return match requested {
+                Some(_) => Err(error),
+                None => Ok(None),
+            };
+        }
+    };
+    let own_session = crate::peers::app_binding::peer_is_host_owned(&peers_root, slug)
+        && crate::peers::host_tools::host_peer_session(&peers_root, slug).as_ref()
+            == Some(&params.session_id);
+    if !own_session {
+        return match requested {
+            Some(_) => Err(not_allowed()),
+            None => Ok(None),
+        };
+    }
+    let turn_id = params.turn_id.0.to_string();
+    let from_peer_input = crate::peers::host_tools::peer_input_turn(&peers_root, slug, &turn_id);
+    let origin = if from_peer_input {
+        if requested.is_some_and(|origin| origin.kind != TurnOriginKind::SystemAgent) {
+            return Err(turn_origin_error(
+                "turn_origin_mismatch",
+                "this turn was handed out in a peer/input: it is the system agent's and \
+                 cannot be relabelled",
+            ));
+        }
+        Some(TurnOrigin {
+            kind: TurnOriginKind::SystemAgent,
+            label: None,
+        })
+    } else if let Some(requested) = requested {
+        if ws.is_external()
+            || crate::peers::host_tools::host_route_connection(&peers_root, slug)
+                != Some(ws.connection_id.0)
+        {
+            return Err(turn_origin_error(
+                "turn_origin_host_only",
+                "only the connection that registered the peer's tools may set a turn origin",
+            ));
+        }
+        if requested.kind == TurnOriginKind::SystemAgent {
+            return Err(turn_origin_error(
+                "turn_origin_mismatch",
+                "only the kernel labels the system agent's input: start that turn from its \
+                 peer/input",
+            ));
+        }
+        Some(crate::peers::turn_origin::sanitized(requested))
+    } else {
+        None
+    };
+    Ok(Some(PeerTurnOrigin { origin }))
 }
 
 #[allow(clippy::too_many_arguments)]

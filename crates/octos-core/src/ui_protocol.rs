@@ -2138,6 +2138,49 @@ pub struct TurnStartParams {
     /// types. Defaults false; omitted on the wire when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub live_video: bool,
+    /// Who is speaking in this turn of a host-owned app peer's shared
+    /// conversation (`<originator base>#peer-<slug>`). Only the peer's host
+    /// connection may set it, and never to `system_agent`: the kernel labels
+    /// a turn started for its own `peer/input` itself. The kernel records it
+    /// in the transcript as a stable prefix of the prompt
+    /// (`[from the person] …`). Refused on every other session. Omitted on
+    /// the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TurnOrigin>,
+}
+
+/// Who speaks in one turn of a host-owned app peer's shared conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnOrigin {
+    pub kind: TurnOriginKind,
+    /// Optional display label, e.g. the person's name or the app card. One
+    /// line, at most 64 bytes; the kernel strips brackets and control
+    /// characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// The speaker of a host-owned app peer's turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOriginKind {
+    /// The person, chatting through the host (the app's UI or its cards).
+    Person,
+    /// The owning system agent (`peer_send_input` → `peer/input`).
+    SystemAgent,
+    /// The app itself (e.g. a background run the host starts).
+    App,
+}
+
+impl TurnOriginKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::SystemAgent => "system_agent",
+            Self::App => "app",
+        }
+    }
 }
 
 /// Reasoning/thinking effort level carried on the wire (octos-core cannot depend

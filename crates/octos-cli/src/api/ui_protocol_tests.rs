@@ -11472,6 +11472,7 @@ fn parses_turn_start_rpc_request() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     })
     .into_rpc_request("1")
     .expect("request");
@@ -21058,6 +21059,7 @@ fn session_ingress_scope_accepts_matching_topic_folded_turn() {
         media: Vec::new(),
         topic: Some("coding".into()),
         live_video: false,
+        origin: None,
         reasoning_effort: None,
         tool_context: None,
         rewrite_for: None,
@@ -23417,6 +23419,7 @@ async fn echo_literal_fixture_dual_emits_the_declared_literal() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     // Sender stays alive so the trailing fixture delay completes instead of
@@ -23462,6 +23465,7 @@ async fn cjk_fixtures_dual_emit_multibyte_content_with_per_line_deltas() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
@@ -23497,6 +23501,7 @@ async fn cjk_fixtures_dual_emit_multibyte_content_with_per_line_deltas() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
@@ -23546,6 +23551,7 @@ async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
@@ -23682,6 +23688,7 @@ async fn m9_fixture_interrupt_cancels_pending_user_questions() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
@@ -31360,6 +31367,7 @@ async fn cold_scope_admission_case(case: &str) {
             reasoning_effort: None,
             tool_context: None,
             live_video: false,
+            origin: None,
         },
     )
     .await;
@@ -31473,6 +31481,7 @@ async fn cold_scope_admission_case(case: &str) {
                 reasoning_effort: None,
                 tool_context: None,
                 live_video: false,
+                origin: None,
             },
         )
         .await;
@@ -40664,6 +40673,7 @@ async fn turn_start_still_rejects_when_turn_already_running() {
             reasoning_effort: None,
             tool_context: None,
             live_video: false,
+            origin: None,
         },
     )
     .await;
@@ -40725,6 +40735,7 @@ async fn should_refuse_with_typed_turn_in_progress_when_turn_start_collides() {
             reasoning_effort: None,
             tool_context: None,
             live_video: false,
+            origin: None,
         },
     )
     .await;
@@ -40946,6 +40957,7 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
             reasoning_effort: None,
             tool_context: None,
             live_video: false,
+            origin: None,
         },
     )
     .await;
@@ -45612,6 +45624,7 @@ async fn state_get_during_held_admission(topic: Option<&str>) -> (Value, Value, 
             reasoning_effort: None,
             tool_context: None,
             live_video: false,
+            origin: None,
         },
     );
     let probe = async {
@@ -45795,6 +45808,7 @@ long enough to be a substantive tool result rather than a short diagnostic strin
             reasoning_effort: None,
             tool_context: None,
             live_video: false,
+            origin: None,
         },
     )
     .await;
