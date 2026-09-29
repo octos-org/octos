@@ -218,6 +218,15 @@ pub(crate) fn serp_scrape_allowed() -> bool {
     octos_research::serp_scrape_allowed(|k| std::env::var(k).ok())
 }
 
+/// Upgrade visibility: when a results-page provider runs only because of
+/// the new default, say so once on stderr (the skill's log).
+fn default_notice_once() {
+    static NOTICE: std::sync::Once = std::sync::Once::new();
+    if let Some(notice) = octos_research::serp_scrape_default_notice(|k| std::env::var(k).ok()) {
+        NOTICE.call_once(|| eprintln!("[deep-search] {notice}"));
+    }
+}
+
 /// Automatic provider plan for this environment.
 pub(crate) fn auto_plan(news: bool, allow_serp_scrape: bool) -> Vec<Provider> {
     plan::plan(&PlanInput {
@@ -521,6 +530,7 @@ async fn run_provider(
             if !opts.allow_serp_scrape {
                 return Err("disabled".to_string());
             }
+            default_notice_once();
             ProviderOut {
                 hits: crate::ddg_search(query, count).await?,
                 answer: String::new(),
@@ -531,6 +541,7 @@ async fn run_provider(
             if !opts.allow_serp_scrape {
                 return Err("disabled".to_string());
             }
+            default_notice_once();
             ProviderOut {
                 hits: crate::bing_cdp_search(query, count).await?,
                 answer: String::new(),

@@ -84,19 +84,38 @@ pub fn respect_robots(lookup: impl Fn(&str) -> Option<String>) -> bool {
 /// (e.g. `http://127.0.0.1:8888`).
 pub const SEARXNG_URL_ENV: &str = "SEARXNG_URL";
 
-/// Whether results-page search (DuckDuckGo HTML, Bing in a browser) is on:
-/// yes unless [`SERP_SCRAPE_ENV`] or its alias [`BROWSER_SERP_ENV`] is set
-/// to `0`/`false`/`no`/`off`. The env lookup is injected so tests never
-/// touch process env.
+/// Whether results-page search (DuckDuckGo HTML, Bing in a browser) is on.
+/// Unset: on (the default, OctoSense ADR 0002 §6 amendment). Set: on only
+/// for `1`/`true`/`yes`/`on`; any other value, including an empty or
+/// unrecognised one, turns it **off**, so a mistyped opt-out fails safe.
+/// If either [`SERP_SCRAPE_ENV`] or its alias [`BROWSER_SERP_ENV`] turns it
+/// off, it is off. The env lookup is injected so tests never touch process
+/// env.
 pub fn serp_scrape_allowed(lookup: impl Fn(&str) -> Option<String>) -> bool {
-    ![SERP_SCRAPE_ENV, BROWSER_SERP_ENV].iter().any(|k| {
-        lookup(k).is_some_and(|v| {
+    [SERP_SCRAPE_ENV, BROWSER_SERP_ENV].iter().all(|k| {
+        lookup(k).is_none_or(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
+                "1" | "true" | "yes" | "on"
             )
         })
     })
+}
+
+/// One-time notice for hosts to log when results-page search runs only
+/// because of the default (the variable is unset): it was off by default
+/// before, so an upgrade changes behaviour. `None` when the operator set
+/// the variable either way.
+pub fn serp_scrape_default_notice(lookup: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    let unset = [SERP_SCRAPE_ENV, BROWSER_SERP_ENV]
+        .iter()
+        .all(|k| lookup(k).is_none());
+    unset.then_some(
+        "Results-page search (DuckDuckGo's HTML page, Bing in headless Chrome) is now on by \
+         default for general web results (OctoSense ADR 0002 amendment). Search engines' terms \
+         may not allow automated queries (Bing: high risk; DuckDuckGo: its robots.txt allows \
+         the HTML page, its terms promise nothing). Set OCTOS_ALLOW_SERP_SCRAPE=0 to turn it off.",
+    )
 }
 
 /// Message for a search where no provider returned anything: what was tried
@@ -114,9 +133,12 @@ pub fn no_results_message(query: &str, tried: &[String]) -> String {
          SERPER_API_KEY, TAVILY_API_KEY, YDC_API_KEY or PERPLEXITY_API_KEY) or set \
          {SEARXNG_URL_ENV} to a self-hosted SearXNG instance (with the `json` format \
          enabled). For news, use category \"news\" or a recent `since`. Results-page \
-         search (DuckDuckGo, Bing) is on unless {SERP_SCRAPE_ENV}=0; if it was tried, \
-         the engines may have answered with a challenge page, which octos does not \
-         bypass.\n"
+         search (DuckDuckGo, Bing; an interim layer until the metasearch's own \
+         results-page engines replace it) is on unless {SERP_SCRAPE_ENV}=0; if it was \
+         tried, the engines may have answered with a challenge page, which octos does \
+         not bypass. Note: search engines' terms may not allow automated queries \
+         (Bing: high risk; DuckDuckGo: its robots.txt allows the HTML page, its terms \
+         promise nothing).\n"
     )
 }
 
@@ -129,16 +151,26 @@ mod tests {
         assert!(serp_scrape_allowed(|_| None), "on by default");
         let only =
             |key: &'static str, v: &'static str| move |k: &str| (k == key).then(|| v.to_string());
-        assert!(serp_scrape_allowed(only(SERP_SCRAPE_ENV, "1")));
-        assert!(
-            serp_scrape_allowed(only(SERP_SCRAPE_ENV, "")),
-            "empty is not a no"
-        );
-        for off in ["0", "false", "NO", "off"] {
-            assert!(!serp_scrape_allowed(only(SERP_SCRAPE_ENV, off)), "{off}");
+        for on in ["1", "TRUE", "yes", "on"] {
+            assert!(serp_scrape_allowed(only(SERP_SCRAPE_ENV, on)), "{on}");
+        }
+        // Set to anything else, including empty or a typo: off (fail safe).
+        for off in ["0", "false", "NO", "off", "", "  ", "disabled", "nope"] {
+            assert!(!serp_scrape_allowed(only(SERP_SCRAPE_ENV, off)), "{off:?}");
         }
         assert!(!serp_scrape_allowed(only(BROWSER_SERP_ENV, "0")), "alias");
         assert!(serp_scrape_allowed(only("OTHER", "0")));
+    }
+
+    #[test]
+    fn should_give_the_default_notice_only_when_unset() {
+        assert!(serp_scrape_default_notice(|_| None).is_some_and(|n| n.contains("=0")));
+        assert!(
+            serp_scrape_default_notice(|k| (k == SERP_SCRAPE_ENV).then(|| "1".into())).is_none()
+        );
+        assert!(
+            serp_scrape_default_notice(|k| (k == BROWSER_SERP_ENV).then(|| "0".into())).is_none()
+        );
     }
 
     #[test]

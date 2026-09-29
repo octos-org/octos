@@ -461,6 +461,16 @@ impl Tool for WebSearchTool {
         let serp_scrape = self
             .serp_scrape
             .unwrap_or_else(|| serp_scrape_opted_in(|k| std::env::var(k).ok()));
+        // Upgrade visibility: say once per process that results-page search
+        // runs because of the new default.
+        if serp_scrape && self.serp_scrape.is_none() {
+            static NOTICE: std::sync::Once = std::sync::Once::new();
+            if let Some(notice) =
+                octos_research::serp_scrape_default_notice(|k| std::env::var(k).ok())
+            {
+                NOTICE.call_once(|| warn!("{notice}"));
+            }
+        }
 
         // Free structured sources first (ADR 0002 §6): GDELT + Google News
         // for news-ish queries, then a configured SearXNG.

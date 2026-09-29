@@ -2,8 +2,9 @@
 //! fetch paths must not pose as a desktop browser. No hard-coded browser
 //! User-Agent (`Mozilla/5.0 (...) ... Chrome/...`, `AppleWebKit`, `Safari/`)
 //! may appear in the research crates or the built-in search tools — including
-//! behind the opt-in search-results scrapers — nor in the metasearch engine
-//! scripts and manifests.
+//! the results-page providers (on by default since the ADR 0002 amendment;
+//! they identify as octos) — nor in the metasearch engine scripts and
+//! manifests.
 
 use std::path::{Path, PathBuf};
 
