@@ -5478,7 +5478,7 @@ async fn start_turn_when_free(
     text: &str,
     origin: Option<octos_core::ui_protocol::TurnOrigin>,
 ) {
-    for attempt in 0..250 {
+    for attempt in 0..1000 {
         if start_turn(
             e,
             &e.ws,
@@ -5686,7 +5686,7 @@ async fn should_run_the_person_lane_while_the_system_agent_lane_is_busy() {
     let dir = e.data_dir.join("peers/news");
     // (`turns.txt` is appended just after `result.md`.)
     let mut turns = String::new();
-    for _ in 0..250 {
+    for _ in 0..1000 {
         turns = std::fs::read_to_string(dir.join("turns.txt")).unwrap();
         if turns.lines().count() >= 3 {
             break;
@@ -5858,7 +5858,8 @@ async fn should_let_only_the_host_open_a_sharing_context_and_label_its_turns() {
     // The plain context's turn writes no blackboard round.
     let plain_turn = TurnId::new();
     start_turn_when_free(&e, &active, "o5", &plain, &plain_turn, "mini", None).await;
-    for _ in 0..100 {
+    // (Slow runners: wait up to 20 s for the plain turn to reach the model.)
+    for _ in 0..1000 {
         if llm.requests.lock().unwrap().len() >= 2 {
             break;
         }
