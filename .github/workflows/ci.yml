@@ -494,18 +494,26 @@ jobs:
         run: cargo test -p octos-agent --test '*' -- --test-threads=1
 
 
-  # Split three ways so the PR wait is the slowest third (~25 min), not the
-  # whole ~57 min serial run. Every step that ran before still runs, in
-  # exactly one part: `unit` (lib + the api-feature filter suites + smart-home),
-  # `integration` (integration tests + the serial serve process e2e), `oup`
-  # (the OUP runtime/frontend contracts and their evidence). Each part keeps
-  # its own warm cache.
+  # Split four ways so the PR wait is the slowest part (integration, ~35 min on
+  # 2026-09-28), not the whole ~90 min serial run. Every step that ran before
+  # still runs, in exactly one part: `unit` (lib + the api-feature filter
+  # suites + smart-home), `integration` (integration tests + the serial serve
+  # process e2e), `oup` (the OUP runtime/C-Python ABI contracts and their
+  # evidence), `oup-minimal` (the no-default-features frontend contract and
+  # strict lint). Each part keeps its own warm cache.
   test-octos-cli:
     name: test-octos-cli (${{ matrix.part }})
     strategy:
       fail-fast: false
       matrix:
-        part: [unit, integration, oup]
+        # oup-minimal is its own leg (#2421): it rebuilds every target with a
+        # --no-default-features fingerprint, so sharing the oup runner paid a
+        # second serial full build (~22 min, main run 36430435982) on every
+        # PR. The new context is enforced transitively for now — a failure
+        # skips the required security job through the test-octos-cli
+        # needs-aggregate — so add `test-octos-cli (oup-minimal)` to the
+        # branch-protection ruleset's required contexts.
+        part: [unit, integration, oup, oup-minimal]
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "1"
@@ -654,7 +662,7 @@ jobs:
         run: cargo test -p smart-home
 
       - name: Minimal OUP frontend contract
-        if: matrix.part == 'oup'
+        if: matrix.part == 'oup-minimal'
         run: ./scripts/milestone-ci.sh oup-minimal
 
       - name: Retain OUP runtime evidence
@@ -662,6 +670,17 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: oup-runtime-evidence
+          path: target/oup-functional/
+          retention-days: 14
+          if-no-files-found: error
+
+      # Same evidence dir as the runtime leg, distinct artifact name: two
+      # matrix legs may not upload under one name in the same run.
+      - name: Retain OUP minimal evidence
+        if: always() && matrix.part == 'oup-minimal'
+        uses: actions/upload-artifact@v7
+        with:
+          name: oup-minimal-evidence
           path: target/oup-functional/
           retention-days: 14
           if-no-files-found: error
