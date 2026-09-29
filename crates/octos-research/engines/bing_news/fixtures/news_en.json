@@ -1,0 +1,58 @@
+{
+  "body_file": "news_en.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": "2026-09-28T18:00:00Z",
+      "source": "CNN on MSN",
+      "title": "President Trump says he’s dead-set against AI regulation. What could change his mind?",
+      "url": "https://www.msn.com/en-us/news/other/president-trump-says-he-s-dead-set-against-ai-regulation-what-could-change-his-mind/vi-AA2d8FBd"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-26T00:00:00Z",
+      "source": "MPR News",
+      "title": "AI regulation: Exploring how to govern a rapidly evolving technology",
+      "url": "https://www.mprnews.org/episode/2026/09/28/ai-regulation-governing-and-oversight"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-28T00:00:00Z",
+      "source": "Crypto Briefing",
+      "title": "Pope Leo criticizes Nvidia’s Jensen Huang over AI safety, positioning Vatican as moral counterweight to Big Tech",
+      "url": "https://cryptobriefing.com/pope-leo-criticizes-nvidia-huang-ai-safety"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-28T23:00:00Z",
+      "source": "The Hill",
+      "title": "Debate over AI regulation pushed past midterms",
+      "url": "https://thehill.com/newsletters/technology/6116302-debate-over-ai-regulation-pushed-past-midterms"
+    },
+    {
+      "lang": "en",
+      "published": "2026-09-22T00:00:00Z",
+      "source": "The Conversation",
+      "title": "Calls for global regulation of AI are growing. What exactly could it look like?",
+      "url": "https://theconversation.com/calls-for-global-regulation-of-ai-are-growing-what-exactly-could-it-look-like-292243"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "text/html"
+    },
+    "method": "GET",
+    "url": "https://www.bing.com/news/search?q=AI+regulation&setlang=en"
+  },
+  "recorded": "live, 2026-09-29",
+  "request": {
+    "category": "news",
+    "count": 5,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-29T00:00:00Z",
+    "query": "AI regulation",
+    "since": null
+  }
+}

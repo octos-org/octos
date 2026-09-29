@@ -12,8 +12,8 @@
       "lang": "zh",
       "published": null,
       "source": "Wikipedia",
-      "title": "颱風白海豚 (2026年)",
-      "url": "https://zh.wikipedia.org/wiki/%E9%A2%B1%E9%A2%A8%E7%99%BD%E6%B5%B7%E8%B1%9A_(2026%E5%B9%B4)"
+      "title": "颱風杜鵑 (2026年)",
+      "url": "https://zh.wikipedia.org/wiki/%E9%A2%B1%E9%A2%A8%E6%9D%9C%E9%B5%91_(2026%E5%B9%B4)"
     },
     {
       "lang": "zh",
@@ -21,13 +21,6 @@
       "source": "Wikipedia",
       "title": "台风俱乐部",
       "url": "https://zh.wikipedia.org/wiki/%E5%8F%B0%E9%A3%8E%E4%BF%B1%E4%B9%90%E9%83%A8"
-    },
-    {
-      "lang": "zh",
-      "published": null,
-      "source": "Wikipedia",
-      "title": "颱風山竹",
-      "url": "https://zh.wikipedia.org/wiki/%E9%A2%B1%E9%A2%A8%E5%B1%B1%E7%AB%B9"
     },
     {
       "lang": "zh",
@@ -42,16 +35,16 @@
       "accept": "application/json"
     },
     "method": "GET",
-    "url": "https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch=%E5%8F%B0%E9%A3%8E&srlimit=5&sroffset=0&srprop=snippet&format=json&formatversion=2"
+    "url": "https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch=%E5%8F%B0%E9%A3%8E&srlimit=4&sroffset=0&srprop=snippet&format=json&formatversion=2"
   },
-  "recorded": "live, 2026-09-27",
+  "recorded": "live, 2026-09-29",
   "request": {
     "category": "general",
     "count": 5,
     "langs": [
       "zh"
     ],
-    "now": "2026-09-27T22:00:00Z",
+    "now": "2026-09-29T00:00:00Z",
     "query": "台风",
     "since": null
   }

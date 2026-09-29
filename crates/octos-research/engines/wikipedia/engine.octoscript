@@ -1,8 +1,11 @@
 // MediaWiki Action API, list=search, on <lang>.wikipedia.org.
 // Written from https://www.mediawiki.org/wiki/API:Search
+// In general search it adds encyclopedia context next to web results, so
+// it asks for at most 4 articles.
 use mod.markup
 use mod.net
 use mod.std.array
+use mod.std.math
 use mod.std.object
 use mod.std.text
 
@@ -16,7 +19,7 @@ fn host(opts) {
 }
 
 fn build_request(query, opts) {
-    let params = [["action", "query"], ["list", "search"], ["srsearch", query], ["srlimit", opts.count], ["sroffset", (opts.page - 1) * opts.count], ["srprop", "snippet"], ["format", "json"], ["formatversion", "2"]]
+    let params = [["action", "query"], ["list", "search"], ["srsearch", query], ["srlimit", math.min(opts.count, 4)], ["sroffset", (opts.page - 1) * opts.count], ["srprop", "snippet"], ["format", "json"], ["formatversion", "2"]]
     let u = net.url({base: "https://" + host(opts) + "/w/api.php", query: params})
     return net.request({url: u.url, headers: {accept: "application/json"}})
 }

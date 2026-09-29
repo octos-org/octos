@@ -84,6 +84,9 @@ pub const BUILTIN: &[(&str, &str, &str)] = builtin![
     "duckduckgo",
     "bing",
     "google",
+    "google_cse",
+    "brave_web",
+    "bing_news",
     "brave",
 ];
 

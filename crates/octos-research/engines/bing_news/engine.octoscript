@@ -1,0 +1,107 @@
+// Bing News results page (www.bing.com/news/search).
+// Written from the page itself and Microsoft's search-options help page
+// (docs_url): `q` query, `setlang` language, `cc` country, `qft` time
+// filter. Each story is a `div.news-card` carrying `data-url`,
+// `data-title` and `data-author`; its age is an aria-label such as
+// "6 hours ago", turned into a time from `opts.now`. A challenge page is
+// reported, not worked around.
+use mod.markup
+use mod.net
+use mod.std.array
+use mod.std.object
+use mod.std.text
+
+fn build_request(query, opts) {
+    let params = [["q", query]]
+    if opts.lang != nil {
+        array.push(params, ["setlang", opts.lang.primary])
+    }
+    let cc = if opts.region != nil {
+        opts.region
+    } elif opts.lang != nil {
+        opts.lang.region
+    } else {
+        nil
+    }
+    if cc != nil {
+        array.push(params, ["cc", cc])
+    }
+    if opts.since != nil {
+        // interval="4" last hour, "7" 24 hours, "8" 7 days, "9" 30 days
+        let h = opts.since.hours
+        let iv = if h <= 1 {
+            "4"
+        } elif h <= 24 {
+            "7"
+        } elif h <= 168 {
+            "8"
+        } else {
+            "9"
+        }
+        array.push(params, ["qft", "interval=\"" + iv + "\""])
+    }
+    let u = net.url({base: "https://www.bing.com/news/search", query: params})
+    return net.request({url: u.url, headers: {accept: "text/html"}})
+}
+
+fn is_digits(s) {
+    if s == "" || text.len(s) > 6 {
+        return false
+    }
+    for i in array.range(0, text.len(s)) {
+        if !text.contains("0123456789", text.slice(s, i, i + 1)) {
+            return false
+        }
+    }
+    return true
+}
+
+// "6 hours ago" / "2 days ago" / "an hour ago" -> unix seconds.
+fn age_to_unix(label, now) {
+    if label == nil {
+        return nil
+    }
+    let parts = text.split(text.lower(label), " ")
+    if array.len(parts) < 2 {
+        return nil
+    }
+    let n = if is_digits(parts[0]) {
+        parts[0].parse_json()
+    } elif parts[0] == "a" || parts[0] == "an" {
+        1
+    } else {
+        nil
+    }
+    let unit = parts[1]
+    let secs = if text.starts_with(unit, "min") {
+        60
+    } elif text.starts_with(unit, "h") {
+        3600
+    } elif text.starts_with(unit, "d") {
+        86400
+    } elif text.starts_with(unit, "w") {
+        604800
+    } else {
+        nil
+    }
+    if secs == nil || n == nil {
+        return nil
+    }
+    return now - n * secs
+}
+
+fn parse_response(response, opts) {
+    let body = response.body
+    if text.contains(body, "b_captcha") || text.contains(body, "solve the challenge") {
+        return {challenge: "Bing asked to confirm a person is searching"}
+    }
+    let found = markup.select({item: "div.news-card", fields: {url: "@data-url", title: "@data-title", source: "@data-author", snippet: ".snippet", age: "span[aria-label]@aria-label"}})
+    let out = []
+    for r in found.items {
+        if r.url == nil || r.title == nil || !text.starts_with(r.url, "http") {
+            continue
+        }
+        array.push(out, {url: r.url, title: r.title, snippet: r.snippet, source: r.source, published: age_to_unix(r.age, opts.now.unix)})
+    }
+    return out
+}

@@ -86,6 +86,9 @@ async fn replay(engine: &str, case: &Path) {
     let mut config = Config::default();
     config.enabled.push(engine.to_string());
     config.keys.insert("brave".into(), "fixture-key".into());
+    config
+        .keys
+        .insert("google_cse".into(), "fixture-key".into());
     let ms = Metasearch::new(registry, fetch.clone(), config);
 
     let r = &doc["request"];
@@ -215,6 +218,9 @@ fixture_tests! {
     github_build_and_parse => "github",
     google_news_build_and_parse => "google_news",
     google_build_and_parse => "google",
+    google_cse_build_and_parse => "google_cse",
+    brave_web_build_and_parse => "brave_web",
+    bing_news_build_and_parse => "bing_news",
     duckduckgo_build_and_parse => "duckduckgo",
     bing_build_and_parse => "bing",
     publisher_feeds_build_and_parse => "publisher_feeds",

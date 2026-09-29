@@ -19,13 +19,6 @@
       "lang": "en",
       "published": null,
       "source": "Wikipedia",
-      "title": "Rust syntax",
-      "url": "https://en.wikipedia.org/wiki/Rust_syntax"
-    },
-    {
-      "lang": "en",
-      "published": null,
-      "source": "Wikipedia",
       "title": "List of programming languages by type",
       "url": "https://en.wikipedia.org/wiki/List_of_programming_languages_by_type"
     },
@@ -33,8 +26,8 @@
       "lang": "en",
       "published": null,
       "source": "Wikipedia",
-      "title": "Rust compiler",
-      "url": "https://en.wikipedia.org/wiki/Rust_compiler"
+      "title": "Rust syntax",
+      "url": "https://en.wikipedia.org/wiki/Rust_syntax"
     }
   ],
   "http": {
@@ -42,16 +35,16 @@
       "accept": "application/json"
     },
     "method": "GET",
-    "url": "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=Rust+programming+language&srlimit=5&sroffset=0&srprop=snippet&format=json&formatversion=2"
+    "url": "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=Rust+programming+language&srlimit=4&sroffset=0&srprop=snippet&format=json&formatversion=2"
   },
-  "recorded": "live, 2026-09-27",
+  "recorded": "live, 2026-09-29",
   "request": {
     "category": "general",
     "count": 5,
     "langs": [
       "en"
     ],
-    "now": "2026-09-27T22:00:00Z",
+    "now": "2026-09-29T00:00:00Z",
     "query": "Rust programming language",
     "since": null
   }

@@ -1,0 +1,58 @@
+{
+  "body_file": "general_en.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": null,
+      "source": "Omarchy",
+      "title": "Omarchy - Beautiful, fun & agentic Linux by DHH",
+      "url": "https://omarchy.org/"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "GitHub",
+      "title": "GitHub - omacom/omarchy: Beautiful, Modern & Opinionated Linux · GitHub",
+      "url": "https://github.com/omacom/omarchy"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "Tedium",
+      "title": "Thoughts On Omarchy: Slick Distro, Complicated Ethics",
+      "url": "https://tedium.co/2025/10/13/omarchy-linux-distro-commentary"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "Wikipedia",
+      "title": "Omarchy - Wikipedia",
+      "url": "https://en.wikipedia.org/wiki/Omarchy"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "Data Engineering Blog",
+      "title": "Arch Linux (Omarchy) — 8 Months Later: The Good, the Bad, and the Fixable | ssp.sh",
+      "url": "https://www.ssp.sh/blog/linux-omarchy-the-good-bad-and-fixable"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "text/html"
+    },
+    "method": "GET",
+    "url": "https://search.brave.com/search?q=omarchy+linux&source=web"
+  },
+  "recorded": "live, 2026-09-29",
+  "request": {
+    "category": "general",
+    "count": 5,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-29T00:00:00Z",
+    "query": "omarchy linux",
+    "since": null
+  }
+}

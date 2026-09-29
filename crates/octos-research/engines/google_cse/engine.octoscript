@@ -1,0 +1,47 @@
+// Google results through the person's own Programmable Search Engine: its
+// public page (cse.google.com/cse?cx=...), which renders results with
+// JavaScript, so the request is rendered in the person's browser. The
+// engine ID (`cx`) is attached by the host like a key.
+// Written from Google's Programmable Search Element documentation
+// (docs_url): results are `.gsc-webResult` blocks with an `a.gs-title`
+// link and a `.gs-snippet`; the query goes in `q` and in the `gsc.q`
+// fragment. An "unusual traffic" page is reported as a challenge for the
+// person, never worked around.
+use mod.markup
+use mod.net
+use mod.std.array
+use mod.std.text
+
+fn build_request(query, opts) {
+    let params = [["q", query]]
+    if opts.lang != nil {
+        array.push(params, ["hl", opts.lang.primary])
+    }
+    let u = net.url({base: "https://cse.google.com/cse", query: params})
+    return net.request({url: u.url, render: true})
+}
+
+fn parse_response(response, opts) {
+    let body = response.body
+    if text.contains(body, "unusual traffic") || text.contains(body, "/sorry/") {
+        return {challenge: "Google reported unusual traffic"}
+    }
+    let found = markup.select({item: ".gsc-webResult.gsc-result", fields: {title: "a.gs-title", url: "a.gs-title@href", original: "a.gs-title@data-ctorig", snippet: ".gs-snippet", site: ".gs-visibleUrl-short"}})
+    let out = []
+    for r in found.items {
+        let raw = if r.original != nil {
+            r.original
+        } else {
+            r.url
+        }
+        if raw == nil || r.title == nil || r.title == "" {
+            continue
+        }
+        let url = markup.unwrap({url: raw, base: "https://cse.google.com/"}).url
+        if !text.starts_with(url, "http") {
+            continue
+        }
+        array.push(out, {url: url, title: r.title, snippet: r.snippet, source: r.site})
+    }
+    return out
+}

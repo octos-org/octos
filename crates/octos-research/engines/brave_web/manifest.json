@@ -1,0 +1,26 @@
+{
+  "id": "brave_web",
+  "name": "Brave Search (web page)",
+  "categories": [
+    "general"
+  ],
+  "languages": [
+    "*"
+  ],
+  "hosts": [
+    "search.brave.com"
+  ],
+  "results_page": true,
+  "rate_limit": {
+    "min_interval_ms": 10000,
+    "source": "No published limit for the results page; Brave answered HTTP 429 to a network sending a few searches a minute (observed 2026-09-28), so one search per 10 s."
+  },
+  "docs_url": [
+    "https://search.brave.com/search",
+    "https://search.brave.com/help/operators"
+  ],
+  "license_note": "Brave Search's results page, read for one person (ADR 0002 §6); the keyed `brave` engine uses the API instead. Titles, snippets and links only; a challenge page is reported, never worked around.",
+  "weight": 1.1,
+  "cache_ttl_secs": 900,
+  "timeout_secs": 10
+}
