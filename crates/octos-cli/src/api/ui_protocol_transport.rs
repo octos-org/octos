@@ -4425,6 +4425,15 @@ struct AppUiPromptContextBridge {
     /// UPCR-2026-035: render earlier `memory_update` context events as "no
     /// memory" in the outgoing prompt (a turn without the app's context).
     redact_memory_events: bool,
+    /// UPCR-2026-034: a prompt-only message (the other lane's recent turns,
+    /// read-only) put in front of the turn's own prompt on every model call
+    /// of the turn. It is added AFTER the context manager projected the
+    /// prompt and is never recorded, so it reaches neither the transcript
+    /// nor the context ledger.
+    ephemeral_block: Option<Message>,
+    /// The turn's own prompt row (the last user row at `TurnStart`), before
+    /// which [`Self::ephemeral_block`] goes.
+    ephemeral_anchor: StdMutex<Option<Message>>,
 }
 
 impl AppUiPromptContextBridge {
@@ -4443,12 +4452,41 @@ impl AppUiPromptContextBridge {
             context_lifecycle_notify: None,
             llm_compaction_provider: None,
             redact_memory_events: false,
+            ephemeral_block: None,
+            ephemeral_anchor: StdMutex::new(None),
         }
     }
 
     fn with_redacted_memory_events(mut self, redact: bool) -> Self {
         self.redact_memory_events = redact;
         self
+    }
+
+    fn with_ephemeral_block(mut self, block: Option<Message>) -> Self {
+        self.ephemeral_block = block;
+        self
+    }
+
+    /// Put the prompt-only block in front of the turn's own prompt row in
+    /// the outgoing `messages` (after that row was projected). Skipped when
+    /// the row is no longer in the prompt.
+    fn insert_ephemeral_block(&self, messages: &mut Vec<Message>) {
+        let Some(block) = &self.ephemeral_block else {
+            return;
+        };
+        let anchor = self
+            .ephemeral_anchor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(anchor) = anchor.as_ref() else {
+            return;
+        };
+        if let Some(index) = messages
+            .iter()
+            .rposition(|message| prompt_message_matches(message, anchor))
+        {
+            messages.insert(index, block.clone());
+        }
     }
 
     fn with_context_lifecycle_notify(mut self, notify: ContextLifecycleNotify) -> Self {
@@ -4541,6 +4579,16 @@ impl PromptContextManager for AppUiPromptContextBridge {
             .scratch
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if request.phase == PromptContextPhase::TurnStart && self.ephemeral_block.is_some() {
+            *self
+                .ephemeral_anchor
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = messages
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::User)
+                .cloned();
+        }
         if request.phase == PromptContextPhase::TurnStart || scratch_guard.is_none() {
             let mut manager = self
                 .context_manager
@@ -4719,6 +4767,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 _ => messages.insert(0, system),
             }
         }
+        self.insert_ephemeral_block(messages);
         scratch.observed_messages = messages.len();
         {
             let mut canonical = self
@@ -15510,6 +15559,13 @@ struct RawPeerContextParams {
     /// The host token of the owning app peer.
     #[serde(default)]
     host_token: Option<String>,
+    /// UPCR-2026-034 "Parallel person context with shared history":
+    /// `{last_n?, max_bytes?}` opens the context as the person's lane of the
+    /// peer, running in parallel with the peer's own session, each lane shown
+    /// the other's recent turns read-only. Only the peer's host connection
+    /// may set it. Fixed at creation: a re-open must restate it.
+    #[serde(default)]
+    share_history: Option<crate::peers::shared_history::ShareHistoryParams>,
 }
 
 fn host_peer_context_prelude(
@@ -15554,10 +15610,22 @@ fn host_peer_context_prelude(
 /// UPCR-2026-034 `peer/context/open` — open a bound request context of a
 /// host-owned app peer. Idempotent for an open context; a closed context id
 /// is never reopened (the host mints a new id per client generation).
+#[cfg(test)]
 fn raw_peer_context_open(
     state: &Arc<AppState>,
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    raw_peer_context_open_from(state, request, connection_profile_id, None)
+}
+
+/// [`raw_peer_context_open`] from connection `caller` (`None`: a caller
+/// with no connection, which may not set `share_history`).
+fn raw_peer_context_open_from(
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+    caller: Option<&WsConnection>,
 ) -> Result<Value, RpcError> {
     use crate::peers::app_binding::{
         PeerContextBinding, context_memory_namespace, context_session_key, read_context_binding,
@@ -15570,6 +15638,27 @@ fn raw_peer_context_open(
         return Err(host_peer_error(
             "peer_closed",
             format!("peer '{slug}' is closed"),
+        ));
+    }
+    let share_history = params
+        .share_history
+        .as_ref()
+        .map(|share| share.normalize().map_err(RpcError::invalid_params))
+        .transpose()?;
+    // Shared history makes the context the person's lane of the peer: only
+    // the connection that holds the peer's route (its host) may ask for it.
+    if share_history.is_some()
+        && !caller.is_some_and(|ws| {
+            !ws.is_external()
+                && crate::peers::host_tools::host_route_connection(&peers_root, &slug)
+                    == Some(ws.connection_id.0)
+        })
+    {
+        return Err(host_peer_error(
+            "share_history_host_only",
+            "only the connection that registered the peer's tools may open a context with \
+             share_history"
+                .to_owned(),
         ));
     }
     let namespace = crate::runtime::memory_namespace::validate_memory_namespace(
@@ -15656,6 +15745,15 @@ fn raw_peer_context_open(
                     format!("request context '{context_id}' is bound to another workspace"),
                 ));
             }
+            if existing.share_history != share_history {
+                return Err(host_peer_error(
+                    "peer_binding_mismatch",
+                    format!(
+                        "request context '{context_id}' was opened with other share_history \
+                         settings; open a new context id"
+                    ),
+                ));
+            }
             false
         }
         None => {
@@ -15668,6 +15766,7 @@ fn raw_peer_context_open(
                     cwd: requested_cwd.clone(),
                     memory_namespace: namespace.clone(),
                     closed: false,
+                    share_history,
                 },
             )
             .map_err(RpcError::internal_error)?;
@@ -15690,6 +15789,7 @@ fn raw_peer_context_open(
         "model": peer_effective_model_json(&lanes, lane.as_deref()),
         "profile_id": profile_id,
         "created": created,
+        "share_history": binding.share_history,
     }))
 }
 
@@ -17386,21 +17486,25 @@ fn write_peer_result_if_peer_session(
     tokens_consumed: u64,
     lifetime_turn: Option<&PeerLifetimeTurn>,
 ) {
-    // UPCR-2026-035: a request context writes no blackboard result, but its
-    // turn is charged to the owning peer's budget (#2500).
+    // UPCR-2026-035: a request context's turn is charged to the owning
+    // peer's budget (#2500). A plain context writes no blackboard result; a
+    // context with shared history (the person's lane, UPCR-2026-034) leaves
+    // its round on the peer's blackboard, labelled with its origin, so the
+    // system agent sees it through `peer_gather`.
     if session_id.topic().is_some_and(|topic| {
         topic.starts_with(crate::peers::app_binding::PEER_CONTEXT_TOPIC_PREFIX)
     }) {
         if let (Some(slug), Some(runtime)) = (
             crate::peers::budget_peer_slug(session_id),
             resolve_session_profile_runtime(state, session_id.profile_id()),
-        ) && let Err(error) = charge_peer_token_budget(
-            &runtime.data_dir.join("peers"),
-            slug,
-            &turn_id.0.to_string(),
-            tokens_consumed,
         ) {
-            tracing::warn!(slug, %error, "failed to charge a request context's turn to its peer's budget");
+            let peers_root = runtime.data_dir.join("peers");
+            if let Err(error) =
+                charge_peer_token_budget(&peers_root, slug, &turn_id.0.to_string(), tokens_consumed)
+            {
+                tracing::warn!(slug, %error, "failed to charge a request context's turn to its peer's budget");
+            }
+            write_sharing_context_round(&peers_root, session_id, turn_id, outcome, content);
         }
         return;
     }
@@ -17460,6 +17564,13 @@ fn write_peer_result_if_peer_session(
     // #435: versioned result files prevent silent overwrite when a persistent
     // peer runs multiple turns. Count existing result-*.md files to determine
     // the turn number so the caller doesn't need to track state.
+    //
+    // UPCR-2026-034: a host-owned peer's person lane (a context with shared
+    // history) publishes rounds here too, concurrently with this session:
+    // numbering, the versioned file, `result.md` and the `turns.txt` line are
+    // one critical section under the peer's publish lock.
+    let publish_lock = crate::peers::peer_round_publish_lock(&peer_dir);
+    let publish_guard = publish_lock.lock().unwrap_or_else(|p| p.into_inner());
     let turn_count = count_peer_result_versions(&peer_dir) + 1;
 
     // The shared peer conversation: a host-owned peer's turn names who spoke
@@ -17558,6 +17669,7 @@ fn write_peer_result_if_peer_session(
     if let Err(err) = peer_io::append_peer_line(&peer_dir, "turns.txt", &index_line) {
         tracing::warn!(?err, slug, turn_count, "failed to append to turns.txt");
     }
+    drop(publish_guard);
     // A person's turn is the app's own conversation, not work the system
     // agent handed off: it must not re-arm the fleet synthesis on its own.
     if origin.is_some_and(|origin| origin.kind == octos_core::ui_protocol::TurnOriginKind::Person) {
@@ -18233,12 +18345,16 @@ fn gathered_peer_result(slug: &str, result: &str) -> Option<GatheredPeerResult> 
         .ok()?;
     let round = lines.next()?.strip_prefix("turn: ")?.parse::<u32>().ok()?;
     // The writer appends bookkeeping keys after `turn:` — `turn_id:` is
-    // always present (#2627), and host-owned conversation turns add
-    // `origin:` (#2626). Unknown keys still fail, so foreign frontmatter
-    // is not mistaken for a writer receipt; the receipt's identity is the
-    // whole-body digest, so the bookkeeping values need no validation.
+    // always present (#2627), host-owned conversation turns add `origin:`
+    // (#2626), and a person context's round adds `context:` (UPCR-2026-034).
+    // Unknown keys still fail, so foreign frontmatter is not mistaken for a
+    // writer receipt; the receipt's identity is the whole-body digest, so
+    // the bookkeeping values need no validation.
     for line in lines {
-        if !line.starts_with("turn_id: ") && !line.starts_with("origin: ") {
+        if !line.starts_with("turn_id: ")
+            && !line.starts_with("origin: ")
+            && !line.starts_with("context: ")
+        {
             return None;
         }
     }
@@ -19052,6 +19168,104 @@ fn reset_peer_fleet_synthesis_if_cleared(peers_root: &Path, master: &str) {
     // fresh fleet marked-but-unsynthesized. The disk marker and the in-memory
     // guard are cleared together so the next legitimate fire is not suppressed.
     default_agent_orchestrator().clear_peer_fleet_synthesis_claim(&SessionKey(master.to_owned()));
+}
+
+/// UPCR-2026-034, the parallel person context with shared history: a turn
+/// of a context opened with `share_history` publishes a round on the owning
+/// peer's blackboard (`result-<n>.md`, `result.md`, `turns.txt`), with
+/// `origin:` (person unless the host said app) and `context: <id>` in its
+/// frontmatter, so the system agent sees the person's conversation through
+/// `peer_gather`. Numbered under the peer's publish lock (the peer's own
+/// session publishes concurrently). A person's round alone never fires a
+/// fleet synthesis. No-op for any other session.
+fn write_sharing_context_round(
+    peers_root: &Path,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+    outcome: TurnTerminalOutcome,
+    content: &str,
+) {
+    use octos_core::ui_protocol::TurnOriginKind;
+    let Some((slug, context_id)) = session_id
+        .topic()
+        .and_then(crate::peers::app_binding::parse_context_topic)
+    else {
+        return;
+    };
+    let sharing = crate::peers::app_binding::read_context_binding(peers_root, slug, context_id)
+        .is_some_and(|binding| binding.share_history.is_some());
+    if !sharing || !crate::peers::app_binding::peer_is_host_owned(peers_root, slug) {
+        return;
+    }
+    let Some(peer_dir) = staged_peer_dir(peers_root, slug) else {
+        return;
+    };
+    const PEER_RESULT_MAX_BYTES: usize = 256 * 1024;
+    let (body, truncated) = crate::peers::capped_utf8(content.to_owned(), PEER_RESULT_MAX_BYTES);
+    let truncated = if truncated { "\n\n[truncated]" } else { "" };
+    let updated_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let outcome_str = match outcome {
+        TurnTerminalOutcome::Completed => "completed",
+        TurnTerminalOutcome::Errored => "errored",
+        TurnTerminalOutcome::Interrupted => "interrupted",
+        TurnTerminalOutcome::RateLimited => "rate_limited",
+    };
+    let origin = crate::peers::turn_origin::turn_origin(session_id, turn_id)
+        .map(|origin| origin.kind)
+        .unwrap_or(TurnOriginKind::Person);
+    {
+        let publish_lock = crate::peers::peer_round_publish_lock(&peer_dir);
+        let _publish = publish_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let round = count_peer_result_versions(&peer_dir) + 1;
+        let text = format!(
+            "---\nslug: {slug}\noutcome: {outcome_str}\nupdated_unix: {updated_unix}\nturn: {round}\nturn_id: {}\norigin: {}\ncontext: {context_id}\n---\n\n{body}{truncated}\n",
+            turn_id.0,
+            origin.as_str(),
+        );
+        if let Err(err) =
+            peer_io::write_peer_file_atomic(&peer_dir, &format!("result-{round}.md"), &text)
+        {
+            tracing::warn!(
+                ?err,
+                slug,
+                round,
+                "failed to write a person context's round"
+            );
+            return;
+        }
+        // The peer's own hand-written final word keeps the latest pointer
+        // (#27f); the versioned copy above still records this round.
+        let peer_owns_result = peer_io::read_peer_file(
+            &peer_dir,
+            ".result-owner",
+            peer_io::PEER_FILE_READ_CAP_SMALL,
+        )
+        .map(|owner| octos_agent::result_md_owner_content_is_peer(&owner))
+        .unwrap_or(false);
+        if !peer_owns_result
+            && let Err(err) = peer_io::write_peer_file_atomic(&peer_dir, "result.md", &text)
+        {
+            tracing::warn!(
+                ?err,
+                slug,
+                round,
+                "failed to write a person context's result"
+            );
+        }
+        if let Err(err) = peer_io::append_peer_line(
+            &peer_dir,
+            "turns.txt",
+            &format!("{round} {outcome_str} {updated_unix}\n"),
+        ) {
+            tracing::warn!(?err, slug, round, "failed to append to turns.txt");
+        }
+    }
+    if origin == TurnOriginKind::Person {
+        absorb_person_round_into_fleet_marks(peers_root, &peer_dir, slug);
+    }
 }
 
 /// The shared peer conversation: a PERSON's turn on a host-owned app peer
@@ -20419,7 +20633,8 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_PEER_GATHER => raw_peer_gather(state, request, connection_profile_id),
         APPUI_METHOD_PEER_MODEL_SET => raw_peer_model_set(state, request, connection_profile_id),
         APPUI_METHOD_PEER_CONTEXT_OPEN => {
-            let result = raw_peer_context_open(state, request, connection_profile_id);
+            let result =
+                raw_peer_context_open_from(state, request, connection_profile_id, Some(ws));
             if let Ok(value) = &result {
                 invalidate_bound_topics(state, std::iter::once(value)).await;
             }
@@ -27451,6 +27666,11 @@ fn turn_origin_error(kind: &str, message: impl Into<String>) -> RpcError {
 ///   `system_agent` (`turn_origin_mismatch`), and only on the peer's own
 ///   session on its originator's base key (`turn_origin_not_allowed`
 ///   elsewhere, including request contexts and ordinary sessions).
+/// - A request context opened with `share_history` is the person's lane of
+///   the peer (UPCR-2026-034, the parallel person context): its turns are
+///   the person's (`person` when the host sets no origin), the host may say
+///   `person` or `app`, and `system_agent` is refused there
+///   (`turn_origin_mismatch`).
 fn resolve_peer_turn_origin(
     state: &AppState,
     ws: &WsConnection,
@@ -27465,6 +27685,11 @@ fn resolve_peer_turn_origin(
             "turn/start origin is accepted only on a host-owned app peer's own session",
         )
     };
+    if let Some(decided) =
+        resolve_sharing_context_turn_origin(state, ws, params, routed_profile_id)?
+    {
+        return Ok(Some(decided));
+    }
     let slug = params
         .session_id
         .topic()
@@ -27531,6 +27756,69 @@ fn resolve_peer_turn_origin(
         None
     };
     Ok(Some(PeerTurnOrigin { origin }))
+}
+
+/// The origin of a turn on a request context opened with `share_history`
+/// (the person's lane of a host-owned app peer); `None` for any other
+/// session, which [`resolve_peer_turn_origin`] then decides as before.
+fn resolve_sharing_context_turn_origin(
+    state: &AppState,
+    ws: &WsConnection,
+    params: &TurnStartParams,
+    routed_profile_id: Option<&str>,
+) -> Result<Option<PeerTurnOrigin>, RpcError> {
+    use crate::peers::app_binding::{
+        context_session_key, parse_context_topic, read_context_binding,
+    };
+    use octos_core::ui_protocol::{TurnOrigin, TurnOriginKind};
+    let Some((slug, context_id)) = params.session_id.topic().and_then(parse_context_topic) else {
+        return Ok(None);
+    };
+    if !peer_slug_is_safe(slug) {
+        return Ok(None);
+    }
+    let profile = params.session_id.profile_id().or(routed_profile_id);
+    let Ok((_, data_dir)) = resolve_profile_data_dir(state, profile) else {
+        return Ok(None);
+    };
+    let peers_root = data_dir.join("peers");
+    let sharing = crate::peers::app_binding::peer_is_host_owned(&peers_root, slug)
+        && context_session_key(&params.session_id, slug, context_id) == params.session_id
+        && crate::peers::host_tools::host_peer_session(&peers_root, slug)
+            .is_some_and(|peer| peer.base_key() == params.session_id.base_key())
+        && read_context_binding(&peers_root, slug, context_id)
+            .is_some_and(|binding| binding.share_history.is_some());
+    if !sharing {
+        return Ok(None);
+    }
+    let origin = match params.origin.as_ref() {
+        None => TurnOrigin {
+            kind: TurnOriginKind::Person,
+            label: None,
+        },
+        Some(requested) => {
+            if requested.kind == TurnOriginKind::SystemAgent {
+                return Err(turn_origin_error(
+                    "turn_origin_mismatch",
+                    "a context with shared history is the person's lane: the system agent's \
+                     input runs on the peer's own session",
+                ));
+            }
+            if ws.is_external()
+                || crate::peers::host_tools::host_route_connection(&peers_root, slug)
+                    != Some(ws.connection_id.0)
+            {
+                return Err(turn_origin_error(
+                    "turn_origin_host_only",
+                    "only the connection that registered the peer's tools may set a turn origin",
+                ));
+            }
+            crate::peers::turn_origin::sanitized(requested)
+        }
+    };
+    Ok(Some(PeerTurnOrigin {
+        origin: Some(origin),
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -37070,6 +37358,34 @@ pub(crate) fn peer_send_input_occurrence_id(
     format!("{calling_session}/{}/{tool_occurrence_id}", turn_id.0)
 }
 
+/// The read-only block of the other lane's recent turns for a turn on
+/// `session_id` (UPCR-2026-034, the parallel person context with shared
+/// history), or `None` when the session is not a lane of a sharing peer or
+/// the other lane has nothing to show. Each transcript is read under its
+/// persist lock, from where the runtime persists it.
+async fn shared_history_block_for_turn(
+    state: &AppState,
+    profile: &Arc<crate::runtime::ProfileRuntime>,
+    session_id: &SessionKey,
+) -> Option<String> {
+    let peers_root = profile.data_dir.join("peers");
+    let sessions_in_cwd = state.session_cache.sessions_in_cwd();
+    let transcript_root = |cwd: &Path| {
+        crate::runtime::session::resolve_sessions_root_from_hint(
+            profile,
+            Some(cwd),
+            sessions_in_cwd,
+        )
+    };
+    let (lane, rows, max_bytes) = crate::peers::shared_history::shared_history_for_turn(
+        &peers_root,
+        session_id,
+        &transcript_root,
+    )
+    .await?;
+    crate::peers::shared_history::render_block(lane, &rows, max_bytes)
+}
+
 /// UPCR-2026-035: replace the content of every `memory_update` context event
 /// in `history` (as rendered by the context manager) with "no memory".
 fn redact_memory_context_messages(history: &mut [Message]) {
@@ -39269,6 +39585,18 @@ async fn run_standalone_turn(
         &mut history,
         tail_context_events,
     );
+    // UPCR-2026-034, the parallel person context with shared history: the
+    // other lane's recent turns, read-only, on THIS turn's prompts only. The
+    // prompt bridge below adds it after the context manager projected each
+    // prompt, so it never reaches this session's transcript or context
+    // ledger. Only a turn with the app's context gets it.
+    let shared_history_block = if app_context_allowed {
+        shared_history_block_for_turn(&state, &session_runtime.profile, &session_id)
+            .await
+            .map(crate::peers::shared_history::block_message)
+    } else {
+        None
+    };
     // UPCR-2026-035: memory injected into the host's earlier turns lives in
     // the session's context history; a turn without app context must not
     // replay it.
@@ -39441,7 +39769,8 @@ async fn run_standalone_turn(
         voice_turn_hint,
     )
     .with_context_lifecycle_notify(context_lifecycle_notify)
-    .with_redacted_memory_events(!app_context_allowed);
+    .with_redacted_memory_events(!app_context_allowed)
+    .with_ephemeral_block(shared_history_block);
     // Only wire the provider when `--llm-compaction` is on; a present provider
     // is what flips the in-loop bridge to the LLM-summarization path.
     if session_compaction_llm_enabled(&session_id, &state) {

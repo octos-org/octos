@@ -51,6 +51,7 @@ use crate::contracts::UiProtocolContractStores;
 pub(crate) mod app_binding;
 pub(crate) mod host_tools;
 mod recovery;
+pub(crate) mod shared_history;
 pub(crate) mod turn_origin;
 pub(crate) use recovery::*;
 // task-evo-peer-turn-status — the typed lifetime projection lives in
@@ -4411,6 +4412,26 @@ pub(crate) fn peer_respond_resolve(
 /// inflate the derived version number (#1824).
 pub(crate) fn count_peer_result_versions(peer_dir: &std::path::Path) -> u32 {
     peer_io::peer_dir_count_prefixed(peer_dir, "result-", peer_io::PEER_DIR_SCAN_CAP) as u32
+}
+
+/// The lock a writer holds while it publishes one round of a staged peer
+/// (numbers `result-<n>.md`, writes it, `result.md` and the `turns.txt`
+/// line). A host-owned app peer's two lanes (its own session and a request
+/// context with shared history, UPCR-2026-034) finish turns concurrently;
+/// without it two writers could count the same `n` and one round would
+/// overwrite the other, or `turns.txt` and `result.md` could name rounds out
+/// of order. Keyed by the peer dir, process-wide (one kernel owns a peers
+/// root).
+pub(crate) fn peer_round_publish_lock(peer_dir: &Path) -> Arc<std::sync::Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<std::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(peer_dir.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 /// Count how many `brief-<n>.md` instruction files exist in the peer directory

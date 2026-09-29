@@ -10,7 +10,9 @@
   `peer/model/set`, `peer/context/open`, `peer/context/close`; session-level
   enforcement of app bindings and app/account memory namespaces; an
   additive `turn/start` `origin` on a host-owned app peer's own session (the
-  shared peer conversation, amended 2026-09-28)
+  shared peer conversation, amended 2026-09-28); an additive
+  `peer/context/open` `share_history` (the parallel person context with
+  shared history, amended 2026-09-29)
 - Origin: Rinx ADR 0007, "Host-owned Octos app peers and Rinx deployment
   modes" (OctoSense shells host apps such as Rinx on one shared kernel)
 
@@ -87,12 +89,14 @@ profile's lanes and all credentials are untouched.
 
 A **request context** belongs to a host-owned app peer: a separate
 transcript, a workspace inside the peer's, and a child memory namespace. It
-is not an agent: it cannot hand off peers, has no blackboard entry and runs
-on its peer's model lane.
+is not an agent: it cannot hand off peers, has no blackboard entry (unless
+it shares history, below) and runs on its peer's model lane.
 
-`peer/context/open {session_id, peer, context_id, host_token, cwd?, profile_id?}` →
+`peer/context/open {session_id, peer, context_id, host_token, cwd?, profile_id?, share_history?}` →
 `{session_id, topic, slug, context_id, cwd, memory_namespace, model,
-profile_id, created}`. Originator plus host token; `context_id` is
+profile_id, created, share_history}`. `share_history` makes the context the
+person's lane of the peer (see "Parallel person context with shared
+history" below); without it a context is exactly as described here. Originator plus host token; `context_id` is
 `[a-z0-9][a-z0-9-]{0,63}`. The session key is derived by the kernel:
 `<originator base key>#peerctx-<slug>.<context_id>`. It is an address, not a
 secret. `cwd` defaults to
@@ -112,7 +116,8 @@ workspace stay on disk; the host owns retention. A closed id is never
 reopened (`peer_context_closed`); hosts mint a new id per client generation.
 
 Other kinds: `peer_not_found`, `peer_not_host_bound`,
-`peer_context_not_found`, `peer_context_namespace_too_long`.
+`peer_context_not_found`, `peer_context_namespace_too_long`,
+`share_history_host_only`, `peer_binding_mismatch`.
 
 ### Session enforcement
 
@@ -167,6 +172,12 @@ token) cannot answer them either: `approval/respond` and
 `host_owned_peer_answer_denied` (UPCR-2026-036).
 
 ### The shared peer conversation (turn origin)
+
+*Superseded for person chat on 2026-09-29 by "Parallel person context with
+shared history" below: hosts now run the person's chat in a sharing request
+context in parallel, instead of queueing person turns and `peer/input`s on
+the peer's session. The `origin` field, its markers and every rule below
+still hold for turns on the peer's own session.*
 
 A host-owned app peer has ONE conversation, its own session
 `<originator base>#peer-<slug>`, and both the person and the owning system
@@ -249,6 +260,95 @@ for the rest of this UPCR; an older server ignores an unknown `origin`, so a
 host that needs labels must check the result (the kernel's marker in the
 echoed user row, or `origin:` in `result.md`).
 
+### Parallel person context with shared history
+
+Amended 2026-09-29. It replaces the single, queued conversation above for
+the person's chat: the person and the system agent each get their own
+session of the peer, the two run **in parallel**, and each sees the other's
+recent turns **read-only**. Two writers on one transcript are rejected: they
+break tool-call pairing and compaction.
+
+- **The two lanes.** The *system agent lane* is the peer's own session
+  `<originator base>#peer-<slug>`, driven by `peer/input` as before. The
+  *person lane* is a request context `…#peerctx-<slug>.<id>` the host opens
+  with `share_history`. Turn admission is per session, so a turn in one lane
+  never waits for (or is refused `turn_in_progress` by) the other; each lane
+  still runs one turn at a time.
+- **Opening.** `peer/context/open` takes an optional
+  `share_history: {last_n?: u32, max_bytes?: u32}`. `last_n` defaults to
+  20 and is clamped to 50 (`0` is refused); `max_bytes` defaults to 16384
+  and is clamped to 1024..=65536. Only the connection that holds the peer's
+  route (the one that registered its tools with `peer/tools/register`) may
+  set it: any other connection, an external client, or a call with no
+  connection is refused with `share_history_host_only`. The context must be
+  the peer's own (the originator plus host token rules above). The settings
+  are recorded in the context's binding and fixed at creation: re-opening
+  the id must restate the same (normalized) settings, or it is refused with
+  `peer_binding_mismatch` (open a new id). The result echoes the normalized
+  `share_history` (`null` for a plain context).
+- **The block.** At the start of each turn in one lane, the kernel reads the
+  other lane's transcript under that session's persist lock and shows the
+  model its last `last_n` user and assistant TEXT rows as one read-only
+  block, placed just before the turn's own prompt:
+
+  ```
+  <shared_history lane="system_agent" read_only="true">
+  Recent turns in the system agent's conversation with this app (read-only: …):
+  - 2026-09-29T12:03:00Z [from the system agent] SUMMARIZE_TODAY
+  - 2026-09-29T12:03:05Z [the app agent] Three new stories …
+  </shared_history>
+  ```
+
+  (`lane="person"` and "Recent turns in the person's conversation with this
+  app" the other way.) Tool results, system rows and assistant rows that
+  only call tools are dropped, and an assistant row's tool calls are never
+  shown. Every row names its speaker: a user row keeps the kernel's origin
+  marker (`[from the person: Ada]`, `[from the system agent]`,
+  `[from the app]`), an unlabelled user row reads `[from the host]`, an
+  assistant row reads `[the app agent]`. A row longer than 2 KiB is cut; the
+  block keeps the newest rows that fit in `max_bytes`. The block is added to
+  the outgoing prompt after the context manager projected it, on every model
+  call of the turn, and is **never written** into the reader's transcript or
+  context ledger. It is shown only on turns that get the app's context (the
+  host's turns), never on a foreign or kernel-internal turn.
+- **Several sharing contexts.** A sharing context sees only the peer
+  session, never its sibling contexts. The peer session sees every OPEN
+  sharing context of the peer: each context's last rows, merged by time, the
+  newest `last_n` overall, in one block bounded by one `max_bytes`, where
+  `last_n` and `max_bytes` are the largest any of those contexts asked for.
+  With more than one, each row says which conversation it is from
+  (`(conversation <id>)`). A closed context is not shown.
+- **Speaker.** A sharing context is the person's lane: a turn there with no
+  `origin` is labelled `person` by the kernel (`[from the person] …` in its
+  own transcript). The host may set `origin: person` (with a label) or
+  `app`, from its route connection only (`turn_origin_host_only`);
+  `system_agent` is refused there (`turn_origin_mismatch`): the system
+  agent's input runs on the peer's own session. A plain context still
+  refuses `origin` (`turn_origin_not_allowed`). A person's turn in the
+  context is attended and its questions do not wake the system agent, as on
+  the peer's session.
+- **The system agent's view.** Each turn of a sharing context publishes a
+  round on the peer's blackboard like a peer-session turn: `result-<n>.md`,
+  `result.md` (unless the peer owns it, #27f) and a `turns.txt` line, with
+  `origin: person | app` and `context: <id>` after `turn_id` in the
+  frontmatter, so `peer_gather` reads it (its receipt parser accepts the
+  `context:` key). A person's round alone never fires a fleet synthesis
+  (the rule above). Plain contexts still write no blackboard entry.
+- **Round numbering.** With two lanes finishing turns concurrently, the
+  kernel publishes a round (numbering `result-<n>.md`, writing it,
+  `result.md` and the `turns.txt` line) under a per-peer publish lock, so
+  two rounds never take the same `n` and `turns.txt` stays in order.
+- **What the lanes share, and do not.** Each lane has its own transcript,
+  and the context keeps its own workspace `<peer cwd>/contexts/<id>` and
+  child memory namespace. Both lanes share the peer's model lane, host tool
+  route, token budget (checked at turn start, so parallel turns may overshoot
+  it slightly) and unknown-outcome marks. File edits in a shared folder are
+  not locked across lanes; each lane edits its own folder.
+- **Hosts.** Open a sharing context per client generation (a closed id is
+  never reopened) and send the person's turns there; keep `peer/input` on
+  the peer's session with its own queue. Contexts without `share_history`
+  (e.g. Rinx mini apps) are unchanged.
+
 ## Non-goals and conservative defaults
 
 - **Permission prompts.** Approvals keep their existing policy: an app
@@ -313,3 +413,20 @@ echoed user row, or `origin:` in `result.md`).
   `should_not_rearm_the_fleet_synthesis_for_a_persons_round_alone`,
   `should_run_a_foreground_tool_in_the_persons_turn_on_the_peer_session`,
   and the `peers::turn_origin` unit tests
+- Parallel person context with shared history (octos-cli
+  `peer_host_tools_tests`):
+  `should_show_each_lane_the_others_recent_turns_without_persisting_them`
+  (the context's turn sees the peer session's rows and the reverse; tool
+  rows are not shown; no file holds the block; the context's round is on
+  the blackboard with `origin: person` and `context:`, and `peer_gather`'s
+  parser accepts it),
+  `should_run_the_person_lane_while_the_system_agent_lane_is_busy` (no
+  `turn_in_progress` between the lanes; person rounds are covered and queue
+  no synthesis; rounds numbered in order),
+  `should_let_only_the_host_open_a_sharing_context_and_label_its_turns`
+  (`share_history_host_only` for no connection, another connection and an
+  external client; the caps; `peer_binding_mismatch` on a changed re-open;
+  origin rules; a plain context stays unchanged),
+  `should_number_concurrent_rounds_of_both_lanes_without_collisions`, and
+  the `peers::shared_history` unit tests (defaults and caps, tool rows
+  dropped, speakers, merge, the byte budget)

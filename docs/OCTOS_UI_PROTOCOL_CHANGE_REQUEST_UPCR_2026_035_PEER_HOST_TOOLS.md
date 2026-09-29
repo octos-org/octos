@@ -271,6 +271,9 @@ transcript carry the reply).
   queues the input (keeping its `turn_id`) and starts it after the running
   turn ends, or refuses it with `peer/input/reject` reason `busy` when its
   queue is full.
+  Since 2026-09-29 hosts run the person's chat in parallel, in a request
+  context opened with `share_history` (UPCR-2026-034, "Parallel person
+  context with shared history"), so this queue holds only `peer/input`s.
 
 Peers that are not host-owned keep today's behaviour (the gateway inbox or
 the serve continuation queue).

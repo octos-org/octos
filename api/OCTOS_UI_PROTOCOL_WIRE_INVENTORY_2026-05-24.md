@@ -42,7 +42,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `session/hydrate` | shipped, UPCR-2026-009 |
 | `thread/graph/get` | shipped, UPCR-2026-010 |
 | `turn/state/get` | shipped, UPCR-2026-011; `running` field UPCR-2026-031 |
-| `turn/start` | shipped base method; optional `origin` on a host-owned app peer's session (UPCR-2026-034, shared peer conversation) |
+| `turn/start` | shipped base method; optional `origin` on a host-owned app peer's session or sharing request context (UPCR-2026-034, shared peer conversation; parallel person context) |
 | `turn/interrupt` | shipped base method, UPCR-2026-008 typed fields |
 | `approval/respond` | shipped base method, UPCR-2026-001 optional fields |
 | `approval/scopes/list` | shipped, UPCR-2026-001 |
@@ -136,7 +136,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `peer/prepare` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `peer/gather` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `peer/model/set` | shipped; UPCR-2026-034 host-owned app peers |
-| `peer/context/open` | shipped; UPCR-2026-034 host-owned app peers |
+| `peer/context/open` | shipped; UPCR-2026-034 host-owned app peers; optional `share_history` (parallel person context with shared history, amended 2026-09-29) |
 | `peer/context/close` | shipped; UPCR-2026-034 host-owned app peers |
 | `peer/tools/register` | shipped; UPCR-2026-035 host-registered peer tools |
 | `peer/tool/result` | shipped; UPCR-2026-035 host-registered peer tools |

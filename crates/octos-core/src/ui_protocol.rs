@@ -2139,12 +2139,13 @@ pub struct TurnStartParams {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub live_video: bool,
     /// Who is speaking in this turn of a host-owned app peer's shared
-    /// conversation (`<originator base>#peer-<slug>`). Only the peer's host
-    /// connection may set it, and never to `system_agent`: the kernel labels
-    /// a turn started for its own `peer/input` itself. The kernel records it
-    /// in the transcript as a stable prefix of the prompt
-    /// (`[from the person] …`). Refused on every other session. Omitted on
-    /// the wire when absent.
+    /// conversation (`<originator base>#peer-<slug>`), or of a request
+    /// context opened with `share_history` (the person's lane, where
+    /// `person` is the default). Only the peer's host connection may set
+    /// it, and never to `system_agent`: the kernel labels a turn started for
+    /// its own `peer/input` itself. The kernel records it in the transcript
+    /// as a stable prefix of the prompt (`[from the person] …`). Refused on
+    /// every other session. Omitted on the wire when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<TurnOrigin>,
 }

@@ -3181,6 +3181,29 @@ fn persist_lock_for(key: &SessionKey) -> std::sync::Arc<tokio::sync::Mutex<()>> 
         .clone()
 }
 
+/// Read `key`'s persisted messages READ-ONLY, under its per-key persist lock
+/// (see [`persist_lock_for`]), so a concurrent writer of that session is never
+/// observed half-way through an append or a rewrite. Same folding as
+/// [`SessionManager::load`] (both layouts merged, rolled-back turns absent,
+/// budgeted window) and no side effects: no directory is created, nothing is
+/// migrated, and no cache is populated. `None` when the session has no file.
+///
+/// For a reader that shows another session's recent turns to a model
+/// without adopting them into its own transcript (UPCR-2026-034, the
+/// parallel person context with shared history).
+pub async fn load_session_messages_locked(
+    data_dir: &Path,
+    key: &SessionKey,
+) -> Option<Vec<Message>> {
+    let lock = persist_lock_for(key);
+    let _guard = lock.lock().await;
+    let reader = SessionManager {
+        sessions_dir: data_dir.join("sessions"),
+        cache: LruCache::new(NonZeroUsize::new(1).expect("1 > 0")),
+    };
+    reader.load(key).await.map(|session| session.messages)
+}
+
 /// Persist a single message to the canonical per-user `<topic>.jsonl` file
 /// the `SessionActor` and `ApiChannel` both target. Returns the committed
 /// per-session sequence number.

@@ -553,7 +553,15 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   (`<originator base>#peerctx-<slug>.<context_id>`), `cwd` (inside the
   peer's workspace, default `contexts/<context_id>`), the child
   `memory_namespace` (`<peer ns>/ctx-<context_id>`), the peer's `model` and
-  `created`; idempotent while open. Close marks the binding closed and
+  `created`; idempotent while open. Optional `share_history {last_n?
+  (default 20, max 50), max_bytes? (default 16384, 1024..=65536)}`, from
+  the peer's host connection only (`share_history_host_only`), opens the
+  person's lane of the peer (amended 2026-09-29): it runs in parallel with
+  the peer's own session, each lane's turns are shown the other's recent
+  user/assistant text rows as a read-only prompt block that is never
+  persisted, its turns are labelled `person` by default, and each of its
+  turns publishes a round on the peer's blackboard (`origin:`, `context:`).
+  Fixed at creation (`peer_binding_mismatch` on a changed re-open). Close marks the binding closed and
   interrupts the context's in-flight turn; a closed or never-opened
   context session is refused at `session/open` and at every `turn/start`
   (`session_binding_closed`), and its id is never reopened. Typed
@@ -803,8 +811,10 @@ registered a host-owned app peer's tools with `peer/tools/register`):
   the same connection), or refuses it with `peer/input/reject`. Never run as
   a kernel-internal turn; with no host connected `peer_send_input` fails and
   nothing is queued. Ephemeral. The kernel labels that turn `system_agent`
-  (a different `turn/start` `origin` is refused); the person's own turns
-  share the same session (`origin: person`, UPCR-2026-034).
+  (a different `turn/start` `origin` is refused). The person's own turns
+  run in parallel in a request context opened with `share_history`
+  (UPCR-2026-034, amended 2026-09-29), each lane shown the other's recent
+  turns read-only.
 
 Background activity — the human sink (#2019, gate `event.background_activity.v1`):
 
@@ -969,9 +979,11 @@ Optional params (among others):
 - `origin` `{kind: "person" | "system_agent" | "app", label?}` — who speaks
   in this turn of a host-owned app peer's shared conversation
   (UPCR-2026-034, amended 2026-09-28). Only on the peer's own session
-  `<originator base>#peer-<slug>`, only from the peer's host connection, and
-  never `system_agent` (the kernel labels a turn started from its
-  `peer/input` itself). The kernel prefixes the prompt with a stable marker
+  `<originator base>#peer-<slug>` or on a request context opened with
+  `share_history` (amended 2026-09-29: there `person` is the default and
+  only `person` or `app` are accepted), only from the peer's host
+  connection, and never `system_agent` (the kernel labels a turn started
+  from its `peer/input` itself). The kernel prefixes the prompt with a stable marker
   (`[from the person]`, `[from the system agent: …]`) and records
   `origin:` in the peer's `result.md`. Typed `data.kind`:
   `turn_origin_not_allowed`, `turn_origin_host_only`,

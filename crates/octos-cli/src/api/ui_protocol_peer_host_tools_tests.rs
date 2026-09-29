@@ -5384,3 +5384,552 @@ async fn should_run_a_foreground_tool_in_the_persons_turn_on_the_peer_session() 
     crate::peers::host_tools::set_host_route(&peers_root(&fx), "news", 0, Arc::new(|_, _| false));
     assert_eq!(host.await.unwrap().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// UPCR-2026-034, the parallel person context with shared history: the
+// person's lane (a request context opened with `share_history`) runs in
+// parallel with the peer's own session (the system agent's lane), and each
+// lane's turns see the other's recent rows, read-only.
+// ---------------------------------------------------------------------------
+
+/// Open request context `context_id` of the News peer from `caller`, with
+/// `extra` params (e.g. `share_history`).
+fn open_context_from(
+    e: &E2e,
+    caller: Option<&WsConnection>,
+    context_id: &str,
+    extra: Value,
+) -> Result<Value, RpcError> {
+    let mut params = json!({"session_id": e.system, "peer": "news", "context_id": context_id,
+                            "host_token": e.token});
+    for (key, value) in extra.as_object().unwrap() {
+        params[key] = value.clone();
+    }
+    raw_peer_context_open_from(
+        &e.state,
+        &rpc(APPUI_METHOD_PEER_CONTEXT_OPEN, params),
+        None,
+        caller,
+    )
+}
+
+fn sharing_context(e: &E2e, context_id: &str) -> SessionKey {
+    let opened = open_context_from(
+        e,
+        Some(&e.ws),
+        context_id,
+        json!({"share_history": {"last_n": 10}}),
+    )
+    .expect("the host opens a sharing context");
+    assert_eq!(
+        opened["share_history"],
+        json!({"last_n": 10, "max_bytes": crate::peers::shared_history::SHARE_HISTORY_DEFAULT_MAX_BYTES})
+    );
+    serde_json::from_value(opened["session_id"].clone()).unwrap()
+}
+
+/// Every file under `root` whose bytes contain `needle`.
+fn files_containing(root: &Path, needle: &str) -> Vec<PathBuf> {
+    let mut hits = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if std::fs::read(&path)
+                .is_ok_and(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
+            {
+                hits.push(path);
+            }
+        }
+    }
+    hits
+}
+
+/// The system agent's `peer/input` turn id for `text`.
+async fn peer_input_turn_id(e: &E2e, frames: &Frames, text: &str, occurrence: &str) -> TurnId {
+    deliver_peer_send_input(
+        "dev",
+        &e.data_dir.join("peers"),
+        &e.system.0,
+        &TurnId::new(),
+        send_input_request(text, occurrence),
+    )
+    .expect("delivered to the host");
+    let input = wait_frame(frames, |f| {
+        f["method"] == "peer/input" && f["params"]["text"].as_str() == Some(text)
+    })
+    .await;
+    serde_json::from_value(input["params"]["turn_id"].clone()).unwrap()
+}
+
+/// Start a turn, retrying while the session is still finishing its last one.
+#[allow(clippy::too_many_arguments)]
+async fn start_turn_when_free(
+    e: &E2e,
+    active: &SharedActiveTurns,
+    request_id: &str,
+    session: &SessionKey,
+    turn_id: &TurnId,
+    text: &str,
+    origin: Option<octos_core::ui_protocol::TurnOrigin>,
+) {
+    for attempt in 0..250 {
+        if start_turn(
+            e,
+            &e.ws,
+            active,
+            &format!("{request_id}-{attempt}"),
+            session,
+            turn_id,
+            text,
+            origin.clone(),
+        )
+        .await
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("turn {request_id} was never admitted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_show_each_lane_the_others_recent_turns_without_persisting_them() {
+    let llm = Arc::new(RecordingLlm::default());
+    let mut e = e2e_fixture(llm.clone(), json!({ "tools": [] })).await;
+    let frames = collect_frames(e.rx.take().unwrap());
+    let peer = shared_peer(&e);
+    let context = sharing_context(&e, "ui-1");
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+
+    // The system agent's lane: a peer/input turn on the peer's own session.
+    let input_turn = peer_input_turn_id(&e, &frames, "SUMMARIZE_TODAY", "call_1").await;
+    start_turn_when_free(
+        &e,
+        &active,
+        "s1",
+        &peer,
+        &input_turn,
+        "SUMMARIZE_TODAY",
+        None,
+    )
+    .await;
+    let result = wait_result(&e, &input_turn).await;
+    assert!(result.contains("\norigin: system_agent\n"), "{result}");
+
+    // The person's lane: no origin needed, the kernel labels it the person's,
+    // and the model sees the system agent's conversation read-only.
+    let person_turn = TurnId::new();
+    start_turn_when_free(
+        &e,
+        &active,
+        "p1",
+        &context,
+        &person_turn,
+        "what's new?",
+        None,
+    )
+    .await;
+    let result = wait_result(&e, &person_turn).await;
+    assert!(
+        result.contains("\norigin: person\ncontext: ui-1\n"),
+        "{result}"
+    );
+    assert!(
+        gathered_peer_result("news", &result).is_some(),
+        "peer_gather accepts the person context's round: {result}"
+    );
+    let request = llm.requests.lock().unwrap()[1].clone();
+    assert!(
+        request.contains("<shared_history lane=\"system_agent\" read_only=\"true\">"),
+        "{request}"
+    );
+    assert!(
+        request.contains("Recent turns in the system agent's conversation with this app"),
+        "{request}"
+    );
+    assert!(
+        request.contains("[from the system agent] SUMMARIZE_TODAY"),
+        "{request}"
+    );
+    assert!(request.contains("[the app agent] ok"), "{request}");
+    assert!(
+        request.contains("[from the person] what's new?"),
+        "{request}"
+    );
+
+    // The reverse: the system agent's next turn sees the person's lane.
+    let second_input = peer_input_turn_id(&e, &frames, "CHECK_MAIL", "call_2").await;
+    start_turn_when_free(&e, &active, "s2", &peer, &second_input, "CHECK_MAIL", None).await;
+    wait_result(&e, &second_input).await;
+    let request = llm.requests.lock().unwrap()[2].clone();
+    assert!(
+        request.contains("<shared_history lane=\"person\" read_only=\"true\">"),
+        "{request}"
+    );
+    assert!(
+        request.contains("Recent turns in the person's conversation with this app"),
+        "{request}"
+    );
+    assert!(
+        request.contains("[from the person] what's new?"),
+        "{request}"
+    );
+    // Its own lane's rows come from its own transcript, not the block.
+    assert_eq!(
+        request.matches("SUMMARIZE_TODAY").count(),
+        1,
+        "the peer's own row is not repeated in the block: {request}"
+    );
+
+    // The block rides on the prompt only: neither lane's transcript nor
+    // context ledger (nor any other file) holds it.
+    let root = e.data_dir.parent().unwrap().to_path_buf();
+    assert_eq!(
+        files_containing(&root, "<shared_history"),
+        Vec::<PathBuf>::new()
+    );
+    // Each lane keeps its own transcript.
+    let ctx_rows = files_containing(&root, "[from the person] what's new?");
+    assert!(!ctx_rows.is_empty());
+    assert!(
+        files_containing(&root, "CHECK_MAIL")
+            .iter()
+            .all(|path| !ctx_rows.contains(path)
+                || path.extension().is_none_or(|ext| ext != "jsonl")),
+        "the system agent's rows are not in the person's transcript"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_run_the_person_lane_while_the_system_agent_lane_is_busy() {
+    let llm = Arc::new(GatedLlm::default());
+    let mut e = e2e_fixture(llm.clone(), json!({ "tools": [] })).await;
+    let frames = collect_frames(e.rx.take().unwrap());
+    let peer = shared_peer(&e);
+    let context = sharing_context(&e, "ui-1");
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+
+    // The system agent's turn holds the model.
+    let input_turn = peer_input_turn_id(&e, &frames, "SUMMARIZE_TODAY", "call_1").await;
+    assert!(
+        start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "s1",
+            &peer,
+            &input_turn,
+            "SUMMARIZE_TODAY",
+            None
+        )
+        .await
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), llm.entered.notified())
+        .await
+        .expect("the system agent's turn reached the model");
+
+    // The person's turn is admitted at once (no turn_in_progress) and ends
+    // while the system agent's turn is still running.
+    let person_turn = TurnId::new();
+    assert!(
+        start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "p1",
+            &context,
+            &person_turn,
+            "hello",
+            None
+        )
+        .await,
+        "the person's lane is not blocked by the system agent's"
+    );
+    let result = wait_result(&e, &person_turn).await;
+    assert!(result.contains("\nturn: 1\n"), "{result}");
+    assert!(
+        active
+            .lock()
+            .await
+            .get(&peer)
+            .is_some_and(|turn| turn.turn_id == input_turn),
+        "the system agent's turn is still in flight"
+    );
+    // And a second person turn only waits for the first person turn.
+    let next_person = TurnId::new();
+    start_turn_when_free(&e, &active, "p2", &context, &next_person, "more", None).await;
+    wait_result(&e, &next_person).await;
+    // The person's rounds alone queue no synthesis on the system agent: they
+    // are recorded as covered.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(matches!(
+        read_peer_fleet_synthesis_marks(&e.data_dir.join("peers"), &e.system.0),
+        FleetSynthesisMarks::Rounds(ref rounds) if rounds.get("news") == Some(&2)
+    ));
+    assert_eq!(
+        crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+            .pending_continuation_count_for_session_for_test(&e.system, "dev"),
+        0,
+        "no synthesis turn queued on the system agent"
+    );
+
+    llm.release.notify_one();
+    let result = wait_result(&e, &input_turn).await;
+    assert!(result.contains("\nturn: 3\n"), "{result}");
+    assert!(result.contains("\norigin: system_agent\n"), "{result}");
+    let dir = e.data_dir.join("peers/news");
+    // (`turns.txt` is appended just after `result.md`.)
+    let mut turns = String::new();
+    for _ in 0..250 {
+        turns = std::fs::read_to_string(dir.join("turns.txt")).unwrap();
+        if turns.lines().count() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(turns.lines().count(), 3, "{turns}");
+    for (round, turn) in [(1, &person_turn), (2, &next_person), (3, &input_turn)] {
+        let body = std::fs::read_to_string(dir.join(format!("result-{round}.md"))).unwrap();
+        assert!(body.contains(&format!("turn_id: {}", turn.0)), "{body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_let_only_the_host_open_a_sharing_context_and_label_its_turns() {
+    use octos_core::ui_protocol::TurnOriginKind;
+    let llm = Arc::new(RecordingLlm::default());
+    let mut e = e2e_fixture(llm.clone(), json!({ "tools": [] })).await;
+    let host_frames = collect_frames(e.rx.take().unwrap());
+    let share = json!({"share_history": {}});
+    let kind = |result: Result<Value, RpcError>| result.unwrap_err().data.unwrap()["kind"].clone();
+
+    // No connection, another connection of the profile, an external client.
+    assert_eq!(
+        kind(open_context_from(&e, None, "ui-1", share.clone())),
+        "share_history_host_only"
+    );
+    let (foreign, foreign_rx) = ws_connection_for_test(64);
+    let foreign_frames = collect_frames(foreign_rx);
+    assert_eq!(
+        kind(open_context_from(&e, Some(&foreign), "ui-1", share.clone())),
+        "share_history_host_only"
+    );
+    let (external, _external_rx) = external_ws(64);
+    assert_eq!(
+        kind(open_context_from(
+            &e,
+            Some(&external),
+            "ui-1",
+            share.clone()
+        )),
+        "share_history_host_only"
+    );
+    // Bad settings.
+    assert!(
+        open_context_from(
+            &e,
+            Some(&e.ws),
+            "ui-1",
+            json!({"share_history": {"last_n": 0}})
+        )
+        .is_err()
+    );
+    assert!(
+        open_context_from(
+            &e,
+            Some(&e.ws),
+            "ui-1",
+            json!({"share_history": {"all": true}})
+        )
+        .is_err()
+    );
+    // The caps.
+    let capped = open_context_from(
+        &e,
+        Some(&e.ws),
+        "ui-1",
+        json!({"share_history": {"last_n": 500, "max_bytes": 10_000_000}}),
+    )
+    .unwrap();
+    assert_eq!(
+        capped["share_history"],
+        json!({"last_n": 50, "max_bytes": 65536})
+    );
+    // Fixed at creation: a re-open restates it.
+    assert_eq!(
+        kind(open_context_from(&e, Some(&e.ws), "ui-1", json!({}))),
+        "peer_binding_mismatch"
+    );
+    let reopened = open_context_from(
+        &e,
+        Some(&e.ws),
+        "ui-1",
+        json!({"share_history": {"last_n": 500, "max_bytes": 10_000_000}}),
+    )
+    .unwrap();
+    assert_eq!(reopened["created"], false);
+    // A plain context stays as it was: no sharing, no origin.
+    let plain = open_context_from(&e, None, "mini-a", json!({})).unwrap();
+    assert_eq!(plain["share_history"], Value::Null);
+
+    let context: SessionKey = serde_json::from_value(capped["session_id"].clone()).unwrap();
+    let plain: SessionKey = serde_json::from_value(plain["session_id"].clone()).unwrap();
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let origin_of = |kind, label| Some(origin(kind, label));
+    // Never the system agent's lane...
+    assert!(
+        !start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "o1",
+            &context,
+            &TurnId::new(),
+            "hi",
+            origin_of(TurnOriginKind::SystemAgent, None)
+        )
+        .await
+    );
+    assert_eq!(
+        error_kind_of(&host_frames, "o1").await,
+        "turn_origin_mismatch"
+    );
+    // ...an origin only from the host...
+    assert!(
+        !start_turn(
+            &e,
+            &foreign,
+            &active,
+            "o2",
+            &context,
+            &TurnId::new(),
+            "hi",
+            origin_of(TurnOriginKind::Person, None)
+        )
+        .await
+    );
+    assert_eq!(
+        error_kind_of(&foreign_frames, "o2").await,
+        "turn_origin_host_only"
+    );
+    // ...and none on a plain context.
+    assert!(
+        !start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "o3",
+            &plain,
+            &TurnId::new(),
+            "hi",
+            origin_of(TurnOriginKind::Person, None)
+        )
+        .await
+    );
+    assert_eq!(
+        error_kind_of(&host_frames, "o3").await,
+        "turn_origin_not_allowed"
+    );
+    // The host may name the person, or say the app speaks.
+    let app_turn = TurnId::new();
+    start_turn_when_free(
+        &e,
+        &active,
+        "o4",
+        &context,
+        &app_turn,
+        "refresh",
+        origin_of(TurnOriginKind::Person, Some("Ada")),
+    )
+    .await;
+    let result = wait_result(&e, &app_turn).await;
+    assert!(result.contains("\norigin: person\n"), "{result}");
+    let request = llm.requests.lock().unwrap()[0].clone();
+    assert!(
+        request.contains("[from the person: Ada] refresh"),
+        "{request}"
+    );
+    // The plain context's turn writes no blackboard round.
+    let plain_turn = TurnId::new();
+    start_turn_when_free(&e, &active, "o5", &plain, &plain_turn, "mini", None).await;
+    for _ in 0..100 {
+        if llm.requests.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let request = llm.requests.lock().unwrap()[1].clone();
+    assert!(!request.contains("<shared_history"), "{request}");
+    assert!(
+        files_containing(&e.data_dir.join("peers/news"), &plain_turn.0.to_string()).is_empty(),
+        "a plain context leaves no round"
+    );
+}
+
+#[tokio::test]
+async fn should_number_concurrent_rounds_of_both_lanes_without_collisions() {
+    use crate::peers::app_binding::{PeerContextBinding, write_context_binding};
+    let fx = fixture().await;
+    prepare_news(&fx).await;
+    let peers = peers_root(&fx);
+    write_context_binding(
+        &peers,
+        "news",
+        "ui-1",
+        &PeerContextBinding {
+            version: 1,
+            cwd: fx.apps.join("news/contexts/ui-1"),
+            memory_namespace: "app/news/acct-1/ctx-ui-1".into(),
+            closed: false,
+            share_history: Some(crate::peers::shared_history::ShareHistory {
+                last_n: 20,
+                max_bytes: 16 * 1024,
+            }),
+        },
+    )
+    .unwrap();
+    let context = crate::peers::app_binding::context_session_key(&fx.system, "news", "ui-1");
+    let turns: Vec<TurnId> = (0..16).map(|_| TurnId::new()).collect();
+    std::thread::scope(|scope| {
+        for turn in &turns {
+            let (peers, context) = (&peers, &context);
+            scope.spawn(move || {
+                write_sharing_context_round(
+                    peers,
+                    context,
+                    turn,
+                    TurnTerminalOutcome::Completed,
+                    "hi",
+                )
+            });
+        }
+    });
+    let dir = peers.join("news");
+    let mut seen = std::collections::HashSet::new();
+    for round in 1..=16 {
+        let body = std::fs::read_to_string(dir.join(format!("result-{round}.md"))).unwrap();
+        assert!(body.contains(&format!("\nturn: {round}\n")), "{body}");
+        let turn = body
+            .lines()
+            .find_map(|line| line.strip_prefix("turn_id: "))
+            .unwrap()
+            .to_owned();
+        assert!(seen.insert(turn), "round {round} reused a turn");
+    }
+    assert!(!dir.join("result-17.md").exists());
+    let index = std::fs::read_to_string(dir.join("turns.txt")).unwrap();
+    let rounds: Vec<u32> = index
+        .lines()
+        .map(|line| line.split(' ').next().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(rounds, (1..=16).collect::<Vec<_>>(), "{index}");
+    let latest = std::fs::read_to_string(dir.join("result.md")).unwrap();
+    assert!(latest.contains("\nturn: 16\n"), "{latest}");
+}

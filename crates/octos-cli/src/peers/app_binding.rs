@@ -157,6 +157,11 @@ pub(crate) struct PeerContextBinding {
     /// Set by `peer/context/close`; a closed context never runs again.
     #[serde(default)]
     pub(crate) closed: bool,
+    /// Set by `peer/context/open` with `share_history`: the person's lane
+    /// of the peer, running in parallel with the peer's own session and
+    /// shown its recent turns read-only (and the reverse).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) share_history: Option<super::shared_history::ShareHistory>,
 }
 
 /// Validate a context id: `[a-z0-9][a-z0-9-]{0,63}`.
@@ -470,6 +475,7 @@ mod tests {
             cwd: PathBuf::from("/ws/rinx/contexts/app-a"),
             memory_namespace: context_memory_namespace("app/rinx/acct-1", "app-a"),
             closed: false,
+            share_history: None,
         };
         write_context_binding(&peers, "rinx", "app-a", &binding).unwrap();
         assert_eq!(
