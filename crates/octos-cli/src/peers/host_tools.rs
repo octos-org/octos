@@ -846,13 +846,22 @@ impl CallCancel {
 /// answered just before the interrupt) is refused and never sent.
 pub(crate) fn cancel_host_calls_for_turn(session: &SessionKey, turn_id: &str) -> usize {
     let pending = HUB.pending.lock().unwrap_or_else(|p| p.into_inner());
-    HUB.interrupted_turns
+    // This turn is always recorded; a full set forgets the OLDEST interrupt
+    // instead (thousands of interrupts back, whose tool tasks are long gone).
+    let evicted = HUB
+        .interrupted_turns
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .mark(
             interrupted_turn_key(session, turn_id),
             INTERRUPTED_RETENTION,
         );
+    if evicted {
+        tracing::warn!(
+            session = %session.0,
+            "interrupted-turn set full: forgot the oldest interrupt to record this one"
+        );
+    }
     let mut cancelled = 0;
     for call in pending.values() {
         if call.meta.session_id == *session && call.meta.turn_id == turn_id {
@@ -925,20 +934,24 @@ impl BoundedClaims {
     }
 
     /// Insert `key`, evicting the oldest claim when full (for markers whose
-    /// loss is preferable to refusing work).
-    fn mark(&mut self, key: String, retention: Duration) {
+    /// loss is preferable to refusing work). `key` itself is always recorded;
+    /// returns whether an unexpired claim had to be evicted for it.
+    fn mark(&mut self, key: String, retention: Duration) -> bool {
         let now = Instant::now();
         self.evict_expired(now, retention);
         if self.keys.contains(&key) {
-            return;
+            return false;
         }
+        let mut evicted = false;
         if self.order.len() >= Self::MAX {
             if let Some((oldest, _)) = self.order.pop_front() {
                 self.keys.remove(&oldest);
+                evicted = true;
             }
         }
         self.keys.insert(key.clone());
         self.order.push_back((key, now));
+        evicted
     }
 
     fn contains(&mut self, key: &str, retention: Duration) -> bool {
@@ -1992,6 +2005,22 @@ pub(crate) fn pending_calls_for(peers_root: &Path, slug: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_always_record_a_new_mark_when_the_set_is_full() {
+        // #2616 review nit: a full interrupted-turn set must never lose the
+        // interrupt being recorded (that would let its calls through); it
+        // forgets the oldest one instead, and says so.
+        let retention = Duration::from_secs(3_600);
+        let mut set = BoundedClaims::default();
+        for i in 0..BoundedClaims::MAX {
+            assert!(!set.mark(format!("t{i}"), retention));
+        }
+        assert!(set.mark("newest".into(), retention), "reports the eviction");
+        assert!(set.contains("newest", retention));
+        assert!(!set.contains("t0", retention));
+        assert!(set.contains("t1", retention));
+    }
 
     fn tool(name: &str, risk: &str) -> ToolInput {
         serde_json::from_value(json!({
