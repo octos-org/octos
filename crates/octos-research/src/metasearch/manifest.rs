@@ -76,6 +76,11 @@ pub struct EngineManifest {
     /// Off unless the host enables it.
     #[serde(default)]
     pub disabled_by_default: bool,
+    /// Reads a search engine's own results page (general web search). Runs
+    /// only while results-page search is on (on by default; see
+    /// [`crate::SERP_SCRAPE_ENV`]).
+    #[serde(default)]
+    pub results_page: bool,
     /// The engine lists entries it did not search for (feeds): the core
     /// keeps only hits whose title or snippet match the query (the phrase,
     /// or every significant term; see [`super::topic`]) and reports the rest

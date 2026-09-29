@@ -5190,6 +5190,7 @@ dependencies = [
 name = "octos-research"
 version = "2.0.3-rc.13"
 dependencies = [
+ "base64",
  "chrono",
  "dom_smoothie",
  "futures",
@@ -5198,6 +5199,7 @@ dependencies = [
  "quick-xml",
  "regex",
  "reqwest 0.12.28",
+ "scraper 0.22.0",
  "serde",
  "serde_json",
  "sha2",

@@ -45,6 +45,14 @@ pub type FetchFuture<'a> = Pin<Box<dyn Future<Output = Result<HttpResponse, Stri
 /// tests plug in recorded responses.
 pub trait Fetch: Send + Sync {
     fn fetch(&self, req: HttpRequest) -> FetchFuture<'_>;
+
+    /// Load `req.url` in a real browser and return the rendered page as the
+    /// body (for results pages that need JavaScript). Hosts with a browser
+    /// implement it with the person's browser profile; the default has none.
+    fn render(&self, req: HttpRequest) -> FetchFuture<'_> {
+        let _ = req;
+        Box::pin(async { Err("no browser available to render this page".to_string()) })
+    }
 }
 
 /// Parse `Retry-After`: delta-seconds or an HTTP-date. Capped at one hour.

@@ -1,0 +1,55 @@
+// Google's results page (www.google.com/search), which needs JavaScript:
+// the request asks the host to load it in the person's browser (`render`).
+// Written from the page's long-standing structure (each result is a link
+// holding an <h3> headline) and Google's search-operators help page
+// (docs_url): `q` query, `hl` interface language, `gl` country, `num`
+// results. An "unusual traffic" page is reported as a challenge for the
+// person to solve in their browser; it is never worked around.
+use mod.markup
+use mod.net
+use mod.std.array
+use mod.std.math
+use mod.std.text
+
+fn build_request(query, opts) {
+    let q = query
+    if opts.since != nil {
+        q = q + " after:" + opts.since.date
+    }
+    let params = [["q", q], ["num", math.min(opts.count, 20)], ["start", (opts.page - 1) * opts.count]]
+    if opts.lang != nil {
+        array.push(params, ["hl", opts.lang.primary])
+    }
+    let gl = if opts.region != nil {
+        opts.region
+    } elif opts.lang != nil {
+        opts.lang.region
+    } else {
+        nil
+    }
+    if gl != nil {
+        array.push(params, ["gl", text.lower(gl)])
+    }
+    let u = net.url({base: "https://www.google.com/search", query: params})
+    return net.request({url: u.url, render: true})
+}
+
+fn parse_response(response, opts) {
+    let body = response.body
+    if text.contains(body, "unusual traffic") || text.contains(body, "/sorry/") || text.contains(body, "g-recaptcha") {
+        return {challenge: "Google reported unusual traffic"}
+    }
+    let found = markup.select({item: "#search a h3, #rso a h3", fields: {title: "", url: "^a@href"}})
+    let out = []
+    for r in found.items {
+        if r.url == nil || r.title == nil || r.title == "" {
+            continue
+        }
+        let url = markup.unwrap({url: r.url, base: "https://www.google.com/"}).url
+        if !text.starts_with(url, "http") || text.contains(url, "google.com/search") {
+            continue
+        }
+        array.push(out, {url: url, title: r.title})
+    }
+    return out
+}

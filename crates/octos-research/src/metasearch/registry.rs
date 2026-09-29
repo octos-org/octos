@@ -81,6 +81,9 @@ pub const BUILTIN: &[(&str, &str, &str)] = builtin![
     "stackexchange",
     "mastodon",
     "publisher_feeds",
+    "duckduckgo",
+    "bing",
+    "google",
     "brave",
 ];
 

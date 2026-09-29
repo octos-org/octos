@@ -1,0 +1,17 @@
+{
+  "id": "google",
+  "name": "Google",
+  "categories": ["general"],
+  "languages": ["*"],
+  "hosts": ["www.google.com"],
+  "results_page": true,
+  "rate_limit": {
+    "min_interval_ms": 5000,
+    "source": "No published limit for the results page; kept to a person's pace."
+  },
+  "docs_url": ["https://www.google.com/search", "https://support.google.com/websearch/answer/2466433"],
+  "license_note": "Google's results page, loaded in the person's own browser (ADR 0002 §6: the agent searches as the person). Titles and links only. Google often answers automated browsing with an \"unusual traffic\" page: that is reported for the person to solve in their browser, never worked around.",
+  "weight": 1.3,
+  "cache_ttl_secs": 900,
+  "timeout_secs": 20
+}

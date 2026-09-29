@@ -1,0 +1,81 @@
+// DuckDuckGo's no-JavaScript results page (html.duckduckgo.com/html/).
+// Written from the page itself and DuckDuckGo's URL-parameter help page
+// (docs_url): `q` is the query, `kl` the region-language, `df` the time
+// filter (d, w, m, y). Result links are DuckDuckGo redirects (/l/?uddg=),
+// unwrapped by the host. A challenge page is reported, not worked around.
+use mod.markup
+use mod.net
+use mod.std.array
+use mod.std.object
+use mod.std.text
+
+fn region(opts) {
+    let l = opts.lang
+    if l == nil {
+        return nil
+    }
+    let r = if opts.region != nil {
+        text.lower(opts.region)
+    } elif l.region != nil {
+        text.lower(l.region)
+    } else {
+        nil
+    }
+    if l.primary == "zh" {
+        if r == "tw" || r == "hk" {
+            return r + "-tzh"
+        }
+        return "cn-zh"
+    }
+    if r == nil {
+        let dflt = {en: "us", de: "de", fr: "fr", es: "es", ja: "jp", ko: "kr", it: "it", pt: "br", ru: "ru", nl: "nl"}
+        r = object.get(dflt, l.primary, nil)
+    }
+    if r == nil {
+        return nil
+    }
+    return r + "-" + l.primary
+}
+
+fn build_request(query, opts) {
+    let params = [["q", query]]
+    let kl = region(opts)
+    if kl != nil {
+        array.push(params, ["kl", kl])
+    }
+    if opts.since != nil {
+        let h = opts.since.hours
+        let df = if h <= 24 {
+            "d"
+        } elif h <= 168 {
+            "w"
+        } elif h <= 744 {
+            "m"
+        } else {
+            "y"
+        }
+        array.push(params, ["df", df])
+    }
+    let u = net.url({base: "https://html.duckduckgo.com/html/", query: params})
+    return net.request({url: u.url, headers: {accept: "text/html"}})
+}
+
+fn parse_response(response, opts) {
+    let body = response.body
+    if text.contains(body, "anomaly-modal") || text.contains(body, "bots use DuckDuckGo") {
+        return {challenge: "DuckDuckGo asked to confirm a person is searching"}
+    }
+    let found = markup.select({item: "div.result:not(.result--ad)", fields: {title: "a.result__a", url: "a.result__a@href", snippet: ".result__snippet"}})
+    let out = []
+    for r in found.items {
+        if r.url == nil || r.title == nil {
+            continue
+        }
+        let url = markup.unwrap({url: r.url, base: "https://html.duckduckgo.com/"}).url
+        if !text.starts_with(url, "http") {
+            continue
+        }
+        array.push(out, {url: url, title: r.title, snippet: r.snippet, source: nil})
+    }
+    return out
+}

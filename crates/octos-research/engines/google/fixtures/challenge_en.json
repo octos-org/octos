@@ -1,0 +1,21 @@
+{
+  "recorded": "live, 2026-09-28: Google's page as rendered by headless Chrome for this network, an \"unusual traffic\" challenge; the engine must report it as a challenge for the person, not work around it",
+  "request": {
+    "query": "omarchy linux",
+    "langs": [
+      "en"
+    ],
+    "since": null,
+    "category": "general",
+    "count": 5,
+    "now": "2026-09-28T20:00:00Z"
+  },
+  "http": {
+    "method": "GET",
+    "url": "https://www.google.com/search?q=omarchy+linux&num=5&start=0&hl=en",
+    "headers": {}
+  },
+  "body_file": "challenge_en.body",
+  "expect_status": "challenge",
+  "expect": []
+}

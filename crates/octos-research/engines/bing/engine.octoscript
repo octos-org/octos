@@ -1,0 +1,50 @@
+// Bing's results page (www.bing.com/search).
+// Written from the page itself and Microsoft's search-options help page
+// (docs_url): `q` is the query, `setlang` the interface language, `cc` the
+// country, `count`/`first` page through results. Each result is an
+// `li.b_algo`; its links are Bing tracking links (/ck/a?...&u=a1<base64>),
+// unwrapped by the host. A challenge page is reported, not worked around.
+use mod.markup
+use mod.net
+use mod.std.array
+use mod.std.math
+use mod.std.text
+
+fn build_request(query, opts) {
+    let params = [["q", query], ["count", math.min(opts.count, 30)], ["first", (opts.page - 1) * opts.count + 1]]
+    if opts.lang != nil {
+        array.push(params, ["setlang", opts.lang.primary])
+    }
+    let cc = if opts.region != nil {
+        opts.region
+    } elif opts.lang != nil {
+        opts.lang.region
+    } else {
+        nil
+    }
+    if cc != nil {
+        array.push(params, ["cc", cc])
+    }
+    let u = net.url({base: "https://www.bing.com/search", query: params})
+    return net.request({url: u.url, headers: {accept: "text/html"}})
+}
+
+fn parse_response(response, opts) {
+    let body = response.body
+    if text.contains(body, "b_captcha") || text.contains(body, "solve the challenge") {
+        return {challenge: "Bing asked to confirm a person is searching"}
+    }
+    let found = markup.select({item: "li.b_algo", fields: {title: "h2 a", url: "h2 a@href", snippet: ".b_caption p", site: ".tptt"}})
+    let out = []
+    for r in found.items {
+        if r.url == nil || r.title == nil {
+            continue
+        }
+        let url = markup.unwrap({url: r.url, base: "https://www.bing.com/"}).url
+        if !text.starts_with(url, "http") {
+            continue
+        }
+        array.push(out, {url: url, title: r.title, snippet: r.snippet, source: r.site})
+    }
+    return out
+}

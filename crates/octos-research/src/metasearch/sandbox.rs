@@ -48,6 +48,9 @@ pub struct ScriptRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
+    /// Load the page in a real browser (results pages that need
+    /// JavaScript); the host's fetcher decides how.
+    pub render: bool,
 }
 
 /// What `parse_response` returned.
@@ -59,6 +62,9 @@ pub struct ScriptParse {
     /// The engine recognised an error answer (e.g. a plain-text rate-limit
     /// notice with a 200 status).
     pub error: Option<String>,
+    /// The page is a bot challenge (CAPTCHA, "unusual traffic"): the reason.
+    /// It goes to the person to solve; it is never worked around.
+    pub challenge: Option<String>,
 }
 
 /// The engine as the sandbox sees it: its source and where it may go.
@@ -143,12 +149,147 @@ fn request_tool(input: &Value, allowed: &[String], allow_http: bool) -> Result<V
         }
     }
     let body = input.get("body").and_then(Value::as_str);
+    let render = input
+        .get("render")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if render && method != "GET" {
+        return Err("a rendered request must be a GET".to_string());
+    }
     Ok(json!({
         "method": method,
         "url": u.as_str(),
         "headers": headers,
         "body": body,
+        "render": render,
     }))
+}
+
+/// `markup.select({item, fields})`: select elements of the response being
+/// handled (HTML) and pull named fields out of each. `item` is a CSS
+/// selector for one result; each field is `"<css>"` (text of the first
+/// match inside the item), `"<css>@<attr>"` (its attribute), `"@<attr>"`
+/// (the item's own attribute), `""` (the item's text), or `"^<css>..."`
+/// to look in the closest enclosing element that matches instead of inside
+/// the item (e.g. `"^a@href"` for a headline's link). At most 100 items.
+fn select_tool(input: &Value, body: Option<&str>) -> Result<Value, String> {
+    let body = body.ok_or("markup.select is only available in parse_response")?;
+    let item_sel = input
+        .get("item")
+        .and_then(Value::as_str)
+        .ok_or("markup.select needs an item selector")?;
+    let item = scraper::Selector::parse(item_sel)
+        .map_err(|e| format!("bad selector {item_sel:?}: {e}"))?;
+    let mut fields = Vec::new();
+    if let Some(m) = input.get("fields").and_then(Value::as_object) {
+        for (name, spec) in m {
+            let spec = spec.as_str().ok_or("field specs must be strings")?;
+            let (spec, closest) = match spec.trim().strip_prefix('^') {
+                Some(rest) => (rest, true),
+                None => (spec.trim(), false),
+            };
+            let (css, attr) = match spec.rsplit_once('@') {
+                Some((css, attr)) => (css.trim(), Some(attr.trim().to_string())),
+                None => (spec.trim(), None),
+            };
+            let sel = if css.is_empty() {
+                None
+            } else {
+                Some(
+                    scraper::Selector::parse(css)
+                        .map_err(|e| format!("bad selector {css:?}: {e}"))?,
+                )
+            };
+            fields.push((name.clone(), sel, attr, closest));
+        }
+    }
+    let doc = scraper::Html::parse_document(body);
+    let clip = |t: String| -> String {
+        let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+        t.chars().take(1000).collect()
+    };
+    let mut items = Vec::new();
+    let mut used = 64;
+    for el in doc.select(&item).take(100) {
+        let mut rec = serde_json::Map::new();
+        for (name, sel, attr, closest) in &fields {
+            let target = match (sel, closest) {
+                (Some(sel), true) => el
+                    .ancestors()
+                    .filter_map(scraper::ElementRef::wrap)
+                    .find(|a| sel.matches(a)),
+                (Some(sel), false) => el.select(sel).next(),
+                (None, _) => Some(el),
+            };
+            let value = target.and_then(|t| match attr {
+                Some(a) => t.value().attr(a).map(String::from),
+                None => Some(t.text().collect::<String>()),
+            });
+            rec.insert(
+                name.clone(),
+                value.map(clip).map(Value::String).unwrap_or(Value::Null),
+            );
+        }
+        let rec = Value::Object(rec);
+        used += rec.to_string().len() + 1;
+        if used > BRIDGE_BYTES - 1024 {
+            break;
+        }
+        items.push(rec);
+    }
+    Ok(json!({ "items": items }))
+}
+
+/// `markup.unwrap({url})`: the destination of a search engine's redirect
+/// link (DuckDuckGo `/l/?uddg=`, Bing `/ck/a?u=a1<base64url>`, Google
+/// `/url?q=`); other URLs come back unchanged. Relative and
+/// protocol-relative links are resolved against `base` when given.
+fn unwrap_tool(input: &Value) -> Result<Value, String> {
+    let raw = input
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let base = input.get("base").and_then(Value::as_str);
+    Ok(json!({ "url": unwrap_redirect(raw, base) }))
+}
+
+pub(crate) fn unwrap_redirect(raw: &str, base: Option<&str>) -> String {
+    use base64::Engine as _;
+    let joined = match (Url::parse(raw), base.and_then(|b| Url::parse(b).ok())) {
+        (Ok(u), _) => Some(u),
+        (Err(_), Some(b)) => b.join(raw).ok(),
+        (Err(_), None) if raw.starts_with("//") => Url::parse(&format!("https:{raw}")).ok(),
+        _ => None,
+    };
+    let Some(u) = joined else {
+        return raw.to_string();
+    };
+    let host = u.host_str().unwrap_or_default().to_ascii_lowercase();
+    let param = |k: &str| {
+        u.query_pairs()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.into_owned())
+    };
+    let target = if host.ends_with("duckduckgo.com") && u.path().starts_with("/l/") {
+        param("uddg")
+    } else if host.ends_with("bing.com") && u.path().starts_with("/ck/") {
+        param("u").and_then(|v| {
+            let b64 = v.strip_prefix("a1")?;
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(b64.trim_end_matches('='))
+                .ok()?;
+            String::from_utf8(bytes).ok()
+        })
+    } else if host.contains("google.") && u.path() == "/url" {
+        param("q").or_else(|| param("url"))
+    } else {
+        None
+    };
+    match target {
+        Some(t) if t.starts_with("http://") || t.starts_with("https://") => t,
+        _ => u.to_string(),
+    }
 }
 
 fn url_tool(input: &Value, allowed: &[String], allow_http: bool) -> Result<Value, String> {
@@ -316,6 +457,7 @@ fn install_module(rt: &mut Runtime, name: &str, methods: Vec<(&'static str, usiz
 fn runtime(engine: &SandboxEngine<'_>, body: Option<&str>) -> Result<Runtime, String> {
     let mut rt = Runtime::with_limits((), (), limits()).map_err(|e| e.to_string())?;
     let body: Option<String> = body.map(String::from);
+    let select_body = body.clone();
     let hosts = engine.allowed_hosts.to_vec();
     let hosts_req = hosts.clone();
     let allow_http = engine.allow_http;
@@ -342,6 +484,12 @@ fn runtime(engine: &SandboxEngine<'_>, body: Option<&str>) -> Result<Runtime, St
             ("feed", 2, Box::new(move |v| feed_tool(v, body.as_deref()))),
             ("text", 4096, Box::new(text_tool)),
             ("matches", 4096, Box::new(matches_tool)),
+            (
+                "select",
+                4,
+                Box::new(move |v| select_tool(v, select_body.as_deref())),
+            ),
+            ("unwrap", 512, Box::new(unwrap_tool)),
         ],
     );
     Ok(rt)
@@ -429,6 +577,7 @@ fn checked_request(engine: &SandboxEngine<'_>, v: &Value) -> Result<ScriptReques
             })
             .unwrap_or_default(),
         body: checked["body"].as_str().map(String::from),
+        render: checked["render"].as_bool().unwrap_or(false),
     })
 }
 
@@ -473,6 +622,7 @@ pub fn parse_response(
         Some(body),
         "parse_response(input.response, input.opts)",
     )?;
+    let mut challenge = None;
     let (items, backoff, error) = match v {
         Value::Array(items) => (items, None, None),
         Value::Object(mut m) => {
@@ -480,6 +630,10 @@ pub fn parse_response(
                 .get("error")
                 .and_then(Value::as_str)
                 .map(|e| e.chars().take(300).collect::<String>());
+            challenge = m
+                .get("challenge")
+                .and_then(Value::as_str)
+                .map(|e| e.chars().take(200).collect::<String>());
             let items = match m.remove("items") {
                 Some(Value::Array(a)) => a,
                 Some(Value::Null) | None => Vec::new(),
@@ -499,6 +653,7 @@ pub fn parse_response(
         items,
         backoff,
         error,
+        challenge,
     })
 }
 
@@ -698,6 +853,73 @@ fn parse_response(response, opts) {
         let big = "use mod.net\nfn build_request(query, opts) {\nlet s = \"xxxxxxxxxxxxxxxx\"\nlet i = 0\nwhile i < 15 {\ns += s\ni += 1\n}\nreturn net.request({url: \"https://api.example.org/\", body: s})\n}\nfn parse_response(response, opts) {\nreturn []\n}\n";
         let err = build_request(&engine(big, &hosts), "q", &json!({})).unwrap_err();
         assert!(err.contains("bounded JSON"), "{err}");
+    }
+
+    #[test]
+    fn should_unwrap_search_engine_redirect_links() {
+        // Observed on each engine's results page.
+        assert_eq!(
+            unwrap_redirect(
+                "//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.org%2F&rut=eb8d",
+                Some("https://html.duckduckgo.com/")
+            ),
+            "https://omarchy.org/"
+        );
+        assert_eq!(
+            unwrap_redirect(
+                "https://www.bing.com/ck/a?!&&p=36454d&u=a1aHR0cHM6Ly9vbWFyY2h5Lm9yZy8&ntb=1",
+                None
+            ),
+            "https://omarchy.org/"
+        );
+        assert_eq!(
+            unwrap_redirect(
+                "/url?q=https://example.org/a&sa=U",
+                Some("https://www.google.com/")
+            ),
+            "https://example.org/a"
+        );
+        assert_eq!(
+            unwrap_redirect("https://example.org/x", None),
+            "https://example.org/x"
+        );
+        // A wrapper pointing at a non-http target is left alone.
+        assert_eq!(
+            unwrap_redirect("https://duckduckgo.com/l/?uddg=javascript%3Aalert(1)", None),
+            "https://duckduckgo.com/l/?uddg=javascript%3Aalert(1)"
+        );
+    }
+
+    #[test]
+    fn should_select_fields_from_html_results() {
+        let hosts = vec!["a.example.org".to_string()];
+        let html = r#"<html><body>
+            <div class="result"><a class="t" href="/l/1">One</a><p class="s">first  snippet</p></div>
+            <div class="result result--ad"><a class="t" href="/ad">Ad</a></div>
+            <div class="result"><a class="t" href="/l/2">Two</a></div>
+            <div id="search"><a href="https://g.example/x"><div><h3>Headline</h3></div></a></div>
+        </body></html>"#;
+        let script = "use mod.markup\nfn build_request(query, opts) {\nreturn nil\n}\nfn parse_response(response, opts) {\nlet a = markup.select({item: \"div.result:not(.result--ad)\", fields: {title: \"a.t\", url: \"a.t@href\", snippet: \"p.s\"}})\nlet b = markup.select({item: \"#search a h3\", fields: {title: \"\", url: \"^a@href\"}})\nreturn [a.items, b.items]\n}\n";
+        let parsed = parse_response(
+            &engine(script, &hosts),
+            &json!({}),
+            "https://a.example.org/",
+            200,
+            &[],
+            html,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.items[0],
+            json!([
+                {"title": "One", "url": "/l/1", "snippet": "first snippet"},
+                {"title": "Two", "url": "/l/2", "snippet": null}
+            ])
+        );
+        assert_eq!(
+            parsed.items[1],
+            json!([{"title": "Headline", "url": "https://g.example/x"}])
+        );
     }
 
     #[test]

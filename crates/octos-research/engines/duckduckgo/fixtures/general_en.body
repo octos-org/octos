@@ -1,0 +1,626 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+
+<!--[if IE 6]><html class="ie6" xmlns="http://www.w3.org/1999/xhtml"><![endif]-->
+<!--[if IE 7]><html class="lt-ie8 lt-ie9" xmlns="http://www.w3.org/1999/xhtml"><![endif]-->
+<!--[if IE 8]><html class="lt-ie9" xmlns="http://www.w3.org/1999/xhtml"><![endif]-->
+<!--[if gt IE 8]><!--><html xmlns="http://www.w3.org/1999/xhtml"><!--<![endif]-->
+<head>
+  <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=1" />
+  <meta name="referrer" content="origin" />
+  <meta name="HandheldFriendly" content="true" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>omarchy linux at DuckDuckGo</title>
+  <link title="DuckDuckGo (HTML)" type="application/opensearchdescription+xml" rel="search" href="//duckduckgo.com/opensearch_html_v2.xml" />
+  <link href="//duckduckgo.com/favicon.ico" rel="shortcut icon" />
+  <link rel="icon" href="//duckduckgo.com/favicon.ico" type="image/x-icon" />
+  <link id="icon60" rel="apple-touch-icon" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_60x60.png?v=2"/>
+  <link id="icon76" rel="apple-touch-icon" sizes="76x76" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_76x76.png?v=2"/>
+  <link id="icon120" rel="apple-touch-icon" sizes="120x120" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_120x120.png?v=2"/>
+  <link id="icon152" rel="apple-touch-icon" sizes="152x152" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_152x152.png?v=2"/>
+  <link rel="image_src" href="//duckduckgo.com/assets/icons/meta/DDG-icon_256x256.png">
+  <link rel="stylesheet" media="handheld, all" href="//duckduckgo.com/dist/h.86dc4d575e7a59027c3f.css" type="text/css"/>
+</head>
+
+<body class="body--html">
+  <a name="top" id="top"></a>
+
+  <form action="/html/" method="post">
+    <input type="text" name="state_hidden" id="state_hidden" />
+  </form>
+
+  <div>
+    <div class="site-wrapper-border"></div>
+
+    <div id="header" class="header cw header--html">
+      <a title="DuckDuckGo" href="/html/" class="header__logo-wrap"></a>
+
+      <form name="x" class="header__form" action="/html/" method="post">
+        <div class="search search--header">
+          <input name="q" autocomplete="off" class="search__input" id="search_form_input_homepage" type="text" value="omarchy linux" />
+          <input name="b" id="search_button_homepage" class="search__button search__button--html" value="" title="Search" alt="Search" type="submit" />
+        </div>
+
+        
+        
+        
+        
+
+        <div class="frm__select">
+          <select name="kl">
+            
+              <option value="" >All Regions</option>
+            
+              <option value="ar-es" >Argentina</option>
+            
+              <option value="au-en" >Australia</option>
+            
+              <option value="at-de" >Austria</option>
+            
+              <option value="be-fr" >Belgium (fr)</option>
+            
+              <option value="be-nl" >Belgium (nl)</option>
+            
+              <option value="br-pt" >Brazil</option>
+            
+              <option value="bg-bg" >Bulgaria</option>
+            
+              <option value="ca-en" >Canada (en)</option>
+            
+              <option value="ca-fr" >Canada (fr)</option>
+            
+              <option value="ct-ca" >Catalonia</option>
+            
+              <option value="cl-es" >Chile</option>
+            
+              <option value="cn-zh" >China</option>
+            
+              <option value="co-es" >Colombia</option>
+            
+              <option value="hr-hr" >Croatia</option>
+            
+              <option value="cz-cs" >Czech Republic</option>
+            
+              <option value="dk-da" >Denmark</option>
+            
+              <option value="ee-et" >Estonia</option>
+            
+              <option value="fi-fi" >Finland</option>
+            
+              <option value="fr-fr" >France</option>
+            
+              <option value="de-de" >Germany</option>
+            
+              <option value="gr-el" >Greece</option>
+            
+              <option value="hk-tzh" >Hong Kong</option>
+            
+              <option value="hu-hu" >Hungary</option>
+            
+              <option value="is-is" >Iceland</option>
+            
+              <option value="in-en" >India (en)</option>
+            
+              <option value="id-en" >Indonesia (en)</option>
+            
+              <option value="ie-en" >Ireland</option>
+            
+              <option value="il-en" >Israel (en)</option>
+            
+              <option value="it-it" >Italy</option>
+            
+              <option value="jp-jp" >Japan</option>
+            
+              <option value="kr-kr" >Korea</option>
+            
+              <option value="lv-lv" >Latvia</option>
+            
+              <option value="lt-lt" >Lithuania</option>
+            
+              <option value="my-en" >Malaysia (en)</option>
+            
+              <option value="mx-es" >Mexico</option>
+            
+              <option value="nl-nl" >Netherlands</option>
+            
+              <option value="nz-en" >New Zealand</option>
+            
+              <option value="no-no" >Norway</option>
+            
+              <option value="pk-en" >Pakistan (en)</option>
+            
+              <option value="pe-es" >Peru</option>
+            
+              <option value="ph-en" >Philippines (en)</option>
+            
+              <option value="pl-pl" >Poland</option>
+            
+              <option value="pt-pt" >Portugal</option>
+            
+              <option value="ro-ro" >Romania</option>
+            
+              <option value="ru-ru" >Russia</option>
+            
+              <option value="xa-ar" >Saudi Arabia</option>
+            
+              <option value="sg-en" >Singapore</option>
+            
+              <option value="sk-sk" >Slovakia</option>
+            
+              <option value="sl-sl" >Slovenia</option>
+            
+              <option value="za-en" >South Africa</option>
+            
+              <option value="es-ca" >Spain (ca)</option>
+            
+              <option value="es-es" >Spain (es)</option>
+            
+              <option value="se-sv" >Sweden</option>
+            
+              <option value="ch-de" >Switzerland (de)</option>
+            
+              <option value="ch-fr" >Switzerland (fr)</option>
+            
+              <option value="tw-tzh" >Taiwan</option>
+            
+              <option value="th-en" >Thailand (en)</option>
+            
+              <option value="tr-tr" >Turkey</option>
+            
+              <option value="us-en" selected>US (English)</option>
+            
+              <option value="us-es" >US (Spanish)</option>
+            
+              <option value="ua-uk" >Ukraine</option>
+            
+              <option value="uk-en" >United Kingdom</option>
+            
+              <option value="vn-en" >Vietnam (en)</option>
+            
+          </select>
+        </div>
+
+        <div class="frm__select frm__select--last">
+          <select class="" name="df">
+            
+              <option value="" selected>Any Time</option>
+            
+              <option value="d" >Past Day</option>
+            
+              <option value="w" >Past Week</option>
+            
+              <option value="m" >Past Month</option>
+            
+              <option value="y" >Past Year</option>
+            
+          </select>
+        </div>
+      </form>
+    </div>
+
+    
+
+    
+      <!-- Web results are present -->
+      <div>
+        <div class="serp__results">
+          <div id="links" class="results">
+            
+
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.org%2F&amp;rut=eb8db147099cb5a9ef3a867d5750f7be0db8842e130b9c719c49eab70e3e2f8d">Omarchy - Beautiful, fun &amp; agentic Linux by DHH</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.org%2F&amp;rut=eb8db147099cb5a9ef3a867d5750f7be0db8842e130b9c719c49eab70e3e2f8d">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/omarchy.org.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.org%2F&amp;rut=eb8db147099cb5a9ef3a867d5750f7be0db8842e130b9c719c49eab70e3e2f8d">
+                            omarchy.org
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.org%2F&amp;rut=eb8db147099cb5a9ef3a867d5750f7be0db8842e130b9c719c49eab70e3e2f8d">An opinionated Arch <b>Linux</b> and Hyprland setup guide by DHH for users seeking a customized experience.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.us%2F&amp;rut=73f2f908ae51de3492da29c7fdd25850a8903daa5d92ae962ed54aee931d48c1">Omarchy - Beautiful, fun &amp; agentic Linux by DHH</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.us%2F&amp;rut=73f2f908ae51de3492da29c7fdd25850a8903daa5d92ae962ed54aee931d48c1">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/omarchy.us.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.us%2F&amp;rut=73f2f908ae51de3492da29c7fdd25850a8903daa5d92ae962ed54aee931d48c1">
+                            omarchy.us
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.us%2F&amp;rut=73f2f908ae51de3492da29c7fdd25850a8903daa5d92ae962ed54aee931d48c1"><b>Linux</b> used to be a chore to setup, difficult to debug, and full of confusing upfront choices. <b>Omarchy</b> solves all of it with a lightning fast installation, agents that debug all issues, and fantastic defaults that give you a fully functioning system that looks amazing out of the box.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FOmarchy&amp;rut=de07be4a31d4dfffffaf6f73b614949e6629649bd67d57ece31f73669a88e8c5">Omarchy - Wikipedia</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FOmarchy&amp;rut=de07be4a31d4dfffffaf6f73b614949e6629649bd67d57ece31f73669a88e8c5">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/en.wikipedia.org.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FOmarchy&amp;rut=de07be4a31d4dfffffaf6f73b614949e6629649bd67d57ece31f73669a88e8c5">
+                            en.wikipedia.org/wiki/Omarchy
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FOmarchy&amp;rut=de07be4a31d4dfffffaf6f73b614949e6629649bd67d57ece31f73669a88e8c5"><b>Omarchy</b> is an open-source <b>Linux</b> distribution created by David Heinemeier Hansson. It is based on Arch <b>Linux</b> and uses the Hyprland tiling Wayland compositor and Quickshell desktop shell. [3][4][5]</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy%2Dofficial.org%2F&amp;rut=90316d48808d54f265fb401de50f51921414cf1c3a60e6462124cdc386927987">Omarchy — Beautiful, Fun &amp; Opinionated Linux by DHH</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy%2Dofficial.org%2F&amp;rut=90316d48808d54f265fb401de50f51921414cf1c3a60e6462124cdc386927987">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/omarchy-official.org.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy%2Dofficial.org%2F&amp;rut=90316d48808d54f265fb401de50f51921414cf1c3a60e6462124cdc386927987">
+                            omarchy-official.org
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy%2Dofficial.org%2F&amp;rut=90316d48808d54f265fb401de50f51921414cf1c3a60e6462124cdc386927987"><b>Omarchy</b> is an opinionated Arch + Hyprland distro by DHH — tiling, beautiful themes, curated apps, snapshot-safe via Btrfs. Download the ISO and get practical guides.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.org%2Fmanual%2F&amp;rut=a51b879cbd6dbf0348944e0d23ba4b06020571ecf44a9a5415bf207191a0ddb3">The Manual - Omarchy</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.org%2Fmanual%2F&amp;rut=a51b879cbd6dbf0348944e0d23ba4b06020571ecf44a9a5415bf207191a0ddb3">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/omarchy.org.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.org%2Fmanual%2F&amp;rut=a51b879cbd6dbf0348944e0d23ba4b06020571ecf44a9a5415bf207191a0ddb3">
+                            omarchy.org/manual/
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.org%2Fmanual%2F&amp;rut=a51b879cbd6dbf0348944e0d23ba4b06020571ecf44a9a5415bf207191a0ddb3"><b>Omarchy</b> is an omakase <b>Linux</b> distribution based on Arch, the tiling window manager Hyprland, and the desktop construction-kit Quickshell. It ships with everything a modern, savvy computer user needs to be productive immediately.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fomacom%2Fomarchy&amp;rut=2d5ecc64bded6f663f2679a32d7a4757bd1e6ee8c28b8de64290741f5bd0be59">GitHub - omacom/omarchy: Beautiful, Modern &amp; Opinionated Linux</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fomacom%2Fomarchy&amp;rut=2d5ecc64bded6f663f2679a32d7a4757bd1e6ee8c28b8de64290741f5bd0be59">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/github.com.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fomacom%2Fomarchy&amp;rut=2d5ecc64bded6f663f2679a32d7a4757bd1e6ee8c28b8de64290741f5bd0be59">
+                            github.com/omacom/omarchy
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fomacom%2Fomarchy&amp;rut=2d5ecc64bded6f663f2679a32d7a4757bd1e6ee8c28b8de64290741f5bd0be59">Beautiful, Modern &amp; Opinionated <b>Linux</b>. Contribute to omacom/<b>omarchy</b> development by creating an account on GitHub.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.archi%2F&amp;rut=9a16b98b12c9a92f0204ab9b79efe4f7c75a6ea3851205ce14d47d9aa433d34c">Omarchy: Beautiful, Fun &amp; Opinionated Linux</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.archi%2F&amp;rut=9a16b98b12c9a92f0204ab9b79efe4f7c75a6ea3851205ce14d47d9aa433d34c">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/omarchy.archi.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.archi%2F&amp;rut=9a16b98b12c9a92f0204ab9b79efe4f7c75a6ea3851205ce14d47d9aa433d34c">
+                            omarchy.archi
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fomarchy.archi%2F&amp;rut=9a16b98b12c9a92f0204ab9b79efe4f7c75a6ea3851205ce14d47d9aa433d34c"><b>Omarchy</b>: Beautiful, Fun &amp; Opinionated <b>Linux</b>. The malleable OS for the age of agents. Arch + Hyprland, omakase. By DHH.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftedium.co%2F2025%2F10%2F13%2Fomarchy%2Dlinux%2Ddistro%2Dcommentary%2F&amp;rut=19c7e1fc5678c0bcdfb635acafb17dfdafd09652d648279753eb3a3e47dd4282">Thoughts On Omarchy: Slick Distro, Complicated Ethics</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftedium.co%2F2025%2F10%2F13%2Fomarchy%2Dlinux%2Ddistro%2Dcommentary%2F&amp;rut=19c7e1fc5678c0bcdfb635acafb17dfdafd09652d648279753eb3a3e47dd4282">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/tedium.co.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftedium.co%2F2025%2F10%2F13%2Fomarchy%2Dlinux%2Ddistro%2Dcommentary%2F&amp;rut=19c7e1fc5678c0bcdfb635acafb17dfdafd09652d648279753eb3a3e47dd4282">
+                            tedium.co/2025/10/13/omarchy-linux-distro-commentary/
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftedium.co%2F2025%2F10%2F13%2Fomarchy%2Dlinux%2Ddistro%2Dcommentary%2F&amp;rut=19c7e1fc5678c0bcdfb635acafb17dfdafd09652d648279753eb3a3e47dd4282">The rising <b>Linux</b> distro <b>Omarchy</b> smooths out Hyprland&#x27;s rough edges—but it also carries a controversial sheen that some won&#x27;t be able to ignore.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdistrowatch.com%2Fomarchy&amp;rut=cda3ddafb8c63e20fb0cf3dea702853840c410932b445baaf805217725ca2dfe">Omarchy - DistroWatch.com</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdistrowatch.com%2Fomarchy&amp;rut=cda3ddafb8c63e20fb0cf3dea702853840c410932b445baaf805217725ca2dfe">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/distrowatch.com.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdistrowatch.com%2Fomarchy&amp;rut=cda3ddafb8c63e20fb0cf3dea702853840c410932b445baaf805217725ca2dfe">
+                            distrowatch.com/omarchy
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdistrowatch.com%2Fomarchy&amp;rut=cda3ddafb8c63e20fb0cf3dea702853840c410932b445baaf805217725ca2dfe"><b>Omarchy</b> is an Arch-based <b>Linux</b> distribution featuring the Hyprland tiling window manager. It ships with what a modern software developer would need to be productive immediately, including Neovim, Spotify, Chromium, Typora, Alacritty, LibreOffice and Zoom.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftbreak.com%2Fomarchy%2Dlinux%2Ddistro%2Dagentic%2Dai%2F&amp;rut=66b4f4eae840258299cb5cf7e22e725ec35c3daa0fc4ef41db5ae766c87955d6">Omarchy: the Linux distro built for the agentic AI age</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftbreak.com%2Fomarchy%2Dlinux%2Ddistro%2Dagentic%2Dai%2F&amp;rut=66b4f4eae840258299cb5cf7e22e725ec35c3daa0fc4ef41db5ae766c87955d6">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/tbreak.com.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftbreak.com%2Fomarchy%2Dlinux%2Ddistro%2Dagentic%2Dai%2F&amp;rut=66b4f4eae840258299cb5cf7e22e725ec35c3daa0fc4ef41db5ae766c87955d6">
+                            tbreak.com/omarchy-linux-distro-agentic-ai/
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Ftbreak.com%2Fomarchy%2Dlinux%2Ddistro%2Dagentic%2Dai%2F&amp;rut=66b4f4eae840258299cb5cf7e22e725ec35c3daa0fc4ef41db5ae766c87955d6"><b>Omarchy</b> is the Arch-based <b>Linux</b> distro with an AI agent built in. Here is the field it leads, from Ubuntu 26.04 to CachyOS, and how to try it.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+
+            
+              
+              
+                <div class="nav-link">
+                  <form action="/html/" method="post">
+                    <input type="submit" class='btn btn--alt' value="Next" />
+                    <input type="hidden" name="q" value="omarchy linux" />
+                    <input type="hidden" name="s" value="10" />
+                    <input type="hidden" name="nextParams" value="" />
+                    <input type="hidden" name="v" value="l" />
+                    <input type="hidden" name="o" value="json" />
+                    <input type="hidden" name="dc" value="11" />
+                    <input type="hidden" name="api" value="d.js" />
+                    <input type="hidden" name="vqd" value="4-50002522731011937613155084914952902427" />
+
+                    
+                    
+                    
+                      <input name="kl" value="us-en" type="hidden" />
+                    
+                    
+                    
+                    
+                  </form>
+                </div>
+              
+            
+
+            <div class="feedback-btn">
+              <a rel="nofollow" href="//duckduckgo.com/feedback.html" target="_new">Feedback</a>
+            </div>
+            <div class="clear"></div>
+          </div>
+        </div>
+      </div> <!-- links wrapper //-->
+    
+  </div>
+
+  <div id="bottom_spacing2"></div>
+
+  
+    <img src="//duckduckgo.com/t/sl_h"/>
+  
+</body>
+</html>
