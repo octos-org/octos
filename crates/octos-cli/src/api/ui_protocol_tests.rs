@@ -47217,6 +47217,7 @@ async fn should_let_only_the_external_client_answer_its_question() {
     // The host: refused, typed; the question stays pending.
     handle_user_question_respond(
         &host_ws,
+        &state,
         &contracts,
         None,
         None,
@@ -47235,6 +47236,7 @@ async fn should_let_only_the_external_client_answer_its_question() {
     other_ext.set_external(true);
     handle_user_question_respond(
         &other_ext,
+        &state,
         &contracts,
         None,
         Some(other_ext.connection_id()),
@@ -47260,6 +47262,7 @@ async fn should_let_only_the_external_client_answer_its_question() {
     // The owner: accepted.
     handle_user_question_respond(
         &ext_ws,
+        &state,
         &contracts,
         None,
         Some(ext_ws.connection_id()),
@@ -47335,6 +47338,7 @@ async fn should_keep_a_host_turns_question_on_the_host_as_before() {
     );
     handle_user_question_respond(
         &host_ws,
+        &state,
         &contracts,
         None,
         None,
@@ -47426,6 +47430,7 @@ async fn should_keep_external_prompts_from_the_host_when_the_side_table_forgets_
     );
     handle_user_question_respond(
         &host_ws,
+        &state,
         &contracts,
         None,
         None,
@@ -47458,6 +47463,7 @@ async fn should_keep_external_prompts_from_the_host_when_the_side_table_forgets_
     assert_eq!(approval_task.await.unwrap(), ToolApprovalDecision::Deny);
     handle_user_question_respond(
         &ext_ws,
+        &state,
         &contracts,
         None,
         Some(ext_ws.connection_id()),
