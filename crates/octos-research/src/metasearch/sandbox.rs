@@ -7,11 +7,15 @@
 //!
 //! - `net`: `net.request({url, method, headers, body})` validates a request
 //!   against the engine's declared hosts and returns it; `net.url({base,
-//!   query})` builds a percent-encoded URL on a declared host. Neither opens a
-//!   connection: the core performs the request after the script returns.
+//!   query})` builds a percent-encoded URL on a declared host. A record
+//!   `query` carries no key-order contract; pass a list of `[name, value]`
+//!   pairs when order matters. Neither opens a connection: the core
+//!   performs the request after the script returns.
 //! - `markup`: `markup.feed({lang})` parses the response being handled as
-//!   RSS/Atom (the body stays in the host) and `markup.text({html})` turns an
-//!   HTML fragment into plain text.
+//!   RSS/Atom (the body stays in the host), `markup.text({html})` turns an
+//!   HTML fragment into plain text, and `markup.matches({query, text})` says
+//!   whether a headline is about the query (the phrase, or every
+//!   significant term; see [`super::topic`]).
 //!
 //! Each method has a call budget and bounded JSON input and output. There is
 //! no `mod.tool`, filesystem, process, clock or network module.
@@ -222,6 +226,16 @@ fn text_tool(input: &Value) -> Result<Value, String> {
     Ok(json!({ "text": text }))
 }
 
+/// `{matched}`: whether `text` is about `query` ([`super::topic`]).
+fn matches_tool(input: &Value) -> Result<Value, String> {
+    let query = input
+        .get("query")
+        .and_then(Value::as_str)
+        .ok_or("markup.matches needs a query")?;
+    let text = input.get("text").and_then(Value::as_str).unwrap_or("");
+    Ok(json!({ "matched": super::topic::matches_query(query, text) }))
+}
+
 type Handler = Box<dyn Fn(&Value) -> Result<Value, String>>;
 
 /// Install a frozen host module whose methods take and return one bounded
@@ -327,6 +341,7 @@ fn runtime(engine: &SandboxEngine<'_>, body: Option<&str>) -> Result<Runtime, St
         vec![
             ("feed", 2, Box::new(move |v| feed_tool(v, body.as_deref()))),
             ("text", 4096, Box::new(text_tool)),
+            ("matches", 4096, Box::new(matches_tool)),
         ],
     );
     Ok(rt)
@@ -549,9 +564,27 @@ fn parse_response(response, opts) {
         assert_eq!(reqs.len(), 1);
         let req = &reqs[0];
         assert_eq!(req.method, "GET");
+        // Query-param order carries no contract: a record query comes back
+        // in the host build's serde_json Map order (sorted, or insertion-
+        // ordered when the preserve_order feature is unified into the
+        // graph), so compare decoded pairs instead of the serialized string.
+        assert!(
+            req.url.starts_with("https://api.example.org/search?"),
+            "{}",
+            req.url
+        );
+        let mut pairs: Vec<(String, String)> = Url::parse(&req.url)
+            .unwrap()
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        pairs.sort();
         assert_eq!(
-            req.url,
-            "https://api.example.org/search?n=5&q=rust+%26+tokio"
+            pairs,
+            vec![
+                ("n".into(), "5".into()),
+                ("q".into(), "rust & tokio".into())
+            ]
         );
         assert_eq!(
             req.headers,

@@ -343,8 +343,175 @@ impl Default for SafePolicy {
     }
 }
 
+/// Whether `command` names another process's environment or command line
+/// (`/proc/<pid>/environ`, `/proc/<pid>/cmdline`, or anything else under a
+/// process's `/proc/<pid>` view): where a parent or sibling process's secrets
+/// live.
+///
+/// BEST-EFFORT DEFENSE IN DEPTH, not a boundary. It reads the command's words
+/// as paths: quotes and backslashes are dropped, `.`/`..` are folded, glob
+/// patterns (`*`, `?`, `[..]`, `{a,b}`) and `$VAR` words count as matching
+/// whatever they could match, and `cd`/`pushd` to a relative or absolute
+/// directory is followed, so `cat /pro[c]/1/env*` and
+/// `cd /proc && cat 1/environ` are caught as well as the plain spelling. A
+/// shell can still build a path this cannot see (`eval`, command
+/// substitution, variables set earlier, a script file). The real controls
+/// are the sandbox and, for the external clients of
+/// `octos serve --host-managed`, having no shell at all.
+pub fn names_process_secrets(command: &str) -> bool {
+    names_process_secrets_in(command, None)
+}
+
+/// [`names_process_secrets`] for a command that runs in `cwd`.
+pub fn names_process_secrets_in(command: &str, cwd: Option<&std::path::Path>) -> bool {
+    let normalized: String = command
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+        .collect();
+    // The plain spelling, whatever surrounds it.
+    if normalized.contains("/proc/")
+        && (normalized.contains("environ") || normalized.contains("cmdline"))
+    {
+        return true;
+    }
+    let words: Vec<&str> = normalized
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')' | '`' | '=')
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut dir: Vec<String> = cwd
+        .map(|cwd| path_components(&[], &cwd.to_string_lossy()))
+        .unwrap_or_default();
+    let mut mentions_proc = false;
+    let mut names_secret_file = false;
+    let mut index = 0;
+    while index < words.len() {
+        let word = words[index];
+        if matches!(word, "cd" | "pushd") {
+            if let Some(target) = words.get(index + 1) {
+                dir = path_components(&dir, target);
+                if reaches_process_view(&dir) {
+                    return true;
+                }
+                mentions_proc |= dir
+                    .first()
+                    .is_some_and(|first| glob_could_match(first, "proc"));
+            }
+            index += 2;
+            continue;
+        }
+        let path = path_components(&dir, word);
+        if reaches_process_view(&path) {
+            return true;
+        }
+        mentions_proc |= path
+            .first()
+            .is_some_and(|first| glob_could_match(first, "proc"));
+        // `find /proc -name environ`: a secret file's name, spelled with at
+        // least one literal letter (a bare `*` is too common to judge).
+        names_secret_file |= word.split('/').any(|part| {
+            part.chars().any(|c| c.is_ascii_alphabetic())
+                && (glob_could_match(part, "environ") || glob_could_match(part, "cmdline"))
+        });
+        index += 1;
+    }
+    mentions_proc && names_secret_file
+}
+
+/// `word` as lexical path components, relative words resolved against `dir`
+/// (the absolute components of the working directory, when known). Leading
+/// `..` of an unresolvable relative path are dropped, so `../../proc/1` is
+/// judged as `proc/1`.
+fn path_components(dir: &[String], word: &str) -> Vec<String> {
+    let mut parts: Vec<String> = if word.starts_with('/') {
+        Vec::new()
+    } else {
+        dir.to_vec()
+    };
+    for part in word.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part.to_owned()),
+        }
+    }
+    parts
+}
+
+/// Whether absolute components `path` could name `/proc/<pid>` or anything
+/// under it (`self`, `thread-self`, a number, a glob or a `$VAR`).
+fn reaches_process_view(path: &[String]) -> bool {
+    let [first, second, ..] = path else {
+        return false;
+    };
+    glob_could_match(first, "proc")
+        && (second.starts_with('$')
+            || ["self", "thread-self", "1", "4242"]
+                .iter()
+                .any(|name| glob_could_match(second, name)))
+}
+
+/// Whether the shell glob `pattern` (`*`, `?`, `[..]`, one level of `{a,b}`)
+/// matches `name`; a `$VAR` pattern matches anything.
+fn glob_could_match(pattern: &str, name: &str) -> bool {
+    if pattern.contains('$') {
+        return true;
+    }
+    if let (Some(open), Some(close)) = (pattern.find('{'), pattern.find('}')) {
+        if open < close {
+            let (head, rest) = pattern.split_at(open);
+            let (group, tail) = rest[1..].split_at(close - open - 1);
+            let tail = &tail[1..];
+            return group
+                .split(',')
+                .any(|choice| glob_could_match(&format!("{head}{choice}{tail}"), name));
+        }
+    }
+    fn matches(pattern: &[char], name: &[char]) -> bool {
+        match pattern.split_first() {
+            None => name.is_empty(),
+            Some(('*', rest)) => (0..=name.len()).any(|skip| matches(rest, &name[skip..])),
+            Some(('?', rest)) => !name.is_empty() && matches(rest, &name[1..]),
+            Some(('[', rest)) => {
+                let Some(end) = rest.iter().skip(1).position(|c| *c == ']').map(|p| p + 1) else {
+                    return name.first() == Some(&'[') && matches(rest, &name[1..]);
+                };
+                let Some((first, remaining)) = name.split_first() else {
+                    return false;
+                };
+                let (negated, set) = match rest[..end].split_first() {
+                    Some(('!' | '^', set)) => (true, set),
+                    _ => (false, &rest[..end]),
+                };
+                let mut hit = false;
+                let mut i = 0;
+                while i < set.len() {
+                    if i + 2 < set.len() && set[i + 1] == '-' {
+                        hit |= (set[i]..=set[i + 2]).contains(first);
+                        i += 3;
+                    } else {
+                        hit |= set[i] == *first;
+                        i += 1;
+                    }
+                }
+                hit != negated && matches(&rest[end + 1..], remaining)
+            }
+            Some((c, rest)) => name.first() == Some(c) && matches(rest, &name[1..]),
+        }
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    matches(&pattern, &name)
+}
+
 impl CommandPolicy for SafePolicy {
-    fn check(&self, command: &str, _cwd: &std::path::Path) -> Decision {
+    fn check(&self, command: &str, cwd: &std::path::Path) -> Decision {
+        if names_process_secrets_in(command, Some(cwd)) {
+            return Decision::Deny;
+        }
         crate::shell_analysis::evaluate(command, &self.deny_patterns, &self.ask_patterns)
     }
 }
@@ -368,6 +535,72 @@ mod tests {
             policy.check("dd if=/dev/zero of=/dev/sda", Path::new("/tmp")),
             Decision::Deny
         );
+    }
+
+    #[test]
+    fn should_deny_reading_process_environments_and_command_lines() {
+        let policy = SafePolicy::default();
+        for command in [
+            "cat /proc/1234/environ",
+            "tr '\\0' '\\n' < /proc/$PPID/environ",
+            "cat \"/proc/self/cmdline\"",
+            "xxd /proc/1/task/1/environ",
+        ] {
+            assert_eq!(
+                policy.check(command, Path::new("/tmp")),
+                Decision::Deny,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            policy.check("cat /proc/cpuinfo", Path::new("/tmp")),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn should_deny_process_secrets_behind_globs_and_relative_paths() {
+        let policy = SafePolicy::default();
+        for command in [
+            "cd /proc && cat 1/environ",
+            "cd /proc; cd self; cat environ",
+            "pushd /proc/1 >/dev/null; cat env*",
+            "cat /pro[c]/1/environ",
+            "cat /proc/1/env*",
+            "cat /pr?c/[0-9]/c*line",
+            "cat /proc/{1,2}/environ",
+            "cat /p*/1/*",
+            "cat /tmp/../proc/1/environ",
+            "cat ../../../proc/1/environ",
+            "grep -r KEY /proc/1/",
+            "find /proc -name environ",
+            "tar cf - /proc/self",
+        ] {
+            assert_eq!(
+                policy.check(command, Path::new("/tmp")),
+                Decision::Deny,
+                "{command}"
+            );
+        }
+        // The working directory counts too.
+        assert_eq!(
+            policy.check("cat environ", Path::new("/proc/1")),
+            Decision::Deny
+        );
+        for command in [
+            "cat /proc/cpuinfo",
+            "cat /proc/meminfo /proc/loadavg",
+            "ls /proc",
+            "cd /tmp && cat 1/environ.txt.bak",
+            "grep -rn environ src/",
+            "cargo test -p octos-agent",
+        ] {
+            assert_eq!(
+                policy.check(command, Path::new("/tmp")),
+                Decision::Allow,
+                "{command}"
+            );
+        }
     }
 
     #[test]

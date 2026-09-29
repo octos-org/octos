@@ -62,7 +62,7 @@ impl Fetch for MockFetch {
                     tokio::time::sleep(d).await;
                     Ok(HttpResponse {
                         status: 200,
-                        body: "[]".into(),
+                        body: r#"{"hits": []}"#.into(),
                         ..Default::default()
                     })
                 }
@@ -783,5 +783,215 @@ fn should_parse_engine_kind_and_default_to_article() {
         Registry::builtin().get("hackernews").unwrap().manifest.kind,
         ItemKind::Article,
         "HN stories link to articles; text posts mark themselves"
+    );
+}
+
+/// An engine on `host` that answers after `delay` with `items`.
+fn delayed(fetch: &MockFetch, host: &str, delay: Duration) {
+    fetch.on(host, Behavior::Delay(delay));
+}
+
+#[tokio::test(start_paused = true)]
+async fn should_drop_a_slow_engine_when_the_others_have_answered() {
+    let fetch = MockFetch::default();
+    for (host, url) in [
+        ("a.example.org", "https://a.org/1"),
+        ("b.example.org", "https://b.org/1"),
+        ("c.example.org", "https://c.org/1"),
+    ] {
+        fetch.on(host, ok(hits(&[(url, "Story")])));
+    }
+    // GDELT-like: answers only after 9 s, well inside its own timeout.
+    delayed(&fetch, "slow.example.org", Duration::from_secs(9));
+    let ms = search(
+        vec![
+            test_engine("a", "a.example.org", serde_json::json!({})),
+            test_engine("b", "b.example.org", serde_json::json!({})),
+            test_engine("c", "c.example.org", serde_json::json!({})),
+            test_engine(
+                "slow",
+                "slow.example.org",
+                serde_json::json!({"timeout_secs": 15}),
+            ),
+        ],
+        &fetch,
+        Config::default(),
+    );
+    let t0 = Instant::now();
+    let resp = ms.search(&request("q")).await;
+    let took = t0.elapsed();
+    assert!(
+        took >= DEFAULT_STRAGGLER_GRACE && took < DEFAULT_STRAGGLER_GRACE + Duration::from_secs(1),
+        "{took:?}"
+    );
+    assert_eq!(resp.items.len(), 3);
+    let slow = resp.engines.iter().find(|r| r.engine == "slow").unwrap();
+    assert_eq!(slow.status, EngineStatus::Timeout);
+    assert!(
+        slow.error.as_deref().unwrap().contains("soft deadline"),
+        "{slow:?}"
+    );
+    // Reports keep the plan order.
+    let order: Vec<&str> = resp.engines.iter().map(|r| r.engine.as_str()).collect();
+    assert_eq!(order, ["a", "b", "c", "slow"]);
+
+    // Without a grace the search waits for it.
+    let mut req = request("q2");
+    req.straggler_grace = None;
+    let t0 = Instant::now();
+    let resp = ms.search(&req).await;
+    assert!(t0.elapsed() >= Duration::from_secs(9));
+    assert_eq!(status_of(&resp, "slow"), EngineStatus::Empty);
+}
+
+#[tokio::test(start_paused = true)]
+async fn should_wait_for_slow_engines_when_no_engine_has_results_yet() {
+    let fetch = MockFetch::default();
+    fetch.on("a.example.org", ok(hits(&[])));
+    fetch.on("b.example.org", ok(hits(&[])));
+    fetch.on("c.example.org", ok(hits(&[])));
+    delayed(&fetch, "slow.example.org", Duration::from_secs(4));
+    let ms = search(
+        vec![
+            test_engine("a", "a.example.org", serde_json::json!({})),
+            test_engine("b", "b.example.org", serde_json::json!({})),
+            test_engine("c", "c.example.org", serde_json::json!({})),
+            test_engine(
+                "slow",
+                "slow.example.org",
+                serde_json::json!({"timeout_secs": 10}),
+            ),
+        ],
+        &fetch,
+        Config::default(),
+    );
+    let t0 = Instant::now();
+    let resp = ms.search(&request("q")).await;
+    assert!(t0.elapsed() >= Duration::from_secs(4), "{:?}", t0.elapsed());
+    assert_eq!(status_of(&resp, "slow"), EngineStatus::Empty);
+}
+
+#[tokio::test(start_paused = true)]
+async fn should_give_up_on_gdelt_after_its_manifest_timeout_when_it_answers_slowly() {
+    // GDELT answers a throttled IP's requests with a 429 only after ~10 s.
+    let gdelt = Registry::builtin().get("gdelt").unwrap().clone();
+    assert!(
+        (4..=5).contains(&gdelt.manifest.timeout_secs),
+        "{}",
+        gdelt.manifest.timeout_secs
+    );
+    let fetch = MockFetch::default();
+    delayed(&fetch, "api.gdeltproject.org", Duration::from_secs(10));
+    let mut r = Registry::default();
+    r.insert(gdelt);
+    let ms = Metasearch::new(r, Arc::new(fetch.clone()), Config::default());
+    let t0 = Instant::now();
+    let resp = ms.search(&request("climate")).await;
+    assert!(t0.elapsed() <= Duration::from_secs(5), "{:?}", t0.elapsed());
+    assert_eq!(resp.engines[0].status, EngineStatus::Timeout);
+    assert_eq!(
+        resp.engines[0].error.as_deref(),
+        Some("no response within 5s")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn should_suspend_longer_when_an_engine_keeps_timing_out() {
+    let fetch = MockFetch::default();
+    delayed(&fetch, "slow.example.org", Duration::from_secs(30));
+    let ms = search(
+        vec![test_engine(
+            "slow",
+            "slow.example.org",
+            serde_json::json!({}),
+        )],
+        &fetch,
+        Config::default(),
+    );
+    let run = |q: &'static str| {
+        let ms = ms.clone();
+        async move { status_of(&ms.search(&request(q)).await, "slow") }
+    };
+    for q in ["q1", "q2", "q3"] {
+        assert_eq!(run(q).await, EngineStatus::Timeout);
+    }
+    assert_eq!(run("q4").await, EngineStatus::Suspended, "30 s after 3");
+    tokio::time::advance(Duration::from_secs(31)).await;
+    for q in ["q5", "q6", "q7"] {
+        assert_eq!(run(q).await, EngineStatus::Timeout);
+    }
+    tokio::time::advance(Duration::from_secs(45)).await;
+    assert_eq!(
+        run("q8").await,
+        EngineStatus::Suspended,
+        "the second run of timeouts suspends for 60 s"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn should_skip_hits_that_do_not_match_the_query_when_the_engine_lists_feeds() {
+    let fetch = MockFetch::default();
+    fetch.on(
+        "feeds.example.org",
+        ok(hits(&[
+            (
+                "https://f24.example/video/terrorist-act",
+                "Locals near UK airbase react to 'terrorist act' arrests",
+            ),
+            (
+                "https://npr.example/ai-schools",
+                "Welcome to the 'Wild West' of AI in schools",
+            ),
+            (
+                "https://cna.example/eu-ai-act",
+                "EU delays parts of its AI Act for high-risk systems",
+            ),
+        ])),
+    );
+    fetch.on(
+        "search.example.org",
+        ok(hits(&[(
+            "https://other.example/eu",
+            "Searched results are not re-checked",
+        )])),
+    );
+    let ms = search(
+        vec![
+            test_engine(
+                "feeds",
+                "feeds.example.org",
+                serde_json::json!({"query_match": true}),
+            ),
+            test_engine("searcher", "search.example.org", serde_json::json!({})),
+        ],
+        &fetch,
+        Config::default(),
+    );
+    let resp = ms.search(&request("EU AI Act")).await;
+    let urls: Vec<&str> = resp.items.iter().map(|i| i.url.as_str()).collect();
+    assert!(urls.contains(&"https://cna.example/eu-ai-act"), "{urls:?}");
+    assert!(urls.contains(&"https://other.example/eu"), "{urls:?}");
+    assert_eq!(urls.len(), 2, "{urls:?}");
+    let feeds = resp.engines.iter().find(|r| r.engine == "feeds").unwrap();
+    assert_eq!(feeds.hits, 1);
+    let skipped: Vec<(&str, &str)> = resp
+        .skipped
+        .iter()
+        .map(|s| (s.url.as_str(), s.reason.as_str()))
+        .collect();
+    assert!(
+        skipped.contains(&("https://f24.example/video/terrorist-act", "query_mismatch")),
+        "{skipped:?}"
+    );
+    assert!(
+        skipped.contains(&("https://npr.example/ai-schools", "query_mismatch")),
+        "{skipped:?}"
+    );
+    assert!(
+        Registry::builtin()
+            .get("publisher_feeds")
+            .unwrap()
+            .manifest
+            .query_match
     );
 }

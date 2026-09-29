@@ -13,7 +13,7 @@
 //!
 //! Every failure is a [`ReadError`] with a specific reason (see
 //! [`crate::access`]): `blocked`, `robots`, `http_<status>`,
-//! `bot_challenge`, `consent_page`, `paywall`, `login_wall`,
+//! `bot_challenge`, `consent_page`, `stub_page`, `paywall`, `login_wall`,
 //! `redirect_unresolved`, `render_failed`, `render_timeout`,
 //! `no_main_text`, … and the final URL when it is known. Walls are reported,
 //! never worked around: a bot challenge over plain HTTP is not retried in the
@@ -332,7 +332,7 @@ impl Reader {
     /// changed, robots.txt. Rejected renders are discarded before any
     /// extraction. Then the page must not be an error page or a wall
     /// ([`access::diagnose`]) and must have main text. Failures: `blocked`,
-    /// robots reasons, `http_<status>`, `bot_challenge`, `consent_page`,
+    /// robots reasons, `http_<status>`, `bot_challenge`, `consent_page`, `stub_page`,
     /// `paywall`, `login_wall`, `redirect_unresolved`, `no_main_text`, each
     /// with the final URL.
     pub async fn accept_rendered(
@@ -609,6 +609,32 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.reason, want, "{name}: {err}");
             assert_eq!(err.final_url.as_deref(), Some(PUBLISHER), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn should_report_consent_page_when_a_rendered_video_page_is_only_a_consent_prompt() {
+        // Rendered France 24 and WRAL video pages from validation 3 (scripts
+        // and styles stripped). Extraction takes the YouTube consent prompt
+        // and the OneTrust preference centre for the article.
+        let reader = Reader::new(ReaderConfig::default());
+        for (name, url) in [
+            (
+                "france24_video_consent.html",
+                "http://93.184.216.34/en/video/20260928-the-last-thing-you-expect",
+            ),
+            (
+                "wral_video_cookie_dialog.html",
+                "http://93.184.216.34/video/trump-rejects-iran-proposal-reopen-strait-hormuz/",
+            ),
+        ] {
+            let err = reader
+                .accept_rendered(url, page(url, fixture(name), Some(200)))
+                .await
+                .unwrap_err();
+            assert_eq!(err.reason, ReadFailure::ConsentPage, "{name}: {err}");
+            assert!(err.detail.contains("not clicked through"), "{name}: {err}");
+            assert_eq!(err.final_url.as_deref(), Some(url), "{name}");
         }
     }
 

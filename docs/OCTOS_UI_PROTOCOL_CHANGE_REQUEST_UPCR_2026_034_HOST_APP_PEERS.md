@@ -94,8 +94,12 @@ profile_id, created}`. Originator plus host token; `context_id` is
 `[a-z0-9][a-z0-9-]{0,63}`. The session key is derived by the kernel:
 `<originator base key>#peerctx-<slug>.<context_id>`. It is an address, not a
 secret. `cwd` defaults to
-`<peer cwd>/contexts/<context_id>`; an explicit `cwd` must lie strictly
-inside the peer's workspace (`peer_context_workspace_escape`). The memory
+`<peer cwd>/contexts/<context_id>`; an explicit `cwd` must be the context's
+own folder `<peer cwd>/contexts/<name>` (one component directly under
+`contexts/`) that no other context of the peer, open or closed, uses:
+anything else (the peer's folder, `contexts/` itself, a sibling such as
+`<peer cwd>/notes`, a nested folder, another context's folder) is refused
+with `peer_context_workspace_escape` (UPCR-2026-035 round 11). The memory
 namespace is `<peer namespace>/ctx-<context_id>`. Idempotent while open.
 
 `peer/context/close {session_id, peer, context_id, host_token}` →
@@ -134,8 +138,11 @@ For a session whose topic is `peer-<slug>` of a host-owned peer, or any
 ### Approvals belong to the person
 
 A host-owned app peer's tool approvals are answered only by the person, in
-the app's own UI (the host answers them with `approval/respond` on the
-peer's session). The owning system agent never approves them:
+the app's own UI, live or via host-enforced standing rules: the host
+answers them with `approval/respond` on the peer's session, either with the
+person's live decision or from a standing rule the person created (still
+once per approval, and only on the host connection). The owning system
+agent never approves them:
 
 - `peer_respond` refuses to approve or deny a host-owned peer's approval —
   named by id, or as the default target — with a model-visible error that
@@ -152,13 +159,19 @@ binding file is unreadable, so a torn binding cannot re-open the path.
 Ordinary sessions and agent-staged peers are unchanged: their originator
 still answers their approvals.
 
+On `octos serve --host-managed`, an external client (anything but the host
+token) cannot answer them either: `approval/respond` and
+`user_question/respond` on a `peer-…` or `peerctx-…` session are refused with
+`host_owned_peer_answer_denied` (UPCR-2026-036).
+
 ## Non-goals and conservative defaults
 
 - **Permission prompts.** Approvals keep their existing policy: an app
   peer's tool approval is raised like any session's and is answered by the
   person through the host (see "Approvals belong to the person"). The system
   agent's ability to answer a peer's ordinary question is not authority to
-  approve a tool; nothing here auto-approves.
+  approve a tool; the kernel auto-approves nothing (a host may answer from
+  the person's standing rules, see above).
 - **Background work after close.** Closing a request context interrupts its
   work; nothing in this UPCR keeps a context running. A host-owned peer
   survives its app's UI closing (the host owns its lifecycle and may close

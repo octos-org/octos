@@ -426,8 +426,10 @@ impl ToolApprovalRequester for CliApprovalRequester {
     async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
         // Fast path: a prior `s` answer auto-resolves without prompting
         // (mirrors serve's `approval_auto_resolved`). Print a note so the
-        // grant stays visible instead of commands silently running.
-        if self.session_approved() {
+        // grant stays visible instead of commands silently running. A
+        // once-only approval (UPCR-2026-035) is never auto-resolved.
+        let once_only = request.once_only;
+        if self.session_approved() && !once_only {
             eprintln!(
                 "{} {}",
                 "Auto-approved (session scope):".dimmed(),
@@ -443,7 +445,7 @@ impl ToolApprovalRequester for CliApprovalRequester {
         // Re-check after acquiring the lock: a parallel tool batch can queue
         // two prompts; if the first answer was `s`, the second must
         // auto-resolve instead of prompting again.
-        if self.session_approved() {
+        if self.session_approved() && !once_only {
             eprintln!(
                 "{} {}",
                 "Auto-approved (session scope):".dimmed(),
@@ -460,6 +462,9 @@ impl ToolApprovalRequester for CliApprovalRequester {
             .unwrap_or(CliApprovalAnswer::Deny);
         match answer {
             CliApprovalAnswer::ApproveOnce => ToolApprovalDecision::Approve,
+            // A once-only approval answers this call and records no session
+            // scope.
+            CliApprovalAnswer::ApproveSession if once_only => ToolApprovalDecision::Approve,
             CliApprovalAnswer::ApproveSession => {
                 self.session_approved
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -1658,6 +1663,8 @@ mod tests {
             body: "Run command: sudo echo hi".into(),
             command: Some("sudo echo hi".into()),
             cwd: None,
+            once_only: false,
+            host_tool: None,
         };
         let decision = requester.request_approval(request).await;
         assert_eq!(decision, ToolApprovalDecision::Approve);

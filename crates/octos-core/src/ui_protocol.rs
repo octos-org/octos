@@ -327,6 +327,44 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
 ];
 
+/// The features an `octos serve --stdio` connection has without negotiating.
+///
+/// A host that moves a native client from the stdio pipe to the WebSocket of
+/// `octos serve --host-managed` sends exactly these in `X-Octos-Ui-Features`
+/// to keep that client's contract. `voice.asr_admission.v1`,
+/// `skill.actions.v1` and `skill.action_jobs.v1` are server-local AppUI
+/// features without an entry in [`UI_PROTOCOL_KNOWN_FEATURES`]. octos-cli
+/// tests that this list and its stdio defaults stay equal.
+pub const UI_PROTOCOL_STDIO_DEFAULT_FEATURES: &[&str] = &[
+    UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
+    UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
+    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1,
+    "voice.asr_admission.v1",
+    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
+    UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
+    UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
+    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1,
+    UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
+    "skill.actions.v1",
+    "skill.action_jobs.v1",
+    UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+];
+
 /// Returns the feature flag that gates `method` per spec § 7 capability
 /// negotiation, or `None` if the method is unconditionally available.
 ///
@@ -410,6 +448,9 @@ pub mod approval_kinds {
     pub const FILESYSTEM: &str = "filesystem";
     pub const NETWORK: &str = "network";
     pub const SANDBOX_ESCALATION: &str = "sandbox_escalation";
+    /// UPCR-2026-035: a host-routed app tool's call. The host renders the
+    /// sheet from `typed_details.host_tool`.
+    pub const HOST_TOOL: &str = "host_tool";
 }
 
 pub mod approval_scopes {
@@ -1332,6 +1373,21 @@ pub mod methods {
     /// [`PEER_STAGED`]: `session_id` is the ORIGINATING session; durable so
     /// reconnect replay redelivers it, and clients dedup by the closed peer.
     pub const PEER_CLOSED: &str = "peer/closed";
+    /// UPCR-2026-035 `peer/tool/call` — the kernel asks the HOST to run one
+    /// app tool of a host-owned app peer. Sent only to the connection that
+    /// registered the peer's tools with `peer/tools/register`; the host
+    /// answers with `peer/tool/result`. Ephemeral: a host that is gone makes
+    /// the call fail (`host_unavailable`), it is never replayed.
+    pub const PEER_TOOL_CALL: &str = "peer/tool/call";
+    /// UPCR-2026-035 `peer/tool/cancel` — the kernel stopped waiting for a
+    /// `peer/tool/call` (`reason`: `timeout` or `cancelled`).
+    pub const PEER_TOOL_CANCEL: &str = "peer/tool/cancel";
+    /// UPCR-2026-035 `peer/input` — the system agent's `peer_send_input` to a
+    /// host-owned app peer, delivered to the peer's host connection instead
+    /// of running as a kernel-internal turn. The host starts the peer's turn
+    /// itself (`turn/start` on the given `session_id`, ideally with the given
+    /// `turn_id`). Ephemeral: with no host connected the send fails.
+    pub const PEER_INPUT: &str = "peer/input";
 
     // ---- Smart-home bridge integration ----
     // Device control/state moved server-side from octos-web's client-only
@@ -1489,6 +1545,9 @@ pub const UI_PROTOCOL_NOTIFICATION_METHODS: &[&str] = &[
     methods::PEER_STAGED,
     methods::PEER_CLOSED,
     methods::BACKGROUND_ACTIVITY,
+    methods::PEER_TOOL_CALL,
+    methods::PEER_TOOL_CANCEL,
+    methods::PEER_INPUT,
 ];
 
 /// Request methods currently handled by the first server/runtime slice.
@@ -5406,6 +5465,40 @@ pub struct ApprovalSandboxEscalationDetails {
     pub suggested_prefix_rule: Vec<String>,
 }
 
+/// UPCR-2026-035: what a host-routed app tool's approval is about, for the
+/// host to render its own approval sheet: the app that owns the tool, the
+/// tool, the exact arguments, and who is calling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalHostToolDetails {
+    /// The app that owns the tool (the declaration's `app`).
+    pub app: String,
+    /// The declared tool name (`<app>.<tool>`).
+    pub tool: String,
+    /// The exact arguments the call will run with.
+    pub args: serde_json::Value,
+    /// `read` | `act` | `destructive`.
+    pub risk: String,
+    #[serde(default)]
+    pub outward: bool,
+    /// `app_peer` (an app peer's session makes the call) or `system` (a
+    /// host session that is not a peer, e.g. the system agent's).
+    #[serde(default)]
+    pub calling_kind: String,
+    /// The calling app peer's slug (the peer whose session makes the call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calling_peer: Option<String>,
+    /// The calling session.
+    pub calling_session_id: String,
+    /// The calling request context, when the call comes from one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// The same call ran before and its outcome is unknown.
+    #[serde(default)]
+    pub outcome_unknown_before: bool,
+}
+
 /// UPCR-2026-001 typed approval payload. `kind` is intentionally a string
 /// registry so unknown future values can fall back to generic approval text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5423,6 +5516,9 @@ pub struct ApprovalTypedDetails {
     pub network: Option<ApprovalNetworkDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_escalation: Option<ApprovalSandboxEscalationDetails>,
+    /// UPCR-2026-035 `kind: "host_tool"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_tool: Option<ApprovalHostToolDetails>,
 }
 
 impl ApprovalTypedDetails {
@@ -5438,6 +5534,21 @@ impl ApprovalTypedDetails {
             filesystem: None,
             network: None,
             sandbox_escalation: None,
+            host_tool: None,
+        }
+    }
+
+    /// A host-routed app tool's approval (UPCR-2026-035).
+    pub fn host_tool(details: ApprovalHostToolDetails) -> Self {
+        Self {
+            kind: approval_kinds::HOST_TOOL.to_owned(),
+            command: None,
+            sandbox: None,
+            diff: None,
+            filesystem: None,
+            network: None,
+            sandbox_escalation: None,
+            host_tool: Some(details),
         }
     }
 }

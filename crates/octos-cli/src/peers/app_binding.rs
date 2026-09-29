@@ -207,6 +207,29 @@ fn context_leaf(context_id: &str) -> String {
     format!("{CONTEXT_LEAF_PREFIX}{context_id}.json")
 }
 
+/// Every recorded request context of staged peer `slug`, open or closed:
+/// `(context id, binding)`.
+pub(crate) fn context_bindings(peers_root: &Path, slug: &str) -> Vec<(String, PeerContextBinding)> {
+    let Some(dir) = staged_peer_dir(peers_root, slug) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let id = name
+                .strip_prefix(CONTEXT_LEAF_PREFIX)?
+                .strip_suffix(".json")?
+                .to_owned();
+            let binding = read_context_binding(peers_root, slug, &id)?;
+            Some((id, binding))
+        })
+        .collect()
+}
+
 /// Read the host binding of staged peer `slug`, if it has one.
 pub(crate) fn read_peer_host_binding(peers_root: &Path, slug: &str) -> Option<PeerHostBinding> {
     let dir = staged_peer_dir(peers_root, slug)?;

@@ -4,11 +4,11 @@
 //! (key-less OctoScript engines over official APIs and feeds: GDELT, Hacker
 //! News, Wikipedia, arXiv, ...; disable with `OCTOS_METASEARCH=0` to call
 //! GDELT + Google News RSS directly for news), then a
-//! self-hosted SearXNG (`SEARXNG_URL`), then search APIs with keys. Scraping
-//! search-results pages (DuckDuckGo HTML, Bing in headless Chrome) is not in
-//! the default order; both need `OCTOS_ALLOW_SERP_SCRAPE=1` (alias
-//! `OCTOS_ALLOW_BROWSER_SERP`). With nothing configured, a general query
-//! returns an empty result that says how to add SearXNG or a key.
+//! self-hosted SearXNG (`SEARXNG_URL`), then search APIs with keys, then
+//! results-page search (DuckDuckGo HTML, Bing in headless Chrome) for general
+//! web results, on unless `OCTOS_ALLOW_SERP_SCRAPE=0` (alias
+//! `OCTOS_ALLOW_BROWSER_SERP`). If nothing returns anything, the result is
+//! empty and says how to add SearXNG or a key.
 //!
 //! Pages that will be cited are read with an identifiable User-Agent,
 //! after a robots.txt check, spaced per host, with size caps; JS-heavy pages
@@ -46,7 +46,7 @@ pub(crate) struct Options {
     pub category: Category,
     /// Render JS-heavy pages with the browser when plain HTTP has no text.
     pub render: bool,
-    /// Operator opt-in (env) for scraping search-results pages.
+    /// Results-page search on (env; on unless turned off).
     pub allow_serp_scrape: bool,
     pub now: DateTime<Utc>,
 }
@@ -212,10 +212,19 @@ fn keyed_available() -> Vec<Provider> {
     .collect()
 }
 
-/// Operator opt-in for scraping search-results pages (DuckDuckGo HTML,
-/// Bing in headless Chrome).
+/// Whether results-page search (DuckDuckGo HTML, Bing in headless Chrome)
+/// is on: yes unless `OCTOS_ALLOW_SERP_SCRAPE=0`.
 pub(crate) fn serp_scrape_allowed() -> bool {
     octos_research::serp_scrape_allowed(|k| std::env::var(k).ok())
+}
+
+/// Upgrade visibility: when a results-page provider runs only because of
+/// the new default, say so once on stderr (the skill's log).
+fn default_notice_once() {
+    static NOTICE: std::sync::Once = std::sync::Once::new();
+    if let Some(notice) = octos_research::serp_scrape_default_notice(|k| std::env::var(k).ok()) {
+        NOTICE.call_once(|| eprintln!("[deep-search] {notice}"));
+    }
 }
 
 /// Automatic provider plan for this environment.
@@ -521,6 +530,7 @@ async fn run_provider(
             if !opts.allow_serp_scrape {
                 return Err("disabled".to_string());
             }
+            default_notice_once();
             ProviderOut {
                 hits: crate::ddg_search(query, count).await?,
                 answer: String::new(),
@@ -531,6 +541,7 @@ async fn run_provider(
             if !opts.allow_serp_scrape {
                 return Err("disabled".to_string());
             }
+            default_notice_once();
             ProviderOut {
                 hits: crate::bing_cdp_search(query, count).await?,
                 answer: String::new(),

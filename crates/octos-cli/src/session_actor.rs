@@ -679,6 +679,7 @@ impl SessionActorPromptContextBridge {
             supports_media: true,
             max_prompt_token_estimate: None,
             model_capability_id: format!("{}/{}", request.provider_name, request.model_id),
+            redact_memory_events: false,
         }
     }
 }
@@ -5033,6 +5034,7 @@ impl SessionActor {
                 self.agent.provider_name(),
                 self.agent.model_id()
             ),
+            redact_memory_events: false,
         }
     }
 

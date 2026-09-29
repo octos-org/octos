@@ -260,7 +260,7 @@ fn is_substantial(s: &str) -> bool {
         >= 4
 }
 
-fn is_cjk(c: char) -> bool {
+pub(crate) fn is_cjk(c: char) -> bool {
     matches!(c as u32,
         0x3040..=0x30FF   // kana
         | 0x3400..=0x4DBF // CJK ext A

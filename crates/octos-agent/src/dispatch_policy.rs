@@ -437,6 +437,8 @@ pub async fn enforce_dispatch_gates_for_backend(
             ),
             command: None,
             cwd: None,
+            once_only: false,
+            host_tool: None,
         };
         let decision = requester.request_approval(request).await;
         if matches!(decision, ToolApprovalDecision::Deny) {

@@ -369,7 +369,15 @@ pub(crate) struct PromptBuildPolicy {
     pub(crate) supports_media: bool,
     pub(crate) max_prompt_token_estimate: Option<usize>,
     pub(crate) model_capability_id: String,
+    /// UPCR-2026-035: render every earlier `memory_update` context event as
+    /// "no memory" instead of its content. Set for a turn on an app peer's
+    /// session that is not driven by the peer's host connection, so memory
+    /// injected into the host's earlier turns never reaches it.
+    pub(crate) redact_memory_events: bool,
 }
+
+/// What a redacted `memory_update` context event renders as.
+pub(crate) const REDACTED_MEMORY_EVENT: &str = "No injected memory is currently available.";
 
 impl Default for PromptBuildPolicy {
     fn default() -> Self {
@@ -378,6 +386,7 @@ impl Default for PromptBuildPolicy {
             supports_media: false,
             max_prompt_token_estimate: None,
             model_capability_id: "text-only-v1".to_owned(),
+            redact_memory_events: false,
         }
     }
 }
@@ -3426,6 +3435,13 @@ impl ContextManager {
                     label,
                     content,
                 } => {
+                    let content = if policy.redact_memory_events
+                        && *event_kind == ContextEventKind::MemoryUpdate
+                    {
+                        REDACTED_MEMORY_EVENT
+                    } else {
+                        content.as_str()
+                    };
                     entries.push(PromptMessageEntry::new(
                         message(
                             MessageRole::User,

@@ -396,7 +396,12 @@ struct ApprovedToolAutoApprover;
 
 #[async_trait::async_trait]
 impl ToolApprovalRequester for ApprovedToolAutoApprover {
-    async fn request_approval(&self, _request: ToolApprovalRequest) -> ToolApprovalDecision {
+    async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        // A once-only approval (a host-routed app tool, UPCR-2026-035) is the
+        // person's answer to one exact call; a replay path never grants it.
+        if request.once_only {
+            return ToolApprovalDecision::Deny;
+        }
         ToolApprovalDecision::Approve
     }
 }
@@ -3107,6 +3112,30 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn should_never_auto_approve_a_once_only_request() {
+        use crate::tools::{ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester};
+        let request = |once_only| ToolApprovalRequest {
+            tool_id: "c1".into(),
+            tool_name: "mail_send".into(),
+            title: "Approve".into(),
+            body: "exact args".into(),
+            command: None,
+            cwd: None,
+            once_only,
+            host_tool: None,
+        };
+        let approver = super::ApprovedToolAutoApprover;
+        assert_eq!(
+            approver.request_approval(request(true)).await,
+            ToolApprovalDecision::Deny
+        );
+        assert_eq!(
+            approver.request_approval(request(false)).await,
+            ToolApprovalDecision::Approve
+        );
+    }
+
     use super::{
         build_spawn_only_produced_files_message, relativize_workspace_path,
         satisfied_completion_content, satisfied_delivery_is_failure, should_auto_send_tool_files,

@@ -489,7 +489,8 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `server/shutdown` (accepted `UPCR-2026-032`; stops the serving process
   through the same graceful path as SIGINT; advertised and callable only on a
   local `--solo` HTTP serve, never to session-scoped connections, otherwise
-  typed `server_shutdown_unavailable`)
+  typed `server_shutdown_unavailable`; never on `octos serve --host-managed`,
+  `UPCR-2026-036`)
 - `session/status/read` (accepted `UPCR-2026-017`)
 - `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`
   (accepted `UPCR-2026-017`; `auth/me` and `auth/logout` are omitted from the
@@ -558,6 +559,60 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   (`session_binding_closed`), and its id is never reopened. Typed
   `data.kind`: `peer_not_host_bound`, `peer_context_closed`,
   `peer_context_not_found`, `peer_context_workspace_escape`)
+- `peer/tools/register` (accepted `UPCR-2026-035`: the host declares a
+  host-owned app peer's app tools and the generic kernel tools it may use;
+  without `peer`, the tools of the host SESSION `session_id` itself (e.g.
+  the system agent's conversation; credential: the host token of an app
+  peer that session prepared; only the registering connection's turns get
+  them, calls carry `caller.kind: "system"`, and the set lives as long as
+  that connection);
+  `{session_id, peer?, host_token, tools?, generic_tools?, if_version?,
+  call_timeout_ms?, approval_ttl_secs?, max_result_bytes?}` (`tools` are
+  the app bundle's `tools.json` entries: `name`, `description`,
+  `input_schema`, `output_schema?`, `risk`, `background?`, `outward?`,
+  `confirm?` `host`|`app`) →
+  `{slug, version, previous_version, tools, generic_tools, applies:
+  "next_turn"}`. Replaces the set atomically; from the next turn every
+  session of the peer and of its request contexts ADDS those app tools to
+  the peer's usual kernel tools (exactly `generic_tools` of them when the
+  host sets that list), but only for turns on the peer originator's base key
+  that are driven by the registering connection; any other turn on those
+  topics gets no tools (hosts must drive the peer's turns on that
+  connection). App tool calls are sent to the registering connection as the
+  server notification `peer/tool/call` `{peer, session_id, context_id,
+  turn_id, call_id, tool_call_id, args_digest, name, app, caller: {peer,
+  session_id, context_id}, args, risk, confirm_required, timeout_ms,
+  tools_version}` (`app` = the tool's owning app, which a cross-app tool
+  names in its declaration; `caller` = `{kind, peer, session_id,
+  context_id, turn_id}`, the calling peer, session and turn); `peer/tool/cancel`
+  `{call_id, reason}` stops one, after which the host must not execute it.
+  `generic_tools`, when given, is the peer's kernel tool set exactly (no
+  kernel-side exclusions; it never adds a tool the session lacks). Approvals of these calls, and `turn/steer` / `turn/interrupt` on
+  the peer's sessions, belong to the host connection: other connections do
+  not see those approvals and are refused (`peer_host_connection_only`). Kernel approvals of these calls are once-only: no
+  remembered scope answers them or is recorded from them. Destructive and outward tools need an `approval/requested` →
+  `approval/respond` on the calling session first (the host renders it),
+  except `confirm: app` tools, which the host hands to the owning app's own
+  sheet for callers of every kind (`confirm_required: true`). Typed `data.kind`:
+  `peer_not_host_bound`, `peer_tools_invalid`, `peer_tools_version_conflict`)
+- `peer/tool/result` (accepted `UPCR-2026-035`: the host answers one
+  `peer/tool/call`; `{session_id, peer?, host_token, call_id, ok?, data?,
+  error?, status?: "awaiting_confirmation"}` → `{call_id, accepted,
+  result_too_large?, awaiting_confirmation?}`; an acknowledgement extends a
+  gated call's wait to the approval TTL; an unanswered non-read call ends as
+  `outcome_unknown`; typed `data.kind` `peer_tool_call_not_found` for a
+  finished, timed-out or cancelled call, whose late result is audited)
+- `peer/input/reject` (accepted `UPCR-2026-035`, #2618: the host refuses a
+  `peer/input`; `{session_id, peer, host_token, input_id, reason:
+  "signed_out" | "no_consent" | "busy" | "other", message?}` → `{input_id,
+  rejected, reported_to: "call" | "system_session"}`; only from the connection
+  the input was sent to, once, before a `turn/start` with its `turn_id`; the
+  system agent's waiting `peer_send_input` fails with `peer_input_rejected:
+  <reason>`, or the refusal is reported on the system session's next turn;
+  the `turn_id` is released and a later `turn/start` with it is refused;
+  typed `data.kind` `peer_input_reject_invalid`, `peer_input_not_found`,
+  `peer_input_wrong_connection`, `peer_input_already_rejected`,
+  `peer_input_already_started`)
 - `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
   latest `result.md` — written server-side on every peer-session turn
   terminal — with per-field truncation flags and `result_updated_unix`;
@@ -728,6 +783,26 @@ Peer staging (#1801 v3, ungated):
   `peer-<slug>`). `params` carry the ORIGINATING `session_id` plus `topic`,
   `slug`, and `profile_id`. Durable: reconnect replay redelivers it, so
   clients dedup by the already-closed peer for the topic.
+
+Host-registered peer tools (UPCR-2026-035; sent only to the connection that
+registered a host-owned app peer's tools with `peer/tools/register`):
+
+- `peer/tool/call` — run one app tool: `{peer, session_id, context_id,
+  turn_id, call_id, tool_call_id, args_digest, name, app, caller, args,
+  risk, confirm_required, timeout_ms, tools_version}`. Approvals of these
+  calls carry `approval_kind: "host_tool"` and `typed_details.host_tool`
+  `{app, tool, args, risk, outward, calling_peer?, calling_session_id,
+  context_id?, tool_call_id?, outcome_unknown_before}` for the host's own
+  sheet. The host answers with `peer/tool/result`.
+  Ephemeral: never replayed; a host that is gone fails the call.
+- `peer/tool/cancel` — the kernel stopped waiting for `call_id`
+  (`reason`: `timeout` | `cancelled`).
+- `peer/input` — the system agent's `peer_send_input` to a host-owned peer:
+  `{peer, session_id, input_id, turn_id, text}`. The host starts the peer's
+  turn itself (`turn/start` on `session_id` with `turn_id` and the text, on
+  the same connection), or refuses it with `peer/input/reject`. Never run as
+  a kernel-internal turn; with no host connected `peer_send_input` fails and
+  nothing is queued. Ephemeral.
 
 Background activity — the human sink (#2019, gate `event.background_activity.v1`):
 
@@ -2137,7 +2212,8 @@ Optional typed fields from accepted `UPCR-2026-001`:
 
 - `approval_kind`
   String registry with initial values `command`, `diff`, `filesystem`,
-  `network`, and `sandbox_escalation`.
+  `network`, and `sandbox_escalation`; `host_tool` (UPCR-2026-035) for a
+  host-routed app tool's call, with `typed_details.host_tool`.
 - `risk`
   Display/audit risk label.
 - `typed_details`

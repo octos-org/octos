@@ -260,6 +260,48 @@ jobs:
           bash scripts/test-install-paths.sh
           pwsh scripts/tests/test-install-checksum.ps1
 
+  # Classifies a PR's diff so the heavy suites can skip PRs that only touch
+  # the research crates. `octos-research` is a leaf library used by
+  # octos-agent's web_search / site_crawl / deep_search tools, and
+  # deep-search / deep-crawl are standalone skill binaries: `check` still
+  # runs fmt, clippy over the whole workspace and their tests, and
+  # test-octos-agent runs the tools that use them. Pushes to main always
+  # run everything, so anything this lets through is caught on merge.
+  #   research_only: every changed file is under a research path.
+  #   windows_neutral: research_only and no skill crate changed (the skills
+  #     have cfg(not(unix)) code that only check-windows compiles).
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      research_only: ${{ steps.scope.outputs.research_only }}
+      windows_neutral: ${{ steps.scope.outputs.windows_neutral }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: scope
+        run: |
+          set -euo pipefail
+          research_only=false
+          windows_neutral=false
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+            echo "Changed files:"
+            echo "$FILES"
+            # Here-strings, not pipes: under pipefail an early `grep -q` exit
+            # can SIGPIPE `echo`, and the negated failure would read as a match.
+            if [ -n "$FILES" ] && ! grep -qvE '^crates/(octos-research|app-skills/deep-search|app-skills/deep-crawl)/' <<<"$FILES"; then
+              research_only=true
+              if ! grep -qvE '^crates/octos-research/' <<<"$FILES"; then
+                windows_neutral=true
+              fi
+            fi
+          fi
+          echo "research_only=$research_only" | tee -a "$GITHUB_OUTPUT"
+          echo "windows_neutral=$windows_neutral" | tee -a "$GITHUB_OUTPUT"
+
   check:
     runs-on: ubuntu-latest
     env:
@@ -449,6 +491,7 @@ jobs:
         # 16GB allocation and neither inherits residual RAM from the
         # other's compile phase.
         test-mode: [lib, integration]
+    needs: scope
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "1"
@@ -470,11 +513,16 @@ jobs:
           shared-key: octos-agent-tests-${{ matrix.test-mode }}
 
       - name: Test octos-agent (lib)
-        if: matrix.test-mode == 'lib'
+        if: matrix.test-mode == 'lib' && needs.scope.outputs.research_only != 'true'
         run: cargo test -p octos-agent --lib
 
+      # Research-only PR: just the tools built on octos-research.
+      - name: Test octos-agent (lib, research tools)
+        if: matrix.test-mode == 'lib' && needs.scope.outputs.research_only == 'true'
+        run: cargo test -p octos-agent --lib -- tools::web_search tools::site_crawl tools::deep_search
+
       - name: Test octos-agent (integration)
-        if: matrix.test-mode == 'integration'
+        if: matrix.test-mode == 'integration' && needs.scope.outputs.research_only != 'true'
         env:
           # Keep a cache miss viable on the standard runner. This shard links
           # many test binaries, so omit debug info to reduce disk and peak RSS.
@@ -494,18 +542,28 @@ jobs:
         run: cargo test -p octos-agent --test '*' -- --test-threads=1
 
 
-  # Split three ways so the PR wait is the slowest third (~25 min), not the
-  # whole ~57 min serial run. Every step that ran before still runs, in
-  # exactly one part: `unit` (lib + the api-feature filter suites + smart-home),
-  # `integration` (integration tests + the serial serve process e2e), `oup`
-  # (the OUP runtime/frontend contracts and their evidence). Each part keeps
-  # its own warm cache.
+  # Split four ways so the PR wait is the slowest part (integration, ~35 min on
+  # 2026-09-28), not the whole ~90 min serial run. Every step that ran before
+  # still runs, in exactly one part: `unit` (lib + the api-feature filter
+  # suites + smart-home), `integration` (integration tests + the serial serve
+  # process e2e), `oup` (the OUP runtime/C-Python ABI contracts and their
+  # evidence), `oup-minimal` (the no-default-features frontend contract and
+  # strict lint). Each part keeps its own warm cache.
   test-octos-cli:
     name: test-octos-cli (${{ matrix.part }})
     strategy:
       fail-fast: false
       matrix:
-        part: [unit, integration, oup]
+        # oup-minimal is its own leg (#2421): it rebuilds every target with a
+        # --no-default-features fingerprint, so sharing the oup runner paid a
+        # second serial full build (~22 min, main run 36430435982) on every
+        # PR. The new context is enforced transitively for now — a failure
+        # skips the required security job through the test-octos-cli
+        # needs-aggregate — so add `test-octos-cli (oup-minimal)` to the
+        # branch-protection ruleset's required contexts.
+        part: [unit, integration, oup, oup-minimal]
+    needs: scope
+    if: needs.scope.outputs.research_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "1"
@@ -531,23 +589,26 @@ jobs:
 
       - name: Test octos-cli (integration, excluding serve process e2e)
         if: matrix.part == 'integration'
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_solo_gateway_guard
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
 
       - name: OUP runtime and C/Python contracts
         if: matrix.part == 'oup'
         run: ./scripts/milestone-ci.sh oup-runtime
 
       # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe),
-      # SIGTERM gateway-reap e2e (serve_sigterm), and solo manual-start
-      # guard e2e (serve_solo_gateway_guard). These spawn real
+      # SIGTERM gateway-reap e2e (serve_sigterm), WS half-open
+      # liveness e2e (serve_ws_liveness), solo manual-start
+      # guard e2e (serve_solo_gateway_guard), and the host-managed ownership
+      # e2e (serve_host_managed: stdin EOF, host SIGKILL, inherited listener).
+      # These spawn real
       # `octos serve` children that contend for model catalog / profile
       # store resources with other test binaries; under the default
       # thread-per-core parallelism the children starve and the 15s port
       # barrier times out. Dedicated serial step per the #21 outer-loop
       # ruling (2026-08-27): layer at the CI command level, never #[ignore].
-      - name: serve BrokenPipe/SIGTERM/solo-guard process e2e (serial)
+      - name: serve BrokenPipe/SIGTERM/WS-liveness/solo-guard/host-managed process e2e (serial)
         if: matrix.part == 'integration'
-        run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_sigterm --test serve_solo_gateway_guard -- --test-threads=1
+        run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_sigterm --test serve_ws_liveness --test serve_solo_gateway_guard --test serve_host_managed -- --test-threads=1
 
       # In the `unit` part, so they reuse its warm octos-cli build cache.
       # All api-feature filter steps below go through ci-api-filter-test.sh:
@@ -651,7 +712,7 @@ jobs:
         run: cargo test -p smart-home
 
       - name: Minimal OUP frontend contract
-        if: matrix.part == 'oup'
+        if: matrix.part == 'oup-minimal'
         run: ./scripts/milestone-ci.sh oup-minimal
 
       - name: Retain OUP runtime evidence
@@ -663,19 +724,36 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+      # Same evidence dir as the runtime leg, distinct artifact name: two
+      # matrix legs may not upload under one name in the same run.
+      - name: Retain OUP minimal evidence
+        if: always() && matrix.part == 'oup-minimal'
+        uses: actions/upload-artifact@v7
+        with:
+          name: oup-minimal-evidence
+          path: target/oup-functional/
+          retention-days: 14
+          if-no-files-found: error
+
   # Lightweight check that exercises the `matrix` feature gate. The default
   # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
   # job lean, but the Dockerfile and several release configurations enable it.
   # Without this job, feature-gated compile errors (e.g. an identifier referenced
   # only inside `#[cfg(feature = "matrix")]`) slip past PR CI and only surface
-  # during docker builds. Keep this job intentionally tiny: no tests.
-  # It also carries the clippy gate for the feature-gated api/serve/ui_protocol
-  # modules: octos-cli has `default = []`, so the workspace clippy in `check`
-  # never lints them — and clippy subsumes `cargo check`.
+  # during docker builds. It also carries the clippy gate for the feature-gated
+  # channel modules: the non-api channels stay outside octos-cli's default
+  # features, so the workspace clippy in `check` never lints them — and clippy
+  # subsumes `cargo check`. And it runs the feature-gated octos-bus matrix
+  # test suite: with the feature off (as in `check`'s `cargo test -p
+  # octos-bus`) the whole suite is cfg'd out, and the workspace-wide runs that
+  # do execute it only exist in the nightly and self-hosted lanes.
   check-matrix:
+    needs: scope
+    if: needs.scope.outputs.research_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v6
 
@@ -695,6 +773,21 @@ jobs:
 
       - name: Clippy octos-cli with matrix feature
         run: cargo clippy -p octos-cli --all-targets --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3 -- -D warnings
+
+      # The suite itself: its only PR-time execution. Floor-check the listing
+      # first so the gate fails loudly if the suite silently drops to zero
+      # (the #2029 lesson), and skip the known nightly failure
+      # test_handle_room_query_requires_token (#2267: fails on the slow
+      # runner lanes) so the gate stays deterministic; lift the skip with the
+      # #2267 fix.
+      - name: Test octos-bus with the matrix feature
+        run: |
+          count=$(cargo test -p octos-bus --features matrix -- --list matrix_ | grep -c ': test$')
+          if [ "$count" -lt 100 ]; then
+            echo "::error::only $count matrix-gated tests listed; expected the suite floor of 100"
+            exit 1
+          fi
+          cargo test -p octos-bus --features matrix -- --skip test_handle_room_query_requires_token
 
   check-arm:
     # Deliberately NOT on PRs, unlike check-windows: the workspace has ZERO
@@ -755,12 +848,14 @@ jobs:
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
       # Same serve-process exclusions as the test-octos-cli PR job: the
-      # serve_broken_pipe / serve_sigterm e2e suites spawn real `octos serve`
-      # children that starve under default thread-per-core parallelism. They
-      # get their dedicated serial run in test-octos-cli; skipping here keeps
-      # this manual lane's coverage semantics identical to the PR lane's.
+      # serve_broken_pipe / serve_sigterm / serve_ws_liveness /
+      # serve_solo_gateway_guard e2e suites
+      # spawn real `octos serve` children that starve under default
+      # thread-per-core parallelism. They get their dedicated serial run in
+      # test-octos-cli; skipping here keeps this manual lane's coverage
+      # semantics identical to the PR lane's.
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_solo_gateway_guard
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
@@ -839,7 +934,7 @@ jobs:
       # Same serve-process exclusions as the test-octos-cli PR job (see the
       # matching comment in check-arm).
       - name: Test octos-cli (integration, excluding serve process e2e)
-        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_solo_gateway_guard
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
@@ -850,6 +945,8 @@ jobs:
         run: cargo test --workspace --doc
 
   check-windows:
+    needs: scope
+    if: needs.scope.outputs.windows_neutral != 'true'
     # Runs on PRs, unlike its ARM/RISC-V siblings below. The workspace has 42
     # `cfg(windows)` sites that NEVER compile on the Linux runners every other
     # PR job uses, so a Windows-only break was invisible until after merge. At
@@ -998,6 +1095,8 @@ jobs:
         run: cargo test --workspace --doc
 
   check-darwin:
+    needs: scope
+    if: needs.scope.outputs.research_only != 'true'
     # Runs on PRs, like check-windows: the workspace has 89
     # `cfg(target_os = "macos")` sites that NEVER compile on the Linux runners
     # every other PR job uses, so a macOS-only break was invisible until after
@@ -1400,6 +1499,11 @@ jobs:
   security:
     runs-on: macos-14
     needs: [check, test-octos-agent, test-octos-cli]
+    # test-octos-cli is skipped on research-only PRs (see `scope`).
+    if: >-
+      !cancelled() && needs.check.result == 'success'
+      && needs.test-octos-agent.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.test-octos-cli.result)
     # Run on pushes and on every PR — the file-level detection below is the
     # only filter (title keyword matching used to let security-relevant PRs
     # slip through when the title didn't say "security"/"sandbox").
@@ -1449,6 +1553,7 @@ jobs:
     name: CI required
     if: always()
     needs:
+      - scope
       - dashboard
       - swarm-app
       - typos
@@ -1474,11 +1579,22 @@ jobs:
           set -euo pipefail
           echo "$RESULTS" | jq .
 
-          for job in dashboard swarm-app typos ux-gate-report \
+          # Jobs `scope` skipped on a research-only PR may be "skipped".
+          research_only=$(echo "$RESULTS" | jq -r '.scope.outputs.research_only')
+          windows_neutral=$(echo "$RESULTS" | jq -r '.scope.outputs.windows_neutral')
+          for job in scope dashboard swarm-app typos ux-gate-report \
             windows-deploy-script web-app-base-url-windows check \
             test-octos-agent test-octos-cli check-matrix check-windows \
             check-darwin e2e-changes security; do
             result=$(echo "$RESULTS" | jq -r --arg job "$job" '.[$job].result')
+            skippable=false
+            case "$job" in
+              test-octos-cli|check-matrix|check-darwin) [ "$research_only" = true ] && skippable=true ;;
+              check-windows) [ "$windows_neutral" = true ] && skippable=true ;;
+            esac
+            if [ "$result" = skipped ] && [ "$skippable" = true ]; then
+              continue
+            fi
             if [ "$result" != success ]; then
               echo "::error::required job $job finished with $result"
               exit 1

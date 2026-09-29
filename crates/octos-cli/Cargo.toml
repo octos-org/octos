@@ -143,7 +143,10 @@ rpassword = { workspace = true }
 # `src/build_cache/pool.rs` (review #3 D1). Unlike the `kill` binary, the
 # syscall returns a distinguishable errno (ESRCH vs EPERM), and unlike
 # `libc::kill` it is safe under the workspace-wide deny(unsafe_code).
-rustix = { version = "1.1", features = ["fs", "process"] }
+# `net` validates the listener `serve --host-managed --listen-fd` inherits
+# (socket type, listen) in `src/api/host_managed.rs`; `process` also sets its
+# Linux/Android parent-death signal.
+rustix = { version = "1.1", features = ["fs", "process", "net"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }

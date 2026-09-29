@@ -955,6 +955,9 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "peer/staged",
             "peer/closed",
             "background/activity",
+            "peer/tool/call",
+            "peer/tool/cancel",
+            "peer/input",
         ]
     );
     assert_eq!(
@@ -1179,7 +1182,10 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "session/orchestration",
                 "peer/staged",
                 "peer/closed",
-                "background/activity"
+                "background/activity",
+                "peer/tool/call",
+                "peer/tool/cancel",
+                "peer/input"
             ],
             "supported_features": [
                 "approval.typed.v1",
@@ -1536,6 +1542,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
                 filesystem: None,
                 network: None,
                 sandbox_escalation: None,
+                host_tool: None,
             }),
             ..generic.clone()
         },
@@ -1558,6 +1565,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
                 }),
                 network: None,
                 sandbox_escalation: None,
+                host_tool: None,
             }),
             ..generic.clone()
         },
@@ -1580,6 +1588,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
                     urls: vec!["https://api.openai.com/v1/responses".into()],
                 }),
                 sandbox_escalation: None,
+                host_tool: None,
             }),
             ..generic.clone()
         },
@@ -1612,6 +1621,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
                     justification: Some("Run integration tests".into()),
                     suggested_prefix_rule: vec!["cargo".into(), "test".into()],
                 }),
+                host_tool: None,
             }),
             ..generic
         },

@@ -19,6 +19,11 @@
 //! - Everything else (challenge, consent, paywall and login phrases, a
 //!   paywall declared in schema.org `isAccessibleForFree`, error pages) only
 //!   when the page yielded no main text and has little visible text.
+//! - Extracted main text that is not an article: a consent dialog (mostly
+//!   consent wording, with three of the dialog's own phrases unquoted), an
+//!   embedded player's consent prompt with no article text left
+//!   (`consent_page`), or boilerplate, a playlist or a video caption with
+//!   less than a few sentences of its own (`stub_page`).
 //!
 //! No HTML parser is needed, so `deep-crawl` (which builds without
 //! `extract`) can share the detector.
@@ -32,7 +37,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::urls;
 
 /// Why a read failed. Serialized as its [`code`](ReadFailure::code):
-/// `redirect_unresolved`, `consent_page`, `paywall`, `login_wall`,
+/// `redirect_unresolved`, `consent_page`, `stub_page`, `paywall`, `login_wall`,
 /// `bot_challenge`, `render_failed`, `render_timeout`, `no_main_text`,
 /// `blocked`, `http_<status>`, `robots`, `robots_unreachable`,
 /// `fetch_error`, `unsupported_content_type`.
@@ -41,8 +46,13 @@ pub enum ReadFailure {
     /// An aggregator link (Google News) was not resolved to the publisher:
     /// no browser renderer, or the browser stayed on the aggregator.
     RedirectUnresolved,
-    /// A cookie or privacy consent wall (not clicked through).
+    /// A cookie or privacy consent wall (not clicked through), including a
+    /// consent dialog or an embedded player's consent prompt that extraction
+    /// took for the article.
     ConsentPage,
+    /// The page loaded, but its text is only a stub: a video page's player
+    /// and caption, a playlist, or boilerplate with no article text.
+    StubPage,
     /// A subscriber-only page (not bypassed).
     Paywall,
     /// The content is shown only to signed-in users.
@@ -84,6 +94,7 @@ impl ReadFailure {
         match self {
             Self::RedirectUnresolved => "redirect_unresolved",
             Self::ConsentPage => "consent_page",
+            Self::StubPage => "stub_page",
             Self::Paywall => "paywall",
             Self::LoginWall => "login_wall",
             Self::BotChallenge => "bot_challenge",
@@ -112,6 +123,7 @@ impl ReadFailure {
         [
             Self::RedirectUnresolved,
             Self::ConsentPage,
+            Self::StubPage,
             Self::Paywall,
             Self::LoginWall,
             Self::BotChallenge,
@@ -321,7 +333,7 @@ pub fn diagnose(
                 .at(final_url),
             );
         }
-        return None;
+        return judge_main_text(&main, final_url, head).map(|e| e.at(final_url));
     }
 
     // 3. Pages with no main text and little visible text.
@@ -390,6 +402,9 @@ const CHALLENGE_PHRASES: &[&str] = &[
     "attention required! | cloudflare",
     "enable javascript and cookies to continue",
     "unusual traffic from your computer network",
+    // Results pages (#2607): DuckDuckGo's HTML-endpoint check and Bing's.
+    "unfortunately, bots use duckduckgo too",
+    "please solve the challenge below to continue",
 ];
 
 /// Titles challenge pages use.
@@ -409,6 +424,12 @@ fn challenge_marker(lower_html: &str, title: &str) -> Option<&'static str> {
     }
     if lower_html.contains("id=\"px-captcha\"") || lower_html.contains("px-captcha") {
         return Some("a HUMAN (PerimeterX) challenge");
+    }
+    if lower_html.contains("anomaly-modal") || lower_html.contains("duckduckgo.com/anomaly.js") {
+        return Some("a DuckDuckGo bot check");
+    }
+    if lower_html.contains("bing.com/turing/captcha") || lower_html.contains("\"/turing/captcha") {
+        return Some("a Bing challenge");
     }
     if CHALLENGE_TITLES.iter().any(|t| title.trim() == *t) {
         return Some("a bot-challenge page");
@@ -471,6 +492,389 @@ fn is_consent_wall(text: &str) -> bool {
     .filter(|w| text.contains(**w))
     .count();
     topic && choice >= 2
+}
+
+/// Main text with less article text than this (in [`text_weight`] units:
+/// characters, CJK counted three times) is not an article.
+const MIN_PROSE_WEIGHT: usize = 150;
+
+/// A video page's text must carry at least this much article text to be
+/// more than its caption.
+const MIN_VIDEO_PAGE_PROSE_WEIGHT: usize = 400;
+
+/// Share (in tenths) of the main text in consent lines at which, with
+/// [`MIN_DIALOG_MARKERS`] of the dialog's own phrases, the text is a
+/// consent dialog.
+const DIALOG_SHARE_TENTHS: usize = 6;
+const MIN_DIALOG_MARKERS: usize = 3;
+
+/// Words that put a line in a consent dialog, in the languages the reader
+/// meets most. Lowercase.
+const CONSENT_VOCABULARY: &[&str] = &[
+    "cookie",
+    "consent",
+    "privacy",
+    "personal data",
+    "personal information",
+    "tracking",
+    "opt out",
+    "opt-out",
+    "advertising partners",
+    "einwilligung",
+    "datenschutz",
+    "werbepartner",
+    "consentement",
+    "données personnelles",
+    "vie privée",
+    "suivi publicitaire",
+    "consentimiento",
+    "privacidad",
+    "datos personales",
+    "consenso",
+    "dati personali",
+    "toestemming",
+    "consentimento",
+    "隐私",
+    "隱私",
+    "同意",
+    "个人信息",
+    "個人資料",
+    "クッキー",
+    "쿠키",
+    "개인정보",
+];
+
+/// Phrases consent dialogs say about themselves, or their buttons.
+/// Lowercase. Counted only when not quoted, so an article that reports on
+/// "Accept all" buttons is not a dialog.
+const DIALOG_MARKERS: &[&str] = &[
+    "accept all",
+    "reject all",
+    "allow all",
+    "deny all",
+    "decline all",
+    "accept cookies",
+    "cookie settings",
+    "cookie preferences",
+    "manage preferences",
+    "manage options",
+    "manage my choices",
+    "manage consent",
+    "privacy preference center",
+    "strictly necessary",
+    "always active",
+    "performance cookies",
+    "targeting cookies",
+    "functional cookies",
+    "analytics cookies",
+    "advertising cookies",
+    "these cookies",
+    "we use cookies",
+    "we store cookies",
+    "this site uses cookies",
+    "this website uses cookies",
+    "store and/or access information on a device",
+    "your consent choices",
+    "we value your privacy",
+    "before you continue",
+    "sale of personal data",
+    "more options",
+    // de
+    "alle akzeptieren",
+    "alle ablehnen",
+    "einstellungen verwalten",
+    "wir verwenden cookies",
+    "diese cookies",
+    "notwendige cookies",
+    // fr
+    "tout accepter",
+    "tout refuser",
+    "nous utilisons des cookies",
+    "gérer mes choix",
+    "paramétrer les cookies",
+    // es, pt
+    "aceptar todo",
+    "rechazar todo",
+    "utilizamos cookies",
+    "usamos cookies",
+    "aceitar tudo",
+    "rejeitar tudo",
+    // it, nl
+    "accetta tutto",
+    "rifiuta tutto",
+    "utilizziamo i cookie",
+    "alles accepteren",
+    "alles weigeren",
+    "wij gebruiken cookies",
+    // zh, ja, ko
+    "接受全部",
+    "全部接受",
+    "接受所有",
+    "拒绝全部",
+    "全部拒绝",
+    "拒绝所有",
+    "拒絕全部",
+    "我们使用cookie",
+    "我們使用cookie",
+    "管理偏好",
+    "这些cookie",
+    "這些cookie",
+    "すべて同意",
+    "すべて拒否",
+    "모두 동의",
+    "모두 거부",
+];
+
+/// An embedded player's consent prompt ("to display this content from
+/// YouTube, you must enable advertisement tracking"). Lowercase.
+const EMBED_CONSENT_PHRASES: &[&str] = &[
+    "to display this content from",
+    "you must enable advertisement tracking",
+    "before you continue to youtube",
+    "accept cookies to view",
+    "accept cookies to watch",
+    "pour afficher ce contenu",
+    "vous devez activer le suivi publicitaire",
+    "bevor sie zu youtube weitergehen",
+    "um diesen inhalt anzuzeigen",
+    "para mostrar este contenido",
+    "per visualizzare questo contenuto",
+];
+
+/// Player chrome that extraction keeps as text. Lowercase.
+const PLAYER_PHRASES: &[&str] = &[
+    "video player",
+    "to watch this content",
+    "play video",
+    "your browser does not support the video",
+    "ie 11 is not supported",
+    "for an optimal experience visit",
+    "lecteur vidéo",
+    "regarder ce contenu",
+    "视频播放器",
+];
+
+/// Short lines that are page furniture, by how they start. Lowercase.
+const FURNITURE_STARTS: &[&str] = &[
+    "share",
+    "read more",
+    "read less",
+    "advertisement",
+    "up next",
+    "now playing",
+    "subscribe",
+    "sign up",
+    "follow us",
+    "issued on",
+    "published",
+    "posted",
+    "updated",
+    "last updated",
+    "cover image",
+    "image:",
+    "photo:",
+    "credit:",
+    "©",
+    "copyright",
+    "partager",
+    "publié le",
+    "image de couverture",
+    "分享",
+    "发表时间",
+    "發表時間",
+    "来源：",
+    "來源：",
+    "责任编辑",
+    "責任編輯",
+    "广告",
+    "廣告",
+];
+
+/// What the sentences of an extracted text are.
+#[derive(Debug, Default)]
+struct LineMix {
+    /// Weight of every sentence.
+    total: usize,
+    /// Weight of sentences in consent vocabulary.
+    consent: usize,
+    /// Weight of sentences that are neither consent, player, running times
+    /// nor furniture.
+    prose: usize,
+    /// Sentences, and those that are only a running time ("01:34").
+    lines: usize,
+    running_times: usize,
+    /// Lines long enough to be a paragraph that hold article text.
+    paragraphs: usize,
+}
+
+/// Characters that are not whitespace, with CJK characters counted three
+/// times (a CJK character carries about as much as a short word).
+fn text_weight(s: &str) -> usize {
+    s.chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| if crate::text::is_cjk(c) { 3 } else { 1 })
+        .sum()
+}
+
+fn is_running_time(line: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\d{1,2}(?::\d{2}){1,2}$").expect("regex"))
+        .is_match(line)
+}
+
+fn is_furniture(line: &str) -> bool {
+    let words = line.split_whitespace().count();
+    words <= 8
+        && line.chars().count() <= 60
+        && (FURNITURE_STARTS.iter().any(|s| line.starts_with(s)) || is_date_line(line))
+}
+
+/// A short line that is mostly a date ("28/09/2026 - 10:55").
+fn is_date_line(line: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^\d{1,4}[/.\-年]\d{1,2}[/.\-月]\d{1,4}").expect("regex"))
+        .is_match(line)
+}
+
+/// Classify the sentences of lowercase `text` (each line split after
+/// `.`, `!`, `?` or their CJK forms). Consent sentences count as prose
+/// unless `dialog` (the text shows a dialog's own phrases): a short article
+/// about privacy stays an article.
+fn line_mix(text: &str, dialog: bool) -> LineMix {
+    let mut m = LineMix::default();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let cjk = line.chars().filter(|c| crate::text::is_cjk(*c)).count();
+        let paragraph = line.split_whitespace().count() >= 25 || cjk >= 60;
+        let mut prose_line = false;
+        for seg in sentences(line) {
+            let w = text_weight(seg);
+            m.total += w;
+            m.lines += 1;
+            if is_running_time(seg) {
+                m.running_times += 1;
+                continue;
+            }
+            if CONSENT_VOCABULARY.iter().any(|v| seg.contains(v)) {
+                m.consent += w;
+                if dialog {
+                    continue;
+                }
+            }
+            if PLAYER_PHRASES.iter().any(|p| seg.contains(p)) || is_furniture(seg) {
+                continue;
+            }
+            m.prose += w;
+            prose_line = true;
+        }
+        if paragraph && prose_line {
+            m.paragraphs += 1;
+        }
+    }
+    m
+}
+
+/// A line's sentences, split after sentence-ending punctuation.
+fn sentences(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut chars = line.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let end = i + c.len_utf8();
+        let split = match c {
+            '。' | '！' | '？' => true,
+            '.' | '!' | '?' => chars.peek().is_some_and(|(_, n)| n.is_whitespace()),
+            _ => false,
+        };
+        if split {
+            let seg = line[start..end].trim();
+            if !seg.is_empty() {
+                out.push(seg);
+            }
+            start = end;
+        }
+    }
+    let rest = line[start..].trim();
+    if !rest.is_empty() {
+        out.push(rest);
+    }
+    out
+}
+
+/// Distinct dialog phrases in lowercase `text` that are not quoted.
+fn dialog_markers(text: &str) -> usize {
+    const QUOTES: &[char] = &['"', '\'', '“', '‘', '«', '„', '「', '『'];
+    DIALOG_MARKERS
+        .iter()
+        .filter(|m| {
+            text.match_indices(**m).any(|(i, _)| {
+                !text[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| QUOTES.contains(&c))
+            })
+        })
+        .count()
+}
+
+/// A video page: `og:type` video, or a `video`/`videos`/`watch` path.
+fn is_video_page(url: &str, html: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let og = RE.get_or_init(|| {
+        Regex::new(
+            r#"(?i)<meta[^>]+(?:property=["']og:type["'][^>]*content=["']video|content=["']video[^"']*["'][^>]*property=["']og:type["'])"#,
+        )
+        .expect("regex")
+    });
+    let path = url::Url::parse(url).ok().is_some_and(|u| {
+        u.path_segments()
+            .is_some_and(|mut s| s.any(|p| matches!(p, "video" | "videos" | "watch")))
+    });
+    path || og.is_match(html)
+}
+
+/// Whether extracted main text (lowercase) is a page's stub rather than an
+/// article: a consent dialog or an embedded player's consent prompt
+/// (`consent_page`), or a player, playlist or boilerplate with no article
+/// text (`stub_page`). Conservative: a text with a few sentences of its own
+/// is an article, whatever else the page shows.
+fn judge_main_text(text: &str, url: &str, html: &str) -> Option<ReadError> {
+    let markers = dialog_markers(text);
+    let embed = EMBED_CONSENT_PHRASES.iter().any(|p| text.contains(p));
+    let mix = line_mix(text, markers >= MIN_DIALOG_MARKERS || embed);
+    if mix.total == 0 {
+        return None;
+    }
+    if markers >= MIN_DIALOG_MARKERS && mix.consent * 10 >= mix.total * DIALOG_SHARE_TENTHS {
+        return Some(ReadError::new(
+            ReadFailure::ConsentPage,
+            "the page text is a cookie or privacy dialog (not clicked through)",
+        ));
+    }
+    if embed && mix.prose < MIN_PROSE_WEIGHT {
+        return Some(ReadError::new(
+            ReadFailure::ConsentPage,
+            "an embedded player behind a consent prompt, with no article text (not clicked through)",
+        ));
+    }
+    if mix.prose < MIN_PROSE_WEIGHT {
+        return Some(ReadError::new(
+            ReadFailure::StubPage,
+            "the page text is boilerplate, with no article text",
+        ));
+    }
+    if mix.running_times >= 3 && mix.running_times * 4 >= mix.lines && mix.paragraphs == 0 {
+        return Some(ReadError::new(
+            ReadFailure::StubPage,
+            "a video playlist (titles and running times), with no article text",
+        ));
+    }
+    if mix.prose < MIN_VIDEO_PAGE_PROSE_WEIGHT && is_video_page(url, html) {
+        return Some(ReadError::new(
+            ReadFailure::StubPage,
+            "a video page with only its player and caption",
+        ));
+    }
+    None
 }
 
 const PAYWALL_PHRASES: &[&str] = &[
@@ -594,6 +998,39 @@ mod tests {
         assert_eq!(e.final_url.as_deref(), Some(ARTICLE));
     }
 
+    fn serp_fixture(name: &str) -> String {
+        let path = format!("{}/tests/fixtures/serp/{name}", env!("CARGO_MANIFEST_DIR"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    #[test]
+    fn should_report_bot_challenge_when_a_results_page_answers_with_one() {
+        // #2607: results-page search treats these as a miss, never solves them.
+        assert!(is_bot_challenge(&serp_fixture("ddg_anomaly.html")));
+        assert!(is_bot_challenge(&serp_fixture("bing_challenge.html")));
+        // The rendered-text form deep-search's Bing path reads.
+        assert!(is_bot_challenge(&serp_fixture("bing_challenge.txt")));
+    }
+
+    #[test]
+    fn should_not_take_a_results_page_about_bot_checks_for_a_challenge() {
+        // Results for "anomaly detection" or about DuckDuckGo's bot check:
+        // the words appear, the challenge markup does not, and the page has
+        // far more text than a challenge.
+        let row = |i: usize| {
+            format!(
+                "<div class=\"result\"><a class=\"result__a\" href=\"https://example.org/{i}\">Anomaly detection {i}</a>\
+                 <a class=\"result__snippet\">Unfortunately, bots use DuckDuckGo too, one post says; \
+                 others explain isolation forests and time-series anomaly scores in depth.</a></div>"
+            )
+        };
+        let page = format!(
+            "<html><head><title>anomaly detection at DuckDuckGo</title></head><body>{}</body></html>",
+            (0..10).map(row).collect::<String>()
+        );
+        assert!(!is_bot_challenge(&page));
+    }
+
     #[test]
     fn should_report_bot_challenge_when_marker_present_even_if_text_was_extracted() {
         // A fallback text extractor can turn a challenge page into 200+
@@ -650,6 +1087,149 @@ mod tests {
             diagnose(ARTICLE, ARTICLE, &html, Some(dialog)).map(|e| e.reason),
             Some(ReadFailure::ConsentPage)
         );
+    }
+
+    /// What `diagnose` says about extracted `text` (no HTML).
+    fn text_reason(url: &str, text: &str) -> Option<ReadFailure> {
+        diagnose(url, url, "", Some(text)).map(|e| e.reason)
+    }
+
+    const F24_VIDEO: &str = "https://www.france24.com/en/video/20260928-the-last-thing-you-expect-locals-near-uk-airbase-react-to-terrorist-act-arrests";
+    const WRAL_VIDEO: &str = "https://www.wral.com/video/trump-rejects-iran-proposal-reopen-strait-hormuz-september-2026/";
+
+    #[test]
+    fn should_report_consent_page_when_the_text_is_a_video_consent_prompt() {
+        // France 24, read in both EU AI Act runs of validation 3: 320
+        // characters, the YouTube consent prompt and player boilerplate.
+        let text = fixture("france24_video_consent.txt");
+        let e = diagnose(F24_VIDEO, F24_VIDEO, "", Some(&text)).unwrap();
+        assert_eq!(e.reason, ReadFailure::ConsentPage, "{e}");
+        assert!(e.detail.contains("not clicked through"), "{e}");
+        assert_eq!(e.final_url.as_deref(), Some(F24_VIDEO));
+        // Not because of the URL: the same text anywhere is a prompt.
+        assert_eq!(text_reason(ARTICLE, &text), Some(ReadFailure::ConsentPage));
+    }
+
+    #[test]
+    fn should_report_consent_page_when_the_text_is_a_cookie_preference_center() {
+        // WRAL, validation 3 (Strait of Hormuz): 3,395 characters of a
+        // OneTrust preference centre taken for the article.
+        let text = fixture("wral_video_cookie_dialog.txt");
+        assert!(text.chars().count() > MAX_CONSENT_TEXT_CHARS);
+        assert_eq!(
+            text_reason(WRAL_VIDEO, &text),
+            Some(ReadFailure::ConsentPage)
+        );
+        assert_eq!(text_reason(ARTICLE, &text), Some(ReadFailure::ConsentPage));
+    }
+
+    #[test]
+    fn should_report_consent_page_when_the_dialog_is_in_another_language() {
+        let de = "Datenschutzeinstellungen\n\nWir verwenden Cookies und ähnliche \
+                  Technologien, um Inhalte zu personalisieren und Zugriffe zu analysieren. \
+                  Mit „Alle akzeptieren“ stimmen Sie der Verwendung zu.\n\nAlle akzeptieren\n\n\
+                  Alle ablehnen\n\nEinstellungen verwalten\n\nNotwendige Cookies\n\nDiese \
+                  Cookies sind für den Betrieb der Website erforderlich und können nicht \
+                  deaktiviert werden.\n\nMarketing-Cookies\n\nDiese Cookies werden von \
+                  Werbepartnern gesetzt, um ein Profil Ihrer Interessen zu erstellen.";
+        assert_eq!(text_reason(ARTICLE, de), Some(ReadFailure::ConsentPage));
+        let fr = "Pour afficher ce contenu YouTube, vous devez activer le suivi \
+                  publicitaire et la mesure d'audience.\n\nUne de vos extensions de \
+                  navigateur semble bloquer le chargement du lecteur vidéo. Pour pouvoir \
+                  regarder ce contenu, vous devez la désactiver ou la désinstaller.\n\n\
+                  Image de couverture : © France 24\n02:13\n\nPublié le : 28/09/2026 - 10:55\n\n\
+                  Partager";
+        assert_eq!(text_reason(ARTICLE, fr), Some(ReadFailure::ConsentPage));
+        let zh = "隐私设置\n\n我们使用Cookie来改善您的浏览体验、提供个性化内容并分析网站流量。\
+                  点击“接受全部”即表示您同意我们使用Cookie。\n\n接受全部\n\n拒绝全部\n\n\
+                  管理偏好设置\n\n必要Cookie\n\n这些Cookie是网站正常运行所必需的，无法关闭。\n\n\
+                  广告Cookie\n\n这些Cookie由我们的广告合作伙伴设置，用于建立您的兴趣档案。";
+        assert_eq!(text_reason(ARTICLE, zh), Some(ReadFailure::ConsentPage));
+        let yt = "Before you continue to YouTube\n\nWe use cookies and data to deliver and \
+                  maintain Google services, track outages and protect against spam, fraud \
+                  and abuse.\n\nIf you choose to 'Accept all', we will also use cookies and \
+                  data to develop and improve new services.\n\nReject all\n\nAccept all\n\n\
+                  More options";
+        assert_eq!(text_reason(ARTICLE, yt), Some(ReadFailure::ConsentPage));
+    }
+
+    #[test]
+    fn should_report_stub_page_when_the_text_is_a_video_playlist() {
+        // NBC News, validation 3: a video page whose "article" is the
+        // playlist (titles and running times).
+        let text = fixture("nbc_video_playlist.txt");
+        let e = diagnose(ARTICLE, ARTICLE, "", Some(&text)).unwrap();
+        assert_eq!(e.reason, ReadFailure::StubPage, "{e}");
+        assert_eq!(e.code(), "stub_page");
+    }
+
+    #[test]
+    fn should_report_stub_page_when_a_video_page_has_only_its_caption() {
+        let caption = "Video Player is loading.\n\nPresident Trump rejects Iran proposal to \
+                       reopen Strait of Hormuz\n\nU.S. President Donald Trump has rejected \
+                       Iran’s proposal to reopen the Strait of Hormuz.\n\nPosted 9/28/2026, \
+                       9:52:11 AM\n\n© WRAL\n\nAdvertisement";
+        assert_eq!(
+            text_reason(WRAL_VIDEO, caption),
+            Some(ReadFailure::StubPage)
+        );
+        // Declared a video page by og:type, on any path.
+        let html = r#"<html><head><meta property="og:type" content="video.other"></head><body></body></html>"#;
+        assert_eq!(
+            diagnose(ARTICLE, ARTICLE, html, Some(caption)).map(|e| e.reason),
+            Some(ReadFailure::StubPage)
+        );
+        // Boilerplate with no article text is a stub on any page.
+        let boiler = "Share\n\nRead more\n\nAdvertisement\n\n01:34\n\nIssued on: 28/09/2026 - \
+                      10:55\n\nCover image: © Example\n\nUp next\n\nNow playing\n\n02:10\n\n\
+                      Updated 28 September 2026\n\nSubscribe\n\nSign up for newsletters";
+        assert_eq!(text_reason(ARTICLE, boiler), Some(ReadFailure::StubPage));
+    }
+
+    #[test]
+    fn should_not_flag_short_real_articles_when_their_text_is_brief() {
+        // Real short reads from validation 3 that were articles.
+        for name in [
+            "short_article_zh.txt",       // chinanews, 283 characters
+            "short_lines_article_zh.txt", // 东南网, one short line per phrase
+            "short_article_en.txt",       // Anadolu, 1,443 characters
+        ] {
+            let text = fixture(name);
+            assert_eq!(text_reason(ARTICLE, &text), None, "{name}");
+        }
+        let kyodo = "【共同社9月28日电】今年第26号超强台风“舒力基”28日预计将在维持现有强度的同时接近冲绳和\
+                     奄美地区。日本气象厅提醒警惕伴有涌浪的大浪和强风。因台风路径，风力恐将进一步增强。";
+        assert_eq!(text_reason(ARTICLE, kyodo), None);
+        let brief = "Officials said the bridge would reopen on Tuesday after repairs to a \
+                     damaged expansion joint were finished ahead of schedule.\n\nTraffic had \
+                     been diverted through the city centre for nine days, adding up to 40 \
+                     minutes to some journeys.";
+        assert_eq!(text_reason(ARTICLE, brief), None);
+        // A short article on a video page keeps its text when it has one.
+        let story = format!("{brief}\n\n{brief}\n\n{brief}");
+        assert_eq!(text_reason(WRAL_VIDEO, &story), None);
+    }
+
+    #[test]
+    fn should_not_flag_article_when_it_reports_on_cookie_banners() {
+        let text = "Regulators in Brussels said on Monday that websites must make it as easy \
+                    to refuse cookies as to accept them, after a two-year review of consent \
+                    banners.\n\nThe review found that many sites showed an \"Accept all\" button \
+                    on the first screen but hid \"Reject all\" behind a second page of settings. \
+                    Officials said that design nudged people into sharing personal data.\n\n\
+                    \"People should not have to hunt for the privacy option,\" the commissioner \
+                    told reporters. Sites have six months to comply.\n\nIndustry groups said the \
+                    rules on strictly necessary cookies were still unclear and asked for \
+                    guidance on analytics.";
+        assert_eq!(text_reason(ARTICLE, text), None);
+        // And a live blog's timestamps are not a playlist.
+        let live = "10:32\n\nThe prime minister has arrived at the summit venue, where leaders \
+                    are expected to discuss energy prices and the reopening of the strait over \
+                    the next two days.\n\n10:05\n\nOil prices rose 2% in early trading as \
+                    markets waited for news from the talks, with analysts warning of further \
+                    volatility.\n\n09:41\n\nSecurity has been tightened around the city centre, \
+                    police said.";
+        assert_eq!(text_reason(ARTICLE, live), None);
     }
 
     #[test]
@@ -774,6 +1354,7 @@ mod tests {
         for f in [
             ReadFailure::RedirectUnresolved,
             ReadFailure::ConsentPage,
+            ReadFailure::StubPage,
             ReadFailure::Paywall,
             ReadFailure::LoginWall,
             ReadFailure::BotChallenge,

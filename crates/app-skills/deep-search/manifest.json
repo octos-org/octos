@@ -47,7 +47,7 @@
           },
           "search_engine": {
             "type": "string",
-            "description": "Try one provider first: gdelt, google_news_rss, searxng, serper, tavily, perplexity, brave, you; or all. Default: automatic order (free sources first: GDELT + Google News for news, then SearXNG if configured, then keyed APIs). Search-results page scraping (duckduckgo, bing_cdp) is off unless the operator enables it. Falls back to the automatic order if it returns nothing."
+            "description": "Try one provider first: gdelt, google_news_rss, searxng, serper, tavily, perplexity, brave, you; or all. Default: automatic order (free sources first: GDELT + Google News for news, then SearXNG if configured, then keyed APIs). Results-page search (duckduckgo, bing_cdp) runs last for general web results unless the operator turned it off. Falls back to the automatic order if it returns nothing."
           },
           "output": {
             "type": "string",
@@ -86,7 +86,7 @@
           "category": {
             "type": "string",
             "enum": ["auto", "news", "general", "science", "it", "social"],
-            "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (Wikipedia, Wikidata; web results need a key), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
+            "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (Wikipedia, Wikidata; web results come from results-page search, DuckDuckGo then Bing, on unless the operator turned it off), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
           },
           "max_per_domain": {
             "type": "integer",

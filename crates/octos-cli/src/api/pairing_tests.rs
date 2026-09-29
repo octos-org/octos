@@ -395,3 +395,40 @@ async fn pairing_does_not_bypass_bearer_auth_on_protected_routes() {
 
     server.abort();
 }
+
+#[test]
+fn a_rate_limited_code_refills_its_budget_instead_of_burning() {
+    let window = Duration::from_secs(60);
+    let pairing = PairingState::mint_rate_limited(
+        ORIGIN,
+        Some(TOKEN.to_owned()),
+        Duration::from_secs(300),
+        window,
+    );
+    let code = pairing.printed_code();
+    let wrong = if code.starts_with('0') {
+        "11111111"
+    } else {
+        "00000000"
+    };
+    let start = std::time::Instant::now();
+    for _ in 0..super::PAIR_MAX_FAILED_CLAIMS {
+        let _ = pairing.claim_at(wrong, start);
+    }
+    assert_eq!(
+        pairing.claim_at(&code, start),
+        Err(super::PairError::Locked),
+        "locked within the window"
+    );
+    let later = start + window;
+    assert_eq!(
+        pairing.claim_at(&code, later).as_deref(),
+        Ok(TOKEN),
+        "the budget refilled"
+    );
+    assert_eq!(
+        pairing.claim_at(&code, later),
+        Err(super::PairError::Unknown),
+        "still single use"
+    );
+}

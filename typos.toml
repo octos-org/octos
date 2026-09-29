@@ -54,6 +54,12 @@ abd = "abd"
 # "string"). Allowlist the misspelling so the typos lint doesn't flag the
 # negative-test JSON literal.
 strng = "strng"
+# Consent-dialog phrases in other languages (German, French), matched by
+# octos-research's consent detector and its tests (access.rs, README).
+alle = "alle"
+sie = "sie"
+ein = "ein"
+mesure = "mesure"
 # Spanish word for "advances" — test corpus in octos-research/src/extract.rs
 avances = "avances"
 # Basic Regular Expression — referenced in slides validator spec comments

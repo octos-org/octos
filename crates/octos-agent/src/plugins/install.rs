@@ -126,6 +126,14 @@ pub async fn activate_skill(
                 Ok((tools, _extras)) => {
                     for tool in tools {
                         let name = tool.name().to_string();
+                        // Never over a compiled-in tool (see the loader).
+                        if registry.is_builtin_name(&name) {
+                            warn!(
+                                tool = %name,
+                                "plugin tool name collides with a built-in tool, skipping"
+                            );
+                            continue;
+                        }
                         registry.mark_as_plugin(&name);
                         tool_names.push(name);
                         registry.register(tool);

@@ -350,6 +350,27 @@ pub struct ServeCommand {
     #[arg(long)]
     pub stdio: bool,
 
+    /// Run as the loopback server of an embedding host (an app shell), which
+    /// owns this process: the host writes the host token and an optional
+    /// external-client token (an allowlist of UI Protocol methods only) as
+    /// the first two lines of stdin, never the environment; requests must
+    /// name the loopback
+    /// listener in `Host`, only configured browser origins are trusted,
+    /// pairing is off until the host enables it, profiles run in this
+    /// process, and the server stops when stdin reaches EOF. Requires
+    /// `--host 127.0.0.1` and a Local deployment. See
+    /// `docs/HOST_MANAGED_SERVE.md`.
+    #[arg(long, conflicts_with_all = ["stdio", "solo", "auth_token", "danger_full_access", "web_url"])]
+    #[serde(default)]
+    pub host_managed: bool,
+
+    /// With `--host-managed` on Unix: serve on the listening TCP socket the
+    /// host passed as this inherited descriptor (bound to 127.0.0.1) instead
+    /// of binding `--port`, so the host keeps the port across restarts.
+    #[arg(long, value_name = "FD", requires = "host_managed")]
+    #[serde(default)]
+    pub listen_fd: Option<i32>,
+
     /// Working directory (defaults to current directory).
     #[arg(short, long)]
     pub cwd: Option<PathBuf>,
@@ -515,6 +536,34 @@ fn resolve_auth_token(
         Some(token) if !token.is_empty() => Some((token.to_string(), AuthTokenSource::Config)),
         _ => None,
     }
+}
+
+/// Validate `--host-managed`'s invariants and return `(host token, external
+/// token)`. Loopback IPv4 only (the `Host` allowlist and the listener agree),
+/// Local mode, and a host token from the environment.
+fn host_managed_preflight(
+    host: &str,
+    mode: &crate::config::DeploymentMode,
+    host_token: Option<String>,
+    external_token: Option<String>,
+) -> Result<(String, Option<String>)> {
+    use crate::api::host_managed::{EXTERNAL_TOKEN_ENV, HOST_TOKEN_ENV};
+    eyre::ensure!(
+        host == "127.0.0.1",
+        "--host-managed binds 127.0.0.1 only (got --host {host})"
+    );
+    eyre::ensure!(
+        *mode == crate::config::DeploymentMode::Local,
+        "--host-managed requires a Local deployment"
+    );
+    let host_token = host_token
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| eyre::eyre!("--host-managed requires {HOST_TOKEN_ENV}"))?;
+    let external_token = external_token.filter(|token| !token.is_empty());
+    // Same validation HostManaged::new applies, early and without a port.
+    crate::api::host_managed::HostManaged::new(host_token.clone(), external_token.clone(), 1)
+        .wrap_err_with(|| format!("invalid {HOST_TOKEN_ENV} or {EXTERNAL_TOKEN_ENV}"))?;
+    Ok((host_token, external_token))
 }
 
 /// How long the serve keeps draining in-flight connections after the stop
@@ -1032,7 +1081,40 @@ impl ServeCommand {
 
         // Security: warn if binding to non-localhost without auth token
         // Precedence: CLI arg, then OCTOS_AUTH_TOKEN env var, then config
-        let auth_token = if let Some((token, source)) = resolve_auth_token(
+        // `--host-managed`: validate the mode before anything binds, spawns
+        // or opens stores. The host token comes from the environment only.
+        let host_managed_tokens = if self.host_managed {
+            // Linux/Android: SIGTERM when the host dies (a no-op elsewhere).
+            crate::api::host_managed::bind_to_parent()?;
+            // The tokens arrive on stdin, never in the environment, which any
+            // process of this user (on Android: this app's own tools) can
+            // read from /proc/<pid>/environ.
+            for name in [
+                crate::api::host_managed::HOST_TOKEN_ENV,
+                crate::api::host_managed::EXTERNAL_TOKEN_ENV,
+            ] {
+                eyre::ensure!(
+                    std::env::var_os(name).is_none(),
+                    "--host-managed reads its tokens from stdin; unset {name}"
+                );
+            }
+            let (host_token, external_token) = crate::api::host_managed::read_tokens_from_stdin(
+                std::io::stdin(),
+                std::time::Duration::from_secs(60),
+            )?;
+            Some(host_managed_preflight(
+                &self.host,
+                &config.mode,
+                host_token,
+                external_token,
+            )?)
+        } else {
+            None
+        };
+
+        let auth_token = if let Some((host_token, _)) = &host_managed_tokens {
+            Some(host_token.clone())
+        } else if let Some((token, source)) = resolve_auth_token(
             self.auth_token.clone(),
             std::env::var("OCTOS_AUTH_TOKEN").ok(),
             config.auth_token.as_deref(),
@@ -1448,15 +1530,38 @@ impl ServeCommand {
                 .with_sessions_in_cwd(config.appui.sessions_in_cwd),
         );
 
-        let (http_listener, effective_serve_port) =
-            bind_http_listener(self.stdio, &self.host, self.port).await?;
+        let (http_listener, effective_serve_port) = match self.listen_fd {
+            Some(fd) => {
+                let listener = crate::api::host_managed::adopt_listener_fd(fd)?;
+                let port = listener
+                    .local_addr()
+                    .wrap_err("failed to inspect the inherited listener")?
+                    .port();
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .wrap_err("failed to adopt the inherited listener")?;
+                (Some(listener), port)
+            }
+            None => bind_http_listener(self.stdio, &self.host, self.port).await?,
+        };
+        let host_managed = match host_managed_tokens {
+            Some((host_token, external_token)) => {
+                Some(Arc::new(crate::api::host_managed::HostManaged::new(
+                    host_token,
+                    external_token,
+                    effective_serve_port,
+                )?))
+            }
+            None => None,
+        };
 
         // WEB-PAIRING-CONTRACT-5100 — mint ONE pairing code per process
         // start, against the REAL bound port (so `--port 0` pairs too). Only
         // for an HTTP serve: `--stdio` binds no listener, so it exposes no
         // `/pair/*` surface and the state stays `None`. The code lives in
         // memory for this process only and is NEVER handed to `tracing`.
-        let pairing = (!self.stdio).then(|| {
+        // A host-managed server mints none at startup: its host enables a
+        // code for the EXTERNAL token on demand (`/api/admin/host/pairing`).
+        let pairing = (!self.stdio && !self.host_managed).then(|| {
             Arc::new(crate::api::pairing::PairingState::mint(
                 format!("http://127.0.0.1:{effective_serve_port}"),
                 auth_token.clone(),
@@ -1467,19 +1572,32 @@ impl ServeCommand {
         // gateway for the same profile would open its episodes.redb again and
         // lock session/open out of the profile after onboarding. Stdio serve
         // already has no gateway auto-start; keep HTTP solo consistent.
-        let solo_login_enabled_flag = self.solo
-            || std::env::var("OCTOS_SOLO_LOGIN")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-        let solo_in_process =
-            solo_login_enabled_flag && config.mode == crate::config::DeploymentMode::Local;
+        //
+        // `--host-managed` never enables solo login (not even through
+        // `OCTOS_SOLO_LOGIN`) but also runs its profiles in this process.
+        let solo_login_enabled_flag = !self.host_managed
+            && (self.solo
+                || std::env::var("OCTOS_SOLO_LOGIN")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false));
+        let solo_in_process = (solo_login_enabled_flag || self.host_managed)
+            && config.mode == crate::config::DeploymentMode::Local;
 
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
                 .with_solo_in_process(solo_in_process)
                 .with_bridge_js(bridge_js_path)
-                .with_serve_config(effective_serve_port, auth_token.clone())
+                // Host-managed: gateways never start, and the host token
+                // stays out of every child's reach.
+                .with_serve_config(
+                    effective_serve_port,
+                    if self.host_managed {
+                        None
+                    } else {
+                        auth_token.clone()
+                    },
+                )
                 // Section B (codex review round-5 P1.2): every spawned
                 // gateway inherits the host's strict-signing policy via
                 // an env var. `Config::from_file` OR-merges it onto the
@@ -1686,10 +1804,16 @@ impl ServeCommand {
                 eyre::bail!("OCTOS_APPUI_ALLOWED_ORIGINS must be valid Unicode")
             }
         };
+        // A host-managed server trusts only the configured origins: not even
+        // this listener's own loopback origins (it serves no host UI pages).
         let appui_allowed_origins = resolve_appui_allowed_origins(
             &config.appui.allowed_origins,
             appui_allowed_origins_env.as_deref(),
-            effective_serve_port,
+            if self.host_managed {
+                0
+            } else {
+                effective_serve_port
+            },
         )
         .wrap_err("invalid AppUI browser-origin configuration")?;
 
@@ -1752,6 +1876,7 @@ impl ServeCommand {
             host_memory: config.memory.clone(),
             pairing: pairing.clone(),
             solo_login_enabled: solo_login_enabled_flag,
+            host_managed: host_managed.clone(),
             // Only the HTTP serve has a loop to stop; see AppState::serve_shutdown.
             serve_shutdown: (!self.stdio).then(|| serve_shutdown_tx.clone()),
             dangerous_default_permissions: dangerous_default_permissions_flag,
@@ -1856,6 +1981,12 @@ impl ServeCommand {
         // returns before this point and keeps its existing behavior — it
         // spawns no gateways, so there is nothing to orphan.
         let shutdown_rx = spawn_serve_shutdown_signal_watcher(serve_shutdown_tx.clone());
+        // `--host-managed`: the host owns the lifecycle. Its end of stdin
+        // closing (orderly stop, crash, kill) stops the server through the
+        // same drain path; `server/shutdown` is never offered to clients.
+        if self.host_managed {
+            crate::api::host_managed::spawn_stdin_eof_watcher(serve_shutdown_tx.clone());
+        }
 
         let gateway_auto_start_enabled = !solo_in_process;
 
@@ -2367,6 +2498,96 @@ mod tests {
             resolved,
             Some(("argv-token".to_string(), AuthTokenSource::Argv))
         );
+    }
+
+    #[test]
+    fn should_require_loopback_local_mode_and_a_host_token_when_host_managed() {
+        use crate::config::DeploymentMode;
+        let host = "h".repeat(40);
+        let external = "e".repeat(40);
+        let ok = host_managed_preflight(
+            "127.0.0.1",
+            &DeploymentMode::Local,
+            Some(host.clone()),
+            Some(external.clone()),
+        )
+        .unwrap();
+        assert_eq!(ok, (host.clone(), Some(external)));
+        // No external token: host-only (external clients disabled).
+        assert_eq!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Local,
+                Some(host.clone()),
+                Some(String::new())
+            )
+            .unwrap()
+            .1,
+            None
+        );
+        for bad_host in ["0.0.0.0", "::1", "localhost", "192.168.1.2"] {
+            assert!(
+                host_managed_preflight(bad_host, &DeploymentMode::Local, Some(host.clone()), None)
+                    .is_err(),
+                "{bad_host}"
+            );
+        }
+        assert!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Cloud,
+                Some(host.clone()),
+                None
+            )
+            .is_err()
+        );
+        assert!(host_managed_preflight("127.0.0.1", &DeploymentMode::Local, None, None).is_err());
+        assert!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Local,
+                Some("short".into()),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Local,
+                Some(host.clone()),
+                Some(host)
+            )
+            .is_err(),
+            "the two credentials must differ"
+        );
+    }
+
+    #[test]
+    fn should_refuse_host_managed_with_stdio_solo_or_an_argv_token() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+        for extra in [
+            &["--stdio"][..],
+            &["--solo"],
+            &["--auth-token", "x"],
+            &["--danger-full-access"],
+        ] {
+            let mut argv = vec!["octos", "--host-managed"];
+            argv.extend_from_slice(extra);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{extra:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["octos", "--listen-fd", "3"]).is_err(),
+            "--listen-fd needs --host-managed"
+        );
+        let parsed = Cli::try_parse_from(["octos", "--host-managed", "--listen-fd", "3"]).unwrap();
+        assert!(parsed.serve.host_managed);
+        assert_eq!(parsed.serve.listen_fd, Some(3));
     }
 
     #[test]

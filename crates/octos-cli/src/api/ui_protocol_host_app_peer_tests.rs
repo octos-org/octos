@@ -3,6 +3,18 @@
 //! session-level enforcement of workspace, memory namespace and closure.
 use super::*;
 
+/// The chat id of this test's host sessions. The host-session map is
+/// process-wide and tests run in parallel, so each test (one thread per
+/// `#[tokio::test]`) gets its own id; every key in one test shares it.
+fn host_chat() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static CHAT: String = format!("host-hp{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    }
+    CHAT.with(Clone::clone)
+}
+
 struct Fixture {
     _tmp: tempfile::TempDir,
     state: Arc<AppState>,
@@ -99,7 +111,7 @@ async fn fixture() -> Fixture {
         runtime,
         data_dir,
         apps,
-        system: SessionKey::with_profile_topic("dev", "api", "host", "system"),
+        system: SessionKey::with_profile_topic("dev", "api", &host_chat(), "system"),
         tokens: Default::default(),
         _tmp: tmp,
     }
@@ -190,7 +202,7 @@ async fn should_stage_and_resume_a_host_owned_app_peer_with_a_persisted_system_o
             json!({
                 "brief": "hijack", "names": ["Rinx"],
                 "cwd": fx.apps.join("rinx").to_string_lossy(),
-                "session_id": SessionKey::with_profile_topic("dev", "api", "host", "other"),
+                "session_id": SessionKey::with_profile_topic("dev", "api", &host_chat(), "other"),
                 "memory_namespace": "app/rinx/acct-1", "resume": true,
             }),
         ),
@@ -321,7 +333,7 @@ async fn should_select_a_configured_model_for_one_peer_without_touching_the_prof
         &fx.state,
         &rpc(
             APPUI_METHOD_PEER_MODEL_SET,
-            json!({ "session_id": SessionKey::with_profile_topic("dev", "api", "host", "other"), "peer": "Rinx", "model": null }),
+            json!({ "session_id": SessionKey::with_profile_topic("dev", "api", &host_chat(), "other"), "peer": "Rinx", "model": null }),
         ),
         None,
     )
@@ -409,7 +421,7 @@ async fn should_isolate_app_peer_workspace_and_memory_from_the_system_and_each_o
     // An ordinary session keeps the profile's own memory.
     let plain = crate::runtime::SessionRuntime::bootstrap(
         &fx.runtime,
-        SessionKey::with_profile_topic("dev", "api", "host", "chat"),
+        SessionKey::with_profile_topic("dev", "api", &host_chat(), "chat"),
         None,
     )
     .await
@@ -511,7 +523,7 @@ async fn should_open_isolated_request_contexts_and_refuse_them_after_close() {
         &fx.state,
         &rpc(
             APPUI_METHOD_PEER_CONTEXT_OPEN,
-            json!({ "session_id": SessionKey::with_profile_topic("dev", "api", "host", "other"), "peer": "Rinx", "context_id": "mini-d" }),
+            json!({ "session_id": SessionKey::with_profile_topic("dev", "api", &host_chat(), "other"), "peer": "Rinx", "context_id": "mini-d" }),
         ),
         None,
     )
@@ -730,4 +742,56 @@ async fn should_refuse_a_binding_that_shares_state_with_another_app_peer() {
     prepare_app(&fx, "Notes", "notes", "app/notes/acct-1", true)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn should_accept_only_a_contexts_own_folder_as_its_workspace() {
+    let fx = fixture().await;
+    prepare_app(&fx, "Rinx", "rinx", "app/rinx/acct-1", true)
+        .await
+        .unwrap();
+    let peer_root = fx.apps.join("rinx");
+    let open = |context_id: &str, cwd: Option<PathBuf>| {
+        let mut params = json!({ "session_id": fx.system, "host_token": tok(&fx, "Rinx"),
+                                 "peer": "Rinx", "context_id": context_id });
+        if let Some(cwd) = cwd {
+            std::fs::create_dir_all(&cwd).unwrap();
+            params["cwd"] = json!(cwd.to_string_lossy());
+        }
+        raw_peer_context_open(
+            &fx.state,
+            &rpc(APPUI_METHOD_PEER_CONTEXT_OPEN, params),
+            None,
+        )
+    };
+    let kind = |result: Result<Value, RpcError>| {
+        result.unwrap_err().data.unwrap()["kind"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    // The default folder, and a fresh `contexts/<name>`.
+    let a = open("ctx-a", None).unwrap();
+    assert!(a["cwd"].as_str().unwrap().ends_with("contexts/ctx-a"));
+    open("ctx-b", Some(peer_root.join("contexts").join("named-b"))).unwrap();
+    // Refused: `contexts/` itself, another context's folder, a sibling of
+    // `contexts/`, a nested folder, and `..` tricks.
+    for (id, cwd) in [
+        ("ctx-c", peer_root.join("contexts")),
+        ("ctx-d", peer_root.join("contexts").join("ctx-a")),
+        ("ctx-e", peer_root.join("contexts").join("named-b")),
+        ("ctx-f", peer_root.join("notes")),
+        ("ctx-g", peer_root.join("contexts").join("x").join("deep")),
+        (
+            "ctx-h",
+            peer_root.join("contexts").join("..").join("notes2"),
+        ),
+    ] {
+        assert_eq!(
+            kind(open(id, Some(cwd.clone()))),
+            "peer_context_workspace_escape",
+            "{}",
+            cwd.display()
+        );
+    }
 }

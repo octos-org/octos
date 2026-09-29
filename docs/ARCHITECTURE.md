@@ -1602,7 +1602,7 @@ crates/
 - Tool policies: allow/deny with deny-wins semantics, group support, provider-specific filtering
 - Tool argument size limit: 1MB per invocation (non-allocating `estimate_json_size` with escape char accounting)
 - Path traversal prevention + symlink-safe file I/O via `O_NOFOLLOW` (Unix) eliminating TOCTOU races
-- SSRF protection in shared `ssrf.rs` module: blocks private IPs (10/8, 172.16/12, 192.168/16, 169.254/16, IPv6 ULA/link-local, IPv4-mapped/compatible). Used by web_fetch and browser.
+- SSRF protection via `octos_research::net::check_url` — the one shared implementation, adapted for the agent tools by `octos-agent/src/tools/ssrf.rs`: blocks private IPs (10/8, 172.16/12, 192.168/16, 169.254/16, IPv6 ULA/link-local, IPv4-mapped/compatible). Used by web_fetch and browser.
 - Browser: URL scheme allowlist (http/https only), 10s JS execution timeout, zombie process reaping, secure tempfiles for screenshots
 - MCP: input schema validation (max depth 10, max size 64KB) prevents malicious tool definitions
 

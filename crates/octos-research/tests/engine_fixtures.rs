@@ -106,11 +106,19 @@ async fn replay(engine: &str, case: &Path) {
     let resp = ms.search(&req).await;
     let name = case.display();
     assert_eq!(resp.engines.len(), 1, "{name}: {:?}", resp.engines);
+    // A case that expects no items (nothing in the recorded feeds is about
+    // the query) answers `empty`; every other case `ok`.
+    let want_status = if doc["expect"].as_array().is_some_and(|e| e.is_empty()) {
+        EngineStatus::Empty
+    } else {
+        EngineStatus::Ok
+    };
     assert_eq!(
         resp.engines[0].status,
-        EngineStatus::Ok,
-        "{name}: {:?}",
-        resp.engines[0]
+        want_status,
+        "{name}: {:?} {:?}",
+        resp.engines[0],
+        resp.items.iter().map(|i| &i.title).collect::<Vec<_>>()
     );
 
     // build_request

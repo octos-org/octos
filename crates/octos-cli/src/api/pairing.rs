@@ -100,6 +100,8 @@ struct PairingInner {
     code: [u8; PAIR_CODE_LEN],
     status: CodeStatus,
     failures: u32,
+    /// With a failure window: when the current window's first failure was.
+    window_start: Option<Instant>,
 }
 
 /// The process-wide pairing state: one code, one token, one origin.
@@ -114,6 +116,10 @@ pub struct PairingState {
     token: String,
     /// `http://127.0.0.1:<port>` for the bound listener.
     server_origin: String,
+    /// `None`: the attempt budget burns the code for good (the printed-code
+    /// contract). `Some(w)`: a rate limit instead: the budget refills `w`
+    /// after its first failure, so guessing cannot deny a host-shown code.
+    failure_window: Option<Duration>,
 }
 
 impl PairingState {
@@ -134,11 +140,28 @@ impl PairingState {
                 code: mint_code(),
                 status: CodeStatus::Live,
                 failures: 0,
+                window_start: None,
             }),
             minted_at: Instant::now(),
             ttl,
             token: token.unwrap_or_default(),
             server_origin: server_origin.into(),
+            failure_window: None,
+        }
+    }
+
+    /// A code whose attempt budget is a rate limit ([`PAIR_MAX_FAILED_CLAIMS`]
+    /// failures per `window`) rather than a permanent lock. For a code a host
+    /// shows on demand (`octos serve --host-managed`).
+    pub fn mint_rate_limited(
+        server_origin: impl Into<String>,
+        token: Option<String>,
+        ttl: Duration,
+        window: Duration,
+    ) -> Self {
+        Self {
+            failure_window: Some(window),
+            ..Self::mint_with_ttl(server_origin, token, ttl)
         }
     }
 
@@ -175,6 +198,18 @@ impl PairingState {
         let submitted = normalize_code(submitted).ok_or(PairError::Invalid)?;
 
         let mut inner = self.lock();
+        if let Some(window) = self.failure_window {
+            let elapsed = inner
+                .window_start
+                .is_some_and(|start| now.saturating_duration_since(start) >= window);
+            if elapsed {
+                inner.failures = 0;
+                inner.window_start = None;
+                if inner.status == CodeStatus::Locked {
+                    inner.status = CodeStatus::Live;
+                }
+            }
+        }
         match inner.status {
             CodeStatus::Used => return Err(PairError::Unknown),
             CodeStatus::Locked => return Err(PairError::Locked),
@@ -192,6 +227,9 @@ impl PairingState {
             return Ok(self.token.clone());
         }
 
+        if inner.failures == 0 {
+            inner.window_start = Some(now);
+        }
         inner.failures = inner.failures.saturating_add(1);
         if inner.failures >= PAIR_MAX_FAILED_CLAIMS {
             // The budget is spent: burn the code in the SAME critical section
@@ -333,15 +371,22 @@ fn is_loopback_peer(remote_ip: Option<IpAddr>, headers: &HeaderMap) -> bool {
 /// 404 (not 403) for a non-loopback peer, and 404 when this deployment has no
 /// pairing state at all — a client reads that as "pairing not supported" and
 /// falls back to the manual origin+token form.
-fn resolve<'a>(
-    state: &'a AppState,
+///
+/// A host-managed server (`octos serve --host-managed`) mints no code at
+/// startup; its host enables one on demand, and the code exchanges for the
+/// EXTERNAL token, never the host's.
+fn resolve(
+    state: &AppState,
     peer: PeerAddr,
     headers: &HeaderMap,
-) -> Result<&'a Arc<PairingState>, StatusCode> {
+) -> Result<Arc<PairingState>, StatusCode> {
     if !is_loopback_peer(peer.0.map(|addr| addr.ip()), headers) {
         return Err(StatusCode::NOT_FOUND);
     }
-    state.pairing.as_ref().ok_or(StatusCode::NOT_FOUND)
+    if let Some(host_managed) = &state.host_managed {
+        return host_managed.pairing().ok_or(StatusCode::NOT_FOUND);
+    }
+    state.pairing.clone().ok_or(StatusCode::NOT_FOUND)
 }
 
 fn error_response(err: PairError) -> Response {
@@ -391,6 +436,18 @@ pub async fn pair_claim(
         Ok(pairing) => pairing,
         Err(status) => return status.into_response(),
     };
+    // Host-managed: a browser may claim only from the host's configured
+    // origin (the Origin header is a browser guard; the code is the control).
+    if state.host_managed.is_some() {
+        if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
+            let allowed = origin
+                .to_str()
+                .is_ok_and(|origin| state.appui_allowed_origins.iter().any(|a| a == origin));
+            if !allowed {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        }
+    }
 
     // The body is never logged, at any level: it carries a credential.
     let submitted = serde_json::from_slice::<ClaimRequest>(&body)
@@ -400,7 +457,25 @@ pub async fn pair_claim(
         return error_response(PairError::Invalid);
     };
 
-    match pairing.claim(&submitted) {
+    let result = pairing.claim(&submitted);
+    if state.host_managed.is_some() {
+        // Audited, without the code: every claim of a host-shown code.
+        let outcome = match &result {
+            Ok(_) => serde_json::json!({ "claimed": true }),
+            Err(error) => serde_json::json!({ "claimed": false, "error": error.kind() }),
+        };
+        if let Err(error) = super::admin_audit::record_admin_action(
+            &state,
+            None,
+            "host.pairing.claim",
+            "external",
+            None,
+            Some(outcome),
+        ) {
+            tracing::error!(%error, "could not audit a pairing claim");
+        }
+    }
+    match result {
         Ok(token) => axum::Json(serde_json::json!({
             "token": token,
             "server_origin": pairing.server_origin(),

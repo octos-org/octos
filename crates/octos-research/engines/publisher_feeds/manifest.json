@@ -23,5 +23,6 @@
   "weight": 0.9,
   "cache_ttl_secs": 900,
   "timeout_secs": 10,
-  "robots": true
+  "robots": true,
+  "query_match": true
 }

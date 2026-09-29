@@ -399,8 +399,15 @@ impl SessionRuntimeCache {
                 });
                 if let Some(entry) = guard.get_mut(&key) {
                     if Arc::ptr_eq(&entry.runtime.profile, profile) {
-                        entry.last_used = Instant::now();
-                        return Ok(Arc::clone(&entry.runtime));
+                        // UPCR-2026-035: a runtime cached before its session
+                        // was bound (or rebound) to an app is stale — it
+                        // carries the profile's memory, its workspace and its
+                        // permissions. Drop it and rebuild.
+                        if entry.runtime.app_binding_is_current() {
+                            entry.last_used = Instant::now();
+                            return Ok(Arc::clone(&entry.runtime));
+                        }
+                        guard.remove(&key);
                     }
                 }
             }
@@ -661,6 +668,30 @@ impl SessionRuntimeCache {
         }
         let mut guard = self.inner.write().await;
         guard.retain(|(_, key_session, _), _| key_session != session_key);
+    }
+
+    /// Drop every cached runtime whose session has `topic`, under any base
+    /// key and profile, bumping each one's session generation. Used when a
+    /// topic becomes (or changes) an app binding (UPCR-2026-034/035): a
+    /// runtime built before the binding carries the profile's memory,
+    /// workspace and permissions.
+    pub async fn invalidate_sessions_with_topic(&self, topic: &str) {
+        let mut guard = self.inner.write().await;
+        let stale: Vec<SessionKey> = guard
+            .keys()
+            .filter(|(_, key, _)| key.topic() == Some(topic))
+            .map(|(_, key, _)| key.clone())
+            .collect();
+        {
+            let mut generations = self
+                .session_generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for key in &stale {
+                *generations.entry(key.clone()).or_insert(0) += 1;
+            }
+        }
+        guard.retain(|(_, key, _), _| key.topic() != Some(topic));
     }
 
     pub(crate) fn session_generation(&self, session_key: &SessionKey) -> u64 {

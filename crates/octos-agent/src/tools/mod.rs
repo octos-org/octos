@@ -439,6 +439,14 @@ pub struct ToolApprovalRequest {
     pub body: String,
     pub command: Option<String>,
     pub cwd: Option<String>,
+    /// This approval covers exactly this call: a remembered approval scope
+    /// (`approve_for_tool`, `approve_for_session`, …) must neither answer it
+    /// nor be recorded from it. Set by host-routed app tools (UPCR-2026-035),
+    /// whose approvals carry the exact arguments.
+    pub once_only: bool,
+    /// A host-routed app tool's call (UPCR-2026-035): the owning app, the
+    /// tool, the exact arguments and the caller, for the host's own sheet.
+    pub host_tool: Option<octos_core::ui_protocol::ApprovalHostToolDetails>,
 }
 
 /// Decision returned to a blocked tool after client approval handling.
@@ -802,6 +810,13 @@ pub trait Tool: Send + Sync {
     fn blocks_on_human_input(&self) -> bool {
         false
     }
+
+    /// Where the tool's code runs ([`ToolOrigin`]). The registry records it
+    /// at registration, so a filter can select by origin instead of by
+    /// name. Default: [`ToolOrigin::Builtin`].
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
 }
 
 // Tool registry (extracted to its own module)
@@ -809,7 +824,7 @@ pub trait Tool: Send + Sync {
 pub(crate) mod read_paging_probe;
 pub(crate) mod read_window;
 mod registry;
-pub use registry::ToolRegistry;
+pub use registry::{RESERVED_BUILTIN_TOOL_NAMES, ToolOrigin, ToolRegistry};
 
 // Tool policy
 pub mod policy;
@@ -855,6 +870,7 @@ pub mod message;
 pub mod peer_close;
 pub mod peer_gather;
 pub mod peer_handoff;
+pub mod peer_host_tool;
 pub mod peer_list;
 pub mod peer_respond;
 pub mod peer_send_input;
@@ -928,12 +944,17 @@ pub use peer_gather::{PeerGatherCallback, PeerGatherTool};
 pub use peer_handoff::{
     PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool,
 };
+pub use peer_host_tool::{
+    HOST_TOOL_MAX_ARGS_BYTES, HostRoutedTool, HostToolAudit, HostToolCall, HostToolCallOutcome,
+    HostToolCaller, HostToolConfirm, HostToolDecl, HostToolRisk, HostToolRouter, OccurrenceClaim,
+};
 pub use peer_list::{PeerListCallback, PeerListTool};
 pub use peer_respond::{
     PeerRespondAnswer, PeerRespondCallback, PeerRespondRequest, PeerRespondTool,
 };
 pub use peer_send_input::{
-    PeerSendInputCallback, PeerSendInputDelivery, PeerSendInputRequest, PeerSendInputTool,
+    PeerSendInputAnswerCallback, PeerSendInputCallback, PeerSendInputDelivery,
+    PeerSendInputRefusal, PeerSendInputRequest, PeerSendInputTool,
 };
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
@@ -1049,14 +1070,61 @@ pub fn resolve_path_with_scope(
     user_path: &str,
     filesystem_scope: FilesystemScope,
 ) -> Result<PathBuf> {
-    if filesystem_scope.is_host() {
+    let resolved = if filesystem_scope.is_host() {
         let candidate = PathBuf::from(user_path);
         if candidate.is_absolute() {
-            return Ok(normalize_lexical(&candidate));
+            normalize_lexical(&candidate)
+        } else {
+            normalize_lexical(&base_dir.join(user_path))
         }
-        return Ok(normalize_lexical(&base_dir.join(user_path)));
+    } else {
+        resolve_path(base_dir, user_path)?
+    };
+    if is_process_secret_path(&resolved) || is_process_secret_path(Path::new(user_path)) {
+        eyre::bail!("process environments and command lines are off limits: {user_path}");
     }
-    resolve_path(base_dir, user_path)
+    Ok(resolved)
+}
+
+/// A process's private view: anything under `/proc/self`, `/proc/thread-self`
+/// or `/proc/<pid>` (environment, command line, `fd/`, `root/`, `cwd`,
+/// `mem`, …) and `/dev/fd`, `/dev/std*`. No file tool opens these in any
+/// filesystem scope, however the path is spelled: the raw spelling, its
+/// lexical normalization and (when it exists) its canonical target are all
+/// judged, so `..`, a leading `/../..` or a workspace symlink cannot slip
+/// past. System-wide `/proc` files such as `/proc/cpuinfo` stay readable.
+pub fn is_process_secret_path(path: &Path) -> bool {
+    fn private_view(path: &Path) -> bool {
+        let text = path.to_string_lossy();
+        let text = text.trim_end_matches('/');
+        let mut parts = text
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".");
+        let found = |parts: &mut dyn Iterator<Item = &str>| -> bool {
+            let mut previous = "";
+            for part in parts {
+                if previous == "proc"
+                    && (part == "self"
+                        || part == "thread-self"
+                        || part.chars().all(|c| c.is_ascii_digit()))
+                {
+                    return true;
+                }
+                if previous == "dev" && (part == "fd" || part.starts_with("std")) {
+                    return true;
+                }
+                if part == "environ" || part == "cmdline" {
+                    return text.contains("/proc/");
+                }
+                previous = part;
+            }
+            false
+        };
+        found(&mut parts)
+    }
+    private_view(path)
+        || private_view(&normalize_lexical(path))
+        || std::fs::canonicalize(path).is_ok_and(|real| private_view(&real))
 }
 
 /// Resolve and classify a user-supplied path against a [`SessionScope`]
@@ -1103,6 +1171,11 @@ fn resolve_for_scope(
     user_path: &str,
     for_write: bool,
 ) -> Result<PathBuf, &'static str> {
+    if is_process_secret_path(Path::new(user_path))
+        || is_process_secret_path(&normalize_lexical(Path::new(user_path)))
+    {
+        return Err("process environments and command lines are off limits");
+    }
     // Upload handles (`up/<base64>/<name>`) are opaque references to a file in
     // the authenticated upload tmpdir — NOT workspace-relative paths. Without
     // this short-circuit the join+classify logic below treats them as
@@ -2737,5 +2810,29 @@ mod tool_context_tests {
         let permissions = ToolPermissions::default();
         assert!(permissions.is_tool_allowed("anything"));
         assert!(permissions.is_tool_allowed("shell"));
+    }
+}
+
+#[cfg(test)]
+mod process_secret_path_tests {
+    use super::*;
+
+    #[test]
+    fn should_refuse_process_environments_in_every_scope() {
+        for path in [
+            "/proc/1/environ",
+            "/proc/self/cmdline",
+            "/proc/9/task/9/environ",
+            "/proc/1/../1/environ",
+        ] {
+            assert!(
+                resolve_path_with_scope(Path::new("/tmp"), path, FilesystemScope::Host).is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            resolve_path_with_scope(Path::new("/tmp"), "/proc/cpuinfo", FilesystemScope::Host)
+                .is_ok()
+        );
     }
 }

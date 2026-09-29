@@ -49,6 +49,7 @@ use crate::build_cache::pool::{BuildCacheConfig, Slot, SlotOutcome};
 use crate::contracts::UiProtocolContractStores;
 
 pub(crate) mod app_binding;
+pub(crate) mod host_tools;
 mod recovery;
 pub(crate) use recovery::*;
 // task-evo-peer-turn-status — the typed lifetime projection lives in
@@ -674,6 +675,21 @@ pub(crate) fn adopt_parked_peer_tasks_with_results(
 
 /// Split a `peer-<slug>` session key into `(profile_id, slug)`, or `None` for
 /// a non-peer or unprofiled session.
+/// The peer whose token budget (#2500) a session's turns are charged to: the
+/// peer itself for `peer-<slug>`, and the OWNING peer for a request context
+/// `peerctx-<slug>.<id>` (UPCR-2026-034/035), so an app cannot spend outside
+/// its budget by working through contexts.
+pub(crate) fn budget_peer_slug(session_id: &SessionKey) -> Option<&str> {
+    if let Some((_, slug)) = peer_slug_and_profile(session_id) {
+        return Some(slug);
+    }
+    let topic = session_id.topic()?;
+    topic.strip_prefix(app_binding::PEER_CONTEXT_TOPIC_PREFIX)?;
+    let (slug, context_id) = app_binding::parse_context_topic(topic)?;
+    (peer_slug_is_safe(slug) && app_binding::validate_context_id(context_id).is_ok())
+        .then_some(slug)
+}
+
 pub(crate) fn peer_slug_and_profile(session_id: &SessionKey) -> Option<(&str, &str)> {
     // NOT a peer session. The overwhelmingly common case, and the only one where
     // `None` is uninteresting — every caller correctly skips peer bookkeeping.

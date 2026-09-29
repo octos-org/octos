@@ -1,7 +1,11 @@
 //! Shared SSRF (Server-Side Request Forgery) protection.
 //!
-//! Provides hostname and IP validation to block requests to private/internal
-//! network addresses. Used by both `web_fetch` and `browser` tools.
+//! A thin agent-facing adapter over `octos_research::net` — the one SSRF
+//! implementation in the workspace (host/IP classification, fail-closed DNS
+//! validation, per-hop pinned fetching). Used by the `browser` and
+//! `site_crawl` tools and the MCP remote dispatcher; `web_fetch` takes its
+//! fleet allowlist gate ([`check_host_allowlist`]) from here and its URL
+//! safety directly from `octos_research::net`.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -12,80 +16,67 @@ pub(crate) struct SsrfCheckResult {
     /// Resolved socket addresses — empty ONLY when the host was a literal
     /// IP (already validated, nothing to pin). A DNS-resolved host always
     /// carries at least one pinned address: an empty DNS answer fails
-    /// closed in `validate_answer_set` instead of skipping the pin.
+    /// closed in `octos_research::net` (`validate_answer_set`) instead of
+    /// skipping the pin.
     pub resolved_addrs: Vec<SocketAddr>,
 }
 
 /// Validate a URL against SSRF protections: checks scheme, hostname, and DNS resolution.
 /// Returns `Ok(SsrfCheckResult)` if the URL is safe, `Err(error_message)` if blocked.
 ///
-/// Fails closed: DNS lookup failures are treated as blocked (prevents bypass
-/// by causing DNS resolution to fail at check time but succeed at fetch time).
+/// A thin adapter over [`octos_research::net::check_url`], keeping this
+/// module's agent-facing contract: the legacy error messages the tools
+/// surface (and their tests pin), and an empty pin set for literal-IP
+/// hosts. Fails closed: DNS lookup failures are treated as blocked (prevents
+/// bypass by causing DNS resolution to fail at check time but succeed at
+/// fetch time).
 pub(crate) async fn check_ssrf_with_addrs(url: &str) -> Result<SsrfCheckResult, String> {
     let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid URL".to_string())?;
     let host = parsed
         .host_str()
         .ok_or_else(|| "URL has no host".to_string())?;
 
-    if is_private_host(host) {
-        return Err("Requests to private/internal hosts are not allowed".to_string());
-    }
+    let (checked_host, resolved_addrs) = octos_research::net::check_url(url)
+        .await
+        .map_err(|e| map_check_url_error(&e, host))?;
 
-    // Literal IPs were already checked by is_private_host — no DNS needed.
-    if host.parse::<IpAddr>().is_ok() {
-        return Ok(SsrfCheckResult {
-            resolved_addrs: vec![],
-        });
-    }
-
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    match tokio::net::lookup_host(format!("{host}:{port}")).await {
-        Ok(addrs) => Ok(SsrfCheckResult {
-            resolved_addrs: validate_answer_set(host, addrs)?,
-        }),
-        Err(e) => {
-            // Fail closed: if DNS fails, block the request. An attacker could
-            // trigger DNS failure at check time, then succeed at fetch time
-            // (DNS rebinding variant).
-            Err(format!(
-                "DNS resolution failed for host '{host}' — blocking request (fail closed): {e}"
-            ))
-        }
-    }
+    // Literal IPs connect directly — nothing to pin. A DNS-resolved host
+    // always pins: `check_url` fails closed on an empty answer set.
+    let resolved_addrs = if checked_host.parse::<IpAddr>().is_ok() {
+        Vec::new()
+    } else {
+        resolved_addrs
+    };
+    Ok(SsrfCheckResult { resolved_addrs })
 }
 
-/// Validate a DNS answer set for `host`: every address must be public, and
-/// the answer set must be non-empty.
-///
-/// SECURITY (peer-review fix): an EMPTY answer set is a hard failure, never
-/// a bypass. The returned list is the DNS-pin set: every consumer of
-/// [`SsrfCheckResult::resolved_addrs`] (`web_fetch`'s hop loop, the MCP
-/// remote dispatcher) skips
-/// `.resolve()` pinning when the list is empty, on the assumption that
-/// "empty = literal-IP host, nothing to pin". If an empty RESOLVED answer
-/// could reach those consumers, the connect phase would re-resolve the host
-/// unpinned — re-opening the DNS-rebinding TOCTOU (empty answer at check
-/// time, private IP at fetch time) that pinning exists to prevent.
-fn validate_answer_set(
-    host: &str,
-    addrs: impl IntoIterator<Item = SocketAddr>,
-) -> Result<Vec<SocketAddr>, String> {
-    let mut safe_addrs = Vec::new();
-    for addr in addrs {
-        if is_private_ip(&addr.ip()) {
-            return Err(
-                "Requests to private/internal hosts are not allowed (DNS resolved to private IP)"
-                    .to_string(),
-            );
-        }
-        safe_addrs.push(addr);
+/// Map [`octos_research::net::check_url`]'s errors onto this module's
+/// agent-facing messages — the strings the tools surface to the model and
+/// their tests pin. `check_url` has a closed error vocabulary, so the
+/// mapping is exact-match with a passthrough for anything unrecognized
+/// (e.g. its non-http(s) scheme refusal, which this module never had).
+fn map_check_url_error(err: &str, host: &str) -> String {
+    const PRIVATE: &str = "Requests to private/internal hosts are not allowed";
+    if let Some(e) = err.strip_prefix("blocked: DNS resolution failed (fail closed): ") {
+        // Fail closed: if DNS fails, block the request. An attacker could
+        // trigger DNS failure at check time, then succeed at fetch time
+        // (DNS rebinding variant).
+        return format!(
+            "DNS resolution failed for host '{host}' — blocking request (fail closed): {e}"
+        );
     }
-    if safe_addrs.is_empty() {
-        return Err(format!(
+    if err == "blocked: DNS returned no addresses (fail closed)" {
+        return format!(
             "DNS resolution returned no addresses for host '{host}' — blocking request (fail closed)"
-        ));
+        );
     }
-    Ok(safe_addrs)
+    if err == "blocked: private/internal host" || err == "blocked: private/internal address" {
+        return PRIVATE.to_string();
+    }
+    if err == "blocked: host resolves to a private/internal address" {
+        return format!("{PRIVATE} (DNS resolved to private IP)");
+    }
+    err.to_string()
 }
 
 /// Validate a URL against SSRF protections: checks scheme, hostname, and DNS resolution.
@@ -343,49 +334,69 @@ mod tests {
         assert!(!is_private_ip(&"1.1.1.1".parse().unwrap()));
     }
 
-    // --- validate_answer_set tests ---
+    // --- adapter parity with the shared implementation ---
 
-    /// SECURITY (peer-review finding: empty DNS answer skips pinning): an
-    /// empty DNS answer set must be a HARD FAILURE, never a bypass — if it
-    /// flowed through as `Ok` with no addresses, every pinning consumer
-    /// would skip `.resolve()` ("empty = literal IP, nothing to pin") and
-    /// reqwest would re-resolve the host at connect time, letting a
-    /// rebinding resolver answer empty at check time and 169.254.169.254 at
-    /// fetch time — the exact DNS-rebinding TOCTOU the pin exists to close.
-    #[test]
-    fn should_fail_closed_when_dns_answer_set_is_empty() {
-        let result = validate_answer_set("rebind.example.com", std::iter::empty());
+    /// The adapter maps errors and narrows pin sets but must never invert a
+    /// verdict: everything `check_url` blocks stays blocked, with this
+    /// module's messages. The listed URLs double as the module's blocking
+    /// matrix (each row also asserts through the adapter's real code path).
+    #[tokio::test]
+    async fn adapter_classifies_in_parity_with_check_url() {
+        for url in [
+            "http://localhost/secret",
+            "http://127.0.0.1:8080/admin",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/internal",
+            "http://192.168.1.1/router",
+            "http://[::1]/secret",
+            "http://[::ffff:192.168.1.1]/internal",
+            "ftp://93.184.216.34/x",
+            "file:///etc/passwd",
+            "not-a-url",
+        ] {
+            let adapter = check_ssrf_with_addrs(url).await.err();
+            let shared = octos_research::net::check_url(url).await.err();
+            assert_eq!(
+                adapter.is_some(),
+                shared.is_some(),
+                "classification must match the shared implementation for {url}"
+            );
+            assert!(adapter.is_some(), "{url} must be blocked");
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_returns_no_pins_for_public_ipv6_literals() {
+        // A public IPv6 literal is validated structurally by `check_url` —
+        // no name resolution at all — and connects directly: empty pin set,
+        // like every literal host. Pre-consolidation this resolved the
+        // bracketed host through `getaddrinfo` and pinned from that answer.
+        let result = check_ssrf_with_addrs("http://[2606:4700::1111]/").await;
+        let result = result.expect("public IPv6 literal must be allowed");
         assert!(
-            result.is_err(),
-            "empty DNS answer must be blocked, not treated as 'nothing to pin'"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("no addresses") && err.contains("fail closed"),
-            "error must keep the module's fail-closed taxonomy: {err}"
+            result.resolved_addrs.is_empty(),
+            "literal IP should not trigger DNS, resolved_addrs empty"
         );
     }
 
-    #[test]
-    fn should_pass_public_answer_set_through_validation() {
-        let addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let result = validate_answer_set("example.com", [addr]);
-        assert_eq!(result.expect("public answer set is safe"), vec![addr]);
-    }
-
-    #[test]
-    fn should_block_answer_set_containing_private_ip() {
-        // A mixed answer (public + private) is how a rebinding resolver
-        // smuggles an internal target past a first-answer-only check.
-        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let private: SocketAddr = "10.0.0.1:443".parse().unwrap();
-        let result = validate_answer_set("mixed.example.com", [public, private]);
-        assert!(
-            result
-                .expect_err("private answer must block")
-                .contains("private"),
-            "private answers must be reported with the module's taxonomy"
-        );
+    #[tokio::test]
+    async fn adapter_never_returns_ok_with_empty_pins_for_a_dns_host() {
+        // The DNS-pin side of the contract: when a host name resolves to an
+        // allowed answer set, the fetchers' `resolve_to_addrs` must receive
+        // it — an empty pin set is reserved for literal hosts and would
+        // disable pinning. (Behind a fake-ip/VPN resolver example.com
+        // answers from a blocked range; the check must then fail closed —
+        // never come back `Ok` un-pinned.)
+        match check_ssrf_with_addrs("https://example.com/").await {
+            Ok(result) => assert!(
+                !result.resolved_addrs.is_empty(),
+                "a DNS-resolved host must carry its pin set"
+            ),
+            Err(err) => assert!(
+                err.contains("private") || err.contains("fail closed"),
+                "a blocked resolution must say why: {err}"
+            ),
+        }
     }
 
     // --- check_ssrf_with_addrs tests ---

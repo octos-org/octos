@@ -138,6 +138,9 @@ spec and UPCR documents. The authoritative source remains code:
 | `peer/model/set` | shipped; UPCR-2026-034 host-owned app peers |
 | `peer/context/open` | shipped; UPCR-2026-034 host-owned app peers |
 | `peer/context/close` | shipped; UPCR-2026-034 host-owned app peers |
+| `peer/tools/register` | shipped; UPCR-2026-035 host-registered peer tools |
+| `peer/tool/result` | shipped; UPCR-2026-035 host-registered peer tools |
+| `peer/input/reject` | shipped; UPCR-2026-035 host-registered peer tools (#2618) |
 | `turn/steer` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `session/compact` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `session/compact/mode/set` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
@@ -181,6 +184,9 @@ spec and UPCR documents. The authoritative source remains code:
 | `router/failover` | shipped adaptive-router notification |
 | `queue/state` | known client-emitted queue notification |
 | `agent/updated` | shipped, UPCR-2026-019 / UPCR-2026-021 |
+| `peer/tool/call` | shipped raw notification to the registering host connection, UPCR-2026-035 |
+| `peer/tool/cancel` | shipped raw notification to the registering host connection, UPCR-2026-035 |
+| `peer/input` | shipped raw notification to the registering host connection, UPCR-2026-035 |
 | `agent/output/delta` | shipped, UPCR-2026-019 / UPCR-2026-021 |
 | `agent/artifact/updated` | shipped, UPCR-2026-019 / UPCR-2026-021 |
 | `session/goal/updated` | shipped, UPCR-2026-021 |

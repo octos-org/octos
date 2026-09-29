@@ -151,12 +151,29 @@ pub struct SessionRuntime {
     /// request contexts (UPCR-2026-034) — the bound app/account namespace.
     pub memory: super::memory_namespace::SessionMemory,
 
+    /// The app binding (UPCR-2026-034) this runtime was built for, and the
+    /// `peers/` root it was resolved under. A binding decides the workspace,
+    /// the memory stores and the permission clamp, so a runtime built for
+    /// another binding must be rebuilt, never reused
+    /// ([`Self::app_binding_is_current`]).
+    pub(crate) app_binding: crate::peers::app_binding::SessionAppBinding,
+    pub(crate) binding_peers_root: PathBuf,
     /// The connection whose `client_commands` declaration is currently in
     /// the prompt, so only that connection's close releases it.
     client_commands_owner: std::sync::Mutex<Option<u64>>,
 }
 
 impl SessionRuntime {
+    /// Whether the durable app binding of this session still equals the one
+    /// this runtime was built for. `false` means the runtime is stale (e.g.
+    /// cached before `peer/prepare` bound the session) and must be rebuilt.
+    pub(crate) fn app_binding_is_current(&self) -> bool {
+        crate::peers::app_binding::resolve_session_app_binding(
+            &self.binding_peers_root,
+            &self.session_key,
+        ) == self.app_binding
+    }
+
     /// Construct a [`SessionRuntime`] for the given session key.
     ///
     /// See the M11-C contract in `workstreams/M11-runtime-unification.md`
@@ -331,10 +348,15 @@ impl SessionRuntime {
         // namespace; a closed or never-opened binding refuses to run at all.
         // The binding is durable kernel state written by `peer/prepare` /
         // `peer/context/open`, never taken from this open's parameters.
+        let binding_peers_root = profile.data_dir.join("peers");
         let app_binding = crate::peers::app_binding::resolve_session_app_binding(
-            &profile.data_dir.join("peers"),
+            &binding_peers_root,
             &session_key,
         );
+        // Kept on the runtime: a cached runtime whose binding no longer
+        // matches the durable one (the session was bound by `peer/prepare` or
+        // `peer/context/open` after it was cached) is never reused.
+        let bootstrapped_binding = app_binding.clone();
         let (workspace_hint, bound_memory_namespace) = match app_binding {
             crate::peers::app_binding::SessionAppBinding::Unbound => (workspace_hint, None),
             crate::peers::app_binding::SessionAppBinding::Refused(reason) => {
@@ -358,6 +380,28 @@ impl SessionRuntime {
                 (Some(cwd), Some(memory_namespace))
             }
         };
+        // UPCR-2026-035: a host-bound app session never runs with host
+        // filesystem access. `Host` (danger_full_access, e.g. a Solo profile
+        // run with `--danger-full-access`) leaves file tools unscoped and the
+        // sandbox off, so an app's read tools would accept any absolute path.
+        // Clamp it to workspace access, keeping the approval policy; the
+        // session scope is then attached below like for any other session.
+        let (permissions, sandbox_override) =
+            if bound_memory_namespace.is_some() && permissions.filesystem_scope.is_host() {
+                tracing::warn!(
+                    session = %session_key,
+                    "host-bound app session: clamping host filesystem access to its workspace"
+                );
+                (
+                    EffectivePermissions {
+                        approval_policy: permissions.approval_policy,
+                        ..EffectivePermissions::workspace_write()
+                    },
+                    None,
+                )
+            } else {
+                (permissions, sandbox_override)
+            };
         let had_workspace_hint = workspace_hint.is_some();
         let workspace_root = resolve_workspace_root(profile, &session_key, workspace_hint)?;
         let workspace_profile = profile.for_workspace(&workspace_root).await?;
@@ -651,6 +695,11 @@ impl SessionRuntime {
                 }
             }
         };
+        // A host-bound app session is always fenced to its workspace: never
+        // fall back to the unscoped legacy resolver.
+        if bound_memory_namespace.is_some() && session_scope.is_none() {
+            eyre::bail!("session {session_key} is host-bound but its workspace scope failed");
+        }
 
         // The prompt's slash commands (`/router`, `/queue`, …) are handled by
         // bus channels only; serve sessions get the client's own commands
@@ -833,6 +882,8 @@ impl SessionRuntime {
             sessions_root,
             sessions,
             memory,
+            app_binding: bootstrapped_binding,
+            binding_peers_root,
             client_commands_owner: std::sync::Mutex::new(None),
         }))
     }

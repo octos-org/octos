@@ -10,11 +10,12 @@ Research building blocks for the octos search tools (`web_search`, `deep-search`
 
 ## Metasearch
 
-A Rust core fans a query out to small search engines written as sandboxed [OctoScript](https://github.com/OctoSense-org/Octoscript) scripts, then merges and ranks what they return. It is the first provider in the chain for every category. After it come a self-hosted SearXNG (if configured) and keyed APIs. Scraping search-results pages stays behind `OCTOS_ALLOW_SERP_SCRAPE`.
+A Rust core fans a query out to small search engines written as sandboxed [OctoScript](https://github.com/OctoSense-org/Octoscript) scripts, then merges and ranks what they return. It is the first provider in the chain for every category. After it come a self-hosted SearXNG (if configured) and keyed APIs. Results-page search (DuckDuckGo, Bing via Chrome) follows as the last tier for general web results; it is on unless `OCTOS_ALLOW_SERP_SCRAPE=0`.
 
 ```
 octos-research (Rust, trusted)                      engines/<id>/ (sandboxed OctoScript)
- ├─ dispatcher: parallel fan-out, deadline           ├─ manifest.json   id, categories, languages, hosts,
+ ├─ dispatcher: parallel fan-out, deadline,         ├─ manifest.json   id, categories, languages, hosts,
+ │   soft deadline for stragglers                   │
  ├─ engine suspension on errors (doubling backoff)   │                  auth, rate_limit, docs_url, license_note
  ├─ HTTP: per-host spacing, Retry-After, ETag /      ├─ engine.octoscript
  │   If-Modified-Since cache, octos UA   │    build_request(query, opts)  -> request | [request] (≤ max_requests)
@@ -31,6 +32,7 @@ octos-research (Rust, trusted)                      engines/<id>/ (sandboxed Oct
   - `net.url({base, query})` builds a percent-encoded URL on a declared host.
   - `markup.feed({lang})` parses the current response as RSS or Atom.
   - `markup.text({html})` returns the plain text of an HTML fragment.
+  - `markup.matches({query, text})` returns `{matched}`: whether a headline is about the query (see [Publisher feeds](#engines) below).
 - **No other capability.** The engines run on the bounded `octoscript-core` runtime: there is no `mod.tool`, filesystem, process, clock or network module, each method has a call budget, and instructions, heap, strings, stack and wall-clock time are bounded.
 - **Keys stay in the host.** A manifest's `auth` says where the core attaches a key (header, bearer or query parameter) after `build_request` has run. The script never sees it. Engines with `needs_key` run only when the host has a key.
 - **Rate limits.** Each engine's `rate_limit.min_interval_ms` is enforced per host across the whole process. When the provider signals, the core waits:
@@ -38,6 +40,7 @@ octos-research (Rust, trusted)                      engines/<id>/ (sandboxed Oct
   - the `backoff` value an engine reads from the response, as Stack Exchange's API sends.
 
   A search skips an engine whose next slot would miss its deadline.
+- **Timeouts and slow engines.** Each request is bounded by its manifest's `timeout_secs` (GDELT: 5 s, because it answers a throttled client's request with a 429 only after about 10 s). Once one engine has answered with results and at most a quarter of the calls (at least one) are still running, those get `SearchRequest::straggler_grace` (default 2 s) more; then they are dropped and reported as `timeout` with the reason "dropped (soft deadline)". A dropped call counts as a timeout for the engine's health: three in a row suspend it for 30 s, doubling each time it happens again before the engine answers. An error suspends it at once (30 s, doubling, or `Retry-After` when longer).
 - **Discovery.** Built-in engines are compiled in. Extra engines are loaded from `OCTOS_METASEARCH_ENGINES/<id>/`, and each must be pinned by the digest `sha256(manifest.json ‖ 0x00 ‖ engine.octoscript)`. Pins come only from the host: a file named by `OCTOS_METASEARCH_PINS`, which must live outside the engine directory, so write access to that directory is not enough to add or change an engine. A directory engine may not replace a built-in with the same id unless `OCTOS_METASEARCH_ALLOW_OVERRIDE=1`.
 
 ### Engines
@@ -62,7 +65,7 @@ Notes:
 - **`general` without a key is thin.** Key-less general search is Wikipedia and Wikidata only, and results say so.
 - **Google News.** Headlines, publisher and date only; article redirect links are cited, never fetched. Google doesn't document the feed, and its text limits it to personal, non-commercial feed-reader use, which is how an octos agent acting for one person uses it.
 - **Mastodon.** Uses the public hashtag timeline, because full-text search needs a user token. Set another instance with `OCTOS_METASEARCH_MASTODON_INSTANCE`. Its results are posts (see [Articles and posts](#articles-and-posts)).
-- **Publisher feeds.** Feeds can't be searched, so the engine reads the feeds for the requested languages (one request per feed, each cached 15 minutes) and keeps entries that mention the query terms; English terms match whole words, Chinese terms match anywhere. Headline, source, date and link only. Publishers whose terms forbid AI or automated use (BBC, The Guardian, Al Jazeera, DW, NYT 中文网) are not included.
+- **Publisher feeds.** Feeds can't be searched, so the engine reads the feeds for the requested languages (one request per feed, each cached 15 minutes) and keeps the entries whose headline or summary is about the query: the query as a phrase, or every significant term of it. Stop-words ("the", "of", "news", "的", "最新"…) and one-letter terms are not significant, and some terms are never enough, so "EU AI Act" does not match a "terrorist act" or "AI in schools". Words match whole words ("ai" is not in "said"; a plural "s" is allowed); CJK terms match anywhere in the CJK text, ignoring punctuation between characters. The manifest's `query_match: true` makes the core apply the same test again and report anything else as skipped (`query_mismatch`). Headline, source, date and link only. Publishers whose terms forbid AI or automated use (BBC, The Guardian, Al Jazeera, DW, NYT 中文网) are not included.
 - **Small key-less quotas.** OpenAlex allows about 100 searches a day per IP without a key. Stack Exchange allows 300 requests a day.
 
 ### Articles and posts
@@ -87,7 +90,8 @@ Every failed read is a `ReadError`: `{reason, detail, final_url}`. It displays a
 | `reason` | Meaning |
 |---|---|
 | `redirect_unresolved` | A Google News link never reached the publisher: no renderer is configured, or the browser stayed on news.google.com. |
-| `consent_page` | A cookie or privacy consent wall, including a redirect to consent.google.com or guce.yahoo.com. It is not clicked through. |
+| `consent_page` | A cookie or privacy consent wall, including a redirect to consent.google.com or guce.yahoo.com, a consent dialog that extraction took for the article (most of the text is consent wording, with at least three of the dialog's own phrases, such as "Strictly necessary", "Always active" or "Alle akzeptieren", not in quotes), or an embedded player's consent prompt ("To display this content from YouTube, you must enable advertisement tracking…") with no article text. It is not clicked through. |
+| `stub_page` | The page loaded, but its text is only a stub: boilerplate with less than about one sentence of article text (CJK counted three per character), a video playlist (running times and titles, no paragraph), or a video page (`og:type` video, or a `/video/` path) with only its caption. |
 | `paywall` | Subscriber-only content, from schema.org `isAccessibleForFree: false` or the page's subscribe prompt. It is not bypassed. |
 | `login_wall` | The content is shown only to signed-in users. |
 | `bot_challenge` | An anti-bot check: Cloudflare, DataDome, HUMAN/PerimeterX, or Google's unusual-traffic page. It is not bypassed. |

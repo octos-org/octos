@@ -76,6 +76,12 @@ pub struct EngineManifest {
     /// Off unless the host enables it.
     #[serde(default)]
     pub disabled_by_default: bool,
+    /// The engine lists entries it did not search for (feeds): the core
+    /// keeps only hits whose title or snippet match the query (the phrase,
+    /// or every significant term; see [`super::topic`]) and reports the rest
+    /// as skipped (`query_mismatch`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub query_match: bool,
 }
 
 /// Where the host puts a key.

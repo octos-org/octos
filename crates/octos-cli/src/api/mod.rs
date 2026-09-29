@@ -19,6 +19,7 @@ mod events_harness;
 mod file_mutations;
 mod frps_plugin;
 mod handlers;
+pub(crate) mod host_managed;
 mod memory_panel;
 pub mod metrics;
 pub(crate) mod ominix_runtime;
@@ -372,6 +373,10 @@ pub struct AppState {
     /// configs never set) is the primary defence; the handlers additionally
     /// reject any request carrying proxy-forwarding headers.
     pub solo_login_enabled: bool,
+    /// `octos serve --host-managed`: the embedding host's two credentials,
+    /// the loopback `Host` allowlist and the host-enabled pairing code. `None`
+    /// on every other server. See [`host_managed`].
+    pub host_managed: Option<Arc<host_managed::HostManaged>>,
     /// The HTTP serve's stop switch — the same `watch` channel the SIGINT /
     /// SIGTERM watcher flips, so the `server/shutdown` UI Protocol method ends
     /// the process through exactly the path Ctrl+C takes: stop accepting,
@@ -536,6 +541,7 @@ impl AppState {
             deployment_mode: crate::config::DeploymentMode::Local,
             pairing: None,
             solo_login_enabled: false,
+            host_managed: None,
             serve_shutdown: None,
             dangerous_default_permissions: false,
             default_network_denied: false,

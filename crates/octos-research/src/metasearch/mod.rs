@@ -29,6 +29,7 @@ pub mod manifest;
 pub mod merge;
 pub mod registry;
 pub mod sandbox;
+pub mod topic;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -77,6 +78,9 @@ pub const PINS_ENV: &str = "OCTOS_METASEARCH_PINS";
 /// (`1`/`true`/`yes`; off by default).
 pub const ALLOW_OVERRIDE_ENV: &str = "OCTOS_METASEARCH_ALLOW_OVERRIDE";
 
+/// Default [`SearchRequest::straggler_grace`].
+pub const DEFAULT_STRAGGLER_GRACE: Duration = Duration::from_secs(2);
+
 /// Whether the metasearch is enabled (default on).
 pub fn enabled(lookup: impl Fn(&str) -> Option<String>) -> bool {
     !lookup(METASEARCH_ENV).is_some_and(|v| {
@@ -104,7 +108,9 @@ pub struct Config {
     /// error up to `backoff_max`.
     pub backoff_base: Duration,
     pub backoff_max: Duration,
-    /// Consecutive timeouts before an engine is suspended.
+    /// Consecutive timeouts before an engine is suspended (for
+    /// `backoff_base`, doubling like errors when it happens again before the
+    /// engine answers).
     pub timeouts_before_suspend: u32,
     /// Check robots.txt for engines whose manifest sets `robots` (operator
     /// setting, off by default; see [`crate::RESPECT_ROBOTS_ENV`]).
@@ -197,6 +203,13 @@ pub struct SearchRequest {
     pub engines: Option<Vec<String>>,
     /// Overall deadline for the whole fan-out.
     pub deadline: Duration,
+    /// Soft deadline: once an engine has answered with results and at most
+    /// a quarter of the calls (at least one) are still running, those get
+    /// this much longer; then they are dropped and reported as `timeout`.
+    /// One slow provider (GDELT answers its 429 only after ~10 s) no longer
+    /// holds up results the others already gave. `None` waits for every
+    /// call (up to its own timeout and [`Self::deadline`]).
+    pub straggler_grace: Option<Duration>,
     pub now: DateTime<Utc>,
 }
 
@@ -215,6 +228,7 @@ impl SearchRequest {
             filters: Filters::default(),
             engines: None,
             deadline: Duration::from_secs(25),
+            straggler_grace: Some(DEFAULT_STRAGGLER_GRACE),
             now: Utc::now(),
         }
     }
@@ -476,8 +490,7 @@ impl Metasearch {
     pub async fn search(&self, req: &SearchRequest) -> SearchResponse {
         let started = Instant::now();
         let calls = self.plan(req);
-        let futs = calls.iter().map(|c| self.run_call(c, req, started));
-        let results = futures::future::join_all(futs).await;
+        let results = self.fan_out(&calls, req, started).await;
 
         let mut filters = req.filters.clone();
         filters.langs = req.langs.clone();
@@ -485,8 +498,25 @@ impl Metasearch {
         let mut ranked = Vec::new();
         let mut reports = Vec::new();
         let mut skipped = Vec::new();
-        for (report, hits) in results {
+        for (call, (mut report, hits)) in calls.iter().zip(results) {
+            // Engines that list rather than search: only hits about the
+            // query count.
+            let matcher = call
+                .engine
+                .manifest
+                .query_match
+                .then(|| topic::QueryMatcher::new(call_query(call, req)));
             for (position, rh) in hits.into_iter().enumerate() {
+                if let Some(m) = &matcher {
+                    if !m.matches(&format!("{} {}", rh.hit.title, rh.hit.snippet)) {
+                        report.hits = report.hits.saturating_sub(1);
+                        if report.hits == 0 && report.status == EngineStatus::Ok {
+                            report.status = EngineStatus::Empty;
+                        }
+                        skipped.push(SkippedUrl::new(rh.hit.url, "query_mismatch".to_string()));
+                        continue;
+                    }
+                }
                 match filters.check(
                     rh.hit.domain_url(),
                     rh.hit.lang.as_deref(),
@@ -523,8 +553,10 @@ impl Metasearch {
             }
         }
         let note = (req.category == "general" && self.general_is_thin()).then(|| {
-            "Key-less general search covers Wikipedia and Wikidata only. For web results, \
-             add a Brave Search key (BRAVE_API_KEY) or set SEARXNG_URL to a self-hosted SearXNG."
+            "The metasearch's key-less general engines are Wikipedia and Wikidata. Web \
+             results come from results-page search (DuckDuckGo, Bing; on unless \
+             OCTOS_ALLOW_SERP_SCRAPE=0), a Brave Search key (BRAVE_API_KEY) or a \
+             self-hosted SearXNG (SEARXNG_URL)."
                 .to_string()
         });
         SearchResponse {
@@ -533,6 +565,88 @@ impl Metasearch {
             skipped,
             note,
         }
+    }
+
+    /// Run every call in parallel. With a [`SearchRequest::straggler_grace`],
+    /// calls still running that long after the soft deadline started (an
+    /// engine answered with results, and at most a quarter of the calls, at
+    /// least one, are left) are dropped and reported as `timeout`. Reports
+    /// keep the plan's order.
+    async fn fan_out(
+        &self,
+        calls: &[Call<'_>],
+        req: &SearchRequest,
+        started: Instant,
+    ) -> Vec<(EngineReport, Vec<RankedHit>)> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        let mut out: Vec<Option<(EngineReport, Vec<RankedHit>)>> =
+            calls.iter().map(|_| None).collect();
+        let mut soft_deadline: Option<Instant> = None;
+        {
+            let mut running: FuturesUnordered<_> = calls
+                .iter()
+                .enumerate()
+                .map(|(i, c)| async move { (i, self.run_call(c, req, started).await) })
+                .collect();
+            let mut done = 0usize;
+            let mut answered = false;
+            while done < calls.len() {
+                let next = match soft_deadline {
+                    Some(at) => match tokio::time::timeout_at(at, running.next()).await {
+                        Ok(next) => next,
+                        // Dropping `running` cancels the stragglers.
+                        Err(_) => break,
+                    },
+                    None => running.next().await,
+                };
+                let Some((i, result)) = next else { break };
+                answered |= !result.1.is_empty();
+                out[i] = Some(result);
+                done += 1;
+                let left = calls.len() - done;
+                if let Some(grace) = req.straggler_grace {
+                    if soft_deadline.is_none()
+                        && answered
+                        && left > 0
+                        && left <= (calls.len() / 4).max(1)
+                    {
+                        soft_deadline = Some(Instant::now() + grace);
+                    }
+                }
+            }
+        }
+        let grace = req.straggler_grace.unwrap_or_default();
+        out.into_iter()
+            .zip(calls)
+            .map(|(r, call)| r.unwrap_or_else(|| self.dropped(call, grace, started)))
+            .collect()
+    }
+
+    /// The report for a call dropped at the soft deadline (counted as a
+    /// timeout for the engine's health).
+    fn dropped(
+        &self,
+        call: &Call<'_>,
+        grace: Duration,
+        started: Instant,
+    ) -> (EngineReport, Vec<RankedHit>) {
+        let m = &call.engine.manifest;
+        self.record(&m.id, EngineStatus::Timeout, None);
+        let report = EngineReport {
+            engine: m.id.clone(),
+            lang: (!call.langs.is_empty()).then(|| call.langs.join(",")),
+            status: EngineStatus::Timeout,
+            hits: 0,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            error: Some(format!(
+                "still running {:.1}s after the other engines had answered; dropped (soft \
+                 deadline)",
+                grace.as_secs_f64()
+            )),
+            cached: false,
+        };
+        (report, Vec::new())
     }
 
     fn suspended(&self, id: &str) -> Option<Duration> {
@@ -560,7 +674,11 @@ impl Metasearch {
             EngineStatus::Timeout => {
                 h.timeouts += 1;
                 if h.timeouts >= c.timeouts_before_suspend {
-                    h.suspended_until = Some(Instant::now() + c.backoff_base);
+                    // Repeated runs of timeouts back off like errors do.
+                    h.errors += 1;
+                    let factor = 2u32.saturating_pow(h.errors.saturating_sub(1).min(16));
+                    let backoff = c.backoff_base.saturating_mul(factor).min(c.backoff_max);
+                    h.suspended_until = Some(Instant::now() + backoff);
                     h.timeouts = 0;
                 }
             }
@@ -616,12 +734,7 @@ impl Metasearch {
             "compact": req.now.format("%Y%m%d%H%M%S").to_string(),
             "unix": req.now.timestamp(),
         });
-        let query = req.query_for(
-            call.langs
-                .first()
-                .map(String::as_str)
-                .filter(|_| call.langs.len() == 1),
-        );
+        let query = call_query(call, req);
         json!({
             "query": query,
             "now": now,
@@ -731,12 +844,7 @@ impl Metasearch {
             allow_http: m.allow_http,
         };
         let opts = self.opts_json(call, req);
-        let query = req.query_for(
-            call.langs
-                .first()
-                .map(String::as_str)
-                .filter(|_| call.langs.len() == 1),
-        );
+        let query = call_query(call, req);
         let requests = sandbox::build_request(&sb, query, &opts)
             .map_err(|err| CallError::Failed(err, None))?;
         if requests.is_empty() {
@@ -1000,6 +1108,17 @@ impl Metasearch {
         }
         Ok(())
     }
+}
+
+/// The query a call searches: the language's own query for a
+/// one-language call, else the shared one.
+fn call_query<'r>(call: &Call<'_>, req: &'r SearchRequest) -> &'r str {
+    req.query_for(
+        call.langs
+            .first()
+            .map(String::as_str)
+            .filter(|_| call.langs.len() == 1),
+    )
 }
 
 enum CallError {
