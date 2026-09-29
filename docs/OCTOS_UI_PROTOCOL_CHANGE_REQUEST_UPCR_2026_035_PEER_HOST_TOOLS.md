@@ -703,5 +703,8 @@ never declares its tools a second way.
   `should_run_a_foreground_tool_in_a_host_turn_started_from_peer_input`,
   `should_hide_a_host_tool_approval_whose_host_is_unknown`,
   `should_refuse_foreign_writes_to_a_host_peer_session_when_its_set_is_on_disk`,
+  `should_refuse_foreign_turn_controls_on_a_host_peer_session_when_its_set_is_on_disk`
+  (no turn has run on the session; a corrupt `host_tools.json` is confined
+  too),
   `should_give_the_system_agent_the_app_tools_the_host_registers_on_its_session`
 - `spec_section6_catalog_lists_every_advertised_method`

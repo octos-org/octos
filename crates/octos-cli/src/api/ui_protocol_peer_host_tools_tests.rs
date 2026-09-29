@@ -8,9 +8,10 @@ use super::*;
 use crate::peers::host_tools::{apply_session_host_tools, resolve_session_host_tools};
 use octos_core::ui_protocol::{ApprovalRespondParams, QuestionId, UserQuestionAnswer};
 
-/// The chat id of this test's host sessions. The host-session map is
-/// process-wide and tests run in parallel, so each test (one thread per
-/// `#[tokio::test]`) gets its own id; every key in one test shares it.
+/// The chat id of this test's host sessions. Peer state (routes, the staged
+/// peers on disk) is process-wide and tests run in parallel, so each test
+/// (one thread per `#[tokio::test]`) gets its own id; every key in one test
+/// shares it.
 fn host_chat() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -3121,8 +3122,6 @@ async fn should_answer_a_host_peer_sessions_questions_only_on_the_owning_or_host
     let key = peer_key(&fx);
     let (host_ws, mut host_rx) = ws_connection_for_test(16);
     register(&fx, &host_ws, &token, json!({ "tools": [] })).unwrap();
-    // A turn of the host marks the session as the host peer's.
-    let _ = turn_registry(&fx, &key, "turn-q").await;
     let contracts = Arc::new(UiProtocolContractStores::default());
     let question_id = QuestionId::new();
     let _waiter = contracts.user_questions.request_runtime_owned(
@@ -3530,7 +3529,7 @@ async fn should_refuse_foreign_turn_controls_on_a_host_peer_session_when_its_set
     let token = prepare_news(&fx).await;
     let key = peer_key(&fx);
     let (host_ws, _host_rx) = ws_connection_for_test(8);
-    let (other_ws, _other_rx) = ws_connection_for_test(8);
+    let (other_ws, mut other_rx) = ws_connection_for_test(8);
     // Before registration nothing is confined.
     assert!(refuse_foreign_host_turn_control(&fx.state, &key, &other_ws, "turn/steer").is_none());
     register(&fx, &host_ws, &token, json!({ "tools": [] })).unwrap();
@@ -3542,6 +3541,32 @@ async fn should_refuse_foreign_turn_controls_on_a_host_peer_session_when_its_set
         assert_eq!(error.data.unwrap()["kind"], "peer_host_connection_only");
         assert!(refuse_foreign_host_turn_control(&fx.state, &key, &host_ws, method).is_none());
     }
+    // The handler refuses too, with no turn ever started on the session.
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    handle_turn_interrupt(
+        &other_ws,
+        &fx.state,
+        &ledger,
+        &active_turns,
+        &Arc::new(UiProtocolContractStores::default()),
+        "i0".into(),
+        TurnInterruptParams {
+            session_id: key.clone(),
+            turn_id: TurnId::new(),
+        },
+    )
+    .await;
+    assert_eq!(
+        rpc_error_kind(other_rx.recv().await.unwrap()),
+        "peer_host_connection_only"
+    );
+    // A corrupt tool-set leaf is confined too: fail closed like a readable
+    // one, still drivable by the host.
+    let leaf = peers_root(&fx).join("news/host_tools.json");
+    std::fs::write(&leaf, "not json").unwrap();
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &other_ws, "turn/steer").is_some());
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &host_ws, "turn/steer").is_none());
     // A prompt on the session is answered by its owner or the host connection.
     assert!(!host_session_answer_allowed(
         &fx.state,

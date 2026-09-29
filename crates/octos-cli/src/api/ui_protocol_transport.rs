@@ -8286,8 +8286,7 @@ where
             }
             let connection_profile_id = connection_profile_id_owned.as_deref();
             // UPCR-2026-035 (#2571): the same host-peer confinement as the WS
-            // loop, from the persisted tool set (so it holds after a restart,
-            // unlike the in-memory check inside the turn-control handlers).
+            // loop, from the persisted tool set (so it holds after a restart).
             if let Some(error) =
                 refuse_foreign_host_peer_session_call(&state, &ws, &request.method, &request.params)
             {
@@ -27042,16 +27041,13 @@ fn refuse_foreign_host_peer_session_call(
             params.get("topic").and_then(Value::as_str),
         ),
     };
-    crate::peers::host_tools::host_peer_slug_of(&session)?;
-    let (_, data_dir) = resolve_profile_data_dir(state, session.profile_id()).ok()?;
-    let controller =
-        crate::peers::host_tools::host_peer_session_controller(&data_dir.join("peers"), &session)?;
-    (controller != Some(ws.connection_id.0)).then(|| host_connection_only_error(method))
+    refuse_foreign_host_turn_control(state, &session, ws, method)
 }
 
 /// The controller of `session` when it is a registered host peer's session:
 /// from the persisted tool set and the peer's current host route, so it
-/// holds from the first call after a restart.
+/// holds from the first call after a restart. The syntax check up front
+/// keeps every ordinary session off the profile resolution entirely.
 fn persisted_host_session_controller(
     state: &AppState,
     session: &SessionKey,
