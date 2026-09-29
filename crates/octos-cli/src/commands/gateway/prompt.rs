@@ -10,9 +10,14 @@ pub const SLASH_COMMANDS_SEGMENT_NAME: &str = "slash_commands";
 const SLASH_COMMANDS_HEADER: &str = "## Slash Commands";
 const MAX_CLIENT_COMMANDS: usize = 64;
 const MAX_CLIENT_COMMAND_LEN: usize = 32;
-/// Commands that act on gateway per-actor state (adaptive router, queue
-/// mode). Serve intercepts them as unavailable, so no client can honor them.
-const GATEWAY_ONLY_COMMANDS: &[&str] = &["adaptive", "router", "queue"];
+/// Gateway commands serve intercepts as unavailable (`api::ws_slash`) that act
+/// on gateway per-actor state (adaptive router, queue mode, session reset):
+/// no client can honor them, so declarations of them are rejected.
+pub const SERVER_STATE_COMMANDS: &[&str] = &["adaptive", "router", "queue", "reset"];
+/// Gateway commands serve also intercepts, but that a client can handle
+/// locally without reaching the server (octoscode implements both), so
+/// declarations of them are accepted.
+pub const CLIENT_HANDLED_COMMANDS: &[&str] = &["status", "thinking"];
 
 /// Build the system prompt with bootstrap files, memory context, and skills.
 ///
@@ -80,7 +85,7 @@ pub fn render_client_commands(commands: &[String]) -> String {
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            && !GATEWAY_ONLY_COMMANDS
+            && !SERVER_STATE_COMMANDS
                 .iter()
                 .any(|blocked| name.eq_ignore_ascii_case(blocked));
         if valid && !names.contains(&name) {
@@ -247,7 +252,10 @@ mod tests {
     //! match) so the prompt can be edited around the rule without
     //! breaking the test — but the load-bearing phrases must stay.
 
-    use super::{render_client_commands, strip_slash_commands};
+    use super::{
+        CLIENT_HANDLED_COMMANDS, SERVER_STATE_COMMANDS, render_client_commands,
+        strip_slash_commands,
+    };
 
     const PROMPT: &str = include_str!("../../prompts/gateway_default.txt");
 
@@ -735,15 +743,27 @@ mod tests {
             "/router".into(),
             "/Adaptive".into(),
             "queue".into(),
+            "/reset".into(),
             "/status".into(),
             "/thinking".into(),
         ]);
         assert!(!section.contains("router"));
         assert!(!section.contains("adaptive"));
         assert!(!section.contains("queue"));
+        assert!(!section.contains("reset"));
         assert!(section.contains("`/status`"));
         assert!(section.contains("`/thinking`"));
         assert!(render_client_commands(&["/router".into()]).is_empty());
+    }
+
+    #[test]
+    fn intercepted_command_classes_are_disjoint() {
+        for name in SERVER_STATE_COMMANDS {
+            assert!(
+                !CLIENT_HANDLED_COMMANDS.contains(name),
+                "/{name} is in both classes"
+            );
+        }
     }
 
     #[test]

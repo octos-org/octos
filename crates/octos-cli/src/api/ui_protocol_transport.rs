@@ -7642,6 +7642,7 @@ async fn ui_protocol_connection(
         &contracts.user_questions,
     )
     .await;
+    release_connection_client_commands(&state, ws.connection_id).await;
     abort_live_forwarders(&live_forwarders, &ledger).await;
     abort_btw_aside_tasks(&mut btw_aside_tasks).await;
     // Dropping `ws` lets the writer task drain & exit; await it so the socket
@@ -8511,6 +8512,7 @@ where
         .await;
     }
     abort_btw_aside_tasks(&mut btw_aside_tasks).await;
+    release_connection_client_commands(&state, ws.connection_id).await;
     cleanup_stdio_connection_resources(
         &active_turns,
         &connection_turns,
@@ -8747,6 +8749,16 @@ async fn abort_btw_aside_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
         task.abort();
         let _ = task.await;
     }
+}
+
+/// A closed connection no longer vouches for the slash commands it declared
+/// on `session/open`; drop them so later turns (loops, cron, peers) don't
+/// advertise a client that is gone.
+async fn release_connection_client_commands(state: &AppState, connection_id: ConnectionId) {
+    state
+        .session_cache
+        .release_client_commands(connection_id.0)
+        .await;
 }
 
 async fn cleanup_stdio_connection_resources(
@@ -21242,8 +21254,10 @@ async fn open_session_result(
                 register_session_ledger_scope(state, ledger, &runtime);
                 // Every open re-declares: a client that omits the field must
                 // not inherit commands another client declared earlier.
-                runtime
-                    .apply_client_commands(params.client_commands.as_deref().unwrap_or_default());
+                runtime.apply_client_commands(
+                    connection_id.0,
+                    params.client_commands.as_deref().unwrap_or_default(),
+                );
                 open_context_provider = Some(
                     peer_lane_provider_for(&params.session_id, &runtime)
                         .unwrap_or_else(|| runtime.profile.llm.clone()),

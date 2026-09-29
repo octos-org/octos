@@ -8351,6 +8351,118 @@ async fn session_reopen_without_client_commands_clears_the_previous_declaration(
 }
 
 #[tokio::test]
+async fn closing_the_declaring_connection_releases_its_client_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(dir.path(), "coding").await;
+    let session_id = SessionKey("local:tui#coding".into());
+    let declarer = ConnectionId::next();
+
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        declarer,
+        Some("coding"),
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+            client_commands: Some(vec!["/model".into()]),
+        },
+    )
+    .await
+    .expect("session/open succeeds");
+    let session = state
+        .session_cache
+        .get_or_init(&runtime, session_id, None)
+        .await
+        .expect("opened session is cached");
+
+    release_connection_client_commands(&state, ConnectionId::next()).await;
+    assert!(session.agent.system_prompt_snapshot().contains("`/model`"));
+
+    release_connection_client_commands(&state, declarer).await;
+    assert!(!session.agent.system_prompt_snapshot().contains("`/model`"));
+}
+
+#[tokio::test]
+async fn stdio_disconnect_releases_client_commands_declared_on_it() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(dir.path(), "coding").await;
+    let session_id = SessionKey("local:tui#coding".into());
+    let (mut input_tx, input_rx) = tokio::io::duplex(1 << 16);
+    let (response_rx, response_tx) = tokio::io::duplex(1 << 20);
+    let connection = tokio::spawn(stdio_connection_with_io(
+        state.clone(),
+        input_rx,
+        response_tx,
+        new_stdio_dispatch_count_for_test(),
+        None,
+    ));
+
+    let open = format!(
+        "{}\n",
+        json!({
+            "jsonrpc": "2.0",
+            "id": "open",
+            "method": octos_core::ui_protocol::methods::SESSION_OPEN,
+            "params": {
+                "session_id": session_id,
+                "profile_id": "coding",
+                "client_commands": ["/model"]
+            }
+        })
+    );
+    input_tx
+        .write_all(open.as_bytes())
+        .await
+        .expect("queue session/open");
+    let mut responses = BufReader::new(response_rx).lines();
+    let opened = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(line) = responses.next_line().await.expect("read response") {
+            let frame: Value = serde_json::from_str(&line).expect("json frame");
+            if frame["id"] == json!("open") {
+                return frame;
+            }
+        }
+        panic!("connection closed before answering session/open");
+    })
+    .await
+    .expect("session/open is answered");
+    assert!(
+        opened.get("result").is_some(),
+        "session/open failed: {opened}"
+    );
+
+    let session = state
+        .session_cache
+        .get_or_init(&runtime, session_id, None)
+        .await
+        .expect("opened session is cached");
+    assert!(session.agent.system_prompt_snapshot().contains("`/model`"));
+
+    drop(input_tx);
+    tokio::spawn(async move { while let Ok(Some(_)) = responses.next_line().await {} });
+    tokio::time::timeout(Duration::from_secs(10), connection)
+        .await
+        .expect("connection exits on EOF")
+        .expect("connection task joins")
+        .expect("connection exits cleanly");
+    assert!(
+        !session.agent.system_prompt_snapshot().contains("`/model`"),
+        "a closed connection must not keep advertising its commands"
+    );
+}
+
+#[tokio::test]
 async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state_with_sessions(dir.path());

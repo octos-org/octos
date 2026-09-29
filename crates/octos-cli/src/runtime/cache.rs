@@ -691,6 +691,15 @@ impl SessionRuntimeCache {
         refreshed
     }
 
+    /// Release the `client_commands` declarations connection `owner` made on
+    /// any cached session, when that connection closes.
+    pub async fn release_client_commands(&self, owner: u64) {
+        let guard = self.inner.read().await;
+        for entry in guard.values() {
+            entry.runtime.release_client_commands(owner);
+        }
+    }
+
     /// Drop every entry whose `last_used` is older than
     /// [`Self::idle_ttl`]. Exposed so tests can verify the eviction
     /// invariant without waiting for the 60 s background sweep.
