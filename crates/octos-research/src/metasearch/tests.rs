@@ -509,20 +509,40 @@ async fn should_merge_across_engines_and_apply_lang_since_and_domain_filters() {
 #[tokio::test(start_paused = true)]
 async fn should_note_that_keyless_general_search_is_thin() {
     let fetch = MockFetch::default();
+    let mut req = request("rust");
+    req.category = "general".into();
+    req.engines = Some(Vec::new());
+
+    // Results-page engines (the default) give web results: nothing to say.
     let ms = Metasearch::new(
         Registry::builtin(),
         Arc::new(fetch.clone()),
         Config::default(),
     );
-    let mut req = request("rust");
-    req.category = "general".into();
-    req.engines = Some(Vec::new());
-    let resp = ms.search(&req).await;
-    assert!(resp.note.as_deref().unwrap().contains("BRAVE_API_KEY"));
+    assert!(ms.search(&req).await.note.is_none());
 
-    let mut config = Config::default();
-    config.keys.insert("brave".into(), "k".into());
-    let ms = Metasearch::new(Registry::builtin(), Arc::new(fetch), config);
+    // Off, and no key: only the encyclopedias.
+    let off = Config {
+        results_pages: false,
+        ..Config::default()
+    };
+    let ms = Metasearch::new(Registry::builtin(), Arc::new(fetch.clone()), off.clone());
+    let note = ms.search(&req).await.note.unwrap();
+    assert!(note.contains("BRAVE_API_KEY") && note.contains("OCTOS_ALLOW_SERP_SCRAPE"));
+    // Off for this request only: the same.
+    let ms = Metasearch::new(
+        Registry::builtin(),
+        Arc::new(fetch.clone()),
+        Config::default(),
+    );
+    let mut this_off = req.clone();
+    this_off.results_pages = false;
+    assert!(ms.search(&this_off).await.note.is_some());
+
+    // A key widens it.
+    let mut keyed = off;
+    keyed.keys.insert("brave".into(), "k".into());
+    let ms = Metasearch::new(Registry::builtin(), Arc::new(fetch), keyed);
     assert!(ms.search(&req).await.note.is_none());
 }
 
@@ -1035,6 +1055,11 @@ async fn should_leave_out_browser_engines_where_the_host_has_no_browser() {
         .await;
     let ids: Vec<&str> = resp.engines.iter().map(|r| r.engine.as_str()).collect();
     assert_eq!(ids, ["a"]);
+    assert_eq!(
+        resp.browser_notice(),
+        None,
+        "no browser used, nothing to disclose"
+    );
     assert!(fetch.calls_to("g.example.org").is_empty());
 
     // With a browser it runs.
@@ -1200,6 +1225,7 @@ async fn should_hand_a_browser_challenge_to_the_person() {
         *host.shown.lock().unwrap(),
         ["https://g.example.org/search"]
     );
+    assert_eq!(resp.browser_notice(), Some(crate::BROWSER_SEARCH_NOTICE));
     let lines = resp.challenges();
     assert_eq!(lines.len(), 1);
     assert!(
@@ -1238,4 +1264,29 @@ async fn should_ask_the_person_to_open_a_challenge_nothing_could_show() {
         "{r:?}"
     );
     assert_eq!(host.shown.lock().unwrap().len(), 1, "offered to the host");
+}
+
+#[tokio::test]
+async fn should_leave_out_results_page_engines_when_the_request_says_so() {
+    let fetch = MockFetch::default();
+    fetch.on("a.example.org", ok(hits(&[("https://a.org/1", "Story")])));
+    fetch.on("r.example.org", ok(hits(&[("https://r.org/1", "Story")])));
+    let ms = search(
+        vec![
+            test_engine("a", "a.example.org", serde_json::json!({})),
+            test_engine(
+                "r",
+                "r.example.org",
+                serde_json::json!({"results_page": true}),
+            ),
+        ],
+        &fetch,
+        Config::default(),
+    );
+    let mut req = request("q");
+    req.results_pages = false;
+    let resp = ms.search(&req).await;
+    let ids: Vec<&str> = resp.engines.iter().map(|r| r.engine.as_str()).collect();
+    assert_eq!(ids, ["a"]);
+    assert!(fetch.calls_to("r.example.org").is_empty());
 }

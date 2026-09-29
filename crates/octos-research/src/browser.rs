@@ -18,6 +18,16 @@
 //! - Challenges ("unusual traffic", CAPTCHAs) are never solved or worked
 //!   around. Where there is a display they are shown to the person
 //!   ([`PersonBrowser::show`]); otherwise they are only reported.
+//! - What it means for the person: with a signed-in profile, searches run
+//!   as their Google account (personalised results, saved to its search
+//!   activity). Every search that used the browser says so, with the terms
+//!   caveat and the opt-out ([`crate::BROWSER_SEARCH_NOTICE`]), and it is
+//!   logged once when the browser starts. `OCTOS_BROWSER=off` stops it.
+//! - Never a browser's own profile: the DevTools port octos attaches to is
+//!   unauthenticated (loopback only) and gives full control of every
+//!   signed-in session in that profile. [`check_profile`] refuses browsers'
+//!   user-data directories, and a custom location must be new, empty or
+//!   already an octos profile ([`PROFILE_MARKER`]).
 //! - A browser octos launched closes after [`IDLE_CLOSE`] without use, and
 //!   short-lived hosts close it on exit ([`close_shared`]).
 //!
@@ -42,7 +52,7 @@ use tokio::sync::Mutex;
 use crate::metasearch::http::{Fetch, FetchFuture, HandOverFuture, HttpRequest, HttpResponse};
 
 /// `auto` (default) | `window` | `headless` | `off`.
-pub const BROWSER_ENV: &str = "OCTOS_BROWSER";
+pub use crate::BROWSER_ENV;
 
 /// Profile directory override (default `~/.octos/browser-profile`).
 pub const BROWSER_PROFILE_ENV: &str = "OCTOS_BROWSER_PROFILE";
@@ -111,6 +121,76 @@ pub fn has_display(lookup: impl Fn(&str) -> Option<String>) -> bool {
     ["DISPLAY", "WAYLAND_DISPLAY"]
         .iter()
         .any(|k| lookup(k).is_some_and(|v| !v.is_empty()))
+}
+
+/// Marker octos writes into a profile it launched a browser on. A custom
+/// profile ([`BROWSER_PROFILE_ENV`]) must carry it, or be empty/new.
+pub const PROFILE_MARKER: &str = ".octos-browser-profile";
+
+/// Browsers' own user-data directories (relative to home). octos never uses
+/// one: attaching to a browser there over the DevTools port (loopback, no
+/// authentication) would give full control of every signed-in session in
+/// it, far beyond searching.
+const REAL_PROFILE_DIRS: &[&str] = &[
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Google/Chrome Beta",
+    "Library/Application Support/Google/Chrome Canary",
+    "Library/Application Support/Chromium",
+    "Library/Application Support/BraveSoftware",
+    "Library/Application Support/Microsoft Edge",
+    "Library/Application Support/Vivaldi",
+    "Library/Application Support/Arc",
+    ".config/google-chrome",
+    ".config/google-chrome-beta",
+    ".config/chromium",
+    ".config/BraveSoftware",
+    ".config/microsoft-edge",
+    ".config/vivaldi",
+    "snap/chromium",
+    "AppData/Local/Google/Chrome",
+    "AppData/Local/Chromium",
+    "AppData/Local/BraveSoftware",
+    "AppData/Local/Microsoft/Edge",
+    "AppData/Local/Vivaldi",
+];
+
+/// Whether octos may use `profile`: never a browser's own profile; a custom
+/// location only if it is new, empty, or already an octos profile.
+/// `default` is the octos-owned default location.
+pub fn check_profile(profile: &Path, default: bool, home: Option<&Path>) -> Result<(), String> {
+    let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let profile_r = resolve(profile);
+    if let Some(home) = home {
+        let home_r = resolve(home);
+        for dir in REAL_PROFILE_DIRS {
+            for h in [home, home_r.as_path()] {
+                let real = h.join(dir);
+                if profile.starts_with(&real) || profile_r.starts_with(&real) {
+                    return Err(format!(
+                        "{} is a browser's own profile; octos will not use it (attaching to it \
+                         would give octos control of every signed-in session). Leave \
+                         {BROWSER_PROFILE_ENV} unset to use ~/.octos/browser-profile.",
+                        profile.display()
+                    ));
+                }
+            }
+        }
+    }
+    if default || profile.join(PROFILE_MARKER).exists() {
+        return Ok(());
+    }
+    let empty = match std::fs::read_dir(profile) {
+        Err(_) => true, // does not exist yet: octos creates it
+        Ok(mut entries) => entries.next().is_none(),
+    };
+    if empty {
+        return Ok(());
+    }
+    Err(format!(
+        "{} is not an octos browser profile (no {PROFILE_MARKER}); octos only uses a new or \
+         empty directory, or one it created.",
+        profile.display()
+    ))
 }
 
 /// Default profile directory: `$HOME/.octos/browser-profile`.
@@ -208,6 +288,14 @@ impl PersonBrowser {
             return None;
         }
         let profile = default_profile(env)?;
+        let custom = env(BROWSER_PROFILE_ENV).is_some_and(|p| !p.trim().is_empty());
+        let home = env("HOME")
+            .or_else(|| env("USERPROFILE"))
+            .map(PathBuf::from);
+        if let Err(e) = check_profile(&profile, !custom, home.as_deref()) {
+            tracing::warn!(error = %e, "person's browser off");
+            return None;
+        }
         let executable = env(CHROME_ENV).filter(|p| !p.is_empty()).map(PathBuf::from);
         Some(Self::new(mode, profile, executable))
     }
@@ -275,6 +363,14 @@ impl PersonBrowser {
     async fn launch(&self, headless: bool) -> Result<Session, String> {
         std::fs::create_dir_all(&self.profile)
             .map_err(|e| format!("browser profile {}: {e}", self.profile.display()))?;
+        let _ = std::fs::write(
+            self.profile.join(PROFILE_MARKER),
+            "A browser profile octos uses for searching (octos_research::browser).\n",
+        );
+        static NOTICE: std::sync::Once = std::sync::Once::new();
+        NOTICE.call_once(|| {
+            tracing::warn!(profile = %self.profile.display(), "{}", crate::BROWSER_SEARCH_NOTICE);
+        });
         // `with_head`: the `headless` switch, when wanted, is in
         // `launch_args`; chromiumoxide would add its own flags otherwise.
         let mut builder = BrowserConfig::builder()
@@ -587,6 +683,50 @@ mod tests {
         assert_eq!(devtools_ws_url("54321\n/elsewhere\n"), None);
         assert_eq!(devtools_ws_url("x\n/devtools/browser/a\n"), None);
         assert_eq!(devtools_ws_url(""), None);
+    }
+
+    #[test]
+    fn should_never_use_a_browsers_own_profile() {
+        let home = Path::new("/home/p");
+        for real in [
+            "/home/p/.config/google-chrome",
+            "/home/p/.config/google-chrome/Default",
+            "/home/p/Library/Application Support/Google/Chrome",
+            "/home/p/AppData/Local/Microsoft/Edge/User Data",
+        ] {
+            let err = check_profile(Path::new(real), false, Some(home)).unwrap_err();
+            assert!(err.contains("browser's own profile"), "{real}: {err}");
+        }
+        assert!(
+            check_profile(
+                Path::new("/home/p/.octos/browser-profile"),
+                true,
+                Some(home)
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn should_use_a_custom_profile_only_if_new_empty_or_octos() {
+        let dir = std::env::temp_dir().join(format!("octos-profile-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(check_profile(&dir, false, None).is_ok(), "new");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(check_profile(&dir, false, None).is_ok(), "empty");
+        std::fs::write(dir.join("Local State"), "{}").unwrap();
+        assert!(
+            check_profile(&dir, false, None)
+                .unwrap_err()
+                .contains(PROFILE_MARKER)
+        );
+        assert!(
+            check_profile(&dir, true, None).is_ok(),
+            "the default location is octos-owned"
+        );
+        std::fs::write(dir.join(PROFILE_MARKER), "").unwrap();
+        assert!(check_profile(&dir, false, None).is_ok(), "marked");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

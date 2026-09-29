@@ -206,6 +206,11 @@ pub struct SearchRequest {
     pub filters: Filters,
     /// Only these engines (ids), if set.
     pub engines: Option<Vec<String>>,
+    /// Run results-page engines (search engines' own pages, including those
+    /// loaded in the person's browser) for this search. Default true; they
+    /// also need [`Config::results_pages`]. A caller whose own setting turns
+    /// results-page search off passes false.
+    pub results_pages: bool,
     /// Overall deadline for the whole fan-out.
     pub deadline: Duration,
     /// Soft deadline: once an engine has answered with results and at most
@@ -232,6 +237,7 @@ impl SearchRequest {
             category: category.to_string(),
             filters: Filters::default(),
             engines: None,
+            results_pages: true,
             deadline: Duration::from_secs(25),
             straggler_grace: Some(DEFAULT_STRAGGLER_GRACE),
             now: Utc::now(),
@@ -282,6 +288,10 @@ pub struct EngineReport {
     /// solve in their browser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenge_url: Option<String>,
+    /// The engine loads its pages in the person's browser (manifest
+    /// `renders`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_browser: bool,
 }
 
 /// Result of one search.
@@ -312,6 +322,21 @@ impl SearchResponse {
 
     pub fn hits(&self) -> Vec<SearchHit> {
         self.items.iter().map(MetaItem::to_hit).collect()
+    }
+
+    /// The disclosure to show the person when this search used their
+    /// browser ([`crate::BROWSER_SEARCH_NOTICE`]); `None` when it did not.
+    pub fn browser_notice(&self) -> Option<&'static str> {
+        self.engines
+            .iter()
+            .any(|e| {
+                e.in_browser
+                    && !matches!(
+                        e.status,
+                        EngineStatus::Suspended | EngineStatus::RateLimited | EngineStatus::Robots
+                    )
+            })
+            .then_some(crate::BROWSER_SEARCH_NOTICE)
     }
 
     /// One line per engine that met a bot challenge, for the person: whether
@@ -483,16 +508,23 @@ impl Metasearch {
         !m.needs_key || c.keys.contains_key(&m.id)
     }
 
-    /// Whether key-less general search is all this host has.
-    fn general_is_thin(&self) -> bool {
-        !self.engines_for("general").iter().any(|m| m.needs_key)
+    /// Whether general search is only the encyclopedias here: no keyed
+    /// engine and no results-page engine for this request.
+    fn general_is_thin(&self, req: &SearchRequest) -> bool {
+        !self
+            .engines_for("general")
+            .iter()
+            .any(|m| m.needs_key || (m.results_page && req.results_pages))
     }
 
     fn plan<'a>(&'a self, req: &SearchRequest) -> Vec<Call<'a>> {
         let mut calls = Vec::new();
         for e in self.inner.registry.engines() {
             let m = &e.manifest;
-            if !m.serves(&req.category) || !self.is_enabled(m) {
+            if !m.serves(&req.category)
+                || !self.is_enabled(m)
+                || (m.results_page && !req.results_pages)
+            {
                 continue;
             }
             if let Some(only) = &req.engines {
@@ -604,11 +636,11 @@ impl Metasearch {
                 items.push(item);
             }
         }
-        let note = (req.category == "general" && self.general_is_thin()).then(|| {
-            "The metasearch's key-less general engines are Wikipedia and Wikidata. Web \
-             results come from results-page search (DuckDuckGo, Bing; on unless \
-             OCTOS_ALLOW_SERP_SCRAPE=0), a Brave Search key (BRAVE_API_KEY) or a \
-             self-hosted SearXNG (SEARXNG_URL)."
+        let note = (req.category == "general" && self.general_is_thin(req)).then(|| {
+            "With results-page search off and no search key, the metasearch's general \
+             engines are Wikipedia and Wikidata. For web results, turn results-page search \
+             back on (unset OCTOS_ALLOW_SERP_SCRAPE), add a Brave Search key \
+             (BRAVE_API_KEY) or set a self-hosted SearXNG (SEARXNG_URL)."
                 .to_string()
         });
         SearchResponse {
@@ -705,6 +737,7 @@ impl Metasearch {
             )),
             cached: false,
             challenge_url: None,
+            in_browser: m.renders,
         };
         (report, Vec::new())
     }
@@ -854,6 +887,7 @@ impl Metasearch {
             error,
             cached,
             challenge_url: None,
+            in_browser: m.renders,
         };
         if let Some(left) = self.suspended(&m.id) {
             let msg = format!(

@@ -844,6 +844,11 @@ impl WebSearchTool {
         req.limit = count as usize * langs.len().max(1) * 2;
         req.filters = c.filters.clone();
         req.now = c.now;
+        // This tool's results-page setting (`with_serp_scrape`, or the
+        // environment) governs the metasearch's results-page engines too.
+        req.results_pages = self
+            .serp_scrape
+            .unwrap_or_else(|| serp_scrape_opted_in(|k| std::env::var(k).ok()));
         self.metasearch().search(&req).await
     }
 
@@ -900,6 +905,7 @@ impl WebSearchTool {
         let mut used: Vec<&str> = Vec::new();
         let mut note = None;
         let mut challenges = Vec::new();
+        let mut browser_notice = None;
         // The metasearch covers every requested language in one call.
         if providers.contains(&octos_research::Provider::Metasearch) {
             let resp = self.metasearch_search(query, count, c, &langs).await;
@@ -919,6 +925,7 @@ impl WebSearchTool {
             }
             note = resp.note.clone();
             challenges = resp.challenges();
+            browser_notice = resp.browser_notice();
         }
         let mut calls = Vec::new();
         for lang in &langs {
@@ -982,6 +989,11 @@ impl WebSearchTool {
         // person (octos does not solve or work around these).
         for line in &challenges {
             output.push_str(&format!("Note: {line}\n"));
+        }
+        // The search used the person's browser: say what that means for
+        // their account, the terms caveat, and how to turn it off.
+        if let Some(notice) = browser_notice {
+            output.push_str(&format!("Note: {notice}\n"));
         }
         if octos_research::respect_robots(|k| std::env::var(k).ok())
             && kept.iter().any(|h| {

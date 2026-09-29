@@ -585,6 +585,7 @@ async fn metasearch_round(
     req.limit = count as usize * 2;
     req.filters = opts.filters.clone();
     req.now = opts.now;
+    req.results_pages = opts.allow_serp_scrape;
     let resp = metasearch().search(&req).await;
     if resp.items.is_empty() {
         let engines: Vec<String> = resp
@@ -604,7 +605,13 @@ async fn metasearch_round(
     Ok(ProviderOut {
         hits: resp.hits(),
         answer: String::new(),
-        notes: resp.note.iter().cloned().chain(resp.challenges()).collect(),
+        notes: resp
+            .note
+            .iter()
+            .cloned()
+            .chain(resp.challenges())
+            .chain(resp.browser_notice().map(String::from))
+            .collect(),
     })
 }
 
