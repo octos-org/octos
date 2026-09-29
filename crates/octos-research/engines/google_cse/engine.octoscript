@@ -23,10 +23,12 @@ fn build_request(query, opts) {
 
 fn parse_response(response, opts) {
     let body = response.body
-    if text.contains(body, "unusual traffic") || text.contains(body, "/sorry/") {
+    let found = markup.select({item: ".gsc-webResult.gsc-result", fields: {title: "a.gs-title", url: "a.gs-title@href", original: "a.gs-title@data-ctorig", snippet: ".gs-snippet", site: ".gs-visibleUrl-short"}})
+    // Only a page without results is a challenge: results can mention the
+    // same words.
+    if array.len(found.items) == 0 && (text.contains(body, "unusual traffic") || text.contains(body, "/sorry/")) {
         return {challenge: "Google reported unusual traffic"}
     }
-    let found = markup.select({item: ".gsc-webResult.gsc-result", fields: {title: "a.gs-title", url: "a.gs-title@href", original: "a.gs-title@data-ctorig", snippet: ".gs-snippet", site: ".gs-visibleUrl-short"}})
     let out = []
     for r in found.items {
         let raw = if r.original != nil {

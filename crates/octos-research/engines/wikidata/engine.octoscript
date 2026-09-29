@@ -15,7 +15,7 @@ fn lang_code(opts) {
 
 fn build_request(query, opts) {
     let l = lang_code(opts)
-    let params = [["action", "wbsearchentities"], ["search", query], ["language", l], ["uselang", l], ["type", "item"], ["limit", math.min(opts.count, 50)], ["continue", (opts.page - 1) * opts.count], ["format", "json"]]
+    let params = [["action", "wbsearchentities"], ["search", query], ["language", l], ["uselang", l], ["type", "item"], ["limit", math.min(opts.count, 50)], ["continue", (opts.page - 1) * math.min(opts.count, 50)], ["format", "json"]]
     let u = net.url({base: "https://www.wikidata.org/w/api.php", query: params})
     return net.request({url: u.url, headers: {accept: "application/json"}})
 }

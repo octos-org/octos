@@ -330,10 +330,12 @@ impl SearchResponse {
         self.engines
             .iter()
             .any(|e| {
+                // A page actually loaded in the browser (an error may be a
+                // browser that never started).
                 e.in_browser
-                    && !matches!(
+                    && matches!(
                         e.status,
-                        EngineStatus::Suspended | EngineStatus::RateLimited | EngineStatus::Robots
+                        EngineStatus::Ok | EngineStatus::Empty | EngineStatus::Challenge
                     )
             })
             .then_some(crate::BROWSER_SEARCH_NOTICE)
@@ -1209,7 +1211,10 @@ impl Metasearch {
             return Err(CallError::Failed(err, parsed.backoff));
         }
         // Only responses the engine accepted are reused.
-        if !cached && cacheable {
+        // A rendered page with nothing on it may just have been read before
+        // its results arrived: not kept, so the next search loads it again.
+        let empty_render = sreq.render && parsed.items.is_empty();
+        if !cached && cacheable && !empty_render {
             self.inner
                 .cache
                 .store(&cache_key, &response, Duration::from_secs(m.cache_ttl_secs));

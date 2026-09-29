@@ -657,18 +657,23 @@ impl Tool for WebSearchTool {
         // without the metasearch: its own DuckDuckGo, Bing, Brave and Google
         // engines have asked those pages already, and one search never asks
         // a results page twice.
-        if let Some(answer) = self.free_tier_search(&input.query, count, &controls).await {
-            let answer = complete_free_tier(
-                answer,
-                &input.query,
-                serp_scrape && !metasearch_on(),
-                &controls,
-                self.ddg_hits(&input.query, count),
-                self.bing_hits(&input.query, count),
-            )
-            .await;
-            return Ok(answer.into_result(&input.query, &controls));
-        }
+        // Notes from a free tier that found nothing (engines that met a
+        // challenge, the browser notice) still reach the person below.
+        let free_notes = match self.free_tier_search(&input.query, count, &controls).await {
+            Err(notes) => notes,
+            Ok(answer) => {
+                let answer = complete_free_tier(
+                    answer,
+                    &input.query,
+                    serp_scrape && !metasearch_on(),
+                    &controls,
+                    self.ddg_hits(&input.query, count),
+                    self.bing_hits(&input.query, count),
+                )
+                .await;
+                return Ok(answer.into_result(&input.query, &controls));
+            }
+        };
 
         // Keyed providers: Tavily first (best quality), Perplexity last.
         // 1. Tavily (AI-optimized, 1k free/month)
@@ -950,8 +955,12 @@ impl Tool for WebSearchTool {
             query = %input.query,
             "web_search: no results from allowed providers"
         );
+        let mut output = octos_research::no_results_message(&input.query, &tried);
+        for note in &free_notes {
+            output.push_str(&format!("Note: {note}\n"));
+        }
         Ok(ToolResult {
-            output: octos_research::no_results_message(&input.query, &tried),
+            output,
             success: true,
             ..Default::default()
         })
@@ -1079,17 +1088,18 @@ impl WebSearchTool {
         }
     }
 
-    /// Run the free tier for every requested language. Returns `None` when
-    /// it produced nothing usable, so the keyed/keyless chain continues.
+    /// Run the free tier for every requested language. `Err(notes)` when it
+    /// produced nothing usable, so the keyed/keyless chain continues; the
+    /// notes (challenges, the browser notice) go out with the final answer.
     async fn free_tier_search(
         &self,
         query: &str,
         count: u8,
         c: &FreeTierControls,
-    ) -> Option<FreeTierAnswer> {
+    ) -> Result<FreeTierAnswer, Vec<String>> {
         let providers = free_tier_providers(c.news, metasearch_on(), self.searxng_base().is_some());
         if providers.is_empty() {
-            return None;
+            return Err(Vec::new());
         }
         let langs = c.langs(query);
         let mut hits = Vec::new();
@@ -1170,9 +1180,14 @@ impl WebSearchTool {
         let limit = count as usize * langs.len().max(1);
         kept.truncate(limit);
         if kept.is_empty() {
-            return None;
+            // Nothing to show, but what the person needs to know still goes
+            // out with the final answer.
+            return Err(challenges
+                .into_iter()
+                .chain(browser_notice.map(String::from))
+                .collect());
         }
-        Some(FreeTierAnswer {
+        Ok(FreeTierAnswer {
             hits: kept,
             used,
             note,

@@ -1,5 +1,5 @@
 {
-  "recorded": "live, 2026-09-28: Google's page as rendered by headless Chrome for this network, an \"unusual traffic\" challenge; the engine must report it as a challenge for the person, not work around it",
+  "recorded": "live, 2026-09-28: Google's page as rendered by headless Chrome for this network, an \"unusual traffic\" challenge; the engine must report it as a challenge for the person, not work around it The IP address, time and session parameters on the page are replaced with neutral values (192.0.2.1 is a documentation address).",
   "request": {
     "query": "omarchy linux",
     "langs": [

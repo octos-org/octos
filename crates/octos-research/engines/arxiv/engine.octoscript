@@ -27,7 +27,7 @@ fn build_request(query, opts) {
     } else {
         "relevance"
     }
-    let params = [["search_query", sq], ["start", (opts.page - 1) * opts.count], ["max_results", math.min(opts.count, 100)], ["sortBy", sort], ["sortOrder", "descending"]]
+    let params = [["search_query", sq], ["start", (opts.page - 1) * math.min(opts.count, 100)], ["max_results", math.min(opts.count, 100)], ["sortBy", sort], ["sortOrder", "descending"]]
     let u = net.url({base: "https://export.arxiv.org/api/query", query: params})
     return net.request({url: u.url, headers: {accept: "application/atom+xml"}})
 }

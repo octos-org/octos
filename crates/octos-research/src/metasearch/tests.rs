@@ -1290,3 +1290,38 @@ async fn should_leave_out_results_page_engines_when_the_request_says_so() {
     assert_eq!(ids, ["a"]);
     assert!(fetch.calls_to("r.example.org").is_empty());
 }
+
+/// A host whose browser never loads a page (Chrome missing or failing).
+struct BrokenBrowserHost;
+
+impl Fetch for BrokenBrowserHost {
+    fn fetch(&self, _req: HttpRequest) -> FetchFuture<'_> {
+        Box::pin(async { Err("plain fetch not expected".to_string()) })
+    }
+
+    fn render(&self, _req: HttpRequest) -> FetchFuture<'_> {
+        Box::pin(async { Err("could not start the browser".to_string()) })
+    }
+
+    fn can_render(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn should_not_disclose_browser_use_when_no_page_loaded() {
+    let manifest = serde_json::json!({
+        "id": "g", "name": "g", "categories": ["general"], "hosts": ["g.example.org"],
+        "results_page": true, "renders": true,
+        "rate_limit": {"min_interval_ms": 1000}, "docs_url": ["https://example.org/docs"],
+        "license_note": "test"
+    });
+    let mut r = Registry::default();
+    r.insert(Engine::load(&manifest.to_string(), BROWSER_ENGINE, EngineOrigin::Builtin).unwrap());
+    let ms = Metasearch::new(r, Arc::new(BrokenBrowserHost), Config::default());
+    let mut req = request("q");
+    req.category = "general".into();
+    let resp = ms.search(&req).await;
+    assert_eq!(resp.engines[0].status, EngineStatus::Error);
+    assert_eq!(resp.browser_notice(), None, "nothing loaded in the browser");
+}

@@ -11,7 +11,7 @@ use mod.std.math
 use mod.std.text
 
 fn build_request(query, opts) {
-    let params = [["q", query], ["count", math.min(opts.count, 30)], ["first", (opts.page - 1) * opts.count + 1]]
+    let params = [["q", query], ["count", math.min(opts.count, 30)], ["first", (opts.page - 1) * math.min(opts.count, 30) + 1]]
     if opts.lang != nil {
         array.push(params, ["setlang", opts.lang.primary])
     }

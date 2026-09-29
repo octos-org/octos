@@ -20,7 +20,7 @@ fn build_request(query, opts) {
     if opts.since != nil {
         q = q + " after:" + opts.since.date
     }
-    let params = [["q", q], ["num", math.min(opts.count, 20)], ["start", (opts.page - 1) * opts.count]]
+    let params = [["q", q], ["num", math.min(opts.count, 20)], ["start", (opts.page - 1) * math.min(opts.count, 20)]]
     if opts.lang != nil {
         array.push(params, ["hl", opts.lang.primary])
     }

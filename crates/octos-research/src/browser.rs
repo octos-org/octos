@@ -64,12 +64,17 @@ pub const CHROME_ENV: &str = "CHROME";
 /// A browser octos launched closes after this long without use.
 pub const IDLE_CLOSE: Duration = Duration::from_secs(5 * 60);
 
-/// Rendered pages larger than this are cut (matches `ReqwestFetch`).
-const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Rendered pages larger than this are cut: the engine sandbox parses at
+/// most 3 MiB, so a larger page would fetch fine and then fail to parse.
+const MAX_BODY_BYTES: usize = 3 * 1024 * 1024;
 
 /// A challenge for the same host is shown at most once in this window, so
 /// repeated searches do not pile up tabs while the person deals with it.
 const SHOW_AGAIN_AFTER: Duration = Duration::from_secs(120);
+
+/// How long a hand-over waits for the challenge tab before answering (the
+/// core allows 5 s); opening continues in the background after that.
+const HAND_OVER_WAIT: Duration = Duration::from_secs(4);
 
 /// Pause after the load event for script-built results to settle.
 const SETTLE: Duration = Duration::from_millis(700);
@@ -88,7 +93,8 @@ pub enum Mode {
 impl Mode {
     /// Resolve the mode (env lookup and display probe injected for tests).
     /// Without a display `auto` and `window` are `headless`. An
-    /// unrecognised value is `off`, so a typo never opens windows.
+    /// unrecognised value is `off` (`1` and `true` too: name the mode), so a
+    /// typo never opens windows.
     pub fn resolve(lookup: impl Fn(&str) -> Option<String>, has_display: bool) -> Mode {
         let windowed = |m: Mode| if has_display { m } else { Mode::Headless };
         match lookup(BROWSER_ENV) {
@@ -276,6 +282,9 @@ pub struct PersonBrowser {
     session: Arc<Mutex<Option<Session>>>,
     last_used: Arc<StdMutex<Instant>>,
     shown: StdMutex<HashMap<String, Instant>>,
+    /// The last start failed (no usable Chrome): engines that render are
+    /// left out instead of failing every search ([`Self::available`]).
+    unavailable: std::sync::atomic::AtomicBool,
 }
 
 impl PersonBrowser {
@@ -308,6 +317,7 @@ impl PersonBrowser {
             session: Arc::new(Mutex::new(None)),
             last_used: Arc::new(StdMutex::new(Instant::now())),
             shown: StdMutex::new(HashMap::new()),
+            unavailable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -382,8 +392,15 @@ impl PersonBrowser {
         if let Some(exe) = &self.executable {
             builder = builder.chrome_executable(exe);
         }
-        let config = builder.build().map_err(|e| format!("no browser: {e}"))?;
-        let (browser, mut handler) = Browser::launch(config).await.map_err(|e| {
+        let config = builder.build().map_err(|e| {
+            self.unavailable
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            format!("no browser: {e}")
+        })?;
+        let launched = Browser::launch(config).await;
+        self.unavailable
+            .store(launched.is_err(), std::sync::atomic::Ordering::Relaxed);
+        let (browser, mut handler) = launched.map_err(|e| {
             format!(
                 "could not start the browser (is a Chrome already open on {}?): {e}",
                 self.profile.display()
@@ -499,16 +516,25 @@ impl PersonBrowser {
                 .get(&host)
                 .is_some_and(|t| t.elapsed() < SHOW_AGAIN_AFTER)
             {
+                // Open, or being opened, for this host moments ago.
                 return Ok(true);
             }
             shown.insert(host.clone(), Instant::now());
         }
+        let r = self.open_for_person(url).await;
+        // Only a tab that actually opened counts as shown.
+        if !matches!(r, Ok(true)) {
+            self.forget_shown(&host);
+        }
+        r
+    }
+
+    async fn open_for_person(&self, url: &str) -> Result<bool, String> {
         let mut guard = self.ensure().await?;
         if guard.as_ref().is_some_and(|s| s.headless) {
             let s = guard.take().expect("checked above");
             if !s.launched {
                 *guard = Some(s);
-                self.forget_shown(&host);
                 return Ok(false);
             }
             close_session(s).await;
@@ -524,6 +550,12 @@ impl PersonBrowser {
         let _ = page.bring_to_front().await;
         self.touch();
         Ok(true)
+    }
+
+    /// Whether the browser can be used: false after it failed to start,
+    /// until a later start succeeds.
+    pub fn available(&self) -> bool {
+        !self.unavailable.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn forget_shown(&self, host: &str) {
@@ -597,11 +629,28 @@ impl<F: Fetch> Fetch for PersonBrowserFetch<F> {
     }
 
     fn hand_over(&self, url: String) -> HandOverFuture<'_> {
-        Box::pin(async move { self.browser.show(&url).await.unwrap_or(false) })
+        // Opening can outlast the caller's budget (a headless browser is
+        // closed and reopened with a window). It carries on in the
+        // background; the answer is "shown" only if the tab opened in time,
+        // and the person is told to open the page otherwise.
+        let browser = self.browser.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = tx.send(browser.show(&url).await.unwrap_or(false));
+        });
+        Box::pin(async move {
+            tokio::time::timeout(HAND_OVER_WAIT, rx)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false)
+        })
     }
 
+    /// Not after the browser failed to start: engines that render are then
+    /// left out rather than failing every search.
     fn can_render(&self) -> bool {
-        true
+        self.browser.available()
     }
 }
 
@@ -726,6 +775,40 @@ mod tests {
         );
         std::fs::write(dir.join(PROFILE_MARKER), "").unwrap();
         assert!(check_profile(&dir, false, None).is_ok(), "marked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn should_leave_the_browser_out_after_it_fails_to_start() {
+        let dir = std::env::temp_dir().join(format!("octos-nobrowser-{}", std::process::id()));
+        let b = PersonBrowser::new(
+            Mode::Headless,
+            dir.clone(),
+            Some(PathBuf::from("/nonexistent/chrome")),
+        );
+        assert!(b.available(), "not known to be missing yet");
+        assert!(
+            b.render("https://example.org/", Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        assert!(!b.available(), "a failed start makes it unavailable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn should_not_claim_a_challenge_is_shown_when_it_could_not_be() {
+        let dir = std::env::temp_dir().join(format!("octos-noshow-{}", std::process::id()));
+        let b = PersonBrowser::new(
+            Mode::Auto,
+            dir.clone(),
+            Some(PathBuf::from("/nonexistent/chrome")),
+        );
+        let url = "https://www.google.com/sorry/index";
+        assert!(b.show(url).await.is_err());
+        // Not remembered as shown: asked again, it tries again (and fails
+        // again) instead of answering "shown".
+        assert!(b.show(url).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
