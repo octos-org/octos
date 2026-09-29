@@ -22,10 +22,16 @@
 //! returns anything, the result is empty and says which providers were tried
 //! and how to add SearXNG or a search key.
 //!
-//! DuckDuckGo HTML and Bing-in-Chrome scrape search-engine results pages,
-//! which ADR 0002 rules out. They are not part of the default chain: they run
-//! only when the operator sets `OCTOS_ALLOW_SERP_SCRAPE=1` (alias
-//! `OCTOS_ALLOW_BROWSER_SERP=1`), after every keyed provider. Bing drives the
+//! One exception to "first answer wins": for a general (not news) query the
+//! metasearch's key-less engines are only Wikipedia and Wikidata, which match
+//! almost anything. When the free tier's answer is made only of those
+//! reference hits, results-page search (6, 7) also runs and its web results
+//! are merged in front (see `needs_results_page_tier`).
+//!
+//! DuckDuckGo HTML and Bing-in-Chrome read search engines' results pages (ADR
+//! 0002 §6: honest User-Agent, a challenge is a miss, no CAPTCHA solving).
+//! They are on unless the operator sets `OCTOS_ALLOW_SERP_SCRAPE=0` (alias
+//! `OCTOS_ALLOW_BROWSER_SERP`). Bing drives the
 //! same in-process `chromiumoxide`
 //! headless browser the `browser` tool uses and is gated behind the `browser`
 //! cargo feature. On any box with no Chrome/Chromium it degrades to a fast,
@@ -282,6 +288,164 @@ pub(crate) fn free_tier_providers(
     })
 }
 
+/// Metasearch engines that answer almost any general query with an
+/// encyclopedia entry. Their hits are reference material, not web results.
+const REFERENCE_ENGINES: &[&str] = &["wikipedia", "wikidata"];
+
+/// A metasearch hit that only reference engines returned (its `engines`
+/// list, best first, names every engine that found the URL).
+fn is_reference_hit(hit: &octos_research::SearchHit) -> bool {
+    hit.provider == octos_research::metasearch::PROVIDER_ID
+        && !hit.engines.is_empty()
+        && hit
+            .engines
+            .iter()
+            .all(|e| REFERENCE_ENGINES.contains(&e.as_str()))
+}
+
+/// Whether a free-tier answer should be completed with results-page search
+/// (DuckDuckGo, then Bing) before it is returned.
+///
+/// Rule: results-page search is allowed, the query is not news, and the
+/// free tier's answer is non-empty and made *only* of reference-engine hits
+/// (Wikipedia/Wikidata). One hit from any other engine or provider (Hacker
+/// News, GitHub, SearXNG, GDELT, ...) means the free tier found real
+/// results, and its answer is returned unchanged. An empty free tier is not
+/// this case: the normal chain (keyed providers, then DuckDuckGo and Bing)
+/// already runs.
+pub(crate) fn needs_results_page_tier(
+    serp_scrape: bool,
+    news: bool,
+    free_hits: &[octos_research::SearchHit],
+) -> bool {
+    serp_scrape && !news && !free_hits.is_empty() && free_hits.iter().all(is_reference_hit)
+}
+
+/// Results-page hits first, then the free-tier (reference) hits, deduplicated
+/// by normalized URL, filtered by the request's controls and capped at
+/// `limit`. Web results go first so encyclopedia entries cannot crowd them
+/// out of the count.
+pub(crate) fn merge_web_first(
+    web: Vec<octos_research::SearchHit>,
+    free: Vec<octos_research::SearchHit>,
+    filters: &octos_research::Filters,
+    limit: usize,
+) -> Vec<octos_research::SearchHit> {
+    let (mut kept, _skipped) = filters.apply(web.into_iter().chain(free).collect());
+    kept.truncate(limit);
+    kept
+}
+
+/// Results-page search: DuckDuckGo, then Bing only if DuckDuckGo missed. A
+/// miss (error, bot check, no results) is logged and the next one is tried.
+/// Returns the provider that answered and its hits. Both searches are
+/// passed as (lazy) futures so the order is testable without the network.
+pub(crate) async fn results_page_tier<D, B>(
+    query: &str,
+    ddg: D,
+    bing: B,
+) -> Option<(&'static str, Vec<octos_research::SearchHit>)>
+where
+    D: std::future::Future<Output = std::result::Result<Vec<octos_research::SearchHit>, String>>,
+    B: std::future::Future<Output = std::result::Result<Vec<octos_research::SearchHit>, String>>,
+{
+    if let Some(hits) = serp_outcome("duckduckgo", query, ddg.await) {
+        return Some(("duckduckgo", hits));
+    }
+    serp_outcome("bing_cdp", query, bing.await).map(|hits| ("bing_cdp", hits))
+}
+
+fn serp_outcome(
+    provider: &'static str,
+    query: &str,
+    r: std::result::Result<Vec<octos_research::SearchHit>, String>,
+) -> Option<Vec<octos_research::SearchHit>> {
+    match r {
+        Ok(h) if !h.is_empty() => Some(h),
+        Ok(_) => {
+            info!(provider, fallback_reason = "empty", query = %query, "web_search rotation");
+            None
+        }
+        Err(e) => {
+            let snippet = octos_core::truncated_utf8(&e, 120, "...");
+            warn!(provider, fallback_reason = "miss", error = %snippet, "web_search rotation");
+            None
+        }
+    }
+}
+
+/// Complete a free-tier answer with results-page search when
+/// [`needs_results_page_tier`] says so; otherwise return it unchanged. If
+/// both results pages miss, the free-tier answer is still returned.
+pub(crate) async fn complete_free_tier<D, B>(
+    mut answer: FreeTierAnswer,
+    query: &str,
+    serp_scrape: bool,
+    c: &FreeTierControls,
+    ddg: D,
+    bing: B,
+) -> FreeTierAnswer
+where
+    D: std::future::Future<Output = std::result::Result<Vec<octos_research::SearchHit>, String>>,
+    B: std::future::Future<Output = std::result::Result<Vec<octos_research::SearchHit>, String>>,
+{
+    if !needs_results_page_tier(serp_scrape, c.news, &answer.hits) {
+        return answer;
+    }
+    info!(
+        query = %query,
+        "web_search: free tier returned only reference entries; adding results-page search"
+    );
+    if let Some((provider, web)) = results_page_tier(query, ddg, bing).await {
+        let free = std::mem::take(&mut answer.hits);
+        answer.hits = merge_web_first(web, free, &c.filters, answer.limit);
+        answer.used.insert(0, provider);
+        // Log only providers whose hits survived the cap.
+        let hits = &answer.hits;
+        answer
+            .used
+            .retain(|p| hits.iter().any(|h| h.provider == *p));
+        // The "general results are thin" note no longer applies.
+        answer.note = None;
+    }
+    answer
+}
+
+/// What the free tier found, before it is formatted.
+pub(crate) struct FreeTierAnswer {
+    pub hits: Vec<octos_research::SearchHit>,
+    /// Providers that contributed, in output order.
+    pub used: Vec<&'static str>,
+    pub note: Option<String>,
+    /// Result cap (`count` per requested language).
+    pub limit: usize,
+}
+
+impl FreeTierAnswer {
+    fn into_result(self, query: &str, c: &FreeTierControls) -> ToolResult {
+        let used = self.used.join("+");
+        info!(provider = %used, used_provider = %used, query = %query, "web_search");
+        let mut output = octos_research::providers::format_hits(query, &self.hits);
+        if let Some(note) = self.note.filter(|_| c.category == "general") {
+            output.push_str(&format!("Note: {note}\n"));
+        }
+        if octos_research::respect_robots(|k| std::env::var(k).ok())
+            && self.hits.iter().any(|h| {
+                h.provider == "google_news_rss" || h.engines.iter().any(|e| e == "google_news")
+            })
+        {
+            output.push_str(
+                "Note: news.google.com links are redirects whose robots.txt disallows automated fetching; cite them as headlines (publisher and date above) rather than fetching them.\n",
+            );
+        }
+        ToolResult {
+            output,
+            success: true,
+            ..Default::default()
+        }
+    }
+}
+
 /// GDELT asks for at most one request every 5 seconds (process-wide).
 fn gdelt_throttle() -> &'static octos_research::HostThrottle {
     static T: std::sync::OnceLock<octos_research::HostThrottle> = std::sync::OnceLock::new();
@@ -430,7 +594,7 @@ impl Tool for WebSearchTool {
                 "category": {
                     "type": "string",
                     "enum": ["auto", "news", "general", "science", "it", "social"],
-                    "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (Wikipedia, Wikidata; web results need a key), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
+                    "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (Wikipedia, Wikidata; web results come from results-page search, DuckDuckGo then Bing, on unless the operator turned it off), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
                 }
             },
             "required": ["query"]
@@ -474,8 +638,19 @@ impl Tool for WebSearchTool {
 
         // Free structured sources first (ADR 0002 §6): GDELT + Google News
         // for news-ish queries, then a configured SearXNG.
-        if let Some(result) = self.free_tier_search(&input.query, count, &controls).await {
-            return Ok(result);
+        // For a general query answered only by reference engines, the
+        // results-page tier is added (see `needs_results_page_tier`).
+        if let Some(answer) = self.free_tier_search(&input.query, count, &controls).await {
+            let answer = complete_free_tier(
+                answer,
+                &input.query,
+                serp_scrape,
+                &controls,
+                self.ddg_hits(&input.query, count),
+                self.bing_hits(&input.query, count),
+            )
+            .await;
+            return Ok(answer.into_result(&input.query, &controls));
         }
 
         // Keyed providers: Tavily first (best quality), Perplexity last.
@@ -886,14 +1061,14 @@ impl WebSearchTool {
         query: &str,
         count: u8,
         c: &FreeTierControls,
-    ) -> Option<ToolResult> {
+    ) -> Option<FreeTierAnswer> {
         let providers = free_tier_providers(c.news, metasearch_on(), self.searxng_base().is_some());
         if providers.is_empty() {
             return None;
         }
         let langs = c.langs(query);
         let mut hits = Vec::new();
-        let mut used: Vec<&str> = Vec::new();
+        let mut used: Vec<&'static str> = Vec::new();
         let mut note = None;
         // The metasearch covers every requested language in one call.
         if providers.contains(&octos_research::Provider::Metasearch) {
@@ -963,28 +1138,16 @@ impl WebSearchTool {
                 .map(octos_research::lang::primary)
                 .unwrap_or_default()
         });
-        kept.truncate(count as usize * langs.len().max(1));
+        let limit = count as usize * langs.len().max(1);
+        kept.truncate(limit);
         if kept.is_empty() {
             return None;
         }
-        info!(provider = %used.join("+"), used_provider = %used.join("+"), query = %query, "web_search");
-        let mut output = octos_research::providers::format_hits(query, &kept);
-        if let Some(note) = note.filter(|_| c.category == "general") {
-            output.push_str(&format!("Note: {note}\n"));
-        }
-        if octos_research::respect_robots(|k| std::env::var(k).ok())
-            && kept.iter().any(|h| {
-                h.provider == "google_news_rss" || h.engines.iter().any(|e| e == "google_news")
-            })
-        {
-            output.push_str(
-                "Note: news.google.com links are redirects whose robots.txt disallows automated fetching; cite them as headlines (publisher and date above) rather than fetching them.\n",
-            );
-        }
-        Some(ToolResult {
-            output,
-            success: true,
-            ..Default::default()
+        Some(FreeTierAnswer {
+            hits: kept,
+            used,
+            note,
+            limit,
         })
     }
 
@@ -1303,35 +1466,56 @@ impl WebSearchTool {
 
     // --- DuckDuckGo HTML fallback ---
 
-    async fn ddg_search(&self, query: &str, count: u8) -> Result<ToolResult> {
+    /// DuckDuckGo's HTML results page as `(title, url, snippet)`. An HTTP
+    /// error or a bot check is an `Err` (a miss: never parsed, never solved).
+    async fn ddg_results(
+        &self,
+        query: &str,
+        count: u8,
+    ) -> std::result::Result<Vec<(String, String, String)>, String> {
         let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoded(query));
-
         let response = self
             .client
             .get(&url)
             .send()
             .await
-            .wrap_err("failed to fetch DuckDuckGo search results")?;
-
+            .map_err(|e| format!("failed to fetch DuckDuckGo search results: {e}"))?;
         if !response.status().is_success() {
-            let status = response.status();
-            return Ok(ToolResult {
-                output: format!("DuckDuckGo search error: HTTP {status}"),
-                success: false,
-                ..Default::default()
-            });
+            return Err(format!(
+                "DuckDuckGo search error: HTTP {}",
+                response.status()
+            ));
         }
-
         let html = response.text().await.unwrap_or_default();
         // Its bot check (often HTTP 202) is a miss: never parsed, never solved.
         if octos_research::access::is_bot_challenge(&html) {
-            return Ok(ToolResult {
-                output: "DuckDuckGo answered with a bot check (not solved)".to_string(),
-                success: false,
-                ..Default::default()
-            });
+            return Err("DuckDuckGo answered with a bot check (not solved)".to_string());
         }
-        let results = parse_ddg_results(&html, count as usize);
+        Ok(parse_ddg_results(&html, count as usize))
+    }
+
+    /// DuckDuckGo results as search hits (for merging with the free tier).
+    async fn ddg_hits(
+        &self,
+        query: &str,
+        count: u8,
+    ) -> std::result::Result<Vec<octos_research::SearchHit>, String> {
+        self.ddg_results(query, count)
+            .await
+            .map(|r| serp_hits(r, "duckduckgo"))
+    }
+
+    async fn ddg_search(&self, query: &str, count: u8) -> Result<ToolResult> {
+        let results = match self.ddg_results(query, count).await {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(ToolResult {
+                    output: e,
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
 
         if results.is_empty() {
             return Ok(ToolResult {
@@ -1351,6 +1535,31 @@ impl WebSearchTool {
             success: true,
             ..Default::default()
         })
+    }
+
+    /// Bing in headless Chrome as search hits (for merging with the free
+    /// tier). A missing browser, a challenge or a timeout is an `Err`.
+    async fn bing_hits(
+        &self,
+        query: &str,
+        count: u8,
+    ) -> std::result::Result<Vec<octos_research::SearchHit>, String> {
+        #[cfg(feature = "browser")]
+        {
+            self.bing_results(
+                query,
+                count,
+                Duration::from_secs(45),
+                detect_browser_executable(),
+            )
+            .await
+            .map(|r| serp_hits(r, "bing_cdp"))
+        }
+        #[cfg(not(feature = "browser"))]
+        {
+            let _ = (query, count);
+            Err("built without the browser feature".to_string())
+        }
     }
 
     // --- Headless-Chrome (CDP) fallback ---------------------------------------
@@ -1395,6 +1604,49 @@ impl WebSearchTool {
         bound: Duration,
         executable: Option<std::path::PathBuf>,
     ) -> Result<ToolResult> {
+        let results = match self.bing_results(query, count, bound, executable).await {
+            Ok(r) => r,
+            Err(output) => {
+                return Ok(ToolResult {
+                    output,
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+        if results.is_empty() {
+            return Ok(ToolResult {
+                output: format!("No results found for: {query}"),
+                success: true,
+                ..Default::default()
+            });
+        }
+        let mut output = format!("Results for: {query}\n\n");
+        for (i, (title, url, snippet)) in results.iter().enumerate() {
+            output.push_str(&format!("{}. {title}\n   {url}\n", i + 1));
+            if !snippet.is_empty() {
+                output.push_str(&format!("   {snippet}\n"));
+            }
+            output.push('\n');
+        }
+        Ok(ToolResult {
+            output,
+            success: true,
+            ..Default::default()
+        })
+    }
+
+    /// Bing's results page rendered in headless Chrome, as
+    /// `(title, url, snippet)`. No browser, a launch error, a challenge or a
+    /// timeout is an `Err` (a clean miss).
+    #[cfg(feature = "browser")]
+    async fn bing_results(
+        &self,
+        query: &str,
+        count: u8,
+        bound: Duration,
+        executable: Option<std::path::PathBuf>,
+    ) -> std::result::Result<Vec<(String, String, String)>, String> {
         let Some(executable) = executable else {
             // No usable browser: skip cleanly. Caller proceeds (and, with every
             // provider exhausted, the search terminates rather than hanging).
@@ -1403,11 +1655,7 @@ impl WebSearchTool {
                 fallback_reason = "no_browser",
                 "web_search: no Chrome/Chromium found; skipping headless fallback"
             );
-            return Ok(ToolResult {
-                output: "browser unavailable: no Chrome/Chromium executable detected".to_string(),
-                success: false,
-                ..Default::default()
-            });
+            return Err("browser unavailable: no Chrome/Chromium executable detected".to_string());
         };
 
         // Bound the entire launch + navigation + extraction so a stuck Chrome
@@ -1415,28 +1663,7 @@ impl WebSearchTool {
         // whose `Drop`/`shutdown` kills the child process (see browser.rs).
         let fut = render_and_parse_bing(executable, query, count);
         match tokio::time::timeout(bound, fut).await {
-            Ok(Ok(results)) => {
-                if results.is_empty() {
-                    return Ok(ToolResult {
-                        output: format!("No results found for: {query}"),
-                        success: true,
-                        ..Default::default()
-                    });
-                }
-                let mut output = format!("Results for: {query}\n\n");
-                for (i, (title, url, snippet)) in results.iter().enumerate() {
-                    output.push_str(&format!("{}. {title}\n   {url}\n", i + 1));
-                    if !snippet.is_empty() {
-                        output.push_str(&format!("   {snippet}\n"));
-                    }
-                    output.push('\n');
-                }
-                Ok(ToolResult {
-                    output,
-                    success: true,
-                    ..Default::default()
-                })
-            }
+            Ok(Ok(results)) => Ok(results),
             Ok(Err(e)) => {
                 let snippet = octos_core::truncated_utf8(&e.to_string(), 200, "...");
                 warn!(
@@ -1445,11 +1672,7 @@ impl WebSearchTool {
                     error = %snippet,
                     "web_search: headless Chrome search failed"
                 );
-                Ok(ToolResult {
-                    output: format!("browser search failed: {snippet}"),
-                    success: false,
-                    ..Default::default()
-                })
+                Err(format!("browser search failed: {snippet}"))
             }
             Err(_) => {
                 warn!(
@@ -1458,14 +1681,29 @@ impl WebSearchTool {
                     timeout_ms = bound.as_millis() as u64,
                     "web_search: headless Chrome search timed out"
                 );
-                Ok(ToolResult {
-                    output: format!("browser search timed out after {}s", bound.as_secs().max(1)),
-                    success: false,
-                    ..Default::default()
-                })
+                Err(format!(
+                    "browser search timed out after {}s",
+                    bound.as_secs().max(1)
+                ))
             }
         }
     }
+}
+
+/// Results-page rows `(title, url, snippet)` as search hits from `provider`.
+fn serp_hits(
+    rows: Vec<(String, String, String)>,
+    provider: &str,
+) -> Vec<octos_research::SearchHit> {
+    rows.into_iter()
+        .map(|(title, url, snippet)| octos_research::SearchHit {
+            url,
+            title,
+            snippet,
+            provider: provider.to_string(),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// Detect a usable Chrome/Chromium/Edge executable using the exact same probe
@@ -2250,6 +2488,231 @@ mod tests {
         assert!(!r.output.contains("duckduckgo"), "{}", r.output);
         assert!(r.output.contains("SEARXNG_URL"));
         assert!(!r.output.contains("Results for:"));
+    }
+
+    fn meta_hit(url: &str, engines: &[&str]) -> octos_research::SearchHit {
+        octos_research::SearchHit {
+            url: url.to_string(),
+            title: url.to_string(),
+            provider: octos_research::metasearch::PROVIDER_ID.to_string(),
+            engines: engines.iter().map(|e| e.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn web_hit(url: &str, provider: &str) -> octos_research::SearchHit {
+        octos_research::SearchHit {
+            url: url.to_string(),
+            title: url.to_string(),
+            provider: provider.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn controls(query: &str, category: &str) -> FreeTierControls {
+        let input: Input =
+            serde_json::from_value(serde_json::json!({"query": query, "category": category}))
+                .unwrap();
+        FreeTierControls::parse(&input).unwrap()
+    }
+
+    fn reference_answer() -> FreeTierAnswer {
+        FreeTierAnswer {
+            hits: vec![
+                meta_hit("https://en.wikipedia.org/wiki/Omarchy", &["wikipedia"]),
+                meta_hit(
+                    "https://www.wikidata.org/wiki/Q1",
+                    &["wikidata", "wikipedia"],
+                ),
+            ],
+            used: vec!["metasearch"],
+            note: Some("general engines are thin".to_string()),
+            limit: 5,
+        }
+    }
+
+    type Serp = std::result::Result<Vec<octos_research::SearchHit>, String>;
+
+    /// A results-page search that records whether it ran.
+    async fn serp(called: &std::sync::atomic::AtomicBool, r: Serp) -> Serp {
+        called.store(true, std::sync::atomic::Ordering::SeqCst);
+        r
+    }
+
+    const QUERY: &str = "\"switched to Omarchy\" OR \"using Omarchy\" daily driver";
+
+    #[tokio::test]
+    async fn should_add_results_page_hits_first_when_general_query_gets_only_reference_hits() {
+        let c = controls(QUERY, "auto");
+        assert!(!c.news, "the validation query is general");
+        let (ddg, bing) = (Default::default(), Default::default());
+        let web = vec![
+            web_hit("https://blog.example.com/omarchy", "duckduckgo"),
+            // Same page as a metasearch hit, other spelling: deduplicated.
+            web_hit("http://en.wikipedia.org/wiki/Omarchy/", "duckduckgo"),
+        ];
+        let out = complete_free_tier(
+            reference_answer(),
+            QUERY,
+            true,
+            &c,
+            serp(&ddg, Ok(web)),
+            serp(&bing, Ok(vec![web_hit("https://b.example/", "bing_cdp")])),
+        )
+        .await;
+        assert!(ddg.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !bing.load(std::sync::atomic::Ordering::SeqCst),
+            "DDG answered"
+        );
+        let urls: Vec<&str> = out.hits.iter().map(|h| h.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://blog.example.com/omarchy",
+                "http://en.wikipedia.org/wiki/Omarchy/",
+                "https://www.wikidata.org/wiki/Q1",
+            ],
+            "web first, deduplicated by normalized URL"
+        );
+        assert_eq!(out.used, vec!["duckduckgo", "metasearch"]);
+        assert!(out.note.is_none());
+        let r = out.into_result(QUERY, &c);
+        assert!(r.output.starts_with("Results for:"), "{}", r.output);
+    }
+
+    #[tokio::test]
+    async fn should_cap_merged_hits_at_the_limit_with_web_hits_kept() {
+        let c = controls("rust borrow checker", "general");
+        let web: Vec<_> = (0..5)
+            .map(|i| web_hit(&format!("https://w{i}.example/"), "duckduckgo"))
+            .collect();
+        let (ddg, bing) = (Default::default(), Default::default());
+        let out = complete_free_tier(
+            reference_answer(),
+            "rust borrow checker",
+            true,
+            &c,
+            serp(&ddg, Ok(web)),
+            serp(&bing, Ok(vec![])),
+        )
+        .await;
+        assert_eq!(out.hits.len(), 5);
+        assert!(out.hits.iter().all(|h| h.provider == "duckduckgo"));
+        assert_eq!(out.used, vec!["duckduckgo"], "no metasearch hit survived");
+    }
+
+    #[tokio::test]
+    async fn should_keep_the_metasearch_answer_when_results_page_search_is_off() {
+        let c = controls(QUERY, "general");
+        let (ddg, bing) = (Default::default(), Default::default());
+        let out = complete_free_tier(
+            reference_answer(),
+            QUERY,
+            false,
+            &c,
+            serp(&ddg, Ok(vec![web_hit("https://a.example/", "duckduckgo")])),
+            serp(&bing, Ok(vec![])),
+        )
+        .await;
+        assert!(!ddg.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!bing.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(out.hits, reference_answer().hits);
+        assert_eq!(out.used, vec!["metasearch"]);
+        assert!(out.note.is_some());
+    }
+
+    #[tokio::test]
+    async fn should_keep_the_answer_unchanged_when_query_is_news() {
+        let c = controls("latest Omarchy release news", "auto");
+        assert!(c.news);
+        let (ddg, bing) = (Default::default(), Default::default());
+        let out = complete_free_tier(
+            reference_answer(),
+            "latest Omarchy release news",
+            true,
+            &c,
+            serp(&ddg, Ok(vec![web_hit("https://a.example/", "duckduckgo")])),
+            serp(&bing, Ok(vec![])),
+        )
+        .await;
+        assert!(!ddg.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(out.hits, reference_answer().hits);
+    }
+
+    #[tokio::test]
+    async fn should_not_search_results_pages_when_metasearch_found_other_engines() {
+        let c = controls(QUERY, "general");
+        let mut answer = reference_answer();
+        answer.hits.push(meta_hit(
+            "https://news.ycombinator.com/item?id=1",
+            &["hackernews"],
+        ));
+        let expected = answer.hits.clone();
+        let (ddg, bing) = (Default::default(), Default::default());
+        let out = complete_free_tier(
+            answer,
+            QUERY,
+            true,
+            &c,
+            serp(&ddg, Ok(vec![web_hit("https://a.example/", "duckduckgo")])),
+            serp(&bing, Ok(vec![])),
+        )
+        .await;
+        assert!(!ddg.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!bing.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(out.hits, expected);
+        // A SearXNG hit is a web result too.
+        let mixed = [
+            meta_hit("https://en.wikipedia.org/wiki/X", &["wikipedia"]),
+            web_hit("https://x.example/", "searxng"),
+        ];
+        assert!(!needs_results_page_tier(true, false, &mixed));
+        assert!(!needs_results_page_tier(true, false, &[]));
+    }
+
+    #[tokio::test]
+    async fn should_try_bing_after_a_duckduckgo_challenge() {
+        let c = controls(QUERY, "general");
+        let (ddg, bing) = (Default::default(), Default::default());
+        let out = complete_free_tier(
+            reference_answer(),
+            QUERY,
+            true,
+            &c,
+            serp(
+                &ddg,
+                Err("DuckDuckGo answered with a bot check (not solved)".into()),
+            ),
+            serp(
+                &bing,
+                Ok(vec![web_hit("https://b.example/post", "bing_cdp")]),
+            ),
+        )
+        .await;
+        assert!(ddg.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(bing.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(out.hits[0].url, "https://b.example/post");
+        assert_eq!(out.used, vec!["bing_cdp", "metasearch"]);
+    }
+
+    #[tokio::test]
+    async fn should_return_the_metasearch_answer_when_both_results_pages_miss() {
+        let c = controls(QUERY, "general");
+        let (ddg, bing) = (Default::default(), Default::default());
+        let out = complete_free_tier(
+            reference_answer(),
+            QUERY,
+            true,
+            &c,
+            serp(&ddg, Err("DuckDuckGo answered with a bot check".into())),
+            serp(&bing, Err("Bing answered with a challenge".into())),
+        )
+        .await;
+        assert!(bing.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(out.hits, reference_answer().hits);
+        assert_eq!(out.used, vec!["metasearch"]);
+        assert!(out.note.is_some(), "the thin-general note stays");
     }
 
     #[test]

@@ -3760,6 +3760,12 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             "call_id": "probe",
             "ok": true,
         }),
+        APPUI_METHOD_PEER_INPUT_REJECT => json!({
+            "session_id": session_id,
+            "peer": "probe",
+            "input_id": "probe",
+            "reason": "busy",
+        }),
         APPUI_METHOD_TURN_STEER => json!({
             "session_id": session_id,
             "input": [{ "kind": "text", "text": "steer probe" }],
@@ -46191,6 +46197,7 @@ async fn should_let_an_external_client_answer_only_its_own_turns_approvals_once(
 #[tokio::test]
 async fn should_refuse_an_external_answer_to_a_host_owned_peer_question() {
     let contracts = Arc::new(UiProtocolContractStores::default());
+    let state = Arc::new(AppState::empty_for_tests());
     let session_id = host_managed_peer_session("peerctx-rinx.app-a");
     let question_id = QuestionId::new();
     let mut waiter = contracts
@@ -46209,6 +46216,7 @@ async fn should_refuse_an_external_answer_to_a_host_owned_peer_question() {
     let (ws, mut rx) = ws_connection_for_test(32);
     handle_user_question_respond(
         &ws,
+        &state,
         &contracts,
         Some(MAIN_PROFILE_ID),
         Some(ws.connection_id()),
@@ -46226,6 +46234,7 @@ async fn should_refuse_an_external_answer_to_a_host_owned_peer_question() {
     // The host still answers it.
     handle_user_question_respond(
         &ws,
+        &state,
         &contracts,
         Some(MAIN_PROFILE_ID),
         None,
@@ -46368,6 +46377,7 @@ async fn should_let_an_external_client_steer_and_interrupt_only_turns_it_owns() 
 
     handle_turn_interrupt(
         &ws,
+        &state,
         &ledger,
         &active_turns,
         &contracts,
@@ -47517,6 +47527,7 @@ async fn should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_serve
 #[tokio::test]
 async fn should_let_an_external_client_answer_only_its_own_turns_questions() {
     let contracts = Arc::new(UiProtocolContractStores::default());
+    let state = Arc::new(AppState::empty_for_tests());
     let session_id = host_managed_peer_session("system");
     let turn_id = TurnId::new();
     let (host_ws, _host_rx) = ws_connection_for_test(32);
@@ -47540,6 +47551,7 @@ async fn should_let_an_external_client_answer_only_its_own_turns_questions() {
     );
     handle_user_question_respond(
         &ws,
+        &state,
         &contracts,
         Some(MAIN_PROFILE_ID),
         Some(ws.connection_id()),
@@ -47559,6 +47571,7 @@ async fn should_let_an_external_client_answer_only_its_own_turns_questions() {
     );
     handle_user_question_respond(
         &ws,
+        &state,
         &contracts,
         Some(MAIN_PROFILE_ID),
         Some(ws.connection_id()),

@@ -8,9 +8,10 @@ use super::*;
 use crate::peers::host_tools::{apply_session_host_tools, resolve_session_host_tools};
 use octos_core::ui_protocol::{ApprovalRespondParams, QuestionId, UserQuestionAnswer};
 
-/// The chat id of this test's host sessions. The host-session map is
-/// process-wide and tests run in parallel, so each test (one thread per
-/// `#[tokio::test]`) gets its own id; every key in one test shares it.
+/// The chat id of this test's host sessions. Peer state (routes, the staged
+/// peers on disk) is process-wide and tests run in parallel, so each test
+/// (one thread per `#[tokio::test]`) gets its own id; every key in one test
+/// shares it.
 fn host_chat() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -310,6 +311,7 @@ fn should_advertise_and_dispatch_the_peer_tool_methods() {
     for method in [
         APPUI_METHOD_PEER_TOOLS_REGISTER,
         APPUI_METHOD_PEER_TOOL_RESULT,
+        APPUI_METHOD_PEER_INPUT_REJECT,
     ] {
         assert!(APPUI_EXTRA_METHODS.contains(&method), "{method} advertised");
         assert!(
@@ -1201,6 +1203,7 @@ async fn should_keep_a_host_tool_approval_and_turn_controls_on_the_host_connecti
     let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     handle_turn_interrupt(
         &spoof_ws,
+        &fx.state,
         &ledger,
         &active_turns,
         &contracts,
@@ -1215,8 +1218,8 @@ async fn should_keep_a_host_tool_approval_and_turn_controls_on_the_host_connecti
         rpc_error_kind(spoof_rx.recv().await.unwrap()),
         "peer_host_connection_only"
     );
-    assert!(refuse_foreign_host_turn_control(&key, &spoof_ws, "turn/steer").is_some());
-    assert!(refuse_foreign_host_turn_control(&key, &host_ws, "turn/steer").is_none());
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &spoof_ws, "turn/steer").is_some());
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &host_ws, "turn/steer").is_none());
 
     // The host connection answers it.
     handle_approval_respond(
@@ -2600,6 +2603,7 @@ async fn should_refuse_host_tool_registration_and_results_when_the_connection_is
     for method in [
         APPUI_METHOD_PEER_TOOLS_REGISTER,
         APPUI_METHOD_PEER_TOOL_RESULT,
+        APPUI_METHOD_PEER_INPUT_REJECT,
     ] {
         let error = super::super::host_managed::external_gate(method, &params, &HashSet::new())
             .unwrap_err();
@@ -2617,6 +2621,7 @@ async fn should_refuse_host_tool_registration_and_results_when_the_connection_is
     for (id, method) in [
         ("ext-register", APPUI_METHOD_PEER_TOOLS_REGISTER),
         ("ext-result", APPUI_METHOD_PEER_TOOL_RESULT),
+        ("ext-reject", APPUI_METHOD_PEER_INPUT_REJECT),
     ] {
         let mut call_params = params.clone();
         call_params["call_id"] = json!("call-1");
@@ -3120,8 +3125,6 @@ async fn should_answer_a_host_peer_sessions_questions_only_on_the_owning_or_host
     let key = peer_key(&fx);
     let (host_ws, mut host_rx) = ws_connection_for_test(16);
     register(&fx, &host_ws, &token, json!({ "tools": [] })).unwrap();
-    // A turn of the host marks the session as the host peer's.
-    let _ = turn_registry(&fx, &key, "turn-q").await;
     let contracts = Arc::new(UiProtocolContractStores::default());
     let question_id = QuestionId::new();
     let _waiter = contracts.user_questions.request_runtime_owned(
@@ -3155,12 +3158,30 @@ async fn should_answer_a_host_peer_sessions_questions_only_on_the_owning_or_host
         )
     };
     let (other_ws, mut other_rx) = ws_connection_for_test(16);
-    handle_user_question_respond(&other_ws, &contracts, None, None, "q1".into(), answer()).await;
+    handle_user_question_respond(
+        &other_ws,
+        &fx.state,
+        &contracts,
+        None,
+        None,
+        "q1".into(),
+        answer(),
+    )
+    .await;
     assert_eq!(
         rpc_error_kind(other_rx.recv().await.unwrap()),
         "peer_host_connection_only"
     );
-    handle_user_question_respond(&host_ws, &contracts, None, None, "q2".into(), answer()).await;
+    handle_user_question_respond(
+        &host_ws,
+        &fx.state,
+        &contracts,
+        None,
+        None,
+        "q2".into(),
+        answer(),
+    )
+    .await;
     let reply = frame_json(host_rx.recv().await.unwrap());
     assert!(reply.get("error").is_none(), "{reply}");
 }
@@ -3285,6 +3306,7 @@ async fn should_cancel_an_in_flight_host_call_when_the_turn_is_interrupted() {
     // The person interrupts the turn.
     handle_turn_interrupt(
         &e.ws,
+        &e.state,
         &ledger,
         &active_turns,
         &contracts,
@@ -3502,6 +3524,72 @@ async fn should_refuse_foreign_writes_to_a_host_peer_session_when_its_set_is_on_
         refuse_foreign_host_peer_session_call(&fx.state, &host_ws, "turn/start", &by_session)
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn should_refuse_foreign_turn_controls_on_a_host_peer_session_when_its_set_is_on_disk() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let key = peer_key(&fx);
+    let (host_ws, _host_rx) = ws_connection_for_test(8);
+    let (other_ws, mut other_rx) = ws_connection_for_test(8);
+    // Before registration nothing is confined.
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &other_ws, "turn/steer").is_none());
+    register(&fx, &host_ws, &token, json!({ "tools": [] })).unwrap();
+    // No turn has run yet: the confinement must hold anyway (from the first
+    // call after a restart, or once the in-memory map would have evicted).
+    for method in ["turn/steer", "turn/interrupt"] {
+        let error = refuse_foreign_host_turn_control(&fx.state, &key, &other_ws, method)
+            .unwrap_or_else(|| panic!("{method} accepted from a foreign connection"));
+        assert_eq!(error.data.unwrap()["kind"], "peer_host_connection_only");
+        assert!(refuse_foreign_host_turn_control(&fx.state, &key, &host_ws, method).is_none());
+    }
+    // The handler refuses too, with no turn ever started on the session.
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    handle_turn_interrupt(
+        &other_ws,
+        &fx.state,
+        &ledger,
+        &active_turns,
+        &Arc::new(UiProtocolContractStores::default()),
+        "i0".into(),
+        TurnInterruptParams {
+            session_id: key.clone(),
+            turn_id: TurnId::new(),
+        },
+    )
+    .await;
+    assert_eq!(
+        rpc_error_kind(other_rx.recv().await.unwrap()),
+        "peer_host_connection_only"
+    );
+    // A corrupt tool-set leaf is confined too: fail closed like a readable
+    // one, still drivable by the host.
+    let leaf = peers_root(&fx).join("news/host_tools.json");
+    std::fs::write(&leaf, "not json").unwrap();
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &other_ws, "turn/steer").is_some());
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &host_ws, "turn/steer").is_none());
+    // A prompt on the session is answered by its owner or the host connection.
+    assert!(!host_session_answer_allowed(
+        &fx.state,
+        &key,
+        Some(host_ws.connection_id.0),
+        &other_ws
+    ));
+    assert!(host_session_answer_allowed(
+        &fx.state,
+        &key,
+        Some(host_ws.connection_id.0),
+        &host_ws
+    ));
+    // After the host's connection closed (or a restart: nothing in memory),
+    // nobody drives it or answers for it until the host registers again.
+    crate::peers::host_tools::drop_routes_for_connection(host_ws.connection_id.0);
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &host_ws, "turn/steer").is_some());
+    assert!(!host_session_answer_allowed(
+        &fx.state, &key, None, &host_ws
+    ));
 }
 
 fn register_on_session(
@@ -3952,5 +4040,417 @@ async fn should_end_in_flight_calls_when_a_send_to_the_host_fails() {
         result.output.contains("outcome_unknown"),
         "{}",
         result.output
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #2618 — `peer/input/reject`: the host refuses a `peer/input`
+// ---------------------------------------------------------------------------
+
+/// `peer/input/reject` from `connection`.
+fn reject_input(
+    fx: &Fx,
+    connection: u64,
+    token: &str,
+    input_id: &str,
+    extra: Value,
+) -> Result<Value, RpcError> {
+    let mut params = json!({
+        "session_id": fx.system,
+        "peer": "news",
+        "host_token": token,
+        "input_id": input_id,
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        params[key] = value.clone();
+    }
+    raw_peer_input_reject(
+        connection,
+        &fx.state,
+        &rpc(APPUI_METHOD_PEER_INPUT_REJECT, params),
+        None,
+    )
+}
+
+/// The system agent's `peer_send_input`, wired as a system turn wires it,
+/// waiting `wait` for the host's answer.
+fn system_send_input_tool(fx: &Fx, wait: std::time::Duration) -> octos_agent::PeerSendInputTool {
+    let peers = peers_root(fx);
+    let system = fx.system.0.clone();
+    let turn = TurnId::new();
+    let answer_turn = turn.clone();
+    let send: octos_agent::PeerSendInputCallback =
+        Arc::new(move |req| deliver_peer_send_input("dev", &peers, &system, &turn, req));
+    octos_agent::PeerSendInputTool::new(send).with_answer(peer_send_input_answer_callback(
+        fx.system.0.clone(),
+        answer_turn,
+        wait,
+    ))
+}
+
+/// Deliver one input to the host on `rx`; returns the `peer/input` params.
+async fn deliver_input(fx: &Fx, rx: &mut mpsc::Receiver<WsMessage>, occurrence: &str) -> Value {
+    deliver_peer_send_input(
+        "dev",
+        &peers_root(fx),
+        &fx.system.0,
+        &TurnId::new(),
+        send_input_request("summarise today's news", occurrence),
+    )
+    .expect("delivered");
+    next_frame(rx, "peer/input").await
+}
+
+fn rpc_kind(error: RpcError) -> String {
+    error.data.expect("typed error")["kind"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn should_fail_the_waiting_peer_send_input_with_the_hosts_reason() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(16);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    let connection = ws.connection_id.0;
+    // The host refuses the input as soon as it arrives.
+    let host = {
+        let state = fx.state.clone();
+        let system = fx.system.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            let input = next_frame(&mut rx, "peer/input").await;
+            raw_peer_input_reject(
+                connection,
+                &state,
+                &rpc(
+                    APPUI_METHOD_PEER_INPUT_REJECT,
+                    json!({"session_id": system, "peer": "news", "host_token": token,
+                           "input_id": input["input_id"], "reason": "no_consent"}),
+                ),
+                None,
+            )
+        })
+    };
+
+    let tool = system_send_input_tool(&fx, std::time::Duration::from_secs(10));
+    let started = std::time::Instant::now();
+    let result = octos_agent::Tool::execute_with_context(
+        &tool,
+        &call_ctx("call_1"),
+        &json!({"slug": "news", "message": "summarise today's news"}),
+    )
+    .await
+    .unwrap();
+    assert!(!result.success, "{}", result.output);
+    assert!(
+        result.output.contains("peer_input_rejected: no_consent"),
+        "{}",
+        result.output
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the refusal ends the wait"
+    );
+    let accepted = host.await.unwrap().expect("the refusal is accepted");
+    assert_eq!(accepted["rejected"], true);
+    assert_eq!(accepted["reported_to"], "call");
+    // Told through the call: nothing is left for the system session's next turn.
+    assert!(
+        crate::peers::host_tools::peer_input_rejections_note(&peers_root(&fx), &fx.system)
+            .is_none()
+    );
+    let decisions: Vec<Value> = audit_rows(&fx)
+        .into_iter()
+        .filter_map(|row| row.get("decision").cloned())
+        .collect();
+    assert_eq!(
+        decisions,
+        vec![json!("peer_input_sent"), json!("peer_input_rejected")]
+    );
+    let rejected = audit_rows(&fx).pop().unwrap();
+    assert_eq!(rejected["outcome"], "no_consent");
+    assert_eq!(rejected["reported_to"], "call");
+}
+
+#[tokio::test]
+async fn should_end_the_wait_without_an_error_when_the_host_starts_the_turn() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(16);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    let host = {
+        let state = fx.state.clone();
+        let peer = peer_key(&fx);
+        tokio::spawn(async move {
+            let input = next_frame(&mut rx, "peer/input").await;
+            let turn: TurnId = serde_json::from_value(input["turn_id"].clone()).unwrap();
+            claim_peer_input_turn(&state, &peer, &turn)
+        })
+    };
+    let tool = system_send_input_tool(&fx, std::time::Duration::from_secs(10));
+    let started = std::time::Instant::now();
+    let result = octos_agent::Tool::execute_with_context(
+        &tool,
+        &call_ctx("call_1"),
+        &json!({"slug": "news", "message": "hello"}),
+    )
+    .await
+    .unwrap();
+    assert!(result.success, "{}", result.output);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    host.await.unwrap().expect("the turn start is accepted");
+}
+
+#[tokio::test]
+async fn should_report_a_rejection_after_the_call_returned_on_the_system_session() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(16);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    // The host does not answer within the call's wait: the call reports the
+    // input as sent.
+    let tool = system_send_input_tool(&fx, std::time::Duration::from_millis(50));
+    let result = octos_agent::Tool::execute_with_context(
+        &tool,
+        &call_ctx("call_1"),
+        &json!({"slug": "news", "message": "summarise today's news"}),
+    )
+    .await
+    .unwrap();
+    assert!(result.success, "{}", result.output);
+    let input = next_frame(&mut rx, "peer/input").await;
+
+    let accepted = reject_input(
+        &fx,
+        ws.connection_id.0,
+        &token,
+        input["input_id"].as_str().unwrap(),
+        json!({"reason": "other", "message": "the News account is suspended"}),
+    )
+    .expect("accepted after the call returned");
+    assert_eq!(accepted["reported_to"], "system_session");
+    // On the peer's blackboard...
+    let log = std::fs::read_to_string(peers_root(&fx).join("news/input_rejections.jsonl")).unwrap();
+    assert!(log.contains("\"reason\":\"other\""), "{log}");
+    // ...and told to the system session at its next turn, once.
+    let note = crate::peers::host_tools::peer_input_rejections_note(&peers_root(&fx), &fx.system)
+        .expect("a note for the system session");
+    assert!(
+        note.contains("News (news): peer_input_rejected: other (the News account is suspended)")
+            || note.contains("news: peer_input_rejected: other (the News account is suspended)"),
+        "{note}"
+    );
+    assert!(
+        crate::peers::host_tools::peer_input_rejections_note(&peers_root(&fx), &fx.system)
+            .is_none(),
+        "reported once"
+    );
+    // Never to the peer's own session or another session.
+    assert!(
+        crate::peers::host_tools::peer_input_rejections_note(&peers_root(&fx), &peer_key(&fx))
+            .is_none()
+    );
+    let rejected = audit_rows(&fx).pop().unwrap();
+    assert_eq!(rejected["decision"], "peer_input_rejected");
+    assert_eq!(rejected["reported_to"], "system_session");
+}
+
+#[tokio::test]
+async fn should_refuse_a_rejection_from_a_foreign_connection_with_a_bad_token_twice_or_after_the_turn_started()
+ {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(16);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    let host = ws.connection_id.0;
+    let (other, _other_rx) = ws_connection_for_test(16);
+    let busy = json!({"reason": "busy"});
+
+    let input = deliver_input(&fx, &mut rx, "call_1").await;
+    let input_id = input["input_id"].as_str().unwrap();
+    // Another connection of the profile, even holding the token.
+    assert_eq!(
+        rpc_kind(
+            reject_input(&fx, other.connection_id.0, &token, input_id, busy.clone()).unwrap_err()
+        ),
+        "peer_input_wrong_connection"
+    );
+    // The host connection without the token.
+    assert_eq!(
+        rpc_kind(reject_input(&fx, host, "guess", input_id, busy.clone()).unwrap_err()),
+        "peer_host_token_mismatch"
+    );
+    // An input the kernel never sent.
+    assert_eq!(
+        rpc_kind(reject_input(&fx, host, &token, "no-such-input", busy.clone()).unwrap_err()),
+        "peer_input_not_found"
+    );
+    // Accepted once...
+    reject_input(&fx, host, &token, input_id, busy.clone()).expect("the host refuses it");
+    // ...never twice.
+    assert_eq!(
+        rpc_kind(reject_input(&fx, host, &token, input_id, busy.clone()).unwrap_err()),
+        "peer_input_already_rejected"
+    );
+
+    // An input whose turn the host already started is answered.
+    let input = deliver_input(&fx, &mut rx, "call_2").await;
+    let turn: TurnId = serde_json::from_value(input["turn_id"].clone()).unwrap();
+    claim_peer_input_turn(&fx.state, &peer_key(&fx), &turn).expect("the host starts the turn");
+    assert_eq!(
+        rpc_kind(
+            reject_input(&fx, host, &token, input["input_id"].as_str().unwrap(), busy).unwrap_err()
+        ),
+        "peer_input_already_started"
+    );
+}
+
+#[tokio::test]
+async fn should_refuse_an_unknown_reason_an_unknown_field_or_a_bad_message() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(16);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    let host = ws.connection_id.0;
+    let input = deliver_input(&fx, &mut rx, "call_1").await;
+    let input_id = input["input_id"].as_str().unwrap();
+
+    for (extra, kind) in [
+        (
+            json!({"reason": "offline"}),
+            Some("peer_input_reject_invalid"),
+        ),
+        (json!({"reason": "Busy"}), Some("peer_input_reject_invalid")),
+        (
+            json!({"reason": "other", "message": "x".repeat(257)}),
+            Some("peer_input_reject_invalid"),
+        ),
+        (
+            json!({"reason": "other"}),
+            Some("peer_input_reject_invalid"),
+        ),
+        (
+            json!({"reason": "other", "message": "  "}),
+            Some("peer_input_reject_invalid"),
+        ),
+        (
+            json!({"reason": "other", "message": "line one\nline two"}),
+            Some("peer_input_reject_invalid"),
+        ),
+        (
+            json!({"reason": "busy", "message": "queue full"}),
+            Some("peer_input_reject_invalid"),
+        ),
+        // Unknown fields are refused by the parser (no typed kind).
+        (json!({"reason": "busy", "retry_after": 30}), None),
+    ] {
+        let error = reject_input(&fx, host, &token, input_id, extra.clone())
+            .expect_err(&format!("{extra} is refused"));
+        if let Some(kind) = kind {
+            assert_eq!(rpc_kind(error), kind, "{extra}");
+        }
+    }
+    // None of those consumed the input: a well-formed refusal is accepted.
+    let accepted = reject_input(
+        &fx,
+        host,
+        &token,
+        input_id,
+        json!({"reason": "other", "message": "x".repeat(256)}),
+    )
+    .expect("a 256-byte message is accepted");
+    assert_eq!(accepted["rejected"], true);
+}
+
+#[tokio::test]
+async fn should_refuse_a_turn_start_with_a_rejected_inputs_turn_id() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(64);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    let input = deliver_input(&fx, &mut rx, "call_1").await;
+    let turn: TurnId = serde_json::from_value(input["turn_id"].clone()).unwrap();
+    reject_input(
+        &fx,
+        ws.connection_id.0,
+        &token,
+        input["input_id"].as_str().unwrap(),
+        json!({"reason": "signed_out"}),
+    )
+    .unwrap();
+
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let started = handle_turn_start(
+        &ws,
+        &fx.state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "start-rejected".into(),
+        TurnStartParams {
+            session_id: peer_key(&fx),
+            turn_id: turn.clone(),
+            input: vec![InputItem::Text {
+                text: input["text"].as_str().unwrap().into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+        },
+    )
+    .await;
+    assert!(!started, "the turn is refused");
+    let refused = loop {
+        let frame = frame_json(
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a frame in time")
+                .expect("connection open"),
+        );
+        if frame["id"] == "start-rejected" {
+            break frame;
+        }
+    };
+    assert_eq!(
+        refused["error"]["data"]["kind"], "peer_input_rejected",
+        "{refused}"
+    );
+    assert!(active_turns.lock().await.is_empty());
+    // The turn id is released: it no longer counts as the system agent's
+    // request (a foreground app tool would not run in it).
+    let mut foreground = news_list();
+    foreground["background"] = json!(false);
+    register(&fx, &ws, &token, json!({ "tools": [foreground] })).unwrap();
+    let registry = turn_registry(&fx, &peer_key(&fx), &turn.0.to_string()).await;
+    let approver = app_approver(
+        &fx,
+        &peer_key(&fx),
+        &Arc::new(UiProtocolContractStores::default()),
+        &TurnId::new(),
+    );
+    let refused = octos_agent::tools::TOOL_APPROVAL_CTX
+        .scope(
+            approver,
+            registry.execute_with_context(&call_ctx("c1"), "news_list", &json!({})),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !refused.success && refused.output.contains("background"),
+        "{}",
+        refused.output
     );
 }
