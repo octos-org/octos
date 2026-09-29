@@ -3320,12 +3320,31 @@ async fn should_cancel_an_in_flight_host_call_when_the_turn_is_interrupted() {
         },
     )
     .await;
-    // The host is told to stop that very call...
+    // The host is told to stop that very call. The frame is written by the
+    // call's own task when it observes the cancellation; nothing here joins
+    // that task, so on a loaded runner the frame can land after the turn's
+    // terminal and ack are already out (#2638). The pending set empties in
+    // the same synchronous block that writes the frame, so wait for that
+    // first — up to 20 s, well inside the 30 s call timeout, so a timeout
+    // is not what can have emptied it; if that race were ever lost anyway,
+    // the `reason` assert below is the backstop.
+    let peers_root = e.data_dir.join("peers");
+    let mut cancelled = false;
+    for _ in 0..1000 {
+        if crate::peers::host_tools::pending_calls_for(&peers_root, "news").is_empty() {
+            cancelled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        cancelled,
+        "the interrupted call is still pending after the 20 s drain wait"
+    );
     let cancel = next_frame(&mut rx, "peer/tool/cancel").await;
     assert_eq!(cancel["call_id"], call["call_id"]);
     assert_eq!(cancel["reason"], "cancelled");
     // ...and the call ends as an unknown outcome (it is not resent later).
-    let peers_root = e.data_dir.join("peers");
     let mut unknown = false;
     for _ in 0..200 {
         let audit =
