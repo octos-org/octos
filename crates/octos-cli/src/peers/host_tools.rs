@@ -1126,12 +1126,12 @@ pub(crate) fn deliver_peer_input(
     let session = host_peer_session(peers_root, slug)
         .ok_or_else(|| format!("peer '{slug}' has no recorded originator"))?;
     let key = route_key(peers_root, slug);
-    let send = HUB
+    let (send, connection) = HUB
         .routes
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(&key)
-        .map(|route| route.send.clone())
+        .map(|route| (route.send.clone(), route.connection))
         .ok_or_else(not_connected)?;
     let claim_key = format!("{key}\u{0}{input_id}");
     match HUB
@@ -1153,6 +1153,11 @@ pub(crate) fn deliver_peer_input(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .mark(format!("{key}\u{0}{}", turn_id.0), INPUT_RETENTION);
+    // Recorded before the send: the host may refuse it at once.
+    let entry_at = INPUT_LEDGER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(input_id, &key, connection, &turn_id.0.to_string());
     let params = json!({
         "peer": slug,
         "session_id": session,
@@ -1161,14 +1166,570 @@ pub(crate) fn deliver_peer_input(
         "text": text,
     });
     if send(PEER_INPUT_NOTIFICATION, params) {
+        append_audit(
+            peers_root,
+            slug,
+            &json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "peer": slug,
+                "session_id": session,
+                "turn_id": turn_id,
+                "input_id": input_id,
+                "decision": "peer_input_sent",
+            }),
+        );
         return Ok(PeerInputDelivery::Sent);
     }
+    INPUT_LEDGER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(input_id, entry_at);
     HUB.inputs
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(&claim_key);
     drop_route_if(&key, &send);
     Err(not_connected())
+}
+
+// ---------------------------------------------------------------------------
+// Answers to `peer/input`: the host starts the turn, or refuses the input
+// ---------------------------------------------------------------------------
+
+/// Longest `message` a host may give with `peer/input/reject`.
+pub(crate) const PEER_INPUT_REJECT_MESSAGE_MAX_BYTES: usize = 256;
+
+/// How long the system agent's `peer_send_input` waits for the host's answer
+/// to a `peer/input`: a `turn/start` with its turn id ends the wait at once,
+/// `peer/input/reject` makes the call fail with the reason. A host that does
+/// neither leaves the call reporting the input as sent, as before.
+pub(crate) const PEER_INPUT_ANSWER_WAIT: Duration = Duration::from_secs(5);
+
+/// Why the host refused a `peer/input` (a closed set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerInputRejectReason {
+    /// The account is signed out or suspended.
+    SignedOut,
+    /// The person has not granted the app consent.
+    NoConsent,
+    /// The peer is busy past the host's queue limit.
+    Busy,
+    /// Anything else; `message` says what.
+    Other,
+}
+
+impl PeerInputRejectReason {
+    pub(crate) fn parse(reason: &str) -> Option<Self> {
+        match reason {
+            "signed_out" => Some(Self::SignedOut),
+            "no_consent" => Some(Self::NoConsent),
+            "busy" => Some(Self::Busy),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::SignedOut => "signed_out",
+            Self::NoConsent => "no_consent",
+            Self::Busy => "busy",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// A host's refusal of one `peer/input`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeerInputRejection {
+    pub(crate) reason: PeerInputRejectReason,
+    /// Only with [`PeerInputRejectReason::Other`]; one line, bounded.
+    pub(crate) message: Option<String>,
+}
+
+impl PeerInputRejection {
+    /// Validate a host's `reason` and `message`.
+    pub(crate) fn parse(reason: &str, message: Option<String>) -> Result<Self, String> {
+        let reason = PeerInputRejectReason::parse(reason).ok_or_else(|| {
+            format!("unknown reason '{reason}' (signed_out, no_consent, busy or other)")
+        })?;
+        let message = match (reason, message) {
+            (PeerInputRejectReason::Other, Some(message)) => {
+                let message = message.trim().to_owned();
+                if message.is_empty() || message.len() > PEER_INPUT_REJECT_MESSAGE_MAX_BYTES {
+                    return Err(format!(
+                        "message must be 1..={PEER_INPUT_REJECT_MESSAGE_MAX_BYTES} bytes"
+                    ));
+                }
+                if message.chars().any(char::is_control) {
+                    return Err("message must be one line without control characters".into());
+                }
+                Some(message)
+            }
+            (PeerInputRejectReason::Other, None) => {
+                return Err("reason \"other\" needs a message".into());
+            }
+            (_, Some(_)) => {
+                return Err(format!(
+                    "message is only given with reason \"other\", not \"{}\"",
+                    reason.as_str()
+                ));
+            }
+            (_, None) => None,
+        };
+        Ok(Self { reason, message })
+    }
+
+    /// What the system agent reads: `peer_input_rejected: <reason>` and, for
+    /// `other`, the host's message.
+    pub(crate) fn describe(&self) -> String {
+        match &self.message {
+            Some(message) => format!("peer_input_rejected: {} ({message})", self.reason.as_str()),
+            None => format!("peer_input_rejected: {}", self.reason.as_str()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputAnswer {
+    Unanswered,
+    /// A `turn/start` with the input's turn id arrived.
+    Started,
+    Rejected,
+}
+
+/// One `peer/input` the kernel sent, until the host answers it.
+struct InputEntry {
+    route_key: String,
+    /// The host connection it was sent to: only it may refuse it.
+    connection: u64,
+    turn_id: String,
+    at: Instant,
+    answer: InputAnswer,
+    /// The system agent's call stopped waiting for the answer.
+    call_returned: bool,
+    /// A refusal handed to the waiting call.
+    for_call: Option<PeerInputRejection>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+/// Inputs by id (ids carry the calling session, turn and tool call, so they
+/// are unique across peers), bounded like the other claim sets.
+#[derive(Default)]
+struct InputLedger {
+    entries: HashMap<String, InputEntry>,
+    /// `(route, turn id)` → input id.
+    by_turn: HashMap<String, String>,
+    order: std::collections::VecDeque<(String, Instant)>,
+}
+
+impl InputLedger {
+    const MAX: usize = 4_096;
+
+    fn turn_key(route_key: &str, turn_id: &str) -> String {
+        format!("{route_key}\u{0}{turn_id}")
+    }
+
+    /// Record a new input; returns its insertion time (its identity for
+    /// [`Self::remove`]). The oldest entries go first when full or expired.
+    fn insert(
+        &mut self,
+        input_id: &str,
+        route_key: &str,
+        connection: u64,
+        turn_id: &str,
+    ) -> Instant {
+        let now = Instant::now();
+        while let Some((oldest, at)) = self.order.front().cloned() {
+            if self.entries.len() < Self::MAX && now.duration_since(at) < INPUT_RETENTION {
+                break;
+            }
+            self.order.pop_front();
+            self.remove(&oldest, at);
+        }
+        self.remove_any(input_id);
+        self.by_turn
+            .insert(Self::turn_key(route_key, turn_id), input_id.to_owned());
+        self.entries.insert(
+            input_id.to_owned(),
+            InputEntry {
+                route_key: route_key.to_owned(),
+                connection,
+                turn_id: turn_id.to_owned(),
+                at: now,
+                answer: InputAnswer::Unanswered,
+                call_returned: false,
+                for_call: None,
+                wake: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+        self.order.push_back((input_id.to_owned(), now));
+        now
+    }
+
+    /// Forget `input_id` if it is still the entry recorded at `at`.
+    fn remove(&mut self, input_id: &str, at: Instant) {
+        if self
+            .entries
+            .get(input_id)
+            .is_some_and(|entry| entry.at == at)
+        {
+            self.remove_any(input_id);
+        }
+    }
+
+    fn remove_any(&mut self, input_id: &str) {
+        if let Some(entry) = self.entries.remove(input_id) {
+            self.by_turn
+                .remove(&Self::turn_key(&entry.route_key, &entry.turn_id));
+        }
+    }
+}
+
+static INPUT_LEDGER: LazyLock<Mutex<InputLedger>> =
+    LazyLock::new(|| Mutex::new(InputLedger::default()));
+
+/// Wait up to `wait` for the host's answer to the input `input_id`, for the
+/// system agent's `peer_send_input` call that sent it. Returns the host's
+/// refusal, or `None` when the host started the turn, the wait ran out, or
+/// the kernel knows no such input. After this returns (or is dropped) a
+/// refusal is reported on the system session instead.
+pub(crate) async fn await_peer_input_answer(
+    input_id: &str,
+    wait: Duration,
+) -> Option<PeerInputRejection> {
+    /// Marks the call as returned however the wait ends (an interrupted
+    /// turn drops it).
+    struct Returned<'a>(&'a str);
+    impl Drop for Returned<'_> {
+        fn drop(&mut self) {
+            if let Some(entry) = INPUT_LEDGER
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entries
+                .get_mut(self.0)
+            {
+                entry.call_returned = true;
+            }
+        }
+    }
+    let wake = {
+        let mut ledger = INPUT_LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = ledger.entries.get_mut(input_id)?;
+        if entry.call_returned {
+            return None;
+        }
+        match entry.answer {
+            InputAnswer::Unanswered => entry.wake.clone(),
+            InputAnswer::Started => {
+                entry.call_returned = true;
+                return None;
+            }
+            InputAnswer::Rejected => {
+                entry.call_returned = true;
+                return entry.for_call.take();
+            }
+        }
+    };
+    let returned = Returned(input_id);
+    let _ = tokio::time::timeout(wait, wake.notified()).await;
+    let rejection = INPUT_LEDGER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entries
+        .get_mut(input_id)
+        .and_then(|entry| {
+            entry.call_returned = true;
+            entry.for_call.take()
+        });
+    drop(returned);
+    rejection
+}
+
+/// Why a `turn/start` or a `peer/input/reject` was refused.
+fn input_error(kind: &'static str, message: String) -> CompleteError {
+    CompleteError { kind, message }
+}
+
+/// A `turn/start` on the host-owned peer `slug`'s own session with
+/// `turn_id`. If the kernel handed that turn id out in a `peer/input`, the
+/// input counts as answered (it can no longer be refused), unless the host
+/// already refused it: then its turn id is released and the start is
+/// refused (`peer_input_rejected`).
+pub(crate) fn start_peer_input_turn(
+    peers_root: &Path,
+    slug: &str,
+    turn_id: &str,
+) -> Result<(), CompleteError> {
+    let mut ledger = INPUT_LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(input_id) = ledger
+        .by_turn
+        .get(&InputLedger::turn_key(
+            &route_key(peers_root, slug),
+            turn_id,
+        ))
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let Some(entry) = ledger.entries.get_mut(&input_id) else {
+        return Ok(());
+    };
+    match entry.answer {
+        InputAnswer::Rejected => Err(input_error(
+            "peer_input_rejected",
+            format!(
+                "turn '{turn_id}' was handed out for input '{input_id}', which the app refused; \
+                 it cannot be started"
+            ),
+        )),
+        InputAnswer::Started => Ok(()),
+        InputAnswer::Unanswered => {
+            entry.answer = InputAnswer::Started;
+            entry.wake.notify_one();
+            Ok(())
+        }
+    }
+}
+
+/// Where a refusal reached the system agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RejectDelivery {
+    /// Its `peer_send_input` call was still waiting: the call fails with it.
+    Call,
+    /// The call had returned: recorded on the peer's blackboard and reported
+    /// to the system session at its next turn.
+    SystemSession,
+}
+
+impl RejectDelivery {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::SystemSession => "system_session",
+        }
+    }
+}
+
+/// `peer/input/reject`: the host connection `connection` refuses the input
+/// `input_id` it received for the peer `slug`. Accepted once, only from the
+/// connection the input was sent to, and only while no `turn/start` with the
+/// input's turn id arrived. The turn id is released: it no longer counts as
+/// the system agent's request, and a later `turn/start` with it is refused.
+pub(crate) fn reject_peer_input(
+    peers_root: &Path,
+    slug: &str,
+    input_id: &str,
+    connection: u64,
+    rejection: PeerInputRejection,
+) -> Result<RejectDelivery, CompleteError> {
+    let key = route_key(peers_root, slug);
+    let (delivery, turn_id) = {
+        let mut ledger = INPUT_LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = ledger
+            .entries
+            .get_mut(input_id)
+            .filter(|entry| entry.route_key == key)
+        else {
+            return Err(input_error(
+                "peer_input_not_found",
+                format!("peer '{slug}' has no input '{input_id}' (unknown or expired)"),
+            ));
+        };
+        if entry.connection != connection {
+            return Err(input_error(
+                "peer_input_wrong_connection",
+                format!("input '{input_id}' was sent to another connection; only it may refuse it"),
+            ));
+        }
+        match entry.answer {
+            InputAnswer::Unanswered => {}
+            InputAnswer::Started => {
+                return Err(input_error(
+                    "peer_input_already_started",
+                    format!("the turn of input '{input_id}' was already started"),
+                ));
+            }
+            InputAnswer::Rejected => {
+                return Err(input_error(
+                    "peer_input_already_rejected",
+                    format!("input '{input_id}' was already refused"),
+                ));
+            }
+        }
+        entry.answer = InputAnswer::Rejected;
+        let waiting = !entry.call_returned && entry.at.elapsed() < PEER_INPUT_ANSWER_WAIT;
+        let delivery = if waiting {
+            entry.for_call = Some(rejection.clone());
+            entry.wake.notify_one();
+            RejectDelivery::Call
+        } else {
+            RejectDelivery::SystemSession
+        };
+        (delivery, entry.turn_id.clone())
+    };
+    // Released: a turn with this id is no longer the system agent's request.
+    HUB.input_turns
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&InputLedger::turn_key(&key, &turn_id));
+    if delivery == RejectDelivery::SystemSession {
+        record_input_rejection(peers_root, slug, input_id, &turn_id, &rejection);
+    }
+    append_audit(
+        peers_root,
+        slug,
+        &json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "peer": slug,
+            "session_id": host_peer_session(peers_root, slug),
+            "turn_id": turn_id,
+            "input_id": input_id,
+            "decision": "peer_input_rejected",
+            "outcome": rejection.reason.as_str(),
+            "message": rejection.message,
+            "reported_to": delivery.as_str(),
+        }),
+    );
+    Ok(delivery)
+}
+
+/// Peer-dir leaf of the refusals reported after the call returned (the
+/// peer's blackboard): one JSON object per line.
+pub(crate) const INPUT_REJECTIONS_LEAF: &str = "input_rejections.jsonl";
+/// How many lines of [`INPUT_REJECTIONS_LEAF`] the system session was told.
+const INPUT_REJECTIONS_CURSOR_LEAF: &str = ".input_rejections_notified";
+const INPUT_REJECTIONS_MAX_BYTES: u64 = 256 * 1024;
+/// Refusals named in one turn-start note.
+const INPUT_REJECTIONS_NOTE_MAX: usize = 8;
+
+fn record_input_rejection(
+    peers_root: &Path,
+    slug: &str,
+    input_id: &str,
+    turn_id: &str,
+    rejection: &PeerInputRejection,
+) {
+    let Some(dir) = staged_peer_dir(peers_root, slug) else {
+        return;
+    };
+    let size = std::fs::symlink_metadata(dir.join(INPUT_REJECTIONS_LEAF))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if size >= INPUT_REJECTIONS_MAX_BYTES {
+        tracing::warn!(slug, "input rejection log full; not recording the refusal");
+        return;
+    }
+    let row = json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "input_id": input_id,
+        "turn_id": turn_id,
+        "reason": rejection.reason.as_str(),
+        "message": rejection.message,
+    });
+    if let Err(error) = peer_io::append_peer_line(&dir, INPUT_REJECTIONS_LEAF, &format!("{row}\n"))
+    {
+        tracing::warn!(slug, %error, "failed to record the peer input refusal");
+    }
+}
+
+/// Turn-start note for `session`: the refusals of its peers' inputs that
+/// arrived after its `peer_send_input` calls had returned, each reported
+/// once. `None` for peer sessions and when there is nothing new.
+pub(crate) fn peer_input_rejections_note(
+    peers_root: &Path,
+    session: &SessionKey,
+) -> Option<String> {
+    if session.topic().is_some_and(|topic| {
+        topic.starts_with("peer-") || topic.starts_with(PEER_CONTEXT_TOPIC_PREFIX)
+    }) {
+        return None;
+    }
+    let read_dir = std::fs::read_dir(peers_root).ok()?;
+    let mut dirs: Vec<_> = read_dir.flatten().collect();
+    dirs.sort_by_key(|entry| entry.file_name());
+    let mut lines = Vec::new();
+    let mut total = 0usize;
+    for entry in dirs {
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        let Some(dir) = staged_peer_dir(peers_root, &slug) else {
+            continue;
+        };
+        if !peer_io::peer_regular_file_exists(&dir, INPUT_REJECTIONS_LEAF) {
+            continue;
+        }
+        let originator =
+            peer_io::read_peer_file(&dir, "originator", peer_io::PEER_FILE_READ_CAP_SMALL);
+        if originator.as_deref().map(str::trim) != Some(session.0.as_str()) {
+            continue;
+        }
+        let Some(body) = peer_io::read_peer_file(
+            &dir,
+            INPUT_REJECTIONS_LEAF,
+            peer_io::PEER_FILE_READ_CAP_LARGE,
+        ) else {
+            continue;
+        };
+        // Only complete lines: a line being appended is read next time.
+        let rows: Vec<&str> = body
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+            .collect();
+        let told = peer_io::read_peer_file(
+            &dir,
+            INPUT_REJECTIONS_CURSOR_LEAF,
+            peer_io::PEER_FILE_READ_CAP_SMALL,
+        )
+        .and_then(|cursor| cursor.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+        if told >= rows.len() {
+            continue;
+        }
+        let name = peer_io::read_peer_file(&dir, "name", peer_io::PEER_FILE_READ_CAP_SMALL)
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| slug.clone());
+        for row in &rows[told..] {
+            let Ok(row) = serde_json::from_str::<Value>(row) else {
+                continue;
+            };
+            total += 1;
+            if lines.len() >= INPUT_REJECTIONS_NOTE_MAX {
+                continue;
+            }
+            let rejection = PeerInputRejection {
+                reason: row["reason"]
+                    .as_str()
+                    .and_then(PeerInputRejectReason::parse)
+                    .unwrap_or(PeerInputRejectReason::Other),
+                message: row["message"].as_str().map(ToOwned::to_owned),
+            };
+            let addr = if name == slug {
+                slug.clone()
+            } else {
+                format!("{name} ({slug})")
+            };
+            lines.push(format!("- {addr}: {}", rejection.describe()));
+        }
+        if let Err(error) = peer_io::write_peer_file_atomic(
+            &dir,
+            INPUT_REJECTIONS_CURSOR_LEAF,
+            &rows.len().to_string(),
+        ) {
+            tracing::warn!(slug, ?error, "failed to record the reported input refusals");
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    if total > lines.len() {
+        lines.push(format!("- +{} more", total - lines.len()));
+    }
+    Some(format!(
+        "[peer input rejected: the app refused these peer_send_input messages after the call \
+         returned, so the peer did not act on them]\n{}",
+        lines.join("\n")
+    ))
 }
 
 /// The connection that holds the peer's route, if any.

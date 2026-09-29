@@ -953,7 +953,8 @@ pub use peer_respond::{
     PeerRespondAnswer, PeerRespondCallback, PeerRespondRequest, PeerRespondTool,
 };
 pub use peer_send_input::{
-    PeerSendInputCallback, PeerSendInputDelivery, PeerSendInputRequest, PeerSendInputTool,
+    PeerSendInputAnswerCallback, PeerSendInputCallback, PeerSendInputDelivery,
+    PeerSendInputRefusal, PeerSendInputRequest, PeerSendInputTool,
 };
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;

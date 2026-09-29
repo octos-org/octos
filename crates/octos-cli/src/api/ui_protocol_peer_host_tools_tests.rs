@@ -310,6 +310,7 @@ fn should_advertise_and_dispatch_the_peer_tool_methods() {
     for method in [
         APPUI_METHOD_PEER_TOOLS_REGISTER,
         APPUI_METHOD_PEER_TOOL_RESULT,
+        APPUI_METHOD_PEER_INPUT_REJECT,
     ] {
         assert!(APPUI_EXTRA_METHODS.contains(&method), "{method} advertised");
         assert!(
@@ -2600,6 +2601,7 @@ async fn should_refuse_host_tool_registration_and_results_when_the_connection_is
     for method in [
         APPUI_METHOD_PEER_TOOLS_REGISTER,
         APPUI_METHOD_PEER_TOOL_RESULT,
+        APPUI_METHOD_PEER_INPUT_REJECT,
     ] {
         let error = super::super::host_managed::external_gate(method, &params, &HashSet::new())
             .unwrap_err();
@@ -2617,6 +2619,7 @@ async fn should_refuse_host_tool_registration_and_results_when_the_connection_is
     for (id, method) in [
         ("ext-register", APPUI_METHOD_PEER_TOOLS_REGISTER),
         ("ext-result", APPUI_METHOD_PEER_TOOL_RESULT),
+        ("ext-reject", APPUI_METHOD_PEER_INPUT_REJECT),
     ] {
         let mut call_params = params.clone();
         call_params["call_id"] = json!("call-1");
@@ -3952,5 +3955,417 @@ async fn should_end_in_flight_calls_when_a_send_to_the_host_fails() {
         result.output.contains("outcome_unknown"),
         "{}",
         result.output
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #2618 — `peer/input/reject`: the host refuses a `peer/input`
+// ---------------------------------------------------------------------------
+
+/// `peer/input/reject` from `connection`.
+fn reject_input(
+    fx: &Fx,
+    connection: u64,
+    token: &str,
+    input_id: &str,
+    extra: Value,
+) -> Result<Value, RpcError> {
+    let mut params = json!({
+        "session_id": fx.system,
+        "peer": "news",
+        "host_token": token,
+        "input_id": input_id,
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        params[key] = value.clone();
+    }
+    raw_peer_input_reject(
+        connection,
+        &fx.state,
+        &rpc(APPUI_METHOD_PEER_INPUT_REJECT, params),
+        None,
+    )
+}
+
+/// The system agent's `peer_send_input`, wired as a system turn wires it,
+/// waiting `wait` for the host's answer.
+fn system_send_input_tool(fx: &Fx, wait: std::time::Duration) -> octos_agent::PeerSendInputTool {
+    let peers = peers_root(fx);
+    let system = fx.system.0.clone();
+    let turn = TurnId::new();
+    let answer_turn = turn.clone();
+    let send: octos_agent::PeerSendInputCallback =
+        Arc::new(move |req| deliver_peer_send_input("dev", &peers, &system, &turn, req));
+    octos_agent::PeerSendInputTool::new(send).with_answer(peer_send_input_answer_callback(
+        fx.system.0.clone(),
+        answer_turn,
+        wait,
+    ))
+}
+
+/// Deliver one input to the host on `rx`; returns the `peer/input` params.
+async fn deliver_input(fx: &Fx, rx: &mut mpsc::Receiver<WsMessage>, occurrence: &str) -> Value {
+    deliver_peer_send_input(
+        "dev",
+        &peers_root(fx),
+        &fx.system.0,
+        &TurnId::new(),
+        send_input_request("summarise today's news", occurrence),
+    )
+    .expect("delivered");
+    next_frame(rx, "peer/input").await
+}
+
+fn rpc_kind(error: RpcError) -> String {
+    error.data.expect("typed error")["kind"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn should_fail_the_waiting_peer_send_input_with_the_hosts_reason() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(16);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    let connection = ws.connection_id.0;
+    // The host refuses the input as soon as it arrives.
+    let host = {
+        let state = fx.state.clone();
+        let system = fx.system.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            let input = next_frame(&mut rx, "peer/input").await;
+            raw_peer_input_reject(
+                connection,
+                &state,
+                &rpc(
+                    APPUI_METHOD_PEER_INPUT_REJECT,
+                    json!({"session_id": system, "peer": "news", "host_token": token,
+                           "input_id": input["input_id"], "reason": "no_consent"}),
+                ),
+                None,
+            )
+        })
+    };
+
+    let tool = system_send_input_tool(&fx, std::time::Duration::from_secs(10));
+    let started = std::time::Instant::now();
+    let result = octos_agent::Tool::execute_with_context(
+        &tool,
+        &call_ctx("call_1"),
+        &json!({"slug": "news", "message": "summarise today's news"}),
+    )
+    .await
+    .unwrap();
+    assert!(!result.success, "{}", result.output);
+    assert!(
+        result.output.contains("peer_input_rejected: no_consent"),
+        "{}",
+        result.output
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the refusal ends the wait"
+    );
+    let accepted = host.await.unwrap().expect("the refusal is accepted");
+    assert_eq!(accepted["rejected"], true);
+    assert_eq!(accepted["reported_to"], "call");
+    // Told through the call: nothing is left for the system session's next turn.
+    assert!(
+        crate::peers::host_tools::peer_input_rejections_note(&peers_root(&fx), &fx.system)
+            .is_none()
+    );
+    let decisions: Vec<Value> = audit_rows(&fx)
+        .into_iter()
+        .filter_map(|row| row.get("decision").cloned())
+        .collect();
+    assert_eq!(
+        decisions,
+        vec![json!("peer_input_sent"), json!("peer_input_rejected")]
+    );
+    let rejected = audit_rows(&fx).pop().unwrap();
+    assert_eq!(rejected["outcome"], "no_consent");
+    assert_eq!(rejected["reported_to"], "call");
+}
+
+#[tokio::test]
+async fn should_end_the_wait_without_an_error_when_the_host_starts_the_turn() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(16);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    let host = {
+        let state = fx.state.clone();
+        let peer = peer_key(&fx);
+        tokio::spawn(async move {
+            let input = next_frame(&mut rx, "peer/input").await;
+            let turn: TurnId = serde_json::from_value(input["turn_id"].clone()).unwrap();
+            claim_peer_input_turn(&state, &peer, &turn)
+        })
+    };
+    let tool = system_send_input_tool(&fx, std::time::Duration::from_secs(10));
+    let started = std::time::Instant::now();
+    let result = octos_agent::Tool::execute_with_context(
+        &tool,
+        &call_ctx("call_1"),
+        &json!({"slug": "news", "message": "hello"}),
+    )
+    .await
+    .unwrap();
+    assert!(result.success, "{}", result.output);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    host.await.unwrap().expect("the turn start is accepted");
+}
+
+#[tokio::test]
+async fn should_report_a_rejection_after_the_call_returned_on_the_system_session() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(16);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    // The host does not answer within the call's wait: the call reports the
+    // input as sent.
+    let tool = system_send_input_tool(&fx, std::time::Duration::from_millis(50));
+    let result = octos_agent::Tool::execute_with_context(
+        &tool,
+        &call_ctx("call_1"),
+        &json!({"slug": "news", "message": "summarise today's news"}),
+    )
+    .await
+    .unwrap();
+    assert!(result.success, "{}", result.output);
+    let input = next_frame(&mut rx, "peer/input").await;
+
+    let accepted = reject_input(
+        &fx,
+        ws.connection_id.0,
+        &token,
+        input["input_id"].as_str().unwrap(),
+        json!({"reason": "other", "message": "the News account is suspended"}),
+    )
+    .expect("accepted after the call returned");
+    assert_eq!(accepted["reported_to"], "system_session");
+    // On the peer's blackboard...
+    let log = std::fs::read_to_string(peers_root(&fx).join("news/input_rejections.jsonl")).unwrap();
+    assert!(log.contains("\"reason\":\"other\""), "{log}");
+    // ...and told to the system session at its next turn, once.
+    let note = crate::peers::host_tools::peer_input_rejections_note(&peers_root(&fx), &fx.system)
+        .expect("a note for the system session");
+    assert!(
+        note.contains("News (news): peer_input_rejected: other (the News account is suspended)")
+            || note.contains("news: peer_input_rejected: other (the News account is suspended)"),
+        "{note}"
+    );
+    assert!(
+        crate::peers::host_tools::peer_input_rejections_note(&peers_root(&fx), &fx.system)
+            .is_none(),
+        "reported once"
+    );
+    // Never to the peer's own session or another session.
+    assert!(
+        crate::peers::host_tools::peer_input_rejections_note(&peers_root(&fx), &peer_key(&fx))
+            .is_none()
+    );
+    let rejected = audit_rows(&fx).pop().unwrap();
+    assert_eq!(rejected["decision"], "peer_input_rejected");
+    assert_eq!(rejected["reported_to"], "system_session");
+}
+
+#[tokio::test]
+async fn should_refuse_a_rejection_from_a_foreign_connection_with_a_bad_token_twice_or_after_the_turn_started()
+ {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(16);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    let host = ws.connection_id.0;
+    let (other, _other_rx) = ws_connection_for_test(16);
+    let busy = json!({"reason": "busy"});
+
+    let input = deliver_input(&fx, &mut rx, "call_1").await;
+    let input_id = input["input_id"].as_str().unwrap();
+    // Another connection of the profile, even holding the token.
+    assert_eq!(
+        rpc_kind(
+            reject_input(&fx, other.connection_id.0, &token, input_id, busy.clone()).unwrap_err()
+        ),
+        "peer_input_wrong_connection"
+    );
+    // The host connection without the token.
+    assert_eq!(
+        rpc_kind(reject_input(&fx, host, "guess", input_id, busy.clone()).unwrap_err()),
+        "peer_host_token_mismatch"
+    );
+    // An input the kernel never sent.
+    assert_eq!(
+        rpc_kind(reject_input(&fx, host, &token, "no-such-input", busy.clone()).unwrap_err()),
+        "peer_input_not_found"
+    );
+    // Accepted once...
+    reject_input(&fx, host, &token, input_id, busy.clone()).expect("the host refuses it");
+    // ...never twice.
+    assert_eq!(
+        rpc_kind(reject_input(&fx, host, &token, input_id, busy.clone()).unwrap_err()),
+        "peer_input_already_rejected"
+    );
+
+    // An input whose turn the host already started is answered.
+    let input = deliver_input(&fx, &mut rx, "call_2").await;
+    let turn: TurnId = serde_json::from_value(input["turn_id"].clone()).unwrap();
+    claim_peer_input_turn(&fx.state, &peer_key(&fx), &turn).expect("the host starts the turn");
+    assert_eq!(
+        rpc_kind(
+            reject_input(&fx, host, &token, input["input_id"].as_str().unwrap(), busy).unwrap_err()
+        ),
+        "peer_input_already_started"
+    );
+}
+
+#[tokio::test]
+async fn should_refuse_an_unknown_reason_an_unknown_field_or_a_bad_message() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(16);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    let host = ws.connection_id.0;
+    let input = deliver_input(&fx, &mut rx, "call_1").await;
+    let input_id = input["input_id"].as_str().unwrap();
+
+    for (extra, kind) in [
+        (
+            json!({"reason": "offline"}),
+            Some("peer_input_reject_invalid"),
+        ),
+        (json!({"reason": "Busy"}), Some("peer_input_reject_invalid")),
+        (
+            json!({"reason": "other", "message": "x".repeat(257)}),
+            Some("peer_input_reject_invalid"),
+        ),
+        (
+            json!({"reason": "other"}),
+            Some("peer_input_reject_invalid"),
+        ),
+        (
+            json!({"reason": "other", "message": "  "}),
+            Some("peer_input_reject_invalid"),
+        ),
+        (
+            json!({"reason": "other", "message": "line one\nline two"}),
+            Some("peer_input_reject_invalid"),
+        ),
+        (
+            json!({"reason": "busy", "message": "queue full"}),
+            Some("peer_input_reject_invalid"),
+        ),
+        // Unknown fields are refused by the parser (no typed kind).
+        (json!({"reason": "busy", "retry_after": 30}), None),
+    ] {
+        let error = reject_input(&fx, host, &token, input_id, extra.clone())
+            .expect_err(&format!("{extra} is refused"));
+        if let Some(kind) = kind {
+            assert_eq!(rpc_kind(error), kind, "{extra}");
+        }
+    }
+    // None of those consumed the input: a well-formed refusal is accepted.
+    let accepted = reject_input(
+        &fx,
+        host,
+        &token,
+        input_id,
+        json!({"reason": "other", "message": "x".repeat(256)}),
+    )
+    .expect("a 256-byte message is accepted");
+    assert_eq!(accepted["rejected"], true);
+}
+
+#[tokio::test]
+async fn should_refuse_a_turn_start_with_a_rejected_inputs_turn_id() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(64);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    let input = deliver_input(&fx, &mut rx, "call_1").await;
+    let turn: TurnId = serde_json::from_value(input["turn_id"].clone()).unwrap();
+    reject_input(
+        &fx,
+        ws.connection_id.0,
+        &token,
+        input["input_id"].as_str().unwrap(),
+        json!({"reason": "signed_out"}),
+    )
+    .unwrap();
+
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let started = handle_turn_start(
+        &ws,
+        &fx.state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "start-rejected".into(),
+        TurnStartParams {
+            session_id: peer_key(&fx),
+            turn_id: turn.clone(),
+            input: vec![InputItem::Text {
+                text: input["text"].as_str().unwrap().into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+        },
+    )
+    .await;
+    assert!(!started, "the turn is refused");
+    let refused = loop {
+        let frame = frame_json(
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a frame in time")
+                .expect("connection open"),
+        );
+        if frame["id"] == "start-rejected" {
+            break frame;
+        }
+    };
+    assert_eq!(
+        refused["error"]["data"]["kind"], "peer_input_rejected",
+        "{refused}"
+    );
+    assert!(active_turns.lock().await.is_empty());
+    // The turn id is released: it no longer counts as the system agent's
+    // request (a foreground app tool would not run in it).
+    let mut foreground = news_list();
+    foreground["background"] = json!(false);
+    register(&fx, &ws, &token, json!({ "tools": [foreground] })).unwrap();
+    let registry = turn_registry(&fx, &peer_key(&fx), &turn.0.to_string()).await;
+    let approver = app_approver(
+        &fx,
+        &peer_key(&fx),
+        &Arc::new(UiProtocolContractStores::default()),
+        &TurnId::new(),
+    );
+    let refused = octos_agent::tools::TOOL_APPROVAL_CTX
+        .scope(
+            approver,
+            registry.execute_with_context(&call_ctx("c1"), "news_list", &json!({})),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !refused.success && refused.output.contains("background"),
+        "{}",
+        refused.output
     );
 }

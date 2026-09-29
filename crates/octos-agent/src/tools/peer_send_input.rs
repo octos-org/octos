@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use eyre::Result;
+use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
@@ -78,14 +79,38 @@ pub enum PeerSendInputDelivery {
 pub type PeerSendInputCallback =
     Arc<dyn Fn(PeerSendInputRequest) -> Result<PeerSendInputDelivery, String> + Send + Sync>;
 
+/// A host's refusal of a delivered input (UPCR-2026-035 `peer/input/reject`),
+/// as the model reads it: `peer_input_rejected: <reason>` and, when the host
+/// gave one, its short message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSendInputRefusal(pub String);
+
+/// Host callback that waits, briefly, for the answer to an input it just
+/// delivered: `Some(refusal)` when the receiving host refused it, `None` when
+/// the peer started on it, the wait ran out, or the peer has no such answer.
+pub type PeerSendInputAnswerCallback = Arc<
+    dyn Fn(PeerSendInputRequest) -> BoxFuture<'static, Option<PeerSendInputRefusal>> + Send + Sync,
+>;
+
 /// `peer_send_input` tool. See the module docs for the cross-session channel.
 pub struct PeerSendInputTool {
     send_input: PeerSendInputCallback,
+    await_answer: Option<PeerSendInputAnswerCallback>,
 }
 
 impl PeerSendInputTool {
     pub fn new(send_input: PeerSendInputCallback) -> Self {
-        Self { send_input }
+        Self {
+            send_input,
+            await_answer: None,
+        }
+    }
+
+    /// After a delivery, wait for the receiving host's answer so a refusal
+    /// fails this call with its reason.
+    pub fn with_answer(mut self, await_answer: PeerSendInputAnswerCallback) -> Self {
+        self.await_answer = Some(await_answer);
+        self
     }
 }
 
@@ -215,7 +240,22 @@ impl Tool for PeerSendInputTool {
             occurrence_id,
         };
 
-        match (self.send_input)(request) {
+        let delivery = (self.send_input)(request.clone());
+        if delivery.is_ok() {
+            if let Some(await_answer) = &self.await_answer {
+                if let Some(PeerSendInputRefusal(refusal)) = await_answer(request).await {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "{refusal} — the app that owns peer {slug} refused this input, \
+                             so the peer did not act on it"
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        match delivery {
             Ok(PeerSendInputDelivery::Queued) => Ok(ToolResult {
                 output: format!(
                     "message sent to peer {slug} — \
