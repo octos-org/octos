@@ -547,7 +547,6 @@ pub(crate) fn apply_session_host_tools(
             context_id,
             set,
         } => {
-            note_host_session(session_id, peers_root, slug);
             // The base key names the host but is not a secret. Only a turn
             // driven by the connection that registered the set (and holds
             // the host token) is the host's; any other connection's turn on
@@ -1222,9 +1221,6 @@ impl BoundedMap {
 static HOST_APPROVALS: LazyLock<Mutex<BoundedMap>> =
     LazyLock::new(|| Mutex::new(BoundedMap::new()));
 
-/// Sessions of peers with a registered set: session key → route key.
-static HOST_SESSIONS: LazyLock<Mutex<BoundedMap>> = LazyLock::new(|| Mutex::new(BoundedMap::new()));
-
 /// The host-owned peer slug a `peer-<slug>` / `peerctx-<slug>.<id>` session
 /// belongs to (syntax only).
 pub(crate) fn host_peer_slug_of(session: &SessionKey) -> Option<&str> {
@@ -1331,19 +1327,11 @@ pub(crate) fn app_context_allowed(
         && host_route_connection(peers_root, slug) == turn_connection
 }
 
-/// Remember that `session` is a session of a peer with a registered set.
-fn note_host_session(session: &SessionKey, peers_root: &Path, slug: &str) {
-    HOST_SESSIONS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(session.0.clone(), route_key(peers_root, slug));
-}
-
-/// [`host_session_controller`] derived from what is on disk, so it holds
-/// after a kernel restart too: for a `peer-`/`peerctx-` session of a
-/// host-owned peer with a registered (or unreadable) tool set, on the peer
-/// originator's base key, `Some(host connection)` (`Some(None)` while no host
-/// is connected). `None` for any other session.
+/// The controller of a `peer-`/`peerctx-` session, derived from what is on
+/// disk, so it holds from the first call after a kernel restart: for a
+/// session of a host-owned peer with a registered (or unreadable) tool set,
+/// on the peer originator's base key, `Some(host connection)` (`Some(None)`
+/// while no host is connected). `None` for any other session.
 pub(crate) fn host_peer_session_controller(
     peers_root: &Path,
     session: &SessionKey,
@@ -1355,21 +1343,7 @@ pub(crate) fn host_peer_session_controller(
     {
         return None;
     }
-    note_host_session(session, peers_root, slug);
     Some(host_route_connection(peers_root, slug))
-}
-
-/// For a session of a peer with a registered set: `Some(host connection)`
-/// (`Some(None)` while no host is connected). `None` for any other session.
-/// Controls of such a session's turns (`turn/steer`, `turn/interrupt`)
-/// belong to the host connection only.
-pub(crate) fn host_session_controller(session: &SessionKey) -> Option<Option<u64>> {
-    let key = HOST_SESSIONS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&session.0)
-        .cloned()?;
-    Some(route_connection_by_key(&key))
 }
 
 /// A `peer/tool/result` from the host.

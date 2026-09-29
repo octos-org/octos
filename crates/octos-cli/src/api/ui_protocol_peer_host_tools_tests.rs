@@ -1201,6 +1201,7 @@ async fn should_keep_a_host_tool_approval_and_turn_controls_on_the_host_connecti
     let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     handle_turn_interrupt(
         &spoof_ws,
+        &fx.state,
         &ledger,
         &active_turns,
         &contracts,
@@ -1215,8 +1216,8 @@ async fn should_keep_a_host_tool_approval_and_turn_controls_on_the_host_connecti
         rpc_error_kind(spoof_rx.recv().await.unwrap()),
         "peer_host_connection_only"
     );
-    assert!(refuse_foreign_host_turn_control(&key, &spoof_ws, "turn/steer").is_some());
-    assert!(refuse_foreign_host_turn_control(&key, &host_ws, "turn/steer").is_none());
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &spoof_ws, "turn/steer").is_some());
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &host_ws, "turn/steer").is_none());
 
     // The host connection answers it.
     handle_approval_respond(
@@ -3155,12 +3156,30 @@ async fn should_answer_a_host_peer_sessions_questions_only_on_the_owning_or_host
         )
     };
     let (other_ws, mut other_rx) = ws_connection_for_test(16);
-    handle_user_question_respond(&other_ws, &contracts, None, None, "q1".into(), answer()).await;
+    handle_user_question_respond(
+        &other_ws,
+        &fx.state,
+        &contracts,
+        None,
+        None,
+        "q1".into(),
+        answer(),
+    )
+    .await;
     assert_eq!(
         rpc_error_kind(other_rx.recv().await.unwrap()),
         "peer_host_connection_only"
     );
-    handle_user_question_respond(&host_ws, &contracts, None, None, "q2".into(), answer()).await;
+    handle_user_question_respond(
+        &host_ws,
+        &fx.state,
+        &contracts,
+        None,
+        None,
+        "q2".into(),
+        answer(),
+    )
+    .await;
     let reply = frame_json(host_rx.recv().await.unwrap());
     assert!(reply.get("error").is_none(), "{reply}");
 }
@@ -3285,6 +3304,7 @@ async fn should_cancel_an_in_flight_host_call_when_the_turn_is_interrupted() {
     // The person interrupts the turn.
     handle_turn_interrupt(
         &e.ws,
+        &e.state,
         &ledger,
         &active_turns,
         &contracts,
@@ -3502,6 +3522,46 @@ async fn should_refuse_foreign_writes_to_a_host_peer_session_when_its_set_is_on_
         refuse_foreign_host_peer_session_call(&fx.state, &host_ws, "turn/start", &by_session)
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn should_refuse_foreign_turn_controls_on_a_host_peer_session_when_its_set_is_on_disk() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let key = peer_key(&fx);
+    let (host_ws, _host_rx) = ws_connection_for_test(8);
+    let (other_ws, _other_rx) = ws_connection_for_test(8);
+    // Before registration nothing is confined.
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &other_ws, "turn/steer").is_none());
+    register(&fx, &host_ws, &token, json!({ "tools": [] })).unwrap();
+    // No turn has run yet: the confinement must hold anyway (from the first
+    // call after a restart, or once the in-memory map would have evicted).
+    for method in ["turn/steer", "turn/interrupt"] {
+        let error = refuse_foreign_host_turn_control(&fx.state, &key, &other_ws, method)
+            .unwrap_or_else(|| panic!("{method} accepted from a foreign connection"));
+        assert_eq!(error.data.unwrap()["kind"], "peer_host_connection_only");
+        assert!(refuse_foreign_host_turn_control(&fx.state, &key, &host_ws, method).is_none());
+    }
+    // A prompt on the session is answered by its owner or the host connection.
+    assert!(!host_session_answer_allowed(
+        &fx.state,
+        &key,
+        Some(host_ws.connection_id.0),
+        &other_ws
+    ));
+    assert!(host_session_answer_allowed(
+        &fx.state,
+        &key,
+        Some(host_ws.connection_id.0),
+        &host_ws
+    ));
+    // After the host's connection closed (or a restart: nothing in memory),
+    // nobody drives it or answers for it until the host registers again.
+    crate::peers::host_tools::drop_routes_for_connection(host_ws.connection_id.0);
+    assert!(refuse_foreign_host_turn_control(&fx.state, &key, &host_ws, "turn/steer").is_some());
+    assert!(!host_session_answer_allowed(
+        &fx.state, &key, None, &host_ws
+    ));
 }
 
 fn register_on_session(
