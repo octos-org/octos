@@ -260,6 +260,48 @@ jobs:
           bash scripts/test-install-paths.sh
           pwsh scripts/tests/test-install-checksum.ps1
 
+  # Classifies a PR's diff so the heavy suites can skip PRs that only touch
+  # the research crates. `octos-research` is a leaf library used by
+  # octos-agent's web_search / site_crawl / deep_search tools, and
+  # deep-search / deep-crawl are standalone skill binaries: `check` still
+  # runs fmt, clippy over the whole workspace and their tests, and
+  # test-octos-agent runs the tools that use them. Pushes to main always
+  # run everything, so anything this lets through is caught on merge.
+  #   research_only: every changed file is under a research path.
+  #   windows_neutral: research_only and no skill crate changed (the skills
+  #     have cfg(not(unix)) code that only check-windows compiles).
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      research_only: ${{ steps.scope.outputs.research_only }}
+      windows_neutral: ${{ steps.scope.outputs.windows_neutral }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: scope
+        run: |
+          set -euo pipefail
+          research_only=false
+          windows_neutral=false
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+            echo "Changed files:"
+            echo "$FILES"
+            # Here-strings, not pipes: under pipefail an early `grep -q` exit
+            # can SIGPIPE `echo`, and the negated failure would read as a match.
+            if [ -n "$FILES" ] && ! grep -qvE '^crates/(octos-research|app-skills/deep-search|app-skills/deep-crawl)/' <<<"$FILES"; then
+              research_only=true
+              if ! grep -qvE '^crates/octos-research/' <<<"$FILES"; then
+                windows_neutral=true
+              fi
+            fi
+          fi
+          echo "research_only=$research_only" | tee -a "$GITHUB_OUTPUT"
+          echo "windows_neutral=$windows_neutral" | tee -a "$GITHUB_OUTPUT"
+
   check:
     runs-on: ubuntu-latest
     env:
@@ -449,6 +491,7 @@ jobs:
         # 16GB allocation and neither inherits residual RAM from the
         # other's compile phase.
         test-mode: [lib, integration]
+    needs: scope
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "1"
@@ -470,11 +513,16 @@ jobs:
           shared-key: octos-agent-tests-${{ matrix.test-mode }}
 
       - name: Test octos-agent (lib)
-        if: matrix.test-mode == 'lib'
+        if: matrix.test-mode == 'lib' && needs.scope.outputs.research_only != 'true'
         run: cargo test -p octos-agent --lib
 
+      # Research-only PR: just the tools built on octos-research.
+      - name: Test octos-agent (lib, research tools)
+        if: matrix.test-mode == 'lib' && needs.scope.outputs.research_only == 'true'
+        run: cargo test -p octos-agent --lib -- tools::web_search tools::site_crawl tools::deep_search
+
       - name: Test octos-agent (integration)
-        if: matrix.test-mode == 'integration'
+        if: matrix.test-mode == 'integration' && needs.scope.outputs.research_only != 'true'
         env:
           # Keep a cache miss viable on the standard runner. This shard links
           # many test binaries, so omit debug info to reduce disk and peak RSS.
@@ -514,6 +562,8 @@ jobs:
         # needs-aggregate — so add `test-octos-cli (oup-minimal)` to the
         # branch-protection ruleset's required contexts.
         part: [unit, integration, oup, oup-minimal]
+    needs: scope
+    if: needs.scope.outputs.research_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "1"
@@ -698,6 +748,8 @@ jobs:
   # octos-bus`) the whole suite is cfg'd out, and the workspace-wide runs that
   # do execute it only exist in the nightly and self-hosted lanes.
   check-matrix:
+    needs: scope
+    if: needs.scope.outputs.research_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "2"
@@ -893,6 +945,8 @@ jobs:
         run: cargo test --workspace --doc
 
   check-windows:
+    needs: scope
+    if: needs.scope.outputs.windows_neutral != 'true'
     # Runs on PRs, unlike its ARM/RISC-V siblings below. The workspace has 42
     # `cfg(windows)` sites that NEVER compile on the Linux runners every other
     # PR job uses, so a Windows-only break was invisible until after merge. At
@@ -1041,6 +1095,8 @@ jobs:
         run: cargo test --workspace --doc
 
   check-darwin:
+    needs: scope
+    if: needs.scope.outputs.research_only != 'true'
     # Runs on PRs, like check-windows: the workspace has 89
     # `cfg(target_os = "macos")` sites that NEVER compile on the Linux runners
     # every other PR job uses, so a macOS-only break was invisible until after
@@ -1443,6 +1499,11 @@ jobs:
   security:
     runs-on: macos-14
     needs: [check, test-octos-agent, test-octos-cli]
+    # test-octos-cli is skipped on research-only PRs (see `scope`).
+    if: >-
+      !cancelled() && needs.check.result == 'success'
+      && needs.test-octos-agent.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.test-octos-cli.result)
     # Run on pushes and on every PR — the file-level detection below is the
     # only filter (title keyword matching used to let security-relevant PRs
     # slip through when the title didn't say "security"/"sandbox").
@@ -1492,6 +1553,7 @@ jobs:
     name: CI required
     if: always()
     needs:
+      - scope
       - dashboard
       - swarm-app
       - typos
@@ -1517,11 +1579,22 @@ jobs:
           set -euo pipefail
           echo "$RESULTS" | jq .
 
-          for job in dashboard swarm-app typos ux-gate-report \
+          # Jobs `scope` skipped on a research-only PR may be "skipped".
+          research_only=$(echo "$RESULTS" | jq -r '.scope.outputs.research_only')
+          windows_neutral=$(echo "$RESULTS" | jq -r '.scope.outputs.windows_neutral')
+          for job in scope dashboard swarm-app typos ux-gate-report \
             windows-deploy-script web-app-base-url-windows check \
             test-octos-agent test-octos-cli check-matrix check-windows \
             check-darwin e2e-changes security; do
             result=$(echo "$RESULTS" | jq -r --arg job "$job" '.[$job].result')
+            skippable=false
+            case "$job" in
+              test-octos-cli|check-matrix|check-darwin) [ "$research_only" = true ] && skippable=true ;;
+              check-windows) [ "$windows_neutral" = true ] && skippable=true ;;
+            esac
+            if [ "$result" = skipped ] && [ "$skippable" = true ]; then
+              continue
+            fi
             if [ "$result" != success ]; then
               echo "::error::required job $job finished with $result"
               exit 1
