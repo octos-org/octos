@@ -553,8 +553,10 @@ impl Metasearch {
             }
         }
         let note = (req.category == "general" && self.general_is_thin()).then(|| {
-            "Key-less general search covers Wikipedia and Wikidata only. For web results, \
-             add a Brave Search key (BRAVE_API_KEY) or set SEARXNG_URL to a self-hosted SearXNG."
+            "The metasearch's key-less general engines are Wikipedia and Wikidata. Web \
+             results come from results-page search (DuckDuckGo, Bing; on unless \
+             OCTOS_ALLOW_SERP_SCRAPE=0), a Brave Search key (BRAVE_API_KEY) or a \
+             self-hosted SearXNG (SEARXNG_URL)."
                 .to_string()
         });
         SearchResponse {

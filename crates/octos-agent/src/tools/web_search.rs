@@ -10,8 +10,8 @@
 //! 3. Brave Search (`BRAVE_API_KEY`) — free tier: 2k queries/month
 //! 4. You.com (`YDC_API_KEY`) — rich JSON results with snippets
 //! 5. Perplexity Sonar (`PERPLEXITY_API_KEY`) — AI-synthesized fallback (most expensive)
-//! 6. DuckDuckGo HTML results page — **opt-in only** (`OCTOS_ALLOW_SERP_SCRAPE=1`)
-//! 7. Headless-Chrome (CDP) Bing — **opt-in only** (same flag)
+//! 6. DuckDuckGo HTML results page — on unless `OCTOS_ALLOW_SERP_SCRAPE=0`
+//! 7. Headless-Chrome (CDP) Bing — same switch
 //!
 //! Each provider is tried in order. If a provider returns no results or fails,
 //! the next one is attempted. Perplexity is last among the keyed providers
@@ -86,6 +86,8 @@ pub struct WebSearchTool {
     provider_keys: HashMap<String, String>,
     /// octos metasearch, built on first use (it takes the provider keys).
     metasearch: Arc<std::sync::OnceLock<octos_research::metasearch::Metasearch>>,
+    /// Results-page search override; `None` = the environment decides.
+    serp_scrape: Option<bool>,
 }
 
 impl WebSearchTool {
@@ -108,7 +110,15 @@ impl WebSearchTool {
             config: None,
             provider_keys: HashMap::new(),
             metasearch: Arc::default(),
+            serp_scrape: None,
         }
+    }
+
+    /// Turn results-page search (DuckDuckGo, Bing) on or off regardless of
+    /// the environment.
+    pub fn with_serp_scrape(mut self, on: bool) -> Self {
+        self.serp_scrape = Some(on);
+        self
     }
 
     pub fn with_config(mut self, config: Arc<super::tool_config::ToolConfigStore>) -> Self {
@@ -244,9 +254,9 @@ impl FreeTierControls {
     }
 }
 
-/// Whether the operator opted in to scraping search-results pages
-/// (DuckDuckGo HTML, Bing in headless Chrome). Off by default: ADR 0002
-/// rules out scraping search results pages.
+/// Whether results-page search (DuckDuckGo HTML, Bing in headless Chrome)
+/// is on: yes unless the operator set `OCTOS_ALLOW_SERP_SCRAPE=0`
+/// (ADR 0002 §6: general web search, honest, no CAPTCHA solving).
 pub(crate) fn serp_scrape_opted_in(lookup: impl Fn(&str) -> Option<String>) -> bool {
     octos_research::serp_scrape_allowed(lookup)
 }
@@ -448,7 +458,19 @@ impl Tool for WebSearchTool {
             }
         };
 
-        let serp_scrape = serp_scrape_opted_in(|k| std::env::var(k).ok());
+        let serp_scrape = self
+            .serp_scrape
+            .unwrap_or_else(|| serp_scrape_opted_in(|k| std::env::var(k).ok()));
+        // Upgrade visibility: say once per process that results-page search
+        // runs because of the new default.
+        if serp_scrape && self.serp_scrape.is_none() {
+            static NOTICE: std::sync::Once = std::sync::Once::new();
+            if let Some(notice) =
+                octos_research::serp_scrape_default_notice(|k| std::env::var(k).ok())
+            {
+                NOTICE.call_once(|| warn!("{notice}"));
+            }
+        }
 
         // Free structured sources first (ADR 0002 §6): GDELT + Google News
         // for news-ish queries, then a configured SearXNG.
@@ -664,8 +686,8 @@ impl Tool for WebSearchTool {
             }
         }
 
-        // DuckDuckGo HTML results page: a search-results scrape, so opt-in
-        // only (ADR 0002). Last resort after every keyed provider.
+        // DuckDuckGo HTML results page: general web results, last resort
+        // after every keyed provider (on unless turned off, ADR 0002).
         let ddg_result = if serp_scrape {
             Some(self.ddg_search(&input.query, count).await)
         } else {
@@ -690,7 +712,7 @@ impl Tool for WebSearchTool {
             );
         }
 
-        // Headless-Chrome (CDP) Bing — opt-in only, after DuckDuckGo. Drives
+        // Headless-Chrome (CDP) Bing, after DuckDuckGo. Drives
         // Bing through the in-process headless browser. On a box with no
         // Chrome this is a fast, clean miss (see `browser_cdp_search`).
         #[cfg(feature = "browser")]
@@ -1301,6 +1323,14 @@ impl WebSearchTool {
         }
 
         let html = response.text().await.unwrap_or_default();
+        // Its bot check (often HTTP 202) is a miss: never parsed, never solved.
+        if octos_research::access::is_bot_challenge(&html) {
+            return Ok(ToolResult {
+                output: "DuckDuckGo answered with a bot check (not solved)".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
         let results = parse_ddg_results(&html, count as usize);
 
         if results.is_empty() {
@@ -1515,8 +1545,7 @@ async fn render_and_parse_bing(
             .new_page("about:blank")
             .await
             .map_err(|e| eyre::eyre!("failed to open Bing page: {e}"))?;
-        // Honest UA even on this opt-in scrape: the flag enables it, it does
-        // not license disguise.
+        // Honest UA on results-page search: it is allowed, disguise is not.
         set_identifiable_user_agent(&page).await;
         page.goto(search_url.as_str())
             .await
@@ -1526,6 +1555,10 @@ async fn render_and_parse_bing(
             .content()
             .await
             .map_err(|e| eyre::eyre!("failed to read Bing HTML: {e}"))?;
+        // A challenge is a miss: never parsed, never solved.
+        if octos_research::access::is_bot_challenge(&html) {
+            eyre::bail!("Bing answered with a challenge (not solved)");
+        }
         Ok::<_, eyre::Report>(parse_bing_results(&html, count as usize))
     }
     .await;
@@ -1808,6 +1841,34 @@ mod tests {
         assert_eq!(results[0].2, "This is a snippet.");
     }
 
+    fn serp_fixture(name: &str) -> String {
+        let path = format!(
+            "{}/../octos-research/tests/fixtures/serp/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    #[test]
+    fn should_treat_a_duckduckgo_bot_check_as_a_miss() {
+        // #2607: the check is detected (ddg_search then reports an error and
+        // the rotation moves on) and yields no results even if parsed.
+        let html = serp_fixture("ddg_anomaly.html");
+        assert!(octos_research::access::is_bot_challenge(&html));
+        assert!(parse_ddg_results(&html, 5).is_empty());
+        // A real results page is not taken for one.
+        let results = r#"<a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&amp;rut=abc123">Example Title</a><a class="result__snippet">This is a snippet.</a>"#;
+        assert!(!octos_research::access::is_bot_challenge(results));
+    }
+
+    #[cfg(feature = "browser")]
+    #[test]
+    fn should_treat_a_bing_challenge_as_a_miss() {
+        let html = serp_fixture("bing_challenge.html");
+        assert!(octos_research::access::is_bot_challenge(&html));
+        assert!(parse_bing_results(&html, 5).is_empty());
+    }
+
     #[test]
     fn test_parse_ddg_results_direct_url() {
         let html = r#"<a class="result__a" href="https://example.com">Direct Link</a>"#;
@@ -2061,8 +2122,8 @@ mod tests {
     /// Structural invariant for the rotation order in `execute`:
     ///
     /// The `execute` method MUST iterate providers in the documented priority
-    /// (Tavily → Exa → Brave → You.com → Perplexity, then the opt-in DDG /
-    /// Bing scrapers) and treat any
+    /// (Tavily → Exa → Brave → You.com → Perplexity, then the DDG / Bing
+    /// results pages) and treat any
     /// `is_quota_or_rate_limit_error(&r) == true` outcome as "fall through to
     /// next provider", identical to the empty-results path. Perplexity must
     /// NOT short-circuit unconditionally; on quota error it must fall through
@@ -2105,14 +2166,16 @@ mod tests {
     }
 
     #[test]
-    fn should_gate_both_serp_scrapers_on_one_opt_in_flag() {
-        assert!(!serp_scrape_opted_in(|_| None));
+    fn should_gate_both_results_page_providers_on_one_switch() {
+        assert!(serp_scrape_opted_in(|_| None), "on by default");
         assert!(!serp_scrape_opted_in(|_| Some("false".into())));
         for key in [
             octos_research::SERP_SCRAPE_ENV,
             octos_research::BROWSER_SERP_ENV,
         ] {
-            assert!(serp_scrape_opted_in(|k| (k == key).then(|| "1".to_string())));
+            assert!(!serp_scrape_opted_in(
+                |k| (k == key).then(|| "0".to_string())
+            ));
         }
     }
 
@@ -2136,11 +2199,12 @@ mod tests {
         );
     }
 
-    /// With no key, no SearXNG and no opt-in, a general query must not fall
-    /// back to scraping DuckDuckGo: it returns an empty result with guidance
-    /// (the metasearch is given an offline fetcher, so no network call).
+    /// With results-page search turned off and no key or SearXNG, a general
+    /// query must not call DuckDuckGo: it returns an empty result with
+    /// guidance (the metasearch is given an offline fetcher, so no network
+    /// call).
     #[tokio::test]
-    async fn should_not_use_duckduckgo_by_default() {
+    async fn should_not_use_duckduckgo_when_turned_off() {
         let configured = [
             "TAVILY_API_KEY",
             "EXA_API_KEY",
@@ -2148,8 +2212,6 @@ mod tests {
             "YDC_API_KEY",
             "PERPLEXITY_API_KEY",
             octos_research::SEARXNG_URL_ENV,
-            octos_research::SERP_SCRAPE_ENV,
-            octos_research::BROWSER_SERP_ENV,
         ];
         if configured.iter().any(|k| std::env::var(k).is_ok()) {
             return; // developer machine with keys: not the keyless case
@@ -2168,7 +2230,9 @@ mod tests {
             Arc::new(Offline),
             Default::default(),
         );
-        let tool = WebSearchTool::new().with_metasearch(metasearch);
+        let tool = WebSearchTool::new()
+            .with_metasearch(metasearch)
+            .with_serp_scrape(false);
         let r = tool
             .execute(&serde_json::json!({"query": "rust borrow checker", "category": "general"}))
             .await

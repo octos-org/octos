@@ -10,7 +10,7 @@ Research building blocks for the octos search tools (`web_search`, `deep-search`
 
 ## Metasearch
 
-A Rust core fans a query out to small search engines written as sandboxed [OctoScript](https://github.com/OctoSense-org/Octoscript) scripts, then merges and ranks what they return. It is the first provider in the chain for every category. After it come a self-hosted SearXNG (if configured) and keyed APIs. Scraping search-results pages stays behind `OCTOS_ALLOW_SERP_SCRAPE`.
+A Rust core fans a query out to small search engines written as sandboxed [OctoScript](https://github.com/OctoSense-org/Octoscript) scripts, then merges and ranks what they return. It is the first provider in the chain for every category. After it come a self-hosted SearXNG (if configured) and keyed APIs. Results-page search (DuckDuckGo, Bing via Chrome) follows as the last tier for general web results; it is on unless `OCTOS_ALLOW_SERP_SCRAPE=0`.
 
 ```
 octos-research (Rust, trusted)                      engines/<id>/ (sandboxed OctoScript)
