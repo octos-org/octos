@@ -32,6 +32,9 @@ struct QuestionEntry {
     /// The UI Protocol connection whose turn asked (its `ConnectionId`), when
     /// known. See `PendingApprovalStore::pending_owner`.
     owner_connection: Option<u64>,
+    /// Asked by an external client's turn (UPCR-2026-036): only
+    /// `owner_connection` sees or answers it.
+    external: bool,
 }
 
 #[derive(Debug)]
@@ -97,6 +100,7 @@ impl PendingQuestionStore {
                 runtime_resumable: true,
                 response_tx: Some(tx),
                 owner_connection,
+                external: false,
             },
         );
         rx
@@ -232,6 +236,26 @@ impl PendingQuestionStore {
                 entry.session_id == *session_id
                     && matches!(&entry.state, QuestionEntryState::Pending)
             })
+            .map(|entry| entry.owner_connection)
+    }
+
+    /// Mark question `question_id` as asked by an external client's turn
+    /// (UPCR-2026-036): see [`Self::external_owner`].
+    pub(crate) fn mark_external(&self, question_id: &QuestionId) {
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = entries.get_mut(question_id) {
+            entry.external = true;
+        }
+    }
+
+    /// For a question asked by an external client's turn (in any state):
+    /// `Some(owning connection)`, which alone may see or answer it. `None`
+    /// for every other question.
+    pub(crate) fn external_owner(&self, question_id: &QuestionId) -> Option<Option<u64>> {
+        let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
+        entries
+            .get(question_id)
+            .filter(|entry| entry.external)
             .map(|entry| entry.owner_connection)
     }
 

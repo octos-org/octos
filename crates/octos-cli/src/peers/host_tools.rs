@@ -1273,6 +1273,12 @@ impl<V> BoundedMap<V> {
     pub(crate) fn get(&self, key: &str) -> Option<&V> {
         self.map.get(key)
     }
+
+    #[cfg(test)]
+    pub(crate) fn remove(&mut self, key: &str) {
+        self.map.remove(key);
+        self.order.retain(|k| k != key);
+    }
 }
 
 /// Approvals raised by host-routed calls: approval id → the peer's route key.

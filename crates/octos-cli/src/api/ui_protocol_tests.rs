@@ -46937,6 +46937,532 @@ async fn should_keep_a_host_turns_approval_on_the_host_as_before() {
     assert_eq!(task.await.unwrap(), ToolApprovalDecision::Approve);
 }
 
+fn g1_question_features() -> ConnectionUiFeatures {
+    ConnectionUiFeatures {
+        user_question_v1: true,
+        ..ConnectionUiFeatures::stdio_defaults()
+    }
+}
+
+/// Run one `ask_user_question` of a turn on `ws` in the background; return
+/// the task and the question once it is pending.
+async fn g1_ask_question(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+) -> (
+    tokio::task::JoinHandle<octos_agent::UserQuestionOutcome>,
+    QuestionId,
+) {
+    use octos_agent::UserQuestionRequester as _;
+    let turn_id = TurnId::new();
+    let requester = SessionUserQuestionRequester {
+        ws: ws.clone(),
+        ledger: Arc::clone(ledger),
+        contracts: Arc::clone(contracts),
+        state: Arc::clone(state),
+        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+    };
+    let task = tokio::spawn(async move {
+        requester
+            .request_user_question(octos_agent::UserQuestionRequest {
+                questions: sample_pending_question(
+                    SessionKey("unused".into()),
+                    QuestionId::new(),
+                    TurnId::new(),
+                )
+                .questions,
+                title: "Pick a framework".to_owned(),
+                body: "Which framework?".to_owned(),
+            })
+            .await
+    });
+    for _ in 0..500 {
+        if let Some(pending) = contracts
+            .user_questions
+            .pending_for_session(session_id)
+            .into_iter()
+            .find(|question| question.turn_id == turn_id)
+        {
+            return (task, pending.question_id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("the question never became pending");
+}
+
+fn g1_question_event(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    question_id: &QuestionId,
+) -> LedgeredUiProtocolEvent {
+    ledger
+        .replay_after(
+            session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|entry| {
+            matches!(
+                &entry.event,
+                UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(e))
+                    if e.question_id == *question_id
+            )
+        })
+        .expect("the question is in the shared ledger")
+}
+
+/// The question ids `session/hydrate` returns to `ws` as pending.
+async fn g1_hydrated_questions(
+    ws: &WsConnection,
+    rx: &mut mpsc::Receiver<WsMessage>,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    session_id: &SessionKey,
+) -> Vec<Value> {
+    use octos_core::ui_protocol::hydrate_sections;
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    handle_session_hydrate(
+        ws,
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        &active_turns,
+        None,
+        None,
+        g1_question_features(),
+        "g1-hydrate-q".into(),
+        SessionHydrateParams {
+            session_id: session_id.clone(),
+            after: None,
+            include: vec![hydrate_sections::PENDING_APPROVALS.into()],
+        },
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(rx, "g1-hydrate-q").await;
+    frame["result"]["pending_questions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("pending_questions: {frame}"))
+        .iter()
+        .map(|question| question["question_id"].clone())
+        .collect()
+}
+
+/// The question ids `session/open` lists as pending for `connection`.
+async fn g1_opened_questions(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    contracts: &UiProtocolContractStores,
+    connection: ConnectionId,
+    session_id: &SessionKey,
+) -> Vec<QuestionId> {
+    open_session_result(
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        connection,
+        None,
+        None,
+        g1_question_features(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+            client_commands: None,
+        },
+    )
+    .await
+    .expect("session/open")
+    .pending_questions
+    .into_iter()
+    .map(|question| question.question_id)
+    .collect()
+}
+
+fn g1_answer() -> Vec<UserQuestionAnswer> {
+    vec![UserQuestionAnswer {
+        selected_labels: vec!["axum".into()],
+        free_text: None,
+    }]
+}
+
+#[tokio::test]
+async fn should_show_an_external_clients_question_only_to_that_client() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+
+    let (task, question_id) =
+        g1_ask_question(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let requested = g1_question_event(&ledger, &session_id, &question_id);
+
+    // Live: the host's forwarder drops it; the owner would get it.
+    assert!(!ledger_event_visible_to_connection(
+        &requested.event,
+        host_ws.connection_id
+    ));
+    assert!(ledger_event_visible_to_connection(
+        &requested.event,
+        ext_ws.connection_id
+    ));
+    forward_live_ledger_event(
+        &host_ws,
+        &ledger,
+        requested,
+        0,
+        host_ws.connection_id,
+        g1_question_features(),
+        session_id.topic(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        host_rx.try_recv().is_err(),
+        "not forwarded live to the host"
+    );
+
+    // Pending list (`session/open`) and hydrate: the host sees nothing.
+    assert!(
+        g1_opened_questions(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        g1_opened_questions(
+            &state,
+            &ledger,
+            &contracts,
+            ext_ws.connection_id,
+            &session_id
+        )
+        .await,
+        vec![question_id.clone()]
+    );
+    assert!(
+        g1_hydrated_questions(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        g1_hydrated_questions(
+            &ext_ws,
+            &mut ext_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await,
+        vec![json!(question_id.0.to_string())]
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn should_let_only_the_external_client_answer_its_question() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (task, question_id) =
+        g1_ask_question(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+
+    // The host: refused, typed; the question stays pending.
+    handle_user_question_respond(
+        &host_ws,
+        &contracts,
+        None,
+        None,
+        "host-q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id.clone(), g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-q").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_QUESTION_OWNER_ONLY),
+        "{frame}"
+    );
+    // Another external client: refused.
+    let (other_ext, mut other_ext_rx) = ws_connection_for_test(64);
+    other_ext.set_external(true);
+    handle_user_question_respond(
+        &other_ext,
+        &contracts,
+        None,
+        Some(other_ext.connection_id()),
+        "other-q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id.clone(), g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut other_ext_rx, "other-q").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{frame}"
+    );
+    assert_eq!(
+        contracts
+            .user_questions
+            .pending_for_session(&session_id)
+            .len(),
+        1
+    );
+    assert!(!task.is_finished());
+
+    // The owner: accepted.
+    handle_user_question_respond(
+        &ext_ws,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id, g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut ext_rx, "ext-q").await;
+    assert!(frame.get("error").is_none(), "{frame}");
+    assert!(matches!(
+        task.await.unwrap(),
+        octos_agent::UserQuestionOutcome::Answered(_)
+    ));
+}
+
+#[tokio::test]
+async fn should_keep_a_host_turns_question_on_the_host_as_before() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (turn_ws, _turn_rx) = ws_connection_for_test(64);
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (task, question_id) =
+        g1_ask_question(&turn_ws, &ledger, &contracts, &state, &session_id).await;
+    let requested = g1_question_event(&ledger, &session_id, &question_id);
+    assert!(ledger_event_visible_to_connection(
+        &requested.event,
+        host_ws.connection_id
+    ));
+    forward_live_ledger_event(
+        &host_ws,
+        &ledger,
+        requested,
+        0,
+        host_ws.connection_id,
+        g1_question_features(),
+        session_id.topic(),
+        None,
+    )
+    .await
+    .unwrap();
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_rpc_json(&mut host_rx),
+    )
+    .await
+    .expect("forwarded live to the host");
+    assert_eq!(live["method"], json!("user_question/requested"), "{live}");
+    assert_eq!(
+        g1_opened_questions(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await,
+        vec![question_id.clone()]
+    );
+    assert_eq!(
+        g1_hydrated_questions(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await,
+        vec![json!(question_id.0.to_string())]
+    );
+    handle_user_question_respond(
+        &host_ws,
+        &contracts,
+        None,
+        None,
+        "host-q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id, g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-q").await;
+    assert!(frame.get("error").is_none(), "{frame}");
+    assert!(matches!(
+        task.await.unwrap(),
+        octos_agent::UserQuestionOutcome::Answered(_)
+    ));
+}
+
+#[tokio::test]
+async fn should_keep_external_prompts_from_the_host_when_the_side_table_forgets_them() {
+    // The transport's owner table is bounded; an evicted id must not make a
+    // pending external prompt visible to, or answerable by, the host.
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (approval_task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let (question_task, question_id) =
+        g1_ask_question(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    super::super::host_managed::forget_external_prompt(&approval_id.0.to_string());
+    super::super::host_managed::forget_external_prompt(&question_id.0.to_string());
+
+    assert!(
+        g1_opened_pending(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert!(
+        g1_opened_questions(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert!(
+        g1_hydrated_pending(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    handle_approval_respond(
+        &host_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        None,
+        "host-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Approve,
+        ),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-a").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_APPROVAL_OWNER_ONLY),
+        "{frame}"
+    );
+    handle_user_question_respond(
+        &host_ws,
+        &contracts,
+        None,
+        None,
+        "host-q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id.clone(), g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-q").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_QUESTION_OWNER_ONLY),
+        "{frame}"
+    );
+    assert!(!approval_task.is_finished() && !question_task.is_finished());
+
+    // The owning client still answers both.
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-a".into(),
+        ApprovalRespondParams::new(session_id.clone(), approval_id, ApprovalDecision::Deny),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut ext_rx, "ext-a").await;
+    assert!(frame.get("error").is_none(), "{frame}");
+    assert_eq!(approval_task.await.unwrap(), ToolApprovalDecision::Deny);
+    handle_user_question_respond(
+        &ext_ws,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-q".into(),
+        UserQuestionRespondParams::new(session_id, question_id, g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut ext_rx, "ext-q").await;
+    assert!(frame.get("error").is_none(), "{frame}");
+    assert!(matches!(
+        question_task.await.unwrap(),
+        octos_agent::UserQuestionOutcome::Answered(_)
+    ));
+}
+
 #[tokio::test]
 async fn should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_server() {
     let first = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "octosense", "system");

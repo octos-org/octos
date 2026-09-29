@@ -6053,7 +6053,7 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
         // reaches the ledger.
         let external_turn = self.ws.is_external();
         if external_turn {
-            super::host_managed::register_external_approval(
+            super::host_managed::register_external_prompt(
                 &approval_id.0.to_string(),
                 self.ws.connection_id().0,
             );
@@ -6195,6 +6195,9 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
         );
         if let Some(route) = host_route {
             crate::peers::host_tools::register_host_approval(&approval_id.0.to_string(), route);
+        }
+        if external_turn {
+            self.contracts.approvals.mark_external(&approval_id);
         }
 
         // #1449 drop-guard: arm a guard keyed to THIS pending approval the
@@ -6537,10 +6540,23 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
             return UserQuestionOutcome::Cancelled;
         }
 
+        // UPCR-2026-036 (OctoSense ADR 0004 G1): an external client's
+        // question belongs to that client, like its approvals: the host and
+        // every other connection neither see it nor answer it. Registered
+        // before the question is pending or reaches the ledger.
+        if self.ws.is_external() {
+            super::host_managed::register_external_prompt(
+                &question_id.0.to_string(),
+                self.ws.connection_id().0,
+            );
+        }
         let response_rx = self
             .contracts
             .user_questions
             .request_runtime_owned(event.clone(), Some(self.ws.connection_id().0));
+        if self.ws.is_external() {
+            self.contracts.user_questions.mark_external(&question_id);
+        }
 
         // #2 — RAII drop-guard. Arm a guard keyed to THIS pending entry the
         // instant it is registered. If our future is dropped before a clean
@@ -21555,21 +21571,55 @@ async fn invalidate_bound_topics<'a>(state: &AppState, entries: impl Iterator<It
 /// only by that client (UPCR-2026-036), a host-routed call's only by the
 /// peer's host connection (UPCR-2026-035), every other approval by anyone.
 fn approval_event_visible_to_connection(event: &ApprovalRequestedEvent, connection: u64) -> bool {
-    super::host_managed::external_approval_visible(&event.approval_id.0.to_string(), connection)
+    super::host_managed::external_prompt_visible(&event.approval_id.0.to_string(), connection)
         && crate::peers::host_tools::host_approval_event_visible(event, connection)
 }
 
 /// Whether `connection` may see or answer approval `approval_id`: the
 /// same rules as [`approval_event_visible_to_connection`], from the id alone.
 fn approval_id_visible_to_connection(approval_id: &str, connection: u64) -> bool {
-    super::host_managed::external_approval_visible(approval_id, connection)
+    super::host_managed::external_prompt_visible(approval_id, connection)
         && crate::peers::host_tools::host_approval_visible(approval_id, connection)
 }
 
-/// Whether `connection` may see this ledger event. Only approval events are
-/// restricted: those of an external client's turn to that client
-/// (UPCR-2026-036), those of host-routed calls to the peer's host connection
-/// (UPCR-2026-035). Every other event is visible.
+/// Whether `connection` may see the `user_question/requested` event `event`
+/// (live, on replay, in pending lists and hydrate): an external client's
+/// question only by that client (UPCR-2026-036), every other one by anyone.
+fn question_visible_to_connection(event: &UserQuestionRequestedEvent, connection: u64) -> bool {
+    super::host_managed::external_prompt_visible(&event.question_id.0.to_string(), connection)
+}
+
+/// [`approval_event_visible_to_connection`] for a pending approval, also
+/// honouring the external owner recorded on the approval itself, so the rule
+/// never fails open if the side table evicted the id.
+fn pending_approval_visible_to_connection(
+    approvals: &PendingApprovalStore,
+    event: &ApprovalRequestedEvent,
+    connection: u64,
+) -> bool {
+    approval_event_visible_to_connection(event, connection)
+        && approvals
+            .external_owner(&event.approval_id)
+            .is_none_or(|owner| owner == Some(connection))
+}
+
+/// [`question_visible_to_connection`] for a pending question, also honouring
+/// the external owner recorded on the question itself.
+fn pending_question_visible_to_connection(
+    questions: &PendingQuestionStore,
+    event: &UserQuestionRequestedEvent,
+    connection: u64,
+) -> bool {
+    question_visible_to_connection(event, connection)
+        && questions
+            .external_owner(&event.question_id)
+            .is_none_or(|owner| owner == Some(connection))
+}
+
+/// Whether `connection` may see this ledger event. Only approval and question
+/// events are restricted: those of an external client's turn to that client
+/// (UPCR-2026-036), approvals of host-routed calls to the peer's host
+/// connection (UPCR-2026-035). Every other event is visible.
 fn ledger_event_visible_to_connection(
     event: &UiProtocolLedgerEvent,
     connection: ConnectionId,
@@ -21582,6 +21632,9 @@ fn ledger_event_visible_to_connection(
         UiProtocolLedgerEvent::Notification(UiNotification::ApprovalCancelled(e)) => &e.approval_id,
         UiProtocolLedgerEvent::Notification(UiNotification::ApprovalAutoResolved(e)) => {
             &e.approval_id
+        }
+        UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(e)) => {
+            return question_visible_to_connection(e, connection.0);
         }
         _ => return true,
     };
@@ -22378,7 +22431,9 @@ async fn open_session_result(
             ledger_event_matches_topic_scope(&event, topic_scope.as_deref())
         })
         .filter(|approval| !replayed_approval_ids.contains(&approval.approval_id))
-        .filter(|approval| approval_event_visible_to_connection(approval, connection_id.0))
+        .filter(|approval| {
+            pending_approval_visible_to_connection(approvals, approval, connection_id.0)
+        })
         .collect::<Vec<_>>();
 
     // UPCR-2026-023: replay still-pending structured user-questions on
@@ -22407,6 +22462,9 @@ async fn open_session_result(
             ledger_event_matches_topic_scope(&event, topic_scope.as_deref())
         })
         .filter(|question| !replayed_question_ids.contains(&question.question_id))
+        .filter(|question| {
+            pending_question_visible_to_connection(questions, question, connection_id.0)
+        })
         .collect::<Vec<_>>();
 
     let (context, context_state) = if features.context_lifecycle_available() {
@@ -27126,10 +27184,14 @@ async fn handle_approval_respond(
     // UPCR-2026-036 (OctoSense ADR 0004 G1): an external client's approval
     // is answered by that client only, never by the host (whose automation
     // must not decide for an external client) or any other connection.
-    if !super::host_managed::external_approval_visible(
+    if !super::host_managed::external_prompt_visible(
         &params.approval_id.0.to_string(),
         ws.connection_id.0,
-    ) {
+    ) || contracts
+        .approvals
+        .external_owner(&params.approval_id)
+        .is_some_and(|owner| owner != Some(ws.connection_id.0))
+    {
         let _ = send_rpc_error(
             ws,
             Some(id),
@@ -27268,6 +27330,24 @@ async fn handle_user_question_respond(
             );
             return;
         }
+    }
+    // UPCR-2026-036 (OctoSense ADR 0004 G1): an external client's question
+    // is answered by that client only, never by the host or any other
+    // connection.
+    if !super::host_managed::external_prompt_visible(
+        &params.question_id.0.to_string(),
+        ws.connection_id.0,
+    ) || contracts
+        .user_questions
+        .external_owner(&params.question_id)
+        .is_some_and(|owner| owner != Some(ws.connection_id.0))
+    {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            super::host_managed::external_question_owner_only(),
+        );
+        return;
     }
     // UPCR-2026-035: on a registered host peer's session a question is
     // answered by its owning connection or the peer's host connection (the
@@ -28477,7 +28557,7 @@ async fn handle_session_hydrate(
                 .pending_for_session(&params.session_id)
                 .into_iter()
                 .filter(|approval| {
-                    approval_event_visible_to_connection(approval, ws.connection_id.0)
+                    pending_approval_visible_to_connection(approvals, approval, ws.connection_id.0)
                 })
                 .collect(),
         )
@@ -28492,7 +28572,15 @@ async fn handle_session_hydrate(
     // omitted (not `null`) exactly like a non-negotiated wire event is
     // filtered out. Mirrors the `session/open` pending-question replay gate.
     let pending_questions = if include_set.pending_approvals && features.user_question_v1 {
-        Some(questions.pending_for_session(&params.session_id))
+        Some(
+            questions
+                .pending_for_session(&params.session_id)
+                .into_iter()
+                .filter(|question| {
+                    pending_question_visible_to_connection(questions, question, ws.connection_id.0)
+                })
+                .collect(),
+        )
     } else {
         None
     };

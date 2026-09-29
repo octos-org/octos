@@ -26,6 +26,11 @@ struct ApprovalEntry {
     /// key (`crate::peers::host_tools::route_key`). Only the owning
     /// connection or the peer's current host connection may answer it.
     host_route: Option<String>,
+    /// Raised by an external client's turn (`serve --host-managed`,
+    /// UPCR-2026-036): only `owner_connection` sees or answers it. Kept on
+    /// the entry so the rule holds even if the transport's side table has
+    /// evicted the id.
+    external: bool,
 }
 
 #[derive(Debug)]
@@ -245,6 +250,7 @@ impl PendingApprovalStore {
                 owner_connection: None,
                 once_only: false,
                 host_route: None,
+                external: false,
             },
         );
     }
@@ -262,6 +268,7 @@ impl PendingApprovalStore {
                 owner_connection: None,
                 once_only: false,
                 host_route: None,
+                external: false,
             },
         );
         event
@@ -308,6 +315,7 @@ impl PendingApprovalStore {
                 owner_connection,
                 once_only,
                 host_route,
+                external: false,
             },
         );
         rx
@@ -328,6 +336,26 @@ impl PendingApprovalStore {
                 entry.session_id == *session_id
                     && matches!(&entry.state, ApprovalEntryState::Pending)
             })
+            .map(|entry| entry.owner_connection)
+    }
+
+    /// Mark approval `approval_id` as raised by an external client's turn
+    /// (UPCR-2026-036): see [`Self::external_owner`].
+    pub(crate) fn mark_external(&self, approval_id: &ApprovalId) {
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = entries.get_mut(approval_id) {
+            entry.external = true;
+        }
+    }
+
+    /// For an approval raised by an external client's turn (in any state):
+    /// `Some(owning connection)`, which alone may see or answer it
+    /// (`Some(None)`: nobody may). `None` for every other approval.
+    pub(crate) fn external_owner(&self, approval_id: &ApprovalId) -> Option<Option<u64>> {
+        let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
+        entries
+            .get(approval_id)
+            .filter(|entry| entry.external)
             .map(|entry| entry.owner_connection)
     }
 
