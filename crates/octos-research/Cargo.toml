@@ -63,6 +63,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 name = "record_engine_fixtures"
 required-features = ["http"]
 
+[[example]]
+name = "metasearch_query"
+required-features = ["http"]
+
 [[test]]
 name = "engine_fixtures"
 required-features = ["metasearch"]
