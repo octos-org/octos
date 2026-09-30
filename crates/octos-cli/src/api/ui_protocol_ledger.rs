@@ -61,7 +61,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use octos_core::SessionKey;
 use octos_core::ui_protocol::{
     EnvelopeV2, EnvelopeV2Notification, PayloadV2, RpcError, RpcNotification, SessionOpened,
-    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, UiCursor, UiNotification,
+    TaskRuntimeState, TurnCompletedEvent, TurnErrorEvent, TurnId, UiCursor, UiNotification,
     UiProgressEvent, methods,
 };
 use serde::{Deserialize, Serialize};
@@ -3103,6 +3103,33 @@ impl UiProtocolLedger {
         session_id: &SessionKey,
         after: Option<&UiCursor>,
     ) -> Result<(Vec<LedgeredUiProtocolEvent>, UiCursor), RpcError> {
+        self.snapshot_with_cursor_matching(session_id, after, None)
+    }
+
+    /// Turn-scoped variant of [`Self::snapshot_with_cursor`]: identical
+    /// locking, disk-recovery, and cursor semantics, but the returned events
+    /// are only the ones belonging to `turn_id` — exactly the set
+    /// `project_turn_from_ledger` consumes — so a `turn/state` poll on a
+    /// session with a long ledger no longer deep-clones the whole ring to
+    /// project a single turn.
+    pub(crate) fn snapshot_events_for_turn(
+        &self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
+        let turn_wire_id = turn_id.0.to_string();
+        let (events, _) = self.snapshot_with_cursor_matching(session_id, None, Some(&|event| {
+            event_belongs_to_turn(event, turn_id, &turn_wire_id)
+        }))?;
+        Ok(events)
+    }
+
+    fn snapshot_with_cursor_matching(
+        &self,
+        session_id: &SessionKey,
+        after: Option<&UiCursor>,
+        event_filter: Option<&dyn Fn(&UiProtocolLedgerEvent) -> bool>,
+    ) -> Result<(Vec<LedgeredUiProtocolEvent>, UiCursor), RpcError> {
         // Shadow with the per-project STORAGE identity (no-op when no scope
         // is registered): ring lookups, disk fallbacks, minted cursor
         // `stream`s, and the `after.stream` check below all follow it, so
@@ -3213,7 +3240,9 @@ impl UiProtocolLedger {
         let events: Vec<LedgeredUiProtocolEvent> = session
             .entries
             .iter()
-            .filter(|entry| entry.seq > after.seq)
+            .filter(|entry| {
+                entry.seq > after.seq && event_filter.map_or(true, |f| f(&entry.event))
+            })
             .map(|entry| LedgeredUiProtocolEvent {
                 cursor: UiCursor {
                     stream: session_id.0.clone(),
@@ -3652,6 +3681,27 @@ fn cursor_out_of_range_error(
     data.insert("oldest_retained_seq".into(), json!(oldest_retained_seq));
 
     RpcError::cursor_out_of_range(after, &ledger_head).with_data(Value::Object(data))
+}
+
+/// Whether a ledger event belongs to `turn_id` — exactly the set
+/// `project_turn_from_ledger` reads (turn lifecycle notifications plus the
+/// envelope thread backfill), so a turn-scoped snapshot projects identically
+/// to a full one. `turn_wire_id` is `turn_id` pre-rendered to its wire form.
+fn event_belongs_to_turn(
+    event: &UiProtocolLedgerEvent,
+    turn_id: &TurnId,
+    turn_wire_id: &str,
+) -> bool {
+    let UiProtocolLedgerEvent::Notification(notification) = event else {
+        return false;
+    };
+    match notification {
+        UiNotification::TurnStarted(e) => e.turn_id == *turn_id,
+        UiNotification::TurnCompleted(e) => e.turn_id == *turn_id,
+        UiNotification::TurnError(e) => e.turn_id == *turn_id,
+        UiNotification::EnvelopeV2(e) => e.envelope.turn_id == turn_wire_id,
+        _ => false,
+    }
 }
 
 fn notification_session_id(notification: &UiNotification) -> &SessionKey {
@@ -4698,6 +4748,177 @@ mod tests {
             .snapshot_with_cursor(&session_id, None)
             .expect("from-beginning hydrate must succeed on a trimmed ring");
         assert_eq!(replay_texts(&events), vec!["msg-4", "msg-5", "msg-6"]);
+    }
+
+    fn append_turn_lifecycle(
+        ledger: &UiProtocolLedger,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+        terminal: UiNotification,
+    ) {
+        ledger
+            .append_notification(UiNotification::TurnStarted(
+                octos_core::ui_protocol::TurnStartedEvent {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    timestamp: chrono::Utc::now(),
+                    topic: None,
+                },
+            ));
+        ledger.emit_envelope_v2(
+            session_id,
+            turn_id.0.to_string(),
+            PayloadV2::AssistantDelta {
+                text: format!("answer for {}", turn_id.0),
+                assistant_segment_id: format!("{}:assistant:iteration:0", turn_id.0),
+            },
+            None,
+        );
+        ledger.append_notification(terminal);
+    }
+
+    fn turn_event_seqs(events: &[LedgeredUiProtocolEvent]) -> Vec<u64> {
+        events.iter().map(|event| event.cursor.seq).collect()
+    }
+
+    /// Independent oracle: the exact event set a `turn/state` projection may
+    /// read, matched inline rather than through `event_belongs_to_turn`.
+    fn full_snapshot_turn_seqs(
+        events: &[LedgeredUiProtocolEvent],
+        turn_id: &TurnId,
+    ) -> Vec<u64> {
+        events
+            .iter()
+            .filter(|event| match &event.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnStarted(started)) => {
+                    started.turn_id == *turn_id
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(completed)) => {
+                    completed.turn_id == *turn_id
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnError(errored)) => {
+                    errored.turn_id == *turn_id
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                    envelope.envelope.turn_id == turn_id.0.to_string()
+                }
+                _ => false,
+            })
+            .map(|event| event.cursor.seq)
+            .collect()
+    }
+
+    #[test]
+    fn turn_scoped_snapshot_returns_only_target_turn_events_in_order() {
+        let ledger = UiProtocolLedger::new(16);
+        let session_id = SessionKey("local:turn-scoped".into());
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        ledger.append_notification(delta(&session_id, "noise-1"));
+        append_turn_lifecycle(
+            &ledger,
+            &session_id,
+            &turn_a,
+            UiNotification::TurnCompleted(TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+                token_usage: None,
+            }),
+        );
+        ledger.append_notification(delta(&session_id, "noise-2"));
+        append_turn_lifecycle(
+            &ledger,
+            &session_id,
+            &turn_b,
+            UiNotification::TurnError(TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                code: "interrupted".into(),
+                message: "stop".into(),
+                token_usage: None,
+                partial_result: None,
+            }),
+        );
+
+        let (full, head) = ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("full snapshot");
+        assert_eq!(full.len(), 8);
+
+        for turn in [&turn_a, &turn_b] {
+            let scoped = ledger
+                .snapshot_events_for_turn(&session_id, turn)
+                .expect("turn-scoped snapshot");
+            assert_eq!(
+                turn_event_seqs(&scoped),
+                full_snapshot_turn_seqs(&full, turn),
+                "turn-scoped snapshot must equal the full snapshot's events for the target turn, in order"
+            );
+            assert_eq!(scoped.len(), 3);
+            assert!(scoped.iter().all(|event| event.cursor.seq <= head.seq));
+        }
+    }
+
+    #[test]
+    fn turn_scoped_snapshot_recovers_cold_session_from_disk() {
+        // The turn-scoped read must keep the lazy disk-recovery contract of
+        // `snapshot_with_cursor`: a session whose ring is cold (fresh
+        // process, nothing loaded yet) still projects its turn from the
+        // durable log.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_id = SessionKey("local:turn-scoped-cold".into());
+        let turn_id = TurnId::new();
+        let config = {
+            let mut config = LedgerConfig::durable(temp.path().into());
+            config.active_session_cap = 4;
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            append_turn_lifecycle(
+                &ledger,
+                &session_id,
+                &turn_id,
+                UiNotification::TurnError(TurnErrorEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_id.clone(),
+                    code: "failed".into(),
+                    message: "boom".into(),
+                    token_usage: None,
+                    partial_result: None,
+                }),
+            );
+            ledger.append_notification(delta(&session_id, "noise"));
+            config
+        };
+
+        let recovered = UiProtocolLedger::recover(config);
+        let scoped = recovered
+            .ledger
+            .snapshot_events_for_turn(&session_id, &turn_id)
+            .expect("turn-scoped snapshot on a cold session");
+        assert_eq!(scoped.len(), 3);
+        let (full, _) = recovered
+            .ledger
+            .snapshot_with_cursor(&session_id, None)
+            .expect("full snapshot after recovery");
+        assert_eq!(
+            turn_event_seqs(&scoped),
+            full_snapshot_turn_seqs(&full, &turn_id)
+        );
+    }
+
+    #[test]
+    fn turn_scoped_snapshot_on_unknown_session_is_empty() {
+        let ledger = UiProtocolLedger::new(4);
+        let events = ledger
+            .snapshot_events_for_turn(&SessionKey("local:turn-scoped-missing".into()), &TurnId::new())
+            .expect("unknown session is empty, not an error");
+        assert!(events.is_empty());
     }
 
     /// Boot recovery must synthesize terminal events for task/turn/agent

@@ -29946,9 +29946,11 @@ async fn handle_turn_state_get(
 
     // Pull the ledger projection so we can backfill thread_id /
     // started_at / completed_at / committed_seqs even when the registry
-    // entry is absent or carries less metadata.
-    let projection = match ledger.snapshot_with_cursor(&params.session_id, None) {
-        Ok((events, _)) => Some(project_turn_from_ledger(&params.turn_id, &events)),
+    // entry is absent or carries less metadata. Turn-scoped read: the
+    // projection only consumes this turn's events, so a poll on a session
+    // with a long ledger must not deep-clone the whole ring (#2445).
+    let projection = match ledger.snapshot_events_for_turn(&params.session_id, &params.turn_id) {
+        Ok(events) => Some(project_turn_from_ledger(&params.turn_id, &events)),
         Err(_) => None,
     };
 
