@@ -2857,6 +2857,7 @@ mod build_cache_sandbox_handoff_tests {
 
     fn macos(slot: Option<PathBuf>) -> MacosSandbox {
         MacosSandbox {
+            read_only_view: None,
             allow_network: false,
             read_allow_paths: Vec::new(),
             workspace_write: true,

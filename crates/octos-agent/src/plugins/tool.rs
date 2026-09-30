@@ -1541,6 +1541,15 @@ fn accept_for_intent(
             "path '{raw_path}' rejected: plugin skill dir '{}' is read-only — writes refused per SessionScope policy",
             skill_dir.display()
         )),
+        // A request context's read-only view of its peer's folder
+        // (UPCR-2026-034 `read_parent`): reads allowed, writes refused.
+        (PathClassification::InReadOnlyView { .. }, PathIntent::Read) => {
+            Ok(absolute.to_string_lossy().into_owned())
+        }
+        (PathClassification::InReadOnlyView { root }, PathIntent::Write) => Err(eyre::eyre!(
+            "path '{raw_path}' rejected: '{}' is a read-only view — writes refused per SessionScope policy",
+            root.display()
+        )),
         // Out of scope: refuse for both intents. Echo the raw path so
         // the LLM sees what was refused (matches the round-3/4
         // bespoke-validator error contract).
@@ -1651,6 +1660,7 @@ fn rescue_workspace_input_existence(
         PathClassification::InGrantedDir { .. }
         | PathClassification::InSharedZone { .. }
         | PathClassification::InSkillDir { .. }
+        | PathClassification::InReadOnlyView { .. }
         | PathClassification::OutOfScope => lexical_absolute.to_string(),
     }
 }
