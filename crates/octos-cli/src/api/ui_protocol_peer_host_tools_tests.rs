@@ -4692,6 +4692,61 @@ async fn should_refuse_an_unknown_reason_an_unknown_field_or_a_bad_message() {
 }
 
 #[tokio::test]
+async fn should_accept_a_busy_rejection_when_the_hosts_turn_start_was_refused() {
+    // Security review (ADR 0004): a `turn/start` with an input's turn id that
+    // the kernel then refuses (here: no text input) must not consume the
+    // input — the host can still answer it with `peer/input/reject`.
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(64);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    let input = deliver_input(&fx, &mut rx, "call_1").await;
+    let turn: TurnId = serde_json::from_value(input["turn_id"].clone()).unwrap();
+
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let started = handle_turn_start(
+        &ws,
+        &fx.state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "start-refused".into(),
+        TurnStartParams {
+            session_id: peer_key(&fx),
+            turn_id: turn.clone(),
+            input: Vec::new(),
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+            origin: None,
+        },
+    )
+    .await;
+    assert!(!started, "a turn/start without text input is refused");
+    assert!(active_turns.lock().await.is_empty());
+
+    let accepted = reject_input(
+        &fx,
+        ws.connection_id.0,
+        &token,
+        input["input_id"].as_str().unwrap(),
+        json!({"reason": "busy"}),
+    )
+    .expect("the refused start did not answer the input");
+    assert_eq!(accepted["rejected"], true);
+}
+
+#[tokio::test]
 async fn should_refuse_a_turn_start_with_a_rejected_inputs_turn_id() {
     let fx = fixture().await;
     let token = prepare_news(&fx).await;
