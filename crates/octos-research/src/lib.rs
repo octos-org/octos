@@ -103,6 +103,28 @@ pub const BROWSER_SEARCH_NOTICE: &str = "Some results were loaded in the octos b
      engines' terms may not allow automated queries. Set OCTOS_BROWSER=off to stop using the \
      browser.";
 
+/// Operator switch for reading a page that plain HTTP was blocked on (a bot
+/// challenge, 401 or 403) once in the configured browser renderer. Unset:
+/// on (OctoSense ADR 0002 §6 as amended 2026-09-29: the maintainer decided
+/// octos searches and reads the way SearXNG does, with no person in the
+/// loop; a real browser may read a page a plain client was refused, and
+/// nothing is solved or clicked). Set: on only for `1`/`true`/`yes`/`on`;
+/// any other value turns it off, so a mistyped opt-out fails safe. Before
+/// this switch (octos#2590 to #2637) a challenge over plain HTTP was never
+/// retried in the browser; set it to `0` to keep that behaviour.
+pub const READ_BLOCKED_IN_BROWSER_ENV: &str = "OCTOS_READ_BLOCKED_IN_BROWSER";
+
+/// Whether a page blocked over plain HTTP may be read once in the browser
+/// ([`READ_BLOCKED_IN_BROWSER_ENV`]; env lookup injected for tests).
+pub fn read_blocked_in_browser(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    lookup(READ_BLOCKED_IN_BROWSER_ENV).is_none_or(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// Environment variable naming a self-hosted SearXNG base URL
 /// (e.g. `http://127.0.0.1:8888`).
 pub const SEARXNG_URL_ENV: &str = "SEARXNG_URL";
@@ -213,6 +235,20 @@ mod tests {
         assert!(n.contains("Google account") && n.contains("search activity"));
         assert!(n.contains("terms may not allow"));
         assert!(n.contains(&format!("{BROWSER_ENV}=off")));
+    }
+
+    #[test]
+    fn should_read_blocked_pages_in_the_browser_unless_turned_off() {
+        assert!(read_blocked_in_browser(|_| None), "on by default");
+        let set = |v: &'static str| {
+            move |k: &str| (k == READ_BLOCKED_IN_BROWSER_ENV).then(|| v.to_string())
+        };
+        for on in ["1", "true", "YES", "on"] {
+            assert!(read_blocked_in_browser(set(on)), "{on}");
+        }
+        for off in ["0", "false", "off", "", "nope"] {
+            assert!(!read_blocked_in_browser(set(off)), "{off:?}: fails safe");
+        }
     }
 
     #[test]

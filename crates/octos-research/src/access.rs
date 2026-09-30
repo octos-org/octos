@@ -1496,6 +1496,51 @@ mod tests {
         assert!(is_bot_challenge(&cf));
     }
 
+    #[test]
+    fn should_judge_challenge_text_directly() {
+        // Short challenge wording, English and Chinese.
+        assert!(challenge_text("Just a moment... Checking your browser"));
+        assert!(challenge_text(
+            "火山引擎 正在进行安全检测... 系统正在检测当前网络环境"
+        ));
+        assert!(challenge_text("请完成安全验证 拖动滑块完成拼图"));
+        // Self-clearing: yes for the waiting checks, no when a person must act.
+        assert!(interstitial_text("Just a moment... Checking your browser"));
+        assert!(interstitial_text(
+            "正在进行安全检测... 为保障您的访问安全，系统正在检测当前网络环境"
+        ));
+        assert!(
+            !interstitial_text("请完成安全验证 拖动滑块完成拼图"),
+            "a slider asks a person"
+        );
+        assert!(!interstitial_text(
+            "Checking your browser. Please complete the CAPTCHA"
+        ));
+        // Past the length cap it is a page, not a challenge.
+        let long = format!(
+            "Checking your browser {}",
+            "x".repeat(MAX_CHALLENGE_TEXT_CHARS + 10)
+        );
+        assert!(!challenge_text(&long) && !interstitial_text(&long));
+    }
+
+    #[test]
+    fn should_not_take_an_article_about_security_checks_for_one() {
+        // A news article quoting the wording, in Chinese and English, is
+        // content: it is long and reads as prose.
+        let zh = format!(
+            "<html><head><title>网站安全检测的烦恼</title></head><body><article>{}</article></body></html>",
+            "不少读者反映，访问部分网站时会先看到“正在进行安全检测”的提示页面，需要等待几秒钟。"
+                .repeat(40)
+        );
+        assert!(!is_bot_challenge(&zh) && !is_interstitial(&zh));
+        let en = format!(
+            "<html><head><title>Why sites say Just a moment</title></head><body><article>{}</article></body></html>",
+            "Readers asked why some sites show a Just a moment... Checking your browser page first. ".repeat(40)
+        );
+        assert!(!is_bot_challenge(&en) && !is_interstitial(&en));
+    }
+
     fn serp_or_read_fixture(rel: &str) -> String {
         let path = format!("{}/tests/fixtures/{rel}", env!("CARGO_MANIFEST_DIR"));
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))

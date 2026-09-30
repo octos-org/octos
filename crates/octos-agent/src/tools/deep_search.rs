@@ -682,10 +682,21 @@ async fn render_page(url: &str, bound: Duration) -> Result<octos_research::reade
                 .map_err(|e| eyre::eyre!("navigation failed: {e}"))?;
             let _ = page.wait_for_navigation().await;
             tokio::time::sleep(Duration::from_secs(2)).await;
-            let html = page
+            let mut html = page
                 .content()
                 .await
                 .map_err(|e| eyre::eyre!("failed to read HTML: {e}"))?;
+            // A check that clears itself in a real browser ("Just a
+            // moment…", "正在进行安全检测…"): wait for it, up to ~10 s.
+            for _ in 0..5 {
+                if !octos_research::access::is_interstitial(&html) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if let Ok(h) = page.content().await {
+                    html = h;
+                }
+            }
             let final_url = page
                 .url()
                 .await

@@ -59,11 +59,12 @@ pub fn dedup_key(raw: &str) -> String {
     rest.strip_prefix("www.").unwrap_or(rest).to_string()
 }
 
-/// Host without a leading `www.`, lowercase.
-/// Path segments of sign-in, sign-up and account pages. A crawl follows a
-/// site's content, not its account pages: they hold no article and are
-/// often where a site starts asking who is visiting.
-const ACCOUNT_SEGMENTS: &[&str] = &[
+/// Path segments that are sign-in, sign-up and sign-out pages. A crawl
+/// follows a site's content, not these: they hold no article and are where
+/// a site starts asking who is visiting. Deliberately narrow: segments that
+/// also name content (`auth`, `oauth2`, `profile`, `settings`, `checkout`,
+/// `register` in documentation and directories) are not here.
+pub const ACCOUNT_SEGMENTS: &[&str] = &[
     "login",
     "log-in",
     "logon",
@@ -73,61 +74,39 @@ const ACCOUNT_SEGMENTS: &[&str] = &[
     "signup",
     "sign-up",
     "sign_up",
-    "register",
-    "registration",
     "logout",
     "log-out",
     "signout",
     "sign-out",
-    "auth",
-    "oauth",
-    "oauth2",
-    "sso",
-    "account",
-    "accounts",
+    "forgot-password",
+    "reset-password",
     "my-account",
     "myaccount",
-    "profile",
-    "settings",
-    "password",
-    "reset-password",
-    "forgot-password",
-    "subscribe",
-    "checkout",
-    "cart",
     "usercenter",
-    "passport",
 ];
 
-/// Whether `raw` is a sign-in, sign-up or account page (by its path, or an
-/// `accounts.`/`login.`/`auth.`/`passport.`/`sso.` host). Crawls skip these.
+/// Host prefixes of sign-in services (`accounts.google.com`,
+/// `login.microsoftonline.com`, `passport.example.cn`).
+pub const ACCOUNT_HOST_PREFIXES: &[&str] = &["accounts.", "login.", "signin.", "passport.", "sso."];
+
+/// Whether `raw` is a sign-in, sign-up or sign-out page: a path segment in
+/// [`ACCOUNT_SEGMENTS`] or a host starting with one of
+/// [`ACCOUNT_HOST_PREFIXES`]. Crawls skip these (and say so), unless the
+/// crawl was pointed under a path prefix explicitly.
 pub fn is_account_link(raw: &str) -> bool {
     let Ok(u) = url::Url::parse(raw) else {
         return false;
     };
     let host = u.host_str().unwrap_or("").to_ascii_lowercase();
-    if [
-        "accounts.",
-        "account.",
-        "login.",
-        "auth.",
-        "passport.",
-        "sso.",
-        "signin.",
-    ]
-    .iter()
-    .any(|p| host.starts_with(p))
-    {
+    if ACCOUNT_HOST_PREFIXES.iter().any(|p| host.starts_with(p)) {
         return true;
     }
     u.path_segments().is_some_and(|mut segs| {
-        segs.any(|seg| {
-            let seg = seg.to_ascii_lowercase();
-            ACCOUNT_SEGMENTS.contains(&seg.as_str())
-        })
+        segs.any(|seg| ACCOUNT_SEGMENTS.contains(&seg.to_ascii_lowercase().as_str()))
     })
 }
 
+/// Host without a leading `www.`, lowercase.
 pub fn domain_of(raw: &str) -> Option<String> {
     let u = Url::parse(raw.trim()).ok()?;
     let host = u.host_str()?.to_ascii_lowercase();
@@ -193,13 +172,19 @@ mod tests {
             "https://36kr.com/usercenter/basicinfo",
             "https://accounts.google.com/ServiceLogin",
             "https://example.org/Sign-Up",
-            "https://shop.example/cart",
+            "https://shop.example/my-account/orders",
         ] {
             assert!(is_account_link(u), "{u}");
         }
+        // Content that shares words with account pages (review of #2637).
         for u in [
             "https://www.bbc.com/news/articles/c1",
             "https://medium.com/tag/rust",
+            "https://firebase.google.com/docs/auth",
+            "https://developers.google.com/identity/protocols/oauth2",
+            "https://code.visualstudio.com/docs/editor/settings",
+            "https://docs.stripe.com/payments/checkout",
+            "https://example.org/profile/jane-doe",
             "https://example.org/blog/authors-we-like",
             "https://example.org/login-tips-for-writers-2026",
             "not a url",

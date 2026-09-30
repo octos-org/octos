@@ -887,7 +887,9 @@ async fn render_with_browser(url: &str) -> Result<reader::Rendered, String> {
         "max_pages": 1,
         "include_html": true,
     });
-    let stdout = crate::run_deep_crawl(&bin, &input, Duration::from_secs(45)).await?;
+    // Room for deep_crawl's wait on a self-clearing check (~10 s) on top of
+    // a slow render.
+    let stdout = crate::run_deep_crawl(&bin, &input, Duration::from_secs(60)).await?;
     parse_render_output(&stdout, url)
 }
 
