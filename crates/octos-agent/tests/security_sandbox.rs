@@ -451,6 +451,7 @@ fn should_restrict_reads_when_configured() {
         write_allow_globs: None,
         profile_name: None,
         build_cache_slot: None,
+        read_only_view: None,
     };
     let sandbox = octos_agent::create_sandbox(&config);
     let dir = tempfile::tempdir().unwrap();
@@ -682,6 +683,7 @@ fn should_block_dangerous_docker_cwd() {
         write_allow_globs: None,
         profile_name: None,
         build_cache_slot: None,
+        read_only_view: None,
     });
 
     let cmd = sb.wrap_command("ls", std::path::Path::new("/etc"));

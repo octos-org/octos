@@ -163,6 +163,38 @@ pub struct SessionRuntime {
     client_commands_owner: std::sync::Mutex<Option<u64>>,
 }
 
+/// UPCR-2026-034 `read_parent`: a request context's read-only view of its
+/// peer's folder, minus every context's folder (its own stays its
+/// workspace): `(peer folder, excluded folders)`. Enforced by the session
+/// scope (file tools) and the sandbox (shell), never by convention.
+fn context_read_view(
+    binding: &crate::peers::app_binding::SessionAppBinding,
+) -> Option<(PathBuf, Vec<PathBuf>)> {
+    match binding {
+        crate::peers::app_binding::SessionAppBinding::Bound {
+            read_view: Some(root),
+            ..
+        } => Some((
+            root.clone(),
+            vec![crate::peers::app_binding::contexts_folder(root)],
+        )),
+        _ => None,
+    }
+}
+
+/// Attach [`context_read_view`] to the session scope.
+fn with_context_read_view(
+    scope: Option<Arc<SessionScope>>,
+    binding: &crate::peers::app_binding::SessionAppBinding,
+) -> Result<Option<Arc<SessionScope>>, octos_core::SessionScopeError> {
+    match (scope, context_read_view(binding)) {
+        (Some(scope), Some((root, excluded))) => Ok(Some(Arc::new(
+            (*scope).clone().with_read_only_view(root, excluded)?,
+        ))),
+        (scope, _) => Ok(scope),
+    }
+}
+
 impl SessionRuntime {
     /// Whether the durable app binding of this session still equals the one
     /// this runtime was built for. `false` means the runtime is stale (e.g.
@@ -365,6 +397,7 @@ impl SessionRuntime {
             crate::peers::app_binding::SessionAppBinding::Bound {
                 cwd,
                 memory_namespace,
+                ..
             } => {
                 if let Some(hint) = workspace_hint.as_ref() {
                     let hint_canon = dunce::canonicalize(hint).unwrap_or_else(|_| hint.clone());
@@ -461,8 +494,14 @@ impl SessionRuntime {
         // `fm_tts` and friends emit into this session's
         // `<workspace>/skill-output/` rather than the profile-template
         // path.
-        let sandbox = sandbox_override
+        let mut sandbox = sandbox_override
             .unwrap_or_else(|| permissions.apply_to_sandbox(&profile.default_sandbox));
+        if let Some((root, excluded)) = context_read_view(&bootstrapped_binding) {
+            sandbox.read_only_view = Some(Box::new(octos_agent::SandboxReadOnlyView {
+                root,
+                excluded,
+            }));
+        }
         let mut tools = profile.tool_specs.rebind_cwd_with_permissions(
             &workspace_root,
             create_sandbox(&sandbox),
@@ -700,6 +739,10 @@ impl SessionRuntime {
         if bound_memory_namespace.is_some() && session_scope.is_none() {
             eyre::bail!("session {session_key} is host-bound but its workspace scope failed");
         }
+        let session_scope = with_context_read_view(session_scope, &bootstrapped_binding)
+            .wrap_err_with(|| {
+                format!("session {session_key}: the read view of its peer's folder")
+            })?;
 
         // The prompt's slash commands (`/router`, `/queue`, …) are handled by
         // bus channels only; serve sessions get the client's own commands

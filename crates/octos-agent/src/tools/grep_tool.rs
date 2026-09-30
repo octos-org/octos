@@ -321,6 +321,17 @@ fn run_grep(
     // Canonical form of the resolved search root. Used by the per-entry scope
     // guard to exempt the legitimately-rooted upload file (see below).
     let canonical_search_root = octos_core::canonicalize_lossy(&search_root);
+    // The exemption is for a search root that is itself outside the scope
+    // (the resolved upload file). A search root inside the scope never
+    // exempts an out-of-scope entry below it: a request context searching
+    // its peer's folder (UPCR-2026-034 `read_parent`) must not reach another
+    // context's folder under it.
+    let search_root_out_of_scope = scope.as_ref().is_some_and(|scope| {
+        matches!(
+            scope.classify_canonical_path(&search_root),
+            PathClassification::OutOfScope
+        )
+    });
 
     // Compile regex.
     let regex_pattern = if ignore_case {
@@ -400,7 +411,8 @@ fn run_grep(
             if matches!(
                 scope.classify_canonical_path(path),
                 PathClassification::OutOfScope
-            ) && !octos_core::canonicalize_lossy(path).starts_with(&canonical_search_root)
+            ) && !(search_root_out_of_scope
+                && octos_core::canonicalize_lossy(path).starts_with(&canonical_search_root))
             {
                 continue;
             }

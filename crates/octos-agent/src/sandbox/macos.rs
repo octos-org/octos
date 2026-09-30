@@ -193,6 +193,42 @@ pub struct MacosSandbox {
     /// workspace or a #1976 fence suppresses it (deny-wins — a profile that
     /// confines writes must not quietly regain toolchain caches).
     pub(crate) toolchain_write_grants: super::ToolchainWriteGrants,
+    /// UPCR-2026-034 `read_parent` (see `SandboxConfig::read_only_view`).
+    pub(crate) read_only_view: Option<Box<super::SandboxReadOnlyView>>,
+}
+
+/// Whether `path` would break out of an SBPL string literal.
+fn has_sbpl_metachars(path: &str) -> bool {
+    path.bytes()
+        .any(|b| b < 0x20 || b == 0x7F || b == b'(' || b == b')' || b == b'\\' || b == b'"')
+}
+
+/// The SBPL read rules of a request context's read-only view of its peer's
+/// folder: read the folder, never an excluded (another context's) folder,
+/// and read the cwd again (the context's own folder lies inside an excluded
+/// one; the last matching rule wins). `None` when a path cannot be written
+/// into SBPL safely (the caller refuses to run).
+fn read_only_view_rules(view: &super::SandboxReadOnlyView, real_cwd: &str) -> Option<String> {
+    let real = |path: &Path| {
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let root = real(&view.root);
+    if has_sbpl_metachars(&root) {
+        return None;
+    }
+    let mut rules = format!("(allow file-read* (subpath \"{root}\"))\n");
+    for excluded in &view.excluded {
+        let excluded = real(excluded);
+        if has_sbpl_metachars(&excluded) {
+            return None;
+        }
+        rules.push_str(&format!("(deny file-read* (subpath \"{excluded}\"))\n"));
+    }
+    rules.push_str(&format!("(allow file-read* (subpath \"{real_cwd}\"))\n"));
+    Some(rules)
 }
 
 impl Sandbox for MacosSandbox {
@@ -304,6 +340,25 @@ impl Sandbox for MacosSandbox {
                 }
             }
             rules.join("\n")
+        };
+
+        // UPCR-2026-034 `read_parent`: the peer's folder read-only, other
+        // contexts' folders unreadable, in either read mode.
+        let read_rules = match &self.read_only_view {
+            None => read_rules,
+            Some(view) => match read_only_view_rules(view, &real_cwd) {
+                Some(view_rules) => format!("{read_rules}\n{view_rules}"),
+                None => {
+                    tracing::error!(
+                        "read-only view path contains SBPL metacharacters, refusing to execute"
+                    );
+                    let mut cmd = Command::new("sh");
+                    cmd.arg("-c").arg(
+                        "echo 'sandbox error: read-only view path contains invalid characters' >&2; exit 1",
+                    );
+                    return cmd;
+                }
+            },
         };
 
         // Workspace write rule. Four cases:
@@ -551,10 +606,84 @@ impl Sandbox for MacosSandbox {
 mod tests {
     use super::*;
 
+    fn view_sandbox(root: &Path, read_allow_paths: Vec<String>) -> MacosSandbox {
+        MacosSandbox {
+            read_only_view: Some(Box::new(crate::sandbox::SandboxReadOnlyView {
+                root: root.to_path_buf(),
+                excluded: vec![root.join("contexts")],
+            })),
+            toolchain_write_grants: Default::default(),
+            allow_network: false,
+            read_allow_paths,
+            workspace_write: true,
+            repo_git_write: None,
+            build_cache_slot: None,
+            write_allow_globs: None,
+        }
+    }
+
+    async fn run(sb: &MacosSandbox, cwd: &Path, command: &str) -> (bool, String) {
+        let out = sb.wrap_command(command, cwd).output().await.unwrap();
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn should_let_the_shell_read_the_peer_folder_but_not_other_contexts_when_the_context_reads_its_parent()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let cwd = root.join("contexts/a");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(root.join("contexts/b")).unwrap();
+        std::fs::write(root.join("threads.md"), "ACCOUNT").unwrap();
+        std::fs::write(root.join("contexts/b/p.md"), "OTHER").unwrap();
+        std::fs::write(cwd.join("own.md"), "OWN").unwrap();
+        // Both read modes: global reads (the default) and restricted reads.
+        for read_allow_paths in [Vec::new(), vec!["/usr".to_owned()]] {
+            let sb = view_sandbox(&root, read_allow_paths);
+            let (ok, out) = run(&sb, &cwd, "/bin/cat ../../threads.md own.md").await;
+            assert!(
+                ok && out.contains("ACCOUNT") && out.contains("OWN"),
+                "{out}"
+            );
+            let (ok, out) = run(&sb, &cwd, "/bin/cat ../b/p.md").await;
+            assert!(!ok && !out.contains("OTHER"), "{out}");
+            let (ok, _) = run(&sb, &cwd, "/bin/ls ../b").await;
+            assert!(!ok, "another context's folder is not listable");
+            let (ok, _) = run(&sb, &cwd, "echo x > ../../w.md").await;
+            assert!(
+                !ok && !root.join("w.md").exists(),
+                "the peer folder is read-only"
+            );
+            let (ok, out) = run(&sb, &cwd, "echo x > new.md").await;
+            assert!(ok, "the context's own folder stays writable: {out}");
+        }
+    }
+
+    #[test]
+    fn should_refuse_to_run_when_a_read_view_path_breaks_sbpl() {
+        let sb = view_sandbox(Path::new("/tmp/bad\"peer"), Vec::new());
+        let args: Vec<String> = sb
+            .wrap_command("true", Path::new("/tmp"))
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.iter().any(|a| a.contains("sandbox error")), "{args:?}");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_sandbox_command() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: true,
             read_allow_paths: Vec::new(),
@@ -602,6 +731,7 @@ mod tests {
         // above its grant). Only reached under unrestricted reads, which
         // `supports_repo_git_write` gates.
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -646,6 +776,7 @@ mod tests {
 
         // Default (no repo_git_write): only the cwd subpath is writable, no global.
         let plain = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -676,6 +807,7 @@ mod tests {
         // `.git` READ `git commit` needs, so it must NOT be reported as
         // supporting the worktree flow (the pool gate falls back to scratch).
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec!["/opt/custom".to_string()],
@@ -694,6 +826,7 @@ mod tests {
     #[test]
     fn test_macos_sandbox_rejects_control_chars() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -719,6 +852,7 @@ mod tests {
     #[test]
     fn test_macos_sandbox_rejects_sbpl_metacharacters() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -752,6 +886,7 @@ mod tests {
     #[test]
     fn test_macos_sandbox_denies_network() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -776,6 +911,7 @@ mod tests {
     #[test]
     fn test_macos_sandbox_accepts_valid_path() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -793,6 +929,7 @@ mod tests {
     #[test]
     fn test_macos_sandbox_rejects_del_character() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -812,6 +949,7 @@ mod tests {
     #[test]
     fn should_use_global_file_read_when_no_read_paths() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -844,6 +982,7 @@ mod tests {
             .to_string();
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec!["/custom/path".to_string()],
@@ -892,6 +1031,7 @@ mod tests {
     #[test]
     fn should_reject_read_allow_paths_with_sbpl_metacharacters() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![
@@ -936,6 +1076,7 @@ mod tests {
     #[test]
     fn should_reject_read_allow_paths_with_parens() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec!["/path/with(parens)".to_string()],
@@ -964,6 +1105,7 @@ mod tests {
     #[test]
     fn should_reject_read_allow_paths_with_control_chars() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![
@@ -1009,6 +1151,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![],
@@ -1038,6 +1181,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![],
@@ -1074,6 +1218,7 @@ mod tests {
             .to_string();
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1114,6 +1259,7 @@ mod tests {
             .to_string();
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1149,6 +1295,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1196,6 +1343,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1373,6 +1521,7 @@ mod tests {
         let real_cwd = std::fs::canonicalize(cwd).expect("canonicalize cwd");
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1422,6 +1571,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![],
@@ -1450,6 +1600,7 @@ mod tests {
         let cwd = tmp.path();
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec![],
@@ -1481,6 +1632,7 @@ mod tests {
         std::fs::write(&secret_file, "top-secret-data").expect("write secret");
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: vec!["/nonexistent/path".to_string()],
@@ -1542,6 +1694,7 @@ mod tests {
             .to_string();
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1616,6 +1769,7 @@ mod tests {
         // path is simply not writable — and no injected rule appears.
         let tmp = tempfile::tempdir().expect("create temp dir");
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1662,6 +1816,7 @@ mod tests {
         std::fs::create_dir(cwd.join("cards")).expect("pre-create cards/");
 
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1729,6 +1884,7 @@ mod tests {
     #[test]
     fn toolchain_grants_emitted_with_workspace_write() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: super::super::ToolchainWriteGrants {
                 literals: vec!["/Users/t/.cargo/.package-cache".into()],
                 subpaths: vec![],
@@ -1773,6 +1929,7 @@ mod tests {
             (
                 "read-only workspace",
                 MacosSandbox {
+                    read_only_view: None,
                     toolchain_write_grants: grants.clone(),
                     allow_network: false,
                     read_allow_paths: Vec::new(),
@@ -1785,6 +1942,7 @@ mod tests {
             (
                 "write fence",
                 MacosSandbox {
+                    read_only_view: None,
                     toolchain_write_grants: grants.clone(),
                     allow_network: false,
                     read_allow_paths: Vec::new(),
@@ -1818,6 +1976,7 @@ mod tests {
     #[test]
     fn toolchains_keep_network_authoritative_and_do_not_redirect_cargo_home() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: super::super::ToolchainWriteGrants {
                 literals: vec!["/Users/t/.cargo/.package-cache".into()],
                 subpaths: vec![],
@@ -1866,6 +2025,7 @@ mod tests {
         let own = "/tmp/pool/abc123def456/slot-1";
         let other = "/tmp/pool/abc123def456/slot-2";
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1907,6 +2067,7 @@ mod tests {
     #[test]
     fn build_cache_slot_with_metachars_is_skipped_fail_closed() {
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: Default::default(),
             allow_network: false,
             read_allow_paths: Vec::new(),
@@ -1938,6 +2099,7 @@ mod tests {
     fn build_cache_slot_survives_a_write_fence() {
         let own = "/tmp/pool/abc123def456/slot-1";
         let sb = MacosSandbox {
+            read_only_view: None,
             toolchain_write_grants: super::super::toolchain_write_grants(false),
             allow_network: false,
             read_allow_paths: Vec::new(),

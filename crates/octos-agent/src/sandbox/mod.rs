@@ -167,6 +167,30 @@ pub struct SandboxConfig {
     /// only these globs" must not quietly regain toolchain caches.
     #[serde(default = "default_enabled")]
     pub allow_toolchains: bool,
+
+    /// UPCR-2026-034 `read_parent`: a request context's READ-ONLY view of
+    /// its app peer's folder, minus the other contexts' folders. Set by the
+    /// kernel for such a context's session, never from configuration.
+    ///
+    /// - macOS: `(allow file-read* (subpath <root>))`, then
+    ///   `(deny file-read* (subpath <excluded>))` for each excluded folder,
+    ///   then the cwd read is granted again (the last matching SBPL rule
+    ///   wins). No write rule is added: writes stay the cwd's.
+    /// - bwrap: `--ro-bind <root> <root>`, then `--tmpfs <excluded>` for each
+    ///   excluded folder, both before the cwd bind (which lands on top).
+    /// - Landlock, Docker, AppContainer: cannot hide a folder inside a
+    ///   granted one, so they add nothing (fail closed: the shell does not
+    ///   see the peer's folder; the file tools still do).
+    #[serde(skip)]
+    pub read_only_view: Option<Box<SandboxReadOnlyView>>,
+}
+
+/// See [`SandboxConfig::read_only_view`]. `root` and `excluded` are
+/// absolute; each excluded folder is strictly inside `root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxReadOnlyView {
+    pub root: PathBuf,
+    pub excluded: Vec<PathBuf>,
 }
 
 /// Default system paths that must be readable for shell commands to work.
@@ -370,6 +394,7 @@ impl Default for SandboxConfig {
             write_allow_globs: None,
             profile_name: None,
             allow_toolchains: true,
+            read_only_view: None,
         }
     }
 }
@@ -1109,6 +1134,7 @@ pub fn auto_sandbox_kind() -> (&'static str, bool) {
 fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dyn Sandbox> {
     match choice {
         SandboxBackendChoice::Macos => Box::new(MacosSandbox {
+            read_only_view: config.read_only_view.clone(),
             allow_network: config.allow_network,
             read_allow_paths: config.read_allow_paths.clone(),
             workspace_write: config.workspace_write,
@@ -1122,6 +1148,7 @@ fn build_backend(choice: SandboxBackendChoice, config: &SandboxConfig) -> Box<dy
             toolchain_write_grants: configured_toolchain_grants(config),
         }),
         SandboxBackendChoice::Bwrap => Box::new(BwrapSandbox {
+            read_only_view: config.read_only_view.clone(),
             allow_network: config.allow_network,
             workspace_write: fence_degraded_workspace_write(config, "bwrap"),
             repo_git_write: config.repo_git_write.clone(),
@@ -1451,6 +1478,7 @@ mod tests {
             read_allow_paths: Vec::new(),
             write_allow_globs: None,
             profile_name: None,
+            read_only_view: None,
         };
         let sb = create_sandbox(&config);
         let tmp = std::env::temp_dir();

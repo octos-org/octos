@@ -173,7 +173,7 @@ pub use role_template::{
     ROLE_TEST_WORKER, RoleTemplate, RoleTemplateSummary, SANDBOX_AUTO, SANDBOX_NONE,
     UnknownModelPreference,
 };
-pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
+pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, SandboxReadOnlyView, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use session_usage::{SessionUsageHandle, SessionUsageSnapshot, SharedSessionUsage};
 pub use skills::{SkillFilter, SkillInfo, SkillsLoader};
