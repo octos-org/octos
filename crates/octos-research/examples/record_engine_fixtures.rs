@@ -210,6 +210,15 @@ const CASES: &[Case] = &[
         source: Source::Live,
     },
     Case {
+        engine: "bing_news",
+        name: "news_zh",
+        query: "智能手机 AI 智能体",
+        langs: &["zh"],
+        since: None,
+        category: "news",
+        source: Source::Live,
+    },
+    Case {
         engine: "brave",
         name: "general_synthetic",
         query: "octos agent",
@@ -253,7 +262,9 @@ fn crate_dir() -> PathBuf {
 async fn main() {
     let only: Vec<String> = std::env::args().skip(1).collect();
     for case in CASES {
-        if !only.is_empty() && !only.iter().any(|o| o == case.engine) {
+        // `<engine>` records its cases, `<engine>/<case>` one of them.
+        let path = format!("{}/{}", case.engine, case.name);
+        if !only.is_empty() && !only.iter().any(|o| o == case.engine || *o == path) {
             continue;
         }
         let replay = match case.source {

@@ -1,7 +1,7 @@
 // Bing News results page (www.bing.com/news/search).
 // Written from the page itself and Microsoft's search-options help page
-// (docs_url): `q` query, `setlang` language, `cc` country, `qft` time
-// filter. Each story is a `div.news-card` carrying `data-url`,
+// (docs_url): `q` query, `setlang` language, `cc` country (Hong Kong for
+// mainland China, which Bing News does not serve), `qft` time filter. Each story is a `div.news-card` carrying `data-url`,
 // `data-title` and `data-author`; its age is an aria-label such as
 // "6 hours ago", turned into a time from `opts.now`. A challenge page is
 // reported, not worked around.
@@ -22,6 +22,13 @@ fn build_request(query, opts) {
         opts.lang.region
     } else {
         nil
+    }
+    // Bing News has no mainland China market: `cc=CN` redirects to the
+    // home page, and Chinese without a country finds nothing. Hong Kong's
+    // market serves Chinese news with the mainland publishers' own links
+    // (sina.com.cn, qq.com, sohu.com).
+    if opts.lang != nil && opts.lang.primary == "zh" && (cc == nil || cc == "CN") {
+        cc = "HK"
     }
     if cc != nil {
         array.push(params, ["cc", cc])
@@ -103,7 +110,10 @@ fn parse_response(response, opts) {
         if r.url == nil || r.title == nil || !text.starts_with(r.url, "http") {
             continue
         }
-        array.push(out, {url: r.url, title: r.title, snippet: r.snippet, source: r.source, published: age_to_unix(r.age, opts.now.unix)})
+        // Bing bolds the query's words inside `data-title` (`<strong>`),
+        // seen in Chinese results: the headline is its text.
+        let title = markup.text({html: r.title}).text
+        array.push(out, {url: r.url, title: title, snippet: r.snippet, source: r.source, published: age_to_unix(r.age, opts.now.unix)})
     }
     return out
 }

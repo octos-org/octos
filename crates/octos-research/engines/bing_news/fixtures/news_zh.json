@@ -1,0 +1,51 @@
+{
+  "body_file": "news_zh.body",
+  "expect": [
+    {
+      "lang": "zh",
+      "published": null,
+      "source": "新浪财经",
+      "title": "高通，押注智能体AI",
+      "url": "https://finance.sina.com.cn/wm/2026-09-24/doc-inisxtat5107706.shtml"
+    },
+    {
+      "lang": "zh",
+      "published": null,
+      "source": "腾讯网",
+      "title": "努比亚AI智能体手机将至，中兴能否靠豆包翻身？",
+      "url": "https://news.qq.com/rain/a/20260713A05V6000?adChannelId=tech"
+    },
+    {
+      "lang": "zh",
+      "published": null,
+      "source": "新浪财经",
+      "title": "骁龙引领智能体AI时代，凭借两款全球最快移动SoC赋能下一代智能手机",
+      "url": "https://finance.sina.com.cn/tech/roll/2026-09-23/doc-inisvcpz8505027.shtml"
+    },
+    {
+      "lang": "zh",
+      "published": null,
+      "source": "腾讯网",
+      "title": "智能体手机集中落地，AI能否激活存量手机市场？",
+      "url": "https://news.qq.com/rain/a/20260714A09X3M00"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "text/html"
+    },
+    "method": "GET",
+    "url": "https://www.bing.com/news/search?q=%E6%99%BA%E8%83%BD%E6%89%8B%E6%9C%BA+AI+%E6%99%BA%E8%83%BD%E4%BD%93&setlang=zh&cc=HK"
+  },
+  "recorded": "live, 2026-09-30",
+  "request": {
+    "category": "news",
+    "count": 5,
+    "langs": [
+      "zh"
+    ],
+    "now": "2026-09-30T05:00:00Z",
+    "query": "智能手机 AI 智能体",
+    "since": null
+  }
+}
