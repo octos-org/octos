@@ -59,6 +59,7 @@ pub mod subagent_output;
 pub mod subagent_summary;
 mod subprocess_env;
 pub use subprocess_env::{register_secret_env_names, sanitize_default_subprocess_env};
+pub(crate) mod private_git;
 pub mod summarizer;
 pub mod swarm;
 pub mod task_supervisor;
@@ -173,7 +174,7 @@ pub use role_template::{
     ROLE_TEST_WORKER, RoleTemplate, RoleTemplateSummary, SANDBOX_AUTO, SANDBOX_NONE,
     UnknownModelPreference,
 };
-pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, create_sandbox};
+pub use sandbox::{Sandbox, SandboxConfig, SandboxMode, SandboxReadOnlyView, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use session_usage::{SessionUsageHandle, SessionUsageSnapshot, SharedSessionUsage};
 pub use skills::{SkillFilter, SkillInfo, SkillsLoader};

@@ -162,6 +162,17 @@ pub(crate) struct PeerContextBinding {
     /// shown its recent turns read-only (and the reverse).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) share_history: Option<super::shared_history::ShareHistory>,
+    /// Set by `peer/context/open` with `read_parent: true` (host only): the
+    /// context's turns may READ the peer's folder, never another context's
+    /// folder, and still write only their own. Fixed at creation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) read_parent: bool,
+}
+
+/// The folder every request context of a peer rooted at `peer_root` lives
+/// in; a `read_parent` context's view of `peer_root` excludes it.
+pub(crate) fn contexts_folder(peer_root: &Path) -> PathBuf {
+    peer_root.join("contexts")
 }
 
 /// Validate a context id: `[a-z0-9][a-z0-9-]{0,63}`.
@@ -309,6 +320,9 @@ pub(crate) enum SessionAppBinding {
     Bound {
         cwd: PathBuf,
         memory_namespace: String,
+        /// A `read_parent` request context: the peer's folder, which its
+        /// turns may read (minus [`contexts_folder`]) but not write.
+        read_view: Option<PathBuf>,
     },
     /// Must not run (closed peer or context, or a context with no binding).
     Refused(String),
@@ -355,6 +369,12 @@ pub(crate) fn resolve_session_app_binding(
             Some(binding) => SessionAppBinding::Bound {
                 cwd: binding.cwd,
                 memory_namespace: binding.memory_namespace,
+                read_view: binding.read_parent.then(|| {
+                    let peer = read_peer_host_binding(peers_root, slug)
+                        .map(|peer| peer.cwd)
+                        .unwrap_or_default();
+                    dunce::canonicalize(&peer).unwrap_or(peer)
+                }),
             },
             None => SessionAppBinding::Refused(format!(
                 "request context '{context_id}' of peer '{slug}' was never opened"
@@ -372,6 +392,7 @@ pub(crate) fn resolve_session_app_binding(
             return SessionAppBinding::Bound {
                 cwd: binding.cwd,
                 memory_namespace: binding.memory_namespace,
+                read_view: None,
             };
         }
         // Fail closed on a torn or tampered peer dir that still carries a
@@ -444,9 +465,45 @@ mod tests {
             resolve_session_app_binding(&peers, &key("peer-rinx")),
             SessionAppBinding::Bound {
                 cwd: PathBuf::from("/ws/rinx"),
-                memory_namespace: "app/rinx/acct-1".into()
+                memory_namespace: "app/rinx/acct-1".into(),
+                read_view: None,
             }
         );
+    }
+
+    #[test]
+    fn should_bind_a_read_parent_context_with_the_peer_folder_as_its_read_view_when_it_was_opened_so()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers = tmp.path().join("peers");
+        stage(&peers, "rinx", Path::new("/ws/rinx"), "app/rinx/acct-1");
+        let binding = |read_parent| PeerContextBinding {
+            version: 1,
+            cwd: PathBuf::from("/ws/rinx/contexts/app-a"),
+            memory_namespace: context_memory_namespace("app/rinx/acct-1", "app-a"),
+            closed: false,
+            share_history: None,
+            read_parent,
+        };
+        write_context_binding(&peers, "rinx", "app-a", &binding(true)).unwrap();
+        write_context_binding(&peers, "rinx", "app-b", &binding(false)).unwrap();
+        assert!(matches!(
+            resolve_session_app_binding(&peers, &key("peerctx-rinx.app-a")),
+            SessionAppBinding::Bound { read_view: Some(root), .. } if root == Path::new("/ws/rinx")
+        ));
+        assert!(matches!(
+            resolve_session_app_binding(&peers, &key("peerctx-rinx.app-b")),
+            SessionAppBinding::Bound {
+                read_view: None,
+                ..
+            }
+        ));
+        // A binding written before the field existed reads as no view.
+        let old: PeerContextBinding = serde_json::from_str(
+            r#"{"version":1,"cwd":"/ws/rinx/contexts/x","memory_namespace":"n","closed":false}"#,
+        )
+        .unwrap();
+        assert!(!old.read_parent);
     }
 
     #[test]
@@ -476,13 +533,15 @@ mod tests {
             memory_namespace: context_memory_namespace("app/rinx/acct-1", "app-a"),
             closed: false,
             share_history: None,
+            read_parent: false,
         };
         write_context_binding(&peers, "rinx", "app-a", &binding).unwrap();
         assert_eq!(
             resolve_session_app_binding(&peers, &key("peerctx-rinx.app-a")),
             SessionAppBinding::Bound {
                 cwd: PathBuf::from("/ws/rinx/contexts/app-a"),
-                memory_namespace: "app/rinx/acct-1/ctx-app-a".into()
+                memory_namespace: "app/rinx/acct-1/ctx-app-a".into(),
+                read_view: None,
             }
         );
         write_context_binding(

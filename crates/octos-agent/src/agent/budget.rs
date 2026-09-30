@@ -513,9 +513,9 @@ mod tests {
 
 /// #27e — run `git <args>` in `dir`, returning success + trimmed stdout.
 fn git_in(dir: &std::path::Path, args: &[&str]) -> Option<String> {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    // Kernel-side git in a repo the agent can write: repository-scope hooks,
+    // fsmonitor and filter drivers are overridden (see `agent_repo_git`).
+    octos_core::agent_repo_git::agent_repo_git(dir)
         .args(args)
         .output()
         .ok()
@@ -791,6 +791,57 @@ mod budget_checkpoint_tests {
                 .status()
                 .unwrap()
                 .success()
+        );
+    }
+
+    /// Poison `dir`'s repository config and hooks the way a sandboxed agent
+    /// could; every program writes a marker into `markers`.
+    #[cfg(unix)]
+    fn poison_repo(dir: &std::path::Path, markers: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let touch = |name: &str| format!("touch '{}'", markers.join(name).display());
+        let config = dir.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "[filter \"p\"]\n\tclean = \"{}; cat\"\n[core]\n\tfsmonitor = \"{}\"\n",
+            touch("CLEAN"),
+            touch("FSMONITOR")
+        ));
+        std::fs::write(&config, text).unwrap();
+        std::fs::write(dir.join(".gitattributes"), "* filter=p\n").unwrap();
+        for hook in ["pre-commit", "post-commit", "commit-msg"] {
+            let path = dir.join(".git/hooks").join(hook);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("#!/bin/sh\n{}\n", touch(hook))).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_not_run_repo_hooks_or_filters_when_checkpointing_budget_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        poison_repo(dir.path(), markers.path());
+        std::fs::write(dir.path().join("partial.rs"), "// half-done\n").unwrap();
+
+        checkpoint_budget_exhaustion(
+            Some(dir.path()),
+            &BudgetStop::MaxIterations { limit: 50 },
+            50,
+        )
+        .expect("dirty wt checkpoints");
+
+        let log = git_in(dir.path(), &["log", "--oneline"]).unwrap();
+        assert!(log.contains("#27e"), "checkpoint commit present: {log}");
+        let found: Vec<_> = std::fs::read_dir(markers.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            found.is_empty(),
+            "agent-controlled git config executed: {found:?}"
         );
     }
 

@@ -120,6 +120,16 @@ impl Tool for DiffEditTool {
             }
         };
 
+        // Never let a file tool touch a `.git` directory: its config/hooks
+        // decide what the kernel's own git invocations execute.
+        if let Err(reason) = super::refuse_git_internal_path(&path) {
+            return Ok(ToolResult {
+                output: reason,
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // Read file (O_NOFOLLOW atomically rejects symlinks)
         let content = match super::read_no_follow(&path).await {
             Ok(c) => c,
@@ -395,6 +405,27 @@ pub(crate) fn matches_at(lines: &[String], pattern: &[&str], start: usize) -> bo
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn should_refuse_diff_edit_when_path_enters_a_git_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sites/demo/.git")).unwrap();
+        std::fs::write(dir.path().join("sites/demo/.git/config"), "[core]\n").unwrap();
+        let tool = DiffEditTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "sites/demo/.git/config",
+                "diff": "--- a/config\n+++ b/config\n@@ -1 +1,2 @@\n [core]\n+\tfsmonitor = touch PWNED\n",
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success, "{}", result.output);
+        assert!(result.output.contains(".git"), "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sites/demo/.git/config")).unwrap(),
+            "[core]\n"
+        );
+    }
     use super::*;
 
     #[test]

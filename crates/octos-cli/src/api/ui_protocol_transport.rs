@@ -15566,6 +15566,13 @@ struct RawPeerContextParams {
     /// may set it. Fixed at creation: a re-open must restate it.
     #[serde(default)]
     share_history: Option<crate::peers::shared_history::ShareHistoryParams>,
+    /// UPCR-2026-034 "Read-only view of the peer's folder": `true` lets the
+    /// context's turns READ the peer's folder (never another context's
+    /// folder under `contexts/`), while writes stay fenced to the context's
+    /// own folder. Only the peer's host connection may set it. Fixed at
+    /// creation: a re-open must restate it.
+    #[serde(default)]
+    read_parent: bool,
 }
 
 fn host_peer_context_prelude(
@@ -15661,6 +15668,22 @@ fn raw_peer_context_open_from(
                 .to_owned(),
         ));
     }
+    // A read view of the peer's folder widens what the context's turns can
+    // read: like shared history, only the peer's host may grant it.
+    if params.read_parent
+        && !caller.is_some_and(|ws| {
+            !ws.is_external()
+                && crate::peers::host_tools::host_route_connection(&peers_root, &slug)
+                    == Some(ws.connection_id.0)
+        })
+    {
+        return Err(host_peer_error(
+            "read_parent_host_only",
+            "only the connection that registered the peer's tools may open a context with \
+             read_parent"
+                .to_owned(),
+        ));
+    }
     let namespace = crate::runtime::memory_namespace::validate_memory_namespace(
         &context_memory_namespace(&peer.memory_namespace, &context_id),
     )
@@ -15745,6 +15768,16 @@ fn raw_peer_context_open_from(
                     format!("request context '{context_id}' is bound to another workspace"),
                 ));
             }
+            if existing.read_parent != params.read_parent {
+                return Err(host_peer_error(
+                    "peer_binding_mismatch",
+                    format!(
+                        "request context '{context_id}' was opened with read_parent: {}; open a \
+                         new context id",
+                        existing.read_parent
+                    ),
+                ));
+            }
             if existing.share_history != share_history {
                 return Err(host_peer_error(
                     "peer_binding_mismatch",
@@ -15767,6 +15800,7 @@ fn raw_peer_context_open_from(
                     memory_namespace: namespace.clone(),
                     closed: false,
                     share_history,
+                    read_parent: params.read_parent,
                 },
             )
             .map_err(RpcError::internal_error)?;
@@ -15790,6 +15824,7 @@ fn raw_peer_context_open_from(
         "profile_id": profile_id,
         "created": created,
         "share_history": binding.share_history,
+        "read_parent": binding.read_parent,
     }))
 }
 
@@ -18686,6 +18721,19 @@ fn build_peer_close_callback(
         // that gates `peer_send_input`, so only the session that staged the
         // peer may retire it.
         peer_send_input_authorized(&peers_root, &slug, &origin_session)?;
+        // A host-owned app peer's lifetime belongs to its host app (ADR 0004,
+        // UPCR-2026-034): the app resumes it by its binding, and a close is
+        // permanent — the app could then neither resume it (`peer_closed`)
+        // nor stage a replacement on the same folder
+        // (`peer_binding_conflict`). The system agent is its recorded
+        // originator, so the originator check above does not stop its model;
+        // refuse here, before any marker, queue or wire change.
+        if crate::peers::app_binding::peer_is_host_owned(&peers_root, &slug) {
+            return Err(format!(
+                "peer '{slug}' belongs to its host app, which owns its lifetime; \
+                 peer_close cannot close it (the app closes or purges it itself)"
+            ));
+        }
         // Resolve the REAL staged dir (safe slug, NOT a symlink, has brief.md)
         // and write ONLY under it — a deleted or symlinked peer cannot be
         // closed, so the marker can never land outside `peers/`.
@@ -25449,7 +25497,10 @@ async fn handle_turn_start_with_accept(
             return false;
         }
     };
-    if let Err(error) = claim_peer_input_turn(state, &params.session_id, &params.turn_id) {
+    // Refuse early a turn id whose input the host already refused; the input
+    // itself is answered only once the turn is admitted (below), so a start
+    // refused for any other reason leaves it open for `peer/input/reject`.
+    if let Err(error) = check_peer_input_turn(state, &params.session_id, &params.turn_id) {
         let _ = send_rpc_error(ws, Some(id), error);
         return false;
     }
@@ -25672,7 +25723,7 @@ async fn handle_turn_start_with_accept(
     // lock scope that makes the decision (never by re-acquiring the registry
     // afterwards, which could name a different turn) and it costs no new
     // await under the lock — it is a clone of a field already in hand.
-    let occupied_by = {
+    let admission: Result<(), RpcError> = {
         let mut active = active_turns.lock().await;
         // Allow replacing a `Terminal(_)` entry — the prior turn is finished;
         // we keep the entry only so a follow-up `turn/interrupt` can return
@@ -25681,7 +25732,15 @@ async fn handle_turn_start_with_accept(
         let occupied =
             turn_admission_refusal(&active, &session_id, &turn_id, state.host_managed.is_some())
                 .await;
-        if occupied.is_none() {
+        // UPCR-2026-035: the turn is admitted, so it now answers the
+        // `peer/input` that handed its id out — decided under the same lock,
+        // so a concurrent `peer/input/reject` either lands first (and this
+        // start is refused) or finds the input started.
+        let admission = match occupied {
+            Some(refusal) => Err(refusal.into_error(ws.is_external())),
+            None => claim_peer_input_turn(state, &session_id, &turn_id),
+        };
+        if admission.is_ok() {
             // Client-supplied turn ids carry no uniqueness guarantee — a
             // reused id must not inherit a prior turn's `session/btw` draft.
             btw_live_draft_clear(&session_id, &turn_id);
@@ -25698,11 +25757,11 @@ async fn handle_turn_start_with_accept(
                 },
             );
         }
-        occupied
+        admission
     };
-    if let Some(refusal) = occupied_by {
+    if let Err(error) = admission {
         handle.abort();
-        let _ = send_rpc_error(ws, Some(id), refusal.into_error(ws.is_external()));
+        let _ = send_rpc_error(ws, Some(id), error);
         return false;
     }
     // Admitted: remember who speaks (the turn's terminal labels its
@@ -25748,31 +25807,45 @@ async fn handle_turn_start_with_accept(
     true
 }
 
+/// The host-owned peer `slug` of `session_id`'s topic (`peer-<slug>`), and
+/// its profile's peers root, when the session is a peer's own session.
+fn peer_input_session(state: &Arc<AppState>, session_id: &SessionKey) -> Option<(PathBuf, String)> {
+    let slug = session_id
+        .topic()
+        .and_then(|topic| topic.strip_prefix("peer-"))
+        .filter(|slug| peer_slug_is_safe(slug))?;
+    let runtime = resolve_session_profile_runtime(state, session_id.profile_id())?;
+    Some((runtime.data_dir.join("peers"), slug.to_owned()))
+}
+
+/// Refuse (without answering anything) a `turn/start` whose turn id belongs
+/// to a `peer/input` the host already refused.
+fn check_peer_input_turn(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) -> Result<(), RpcError> {
+    let Some((peers_root, slug)) = peer_input_session(state, session_id) else {
+        return Ok(());
+    };
+    crate::peers::host_tools::check_peer_input_turn(&peers_root, &slug, &turn_id.0.to_string())
+        .map_err(|err| host_peer_error(err.kind, err.message))
+}
+
 /// A `turn/start` on a host-owned peer's own session with a turn id the
-/// kernel handed out in `peer/input` answers that input (UPCR-2026-035); if
-/// the host refused the input (`peer/input/reject`), the turn id is released
-/// and the start is refused.
+/// kernel handed out in `peer/input` answers that input (UPCR-2026-035) once
+/// it is ADMITTED; if the host refused the input (`peer/input/reject`), the
+/// turn id is released and the start is refused.
 fn claim_peer_input_turn(
     state: &Arc<AppState>,
     session_id: &SessionKey,
     turn_id: &TurnId,
 ) -> Result<(), RpcError> {
-    let Some(slug) = session_id
-        .topic()
-        .and_then(|topic| topic.strip_prefix("peer-"))
-        .filter(|slug| peer_slug_is_safe(slug))
-    else {
+    let Some((peers_root, slug)) = peer_input_session(state, session_id) else {
         return Ok(());
     };
-    let Some(runtime) = resolve_session_profile_runtime(state, session_id.profile_id()) else {
-        return Ok(());
-    };
-    crate::peers::host_tools::start_peer_input_turn(
-        &runtime.data_dir.join("peers"),
-        slug,
-        &turn_id.0.to_string(),
-    )
-    .map_err(|err| host_peer_error(err.kind, err.message))
+    crate::peers::host_tools::start_peer_input_turn(&peers_root, &slug, &turn_id.0.to_string())
+        .map_err(|err| host_peer_error(err.kind, err.message))
 }
 
 /// Turn starts currently being admitted in this process (`turn/start`,

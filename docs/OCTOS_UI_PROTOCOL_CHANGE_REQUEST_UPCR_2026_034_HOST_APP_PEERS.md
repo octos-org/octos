@@ -12,7 +12,9 @@
   additive `turn/start` `origin` on a host-owned app peer's own session (the
   shared peer conversation, amended 2026-09-28); an additive
   `peer/context/open` `share_history` (the parallel person context with
-  shared history, amended 2026-09-29)
+  shared history, amended 2026-09-29); an additive `peer/context/open`
+  `read_parent` (a read-only view of the peer's folder, amended 2026-09-30,
+  #2603)
 - Origin: Rinx ADR 0007, "Host-owned Octos app peers and Rinx deployment
   modes" (OctoSense shells host apps such as Rinx on one shared kernel)
 
@@ -92,9 +94,11 @@ transcript, a workspace inside the peer's, and a child memory namespace. It
 is not an agent: it cannot hand off peers, has no blackboard entry (unless
 it shares history, below) and runs on its peer's model lane.
 
-`peer/context/open {session_id, peer, context_id, host_token, cwd?, profile_id?, share_history?}` →
+`peer/context/open {session_id, peer, context_id, host_token, cwd?, profile_id?, share_history?, read_parent?}` →
 `{session_id, topic, slug, context_id, cwd, memory_namespace, model,
-profile_id, created, share_history}`. `share_history` makes the context the
+profile_id, created, share_history, read_parent}`. `read_parent` (boolean,
+default `false`) gives the context's turns a read-only view of the peer's
+folder (see "Read-only view of the peer's folder" below). `share_history` makes the context the
 person's lane of the peer (see "Parallel person context with shared
 history" below); without it a context is exactly as described here. Originator plus host token; `context_id` is
 `[a-z0-9][a-z0-9-]{0,63}`. The session key is derived by the kernel:
@@ -117,7 +121,7 @@ reopened (`peer_context_closed`); hosts mint a new id per client generation.
 
 Other kinds: `peer_not_found`, `peer_not_host_bound`,
 `peer_context_not_found`, `peer_context_namespace_too_long`,
-`share_history_host_only`, `peer_binding_mismatch`.
+`share_history_host_only`, `read_parent_host_only`, `peer_binding_mismatch`.
 
 ### Session enforcement
 
@@ -141,6 +145,55 @@ For a session whose topic is `peer-<slug>` of a host-owned peer, or any
   sessions, and spawned children inherit the namespaced episode store.
 - **Background extraction**: the profile's memory-refresh sweep never reads
   a bound session's transcript.
+
+### Read-only view of the peer's folder (`read_parent`, #2603)
+
+By default a request context's turns are fenced to its own folder
+`<peer cwd>/contexts/<context_id>/` and cannot read the account data beside
+it. `peer/context/open` with `read_parent: true` opens the context with a
+read-only view of the peer's folder:
+
+- **Reads**: `read_file`, `list_dir`, `glob` and `grep` (and a plugin
+  tool's read-intent path arguments) accept paths anywhere under the peer's
+  folder. Paths are absolute (the peer's `cwd` from `peer/prepare`); a
+  relative path still resolves against the context's own folder and `..` is
+  still refused.
+- **Other contexts stay unreadable**: everything under `<peer cwd>/contexts/`
+  except the context's own folder is outside the view. A read is refused,
+  `list_dir` of the peer's folder does not show `contexts`, and `glob` /
+  `grep` walking the peer's folder drop every entry under another context's
+  folder. A symlink in the peer's folder that resolves into another
+  context's folder is refused (classification is canonical).
+- **Writes stay the context's own**: `write_file`, `edit_file`,
+  `apply_patch`, `diff_edit` and plugin write paths refuse the peer's folder
+  ("Writes outside this context's own folder are not permitted").
+- **Other file tools** (`view_image`, `view_video`, `git`, the workspace
+  history tools, `code_structure`) keep the context's own folder: they do
+  not get the view.
+- **Shell** (where the profile offers it) runs under the session's sandbox,
+  which carries the same view:
+  - macOS (`sandbox-exec`): `(allow file-read* (subpath <peer>))`, then
+    `(deny file-read* (subpath <peer>/contexts))`, then the context's own
+    folder is allowed again (the last matching SBPL rule wins). This applies
+    in both read modes (the default global reads and a `read_allow_paths`
+    list), so with `read_parent` the other contexts' folders are unreadable
+    to the shell even under global reads. No write rule is added.
+  - bwrap: `--ro-bind <peer> <peer>` and `--tmpfs <peer>/contexts`, before the
+    context's own folder is bound on top.
+  - Landlock helper, Docker, Windows AppContainer: these cannot hide a
+    folder inside a granted one, so they add nothing (fail closed: the shell
+    does not see the peer's folder there; the file tools still do).
+  Without `read_parent`, every sandbox is exactly as before.
+
+Only the connection that registered the peer's tools (its host route, never
+an external client of a host-managed server) may set it; any other caller,
+including a call with no connection, is refused with
+`read_parent_host_only` before anything is recorded. The flag is part of the
+durable context binding (a binding written before this field reads as
+`false`) and is fixed at creation: a re-open must restate it, and a
+different value is refused with `peer_binding_mismatch`. The peer's own
+session is unchanged (it reads everything under its folder, every context's
+folder included).
 
 ### Approvals belong to the person
 
@@ -470,3 +523,19 @@ break tool-call pairing and compaction.
   dropped, speakers, merge, the byte budget; running rows after finished
   rows, their caps, no double showing while a turn commits, the registry's
   lifetime, the finished-only block unchanged)
+- Read-only view of the peer's folder (#2603): octos-cli
+  `peer_host_tools_tests`
+  `should_read_the_peer_folder_but_not_another_context_when_the_context_has_read_parent`
+  (`read_file`, `list_dir`, `glob`, `grep` read the peer's folder; another
+  context's folder is refused by each of them and through a symlink; writes
+  and edits of the peer's folder are refused, the context's own folder stays
+  writable; the session's sandbox carries the view),
+  `should_keep_the_context_fenced_to_its_own_folder_when_read_parent_is_not_set`,
+  `should_refuse_read_parent_when_the_caller_is_not_the_peers_host`,
+  `should_refuse_a_reopen_when_it_changes_read_parent`; octos-core
+  `session_scope` view tests; octos-agent sandbox tests
+  `should_bind_the_peer_folder_read_only_and_hide_other_contexts_when_the_context_reads_its_parent`
+  (bwrap arguments) and, on macOS,
+  `should_let_the_shell_read_the_peer_folder_but_not_other_contexts_when_the_context_reads_its_parent`
+  (runs `sandbox-exec` in both read modes); `peers::app_binding`
+  `should_bind_a_read_parent_context_with_the_peer_folder_as_its_read_view_when_it_was_opened_so`

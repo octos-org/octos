@@ -1086,6 +1086,65 @@ pub fn resolve_path_with_scope(
     Ok(resolved)
 }
 
+/// Refuse any path that reaches into a git directory (`.git` as ANY path
+/// component). The kernel runs `git` over agent-writable trees (workspace
+/// snapshots, history tools, receipts), and a repository's `config`,
+/// `hooks/` and `info/attributes` decide which programs git executes — a
+/// model that could write `sites/x/.git/config` could make the kernel run a
+/// clean filter, fsmonitor or hook of its choosing. File tools therefore
+/// never create, modify, move or delete anything inside a `.git`.
+///
+/// Judged on the lexical path and, when an ancestor exists, on its canonical
+/// form (so a symlink pointing into a `.git` does not slip past). Matching is
+/// case-insensitive and ignores the trailing dots/spaces and `GIT~1` short
+/// name NTFS/APFS normalise away, the same spellings git itself refuses.
+pub fn refuse_git_internal_path(path: &Path) -> std::result::Result<(), String> {
+    fn is_git_dir_name(name: &std::ffi::OsStr) -> bool {
+        let lossy = name.to_string_lossy();
+        let head = lossy.split(':').next().unwrap_or("");
+        let trimmed = head.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+        trimmed == ".git" || trimmed == "git~1"
+    }
+    fn has_git_component(path: &Path) -> bool {
+        path.components()
+            .any(|c| matches!(c, Component::Normal(name) if is_git_dir_name(name)))
+    }
+    let refused = || {
+        Err(format!(
+            "writes into a .git directory are not permitted: {}",
+            octos_core::truncated_utf8(&path.display().to_string(), 200, "…")
+        ))
+    };
+    if has_git_component(path) || has_git_component(&normalize_lexical(path)) {
+        return refused();
+    }
+    // Canonical check: the deepest existing ancestor, resolved, plus the
+    // not-yet-existing tail.
+    let mut existing = path.to_path_buf();
+    let mut tail = Vec::new();
+    while !existing.as_os_str().is_empty() && std::fs::symlink_metadata(&existing).is_err() {
+        match (
+            existing.file_name().map(|n| n.to_owned()),
+            existing.parent(),
+        ) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                existing = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+    if let Ok(mut real) = std::fs::canonicalize(&existing) {
+        for name in tail.iter().rev() {
+            real.push(name);
+        }
+        if has_git_component(&real) {
+            return refused();
+        }
+    }
+    Ok(())
+}
+
 /// A process's private view: anything under `/proc/self`, `/proc/thread-self`
 /// or `/proc/<pid>` (environment, command line, `fd/`, `root/`, `cwd`,
 /// `mem`, …) and `/dev/fd`, `/dev/std*`. No file tool opens these in any
@@ -1281,6 +1340,15 @@ fn resolve_for_scope(
         PathClassification::InSkillDir { .. } => {
             if for_write {
                 Err("Writes to plugin skill directories are not permitted")
+            } else {
+                Ok(lex_normalised)
+            }
+        }
+        // UPCR-2026-034 `read_parent`: a request context reads its peer's
+        // folder; it never writes there.
+        PathClassification::InReadOnlyView { .. } => {
+            if for_write {
+                Err("Writes outside this context's own folder are not permitted")
             } else {
                 Ok(lex_normalised)
             }
@@ -1561,6 +1629,12 @@ pub(crate) async fn read_no_follow_with_meta(path: &Path) -> std::io::Result<(St
 ///
 /// Eliminates the TOCTOU race between `reject_symlink` and `tokio::fs::write`.
 pub async fn write_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if let Err(reason) = refuse_git_internal_path(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            reason,
+        ));
+    }
     let path = path.to_owned();
     let content = content.to_owned();
     tokio::task::spawn_blocking(move || {
@@ -1620,6 +1694,12 @@ pub(crate) async fn write_no_follow_checked(
     content: &[u8],
     expected: crate::tools::read_window::ViewEpoch,
 ) -> std::io::Result<CheckedWrite> {
+    if let Err(reason) = refuse_git_internal_path(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            reason,
+        ));
+    }
     let path = path.to_owned();
     let content = content.to_owned();
     tokio::task::spawn_blocking(move || {
@@ -1692,6 +1772,50 @@ pub fn file_io_error(e: std::io::Error, display_path: &str) -> ToolResult {
 
 #[cfg(test)]
 mod nofollow_tests {
+
+    #[test]
+    fn should_flag_git_internal_paths_when_any_component_is_a_git_dir() {
+        for p in [
+            "/w/.git/config",
+            "/w/sites/demo/.git/hooks/pre-commit",
+            "/w/sites/demo/.GIT/config",
+            "/w/sites/demo/.git./config",
+            "/w/sites/demo/GIT~1/config",
+            "/w/.git",
+        ] {
+            assert!(refuse_git_internal_path(Path::new(p)).is_err(), "{p}");
+        }
+        for p in [
+            "/w/sites/demo/index.html",
+            "/w/.gitignore",
+            "/w/.github/x.yml",
+            "/w/a.git/x",
+        ] {
+            assert!(refuse_git_internal_path(Path::new(p)).is_ok(), "{p}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_flag_git_internal_paths_when_an_ancestor_symlink_points_into_git() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("sites/demo/.git")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("sites/demo/.git"), dir.path().join("link"))
+            .unwrap();
+        assert!(refuse_git_internal_path(&dir.path().join("link/config")).is_err());
+    }
+
+    #[tokio::test]
+    async fn should_refuse_write_no_follow_when_path_is_git_internal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        assert!(
+            write_no_follow(&dir.path().join(".git/config"), b"x")
+                .await
+                .is_err()
+        );
+        assert!(!dir.path().join(".git/config").exists());
+    }
     use super::*;
 
     #[tokio::test]

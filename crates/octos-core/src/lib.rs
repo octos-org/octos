@@ -7,6 +7,7 @@
 //! - Context and result types
 
 pub mod abort;
+pub mod agent_repo_git;
 pub mod app_ui;
 pub mod app_ui_codec;
 pub mod env_hygiene;
@@ -36,9 +37,9 @@ pub use git_worktree::{
 pub use message::AgentMessage;
 pub use session_scope::{
     DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES, MULTI_TENANT_USERS_DIR_NAME,
-    MULTI_TENANT_WORKSPACE_DIR_NAME, PathClassification, SESSION_SCOPE_SCHEMA_VERSION, ScopeMode,
-    SessionScope, SessionScopeError, canonical_root_lossy, canonicalize_lossy,
-    canonicalize_skill_read_zones, is_safe_session_id,
+    MULTI_TENANT_WORKSPACE_DIR_NAME, PathClassification, ReadOnlyView,
+    SESSION_SCOPE_SCHEMA_VERSION, ScopeMode, SessionScope, SessionScopeError, canonical_root_lossy,
+    canonicalize_lossy, canonicalize_skill_read_zones, is_safe_session_id,
 };
 pub use task::{
     DecisionRecord, FileRecord, SESSION_SUMMARY_SCHEMA_VERSION, STALE_DECISION_PREFIX,

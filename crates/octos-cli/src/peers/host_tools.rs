@@ -1468,8 +1468,38 @@ fn input_error(kind: &'static str, message: String) -> CompleteError {
     CompleteError { kind, message }
 }
 
+/// Would a `turn/start` with `turn_id` on the host-owned peer `slug`'s own
+/// session be refused because the host refused its input? Changes nothing:
+/// the input is answered only by [`start_peer_input_turn`], once the turn is
+/// actually admitted, so a start the kernel refuses for any other reason
+/// (a turn in progress, a reused turn id, a budget, a bad request) leaves the
+/// input open for `peer/input/reject`.
+pub(crate) fn check_peer_input_turn(
+    peers_root: &Path,
+    slug: &str,
+    turn_id: &str,
+) -> Result<(), CompleteError> {
+    let ledger = INPUT_LEDGER.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(input_id) = ledger.by_turn.get(&InputLedger::turn_key(
+        &route_key(peers_root, slug),
+        turn_id,
+    )) else {
+        return Ok(());
+    };
+    match ledger.entries.get(input_id).map(|entry| entry.answer) {
+        Some(InputAnswer::Rejected) => Err(input_error(
+            "peer_input_rejected",
+            format!(
+                "turn '{turn_id}' was handed out for input '{input_id}', which the app refused; \
+                 it cannot be started"
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// A `turn/start` on the host-owned peer `slug`'s own session with
-/// `turn_id`. If the kernel handed that turn id out in a `peer/input`, the
+/// `turn_id`, at the moment it is admitted. If the kernel handed that turn id out in a `peer/input`, the
 /// input counts as answered (it can no longer be refused), unless the host
 /// already refused it: then its turn id is released and the start is
 /// refused (`peer_input_rejected`).

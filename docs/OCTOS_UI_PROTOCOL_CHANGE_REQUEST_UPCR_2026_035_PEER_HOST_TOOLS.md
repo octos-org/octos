@@ -305,8 +305,11 @@ Accepted only:
 - for an input the kernel sent to that peer and still remembers (24 hours,
   4 096 inputs; `peer_input_not_found` otherwise);
 - once per `input_id` (`peer_input_already_rejected`), and only while the
-  input is unanswered: no `turn/start` with its `turn_id` yet
-  (`peer_input_already_started`).
+  input is unanswered: no `turn/start` with its `turn_id` admitted yet
+  (`peer_input_already_started`). A `turn/start` the kernel refuses
+  (`turn_in_progress`, a reused turn id, a budget or request error, …) does
+  not answer the input: the host may still refuse it, for example with
+  `busy`.
 
 Effect:
 
