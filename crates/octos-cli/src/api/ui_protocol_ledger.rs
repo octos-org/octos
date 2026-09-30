@@ -3118,9 +3118,11 @@ impl UiProtocolLedger {
         turn_id: &TurnId,
     ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
         let turn_wire_id = turn_id.0.to_string();
-        let (events, _) = self.snapshot_with_cursor_matching(session_id, None, Some(&|event| {
-            event_belongs_to_turn(event, turn_id, &turn_wire_id)
-        }))?;
+        let (events, _) = self.snapshot_with_cursor_matching(
+            session_id,
+            None,
+            Some(&|event| event_belongs_to_turn(event, turn_id, &turn_wire_id)),
+        )?;
         Ok(events)
     }
 
@@ -3240,9 +3242,7 @@ impl UiProtocolLedger {
         let events: Vec<LedgeredUiProtocolEvent> = session
             .entries
             .iter()
-            .filter(|entry| {
-                entry.seq > after.seq && event_filter.map_or(true, |f| f(&entry.event))
-            })
+            .filter(|entry| entry.seq > after.seq && event_filter.is_none_or(|f| f(&entry.event)))
             .map(|entry| LedgeredUiProtocolEvent {
                 cursor: UiCursor {
                     stream: session_id.0.clone(),
@@ -4756,15 +4756,14 @@ mod tests {
         turn_id: &TurnId,
         terminal: UiNotification,
     ) {
-        ledger
-            .append_notification(UiNotification::TurnStarted(
-                octos_core::ui_protocol::TurnStartedEvent {
-                    session_id: session_id.clone(),
-                    turn_id: turn_id.clone(),
-                    timestamp: chrono::Utc::now(),
-                    topic: None,
-                },
-            ));
+        ledger.append_notification(UiNotification::TurnStarted(
+            octos_core::ui_protocol::TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        ));
         ledger.emit_envelope_v2(
             session_id,
             turn_id.0.to_string(),
@@ -4783,10 +4782,7 @@ mod tests {
 
     /// Independent oracle: the exact event set a `turn/state` projection may
     /// read, matched inline rather than through `event_belongs_to_turn`.
-    fn full_snapshot_turn_seqs(
-        events: &[LedgeredUiProtocolEvent],
-        turn_id: &TurnId,
-    ) -> Vec<u64> {
+    fn full_snapshot_turn_seqs(events: &[LedgeredUiProtocolEvent], turn_id: &TurnId) -> Vec<u64> {
         events
             .iter()
             .filter(|event| match &event.event {
@@ -4916,7 +4912,10 @@ mod tests {
     fn turn_scoped_snapshot_on_unknown_session_is_empty() {
         let ledger = UiProtocolLedger::new(4);
         let events = ledger
-            .snapshot_events_for_turn(&SessionKey("local:turn-scoped-missing".into()), &TurnId::new())
+            .snapshot_events_for_turn(
+                &SessionKey("local:turn-scoped-missing".into()),
+                &TurnId::new(),
+            )
             .expect("unknown session is empty, not an error");
         assert!(events.is_empty());
     }
