@@ -24,6 +24,8 @@ pub struct BwrapSandbox {
     /// host-root ABOVE the worker's grant). Default `None` = today's cwd-only
     /// writable behaviour. The operator's explicit grant, NOT a fence.
     pub(crate) repo_git_write: Option<PathBuf>,
+    /// UPCR-2026-034 `read_parent` (see `SandboxConfig::read_only_view`).
+    pub(crate) read_only_view: Option<Box<super::SandboxReadOnlyView>>,
 }
 
 impl Sandbox for BwrapSandbox {
@@ -70,6 +72,19 @@ impl Sandbox for BwrapSandbox {
         // the tmpfs and re-exposes just that path (bwrap creates the dest path).
         cmd.arg("--tmpfs").arg("/tmp");
         cmd.arg("--tmpfs").arg("/var/tmp");
+
+        // A request context's read-only view of its peer's folder: the folder
+        // read-only, each other context's folder hidden under an empty
+        // tmpfs. Before the cwd bind, which lands on top (the context's own
+        // folder lies inside a hidden one).
+        if let Some(view) = &self.read_only_view {
+            if view.root.exists() {
+                cmd.arg("--ro-bind").arg(&view.root).arg(&view.root);
+                for excluded in &view.excluded {
+                    cmd.arg("--tmpfs").arg(excluded);
+                }
+            }
+        }
 
         // Bind the working directory. Read-write by default; read-only when
         // the permission profile denies workspace writes (`--sandbox
@@ -121,8 +136,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn should_bind_the_peer_folder_read_only_and_hide_other_contexts_when_the_context_reads_its_parent()
+     {
+        let peer = tempfile::tempdir().unwrap();
+        let root = peer.path().to_path_buf();
+        let cwd = root.join("contexts/a");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let sb = BwrapSandbox {
+            read_only_view: Some(Box::new(crate::sandbox::SandboxReadOnlyView {
+                root: root.clone(),
+                excluded: vec![root.join("contexts")],
+            })),
+            allow_network: false,
+            workspace_write: true,
+            repo_git_write: None,
+        };
+        let args: Vec<String> = sb
+            .wrap_command("ls", &cwd)
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let at = |flag: &str, path: &Path| {
+            let path = path.to_string_lossy();
+            args.windows(2)
+                .position(|w| w[0] == flag && w[1] == path)
+                .unwrap_or_else(|| panic!("{flag} {path} missing: {args:?}"))
+        };
+        let view = at("--ro-bind", &root);
+        let hidden = at("--tmpfs", &root.join("contexts"));
+        let own = at("--bind", &cwd);
+        assert!(
+            view < hidden && hidden < own,
+            "the view, then the hidden contexts, then the cwd on top: {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .position(|w| w[0] == "--tmpfs" && w[1] == "/tmp")
+                .unwrap()
+                < view,
+            "the view lands after the /tmp tmpfs: {args:?}"
+        );
+    }
+
+    #[test]
+    fn should_add_no_peer_folder_bind_when_the_context_has_no_read_view() {
+        let sb = BwrapSandbox {
+            read_only_view: None,
+            allow_network: false,
+            workspace_write: true,
+            repo_git_write: None,
+        };
+        let args: Vec<String> = sb
+            .wrap_command("ls", Path::new("/srv/peer/contexts/a"))
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(!args.iter().any(|a| a == "/srv/peer"), "{args:?}");
+    }
+
+    #[test]
     fn test_bwrap_sandbox_command() {
         let sb = BwrapSandbox {
+            read_only_view: None,
             allow_network: false,
             workspace_write: true,
             repo_git_write: None,
@@ -142,6 +219,7 @@ mod tests {
     #[test]
     fn test_bwrap_sandbox_env_sanitization() {
         let sb = BwrapSandbox {
+            read_only_view: None,
             allow_network: false,
             workspace_write: true,
             repo_git_write: None,
@@ -171,6 +249,7 @@ mod tests {
         // P1 (codex): a read-only permission profile must bind the workspace
         // read-only so shell commands cannot write to it.
         let sb = BwrapSandbox {
+            read_only_view: None,
             allow_network: false,
             workspace_write: false,
             repo_git_write: None,
@@ -200,6 +279,7 @@ mod tests {
     #[test]
     fn should_rw_bind_workspace_when_workspace_write_enabled() {
         let sb = BwrapSandbox {
+            read_only_view: None,
             allow_network: false,
             workspace_write: true,
             repo_git_write: None,
@@ -232,6 +312,7 @@ mod tests {
         // the read-only cwd is under /tmp, the tmpfs must be mounted FIRST so
         // the workspace ro-bind lands on top of it and wins.
         let sb = BwrapSandbox {
+            read_only_view: None,
             allow_network: false,
             workspace_write: false,
             repo_git_write: None,
@@ -272,6 +353,7 @@ mod tests {
         // workspace contents are visible and writable (not shadowed by an empty
         // tmpfs). Assert tmpfs precedes the workspace bind here too.
         let sb = BwrapSandbox {
+            read_only_view: None,
             allow_network: false,
             workspace_write: true,
             repo_git_write: None,
@@ -301,6 +383,7 @@ mod tests {
         // (and cannot be re-permitted for writes) and (b) tools that default to
         // /var/tmp still have writable scratch.
         let sb = BwrapSandbox {
+            read_only_view: None,
             allow_network: false,
             workspace_write: false,
             repo_git_write: None,
@@ -341,6 +424,7 @@ mod tests {
         // Both temp-root tmpfs mounts must precede the workspace bind regardless
         // of where cwd lives, so ordering is never workspace-dependent.
         let sb = BwrapSandbox {
+            read_only_view: None,
             allow_network: false,
             workspace_write: false,
             repo_git_write: None,
@@ -378,6 +462,7 @@ mod tests {
     #[test]
     fn test_bwrap_sandbox_allows_network() {
         let sb = BwrapSandbox {
+            read_only_view: None,
             allow_network: true,
             workspace_write: true,
             repo_git_write: None,
@@ -403,6 +488,7 @@ mod tests {
         // the worker's grant. It also skipped the /tmp tmpfs, exposing host /tmp
         // sockets. The fix: bind cwd (rw) + `<repo>/.git` (rw), keep tmpfs.
         let sb = BwrapSandbox {
+            read_only_view: None,
             allow_network: true,
             workspace_write: true,
             repo_git_write: Some(PathBuf::from("/srv/controller-repo/.git")),
@@ -469,6 +555,7 @@ mod tests {
         // Backward compatibility: without `repo_git_write` no extra write bind is
         // emitted (unchanged cwd-only behaviour), and never `--bind / /`.
         let sb = BwrapSandbox {
+            read_only_view: None,
             allow_network: false,
             workspace_write: true,
             repo_git_write: None,

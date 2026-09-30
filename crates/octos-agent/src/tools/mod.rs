@@ -1285,6 +1285,15 @@ fn resolve_for_scope(
                 Ok(lex_normalised)
             }
         }
+        // UPCR-2026-034 `read_parent`: a request context reads its peer's
+        // folder; it never writes there.
+        PathClassification::InReadOnlyView { .. } => {
+            if for_write {
+                Err("Writes outside this context's own folder are not permitted")
+            } else {
+                Ok(lex_normalised)
+            }
+        }
         PathClassification::OutOfScope => Err("Path outside session scope"),
     }
 }

@@ -5995,6 +5995,7 @@ async fn should_number_concurrent_rounds_of_both_lanes_without_collisions() {
                 last_n: 20,
                 max_bytes: 16 * 1024,
             }),
+            read_parent: false,
         },
     )
     .unwrap();
@@ -6294,4 +6295,248 @@ async fn should_show_the_peer_session_a_persons_turn_in_progress() {
     llm.release.notify_one();
     wait_result(&e, &person_turn).await;
     assert_no_block_persisted(&e);
+}
+
+// ---------------------------------------------------------------------------
+// UPCR-2026-034 `read_parent`: a request context's read-only view of its
+// peer's folder (#2603).
+// ---------------------------------------------------------------------------
+
+/// The peer folder of the e2e fixture's News peer, with account data, another
+/// context's private file, and the runtime of context `id` opened with
+/// `read_parent` (or without it).
+async fn read_parent_context(
+    e: &E2e,
+    id: &str,
+    read_parent: bool,
+) -> (PathBuf, Arc<crate::runtime::SessionRuntime>) {
+    let extra = if read_parent {
+        json!({"read_parent": true})
+    } else {
+        json!({})
+    };
+    let opened = open_context_from(e, Some(&e.ws), id, extra).expect("open");
+    assert_eq!(opened["read_parent"], read_parent);
+    let peer_root = dunce::canonicalize(e.data_dir.parent().unwrap().join("apps/news")).unwrap();
+    std::fs::write(peer_root.join("threads.md"), "ACCOUNT-THREADS").unwrap();
+    std::fs::create_dir_all(peer_root.join("contexts/other")).unwrap();
+    std::fs::write(peer_root.join("contexts/other/private.md"), "OTHER-CONTEXT").unwrap();
+    let key = SessionKey(opened["session_id"].as_str().unwrap().to_owned());
+    let profile = e.state.profiles.get("dev").unwrap().clone();
+    let runtime = crate::runtime::SessionRuntime::bootstrap(&profile, key, None)
+        .await
+        .expect("bootstrap the context");
+    (peer_root, runtime)
+}
+
+async fn run_tool(
+    runtime: &crate::runtime::SessionRuntime,
+    tool: &str,
+    args: Value,
+) -> octos_agent::tools::ToolResult {
+    let ctx = octos_agent::tools::ToolContext {
+        tool_id: "t".to_owned(),
+        session_scope: runtime.agent.session_scope().cloned(),
+        ..octos_agent::tools::ToolContext::zero()
+    };
+    runtime
+        .tools
+        .execute_with_context(&ctx, tool, &args)
+        .await
+        .expect("the tool runs")
+}
+
+#[tokio::test]
+async fn should_read_the_peer_folder_but_not_another_context_when_the_context_has_read_parent() {
+    let llm = Arc::new(RecordingLlm::default());
+    let e = e2e_fixture(llm, json!({ "tools": [] })).await;
+    let (peer, rt) = read_parent_context(&e, "ui-read", true).await;
+    let path = |p: &str| peer.join(p).to_string_lossy().into_owned();
+
+    // Reads of the peer's folder.
+    let read = run_tool(&rt, "read_file", json!({"path": path("threads.md")})).await;
+    assert!(
+        read.success && read.output.contains("ACCOUNT-THREADS"),
+        "{}",
+        read.output
+    );
+    let listed = run_tool(&rt, "list_dir", json!({"path": path("")})).await;
+    assert!(
+        listed.success && listed.output.contains("threads.md"),
+        "{}",
+        listed.output
+    );
+    assert!(
+        !listed.output.contains("contexts"),
+        "the contexts folder is hidden: {}",
+        listed.output
+    );
+    let found = run_tool(
+        &rt,
+        "glob",
+        json!({"pattern": format!("{}/**/*.md", path(""))}),
+    )
+    .await;
+    assert!(found.output.contains("threads.md"), "{}", found.output);
+    assert!(!found.output.contains("private.md"), "{}", found.output);
+    let grep = run_tool(
+        &rt,
+        "grep",
+        json!({"pattern": "ACCOUNT-THREADS|OTHER-CONTEXT", "path": path("")}),
+    )
+    .await;
+    assert!(grep.output.contains("ACCOUNT-THREADS"), "{}", grep.output);
+    assert!(!grep.output.contains("OTHER-CONTEXT"), "{}", grep.output);
+
+    // Another context's folder stays unreadable.
+    let other = run_tool(
+        &rt,
+        "read_file",
+        json!({"path": path("contexts/other/private.md")}),
+    )
+    .await;
+    assert!(
+        !other.success && !other.output.contains("OTHER-CONTEXT"),
+        "{}",
+        other.output
+    );
+    let other_dir = run_tool(&rt, "list_dir", json!({"path": path("contexts/other")})).await;
+    assert!(!other_dir.success, "{}", other_dir.output);
+    let other_glob = run_tool(
+        &rt,
+        "glob",
+        json!({"pattern": format!("{}/*.md", path("contexts/other"))}),
+    )
+    .await;
+    assert!(
+        !other_glob.output.contains("private.md"),
+        "{}",
+        other_glob.output
+    );
+    let other_grep = run_tool(
+        &rt,
+        "grep",
+        json!({"pattern": "OTHER-CONTEXT", "path": path("contexts/other")}),
+    )
+    .await;
+    assert!(
+        !other_grep.output.contains("OTHER-CONTEXT"),
+        "{}",
+        other_grep.output
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(peer.join("contexts/other"), peer.join("link")).unwrap();
+        let via_link = run_tool(&rt, "read_file", json!({"path": path("link/private.md")})).await;
+        assert!(
+            !via_link.output.contains("OTHER-CONTEXT"),
+            "{}",
+            via_link.output
+        );
+    }
+
+    // Writes stay in the context's own folder.
+    let write = run_tool(
+        &rt,
+        "write_file",
+        json!({"path": path("threads.md"), "content": "overwritten"}),
+    )
+    .await;
+    assert!(!write.success, "{}", write.output);
+    assert_eq!(
+        std::fs::read_to_string(peer.join("threads.md")).unwrap(),
+        "ACCOUNT-THREADS"
+    );
+    let edit = run_tool(
+        &rt,
+        "edit_file",
+        json!({"path": path("threads.md"), "old_string": "ACCOUNT", "new_string": "X"}),
+    )
+    .await;
+    assert!(!edit.success, "{}", edit.output);
+    let own = run_tool(
+        &rt,
+        "write_file",
+        json!({"path": "notes.md", "content": "mine"}),
+    )
+    .await;
+    assert!(own.success, "{}", own.output);
+    assert_eq!(
+        std::fs::read_to_string(peer.join("contexts/ui-read/notes.md")).unwrap(),
+        "mine"
+    );
+
+    // The shell's sandbox carries the same view.
+    let view = rt.sandbox.read_only_view.as_ref().expect("sandbox view");
+    assert_eq!(view.root, peer);
+    assert_eq!(view.excluded, vec![peer.join("contexts")]);
+}
+
+#[tokio::test]
+async fn should_keep_the_context_fenced_to_its_own_folder_when_read_parent_is_not_set() {
+    let llm = Arc::new(RecordingLlm::default());
+    let e = e2e_fixture(llm, json!({ "tools": [] })).await;
+    let (peer, rt) = read_parent_context(&e, "ui-plain", false).await;
+    let read = run_tool(
+        &rt,
+        "read_file",
+        json!({"path": peer.join("threads.md").to_string_lossy()}),
+    )
+    .await;
+    assert!(
+        !read.success && !read.output.contains("ACCOUNT-THREADS"),
+        "{}",
+        read.output
+    );
+    assert!(rt.sandbox.read_only_view.is_none());
+    assert!(
+        rt.agent
+            .session_scope()
+            .is_some_and(|scope| scope.read_only_view().is_none())
+    );
+}
+
+#[tokio::test]
+async fn should_refuse_read_parent_when_the_caller_is_not_the_peers_host() {
+    let llm = Arc::new(RecordingLlm::default());
+    let e = e2e_fixture(llm, json!({ "tools": [] })).await;
+    let flag = json!({"read_parent": true});
+    let kind = |result: Result<Value, RpcError>| result.unwrap_err().data.unwrap()["kind"].clone();
+    assert_eq!(
+        kind(open_context_from(&e, None, "ui-1", flag.clone())),
+        "read_parent_host_only"
+    );
+    let (foreign, _foreign_rx) = ws_connection_for_test(64);
+    assert_eq!(
+        kind(open_context_from(&e, Some(&foreign), "ui-1", flag.clone())),
+        "read_parent_host_only"
+    );
+    let (external, _external_rx) = external_ws(64);
+    assert_eq!(
+        kind(open_context_from(&e, Some(&external), "ui-1", flag.clone())),
+        "read_parent_host_only"
+    );
+    // Nothing was recorded by the refusals.
+    assert!(
+        crate::peers::app_binding::read_context_binding(&e.data_dir.join("peers"), "news", "ui-1")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn should_refuse_a_reopen_when_it_changes_read_parent() {
+    let llm = Arc::new(RecordingLlm::default());
+    let e = e2e_fixture(llm, json!({ "tools": [] })).await;
+    let flag = json!({"read_parent": true});
+    let opened = open_context_from(&e, Some(&e.ws), "ui-1", flag.clone()).unwrap();
+    assert_eq!(opened["created"], true);
+    let again = open_context_from(&e, Some(&e.ws), "ui-1", flag).unwrap();
+    assert_eq!(again["created"], false);
+    assert_eq!(again["read_parent"], true);
+    let changed = open_context_from(&e, Some(&e.ws), "ui-1", json!({})).unwrap_err();
+    assert_eq!(changed.data.unwrap()["kind"], "peer_binding_mismatch");
+    open_context_from(&e, Some(&e.ws), "ui-2", json!({})).unwrap();
+    let widened =
+        open_context_from(&e, Some(&e.ws), "ui-2", json!({"read_parent": true})).unwrap_err();
+    assert_eq!(widened.data.unwrap()["kind"], "peer_binding_mismatch");
 }
