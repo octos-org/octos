@@ -16397,10 +16397,9 @@ fn raw_peer_tool_result(
         None => {
             // The connection that registered the session's set answers its
             // calls without a token (only it is sent them).
-            let registrant = crate::peers::host_tools::session_set_connection(
-                &peers_root,
-                &params.session_id,
-            ) == Some(connection);
+            let registrant =
+                crate::peers::host_tools::session_set_connection(&peers_root, &params.session_id)
+                    == Some(connection);
             authorize_host_session_call(
                 &peers_root,
                 &params.session_id,

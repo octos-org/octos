@@ -4172,7 +4172,8 @@ async fn should_register_a_host_sessions_tools_without_a_peer_token_when_the_con
     assert_eq!(answer.data.unwrap()["kind"], "peer_tool_call_not_found");
     // Still refused: an app peer's session, and another connection without
     // a token (or its answer).
-    let refused = register_on_session(&fx, &stdio, None, &peer_key(&fx), tools.clone()).unwrap_err();
+    let refused =
+        register_on_session(&fx, &stdio, None, &peer_key(&fx), tools.clone()).unwrap_err();
     assert_eq!(refused.data.unwrap()["kind"], "peer_tools_invalid");
     let (ws, _rx) = ws_connection_for_test(8);
     let refused = register_on_session(&fx, &ws, None, &fx.system, tools.clone()).unwrap_err();
