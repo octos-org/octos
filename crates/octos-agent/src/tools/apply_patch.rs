@@ -333,14 +333,18 @@ impl ApplyPatchTool {
     /// outright (envelope paths must be workspace-relative).
     fn resolve_patch_path(&self, ctx: &ToolContext, user_path: &str) -> Result<PathBuf, String> {
         reject_unsafe_patch_path(user_path)?;
-        match ctx.session_scope.as_ref() {
+        let resolved = match ctx.session_scope.as_ref() {
             Some(scope) => super::resolve_path_for_session_scope_write(scope, user_path)
                 .map_err(|reason| format!("{reason}: {user_path}")),
             None => {
                 super::resolve_path_with_scope(&self.base_dir, user_path, self.filesystem_scope)
                     .map_err(|_| format!("Path outside working directory: {user_path}"))
             }
-        }
+        }?;
+        // No section may add, update, move into/out of or delete anything
+        // inside a `.git` directory.
+        super::refuse_git_internal_path(&resolved)?;
+        Ok(resolved)
     }
 
     /// Phase 1: validate every section against the filesystem (through an
@@ -1211,6 +1215,40 @@ fn find_block_from(lines: &[String], pattern: &[&str], from: usize) -> Option<us
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn should_refuse_patch_when_any_section_enters_a_git_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("sites/demo/.git/hooks")).unwrap();
+        std::fs::write(temp.path().join("sites/demo/.git/config"), "[core]\n").unwrap();
+        std::fs::write(temp.path().join("sites/demo/index.html"), "hi\n").unwrap();
+        let tool = ApplyPatchTool::new(temp.path());
+        for patch in [
+            "*** Begin Patch\n*** Add File: sites/demo/.git/hooks/post-commit\n+touch PWNED\n*** End Patch\n",
+            "*** Begin Patch\n*** Delete File: sites/demo/.git/config\n*** End Patch\n",
+            "*** Begin Patch\n*** Update File: sites/demo/index.html\n*** Move to: sites/demo/.git/info/attributes\n@@\n-hi\n+* filter=p\n*** End Patch\n",
+        ] {
+            let result = run(&tool, patch).await;
+            assert!(
+                !result.success,
+                "{patch} must be refused: {}",
+                result.output
+            );
+            assert!(result.output.contains(".git"), "{}", result.output);
+        }
+        assert!(
+            !temp
+                .path()
+                .join("sites/demo/.git/hooks/post-commit")
+                .exists()
+        );
+        assert!(!temp.path().join("sites/demo/.git/info/attributes").exists());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("sites/demo/.git/config")).unwrap(),
+            "[core]\n"
+        );
+        assert!(temp.path().join("sites/demo/index.html").exists());
+    }
     use super::*;
     use serde_json::json;
 

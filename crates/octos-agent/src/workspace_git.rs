@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -180,11 +181,9 @@ fn init_workspace_repo_unlocked(project_root: &Path, kind: WorkspaceProjectKind)
             .wrap_err_with(|| format!("write .gitignore failed: {}", gitignore_path.display()))?;
     }
 
-    if !project_root.join(".git").exists() {
-        run_git(project_root, &["init"])?;
+    if std::fs::symlink_metadata(project_root.join(".git")).is_err() {
+        crate::private_git::init_project_repo(project_root)?;
     }
-
-    ensure_local_identity(project_root)?;
     Ok(())
 }
 
@@ -204,21 +203,7 @@ pub fn initialize_and_commit(
 ) -> Result<bool> {
     with_repo_git_lock(project_root, || {
         init_workspace_repo_unlocked(project_root, kind)?;
-        run_git(project_root, &["add", "-A", "--", "."])?;
-
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(project_root)
-            .args(["diff", "--cached", "--quiet", "--", "."])
-            .status()
-            .wrap_err("git diff --cached failed")?;
-
-        if status.success() {
-            return Ok(false);
-        }
-
-        run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
-        Ok(true)
+        commit_all_staged(project_root, message)
     })
 }
 
@@ -447,21 +432,7 @@ fn commit_all_if_dirty_with_options(
             ));
         }
 
-        run_git(project_root, &["add", "-A", "--", "."])?;
-
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(project_root)
-            .args(["diff", "--cached", "--quiet", "--", "."])
-            .status()
-            .wrap_err("git diff --cached failed")?;
-
-        if status.success() {
-            return Ok(false);
-        }
-
-        run_git(project_root, &["commit", "-m", message, "--no-verify"])?;
-        Ok(true)
+        commit_all_staged(project_root, message)
     })
 }
 
@@ -875,10 +846,10 @@ fn resolve_artifact_matches(repo_root: &Path, pattern: &str) -> Vec<String> {
 }
 
 fn git_head_revision(project_root: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
-        .args(["rev-parse", "--short=12", "HEAD"])
+    let git = crate::private_git::PrivateGitDir::open(project_root).ok()?;
+    let output = git
+        .command()
+        .args(["rev-parse", "--short=12", "--verify", "--quiet", "HEAD"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -889,13 +860,16 @@ fn git_head_revision(project_root: &Path) -> Option<String> {
 }
 
 fn git_is_dirty(project_root: &Path) -> bool {
-    let Ok(output) = Command::new("git")
-        .arg("-C")
-        .arg(project_root)
+    let Ok(git) = crate::private_git::PrivateGitDir::open(project_root) else {
+        return false;
+    };
+    let Ok(output) = git
+        .command()
         .args([
             "status",
             "--porcelain",
             "--untracked-files=normal",
+            "--ignore-submodules=all",
             "--",
             ".",
         ])
@@ -928,18 +902,6 @@ fn infer_kind_from_root(project_root: &Path) -> Result<WorkspaceProjectKind> {
     }
 }
 
-fn ensure_local_identity(project_root: &Path) -> Result<()> {
-    run_git(
-        project_root,
-        &["config", "--local", "user.name", "Octos Workspace"],
-    )?;
-    run_git(
-        project_root,
-        &["config", "--local", "user.email", "octos@local"],
-    )?;
-    Ok(())
-}
-
 fn normalize_turn_summary(summary: &str) -> String {
     let compact = summary.split_whitespace().collect::<Vec<_>>().join(" ");
     let fallback = if compact.is_empty() {
@@ -963,12 +925,58 @@ fn truncate_utf8_boundary(s: &str, max_len: usize) -> String {
     format!("{}...", &s[..end])
 }
 
-fn run_git(project_root: &Path, args: &[&str]) -> Result<()> {
+/// Stage everything and commit it when the index differs from `HEAD`, all
+/// through a kernel-owned private git dir (see [`crate::private_git`]): the
+/// project's own `.git/config`, hooks and `info/` are never honoured, so
+/// nothing an agent writes there can make this run a program.
+fn commit_all_staged(project_root: &Path, message: &str) -> Result<bool> {
+    let git = crate::private_git::PrivateGitDir::open(project_root)?;
+    run_git(&git, project_root, &["add", "-A", "--", "."])?;
+
+    let status = git
+        .command()
+        .args([
+            "diff",
+            "--cached",
+            "--quiet",
+            "--ignore-submodules=all",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+            ".",
+        ])
+        .status()
+        .wrap_err("git diff --cached failed")?;
+
+    if status.success() {
+        return Ok(false);
+    }
+
+    run_git(
+        &git,
+        project_root,
+        &[
+            "commit",
+            "--quiet",
+            "--no-verify",
+            "--no-gpg-sign",
+            "-m",
+            message,
+        ],
+    )?;
+    git.publish_head()?;
+    Ok(true)
+}
+
+fn run_git(
+    git: &crate::private_git::PrivateGitDir,
+    project_root: &Path,
+    args: &[&str],
+) -> Result<()> {
     let mut attempt = 0_u32;
     loop {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(project_root)
+        let output = git
+            .command()
             .args(args)
             .output()
             .wrap_err_with(|| format!("failed to spawn git {args:?}"))?;
@@ -1074,6 +1082,155 @@ mod tests {
         assert_eq!(repo.kind, WorkspaceProjectKind::Slides);
         assert_eq!(repo.root, base.join("slides/demo"));
         assert_eq!(repo.slug, "demo");
+    }
+
+    /// Seed a committed `sites/demo` repo and return (workspace, project, marker dir).
+    fn seeded_site_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("sites").join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("index.html"), "<h1>v1</h1>\n").unwrap();
+        assert!(
+            initialize_and_commit(&project, WorkspaceProjectKind::Sites, "init").unwrap(),
+            "seed commit"
+        );
+        let markers = temp.path().join("markers");
+        std::fs::create_dir_all(&markers).unwrap();
+        (temp, project, markers)
+    }
+
+    fn append_repo_config(project: &Path, text: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(project.join(".git/config"))
+            .unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn plain_git_log(project: &Path) -> Vec<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(["log", "--format=%s"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn assert_no_markers(markers: &Path) {
+        let found: Vec<_> = std::fs::read_dir(markers)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            found.is_empty(),
+            "agent-controlled git config executed: {found:?}"
+        );
+    }
+
+    #[test]
+    fn should_not_run_repo_clean_filter_when_snapshotting_workspace() {
+        let (temp, project, markers) = seeded_site_repo();
+        let pwned = markers.join("PWNED");
+        append_repo_config(
+            &project,
+            &format!(
+                "[filter \"p\"]\n\tclean = \"touch '{}'; cat\"\n",
+                pwned.display()
+            ),
+        );
+        std::fs::write(project.join(".gitattributes"), "* filter=p\n").unwrap();
+        std::fs::write(project.join("index.html"), "<h1>v2</h1>\n").unwrap();
+
+        let message =
+            snapshot_workspace_change(temp.path(), &project.join("index.html"), "write_file")
+                .unwrap();
+
+        assert!(message.is_some(), "the change is still committed");
+        assert!(
+            !pwned.exists(),
+            "clean filter from .git/config must not run"
+        );
+        let log = plain_git_log(&project);
+        assert_eq!(
+            log.len(),
+            2,
+            "history stays visible in the project's .git: {log:?}"
+        );
+    }
+
+    #[test]
+    fn should_not_run_repo_fsmonitor_or_hooks_when_snapshotting_workspace() {
+        let (temp, project, markers) = seeded_site_repo();
+        append_repo_config(
+            &project,
+            &format!(
+                "[core]\n\tfsmonitor = \"touch '{}'\"\n[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = \"touch '{}'; false\"\n",
+                markers.join("FSMONITOR").display(),
+                markers.join("GPG").display(),
+            ),
+        );
+        let hooks = project.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for hook in [
+            "pre-commit",
+            "post-commit",
+            "commit-msg",
+            "reference-transaction",
+        ] {
+            let path = hooks.join(hook);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\ntouch '{}'\n", markers.join(hook).display()),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        std::fs::write(project.join("index.html"), "<h1>v2</h1>\n").unwrap();
+
+        let message =
+            snapshot_workspace_change(temp.path(), &project.join("index.html"), "write_file")
+                .unwrap();
+        assert!(message.is_some());
+        let _ = inspect_workspace_contract_at_root(&project);
+        assert_no_markers(&markers);
+    }
+
+    #[test]
+    fn should_not_run_hooks_path_from_repo_config_when_snapshotting_workspace() {
+        let (temp, project, markers) = seeded_site_repo();
+        let evil_hooks = temp.path().join("evil-hooks");
+        std::fs::create_dir_all(&evil_hooks).unwrap();
+        let hook = evil_hooks.join("post-commit");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\ntouch '{}'\n",
+                markers.join("HOOKSPATH").display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        append_repo_config(
+            &project,
+            &format!("[core]\n\thooksPath = {}\n", evil_hooks.display()),
+        );
+        std::fs::write(project.join("index.html"), "<h1>v2</h1>\n").unwrap();
+
+        snapshot_workspace_change(temp.path(), &project.join("index.html"), "write_file").unwrap();
+        assert_no_markers(&markers);
     }
 
     #[test]

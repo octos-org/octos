@@ -2641,10 +2641,16 @@ impl ChangeReceipt {
 /// `None` when the dir is not a git work tree (receipt silently omitted —
 /// acceptance ④) or git is unavailable (fail-open).
 pub(crate) fn snapshot_dirty_paths(cwd: &Path) -> Option<Vec<String>> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["status", "--porcelain", "--untracked-files=all"])
+    // The agent can write this repo's `.git/config`; never let it choose
+    // what the kernel's own `git status` runs (fsmonitor, filters, hooks).
+    let out = octos_core::agent_repo_git::agent_repo_git(cwd)
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -2707,6 +2713,50 @@ pub(crate) fn diff_to_receipt(
 #[cfg(test)]
 mod change_receipt_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn should_not_run_repo_fsmonitor_or_filters_when_taking_the_change_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let markers = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        init_repo(dir);
+        std::fs::write(dir.join("tracked.txt"), "one\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["add", "-A"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let touch = |name: &str| format!("touch '{}'", markers.path().join(name).display());
+        let config = dir.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "[filter \"p\"]\n\tclean = \"{}; cat\"\n[core]\n\tfsmonitor = \"{}\"\n",
+            touch("CLEAN"),
+            touch("FSMONITOR")
+        ));
+        std::fs::write(&config, text).unwrap();
+        std::fs::write(dir.join(".gitattributes"), "* filter=p\n").unwrap();
+        std::fs::write(dir.join("tracked.txt"), "two\n").unwrap();
+
+        let dirty = snapshot_dirty_paths(dir).expect("git work tree");
+        assert!(
+            dirty.iter().any(|line| line.contains("tracked.txt")),
+            "{dirty:?}"
+        );
+        let found: Vec<_> = std::fs::read_dir(markers.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            found.is_empty(),
+            "agent-controlled git config executed: {found:?}"
+        );
+    }
 
     fn init_repo(dir: &std::path::Path) {
         for args in [

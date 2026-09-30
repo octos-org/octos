@@ -7,6 +7,7 @@
 //! - Context and result types
 
 pub mod abort;
+pub mod agent_repo_git;
 pub mod app_ui;
 pub mod app_ui_codec;
 pub mod env_hygiene;

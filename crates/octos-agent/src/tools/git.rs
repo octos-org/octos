@@ -435,9 +435,11 @@ fn git_blame(cwd: &std::path::Path, path: &str) -> Result<String> {
         eyre::bail!("file not found: {path}");
     }
 
-    let output = std::process::Command::new("git")
-        .args(["blame", "--porcelain", "--", path])
-        .current_dir(worktree)
+    // Blame reads the worktree file through the repo's filters; the agent can
+    // write this repo's `.git/config`, so run with repository-scope program
+    // settings overridden and without textconv.
+    let output = octos_core::agent_repo_git::agent_repo_git(worktree)
+        .args(["blame", "--porcelain", "--no-textconv", "--", path])
         .output()
         .map_err(|e| eyre::eyre!("failed to run git blame: {e}"))?;
 
@@ -695,6 +697,28 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("hello world"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_not_run_repo_filters_when_blaming() {
+        let dir = setup_git_repo();
+        let markers = TempDir::new().unwrap();
+        let marker = markers.path().join("CLEAN");
+        let config = dir.path().join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "[filter \"p\"]\n\tclean = \"touch '{}'; cat\"\n[diff \"x\"]\n\ttextconv = \"touch '{}'; cat\"\n",
+            marker.display(),
+            marker.display()
+        ));
+        std::fs::write(&config, text).unwrap();
+        std::fs::write(dir.path().join(".gitattributes"), "* filter=p diff=x\n").unwrap();
+        std::fs::write(dir.path().join("hello.txt"), "hello world\nmore\n").unwrap();
+
+        let out = git_blame(dir.path(), "hello.txt").unwrap();
+        assert!(out.contains("hello world"), "{out}");
+        assert!(!marker.exists(), "agent-controlled git config executed");
     }
 
     #[tokio::test]

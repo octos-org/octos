@@ -1,6 +1,7 @@
 //! Spawn tool for background subagent execution.
 
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -165,9 +166,7 @@ impl Drop for WorkerWorktreeGuard {
 fn prune_worker_worktree(repo_root: &Path, worktree: &WorkerWorktree) {
     // `--force` clears the untracked `.octos/worker-worktree.json` status
     // marker; the checkout is otherwise fresh.
-    match Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    match octos_core::agent_repo_git::agent_repo_git(repo_root)
         .args(["worktree", "remove", "--force"])
         .arg(&worktree.path)
         .output()
@@ -204,9 +203,7 @@ fn prune_worker_worktree(repo_root: &Path, worktree: &WorkerWorktree) {
             );
         }
     }
-    match Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    match octos_core::agent_repo_git::agent_repo_git(repo_root)
         .args(["branch", "-D"])
         .arg(&worktree.branch)
         .output()
@@ -252,9 +249,7 @@ fn validate_worker_worktree_slug(slug: &str) -> Result<(), String> {
 }
 
 fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let output = octos_core::agent_repo_git::agent_repo_git(repo)
         .args(args)
         .output()
         .wrap_err_with(|| format!("failed to run git {}", args.join(" ")))?;
@@ -269,9 +264,7 @@ fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_ref_exists(repo: &Path, refname: &str) -> Result<bool> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let status = octos_core::agent_repo_git::agent_repo_git(repo)
         .args(["show-ref", "--verify", "--quiet", refname])
         .status()
         .wrap_err("failed to run git show-ref")?;
@@ -304,9 +297,7 @@ fn git_ref_exists(repo: &Path, refname: &str) -> Result<bool> {
 /// message covers "not a git repository" as the actionable remedy, and a truly
 /// missing git surfaces its own error on the subsequent `git worktree add`.
 fn is_inside_git_work_tree(dir: &Path) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    octos_core::agent_repo_git::agent_repo_git(dir)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .map(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
@@ -435,9 +426,7 @@ fn allocate_worker_worktree(
         // session-scope checks above already ran against the un-simplified
         // path, so containment guarantees are unaffected.
         let git_path = dunce::simplified(&path).to_path_buf();
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&repo_root)
+        let output = octos_core::agent_repo_git::agent_repo_git(&repo_root)
             .args(["worktree", "add", "-b"])
             .arg(&branch)
             .arg(&git_path)

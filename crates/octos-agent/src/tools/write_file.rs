@@ -223,6 +223,16 @@ impl WriteFileTool {
             },
         };
 
+        // Never let a file tool touch a `.git` directory: its config/hooks
+        // decide what the kernel's own git invocations execute.
+        if let Err(reason) = super::refuse_git_internal_path(&path) {
+            return Ok(ToolResult {
+                output: reason,
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // Observe-only (#read-paging probe): a whole-file overwrite of a path
         // that was previously read. If `read_file` were ever changed to return
         // a WINDOW by default, this is the call that would reconstruct the file
@@ -634,6 +644,34 @@ impl WriteFileTool {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn should_refuse_write_when_path_enters_a_git_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sites/demo/.git")).unwrap();
+        std::fs::write(dir.path().join("sites/demo/.git/config"), "[core]\n").unwrap();
+        let tool = WriteFileTool::new(dir.path());
+        for path in [
+            "sites/demo/.git/config",
+            "sites/demo/.GIT/config",
+            "sites/demo/.git/hooks/post-commit",
+            ".git/config",
+            "sites/fresh/.git/config",
+        ] {
+            let result = tool
+                .execute(&serde_json::json!({"path": path, "content": "EVIL"}))
+                .await
+                .unwrap();
+            assert!(!result.success, "{path} must be refused: {}", result.output);
+            assert!(result.output.contains(".git"), "{}", result.output);
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sites/demo/.git/config")).unwrap(),
+            "[core]\n"
+        );
+        assert!(!dir.path().join("sites/fresh/.git").exists());
+        assert!(!dir.path().join(".git").exists());
+    }
     use super::*;
 
     #[tokio::test]
