@@ -669,6 +669,16 @@ pub(crate) fn register_session_tool_set(
     Ok((current, version))
 }
 
+/// The connection that registered the host session set of `session`, if any.
+pub(crate) fn session_set_connection(peers_root: &Path, session: &SessionKey) -> Option<u64> {
+    let key = session_route_key(peers_root, session);
+    SESSION_SETS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&key)
+        .map(|set| set.connection)
+}
+
 /// The route key of the host tool set a call on `session` belongs to: the
 /// app peer's for a `peer-`/`peerctx-` session, the session's own when a
 /// host session set is registered on it.

@@ -31,6 +31,11 @@ struct Fx {
 }
 
 async fn fixture() -> Fx {
+    fixture_with(|_| {}).await
+}
+
+/// [`fixture`], with `setup` applied to the server state first.
+async fn fixture_with(setup: impl FnOnce(&mut AppState)) -> Fx {
     let tmp = tempfile::tempdir().unwrap();
     let profile = crate::profiles::UserProfile {
         id: "dev".to_string(),
@@ -75,6 +80,7 @@ async fn fixture() -> Fx {
     .expect("bootstrap dev runtime");
     let mut state = AppState::empty_for_tests();
     state.profiles.insert("dev".to_string(), runtime.clone());
+    setup(&mut state);
     let apps = tmp.path().join("apps");
     std::fs::create_dir_all(apps.join("news")).unwrap();
     Fx {
@@ -4115,6 +4121,94 @@ async fn should_give_the_system_agent_the_app_tools_the_host_registers_on_its_se
         Some(ws.connection_id.0),
     );
     assert!(after.get("calendar_today").is_none());
+}
+
+/// OctoSense#146: the host's own connection (the private `serve --stdio`
+/// pipe, or the host token's connection of `serve --host-managed`) registers
+/// a host session's tools with no app peer's token, so the system agent's
+/// host tools do not wait for an app peer to exist; it answers the calls
+/// routed to it the same way. Any other connection still needs the token of
+/// an app peer that session prepared, and an app peer's session is still
+/// refused.
+#[tokio::test]
+async fn should_register_a_host_sessions_tools_without_a_peer_token_when_the_connection_is_the_hosts_own()
+ {
+    let tools = json!({ "tools": [calendar_today()] });
+
+    // `serve --stdio`: the host's private pipe. No app peer exists yet.
+    let fx = fixture().await;
+    let (stdio_tx, _stdio_rx) = std::sync::mpsc::sync_channel(8);
+    let stdio = WsConnection::new_stdio(stdio_tx);
+    let registered = register_on_session(&fx, &stdio, None, &fx.system, tools.clone())
+        .expect("the host's own pipe needs no app peer's token");
+    assert_eq!(registered["version"], 1);
+    let runtime = crate::runtime::SessionRuntime::bootstrap(&fx.runtime, fx.system.clone(), None)
+        .await
+        .unwrap();
+    let mut host_turn = runtime.tools.snapshot_excluding(&[]);
+    crate::peers::host_tools::apply_session_owned_host_tools(
+        &mut host_turn,
+        &peers_root(&fx),
+        &fx.system,
+        "turn-h1",
+        Some(stdio.connection_id.0),
+    );
+    assert_eq!(
+        host_turn.origin("calendar_today"),
+        Some(octos_agent::ToolOrigin::HostRouted)
+    );
+    // Its answer to a call needs no token either (only the connection the
+    // call was sent to may answer it).
+    let answer = raw_peer_tool_result(
+        stdio.connection_id.0,
+        &fx.state,
+        &rpc(
+            APPUI_METHOD_PEER_TOOL_RESULT,
+            json!({"session_id": fx.system, "call_id": "no-such-call", "ok": true, "data": {}}),
+        ),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(answer.data.unwrap()["kind"], "peer_tool_call_not_found");
+    // Still refused: an app peer's session, and another connection without
+    // a token (or its answer).
+    let refused = register_on_session(&fx, &stdio, None, &peer_key(&fx), tools.clone()).unwrap_err();
+    assert_eq!(refused.data.unwrap()["kind"], "peer_tools_invalid");
+    let (ws, _rx) = ws_connection_for_test(8);
+    let refused = register_on_session(&fx, &ws, None, &fx.system, tools.clone()).unwrap_err();
+    assert_eq!(refused.data.unwrap()["kind"], "peer_host_token_mismatch");
+    let refused = raw_peer_tool_result(
+        ws.connection_id.0,
+        &fx.state,
+        &rpc(
+            APPUI_METHOD_PEER_TOOL_RESULT,
+            json!({"session_id": fx.system, "call_id": "no-such-call", "ok": true, "data": {}}),
+        ),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(refused.data.unwrap()["kind"], "peer_host_token_mismatch");
+    crate::peers::host_tools::drop_routes_for_connection(stdio.connection_id.0);
+
+    // `serve --host-managed`: the host token's connection needs none; an
+    // external client is refused whatever it holds.
+    let fx = fixture_with(|state| {
+        state.host_managed = Some(Arc::new(
+            super::super::host_managed::HostManaged::new(
+                "host-token-0123456789abcdef0123456789abcdef".to_owned(),
+                None,
+                8765,
+            )
+            .unwrap(),
+        ));
+    })
+    .await;
+    let (host_ws, _host_rx) = ws_connection_for_test(8);
+    register_on_session(&fx, &host_ws, None, &fx.system, tools.clone())
+        .expect("the host token's connection needs no app peer's token");
+    let (ext_ws, _ext_rx) = external_ws(8);
+    assert!(register_on_session(&fx, &ext_ws, None, &fx.system, tools).is_err());
+    crate::peers::host_tools::drop_routes_for_connection(host_ws.connection_id.0);
 }
 
 #[tokio::test]

@@ -16099,6 +16099,7 @@ fn authorize_host_session_call(
     peers_root: &Path,
     session: &SessionKey,
     host_token: Option<&str>,
+    host_connection: bool,
 ) -> Result<(), RpcError> {
     if session.topic().is_some_and(|topic| {
         topic.starts_with("peer-")
@@ -16108,6 +16109,10 @@ fn authorize_host_session_call(
             "an app peer's session takes its tools from its peer: name the peer".to_owned(),
         )
         .with_data(json!({ "kind": "peer_tools_invalid" })));
+    }
+    // The host's own connection (OctoSense#146) needs no app peer's token.
+    if host_connection {
+        return Ok(());
     }
     let proven = crate::peers::app_binding::host_bound_peers(peers_root)
         .into_iter()
@@ -16136,11 +16141,17 @@ fn raw_session_tools_register(
     peers_root: &Path,
     profile_id: &str,
     params: RawPeerToolsRegisterParams,
+    host_connection: bool,
 ) -> Result<Value, RpcError> {
     use crate::peers::host_tools::{
         SessionRegisterError, build_tool_set, register_session_tool_set,
     };
-    authorize_host_session_call(peers_root, &params.session_id, params.host_token.as_deref())?;
+    authorize_host_session_call(
+        peers_root,
+        &params.session_id,
+        params.host_token.as_deref(),
+        host_connection,
+    )?;
     let set = build_tool_set(params.tools, params.generic_tools, params.options)
         .map_err(|err| host_peer_error("peer_tools_invalid", err))?;
     let route_ws = ws.clone();
@@ -16220,7 +16231,11 @@ fn raw_peer_tools_register(
     let (_, data_dir) = resolve_profile_data_dir(state, Some(&profile_id))?;
     let peers_root = data_dir.join("peers");
     let Some(peer) = params.peer.clone() else {
-        return raw_session_tools_register(ws, &peers_root, &profile_id, params);
+        // The host's own connection: the private `serve --stdio` pipe, or a
+        // host-token connection of `serve --host-managed` (an external one
+        // was refused above).
+        let host_connection = ws.is_stdio() || state.host_managed.is_some();
+        return raw_session_tools_register(ws, &peers_root, &profile_id, params, host_connection);
     };
     let slug = authorize_host_peer_call(
         &peers_root,
@@ -16345,10 +16360,17 @@ fn raw_peer_tool_result(
             crate::peers::host_tools::ToolHost::Peer(slug)
         }
         None => {
+            // The connection that registered the session's set answers its
+            // calls without a token (only it is sent them).
+            let registrant = crate::peers::host_tools::session_set_connection(
+                &peers_root,
+                &params.session_id,
+            ) == Some(connection);
             authorize_host_session_call(
                 &peers_root,
                 &params.session_id,
                 params.host_token.as_deref(),
+                registrant,
             )?;
             crate::peers::host_tools::ToolHost::Session(params.session_id.clone())
         }
