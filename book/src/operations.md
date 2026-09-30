@@ -35,6 +35,8 @@ Sessions are stored as rolling JSONL segments, not one ever-growing file. When t
 
 **Mixed-version overlap** (e.g. a Kubernetes rolling upgrade on a shared data directory): an old binary does not see `.segments/`; its `*.jsonl` walks show only the active file, which looks like a short session. Sessions this build has written carry schema version 2, which older builds refuse to load — but never let an old binary *rewrite* (rename, summary) any rolled session: a rewrite replaces the active file with whatever the old build could read. For an older (schema 1) session, a legacy rewrite that erases `sealed_segments` makes the sealed segments invisible to loads; while that unnamed state stands, rewrites refuse and the seal refuses to replace the unnamed segments, so the files stay on disk but the session stops rolling until the state is reconciled.
 
+**Interrupted seals** (a crash or kill between sealing a segment and starting the fresh active file) leave the sealed segments on disk with no (or an empty) active file. The state self-heals on the read path: the next load of the session rebuilds a missing or empty active file from the sealed segments, and on a gateway `/new <name>` recovers a missing active file the same way, so the session resumes its history instead of starting empty. An unreadable active file is left untouched for manual recovery. Deliberately erasing history remains `/clear` (or bare `/new`).
+
 ---
 
 ## Keychain Integration

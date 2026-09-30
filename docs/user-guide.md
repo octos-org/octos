@@ -1046,7 +1046,8 @@ Model switches are persisted to the profile JSON file. On gateway restart, the b
 
 | Command | Description |
 |---------|-------------|
-| `/new` | Fork the conversation — creates a new session copying the last 10 messages |
+| `/new` | Clear the current session's history (same as `/clear`) |
+| `/new <name>` | Switch to — or create — a named session (`/new slides <name>` / `/new site <preset>` scaffold project sessions) |
 | `/config` | View and modify tool configuration (see [Section 6](#6-tool-configuration)) |
 | `/exit`, `/quit`, `:q` | Exit chat (CLI mode only) |
 
@@ -1056,7 +1057,8 @@ Each channel:chat_id pair maintains its own session (conversation history).
 
 - **Session persistence:** JSONL files in `.octos/sessions/`
 - **Max history:** Configurable via `gateway.max_history` (default: 50 messages)
-- **Session forking:** `/new` creates a branched conversation with parent_key tracking
+- **Named sessions:** `/new <name>` switches to — or creates — a named session; bare `/new` clears history like `/clear`. If a background seal was interrupted — the history sits in sealed segments with no active file — the session self-heals: opening it, or `/new <name>` on a gateway, rebuilds the active file from the sealed segments and resumes the history instead of starting empty.
+- **Internally-forked child sessions** (e.g. background spawns) carry a `parent_key` field linking them to their origin — user-created named sessions do not.
 - **Context compaction:** Three-tier (M8.5) — working / cold / archived. When the conversation exceeds the LLM's context window, older messages are summarized to first lines (tool arguments stripped) and the oldest are pushed into the entity bank as long-term memory.
 - **Sticky `thread_id` and `committed_seq` (M8.10)** — every session has a stable `thread_id` that is bound before the first streamed event and carried on subsequent UI Protocol updates. Terminal events include `committed_seq` — the durable history sequence number of the final write — so a web client can replay deterministically after reconnect. See [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md).
 - **Structured resume (M8.6)** — when a worktree is missing or a sub-agent fails, the supervisor refuses to silently drop the turn and re-engages the LLM with a structured-resume payload describing the failure.

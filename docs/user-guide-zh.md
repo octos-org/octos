@@ -950,7 +950,8 @@ curl -X POST http://localhost:50080/api/admin/test-provider \
 
 | 命令 | 说明 |
 |------|------|
-| `/new` | 分叉对话 — 创建新会话，复制最后 10 条消息 |
+| `/new` | 清空当前会话历史（等同于 `/clear`） |
+| `/new <name>` | 切换到——或创建——具名会话（`/new slides <name>`、`/new site <preset>` 脚手架生成项目会话） |
 | `/config` | 查看和修改工具配置（见[第 6 节](#6-工具配置)） |
 | `/exit`、`/quit`、`:q` | 退出聊天（仅 CLI 模式） |
 
@@ -960,7 +961,8 @@ curl -X POST http://localhost:50080/api/admin/test-provider \
 
 - **会话持久化：** `.octos/sessions/` 中的 JSONL 文件
 - **最大历史记录：** 通过 `gateway.max_history` 配置（默认：50 条消息）
-- **会话分叉：** `/new` 创建带有 parent_key 追踪的分支对话
+- **具名会话：** `/new <name>` 切换到——或创建——具名会话；裸 `/new` 与 `/clear` 一样清空历史。若一次后台封存被中断（历史已封存、活跃文件缺失），该会话会自愈：打开它，或在网关上 `/new <name>`，都会从封存分段重建活跃文件并接续历史，而不是从空白开始。
+- **内部派生的子会话**（如后台 spawn）带有 `parent_key` 字段指向其来源——用户创建的具名会话没有。
 - **三层上下文压缩（M8.5）：** 工作层 / 冷层 / 归档层。当对话超过 LLM 的上下文窗口时，较旧的消息按首行摘要（工具参数被剥离），最早的消息被推入实体库作为长期记忆。
 - **Sticky `thread_id` 与 `committed_seq`（M8.10）：** 每个会话拥有稳定的 `thread_id`，在首次流式事件之前完成绑定，并在后续 UI Protocol 更新中携带。终态事件还携带 `committed_seq`（最终写入的持久序号），客户端因此能够在断线重连后做确定性回放。详情见 [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md)。
 - **结构化恢复（M8.6）：** 当工作树缺失或子 Agent 失败时，监督者拒绝静默丢弃当前轮次，而是用一个描述失败原因的结构化恢复负载重新驱动 LLM。

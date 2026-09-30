@@ -89,6 +89,18 @@ Messages over 4096 characters are automatically split into multiple chunks by oc
 
 ---
 
+## Session History Issues
+
+### Session history disappeared after a crash
+
+A crash or kill in the middle of a background segment seal can leave a session's history entirely in sealed segments (`<name>.segments/`) with no active `<name>.jsonl` file. The session then looks empty — or missing — in listings.
+
+The state self-heals: opening the session rebuilds the active file from the sealed segments, and on a gateway `/new <name>` recovers the session the same way, so the history resumes instead of starting over. Recovery deletes nothing — an active file that exists but cannot be read is left untouched for manual repair.
+
+To start fresh on purpose, use `/clear` (or bare `/new`), which clears the current session's history.
+
+---
+
 ## Platform-Specific Issues
 
 | Problem | Solution |
