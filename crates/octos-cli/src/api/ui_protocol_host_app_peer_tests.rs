@@ -796,3 +796,37 @@ async fn should_accept_only_a_contexts_own_folder_as_its_workspace() {
         );
     }
 }
+
+#[tokio::test]
+async fn should_refuse_model_peer_close_when_the_peer_is_host_owned() {
+    // Security review (ADR 0004): the system agent's model could retire a
+    // host-owned app peer for good with `peer_close` — after that the app
+    // could neither resume it (`peer_closed`) nor stage a replacement
+    // (`peer_binding_conflict` on the same folder). The host owns that
+    // lifetime; the model's close must be refused and change nothing.
+    let fx = fixture().await;
+    prepare_app(&fx, "Rinx", "rinx", "app/rinx/acct-1", true)
+        .await
+        .expect("stage");
+    let close = build_peer_close_callback(
+        fx.data_dir.join("peers"),
+        fx.system.0.clone(),
+        "dev".to_string(),
+        contract_stores(),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+    );
+
+    let err = close("Rinx".to_string()).expect_err("model close of a host-owned peer");
+    assert!(err.contains("host"), "{err}");
+    assert!(
+        !fx.data_dir.join("peers/rinx/closed").exists(),
+        "no close marker"
+    );
+
+    let resumed = prepare_app(&fx, "Rinx", "rinx", "app/rinx/acct-1", true)
+        .await
+        .expect("the app still resumes its peer");
+    assert_eq!(resumed["resumed"], true);
+    assert_eq!(resumed["slug"], "rinx");
+}

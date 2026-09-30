@@ -18664,6 +18664,19 @@ fn build_peer_close_callback(
         // that gates `peer_send_input`, so only the session that staged the
         // peer may retire it.
         peer_send_input_authorized(&peers_root, &slug, &origin_session)?;
+        // A host-owned app peer's lifetime belongs to its host app (ADR 0004,
+        // UPCR-2026-034): the app resumes it by its binding, and a close is
+        // permanent — the app could then neither resume it (`peer_closed`)
+        // nor stage a replacement on the same folder
+        // (`peer_binding_conflict`). The system agent is its recorded
+        // originator, so the originator check above does not stop its model;
+        // refuse here, before any marker, queue or wire change.
+        if crate::peers::app_binding::peer_is_host_owned(&peers_root, &slug) {
+            return Err(format!(
+                "peer '{slug}' belongs to its host app, which owns its lifetime; \
+                 peer_close cannot close it (the app closes or purges it itself)"
+            ));
+        }
         // Resolve the REAL staged dir (safe slug, NOT a symlink, has brief.md)
         // and write ONLY under it — a deleted or symlinked peer cannot be
         // closed, so the marker can never land outside `peers/`.
