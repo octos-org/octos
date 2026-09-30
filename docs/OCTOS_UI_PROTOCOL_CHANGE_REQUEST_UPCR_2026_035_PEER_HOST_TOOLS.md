@@ -82,10 +82,14 @@ drives the turns, after every `peer/prepare` and every reconnect.
 **Host session target.** Without `peer`, the set is registered on the host
 session `session_id` itself: a session that is not an app peer, typically
 the system agent's conversation, so the system agent can call the app tools
-the host granted it. The credential is the host token of an app peer that
-`session_id` prepared (only the host that prepared that session's app peers
-holds one); a `peer-`/`peerctx-` session is refused (`peer_tools_invalid`),
-as is an external connection of `serve --host-managed`. The result carries
+the host granted it. The host's own connection needs no credential
+(OctoSense#146): the private `serve --stdio` pipe, or a host-token
+connection of `serve --host-managed`, registers a host session's set before
+any app peer exists. Any other connection presents the host token of an app
+peer that `session_id` prepared (only the host that prepared that session's
+app peers holds one; `peer_host_token_mismatch` otherwise). A
+`peer-`/`peerctx-` session is refused (`peer_tools_invalid`), as is an
+external connection of `serve --host-managed`. The result carries
 `session_id` instead of `slug`. Such a set:
 
 - lives in memory as long as the registering connection (the host registers
@@ -101,7 +105,8 @@ as is an external connection of `serve --host-managed`. The result carries
   host connection (durable, set on `session/open`) is a follow-up (#2605);
 - routes its calls to that connection with `caller.kind: "system"` and
   `peer: null`; they are answered with `peer/tool/result` without `peer`
-  (same credential); its approvals are host-routed like a peer's; its audit
+  (the connection that registered the set answers without a token; any
+  other connection needs the credential above); its approvals are host-routed like a peer's; its audit
   goes to `host_session_tool_audit.jsonl` in the profile data dir (the same
   row shape, `peer: null`).
 
