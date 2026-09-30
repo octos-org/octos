@@ -24,8 +24,19 @@
 //!   does not see its sibling contexts.
 //!
 //! Both are then bounded by `max_bytes` (newest rows kept).
+//!
+//! A turn that is still RUNNING in the other lane is shown too, after the
+//! finished rows: its request (with its origin marker), the assistant text it
+//! has streamed so far (`[the app agent] (in progress)`), and one
+//! `[turn status]` line (`still running`, `waiting for approval: <tool>` or
+//! `waiting for an answer`). The kernel's transcript holds a turn's rows only
+//! once the turn ends, so these come from the in-memory registry of running
+//! lane turns ([`begin_running_turn`]), read under a plain mutex (never
+//! across an await) and never blocking the running turn.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use octos_core::{Message, MessageRole, SessionKey};
@@ -47,6 +58,15 @@ pub(crate) const SHARE_HISTORY_MIN_MAX_BYTES: u32 = 1024;
 pub(crate) const SHARE_HISTORY_MAX_MAX_BYTES: u32 = 64 * 1024;
 /// Longest single row, in bytes (longer rows are cut with `…`).
 const SHARED_ROW_MAX_BYTES: usize = 2 * 1024;
+
+/// Speaker of a running turn's streamed text.
+const IN_PROGRESS_SPEAKER: &str = "[the app agent] (in progress)";
+/// Speaker of a running turn's status line.
+const TURN_STATUS_SPEAKER: &str = "[turn status]";
+/// Longest tool name shown in a status line, in bytes.
+const STATUS_TOOL_NAME_MAX_BYTES: usize = 64;
+/// Running lane turns remembered at most (each is removed when its turn ends).
+const RUNNING_TURNS_MAX: usize = 4_096;
 
 /// `peer/context/open`'s `share_history` as the host sends it.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -221,6 +241,209 @@ pub(crate) fn render_block(
     Some(format!("{open}{}\n{close}", kept.join("\n")))
 }
 
+/// What a running turn is waiting on, if anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TurnWaiting {
+    /// Parked on approval(s) of these tools (names only, never arguments).
+    Approval(Vec<String>),
+    /// Parked on a question to the person.
+    Answer,
+}
+
+/// A running turn's live state, read when another lane builds its block.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LiveTurnStatus {
+    /// The assistant text streamed so far (its tail).
+    pub(crate) draft: String,
+    pub(crate) waiting: Option<TurnWaiting>,
+}
+
+/// Reads a running turn's [`LiveTurnStatus`]. Must not block: it is called
+/// while another lane's turn builds its prompt.
+pub(crate) type LiveTurnProbe = Arc<dyn Fn() -> LiveTurnStatus + Send + Sync>;
+
+#[derive(Clone)]
+struct RunningTurn {
+    turn_id: String,
+    started_at: DateTime<Utc>,
+    /// The turn's request as its transcript will hold it (origin marker
+    /// first); `None` for a kernel-internal turn whose prompt is not a row.
+    request: Option<String>,
+    probe: LiveTurnProbe,
+}
+
+static RUNNING_TURNS: LazyLock<Mutex<HashMap<String, RunningTurn>>> = LazyLock::new(Mutex::default);
+
+/// Registered while a turn runs on a lane-shaped session; removes the entry
+/// when dropped (the turn ended, errored, was interrupted or aborted).
+pub(crate) struct RunningTurnGuard {
+    session: String,
+    turn_id: String,
+}
+
+impl Drop for RunningTurnGuard {
+    fn drop(&mut self) {
+        let mut running = RUNNING_TURNS.lock().unwrap_or_else(|p| p.into_inner());
+        if running
+            .get(&self.session)
+            .is_some_and(|turn| turn.turn_id == self.turn_id)
+        {
+            running.remove(&self.session);
+        }
+    }
+}
+
+/// Record that `turn_id` is running on `session`, so the other lane of a
+/// sharing peer can show it before its rows reach the transcript. Only
+/// sessions that can be a lane (a `peer-<slug>` or `peerctx-…` topic) are
+/// recorded; `None` for any other session. Keep the guard for the turn's
+/// whole run.
+pub(crate) fn begin_running_turn(
+    session: &SessionKey,
+    turn_id: &str,
+    request: Option<&str>,
+    probe: LiveTurnProbe,
+) -> Option<RunningTurnGuard> {
+    let topic = session.topic()?;
+    if !topic.starts_with("peer-") && !topic.starts_with(PEER_CONTEXT_TOPIC_PREFIX) {
+        return None;
+    }
+    let mut running = RUNNING_TURNS.lock().unwrap_or_else(|p| p.into_inner());
+    if running.len() >= RUNNING_TURNS_MAX && !running.contains_key(&session.0) {
+        return None;
+    }
+    running.insert(
+        session.0.clone(),
+        RunningTurn {
+            turn_id: turn_id.to_owned(),
+            started_at: Utc::now(),
+            request: request
+                .map(str::trim)
+                .filter(|request| !request.is_empty())
+                .map(str::to_owned),
+            probe,
+        },
+    );
+    Some(RunningTurnGuard {
+        session: session.0.clone(),
+        turn_id: turn_id.to_owned(),
+    })
+}
+
+/// The last `cap` bytes of `text` (a streamed tail), `…` in front when cut.
+fn tail_capped(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let mut cut = text.len() - cap;
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("…{}", &text[cut..])
+}
+
+/// A tool name as a status line shows it: one token, capped.
+fn status_tool_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+        .collect();
+    let (cleaned, _) = super::capped_utf8(cleaned, STATUS_TOOL_NAME_MAX_BYTES);
+    if cleaned.is_empty() {
+        "a tool".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+/// The rows of the turn running on `session` (its request, the text it has
+/// streamed so far, and its status line), or none. `persisted` is the
+/// session's transcript as just read: when it already holds a user row of
+/// the running turn (the turn is committing its rows), the running turn is
+/// not shown again.
+fn running_rows(
+    session: &SessionKey,
+    persisted: &[Message],
+    conversation: Option<&str>,
+) -> Vec<SharedRow> {
+    let Some(turn) = RUNNING_TURNS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&session.0)
+        .cloned()
+    else {
+        return Vec::new();
+    };
+    running_turn_rows(&turn, persisted, conversation, (turn.probe)(), Utc::now())
+}
+
+fn running_turn_rows(
+    turn: &RunningTurn,
+    persisted: &[Message],
+    conversation: Option<&str>,
+    live: LiveTurnStatus,
+    now: DateTime<Utc>,
+) -> Vec<SharedRow> {
+    if persisted
+        .iter()
+        .any(|message| message.role == MessageRole::User && message.timestamp >= turn.started_at)
+    {
+        return Vec::new();
+    }
+    let row = |at, speaker: &str, text: String| SharedRow {
+        at,
+        conversation: conversation.map(str::to_owned),
+        speaker: speaker.to_owned(),
+        text,
+    };
+    let mut rows = Vec::new();
+    if let Some(request) = &turn.request {
+        let (speaker, text) = match split_origin_marker(request) {
+            Some((marker, text)) => (marker, text),
+            None => ("[from the host]", request.as_str()),
+        };
+        if !text.is_empty() {
+            let (mut text, cut) = super::capped_utf8(text.to_owned(), SHARED_ROW_MAX_BYTES);
+            if cut {
+                text.push('…');
+            }
+            rows.push(row(turn.started_at, speaker, text));
+        }
+    }
+    let draft = live.draft.trim();
+    if !draft.is_empty() {
+        rows.push(row(
+            now,
+            IN_PROGRESS_SPEAKER,
+            tail_capped(draft, SHARED_ROW_MAX_BYTES),
+        ));
+    }
+    let status = match live.waiting {
+        Some(TurnWaiting::Approval(tools)) => {
+            let mut names: Vec<String> = tools.iter().map(|t| status_tool_name(t)).collect();
+            names.dedup();
+            format!("still running, waiting for approval: {}", names.join(", "))
+        }
+        Some(TurnWaiting::Answer) => "still running, waiting for an answer".to_owned(),
+        None => "still running".to_owned(),
+    };
+    rows.push(row(now, TURN_STATUS_SPEAKER, status));
+    rows
+}
+
+/// Finished rows (oldest first) followed by running turns' rows, the newest
+/// `last_n` in all: finished rows go first when there are too many.
+fn with_running(
+    finished: Vec<SharedRow>,
+    running: Vec<SharedRow>,
+    last_n: usize,
+) -> Vec<SharedRow> {
+    let mut rows = finished;
+    rows.extend(running);
+    let skip = rows.len().saturating_sub(last_n);
+    rows.split_off(skip)
+}
+
 /// The prompt-only message that carries a block.
 pub(crate) fn block_message(block: String) -> Message {
     Message {
@@ -270,7 +493,11 @@ pub(crate) async fn shared_history_for_turn(
         )
         .await
         .unwrap_or_default();
-        let rows = select_rows(&messages, None, share.last_n as usize);
+        let rows = with_running(
+            select_rows(&messages, None, share.last_n as usize),
+            running_rows(&peer_session, &messages, None),
+            share.last_n as usize,
+        );
         return Some((SharedLane::SystemAgent, rows, share.max_bytes as usize));
     }
     // System agent lane: show every open sharing context.
@@ -294,15 +521,28 @@ pub(crate) async fn shared_history_for_turn(
     let max_bytes = sharing.iter().map(|(_, _, s)| s.max_bytes).max()? as usize;
     let label = sharing.len() > 1;
     let mut rows = Vec::new();
+    // Each running context's rows stay together; contexts in start order.
+    let mut running: Vec<Vec<SharedRow>> = Vec::new();
     for (id, cwd, _) in &sharing {
         let key = context_session_key(session, slug, id);
         let messages =
             octos_bus::session::load_session_messages_locked(&transcript_root(cwd), &key)
                 .await
                 .unwrap_or_default();
-        rows.extend(select_rows(&messages, label.then_some(id.as_str()), last_n));
+        let conversation = label.then_some(id.as_str());
+        rows.extend(select_rows(&messages, conversation, last_n));
+        let turn = running_rows(&key, &messages, conversation);
+        if !turn.is_empty() {
+            running.push(turn);
+        }
     }
-    Some((SharedLane::Person, merge_rows(rows, last_n), max_bytes))
+    running.sort_by_key(|turn| turn[0].at);
+    let rows = with_running(
+        merge_rows(rows, last_n),
+        running.into_iter().flatten().collect(),
+        last_n,
+    );
+    Some((SharedLane::Person, rows, max_bytes))
 }
 
 #[cfg(test)]
@@ -451,5 +691,252 @@ mod tests {
         let block = render_block(SharedLane::SystemAgent, &rows, 4096).unwrap();
         assert_eq!(block.matches("</shared_history>").count(), 1, "{block}");
         assert!(render_block(SharedLane::Person, &[], 4096).is_none());
+    }
+
+    fn running(request: Option<&str>, started: i64) -> RunningTurn {
+        RunningTurn {
+            turn_id: "t-1".into(),
+            started_at: DateTime::from_timestamp(1_800_000_000 + started, 0).unwrap(),
+            request: request.map(str::to_owned),
+            probe: Arc::new(LiveTurnStatus::default),
+        }
+    }
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap()
+    }
+
+    fn shown(rows: &[SharedRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| format!("{} {}", row.speaker, row.text))
+            .collect()
+    }
+
+    #[test]
+    fn a_running_turn_shows_its_request_draft_and_status_after_the_finished_rows() {
+        let finished = select_rows(
+            &[
+                msg(MessageRole::User, "[from the system agent] EARLIER", 1),
+                msg(MessageRole::Assistant, "Earlier answer.", 2),
+            ],
+            None,
+            10,
+        );
+        let live = LiveTurnStatus {
+            draft: "  Sending the mail now.  ".into(),
+            waiting: Some(TurnWaiting::Approval(vec!["mail_send".into()])),
+        };
+        let turn = running(Some("[from the system agent] SEND_IT"), 5);
+        let rows = with_running(
+            finished,
+            running_turn_rows(&turn, &[], None, live, at(9)),
+            10,
+        );
+        assert_eq!(
+            shown(&rows),
+            [
+                "[from the system agent] EARLIER",
+                "[the app agent] Earlier answer.",
+                "[from the system agent] SEND_IT",
+                "[the app agent] (in progress) Sending the mail now.",
+                "[turn status] still running, waiting for approval: mail_send",
+            ]
+        );
+        let block = render_block(SharedLane::SystemAgent, &rows, 4096).unwrap();
+        assert!(
+            block.contains(
+                "[the app agent] Earlier answer.\n- 2027-01-15T08:00:05Z [from the system agent] SEND_IT\n"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.ends_with(
+                "[turn status] still running, waiting for approval: mail_send\n</shared_history>"
+            ),
+            "{block}"
+        );
+
+        // A question, no draft, no marker; tool arguments never appear.
+        let rows = running_turn_rows(
+            &running(Some("plain"), 5),
+            &[],
+            Some("ui-1"),
+            LiveTurnStatus {
+                draft: " ".into(),
+                waiting: Some(TurnWaiting::Answer),
+            },
+            at(9),
+        );
+        assert_eq!(
+            shown(&rows),
+            [
+                "[from the host] plain",
+                "[turn status] still running, waiting for an answer",
+            ]
+        );
+        assert_eq!(rows[0].conversation.as_deref(), Some("ui-1"));
+        let rows = running_turn_rows(
+            &running(None, 5),
+            &[],
+            None,
+            LiveTurnStatus {
+                draft: String::new(),
+                waiting: Some(TurnWaiting::Approval(vec![
+                    "shell {\"command\": \"rm -rf /\"}".into(),
+                    "shell".into(),
+                ])),
+            },
+            at(9),
+        );
+        assert_eq!(
+            shown(&rows),
+            ["[turn status] still running, waiting for approval: shellcommand:rm-rf, shell"]
+        );
+    }
+
+    #[test]
+    fn a_running_turn_whose_rows_were_persisted_is_not_shown_twice() {
+        let turn = running(Some("[from the person] hello"), 5);
+        let older = [msg(MessageRole::User, "[from the person] before", 4)];
+        assert_eq!(
+            running_turn_rows(&turn, &older, None, LiveTurnStatus::default(), at(9)).len(),
+            2,
+            "rows from before the turn started do not hide it"
+        );
+        let committing = [
+            msg(MessageRole::User, "[from the person] before", 4),
+            msg(MessageRole::User, "[from the person] hello", 5),
+        ];
+        assert!(
+            running_turn_rows(&turn, &committing, None, LiveTurnStatus::default(), at(9))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn running_rows_keep_the_caps() {
+        // 2 KiB per row: the request keeps its head, the draft its tail.
+        let long_request = format!("[from the person] {}", "r".repeat(5000));
+        let long_draft = format!("{}END", "d".repeat(5000));
+        let rows = running_turn_rows(
+            &running(Some(&long_request), 5),
+            &[],
+            None,
+            LiveTurnStatus {
+                draft: long_draft,
+                waiting: None,
+            },
+            at(9),
+        );
+        assert_eq!(rows[0].text.len(), SHARED_ROW_MAX_BYTES + '…'.len_utf8());
+        assert!(rows[0].text.ends_with('…'));
+        assert!(rows[1].text.starts_with('…') && rows[1].text.ends_with("END"));
+        assert_eq!(rows[1].text.len(), SHARED_ROW_MAX_BYTES + '…'.len_utf8());
+        // A multi-byte tail is cut on a char boundary.
+        assert!(tail_capped(&"é".repeat(10), 5).starts_with('…'));
+
+        // last_n: the finished rows give way first.
+        let finished: Vec<_> = (0..10)
+            .map(|i| msg(MessageRole::Assistant, &format!("f{i}"), i))
+            .collect();
+        let finished = select_rows(&finished, None, 10);
+        let running_rows = running_turn_rows(
+            &running(Some("[from the person] now"), 20),
+            &[],
+            None,
+            LiveTurnStatus::default(),
+            at(21),
+        );
+        let rows = with_running(finished.clone(), running_rows.clone(), 4);
+        assert_eq!(
+            shown(&rows),
+            [
+                "[the app agent] f8",
+                "[the app agent] f9",
+                "[from the person] now",
+                "[turn status] still running",
+            ]
+        );
+        assert_eq!(with_running(finished, running_rows, 1).len(), 1);
+
+        // max_bytes: the newest rows (the running turn's) are kept.
+        let long: Vec<_> = (0..40)
+            .map(|i| {
+                msg(
+                    MessageRole::Assistant,
+                    &format!("row {i} {}", "x".repeat(100)),
+                    i,
+                )
+            })
+            .collect();
+        let rows = with_running(
+            select_rows(&long, None, 50),
+            running_turn_rows(
+                &running(Some("[from the person] now"), 50),
+                &[],
+                None,
+                LiveTurnStatus::default(),
+                at(51),
+            ),
+            50,
+        );
+        let block = render_block(SharedLane::Person, &rows, 1024).unwrap();
+        assert!(block.len() <= 1024, "{}", block.len());
+        assert!(block.contains("[from the person] now"), "{block}");
+        assert!(block.contains("[turn status] still running"), "{block}");
+        assert!(!block.contains("row 0 "), "{block}");
+    }
+
+    #[test]
+    fn with_no_running_turn_the_finished_block_is_unchanged() {
+        let messages: Vec<_> = (0..30)
+            .map(|i| msg(MessageRole::User, &format!("[from the person] m{i}"), i))
+            .collect();
+        let finished = select_rows(&messages, None, 20);
+        assert_eq!(with_running(finished.clone(), Vec::new(), 20), finished);
+        let key = SessionKey::with_profile_topic("dev", "api", "chat-none", "peer-idle");
+        assert!(running_rows(&key, &messages, None).is_empty());
+    }
+
+    #[test]
+    fn the_running_registry_records_lane_sessions_until_the_turn_ends() {
+        let lane = SessionKey::with_profile_topic("dev", "api", "chat-reg", "peer-news");
+        let context = SessionKey::with_profile_topic("dev", "api", "chat-reg", "peerctx-news.ui-1");
+        let other = SessionKey::with_profile_topic("dev", "api", "chat-reg", "system");
+        let probe: LiveTurnProbe = Arc::new(|| LiveTurnStatus {
+            draft: "partial".into(),
+            waiting: None,
+        });
+        assert!(begin_running_turn(&other, "t-0", Some("x"), probe.clone()).is_none());
+
+        let guard = begin_running_turn(&lane, "t-1", Some("[from the app] go"), probe.clone())
+            .expect("a peer session is a lane");
+        let rows = running_rows(&lane, &[], None);
+        assert_eq!(
+            shown(&rows),
+            [
+                "[from the app] go",
+                "[the app agent] (in progress) partial",
+                "[turn status] still running",
+            ]
+        );
+        // A later turn on the session replaces it; the earlier guard's drop
+        // leaves the later turn alone.
+        let later = begin_running_turn(&lane, "t-2", Some("again"), probe.clone()).unwrap();
+        drop(guard);
+        assert_eq!(running_rows(&lane, &[], None)[0].text, "again");
+        drop(later);
+        assert!(running_rows(&lane, &[], None).is_empty());
+
+        let guard = begin_running_turn(&context, "t-3", None, probe).expect("a context is a lane");
+        assert_eq!(
+            shown(&running_rows(&context, &[], Some("ui-1"))),
+            [
+                "[the app agent] (in progress) partial",
+                "[turn status] still running",
+            ]
+        );
+        drop(guard);
+        assert!(running_rows(&context, &[], None).is_empty());
     }
 }

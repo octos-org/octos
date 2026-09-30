@@ -4844,12 +4844,40 @@ async fn start_turn(
     text: &str,
     origin: Option<octos_core::ui_protocol::TurnOrigin>,
 ) -> bool {
+    start_turn_in(
+        e,
+        ws,
+        active_turns,
+        &Arc::new(UiProtocolContractStores::default()),
+        request_id,
+        session,
+        turn_id,
+        text,
+        origin,
+    )
+    .await
+}
+
+/// [`start_turn`] with the contract stores (approvals, questions) the turn's
+/// requesters park on.
+#[allow(clippy::too_many_arguments)]
+async fn start_turn_in(
+    e: &E2e,
+    ws: &WsConnection,
+    active_turns: &SharedActiveTurns,
+    contracts: &Arc<UiProtocolContractStores>,
+    request_id: &str,
+    session: &SessionKey,
+    turn_id: &TurnId,
+    text: &str,
+    origin: Option<octos_core::ui_protocol::TurnOrigin>,
+) -> bool {
     let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
     handle_turn_start(
         ws,
         &e.state,
         &Arc::new(UiProtocolLedger::new(256)),
-        &Arc::new(UiProtocolContractStores::default()),
+        contracts,
         active_turns,
         &connection_turns,
         None,
@@ -5952,4 +5980,263 @@ async fn should_number_concurrent_rounds_of_both_lanes_without_collisions() {
     assert_eq!(rounds, (1..=16).collect::<Vec<_>>(), "{index}");
     let latest = std::fs::read_to_string(dir.join("result.md")).unwrap();
     assert!(latest.contains("\nturn: 16\n"), "{latest}");
+}
+
+/// The model of the running-turn tests. Records each request's text. Its
+/// turn's own message decides: "SEND_IT" says a sentence and calls
+/// `mail_send` (then "done" after the tool result); "HOLD" waits until the
+/// test releases it; anything else answers "ok".
+#[derive(Default)]
+struct LaneLlm {
+    requests: std::sync::Mutex<Vec<String>>,
+    held: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl LaneLlm {
+    /// The recorded request whose text contains `needle`.
+    fn request_with(&self, needle: &str) -> String {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| request.contains(needle))
+            .cloned()
+            .unwrap_or_else(|| panic!("no request contains {needle:?}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for LaneLlm {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        let text = messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        self.requests.lock().unwrap().push(text);
+        let own = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::User && m.content.starts_with("[from "))
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let after_tool = messages.last().is_some_and(|m| m.role == MessageRole::Tool);
+        let usage = octos_llm::TokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            ..Default::default()
+        };
+        let reply = |content: &str| octos_llm::ChatResponse {
+            content: Some(content.into()),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: usage.clone(),
+            provider_index: None,
+        };
+        if own.contains("SEND_IT") && !after_tool {
+            return Ok(octos_llm::ChatResponse {
+                content: Some("Sending the mail now.".into()),
+                reasoning_content: None,
+                tool_calls: vec![octos_core::ToolCall {
+                    id: "call_send".into(),
+                    name: "mail_send".into(),
+                    arguments: json!({"draft_id": "d-secret-args"}),
+                    metadata: None,
+                }],
+                stop_reason: octos_llm::StopReason::ToolUse,
+                usage,
+                provider_index: None,
+            });
+        }
+        if own.contains("SEND_IT") {
+            return Ok(reply("done"));
+        }
+        if own.contains("HOLD") {
+            self.held.notify_one();
+            self.release.notified().await;
+        }
+        Ok(reply("ok"))
+    }
+
+    fn model_id(&self) -> &str {
+        "lane"
+    }
+
+    fn provider_name(&self) -> &str {
+        "stub"
+    }
+}
+
+/// Wait (bounded) until `session` has a pending approval in `contracts`.
+async fn wait_for_pending_approval(
+    contracts: &UiProtocolContractStores,
+    session: &SessionKey,
+) -> Vec<ApprovalRequestedEvent> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        let pending = contracts.approvals.pending_for_session(session);
+        if !pending.is_empty() {
+            return pending;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the turn never asked for an approval");
+}
+
+/// The shared-history markers of a running turn, which no file may hold.
+fn assert_no_block_persisted(e: &E2e) {
+    let root = e.data_dir.parent().unwrap().to_path_buf();
+    for needle in ["<shared_history", "[turn status]", "(in progress)"] {
+        assert_eq!(
+            files_containing(&root, needle),
+            Vec::<PathBuf>::new(),
+            "{needle} was persisted"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_show_the_person_lane_a_system_agent_turn_waiting_for_approval() {
+    let llm = Arc::new(LaneLlm::default());
+    let mut e = e2e_fixture(llm.clone(), json!({ "tools": [mail_send()] })).await;
+    let frames = collect_frames(e.rx.take().unwrap());
+    let peer = shared_peer(&e);
+    let context = sharing_context(&e, "ui-1");
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+
+    // The system agent's turn parks on the approval of a destructive tool.
+    let input_turn = peer_input_turn_id(&e, &frames, "SEND_IT", "call_1").await;
+    assert!(
+        start_turn_in(
+            &e,
+            &e.ws,
+            &active,
+            &contracts,
+            "s1",
+            &peer,
+            &input_turn,
+            "SEND_IT",
+            None
+        )
+        .await
+    );
+    let pending = wait_for_pending_approval(&contracts, &peer).await;
+
+    // Meanwhile the person's lane sees the running turn: its request, what
+    // it said so far, and what it waits on (the tool's name, no arguments).
+    let person_turn = TurnId::new();
+    start_turn_when_free(
+        &e,
+        &active,
+        "p1",
+        &context,
+        &person_turn,
+        "what is the agent doing?",
+        None,
+    )
+    .await;
+    wait_result(&e, &person_turn).await;
+    let request = llm.request_with("[from the person] what is the agent doing?");
+    let block = request
+        .split("\n---\n")
+        .find(|part| part.starts_with("<shared_history lane=\"system_agent\""))
+        .unwrap_or_else(|| panic!("no block: {request}"))
+        .to_owned();
+    let rows: Vec<&str> = block
+        .lines()
+        .filter(|line| line.starts_with("- "))
+        .map(|line| line.split_once("Z ").unwrap().1)
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "[from the system agent] SEND_IT",
+            "[the app agent] (in progress) Sending the mail now.",
+            "[turn status] still running, waiting for approval: mail_send",
+        ],
+        "{block}"
+    );
+    assert!(!block.contains("d-secret-args"), "{block}");
+
+    // Declined: the turn ends, and the next block shows it as finished rows.
+    contracts
+        .approvals
+        .respond_with_context(ApprovalRespondParams::new(
+            peer.clone(),
+            pending[0].approval_id.clone(),
+            ApprovalDecision::Deny,
+        ))
+        .expect("the person declines");
+    wait_result(&e, &input_turn).await;
+    let next_turn = TurnId::new();
+    start_turn_when_free(&e, &active, "p2", &context, &next_turn, "and now?", None).await;
+    wait_result(&e, &next_turn).await;
+    let request = llm.request_with("[from the person] and now?");
+    assert!(
+        request.contains("[from the system agent] SEND_IT\n"),
+        "{request}"
+    );
+    assert!(request.contains("[the app agent] done\n"), "{request}");
+    assert!(!request.contains("[turn status]"), "{request}");
+    assert!(!request.contains("(in progress)"), "{request}");
+    assert_no_block_persisted(&e);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_show_the_peer_session_a_persons_turn_in_progress() {
+    let llm = Arc::new(LaneLlm::default());
+    let mut e = e2e_fixture(llm.clone(), json!({ "tools": [] })).await;
+    let frames = collect_frames(e.rx.take().unwrap());
+    let peer = shared_peer(&e);
+    let context = sharing_context(&e, "ui-1");
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+
+    // The person's turn is running (it holds the model).
+    let person_turn = TurnId::new();
+    assert!(
+        start_turn(
+            &e,
+            &e.ws,
+            &active,
+            "p1",
+            &context,
+            &person_turn,
+            "HOLD this for me",
+            None
+        )
+        .await
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(60), llm.held.notified())
+        .await
+        .expect("the person's turn reached the model");
+
+    // The system agent's turn sees it.
+    let input_turn = peer_input_turn_id(&e, &frames, "CHECK_MAIL", "call_1").await;
+    start_turn_when_free(&e, &active, "s1", &peer, &input_turn, "CHECK_MAIL", None).await;
+    wait_result(&e, &input_turn).await;
+    let request = llm.request_with("[from the system agent] CHECK_MAIL");
+    assert!(
+        request.contains("<shared_history lane=\"person\" read_only=\"true\">"),
+        "{request}"
+    );
+    assert!(
+        request.contains("[from the person] HOLD this for me\n"),
+        "{request}"
+    );
+    assert!(
+        request.contains("[turn status] still running\n</shared_history>"),
+        "{request}"
+    );
+
+    llm.release.notify_one();
+    wait_result(&e, &person_turn).await;
+    assert_no_block_persisted(&e);
 }

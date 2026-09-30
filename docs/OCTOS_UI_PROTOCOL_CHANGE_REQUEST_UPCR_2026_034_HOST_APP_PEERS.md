@@ -311,6 +311,39 @@ break tool-call pairing and compaction.
   call of the turn, and is **never written** into the reader's transcript or
   context ledger. It is shown only on turns that get the app's context (the
   host's turns), never on a foreign or kernel-internal turn.
+- **A turn still running in the other lane** (amended 2026-09-29, octos
+  #2636 follow-up). A lane's transcript gets a turn's rows only when that
+  turn ends, so the block also shows the other lane's RUNNING turn, after
+  the finished rows: its request (with its origin marker, as its transcript
+  will hold it), the assistant text it has streamed so far, and one status
+  line:
+
+  ```
+  - 2026-09-29T12:03:00Z [from the system agent] SUMMARIZE_TODAY
+  - 2026-09-29T12:03:05Z [the app agent] Three new stories …
+  - 2026-09-29T12:10:00Z [from the system agent] SEND_IT
+  - 2026-09-29T12:10:04Z [the app agent] (in progress) Sending the mail now.
+  - 2026-09-29T12:10:04Z [turn status] still running, waiting for approval: mail_send
+  ```
+
+  The status line reads `still running`, `still running, waiting for
+  approval: <tool>[, <tool>…]` (tool names only, never arguments) or `still
+  running, waiting for an answer` (a question to the person). The streamed
+  text is its tail (`…` in front when cut) and is omitted when the turn has
+  said nothing yet; a kernel-internal turn shows no request row. It comes
+  from the kernel's in-memory registry of running lane turns (registered
+  when the turn is dispatched, removed when it ends in any way), the
+  pending approval and question stores the turn's own requesters use, and
+  the streamed-text tail `session/btw` reads; each is a short, non-async
+  read, so building the block never waits on or holds up the running turn.
+  Once the reader sees the running turn's user row in the transcript (the
+  turn is committing its rows), the running rows are not shown again. The
+  same rules hold: read-only, never persisted, tool rows and results
+  dropped, 2 KiB per row, `last_n` counts these rows too (the oldest
+  finished rows give way first) and `max_bytes` keeps the newest rows, so
+  the running turn's. For the peer session with several sharing contexts,
+  each running context's rows stay together, after all finished rows, in
+  the order the turns started.
 - **Several sharing contexts.** A sharing context sees only the peer
   session, never its sibling contexts. The peer session sees every OPEN
   sharing context of the peer: each context's last rows, merged by time, the
@@ -427,6 +460,13 @@ break tool-call pairing and compaction.
   (`share_history_host_only` for no connection, another connection and an
   external client; the caps; `peer_binding_mismatch` on a changed re-open;
   origin rules; a plain context stays unchanged),
-  `should_number_concurrent_rounds_of_both_lanes_without_collisions`, and
+  `should_number_concurrent_rounds_of_both_lanes_without_collisions`,
+  `should_show_the_person_lane_a_system_agent_turn_waiting_for_approval`
+  (the running turn's request, its streamed text and `waiting for approval:
+  mail_send`, no tool arguments; once it ends, plain finished rows),
+  `should_show_the_peer_session_a_persons_turn_in_progress` (the reverse;
+  neither test leaves the block or the running rows in any file), and
   the `peers::shared_history` unit tests (defaults and caps, tool rows
-  dropped, speakers, merge, the byte budget)
+  dropped, speakers, merge, the byte budget; running rows after finished
+  rows, their caps, no double showing while a turn commits, the registry's
+  lifetime, the finished-only block unchanged)

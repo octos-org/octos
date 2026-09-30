@@ -37440,6 +37440,47 @@ async fn shared_history_block_for_turn(
     crate::peers::shared_history::render_block(lane, &rows, max_bytes)
 }
 
+/// UPCR-2026-034: how a running lane turn is doing, for the other lane's
+/// shared-history block: the tail of the text it streamed
+/// ([`btw_live_draft_tail`]) and the approvals (tool names only) or question
+/// it is parked on in `contracts`, the stores its own requesters use. Plain,
+/// short, non-async reads: it never waits on the turn.
+fn running_turn_probe(
+    contracts: &Arc<UiProtocolContractStores>,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) -> crate::peers::shared_history::LiveTurnProbe {
+    use crate::peers::shared_history::{LiveTurnStatus, TurnWaiting};
+    let contracts = contracts.clone();
+    let session_id = session_id.clone();
+    let turn_id = turn_id.clone();
+    Arc::new(move || {
+        let tools: Vec<String> = contracts
+            .approvals
+            .pending_for_session(&session_id)
+            .into_iter()
+            .filter(|approval| approval.turn_id == turn_id)
+            .map(|approval| approval.tool_name)
+            .collect();
+        let waiting = if !tools.is_empty() {
+            Some(TurnWaiting::Approval(tools))
+        } else if contracts
+            .user_questions
+            .pending_for_session(&session_id)
+            .iter()
+            .any(|question| question.turn_id == turn_id)
+        {
+            Some(TurnWaiting::Answer)
+        } else {
+            None
+        };
+        LiveTurnStatus {
+            draft: btw_live_draft_tail(&session_id, &turn_id),
+            waiting,
+        }
+    })
+}
+
 /// UPCR-2026-035: replace the content of every `memory_update` context event
 /// in `history` (as rendered by the context manager) with "no memory".
 fn redact_memory_context_messages(history: &mut [Message]) {
@@ -40432,6 +40473,18 @@ async fn run_standalone_turn(
     // (STT transcription merge, voice-mode suffix) has landed; `prompt`
     // itself moves into the agent task below.
     let turn_end_summary = crate::session_actor::git_turn_summary(&prompt);
+    // UPCR-2026-034, the parallel person context with shared history: until
+    // this turn's rows reach the transcript (at its end), the other lane of a
+    // sharing peer sees it from here: its request, the text streamed so far,
+    // and what it waits on. Dropped with this scope, whichever way the turn
+    // ends. No-op for a session that is not a lane.
+    let _running_turn = crate::peers::shared_history::begin_running_turn(
+        &session_id,
+        &turn_id.0.to_string(),
+        (!skip_internal_user_persist)
+            .then(|| voice_user_content_for_persist.as_deref().unwrap_or(&prompt)),
+        running_turn_probe(&contracts, &session_id, &turn_id),
+    );
     let agent_task = tokio::spawn(async move {
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the

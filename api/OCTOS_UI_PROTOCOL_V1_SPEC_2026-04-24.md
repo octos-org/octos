@@ -588,7 +588,9 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   person's lane of the peer (amended 2026-09-29): it runs in parallel with
   the peer's own session, each lane's turns are shown the other's recent
   user/assistant text rows as a read-only prompt block that is never
-  persisted, its turns are labelled `person` by default, and each of its
+  persisted (including the other lane's running turn: its request, its
+  streamed text so far and a `[turn status]` line such as `waiting for
+  approval: <tool>`), its turns are labelled `person` by default, and each of its
   turns publishes a round on the peer's blackboard (`origin:`, `context:`).
   Fixed at creation (`peer_binding_mismatch` on a changed re-open). Close marks the binding closed and
   interrupts the context's in-flight turn; a closed or never-opened
