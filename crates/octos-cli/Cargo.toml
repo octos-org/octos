@@ -161,7 +161,13 @@ keyring = { workspace = true, features = ["windows-native"] }
 # `embed-llama` is on by default: the in-process EmbeddingGemma embedder
 # behind memory search (docs/adr/personal-memory-tiers.md). Building it needs
 # cmake + a C++ toolchain; `--no-default-features --features api` opts out.
-default = ["api", "embed-llama"]
+default = ["api", "embed-llama", "impersonate"]
+# Results-page engines that need a browser-like client (Google's page for
+# simple phones, as SearXNG does; octos-research `impersonate`, BoringSSL,
+# needs cmake). A choice of this binary, not a default of octos-agent: a
+# `--no-default-features` build (the Android kernel) cross-compiles no
+# BoringSSL and simply leaves those engines out.
+impersonate = ["octos-agent/impersonate"]
 # In-process llama.cpp GGUF embedding provider. Wires
 # `embedding.provider = "llamacpp"` in create_embedder. Cross-platform — no
 # target gate — and defaults to the CPU backend; add an accelerator explicitly.

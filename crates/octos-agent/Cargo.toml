@@ -126,10 +126,13 @@ rustix = { workspace = true }
 # pre-existing HTTP-only `web_search` behaviour byte-for-byte. It also lets
 # metasearch engines that render (Google) load in the person's browser
 # (`octos_research::browser`).
-default = ["browser", "impersonate"]
+default = ["browser"]
 browser = ["octos-research/browser"]
 # Results-page engines that need a browser-like client (Google's page for
-# simple phones), as SearXNG does. Not on Windows; building it needs cmake.
+# simple phones), as SearXNG does. Not on Windows; building it needs cmake
+# (BoringSSL). Off here: the binary chooses it (octos-cli's `impersonate`,
+# on by default there), so a `--no-default-features` build of the binary,
+# such as the Android kernel, cross-compiles no BoringSSL.
 impersonate = ["octos-research/impersonate"]
 git = ["dep:gix", "dep:similar"]
 ast = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript", "dep:tree-sitter-typescript"]
