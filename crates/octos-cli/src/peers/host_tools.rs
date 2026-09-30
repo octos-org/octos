@@ -967,6 +967,47 @@ impl BoundedClaims {
     }
 }
 
+/// [`BoundedClaims`] per partition (a peer's or host session's route), so one
+/// busy route filling its own bound never refuses another route's claims.
+/// Each partition holds at most [`BoundedClaims::MAX`] unexpired claims; a
+/// partition with none left is dropped, so the map only holds routes with
+/// live claims.
+#[derive(Default)]
+struct PartitionedClaims {
+    parts: HashMap<String, BoundedClaims>,
+}
+
+impl PartitionedClaims {
+    fn claim(&mut self, part: &str, key: String, retention: Duration) -> Claim {
+        self.sweep(retention);
+        self.parts
+            .entry(part.to_owned())
+            .or_default()
+            .claim(key, retention)
+    }
+
+    fn remove(&mut self, part: &str, key: &str) {
+        if let Some(claims) = self.parts.get_mut(part) {
+            claims.remove(key);
+            if claims.keys.is_empty() {
+                self.parts.remove(part);
+            }
+        }
+    }
+
+    /// Drop partitions whose claims have all expired, once there are many.
+    fn sweep(&mut self, retention: Duration) {
+        if self.parts.len() < 64 {
+            return;
+        }
+        let now = Instant::now();
+        self.parts.retain(|_, claims| {
+            claims.evict_expired(now, retention);
+            !claims.keys.is_empty()
+        });
+    }
+}
+
 /// Calls the kernel stopped waiting for, kept so a late result is audited.
 const FINISHED_RETENTION: Duration = Duration::from_secs(3_600);
 const FINISHED_MAX: usize = 1_024;
@@ -974,8 +1015,8 @@ const FINISHED_MAX: usize = 1_024;
 #[derive(Default)]
 struct HostToolHub {
     routes: Mutex<HashMap<String, HostRoute>>,
-    /// `peer/input` deliveries already sent: `(route, input id)`.
-    inputs: Mutex<BoundedClaims>,
+    /// `peer/input` deliveries already sent: input ids, per route.
+    inputs: Mutex<PartitionedClaims>,
     /// Turn ids the kernel handed out in `peer/input`: `(route, turn id)`.
     /// The host starting such a turn runs the system agent's request, on
     /// the person's behalf: it counts as attended.
@@ -985,7 +1026,8 @@ struct HostToolHub {
     interrupted_turns: Mutex<BoundedClaims>,
     pending: Mutex<HashMap<String, PendingCall>>,
     finished: Mutex<HashMap<String, (CallMeta, Instant)>>,
-    occurrences: Mutex<BoundedClaims>,
+    /// Host tool call occurrences already dispatched, per route.
+    occurrences: Mutex<PartitionedClaims>,
     /// `(route, tool, args digest)` whose outcome is unknown.
     unknown: Mutex<BoundedClaims>,
 }
@@ -1140,13 +1182,12 @@ pub(crate) fn deliver_peer_input(
         .get(&key)
         .map(|route| (route.send.clone(), route.connection))
         .ok_or_else(not_connected)?;
-    let claim_key = format!("{key}\u{0}{input_id}");
-    match HUB
-        .inputs
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .claim(claim_key.clone(), INPUT_RETENTION)
-    {
+    let claim_key = input_id.to_owned();
+    match HUB.inputs.lock().unwrap_or_else(|p| p.into_inner()).claim(
+        &key,
+        claim_key.clone(),
+        INPUT_RETENTION,
+    ) {
         Claim::Claimed => {}
         Claim::AlreadyClaimed => return Ok(PeerInputDelivery::AlreadySent),
         Claim::Full => {
@@ -1194,7 +1235,7 @@ pub(crate) fn deliver_peer_input(
     HUB.inputs
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .remove(&claim_key);
+        .remove(&key, &claim_key);
     drop_route_if(&key, &send);
     Err(not_connected())
 }
@@ -2240,17 +2281,18 @@ impl HostToolRouter for TurnHostToolRouter {
         // provider tool-call id) plus the argument digest, scoped to this
         // profile's peers root.
         let key = format!(
-            "{}\u{0}{}/{}/{tool_call_id}/{args_digest}",
-            self.peers_root.display(),
-            self.session_id.0,
-            self.turn_id
+            "{}/{}/{tool_call_id}/{args_digest}",
+            self.session_id.0, self.turn_id
         );
         match HUB
             .occurrences
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .claim(key, OCCURRENCE_RETENTION)
-        {
+            .claim(
+                &self.host.route_key(&self.peers_root),
+                key,
+                OCCURRENCE_RETENTION,
+            ) {
             Claim::Claimed => OccurrenceClaim::Claimed,
             Claim::AlreadyClaimed => OccurrenceClaim::Duplicate,
             Claim::Full => OccurrenceClaim::Busy,
@@ -2569,6 +2611,69 @@ mod tests {
         assert!(set.contains("newest", retention));
         assert!(!set.contains("t0", retention));
         assert!(set.contains("t1", retention));
+    }
+
+    fn claims_router(peers_root: &Path, slug: &str) -> TurnHostToolRouter {
+        TurnHostToolRouter {
+            peers_root: peers_root.to_path_buf(),
+            host: ToolHost::Peer(slug.to_owned()),
+            context_id: None,
+            session_id: SessionKey(format!("dev:api:c#peer-{slug}")),
+            turn_id: "turn-1".to_owned(),
+            version: 1,
+            call_timeout: Duration::from_secs(1),
+            approval_ttl: Duration::from_secs(1),
+            max_result_bytes: 1024,
+        }
+    }
+
+    #[test]
+    fn should_keep_other_peers_claiming_when_one_peer_fills_its_occurrences() {
+        // Security review (ADR 0004): the occurrence set was one process-wide
+        // 4 096-entry set that refuses when full, so one busy app blocked
+        // every other app's tool calls for a day. Bounds are per route.
+        let root = tempfile::tempdir().unwrap();
+        let busy = claims_router(root.path(), "busy");
+        for i in 0..BoundedClaims::MAX {
+            assert_eq!(
+                busy.claim_occurrence(&format!("call-{i}"), "d"),
+                OccurrenceClaim::Claimed
+            );
+        }
+        assert_eq!(
+            busy.claim_occurrence("one-more", "d"),
+            OccurrenceClaim::Busy,
+            "one route stays bounded"
+        );
+        let quiet = claims_router(root.path(), "quiet");
+        assert_eq!(
+            quiet.claim_occurrence("call-0", "d"),
+            OccurrenceClaim::Claimed,
+            "another peer is not blocked"
+        );
+    }
+
+    #[test]
+    fn should_bound_each_partition_and_drop_it_when_empty() {
+        let retention = Duration::from_secs(3_600);
+        let mut claims = PartitionedClaims::default();
+        for i in 0..BoundedClaims::MAX {
+            assert_eq!(
+                claims.claim("a", format!("k{i}"), retention),
+                Claim::Claimed
+            );
+        }
+        assert_eq!(claims.claim("a", "x".into(), retention), Claim::Full);
+        assert_eq!(claims.claim("b", "x".into(), retention), Claim::Claimed);
+        assert_eq!(
+            claims.claim("b", "x".into(), retention),
+            Claim::AlreadyClaimed
+        );
+        claims.remove("b", "x");
+        assert!(
+            !claims.parts.contains_key("b"),
+            "an emptied partition is dropped"
+        );
     }
 
     fn tool(name: &str, risk: &str) -> ToolInput {

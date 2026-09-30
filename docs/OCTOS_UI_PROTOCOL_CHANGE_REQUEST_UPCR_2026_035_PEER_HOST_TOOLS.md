@@ -516,9 +516,12 @@ registered set, or any `peerctx-<slug>.<context>` of it, every turn start:
   refused (`duplicate`): it neither asks again nor reaches the host again. A
   provider that reuses tool-call ids (`call_1`) with other arguments is a
   different occurrence. `read` calls may repeat. Claims are kept 24 h and
-  only expired claims are evicted: when 4 096 unexpired claims are held, a
-  new non-`read` call is refused (`busy`, host_busy) rather than forgetting
-  a claim.
+  only expired claims are evicted: when one tool set (the peer, or the host
+  session a set is registered on) holds 4 096 unexpired claims, its next
+  non-`read` call is refused (`busy`, host_busy) rather than forgetting a
+  claim. The bound is per tool set, so a busy app never refuses another
+  app's calls; the same per-peer bound applies to the `peer/input`
+  deliveries remembered for de-duplication.
 - **No retry after an unknown outcome.** A non-`read` call whose outcome is
   unknown — it timed out, or its turn was interrupted while the host was
   working on it — marks `(tool set, tool, argument digest)` for 24 h, where
