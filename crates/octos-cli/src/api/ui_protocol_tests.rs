@@ -27612,6 +27612,105 @@ async fn turn_state_get_falls_back_to_durable_projection_for_evicted() {
     );
 }
 
+#[test]
+fn turn_state_projection_from_turn_scoped_snapshot_matches_full_snapshot() {
+    // #2445: handle_turn_state_get projects from the turn-scoped ledger
+    // read instead of a full ring snapshot. This pins the load-bearing
+    // contract — the filter's event set is exactly what this projection
+    // consumes — by running the REAL projection over both snapshots. If
+    // project_turn_from_ledger ever learns to read another event kind,
+    // this fails until UiProtocolLedger::snapshot_events_for_turn's
+    // filter learns it too.
+    let ledger = UiProtocolLedger::new(16);
+    let session_id = SessionKey("local:turn-projection-parity".into());
+    let turn_a = TurnId::new();
+    let turn_b = TurnId::new();
+    ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: TurnId::new(),
+        text: "noise".into(),
+    }));
+    ledger.append_notification(UiNotification::TurnStarted(
+        octos_core::ui_protocol::TurnStartedEvent {
+            session_id: session_id.clone(),
+            turn_id: turn_a.clone(),
+            timestamp: Utc::now(),
+            topic: None,
+        },
+    ));
+    ledger.emit_envelope_v2(
+        &session_id,
+        turn_a.0.to_string(),
+        PayloadV2::AssistantDelta {
+            text: "a answer".into(),
+            assistant_segment_id: format!("{}:assistant:iteration:0", turn_a.0),
+        },
+        None,
+    );
+    ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: turn_a.clone(),
+        code: "interrupted".into(),
+        message: "stop".into(),
+        token_usage: None,
+        partial_result: None,
+    }));
+    ledger.append_notification(UiNotification::TurnStarted(
+        octos_core::ui_protocol::TurnStartedEvent {
+            session_id: session_id.clone(),
+            turn_id: turn_b.clone(),
+            timestamp: Utc::now(),
+            topic: None,
+        },
+    ));
+    ledger.emit_envelope_v2(
+        &session_id,
+        turn_b.0.to_string(),
+        PayloadV2::AssistantDelta {
+            text: "b answer".into(),
+            assistant_segment_id: format!("{}:assistant:iteration:0", turn_b.0),
+        },
+        None,
+    );
+    ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: turn_b.clone(),
+        cursor: None,
+        tokens_in: None,
+        tokens_out: None,
+        session_result: None,
+        token_usage: None,
+    }));
+
+    let (full, _) = ledger
+        .snapshot_with_cursor(&session_id, None)
+        .expect("full snapshot");
+    for turn in [&turn_a, &turn_b] {
+        let scoped = ledger
+            .snapshot_events_for_turn(&session_id, turn)
+            .expect("turn-scoped snapshot");
+        let from_full = project_turn_from_ledger(turn, &full);
+        let from_scoped = project_turn_from_ledger(turn, &scoped);
+        assert_eq!(from_full.state, from_scoped.state);
+        assert_eq!(from_full.started_at, from_scoped.started_at);
+        // completed_at is stamped with Utc::now() at projection time (not
+        // read from the terminal event), so only its presence is comparable
+        // across two projection runs.
+        assert_eq!(
+            from_full.completed_at.is_some(),
+            from_scoped.completed_at.is_some(),
+            "terminal-event visibility must match"
+        );
+        assert_eq!(
+            from_full.thread_id, from_scoped.thread_id,
+            "envelope thread backfill must survive the turn-scoped read"
+        );
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn session_hydrate_rejects_unknown_session() {
     // Build a sessions manager with NO sessions seeded; the handler

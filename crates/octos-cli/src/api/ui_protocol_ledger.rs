@@ -3103,7 +3103,7 @@ impl UiProtocolLedger {
         session_id: &SessionKey,
         after: Option<&UiCursor>,
     ) -> Result<(Vec<LedgeredUiProtocolEvent>, UiCursor), RpcError> {
-        self.snapshot_with_cursor_matching(session_id, after, None)
+        self.snapshot_with_cursor_filtered(session_id, after, None)
     }
 
     /// Turn-scoped variant of [`Self::snapshot_with_cursor`]: identical
@@ -3118,7 +3118,7 @@ impl UiProtocolLedger {
         turn_id: &TurnId,
     ) -> Result<Vec<LedgeredUiProtocolEvent>, RpcError> {
         let turn_wire_id = turn_id.0.to_string();
-        let (events, _) = self.snapshot_with_cursor_matching(
+        let (events, _) = self.snapshot_with_cursor_filtered(
             session_id,
             None,
             Some(&|event| event_belongs_to_turn(event, turn_id, &turn_wire_id)),
@@ -3126,7 +3126,7 @@ impl UiProtocolLedger {
         Ok(events)
     }
 
-    fn snapshot_with_cursor_matching(
+    fn snapshot_with_cursor_filtered(
         &self,
         session_id: &SessionKey,
         after: Option<&UiCursor>,
@@ -4780,8 +4780,12 @@ mod tests {
         events.iter().map(|event| event.cursor.seq).collect()
     }
 
-    /// Independent oracle: the exact event set a `turn/state` projection may
-    /// read, matched inline rather than through `event_belongs_to_turn`.
+    /// Explicit expected-set enumeration for one turn: the same event kinds
+    /// `project_turn_from_ledger` consumes, spelled out inline rather than
+    /// through `event_belongs_to_turn`. This is deliberately a third copy of
+    /// those arms — it is the ledger-level expectation; the drift guard is
+    /// the transport-side projection-equivalence test, which runs the real
+    /// projection over both snapshots.
     fn full_snapshot_turn_seqs(events: &[LedgeredUiProtocolEvent], turn_id: &TurnId) -> Vec<u64> {
         events
             .iter()
@@ -4918,6 +4922,75 @@ mod tests {
             )
             .expect("unknown session is empty, not an error");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn turn_scoped_snapshot_succeeds_on_trimmed_ring_missing_turn_started() {
+        // From-beginning (after: None) is always valid even when the ring
+        // wrapped past the turn's TurnStarted: the scoped read must return
+        // the retained subset — envelope(s) plus terminal — without a
+        // cursor error, and every retained envelope stays in the result
+        // (dedup/first-wins is the projection's call, not the filter's).
+        let ledger = UiProtocolLedger::new(3);
+        let session_id = SessionKey("local:turn-scoped-trimmed".into());
+        let turn_id = TurnId::new();
+        ledger.append_notification(UiNotification::TurnStarted(
+            octos_core::ui_protocol::TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        ));
+        ledger.append_notification(delta(&session_id, "filler-1"));
+        ledger.emit_envelope_v2(
+            &session_id,
+            turn_id.0.to_string(),
+            PayloadV2::AssistantDelta {
+                text: "first".into(),
+                assistant_segment_id: format!("{}:assistant:iteration:0", turn_id.0),
+            },
+            None,
+        );
+        ledger.emit_envelope_v2(
+            &session_id,
+            turn_id.0.to_string(),
+            PayloadV2::AssistantDelta {
+                text: "second".into(),
+                assistant_segment_id: format!("{}:assistant:iteration:1", turn_id.0),
+            },
+            None,
+        );
+        ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            cursor: None,
+            tokens_in: None,
+            tokens_out: None,
+            session_result: None,
+            token_usage: None,
+        }));
+
+        // Ring (cap 3) retains: envelope "first", envelope "second",
+        // turn/completed — TurnStarted and the filler were evicted.
+        let scoped = ledger
+            .snapshot_events_for_turn(&session_id, &turn_id)
+            .expect("trimmed-ring scoped read must succeed");
+        let kinds: Vec<&str> = scoped
+            .iter()
+            .map(|event| match &event.event {
+                UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                    assert_eq!(envelope.envelope.turn_id, turn_id.0.to_string());
+                    "envelope"
+                }
+                UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(_)) => {
+                    "completed"
+                }
+                other => panic!("unexpected event in scoped snapshot: {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["envelope", "envelope", "completed"]);
     }
 
     /// Boot recovery must synthesize terminal events for task/turn/agent
