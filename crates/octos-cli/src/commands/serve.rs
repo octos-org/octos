@@ -840,6 +840,10 @@ impl Executable for ServeCommand {
     fn execute(self) -> Result<()> {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            // Serve runs agent turns, skill actions and profile bootstraps on
+            // its workers; give them the same 8 MiB the chat/acp/mcp runtimes
+            // use for deep agent futures (debug builds overflowed 2 MiB).
+            .thread_stack_size(8 * 1024 * 1024)
             .build()
             .wrap_err("failed to create tokio runtime")?
             .block_on(self.run_async())
