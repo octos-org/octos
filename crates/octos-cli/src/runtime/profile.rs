@@ -83,6 +83,48 @@ impl Drop for ProfileRuntimeLifecycle {
     }
 }
 
+/// Long-lived profile resources a replacement runtime takes over from the
+/// runtime it replaces instead of reopening them. `episodes.redb` admits a
+/// single writer, so reopening it while an in-flight turn still holds the
+/// previous runtime fails; sharing the handles makes a configuration change
+/// (model, key, route) take effect immediately without that lock.
+#[derive(Clone)]
+pub(crate) struct SharedProfileResources {
+    memory: Arc<EpisodeStore>,
+    memory_store: Arc<MemoryStore>,
+    recall: Arc<octos_memory::RecallStore>,
+    embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+    tool_config: Arc<ToolConfigStore>,
+    cron_service: Option<Arc<CronService>>,
+    runtime_lifecycle: Option<Arc<ProfileRuntimeLifecycle>>,
+    /// Handed over, not shared: it is stopped so the replacement can restart
+    /// the sweep with its own provider.
+    memory_refresh: Option<Arc<crate::memory_refresh::MemoryRefreshService>>,
+}
+
+/// Whether stores opened under `previous` stay valid under `next`: the
+/// embedder and recall width they were opened with are unchanged.
+fn configs_share_storage(previous: &Config, next: &Config) -> bool {
+    let embedding = |config: &Config| serde_json::to_value(&config.embedding).ok();
+    let recall_dimension = |config: &Config| {
+        config
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.recall_dimension)
+    };
+    if embedding(previous) != embedding(next)
+        || recall_dimension(previous) != recall_dimension(next)
+    {
+        return false;
+    }
+    // An embedder authenticated by a profile env var must not keep a
+    // credential the new configuration replaced.
+    next.embedding
+        .as_ref()
+        .and_then(|embedding| embedding.api_key_env.as_deref())
+        .is_none_or(|name| previous.env_vars.get(name) == next.env_vars.get(name))
+}
+
 /// Build an ISOLATED per-node pipeline provider router from the profile's
 /// `sub_providers` (e.g. the `deep_research` pipeline's `cheap`/`strong`
 /// nodes, resolved via `RunPipelineTool`'s provider router).
@@ -981,6 +1023,35 @@ impl ProfileRuntime {
         host_voice: Option<&crate::config::VoiceConfig>,
         host_memory: Option<&crate::config::MemoryConfig>,
     ) -> Result<Arc<Self>> {
+        Self::bootstrap_replacing(
+            profile,
+            data_dir,
+            octos_home,
+            role,
+            host_plugins,
+            host_voice,
+            host_memory,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::bootstrap_with_host_plugins`] for a configuration change of a
+    /// profile whose previous runtime may still be alive (held by an in-flight
+    /// turn). When the new configuration keeps the same storage, the new
+    /// runtime shares that runtime's stores and long-lived services; every
+    /// configuration-derived part is rebuilt exactly as a cold bootstrap would.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn bootstrap_replacing(
+        profile: &UserProfile,
+        data_dir: &Path,
+        octos_home: Option<&Path>,
+        role: BootstrapRole,
+        host_plugins: Option<&crate::config::PluginsConfig>,
+        host_voice: Option<&crate::config::VoiceConfig>,
+        host_memory: Option<&crate::config::MemoryConfig>,
+        previous: Option<&Arc<Self>>,
+    ) -> Result<Arc<Self>> {
         // Step 1: derive the per-profile Config. Apply the host plugin
         // policy on top of the profile-derived one before any downstream
         // step inspects `config.plugins.require_signed`.
@@ -996,10 +1067,35 @@ impl ProfileRuntime {
         // inherit the host budget.
         crate::config::merge_host_memory_into_profile(&mut config.memory, host_memory);
 
-        Self::bootstrap_resolved(
-            profile, data_dir, octos_home, role, config, host_voice, false, None,
+        let shared = previous
+            .filter(|previous| previous.can_share_resources_with(data_dir, &config))
+            .map(|previous| previous.shared_resources());
+        Self::bootstrap_resolved_sharing(
+            profile, data_dir, octos_home, role, config, host_voice, false, None, shared,
         )
         .await
+    }
+
+    /// Whether a runtime for `config` rooted at `data_dir` can take over this
+    /// runtime's stores: same storage location, and nothing that shapes how
+    /// the stores were opened (embedder, recall width) has changed.
+    pub(crate) fn can_share_resources_with(&self, data_dir: &Path, config: &Config) -> bool {
+        self.data_dir == data_dir
+            && self.session_store_root.is_none()
+            && configs_share_storage(&self.config, config)
+    }
+
+    pub(crate) fn shared_resources(&self) -> SharedProfileResources {
+        SharedProfileResources {
+            memory: self.memory.clone(),
+            memory_store: self.memory_store.clone(),
+            recall: self.recall.clone(),
+            embedder: self.embedder.clone(),
+            tool_config: self.tool_config.clone(),
+            cron_service: self.cron_service.clone(),
+            runtime_lifecycle: self.runtime_lifecycle.clone(),
+            memory_refresh: self.memory_refresh.clone(),
+        }
     }
 
     /// Local OUP adapters use the same assembler with their already-resolved
@@ -1016,6 +1112,32 @@ impl ProfileRuntime {
         host_voice: Option<&crate::config::VoiceConfig>,
         no_retry: bool,
         provider_override: Option<Arc<dyn LlmProvider>>,
+    ) -> Result<Arc<Self>> {
+        Self::bootstrap_resolved_sharing(
+            profile,
+            data_dir,
+            octos_home,
+            role,
+            config,
+            host_voice,
+            no_retry,
+            provider_override,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bootstrap_resolved_sharing(
+        profile: &UserProfile,
+        data_dir: &Path,
+        octos_home: Option<&Path>,
+        role: BootstrapRole,
+        config: Config,
+        host_voice: Option<&crate::config::VoiceConfig>,
+        no_retry: bool,
+        provider_override: Option<Arc<dyn LlmProvider>>,
+        shared: Option<SharedProfileResources>,
     ) -> Result<Arc<Self>> {
         ensure_profile_runtime_directories(data_dir).wrap_err_with(|| {
             format!(
@@ -1065,39 +1187,53 @@ impl ProfileRuntime {
         // different length. Sizing it from the configured provider is what
         // makes a non-1536-d embedder (e.g. in-process EmbeddingGemma at 768)
         // actually reach the vector lane instead of degrading to BM25-only.
-        let embedder =
-            chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
-        let index_dimension = embedder
-            .as_ref()
-            .map_or(octos_memory::EPISODIC_INDEX_DIMENSION, |e| e.dimension());
-
-        let memory_open_result = match role {
-            BootstrapRole::Serve => {
-                EpisodeStore::open_with_dimension(data_dir, index_dimension).await
-            }
-            BootstrapRole::Gateway => {
-                EpisodeStore::open_or_degraded_with_dimension(data_dir, index_dimension).await
-            }
-        };
-        let memory = Arc::new(memory_open_result.wrap_err_with(|| {
-            format!("failed to open episode store for profile '{}'", profile.id)
-        })?);
-        let memory_store = Arc::new(MemoryStore::open(data_dir).await.wrap_err_with(|| {
-            format!("failed to open memory store for profile '{}'", profile.id)
-        })?);
-        let recall = open_recall_store(data_dir, &config, embedder.as_deref())
-            .await
-            .wrap_err_with(|| {
-                format!("failed to open recall store for profile '{}'", profile.id)
-            })?;
-
-        // Step 5: tool config store.
-        let tool_config = Arc::new(ToolConfigStore::open(data_dir).await.wrap_err_with(|| {
-            format!(
-                "failed to open tool config store for profile '{}'",
-                profile.id
+        let (memory, memory_store, recall, embedder, tool_config) = if let Some(shared) =
+            shared.as_ref()
+        {
+            (
+                shared.memory.clone(),
+                shared.memory_store.clone(),
+                shared.recall.clone(),
+                shared.embedder.clone(),
+                shared.tool_config.clone(),
             )
-        })?);
+        } else {
+            let embedder =
+                chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+            let index_dimension = embedder
+                .as_ref()
+                .map_or(octos_memory::EPISODIC_INDEX_DIMENSION, |e| e.dimension());
+
+            let memory_open_result = match role {
+                BootstrapRole::Serve => {
+                    EpisodeStore::open_with_dimension(data_dir, index_dimension).await
+                }
+                BootstrapRole::Gateway => {
+                    EpisodeStore::open_or_degraded_with_dimension(data_dir, index_dimension).await
+                }
+            };
+            let memory = Arc::new(memory_open_result.wrap_err_with(|| {
+                format!("failed to open episode store for profile '{}'", profile.id)
+            })?);
+            let memory_store = Arc::new(MemoryStore::open(data_dir).await.wrap_err_with(|| {
+                format!("failed to open memory store for profile '{}'", profile.id)
+            })?);
+            let recall = open_recall_store(data_dir, &config, embedder.as_deref())
+                .await
+                .wrap_err_with(|| {
+                    format!("failed to open recall store for profile '{}'", profile.id)
+                })?;
+
+            // Step 5: tool config store.
+            let tool_config =
+                Arc::new(ToolConfigStore::open(data_dir).await.wrap_err_with(|| {
+                    format!(
+                        "failed to open tool config store for profile '{}'",
+                        profile.id
+                    )
+                })?);
+            (memory, memory_store, recall, embedder, tool_config)
+        };
 
         // Step 6: resolve credentials from the profile's declared env
         // vars (keychain-aware). Used by MCP, plugin spawns, and the
@@ -1456,13 +1592,27 @@ impl ProfileRuntime {
         // on `ProfileRuntime::cron_service`; without that field the
         // tokio task `start()` spawned would be cancelled the moment
         // this function returned.
-        let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
-        let cron_service = Arc::new(CronService::new(data_dir.join("cron.json"), cron_tx));
-        cron_service.start();
+        // A replacement runtime keeps the running service and its shutdown
+        // owner: a second `start()` on the same `cron.json` would fire jobs
+        // twice, and dropping the previous lifecycle would stop the timer.
+        let (cron_service, runtime_lifecycle) = match shared.as_ref().and_then(|shared| {
+            Some((
+                shared.cron_service.clone()?,
+                shared.runtime_lifecycle.clone()?,
+            ))
+        }) {
+            Some((cron_service, lifecycle)) => (cron_service, Some(lifecycle)),
+            None => {
+                let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
+                let cron_service = Arc::new(CronService::new(data_dir.join("cron.json"), cron_tx));
+                cron_service.start();
+                let lifecycle = Arc::new(ProfileRuntimeLifecycle {
+                    cron_service: Some(cron_service.clone()),
+                });
+                (cron_service, Some(lifecycle))
+            }
+        };
         tools.register(CronTool::with_context(cron_service.clone(), "api", ""));
-        let runtime_lifecycle = Some(Arc::new(ProfileRuntimeLifecycle {
-            cron_service: Some(cron_service.clone()),
-        }));
         // Hand the same service to the AppUI orchestrator so `loop/delete` can
         // reap the cron jobs a loop created. Without this the orchestrator has
         // no cron handle at all and the reap silently does nothing.
@@ -1663,16 +1813,26 @@ impl ProfileRuntime {
         // mirror bank pages, embed records that arrived without vectors,
         // and apply the heat policy. Runs off the bootstrap path so a large
         // bank never delays the first turn; errors only log.
-        spawn_recall_maintenance(
-            recall.clone(),
-            memory_store.clone(),
-            embedder.clone(),
-            profile.id.clone(),
-        );
+        // A replacement shares stores whose upkeep already ran.
+        if shared.is_none() {
+            spawn_recall_maintenance(
+                recall.clone(),
+                memory_store.clone(),
+                embedder.clone(),
+                profile.id.clone(),
+            );
+        }
 
         // Start the background memory-refresh sweep when enabled. The
         // flock decides ownership when serve and gateway share a profile
-        // dir; the loser just logs and skips.
+        // dir; the loser just logs and skips. A replacement first stops the
+        // sweep it takes over so the restarted one uses the new provider.
+        if let Some(previous) = shared
+            .as_ref()
+            .and_then(|shared| shared.memory_refresh.as_ref())
+        {
+            previous.shutdown().await;
+        }
         let memory_refresh = if memory_refresh_enabled {
             let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
             crate::memory_refresh::MemoryRefreshService::try_start(
@@ -1946,6 +2106,156 @@ mod tests {
     #[cfg(unix)]
     use octos_core::SessionKey;
     use std::collections::HashMap;
+
+    fn gemini_profile(id: &str, model: &str) -> UserProfile {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("GEMINI_API_KEY".to_string(), format!("fixture-{id}"));
+        UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                gateway: GatewaySettings::default(),
+                env_vars,
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("google".to_string()),
+                        model_id: Some(model.to_string()),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Configuration-derived state that a replacement must rebuild exactly as
+    /// a cold bootstrap would.
+    fn derived_snapshot(rt: &ProfileRuntime) -> serde_json::Value {
+        let mut env = rt.plugin_env_template.clone();
+        env.sort();
+        let mut tools = rt.tool_specs.tool_names();
+        tools.sort();
+        serde_json::json!({
+            "env": env,
+            "provider": rt.provider_name,
+            "model": rt.primary_model_id,
+            "tools": tools,
+            "system_prompt": rt.system_prompt,
+            "memory_refresh_enabled": rt.memory_refresh_enabled,
+        })
+    }
+
+    #[tokio::test]
+    async fn should_share_stores_and_match_cold_bootstrap_when_replacing_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("swap").join("data");
+        let first = gemini_profile("swap", "gemini-m1");
+        let mut second = gemini_profile("swap", "gemini-m2");
+        second.updated_at = first.updated_at + chrono::Duration::seconds(5);
+
+        // `old` stays alive like a runtime held by an in-flight turn: it
+        // keeps the single-writer episode store open.
+        let old = ProfileRuntime::bootstrap(&first, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("initial bootstrap");
+        let cold_while_held =
+            ProfileRuntime::bootstrap(&second, &data_dir, None, BootstrapRole::Serve).await;
+        assert!(
+            cold_while_held.is_err(),
+            "a cold bootstrap cannot reopen the store the old runtime holds"
+        );
+
+        let replacement = ProfileRuntime::bootstrap_replacing(
+            &second,
+            &data_dir,
+            None,
+            BootstrapRole::Serve,
+            None,
+            None,
+            None,
+            Some(&old),
+        )
+        .await
+        .expect("replacement shares the held stores");
+        assert!(Arc::ptr_eq(&replacement.memory, &old.memory));
+        assert!(Arc::ptr_eq(&replacement.memory_store, &old.memory_store));
+        assert!(Arc::ptr_eq(&replacement.recall, &old.recall));
+        assert!(Arc::ptr_eq(&replacement.tool_config, &old.tool_config));
+        assert!(Arc::ptr_eq(
+            replacement.cron_service.as_ref().unwrap(),
+            old.cron_service.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            replacement.runtime_lifecycle.as_ref().unwrap(),
+            old.runtime_lifecycle.as_ref().unwrap()
+        ));
+        assert_eq!(old.primary_model_id, "gemini-m1");
+        assert_eq!(replacement.primary_model_id, "gemini-m2");
+        assert_eq!(
+            replacement.memory_refresh.is_some(),
+            replacement.memory_refresh_enabled,
+            "the replacement takes over the memory refresh sweep"
+        );
+        let derived = derived_snapshot(&replacement);
+
+        drop(replacement);
+        drop(old);
+        let cold = ProfileRuntime::bootstrap(&second, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("cold bootstrap once the stores are released");
+        assert_eq!(derived, derived_snapshot(&cold));
+    }
+
+    #[tokio::test]
+    async fn should_refuse_sharing_when_storage_shape_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("shape").join("data");
+        let profile = gemini_profile("shape", "gemini-m1");
+        let old = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("initial bootstrap");
+        let same = old.config.clone();
+        assert!(old.can_share_resources_with(&data_dir, &same));
+        assert!(!old.can_share_resources_with(&tmp.path().join("elsewhere"), &same));
+
+        let mut embedding = same.clone();
+        embedding.embedding = Some(crate::config::EmbeddingConfig {
+            provider: "openai".to_string(),
+            api_key_env: None,
+            base_url: None,
+            model: Some("text-embedding-3-small".to_string()),
+            dimensions: Some(256),
+            model_path: None,
+            auto_download: None,
+        });
+        assert!(!old.can_share_resources_with(&data_dir, &embedding));
+
+        let mut recall = same.clone();
+        recall
+            .memory
+            .get_or_insert_with(Default::default)
+            .recall_dimension = Some(64);
+        assert!(!old.can_share_resources_with(&data_dir, &recall));
+
+        let mut keyed = embedding.clone();
+        keyed.embedding.as_mut().unwrap().api_key_env = Some("EMBED_KEY".to_string());
+        let mut keyed_old = keyed.clone();
+        keyed
+            .env_vars
+            .insert("EMBED_KEY".to_string(), "new".to_string());
+        keyed_old
+            .env_vars
+            .insert("EMBED_KEY".to_string(), "old".to_string());
+        assert!(configs_share_storage(&keyed_old, &keyed_old.clone()));
+        assert!(!configs_share_storage(&keyed_old, &keyed));
+    }
 
     #[test]
     fn should_create_inbox_when_ensuring_profile_runtime_directories() {

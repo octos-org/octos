@@ -21682,6 +21682,17 @@ fn runtime_unavailable_errors_are_typed_for_protocol_clients() {
 }
 
 #[test]
+fn profile_runtime_switching_error_is_not_reported_as_a_second_process() {
+    let error = profile_runtime_switching_error("alan");
+    assert_eq!(
+        error.data.as_ref().and_then(|d| d.get("kind")),
+        Some(&json!("profile_runtime_switching"))
+    );
+    let message = error.data.as_ref().and_then(|d| d.get("message")).unwrap();
+    assert!(!message.as_str().unwrap().contains("another octos process"));
+}
+
+#[test]
 fn held_data_dir_lock_yields_a_clear_actionable_error() {
     // A `session/open` bootstrap that fails because another octos process
     // already owns the profile's redb must be recognized structurally

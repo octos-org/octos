@@ -14665,10 +14665,13 @@ async fn commit_profile_llm_runtime_transition(
     state.session_cache.invalidate_profile(profile_id).await;
     if let Some(key) = dynamic_profile_runtime_key(state, profile_id) {
         bump_profile_runtime_generation(&key);
-        dynamic_profile_runtimes()
+        let removed = dynamic_profile_runtimes()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&key);
+        if let Some(removed) = removed {
+            retire_profile_runtime(&key, &removed);
+        }
     }
 
     if startup_pinned {
@@ -24472,6 +24475,36 @@ fn dynamic_profile_runtimes() -> &'static DynamicProfileRuntimeMap {
     RUNTIMES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
+/// Runtimes dropped from the cache by a configuration commit, kept weakly.
+/// While an in-flight turn still holds one, its single-writer stores stay
+/// open, so the next bootstrap takes them over instead of reopening them.
+fn retired_profile_runtimes()
+-> &'static std::sync::Mutex<HashMap<String, std::sync::Weak<crate::runtime::ProfileRuntime>>> {
+    static RETIRED: OnceLock<
+        std::sync::Mutex<HashMap<String, std::sync::Weak<crate::runtime::ProfileRuntime>>>,
+    > = OnceLock::new();
+    RETIRED.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn retire_profile_runtime(key: &str, runtime: &Arc<crate::runtime::ProfileRuntime>) {
+    retired_profile_runtimes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.to_owned(), Arc::downgrade(runtime));
+}
+
+/// The retired runtime for `key` while something still holds it.
+fn live_retired_profile_runtime(key: &str) -> Option<Arc<crate::runtime::ProfileRuntime>> {
+    let mut retired = retired_profile_runtimes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let runtime = retired.get(key).and_then(std::sync::Weak::upgrade);
+    if runtime.is_none() {
+        retired.remove(key);
+    }
+    runtime
+}
+
 fn dynamic_profile_runtime_key(state: &AppState, profile_id: &str) -> Option<String> {
     let store = state.profile_store.as_ref()?;
     Some(format!(
@@ -24605,7 +24638,8 @@ pub(crate) async fn ensure_session_profile_runtime(
         // Lazily-created profiles must honour host-level policy too — without
         // host_memory, a host opt-out of (default-on) memory refresh would not
         // bind profiles created after startup.
-        let runtime = crate::runtime::ProfileRuntime::bootstrap_with_host_plugins(
+        let retired = live_retired_profile_runtime(&key);
+        let runtime = crate::runtime::ProfileRuntime::bootstrap_replacing(
             &profile,
             &profile_data_dir,
             Some(store.octos_home_dir()),
@@ -24613,6 +24647,7 @@ pub(crate) async fn ensure_session_profile_runtime(
             None,
             None,
             state.host_memory.as_ref(),
+            retired.as_ref(),
         )
         .await
         .map_err(|error| {
@@ -24623,7 +24658,12 @@ pub(crate) async fn ensure_session_profile_runtime(
             // only the outermost context, which is how "failed to open episode
             // store for profile 'x'" used to reach the TUI with its actual cause
             // (and its remedy) silently dropped.
-            if octos_memory::is_episode_store_locked(&error) {
+            if octos_memory::is_episode_store_locked(&error) && retired.is_some() {
+                // This process still holds the stores through the runtime a
+                // configuration change retired; it frees them when its
+                // in-flight work ends. Not a second octos process.
+                profile_runtime_switching_error(profile_id)
+            } else if octos_memory::is_episode_store_locked(&error) {
                 data_dir_locked_error(profile_id, &error)
             } else {
                 runtime_unavailable_error(format!(
@@ -44451,6 +44491,18 @@ fn workspace_not_writable_error(workspace: Option<&str>) -> RpcError {
 /// fault, so it gets its own `kind` (clients can render a remedy instead of a
 /// stack-shaped string) and the sentence names both ways out. `data.message`
 /// is rendered verbatim by clients, matching [`workspace_not_writable_error`].
+fn profile_runtime_switching_error(profile_id: &str) -> RpcError {
+    let sentence = format!(
+        "Profile '{profile_id}' is switching to its updated configuration while earlier \
+         work finishes; retry shortly."
+    );
+    RpcError::internal_error(sentence.clone()).with_data(json!({
+        "kind": "profile_runtime_switching",
+        "profile_id": profile_id,
+        "message": sentence,
+    }))
+}
+
 fn data_dir_locked_error(profile_id: &str, error: &eyre::Report) -> RpcError {
     let sentence = format!(
         "Can't start a session for profile '{profile_id}' — another octos process already \

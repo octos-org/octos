@@ -6079,10 +6079,52 @@ printf '{"success":%s,"output":"%s","structured_metadata":{"revision":"%s"}}\n' 
         )
         .await
         .unwrap();
-        assert_ne!(
+        // The in-flight turn still holds `old` (and its single-writer
+        // episode store); the replacement must take over its stores instead
+        // of failing to reopen them.
+        assert_eq!(
             saved.runtime.as_ref().unwrap().runtime_disposition,
-            "restart_required"
+            "reloaded"
         );
+        let new = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("user-a"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!Arc::ptr_eq(&new, &old));
+        assert!(Arc::ptr_eq(&new.memory, &old.memory));
+        assert!(Arc::ptr_eq(&new.memory_store, &old.memory_store));
+        assert!(Arc::ptr_eq(&new.recall, &old.recall));
+        assert!(Arc::ptr_eq(&new.tool_config, &old.tool_config));
+        assert!(Arc::ptr_eq(
+            new.cron_service.as_ref().unwrap(),
+            old.cron_service.as_ref().unwrap()
+        ));
+        let env_value = |runtime: &crate::runtime::ProfileRuntime, name: &str| {
+            runtime
+                .plugin_env_template
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(
+            env_value(&new, "OCTOS_PROFILE_LLM_MODEL").as_deref(),
+            Some("gemini-m2")
+        );
+        assert_ne!(
+            env_value(&new, "OCTOS_PROFILE_LLM_CONFIG_REVISION"),
+            Some(old_revision.clone())
+        );
+        let other_again = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("user-b"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(Arc::ptr_eq(&other_again, &other), "user B is untouched");
         let b_result = other
             .tool_specs
             .get("env_probe")
@@ -6104,13 +6146,6 @@ printf '{"success":%s,"output":"%s","structured_metadata":{"revision":"%s"}}\n' 
             old_revision
         );
         drop(old);
-        let new = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
-            &state,
-            Some("user-a"),
-        )
-        .await
-        .unwrap()
-        .unwrap();
         let result = new
             .tool_specs
             .get("env_probe")
