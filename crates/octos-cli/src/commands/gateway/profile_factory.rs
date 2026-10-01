@@ -1828,7 +1828,9 @@ mod profile_credential_tests {
             assert_eq!(env.len(), 1);
         }
         config.api_key_env = None;
-        config.env_vars.insert("GEMINI_API_KEY".into(), "unrelated".into());
+        config
+            .env_vars
+            .insert("GEMINI_API_KEY".into(), "unrelated".into());
         apply_profile_primary_credentials(&mut env, &config);
         assert!(
             env.iter()
