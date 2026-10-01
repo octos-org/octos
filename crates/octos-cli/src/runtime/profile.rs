@@ -1120,6 +1120,11 @@ impl ProfileRuntime {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| data_dir.to_path_buf());
         let mut plugin_env_template = profile_plugin_env(profile);
+        crate::commands::gateway::profile_factory::apply_resolved_profile_llm_env(
+            &mut plugin_env_template,
+            &config,
+            &profile.updated_at.to_rfc3339(),
+        );
         push_runtime_plugin_env(
             &mut plugin_env_template,
             data_dir,
