@@ -369,6 +369,7 @@ async fn test_spawn_returns_immediately() {
         hook_context_template: None,
         plugin_dirs: Vec::new(),
         plugin_extra_env: Vec::new(),
+        plugin_blocked_env: Vec::new(),
         plugin_require_signed: false,
         child_tool_factories: Vec::new(),
         task_supervisor: None,

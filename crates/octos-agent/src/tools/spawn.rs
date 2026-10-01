@@ -1065,6 +1065,7 @@ pub struct SpawnTool {
     plugin_dirs: Vec<PathBuf>,
     /// Extra environment variables for plugin processes.
     plugin_extra_env: Vec<(String, String)>,
+    plugin_blocked_env: Vec<String>,
     /// Section B (codex review P1.1): inherit the parent's strict-signing
     /// policy so subagents enforce the same integrity gate when loading
     /// plugin tools. Defaults to `false` (legacy permissive path).
@@ -1182,6 +1183,7 @@ impl SpawnTool {
             hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            plugin_blocked_env: Vec::new(),
             plugin_require_signed: false,
             child_tool_factories: Vec::new(),
             task_supervisor: None,
@@ -1229,6 +1231,7 @@ impl SpawnTool {
             hook_context_template: None,
             plugin_dirs: Vec::new(),
             plugin_extra_env: Vec::new(),
+            plugin_blocked_env: Vec::new(),
             plugin_require_signed: false,
             child_tool_factories: Vec::new(),
             task_supervisor: None,
@@ -1290,6 +1293,7 @@ impl SpawnTool {
             hook_context_template: self.hook_context_template.clone(),
             plugin_dirs: self.plugin_dirs.clone(),
             plugin_extra_env: self.plugin_extra_env.clone(),
+            plugin_blocked_env: self.plugin_blocked_env.clone(),
             plugin_require_signed: self.plugin_require_signed,
             child_tool_factories: self.child_tool_factories.clone(),
             task_supervisor: self.task_supervisor.clone(),
@@ -1430,6 +1434,12 @@ impl SpawnTool {
     ) -> Self {
         self.plugin_dirs = dirs;
         self.plugin_extra_env = extra_env;
+        self
+    }
+
+    /// Preserve the parent profile's inherited-environment removals in workers.
+    pub fn with_plugin_blocked_env(mut self, names: Vec<String>) -> Self {
+        self.plugin_blocked_env = names;
         self
     }
 
@@ -3835,6 +3845,7 @@ impl Tool for SpawnTool {
                     &self.plugin_dirs,
                     &self.plugin_extra_env,
                     crate::plugins::PluginLoadOptions {
+                        blocked_env: self.plugin_blocked_env.clone(),
                         work_dir: Some(&child_working_dir),
                         synthesis_config: None,
                         require_signed: self.plugin_require_signed,
@@ -4260,6 +4271,7 @@ impl Tool for SpawnTool {
             let task_label = label.clone();
             let plugin_dirs = self.plugin_dirs.clone();
             let plugin_extra_env = self.plugin_extra_env.clone();
+            let plugin_blocked_env = self.plugin_blocked_env.clone();
             let plugin_require_signed = self.plugin_require_signed;
             let child_tool_factories = self.child_tool_factories.clone();
             // Detached path: `self` is not available inside the `tokio::spawn`
@@ -4469,6 +4481,7 @@ impl Tool for SpawnTool {
                         &plugin_dirs,
                         &plugin_extra_env,
                         crate::plugins::PluginLoadOptions {
+                            blocked_env: plugin_blocked_env.clone(),
                             work_dir: Some(&working_dir),
                             synthesis_config: None,
                             require_signed: plugin_require_signed,

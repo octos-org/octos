@@ -31451,6 +31451,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         credentials: HashMap::new(),
         skills_dir: None,
         plugin_env_template: Vec::new(),
+        plugin_blocked_env: Vec::new(),
         tool_policy: None,
         default_sandbox: sandbox,
         max_iterations: None,

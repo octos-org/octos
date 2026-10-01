@@ -381,6 +381,7 @@ pub fn known_tool_names_with_plugins(
         plugin_dirs,
         &[],
         octos_agent::PluginLoadOptions {
+            blocked_env: Vec::new(),
             work_dir: None,
             synthesis_config: None,
             require_signed: plugin_require_signed,

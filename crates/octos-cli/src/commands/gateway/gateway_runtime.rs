@@ -438,6 +438,7 @@ impl GatewayRuntime {
                 Some(&config.plugins),
                 config.voice.as_ref(),
                 config.memory.as_ref(),
+                Some(&config.mode),
             )
             .await
             {
@@ -889,6 +890,7 @@ impl GatewayRuntime {
                         &plugin_dirs,
                         &plugin_env,
                         octos_agent::PluginLoadOptions {
+                            blocked_env: Vec::new(),
                             work_dir: Some(&plugin_work_dir),
                             synthesis_config,
                             // Section B: opt-in strict signature enforcement.

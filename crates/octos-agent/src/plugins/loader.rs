@@ -108,6 +108,8 @@ struct LoadedPluginTool {
 /// for callers that don't need the new functionality.
 #[derive(Debug, Default, Clone)]
 pub struct PluginLoadOptions<'a> {
+    /// Inherited env names removed before the profile-owned extra env is applied.
+    pub blocked_env: Vec<String>,
     /// Per-process working directory for plugin executions.
     pub work_dir: Option<&'a Path>,
     /// Synthesis LLM provider config injected into plugin args for tools that
@@ -219,6 +221,7 @@ impl PluginLoader {
             dirs,
             extra_env,
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir,
                 synthesis_config: None,
                 require_signed: false,
@@ -527,6 +530,7 @@ impl PluginLoader {
             plugin_dir,
             extra_env,
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir,
                 synthesis_config: None,
                 require_signed: false,
@@ -776,7 +780,8 @@ impl PluginLoader {
         }
 
         // Collect env vars to filter out
-        let blocked_env: Vec<String> = BLOCKED_ENV_VARS.iter().map(|s| s.to_string()).collect();
+        let mut blocked_env: Vec<String> = BLOCKED_ENV_VARS.iter().map(|s| s.to_string()).collect();
+        blocked_env.extend(options.blocked_env.iter().cloned());
 
         // Cancellation-safety (codex review of 7c3e5eac): clamp a manifest
         // `timeout_secs` to the registry's per-tool backstop
@@ -1388,6 +1393,35 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn loader_forwards_profile_blocked_env_to_subprocess() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), r#"{"name":"fixture","version":"1.0","tools":[{"name":"env_fixture","description":"fixture","input_schema":{"type":"object"},"env":["HOME"]}]}"#).unwrap();
+        let script = dir.path().join("fixture");
+        std::fs::write(&script, "#!/bin/sh\nread INPUT || true\nif [ -n \"${HOME:-}\" ]; then echo '{\"success\":false,\"output\":\"present\"}'; else echo '{\"success\":true,\"output\":\"absent\"}'; fi\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (tools, _) = PluginLoader::load_plugin_with_options(
+            dir.path(),
+            &[],
+            PluginLoadOptions {
+                blocked_env: vec!["HOME".into()],
+                verified_cache_dir: Some(dir.path().join("cache")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(
+            tools[0]
+                .execute(&serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+    }
 
     #[cfg(unix)]
     fn write_test_plugin_executable(plugin_dir: &Path, plugin_name: &str) {
@@ -2239,6 +2273,7 @@ mod tests {
             &[dir.path().to_path_buf()],
             &[],
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
@@ -2280,6 +2315,7 @@ mod tests {
             &[dir.path().to_path_buf()],
             &[],
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
@@ -2326,6 +2362,7 @@ mod tests {
             &[dir.path().to_path_buf()],
             &[],
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
@@ -2386,6 +2423,7 @@ mod tests {
             &[dir.path().to_path_buf()],
             &[],
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
@@ -2448,6 +2486,7 @@ mod tests {
             &[dir.path().to_path_buf()],
             &[],
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
@@ -2602,6 +2641,7 @@ mod tests {
             &[dir.path().to_path_buf()],
             &[],
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: false,
@@ -2677,6 +2717,7 @@ mod tests {
             &[dir.path().to_path_buf()],
             &[],
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: true,
@@ -3103,6 +3144,7 @@ path = "src/main.rs"
             &[dir.path().to_path_buf()],
             &[],
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: false,
@@ -3187,6 +3229,7 @@ path = "src/main.rs"
             &plugin_dir,
             &[],
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir: None,
                 synthesis_config: Some(cfg),
                 require_signed: false,
@@ -3337,6 +3380,7 @@ path = "src/main.rs"
             &plugin_dir,
             &[],
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir: None,
                 synthesis_config: Some(cfg),
                 require_signed: false,
@@ -3524,6 +3568,7 @@ path = "src/main.rs"
             &[dir.path().to_path_buf()],
             &[],
             PluginLoadOptions {
+                blocked_env: Vec::new(),
                 work_dir: None,
                 synthesis_config: None,
                 require_signed: false,

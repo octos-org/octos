@@ -93,6 +93,7 @@ fn build_cached_plugin_registration(
         plugin_dirs,
         &[],
         octos_agent::PluginLoadOptions {
+            blocked_env: Vec::new(),
             work_dir: None,
             synthesis_config: None,
             require_signed,

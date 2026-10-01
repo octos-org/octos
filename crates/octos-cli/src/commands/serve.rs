@@ -1252,6 +1252,7 @@ impl ServeCommand {
                 Some(&config.plugins),
                 config.voice.as_ref(),
                 config.memory.as_ref(),
+                Some(&config.mode),
             )
             .await
             {

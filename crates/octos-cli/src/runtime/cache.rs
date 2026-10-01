@@ -841,6 +841,7 @@ mod tests {
             credentials: StdHashMap::new(),
             skills_dir: None,
             plugin_env_template: Vec::new(),
+            plugin_blocked_env: Vec::new(),
             tool_policy: None,
             default_sandbox: sandbox,
             max_iterations: None,
