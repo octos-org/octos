@@ -4476,3 +4476,32 @@ fn plugin_accepts_input_path_inside_real_skill_dir_under_canonical_classify() {
         "accepted path must remain inside the canonical skill_dir: {path_in}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn strict_env_allowlist_rejects_octos_secret_extra_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        r#"#!/bin/sh
+read INPUT || true
+if [ -n "${OCTOS_AUTH_TOKEN:-}" ] || [ -n "${OCTOS_ADMIN_TOKEN:-}" ]; then
+  echo '{"output":"secret present","success":false}'
+else
+  echo '{"output":"secret absent","success":true}'
+fi
+"#,
+    );
+    let mut def = make_tool_def("strict_secret", "test env isolation");
+    def.env.push("OCTOS_PROFILE_ID".into());
+    let tool = PluginTool::new("p".into(), def, script_path)
+        .with_extra_env(vec![
+            ("OCTOS_AUTH_TOKEN".into(), "fixture".into()),
+            ("OCTOS_ADMIN_TOKEN".into(), "fixture".into()),
+        ])
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
+    let result = tool.execute(&json!({})).await.unwrap();
+    assert!(result.success);
+    assert_eq!(result.output, "secret absent");
+}
