@@ -24475,34 +24475,45 @@ fn dynamic_profile_runtimes() -> &'static DynamicProfileRuntimeMap {
     RUNTIMES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
-/// Runtimes dropped from the cache by a configuration commit, kept weakly.
-/// While an in-flight turn still holds one, its single-writer stores stay
-/// open, so the next bootstrap takes them over instead of reopening them.
+/// Stores of runtimes a configuration commit removed from the cache, held
+/// until a replacement takes them over. An in-flight turn's agent keeps the
+/// single-writer episode store open even after the runtime itself is gone,
+/// so the replacement must reuse these handles rather than reopen the files.
 fn retired_profile_runtimes()
--> &'static std::sync::Mutex<HashMap<String, std::sync::Weak<crate::runtime::ProfileRuntime>>> {
+-> &'static std::sync::Mutex<HashMap<String, crate::runtime::profile::RetiredProfileRuntime>> {
     static RETIRED: OnceLock<
-        std::sync::Mutex<HashMap<String, std::sync::Weak<crate::runtime::ProfileRuntime>>>,
+        std::sync::Mutex<HashMap<String, crate::runtime::profile::RetiredProfileRuntime>>,
     > = OnceLock::new();
     RETIRED.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-fn retire_profile_runtime(key: &str, runtime: &Arc<crate::runtime::ProfileRuntime>) {
+fn retire_profile_runtime(key: &str, runtime: &crate::runtime::ProfileRuntime) {
     retired_profile_runtimes()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key.to_owned(), Arc::downgrade(runtime));
+        .insert(key.to_owned(), runtime.retire());
 }
 
-/// The retired runtime for `key` while something still holds it.
-fn live_retired_profile_runtime(key: &str) -> Option<Arc<crate::runtime::ProfileRuntime>> {
-    let mut retired = retired_profile_runtimes()
+fn take_retired_profile_runtime(
+    key: &str,
+) -> Option<crate::runtime::profile::RetiredProfileRuntime> {
+    retired_profile_runtimes()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let runtime = retired.get(key).and_then(std::sync::Weak::upgrade);
-    if runtime.is_none() {
-        retired.remove(key);
-    }
-    runtime
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(key)
+}
+
+/// Return a retiree whose replacement failed, unless a newer commit already
+/// retired another runtime under the same key.
+fn restore_retired_profile_runtime(
+    key: &str,
+    retired: crate::runtime::profile::RetiredProfileRuntime,
+) {
+    retired_profile_runtimes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(key.to_owned())
+        .or_insert(retired);
 }
 
 fn dynamic_profile_runtime_key(state: &AppState, profile_id: &str) -> Option<String> {
@@ -24638,8 +24649,11 @@ pub(crate) async fn ensure_session_profile_runtime(
         // Lazily-created profiles must honour host-level policy too — without
         // host_memory, a host opt-out of (default-on) memory refresh would not
         // bind profiles created after startup.
-        let retired = live_retired_profile_runtime(&key);
-        let runtime = crate::runtime::ProfileRuntime::bootstrap_replacing(
+        let mut retired = take_retired_profile_runtime(&key);
+        let had_retired = retired.is_some();
+        // Boxed: the bootstrap future is large, and this function is awaited
+        // inside many request futures that run on worker-thread stacks.
+        let bootstrap = Box::pin(crate::runtime::ProfileRuntime::bootstrap_replacing(
             &profile,
             &profile_data_dir,
             Some(store.octos_home_dir()),
@@ -24647,10 +24661,15 @@ pub(crate) async fn ensure_session_profile_runtime(
             None,
             None,
             state.host_memory.as_ref(),
-            retired.as_ref(),
-        )
-        .await
-        .map_err(|error| {
+            &mut retired,
+        ))
+        .await;
+        if bootstrap.is_err() {
+            if let Some(retired) = retired.take() {
+                restore_retired_profile_runtime(&key, retired);
+            }
+        }
+        let runtime = bootstrap.map_err(|error| {
             // Lock contention is a config mistake with a concrete fix, so it gets
             // its own typed kind and a sentence the operator can act on. Anything
             // else stays `runtime_unavailable` — but formatted with `{error:#}`
@@ -24658,7 +24677,7 @@ pub(crate) async fn ensure_session_profile_runtime(
             // only the outermost context, which is how "failed to open episode
             // store for profile 'x'" used to reach the TUI with its actual cause
             // (and its remedy) silently dropped.
-            if octos_memory::is_episode_store_locked(&error) && retired.is_some() {
+            if octos_memory::is_episode_store_locked(&error) && had_retired {
                 // This process still holds the stores through the runtime a
                 // configuration change retired; it frees them when its
                 // in-flight work ends. Not a second octos process.

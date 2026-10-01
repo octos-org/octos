@@ -125,6 +125,27 @@ fn configs_share_storage(previous: &Config, next: &Config) -> bool {
         .is_none_or(|name| previous.env_vars.get(name) == next.env_vars.get(name))
 }
 
+/// The resources of a runtime a configuration commit removed, awaiting its
+/// replacement. See [`ProfileRuntime::retire`].
+pub(crate) struct RetiredProfileRuntime {
+    data_dir: PathBuf,
+    custom_session_root: bool,
+    // Boxed: callers hold the retiree across awaits, and `Config` is large.
+    config: Box<Config>,
+    resources: SharedProfileResources,
+}
+
+impl RetiredProfileRuntime {
+    /// Whether a runtime for `config` rooted at `data_dir` can take over these
+    /// stores: same storage location, and nothing that shapes how the stores
+    /// were opened (embedder, recall width) has changed.
+    pub(crate) fn can_share_with(&self, data_dir: &Path, config: &Config) -> bool {
+        self.data_dir == data_dir
+            && !self.custom_session_root
+            && configs_share_storage(&self.config, config)
+    }
+}
+
 /// Build an ISOLATED per-node pipeline provider router from the profile's
 /// `sub_providers` (e.g. the `deep_research` pipeline's `cheap`/`strong`
 /// nodes, resolved via `RunPipelineTool`'s provider router).
@@ -1031,16 +1052,20 @@ impl ProfileRuntime {
             host_plugins,
             host_voice,
             host_memory,
-            None,
+            &mut None,
         )
         .await
     }
 
     /// [`Self::bootstrap_with_host_plugins`] for a configuration change of a
-    /// profile whose previous runtime may still be alive (held by an in-flight
-    /// turn). When the new configuration keeps the same storage, the new
-    /// runtime shares that runtime's stores and long-lived services; every
-    /// configuration-derived part is rebuilt exactly as a cold bootstrap would.
+    /// profile whose previous stores may still be open (an in-flight turn's
+    /// agent holds them even after the runtime itself is gone). When the new
+    /// configuration keeps the same storage, the new runtime takes over the
+    /// retired stores and long-lived services; every configuration-derived
+    /// part is rebuilt exactly as a cold bootstrap would. When it does not,
+    /// `previous` is released (set to `None`) before the cold bootstrap so
+    /// this process no longer pins the stores; otherwise it is left for the
+    /// caller to keep on failure.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn bootstrap_replacing(
         profile: &UserProfile,
@@ -1050,7 +1075,7 @@ impl ProfileRuntime {
         host_plugins: Option<&crate::config::PluginsConfig>,
         host_voice: Option<&crate::config::VoiceConfig>,
         host_memory: Option<&crate::config::MemoryConfig>,
-        previous: Option<&Arc<Self>>,
+        previous: &mut Option<RetiredProfileRuntime>,
     ) -> Result<Arc<Self>> {
         // Step 1: derive the per-profile Config. Apply the host plugin
         // policy on top of the profile-derived one before any downstream
@@ -1067,34 +1092,39 @@ impl ProfileRuntime {
         // inherit the host budget.
         crate::config::merge_host_memory_into_profile(&mut config.memory, host_memory);
 
-        let shared = previous
-            .filter(|previous| previous.can_share_resources_with(data_dir, &config))
-            .map(|previous| previous.shared_resources());
+        let shared = match previous {
+            Some(retired) if retired.can_share_with(data_dir, &config) => {
+                Some(retired.resources.clone())
+            }
+            _ => {
+                *previous = None;
+                None
+            }
+        };
         Self::bootstrap_resolved_sharing(
             profile, data_dir, octos_home, role, config, host_voice, false, None, shared,
         )
         .await
     }
 
-    /// Whether a runtime for `config` rooted at `data_dir` can take over this
-    /// runtime's stores: same storage location, and nothing that shapes how
-    /// the stores were opened (embedder, recall width) has changed.
-    pub(crate) fn can_share_resources_with(&self, data_dir: &Path, config: &Config) -> bool {
-        self.data_dir == data_dir
-            && self.session_store_root.is_none()
-            && configs_share_storage(&self.config, config)
-    }
-
-    pub(crate) fn shared_resources(&self) -> SharedProfileResources {
-        SharedProfileResources {
-            memory: self.memory.clone(),
-            memory_store: self.memory_store.clone(),
-            recall: self.recall.clone(),
-            embedder: self.embedder.clone(),
-            tool_config: self.tool_config.clone(),
-            cron_service: self.cron_service.clone(),
-            runtime_lifecycle: self.runtime_lifecycle.clone(),
-            memory_refresh: self.memory_refresh.clone(),
+    /// Keep this runtime's stores and long-lived services for its
+    /// replacement. Held strongly: an in-flight turn's agent can keep the
+    /// single-writer episode store open after every runtime handle is gone.
+    pub(crate) fn retire(&self) -> RetiredProfileRuntime {
+        RetiredProfileRuntime {
+            data_dir: self.data_dir.clone(),
+            custom_session_root: self.session_store_root.is_some(),
+            config: Box::new(self.config.clone()),
+            resources: SharedProfileResources {
+                memory: self.memory.clone(),
+                memory_store: self.memory_store.clone(),
+                recall: self.recall.clone(),
+                embedder: self.embedder.clone(),
+                tool_config: self.tool_config.clone(),
+                cron_service: self.cron_service.clone(),
+                runtime_lifecycle: self.runtime_lifecycle.clone(),
+                memory_refresh: self.memory_refresh.clone(),
+            },
         }
     }
 
@@ -2172,6 +2202,17 @@ mod tests {
             "a cold bootstrap cannot reopen the store the old runtime holds"
         );
 
+        // Retire, then keep only what an in-flight agent keeps: the episode
+        // store. Every runtime handle is gone, the redb lock is not.
+        let mut retired = Some(old.retire());
+        let held_by_agent = old.memory.clone();
+        let old_memory_store = old.memory_store.clone();
+        let old_recall = old.recall.clone();
+        let old_tool_config = old.tool_config.clone();
+        let old_cron = old.cron_service.clone().unwrap();
+        let old_lifecycle = old.runtime_lifecycle.clone().unwrap();
+        assert_eq!(old.primary_model_id, "gemini-m1");
+        drop(old);
         let replacement = ProfileRuntime::bootstrap_replacing(
             &second,
             &data_dir,
@@ -2180,23 +2221,31 @@ mod tests {
             None,
             None,
             None,
-            Some(&old),
+            &mut retired,
         )
         .await
         .expect("replacement shares the held stores");
-        assert!(Arc::ptr_eq(&replacement.memory, &old.memory));
-        assert!(Arc::ptr_eq(&replacement.memory_store, &old.memory_store));
-        assert!(Arc::ptr_eq(&replacement.recall, &old.recall));
-        assert!(Arc::ptr_eq(&replacement.tool_config, &old.tool_config));
+        assert!(
+            retired.is_some(),
+            "a shareable retiree stays with the caller"
+        );
+        drop(retired);
+        assert!(Arc::ptr_eq(&replacement.memory, &held_by_agent));
+        assert!(Arc::ptr_eq(&replacement.memory_store, &old_memory_store));
+        assert!(Arc::ptr_eq(&replacement.recall, &old_recall));
+        assert!(Arc::ptr_eq(&replacement.tool_config, &old_tool_config));
         assert!(Arc::ptr_eq(
             replacement.cron_service.as_ref().unwrap(),
-            old.cron_service.as_ref().unwrap()
+            &old_cron
         ));
         assert!(Arc::ptr_eq(
             replacement.runtime_lifecycle.as_ref().unwrap(),
-            old.runtime_lifecycle.as_ref().unwrap()
+            &old_lifecycle
         ));
-        assert_eq!(old.primary_model_id, "gemini-m1");
+        assert!(
+            old_cron.is_running(),
+            "the shared cron service keeps running"
+        );
         assert_eq!(replacement.primary_model_id, "gemini-m2");
         assert_eq!(
             replacement.memory_refresh.is_some(),
@@ -2206,7 +2255,8 @@ mod tests {
         let derived = derived_snapshot(&replacement);
 
         drop(replacement);
-        drop(old);
+        drop((held_by_agent, old_memory_store, old_recall, old_tool_config));
+        drop((old_cron, old_lifecycle));
         let cold = ProfileRuntime::bootstrap(&second, &data_dir, None, BootstrapRole::Serve)
             .await
             .expect("cold bootstrap once the stores are released");
@@ -2222,8 +2272,9 @@ mod tests {
             .await
             .expect("initial bootstrap");
         let same = old.config.clone();
-        assert!(old.can_share_resources_with(&data_dir, &same));
-        assert!(!old.can_share_resources_with(&tmp.path().join("elsewhere"), &same));
+        let retired = old.retire();
+        assert!(retired.can_share_with(&data_dir, &same));
+        assert!(!retired.can_share_with(&tmp.path().join("elsewhere"), &same));
 
         let mut embedding = same.clone();
         embedding.embedding = Some(crate::config::EmbeddingConfig {
@@ -2235,14 +2286,41 @@ mod tests {
             model_path: None,
             auto_download: None,
         });
-        assert!(!old.can_share_resources_with(&data_dir, &embedding));
+        assert!(!retired.can_share_with(&data_dir, &embedding));
 
         let mut recall = same.clone();
         recall
             .memory
             .get_or_insert_with(Default::default)
             .recall_dimension = Some(64);
-        assert!(!old.can_share_resources_with(&data_dir, &recall));
+        assert!(!retired.can_share_with(&data_dir, &recall));
+
+        // An unshareable retiree is released before the cold bootstrap, so
+        // the process does not pin the stores it can no longer use.
+        drop(old);
+        let mut unshareable = Some(retired);
+        let mut changed = profile.clone();
+        changed.config.memory = Some(crate::config::MemoryConfig {
+            recall_dimension: Some(64),
+            ..Default::default()
+        });
+        let rebuilt = ProfileRuntime::bootstrap_replacing(
+            &changed,
+            &data_dir,
+            None,
+            BootstrapRole::Serve,
+            None,
+            None,
+            None,
+            &mut unshareable,
+        )
+        .await;
+        assert!(unshareable.is_none());
+        assert!(
+            rebuilt.is_ok(),
+            "nothing else holds the stores: {:?}",
+            rebuilt.err()
+        );
 
         let mut keyed = embedding.clone();
         keyed.embedding.as_mut().unwrap().api_key_env = Some("EMBED_KEY".to_string());

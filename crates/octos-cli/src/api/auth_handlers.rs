@@ -6062,6 +6062,13 @@ printf '{"success":%s,"output":"%s","structured_metadata":{"revision":"%s"}}\n' 
         let data = store.resolve_data_dir(&store.get("user-a").unwrap().unwrap());
         std::fs::write(data.join("hold"), "hold").unwrap();
         let old_tool = old.tool_specs.get("env_probe").unwrap().clone();
+        // What a live in-flight turn keeps: its agent's episode store and the
+        // executing tool, not the ProfileRuntime (the session cache eviction
+        // drops that). This is the shape the first live acceptance missed.
+        let held_by_agent = old.memory.clone();
+        let old_memory_store = old.memory_store.clone();
+        let old_cron = old.cron_service.clone().unwrap();
+        drop(old);
         let running =
             tokio::spawn(async move { old_tool.execute(&serde_json::json!({})).await.unwrap() });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -6093,15 +6100,13 @@ printf '{"success":%s,"output":"%s","structured_metadata":{"revision":"%s"}}\n' 
         .await
         .unwrap()
         .unwrap();
-        assert!(!Arc::ptr_eq(&new, &old));
-        assert!(Arc::ptr_eq(&new.memory, &old.memory));
-        assert!(Arc::ptr_eq(&new.memory_store, &old.memory_store));
-        assert!(Arc::ptr_eq(&new.recall, &old.recall));
-        assert!(Arc::ptr_eq(&new.tool_config, &old.tool_config));
-        assert!(Arc::ptr_eq(
-            new.cron_service.as_ref().unwrap(),
-            old.cron_service.as_ref().unwrap()
-        ));
+        assert!(Arc::ptr_eq(&new.memory, &held_by_agent));
+        assert!(Arc::ptr_eq(&new.memory_store, &old_memory_store));
+        assert!(Arc::ptr_eq(new.cron_service.as_ref().unwrap(), &old_cron));
+        assert!(
+            old_cron.is_running(),
+            "the shared cron service keeps running"
+        );
         let env_value = |runtime: &crate::runtime::ProfileRuntime, name: &str| {
             runtime
                 .plugin_env_template
@@ -6145,7 +6150,7 @@ printf '{"success":%s,"output":"%s","structured_metadata":{"revision":"%s"}}\n' 
             old_result.structured_metadata.as_ref().unwrap()["revision"],
             old_revision
         );
-        drop(old);
+        drop((held_by_agent, old_memory_store, old_cron));
         let result = new
             .tool_specs
             .get("env_probe")
