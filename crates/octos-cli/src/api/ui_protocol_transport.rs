@@ -14603,7 +14603,7 @@ impl ProfileRuntimeDisposition {
 /// The runtime transition a committed Profile LLM mutation performed, stamped
 /// onto the wire result next to `applied` (#2164).
 #[derive(Debug, Clone)]
-struct ProfileLlmRuntimeTransition {
+pub(crate) struct ProfileLlmRuntimeTransition {
     disposition: ProfileRuntimeDisposition,
     /// Persisted profile revision (`updated_at`) the runtime was — or was
     /// demonstrably not — synced to.
@@ -14612,7 +14612,31 @@ struct ProfileLlmRuntimeTransition {
     error: Option<String>,
 }
 
+/// Shared REST/OUP projection of post-save runtime state.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProfileRuntimeStatus {
+    pub runtime_disposition: String,
+    pub restart_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_error: Option<String>,
+}
+
 impl ProfileLlmRuntimeTransition {
+    pub(crate) fn wire_status(&self) -> ProfileRuntimeStatus {
+        ProfileRuntimeStatus {
+            runtime_disposition: self.disposition.as_str().to_string(),
+            restart_required: self.disposition == ProfileRuntimeDisposition::RestartRequired,
+            config_revision: self.config_revision.clone(),
+            effective_from: (self.disposition != ProfileRuntimeDisposition::Unchanged)
+                .then(|| "next_turn".to_string()),
+            runtime_error: self.error.clone(),
+        }
+    }
+
     fn unchanged() -> Self {
         Self {
             disposition: ProfileRuntimeDisposition::Unchanged,
@@ -14696,27 +14720,11 @@ fn stamp_profile_llm_runtime_transition(
     result: &mut Value,
     transition: &ProfileLlmRuntimeTransition,
 ) {
-    if let Value::Object(object) = result {
-        object.insert(
-            "runtime_disposition".into(),
-            json!(transition.disposition.as_str()),
-        );
-        if let Some(config_revision) = &transition.config_revision {
-            object.insert("config_revision".into(), json!(config_revision));
-        }
-        object.insert(
-            "restart_required".into(),
-            json!(matches!(
-                transition.disposition,
-                ProfileRuntimeDisposition::RestartRequired
-            )),
-        );
-        if transition.disposition != ProfileRuntimeDisposition::Unchanged {
-            object.insert("effective_from".into(), json!("next_turn"));
-        }
-        if let Some(error) = &transition.error {
-            object.insert("runtime_error".into(), json!(error));
-        }
+    if let (Value::Object(object), Value::Object(status)) = (
+        result,
+        serde_json::to_value(transition.wire_status()).expect("runtime status serializes"),
+    ) {
+        object.extend(status);
     }
 }
 
@@ -24773,8 +24781,8 @@ pub(crate) async fn refresh_profile_runtime_after_profile_update(
     state: &AppState,
     profile_id: &str,
     config_revision: Option<String>,
-) {
-    let _ = commit_profile_llm_runtime_transition(state, profile_id, config_revision).await;
+) -> ProfileLlmRuntimeTransition {
+    commit_profile_llm_runtime_transition(state, profile_id, config_revision).await
 }
 
 /// Resolve the canonical `SessionManager` handle for read operations
