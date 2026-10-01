@@ -24613,7 +24613,6 @@ pub(crate) async fn ensure_session_profile_runtime(
             None,
             None,
             state.host_memory.as_ref(),
-            Some(&state.deployment_mode),
         )
         .await
         .map_err(|error| {
@@ -39322,7 +39321,6 @@ async fn run_standalone_turn(
             session_runtime.profile.plugin_dirs.clone(),
             session_runtime.profile.plugin_env_template.clone(),
         )
-        .with_plugin_blocked_env(session_runtime.profile.plugin_blocked_env.clone())
         .with_hook_context(octos_agent::HookContext {
             session_id: Some(session_id.to_string()),
             profile_id: Some(session_runtime.profile.profile_id.clone()),

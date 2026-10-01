@@ -5891,9 +5891,8 @@ mod tests {
         };
         let patch = |model: &str| {
             serde_json::json!({"config":{
-                "llm":{"primary":{"family_id":"google","model_id":model,
-                    "route":{"api_key_env":"CUSTOM_LESSON_KEY"}},"fallbacks":[]},
-                "env_vars":{"CUSTOM_LESSON_KEY":key}
+                "llm":{"primary":{"family_id":"google","model_id":model},"fallbacks":[]},
+                "env_vars":{"GEMINI_API_KEY":key}
             }})
             .to_string()
         };
@@ -5996,9 +5995,8 @@ mod tests {
         let state = Arc::new(state);
         let patch = |model: &str, key: &str| {
             serde_json::json!({"config":{
-                "llm":{"primary":{"family_id":"google","model_id":model,
-                    "route":{"api_key_env":"CUSTOM_LESSON_KEY"}},"fallbacks":[]},
-                "env_vars":{"CUSTOM_LESSON_KEY":key}
+                "llm":{"primary":{"family_id":"google","model_id":model},"fallbacks":[]},
+                "env_vars":{"GEMINI_API_KEY":key}
             }})
             .to_string()
         };
@@ -6061,11 +6059,6 @@ printf '{"success":%s,"output":"%s","structured_metadata":{"revision":"%s"}}\n' 
             .unwrap()
             .1
             .clone();
-        assert!(
-            old.plugin_blocked_env
-                .iter()
-                .any(|name| name == "GEMINI_API_KEY")
-        );
         let data = store.resolve_data_dir(&store.get("user-a").unwrap().unwrap());
         std::fs::write(data.join("hold"), "hold").unwrap();
         let old_tool = old.tool_specs.get("env_probe").unwrap().clone();

@@ -58,7 +58,6 @@ pub struct ProfilePluginReloadConfig {
     base_tools: Arc<ToolRegistry>,
     plugin_dirs: Vec<PathBuf>,
     plugin_env: Vec<(String, String)>,
-    blocked_env: Vec<String>,
     work_dir: PathBuf,
     synthesis_config: Option<octos_agent::plugins::SynthesisConfig>,
     require_signed: bool,
@@ -380,7 +379,6 @@ pub struct ProfileRuntime {
     /// Env-var pairs every plugin spawn for this profile should
     /// inherit (`OCTOS_PROFILE_ID`, `OCTOS_VOICE_DIR`, etc.).
     pub plugin_env_template: Vec<(String, String)>,
-    pub plugin_blocked_env: Vec<String>,
 
     /// The profile's tool policy (allow/deny lists, named groups,
     /// per-provider overrides). `None` means "no profile-level policy"
@@ -652,7 +650,6 @@ async fn build_profile_plugin_layer(
             &reload.plugin_dirs,
             &reload.plugin_env,
             PluginLoadOptions {
-                blocked_env: reload.blocked_env.clone(),
                 work_dir: Some(&reload.work_dir),
                 synthesis_config: reload.synthesis_config.clone(),
                 require_signed: reload.require_signed,
@@ -884,7 +881,6 @@ impl ProfileRuntime {
                 .exists()
                 .then_some(skills_dir_candidate),
             plugin_env_template: self.plugin_env_template.clone(),
-            plugin_blocked_env: self.plugin_blocked_env.clone(),
             tool_policy: self.tool_policy.clone(),
             default_sandbox: self.default_sandbox.clone(),
             max_iterations: self.max_iterations,
@@ -965,10 +961,8 @@ impl ProfileRuntime {
         octos_home: Option<&Path>,
         role: BootstrapRole,
     ) -> Result<Arc<Self>> {
-        Self::bootstrap_with_host_plugins(
-            profile, data_dir, octos_home, role, None, None, None, None,
-        )
-        .await
+        Self::bootstrap_with_host_plugins(profile, data_dir, octos_home, role, None, None, None)
+            .await
     }
 
     /// Section B (codex review round-3): bootstrap a profile runtime while
@@ -986,15 +980,11 @@ impl ProfileRuntime {
         host_plugins: Option<&crate::config::PluginsConfig>,
         host_voice: Option<&crate::config::VoiceConfig>,
         host_memory: Option<&crate::config::MemoryConfig>,
-        host_deployment_mode: Option<&crate::config::DeploymentMode>,
     ) -> Result<Arc<Self>> {
         // Step 1: derive the per-profile Config. Apply the host plugin
         // policy on top of the profile-derived one before any downstream
         // step inspects `config.plugins.require_signed`.
         let mut config = config_from_profile(profile, None, None);
-        if let Some(mode) = host_deployment_mode {
-            config.mode = mode.clone();
-        }
         if let Some(host) = host_plugins {
             if host.require_signed {
                 config.plugins.require_signed = true;
@@ -1135,11 +1125,6 @@ impl ProfileRuntime {
             &config,
             &profile.updated_at.to_rfc3339(),
         );
-        let plugin_blocked_env =
-            crate::commands::gateway::profile_factory::apply_profile_primary_credentials(
-                &mut plugin_env_template,
-                &config,
-            );
         push_runtime_plugin_env(
             &mut plugin_env_template,
             data_dir,
@@ -1256,7 +1241,6 @@ impl ProfileRuntime {
             base_tools: plugin_base_tools,
             plugin_dirs: plugin_dirs.clone(),
             plugin_env: plugin_env_template.clone(),
-            blocked_env: plugin_blocked_env.clone(),
             work_dir: plugin_work_dir,
             synthesis_config: None,
             require_signed: config.plugins.require_signed,
@@ -1728,7 +1712,6 @@ impl ProfileRuntime {
             credentials,
             skills_dir,
             plugin_env_template,
-            plugin_blocked_env,
             tool_policy: config.tool_policy.clone(),
             default_sandbox,
             max_iterations: config.max_iterations,
@@ -2626,7 +2609,6 @@ mod tests {
             Some(&host_plugins),
             None,
             None,
-            None,
         )
         .await
         .expect("bootstrap should succeed (the rejection only suppresses the plugin)");
@@ -2830,7 +2812,6 @@ mod tests {
             Some(&octos_home),
             BootstrapRole::Serve,
             Some(&strict),
-            None,
             None,
             None,
         )
