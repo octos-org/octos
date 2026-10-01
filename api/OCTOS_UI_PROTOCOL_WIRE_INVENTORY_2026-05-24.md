@@ -141,6 +141,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `peer/tools/register` | shipped; UPCR-2026-035 host-registered peer tools |
 | `peer/tool/result` | shipped; UPCR-2026-035 host-registered peer tools |
 | `peer/input/reject` | shipped; UPCR-2026-035 host-registered peer tools (#2618) |
+| `peer/tools/unregister` | shipped; UPCR-2026-035 host-registered peer tools (host releases a peer) |
 | `turn/steer` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `session/compact` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `session/compact/mode/set` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |

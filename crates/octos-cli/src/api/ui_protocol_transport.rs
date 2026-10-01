@@ -427,6 +427,10 @@ const APPUI_METHOD_PEER_TOOL_RESULT: &str = "peer/tool/result";
 /// `peer/input/reject` (UPCR-2026-035, #2618): the host refuses a
 /// `peer/input` it received; the system agent learns why.
 const APPUI_METHOD_PEER_INPUT_REJECT: &str = "peer/input/reject";
+/// UPCR-2026-035 `peer/tools/unregister`: the host releases a host-owned app
+/// peer (the app closed, or its agent was turned off) without closing its
+/// connection; the peer's route is dropped, so later input fails visibly.
+const APPUI_METHOD_PEER_TOOLS_UNREGISTER: &str = "peer/tools/unregister";
 /// `turn/steer` — mid-turn prompt injection into the ACTIVE turn (codex
 /// parity: app-server `turn/steer` → `Session::steer_input`). Params
 /// `{session_id, expected_turn_id?, input}`; result `{turn_id, steered}`.
@@ -543,6 +547,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PEER_TOOLS_REGISTER,
     APPUI_METHOD_PEER_TOOL_RESULT,
     APPUI_METHOD_PEER_INPUT_REJECT,
+    APPUI_METHOD_PEER_TOOLS_UNREGISTER,
     APPUI_METHOD_TURN_STEER,
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
@@ -16108,6 +16113,61 @@ fn raw_peer_input_reject(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPeerToolsUnregisterParams {
+    session_id: SessionKey,
+    peer: String,
+    #[serde(default)]
+    host_token: Option<String>,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+/// `peer/tools/unregister` — the host releases a host-owned app peer it no
+/// longer serves (the app closed, or its agent was turned off) while its
+/// connection stays open for other apps. The peer's route is dropped and its
+/// calls in flight end `host_gone`, exactly as if its connection had closed:
+/// the system agent's later `peer_send_input` fails ("not connected") instead
+/// of being accepted with nobody to run it. Host token and a non-external
+/// connection required; idempotent; `peer/tools/register` restores it.
+fn raw_peer_tools_unregister(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    request: &RpcRequest<Value>,
+    connection_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    if ws.is_external() {
+        return Err(external_host_tools_denied(&request.method));
+    }
+    let params: RawPeerToolsUnregisterParams = parse_raw_params(request)?;
+    let profile_id = raw_scoped_llm_profile_id(
+        params.profile_id.clone(),
+        Some(&params.session_id),
+        connection_profile_id,
+    )?;
+    let (_, data_dir) = resolve_profile_data_dir(state, Some(&profile_id))?;
+    let peers_root = data_dir.join("peers");
+    let slug = authorize_host_peer_call(
+        &peers_root,
+        &params.peer,
+        &params.session_id,
+        params.host_token.as_deref(),
+    )?;
+    if crate::peers::app_binding::read_peer_host_binding(&peers_root, &slug).is_none() {
+        return Err(host_peer_error(
+            "peer_not_host_bound",
+            format!("peer '{slug}' is not a host-owned app peer"),
+        ));
+    }
+    let unregistered = crate::peers::host_tools::unregister_peer_route(&peers_root, &slug);
+    Ok(json!({
+        "slug": slug,
+        "profile_id": profile_id,
+        "unregistered": unregistered,
+    }))
+}
+
 /// The connection a turn counts as driven by for a host peer's tools
 /// (UPCR-2026-035). A kernel-internal continuation (a peer_send_input
 /// injection, a background result) is nobody's turn: it never gets a host
@@ -20696,9 +20756,13 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_PEER_TOOLS_REGISTER
         | APPUI_METHOD_PEER_TOOL_RESULT
         | APPUI_METHOD_PEER_INPUT_REJECT
+        | APPUI_METHOD_PEER_TOOLS_UNREGISTER
             if ws.is_external() =>
         {
             Err(external_host_tools_denied(&request.method))
+        }
+        APPUI_METHOD_PEER_TOOLS_UNREGISTER => {
+            raw_peer_tools_unregister(ws, state, request, connection_profile_id)
         }
         APPUI_METHOD_PEER_TOOLS_REGISTER => {
             raw_peer_tools_register(ws, state, request, connection_profile_id)
@@ -21153,6 +21217,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_PEER_TOOLS_REGISTER
             | APPUI_METHOD_PEER_TOOL_RESULT
             | APPUI_METHOD_PEER_INPUT_REJECT
+            | APPUI_METHOD_PEER_TOOLS_UNREGISTER
             | APPUI_METHOD_PROFILE_SKILLS_LIST
             | APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH
             | APPUI_METHOD_PROFILE_SKILLS_INSTALL

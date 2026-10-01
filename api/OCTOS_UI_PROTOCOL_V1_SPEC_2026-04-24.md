@@ -652,6 +652,13 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   typed `data.kind` `peer_input_reject_invalid`, `peer_input_not_found`,
   `peer_input_wrong_connection`, `peer_input_already_rejected`,
   `peer_input_already_started`)
+- `peer/tools/unregister` (accepted `UPCR-2026-035`: the host releases a
+  host-owned app peer it no longer serves while its connection stays open;
+  `{session_id, peer, host_token, profile_id?}` → `{slug, profile_id,
+  unregistered}`; drops the peer's route and ends its calls in flight
+  `host_gone`, so the system agent's later `peer_send_input` fails "not
+  connected"; idempotent; `peer/tools/register` restores the route; refused
+  to external clients)
 - `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
   latest `result.md` — written server-side on every peer-session turn
   terminal — with per-field truncation flags and `result_updated_unix`;

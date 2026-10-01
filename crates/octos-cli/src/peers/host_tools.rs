@@ -1802,6 +1802,26 @@ pub(crate) fn drop_routes_for_connection(connection: u64) {
         .retain(|_, registered| registered.connection != connection);
 }
 
+/// Drop the peer `slug`'s route at its host's request (`peer/tools/unregister`):
+/// its calls in flight end `host_gone` and later input is refused as "not
+/// connected", as if its connection had closed. Whether a route was held.
+pub(crate) fn unregister_peer_route(peers_root: &Path, slug: &str) -> bool {
+    let key = route_key(peers_root, slug);
+    let send = HUB
+        .routes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&key)
+        .map(|route| route.send.clone());
+    match send {
+        Some(send) => {
+            drop_route_if(&key, &send);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Drop the route if it is still `send` (its connection closed).
 ///
 /// Like a closed connection ([`drop_routes_for_connection`]), every call in

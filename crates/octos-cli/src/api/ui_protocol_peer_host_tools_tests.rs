@@ -6540,3 +6540,56 @@ async fn should_refuse_a_reopen_when_it_changes_read_parent() {
         open_context_from(&e, Some(&e.ws), "ui-2", json!({"read_parent": true})).unwrap_err();
     assert_eq!(widened.data.unwrap()["kind"], "peer_binding_mismatch");
 }
+
+fn unregister(fx: &Fx, ws: &WsConnection, token: Option<&str>) -> Result<Value, RpcError> {
+    raw_peer_tools_unregister(
+        ws,
+        &fx.state,
+        &rpc(
+            APPUI_METHOD_PEER_TOOLS_UNREGISTER,
+            json!({ "session_id": fx.system, "peer": "news", "host_token": token }),
+        ),
+        None,
+    )
+}
+
+#[tokio::test]
+async fn should_refuse_the_system_agents_input_when_the_host_released_the_peer() {
+    // The shell's consumers share one connection, so releasing an app (it
+    // closed, or its agent was turned off) does not close the connection and
+    // the peer's route stayed: the system agent's input was then "sent" and
+    // nobody ran it. `peer/tools/unregister` drops the route, so the input
+    // fails visibly.
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let (ws, mut rx) = ws_connection_for_test(16);
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    deliver_input(&fx, &mut rx, "call_1").await;
+
+    // Host-only: the token is required, and an external client is refused.
+    assert_eq!(
+        rpc_kind(unregister(&fx, &ws, Some("guess")).unwrap_err()),
+        "peer_host_token_mismatch"
+    );
+    let (ext, _ext_rx) = external_ws(8);
+    assert!(unregister(&fx, &ext, Some(&token)).is_err());
+
+    let released = unregister(&fx, &ws, Some(&token)).expect("the host releases its peer");
+    assert_eq!(released["unregistered"], true);
+    let refused = deliver_peer_send_input(
+        "dev",
+        &peers_root(&fx),
+        &fx.system.0,
+        &TurnId::new(),
+        send_input_request("summarise today's news", "call_2"),
+    )
+    .expect_err("no host route: the input is not delivered");
+    assert!(refused.contains("not connected"), "{refused}");
+    // Idempotent, and registering again restores the route.
+    assert_eq!(
+        unregister(&fx, &ws, Some(&token)).unwrap()["unregistered"],
+        false
+    );
+    register(&fx, &ws, &token, json!({ "tools": [] })).unwrap();
+    deliver_input(&fx, &mut rx, "call_3").await;
+}

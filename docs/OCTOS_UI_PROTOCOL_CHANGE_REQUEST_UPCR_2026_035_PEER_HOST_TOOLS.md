@@ -191,6 +191,26 @@ fails with `host_unavailable`; it is never replayed.
   confirmation sheet for a gated call whose `confirm_required` is false
   (for `confirm_required: true` the kernel already waits the approval TTL).
 
+### `peer/tools/unregister`
+
+```
+{session_id, peer, host_token, profile_id?}
+→ {slug, profile_id, unregistered: bool}
+```
+
+The host releases a host-owned app peer it no longer serves — the app
+closed, or its agent was turned off — while its connection stays open for
+other apps (a shell whose app consumers share one connection never closes
+it). The peer's route is dropped exactly as if its connection had closed:
+calls in flight end `host_gone`, and the system agent's later
+`peer_send_input` to the peer fails ("the app that owns peer … is not
+connected") instead of being accepted with nobody to run it. Host token
+required (`peer_host_token_mismatch`), only for a host-owned peer
+(`peer_not_host_bound`), refused to an external client of `serve
+--host-managed`. Idempotent (`unregistered: false` when no route was held).
+The peer itself, its binding and its durable state are untouched;
+`peer/tools/register` restores the route when the app comes back.
+
 ### `peer/tool/result`
 
 ```
