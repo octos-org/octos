@@ -219,3 +219,13 @@ tag-message = "Release {{version}}"
 pre-release-commit-message = "chore: release {{version}}"
 pre-release-hook = ["git-cliff", "-o", "CHANGELOG.md", "--tag", "v{{version}}"]
 publish = false
+
+# -- Build profiles -----------------------------------------------------------
+# Keep dev builds small: line tables are enough for backtraces, dependencies
+# get no debug info, and incremental caches are disabled (they grow unbounded).
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
