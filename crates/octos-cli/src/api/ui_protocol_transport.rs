@@ -3406,6 +3406,9 @@ fn context_event_for_features(
         UiNotification::ContextNormalizationReported(reported) => {
             retain_negotiated_semantic_cache_diagnostics(&mut reported.context_state, features);
         }
+        UiNotification::ContextStateReported(reported) => {
+            retain_negotiated_semantic_cache_diagnostics(&mut reported.context_state, features);
+        }
         _ => {}
     }
     event
@@ -23040,6 +23043,17 @@ fn live_event_passes_capability_filter(
             | UiNotification::ContextNormalizationReported(_)
             | UiNotification::ContextStateReported(_),
         ) = event
+        {
+            return false;
+        }
+    }
+    // `context.state.v1` gate. The live gauge is ledgered on the shared
+    // session stream, so a connection that negotiated only the lifecycle
+    // baseline (or sent no feature header, which implies that baseline) must
+    // not receive a `context/state_reported` produced for another
+    // connection, live or on reconnect replay.
+    if !features.context_state_available() {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::ContextStateReported(_)) = event
         {
             return false;
         }

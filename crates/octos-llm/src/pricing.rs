@@ -150,18 +150,19 @@ pub struct CacheRates {
 /// (reads, 0.1x).
 ///
 /// Native `anthropic` plus the relabeled proxies that construct an
-/// `AnthropicProvider` under a custom label: `zai` / `zai-coding` (GLM over
-/// the Anthropic API) and `r9s` when it is serving a `claude-*` model (r9s
-/// auto-selects the Anthropic protocol for claude models and OpenAI for the
-/// rest — see `registry/r9s.rs`). A label CONTAINING "anthropic" also counts,
-/// covering custom Anthropic-compatible endpoints. zhipu / dashscope /
-/// minimax / moonshot-coding are OpenAI-protocol re-hosts and are
-/// deliberately excluded.
+/// `AnthropicProvider` under a custom label: `r9s` when it is serving a
+/// `claude-*` model (r9s auto-selects the Anthropic protocol for claude models
+/// and OpenAI for the rest — see `registry/r9s.rs`). A label CONTAINING
+/// "anthropic" also counts, covering custom Anthropic-compatible endpoints
+/// (an explicit `api_type: anthropic` route builds an unrelabeled
+/// `AnthropicProvider`). zai / zai-coding (whose lanes now speak OpenAI Chat
+/// Completions and report implicit cache hits as
+/// `prompt_tokens_details.cached_tokens`), zhipu / dashscope / minimax /
+/// moonshot-coding are OpenAI-protocol re-hosts and are deliberately
+/// excluded.
 fn speaks_anthropic_protocol(provider: &str, model: &str) -> bool {
     let p = provider.to_ascii_lowercase();
     p.contains("anthropic")
-        || p == "zai"
-        || p == "zai-coding"
         // Mirror r9s construction EXACTLY (case-sensitive `starts_with("claude-")`
         // on the RAW model): r9s speaks the Anthropic protocol only for the models
         // it actually builds an `AnthropicProvider` for — see `registry::r9s`.
@@ -178,8 +179,8 @@ fn speaks_anthropic_protocol(provider: &str, model: &str) -> bool {
 ///   models per Anthropic's prompt-caching pricing docs, and consistent with
 ///   every catalog row that carries a cached rate (`catalog.rs`: sonnet-4
 ///   0.3/3.0, haiku-4.5 0.08/0.80 — both exactly 0.1x). This branch is keyed
-///   on PROTOCOL, not on the family label, because a relabeled proxy (zai
-///   serving GLM, r9s serving claude) still emits Anthropic cache accounting.
+///   on PROTOCOL, not on the family label, because a relabeled proxy (r9s
+///   serving claude) still emits Anthropic cache accounting.
 /// - `gemini` / `vertex` / `google`: implicit caching bills cached tokens at
 ///   25% of the input rate (catalog row gemini-2.5-flash: 0.0375/0.15 =
 ///   0.25x). No per-token write charge — explicit-cache STORAGE is
@@ -223,7 +224,7 @@ pub fn cache_rates(provider: &str, model: &str) -> CacheRates {
 /// Rate card for a [`CacheLane`] taken from the answering slot's
 /// [`ProviderMetadata`]. This is the AUTHORITATIVE path — the lane is set from
 /// the provider TYPE at construction, so it needs no label guessing and prices
-/// a relabeled Anthropic proxy (zai/r9s/custom+anthropic) correctly. The
+/// a relabeled Anthropic proxy (r9s/custom+anthropic) correctly. The
 /// label-guessing [`cache_rates`] remains only for the legacy string-only
 /// reprice fallbacks that carry no metadata.
 pub fn cache_rates_for_lane(lane: crate::types::CacheLane) -> CacheRates {
@@ -742,7 +743,7 @@ mod tests {
     #[test]
     fn should_price_relabeled_anthropic_protocol_cache_writes_and_reads_at_anthropic_rates() {
         // #2194 review round 2: relabeled Anthropic-protocol providers
-        // (zai / zai-coding serving GLM, r9s serving claude, custom
+        // (r9s serving claude, custom
         // anthropic) emit cache_creation_input_tokens as WRITES. Their label
         // is not "anthropic", but they speak the Anthropic Messages API, so
         // writes bill at 1.25x and reads at 0.1x — NOT free, and not the
@@ -760,9 +761,8 @@ mod tests {
             8_000,
         );
         for (provider, model) in [
-            ("zai", "glm-4.6"),
-            ("zai-coding", "glm-4.6"),
             ("r9s", "claude-3-5-sonnet"),
+            ("custom-anthropic", "glm-5-turbo"),
         ] {
             let cost =
                 p.cost_with_cache_for_provider(provider, model, 100_000, 10_000, 40_000, 8_000);
@@ -777,6 +777,21 @@ mod tests {
             assert!(
                 cost - read_only > 1e-9,
                 "{provider}/{model}: 8k cache-write tokens must add cost, not vanish"
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_price_zai_lanes_as_anthropic_protocol_after_the_openai_switch() {
+        // The z.ai lanes build `OpenAIProvider` on Z.AI's OpenAI-compatible
+        // roots, so the label-guess fallback must not apply Anthropic's 0.1x
+        // cached-read rate to them (a 10x under-estimate); they price in the
+        // never-understate residual bucket like every other OpenAI re-host.
+        for provider in ["zai", "zai-coding"] {
+            let rates = cache_rates(provider, "glm-5-turbo");
+            assert!(
+                (rates.read_multiplier - 1.0).abs() < f64::EPSILON,
+                "{provider}"
             );
         }
     }

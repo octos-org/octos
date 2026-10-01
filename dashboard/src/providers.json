@@ -205,10 +205,10 @@
     "env": "ZAI_CODING_API_KEY",
     "models": [
       { "id": "glm-5.3", "input": 0.0, "output": 0.0, "max_output": 131072, "endpoints": [
-        { "id": "zai-coding", "label": "GLM Coding Plan", "base_url": "https://api.z.ai/api/anthropic", "api_key_env": "ZAI_API_KEY" }
+        { "id": "zai-coding", "label": "GLM Coding Plan", "base_url": "https://api.z.ai/api/coding/paas/v4", "api_key_env": "ZAI_API_KEY" }
       ] },
       { "id": "glm-5.3-flash", "input": 0.0, "output": 0.0, "max_output": 131072, "endpoints": [
-        { "id": "zai-coding", "label": "GLM Coding Plan", "base_url": "https://api.z.ai/api/anthropic", "api_key_env": "ZAI_API_KEY" }
+        { "id": "zai-coding", "label": "GLM Coding Plan", "base_url": "https://api.z.ai/api/coding/paas/v4", "api_key_env": "ZAI_API_KEY" }
       ] }
     ]
   },

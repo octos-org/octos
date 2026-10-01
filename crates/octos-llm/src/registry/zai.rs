@@ -40,17 +40,26 @@ pub const DEFAULT_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 /// moved to the OpenAI protocol. Saved routes still carry it as `base_url`.
 pub(crate) const LEGACY_ANTHROPIC_ROOT: &str = "https://api.z.ai/api/anthropic";
 
+/// Whether a saved `base_url` names Z.AI's Anthropic-compatible root.
+pub(crate) fn is_legacy_anthropic_root(url: &str) -> bool {
+    url.trim()
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(LEGACY_ANTHROPIC_ROOT)
+}
+
 /// Migrate a saved z.ai `base_url` that still names the Anthropic-compatible
 /// root. The lane now speaks OpenAI Chat Completions, and sending that shape
 /// to `/api/anthropic` fails with a 404, so the override is mapped to the
 /// lane's OpenAI-compatible root and the migration is logged once per
 /// provider build. Any other override is kept verbatim. A route that
 /// explicitly sets `api_type: anthropic` never reaches this lane: the
-/// api_type dispatch keeps it on the Anthropic protocol at its own URL, which
-/// remains the (uncached) fallback for anyone who wants it.
+/// api_type dispatch keeps it on the Anthropic protocol at its own URL (or,
+/// without one, at this legacy root via
+/// `registry::anthropic_api_type_default_root`), which remains the
+/// (uncached) fallback for anyone who wants it.
 pub(crate) fn migrate_legacy_anthropic_root(url: &str, replacement: &str, lane: &str) -> String {
     let trimmed = url.trim().trim_end_matches('/');
-    if trimmed.eq_ignore_ascii_case(LEGACY_ANTHROPIC_ROOT) {
+    if is_legacy_anthropic_root(url) {
         tracing::warn!(
             lane,
             from = trimmed,

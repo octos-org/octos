@@ -4037,7 +4037,8 @@ fn truncate_tool_outputs_for_context_pressure(
                 content,
                 &format!(
                     "[cut to {} of {} for context pressure; `recall` with tool_call_id \"{call_id}\" \
-                     returns the recorded output.]",
+                     returns the recorded output while this session still holds it, or repeat \
+                     the call.]",
                     human_bytes(max_tool_bytes.min(original_bytes)),
                     human_bytes(original_bytes),
                 ),
@@ -4227,7 +4228,9 @@ fn tool_name_for_note(tool_name: &str) -> String {
 /// call, how much of it is shown, and the two ways back (`recall` by id,
 /// paged, or a narrower re-run). The bare `[truncated]` floor left the model
 /// guessing at all three, and a careful model answered by re-reading the
-/// whole file in slices on every iteration.
+/// whole file in slices on every iteration. The `recall` promise is hedged:
+/// after a cold restart `tool_output_by_call_id` only holds the model-visible
+/// floor, so the re-run is always offered as the way back.
 fn truncation_note(
     target: &str,
     shown_bytes: usize,
@@ -4235,9 +4238,9 @@ fn truncation_note(
     call_id: &str,
 ) -> String {
     format!(
-        "[showing the first {} of {} of {target}. The full output is recorded: call `recall` \
-         with tool_call_id \"{call_id}\" (page=N for later pages), or repeat the call for a \
-         narrower range.]",
+        "[showing the first {} of {} of {target}. `recall` with tool_call_id \"{call_id}\" \
+         (page=N for later pages) returns the recorded output while this session still holds \
+         it; otherwise repeat the call for a narrower range.]",
         human_bytes(shown_bytes.min(original_bytes)),
         human_bytes(original_bytes),
     )

@@ -19502,7 +19502,7 @@ fn semantic_cache_fields_are_absent_from_unnegotiated_session_open_payload() {
 }
 
 #[test]
-fn semantic_cache_fields_are_gated_on_compaction_and_normalization_payloads() {
+fn semantic_cache_fields_are_gated_on_compaction_normalization_and_state_payloads() {
     let session_id = SessionKey("local:semantic-events".into());
     let mut compaction = context_compaction_completed_for(&session_id);
     let UiNotification::ContextCompactionCompleted(compaction_event) = &mut compaction else {
@@ -19515,12 +19515,21 @@ fn semantic_cache_fields_are_gated_on_compaction_and_normalization_payloads() {
         unreachable!()
     };
     normalization_event.context_state = semantic_context_state_for_test(&session_id);
+    let mut state_reported = context_state_reported_for(&session_id);
+    let UiNotification::ContextStateReported(state_reported_event) = &mut state_reported else {
+        unreachable!()
+    };
+    state_reported_event.context_state = semantic_context_state_for_test(&session_id);
 
     let lifecycle_only = ConnectionUiFeatures::from_requested_feature_tokens(
         [UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1],
         true,
     );
-    for notification in [compaction.clone(), normalization.clone()] {
+    for notification in [
+        compaction.clone(),
+        normalization.clone(),
+        state_reported.clone(),
+    ] {
         let projected = context_event_for_features(
             UiProtocolLedgerEvent::Notification(notification),
             lifecycle_only,
@@ -19539,7 +19548,7 @@ fn semantic_cache_fields_are_gated_on_compaction_and_normalization_payloads() {
         ],
         true,
     );
-    for notification in [compaction, normalization] {
+    for notification in [compaction, normalization, state_reported] {
         let projected = context_event_for_features(
             UiProtocolLedgerEvent::Notification(notification),
             negotiated,
@@ -28820,6 +28829,15 @@ fn context_normalization_reported_for(session: &SessionKey) -> UiNotification {
     })
 }
 
+fn context_state_reported_for(session: &SessionKey) -> UiNotification {
+    UiNotification::ContextStateReported(octos_core::ui_protocol::ContextStateReportedEvent {
+        session_id: session.clone(),
+        context_state: context_state_for_test(session),
+        threshold_tokens: 100_000,
+        iteration: 3,
+    })
+}
+
 /// Builds the canonical background-result projection emitted by the
 /// post-commit observer.
 fn background_child_v2_for(session: &SessionKey) -> UiNotification {
@@ -29133,6 +29151,41 @@ fn capability_filter_routes_context_lifecycle_gating() {
     assert!(
         live_event_passes_capability_filter(&normalization, new),
         "clients with context.lifecycle.v1 receive normalization events",
+    );
+
+    // `context/state_reported` additionally needs an explicit
+    // `context.state.v1`: lifecycle-only, header-less legacy and
+    // lifecycle-less connections never receive it, live or on replay.
+    let state_reported = UiProtocolLedgerEvent::Notification(context_state_reported_for(&session));
+    let legacy_no_header = ConnectionUiFeatures::default();
+    assert!(legacy_no_header.context_lifecycle_available());
+    for (features, label) in [
+        (old, "no context.lifecycle.v1"),
+        (new, "lifecycle-only"),
+        (legacy_no_header, "header-less legacy"),
+    ] {
+        assert!(
+            !live_event_passes_capability_filter(&state_reported, features),
+            "{label} connections must not receive context/state_reported",
+        );
+    }
+    let state = ConnectionUiFeatures {
+        context_lifecycle_v1: true,
+        context_state_v1: true,
+        header_present: true,
+        ..ConnectionUiFeatures::default()
+    };
+    assert!(
+        live_event_passes_capability_filter(&state_reported, state),
+        "clients with context.state.v1 receive context/state_reported",
+    );
+    let state_without_lifecycle = ConnectionUiFeatures {
+        context_lifecycle_v1: false,
+        ..state
+    };
+    assert!(
+        !live_event_passes_capability_filter(&state_reported, state_without_lifecycle),
+        "context.state.v1 without its parent lifecycle capability is not enough",
     );
 }
 
@@ -38163,9 +38216,9 @@ fn config_with_lane(key: &str) -> crate::config::Config {
 /// RECOMMENDED `sub_providers` shape: `provider: "zai"`, `model: "glm-5.2"`,
 /// explicit `api_key_env: "ZAI_API_KEY"` (whose credential is seeded offline
 /// through `env_vars`), and NO `base_url` / `api_type` — the zai registry
-/// entry supplies both defaults (`https://api.z.ai/api/anthropic`, Anthropic
-/// Messages protocol) and returns the provider directly without an `api_type`
-/// dispatch.
+/// entry supplies both defaults (`https://api.z.ai/api/paas/v4`, OpenAI Chat
+/// Completions protocol) and returns the provider directly without an
+/// `api_type` dispatch.
 fn config_with_zai_lane() -> crate::config::Config {
     let mut config = crate::config::Config::default();
     config
@@ -39373,7 +39426,7 @@ fn zai_lane_peer_handoff_miss_warns_and_falls_back_to_primary() {
 
 /// #19-S3 — REAL-machine three-layer acceptance probe for the zai GLM-5.2
 /// peer model lane. NOT a mock: drives the full lane path and makes ONE real
-/// LLM call to `https://api.z.ai/api/anthropic`. Gated `#[ignore]` so CI never
+/// LLM call to `https://api.z.ai/api/paas/v4`. Gated `#[ignore]` so CI never
 /// needs the key; run explicitly with the key in env:
 ///   ZAI_API_KEY=… cargo test -p octos-cli --lib --features api -- \
 ///     --ignored --exact \

@@ -1883,9 +1883,10 @@ pub fn create_provider_with_api_type(
                     entry.name
                 )
             })?;
+        // Without a base_url, use the root the family serves the Anthropic
+        // protocol at — for z.ai that is not the lane's (OpenAI) default.
         let url = base_url.unwrap_or_else(|| {
-            entry
-                .default_base_url
+            octos_llm::registry::anthropic_api_type_default_root(entry)
                 .unwrap_or("https://api.anthropic.com")
                 .into()
         });

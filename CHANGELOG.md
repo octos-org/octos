@@ -9,6 +9,9 @@ All notable changes to octos will be documented in this file.
 
 ### Changed
 
+- Z.AI: the `zai` and `zai-coding` lanes (and the `octos init` Z.AI preset) now speak OpenAI Chat Completions at `https://api.z.ai/api/paas/v4` / `https://api.z.ai/api/coding/paas/v4`, where Z.AI's implicit prompt cache is reported and billed; the Anthropic-compatible root never honoured cache breakpoints. Saved routes naming `https://api.z.ai/api/anthropic` are migrated with a warning; `api_type: "anthropic"` keeps the old protocol (without a `base_url` it targets the Anthropic-compatible root).
+- Capped tool outputs and tier-1 pruning placeholders now name what was cut (target, shown/original size) and how to get it back (`recall` by tool_call_id, or a narrower re-run).
+- New opt-in UI protocol feature `context.state.v1` / `context/state_reported`: a live context-fullness gauge during long turns, delivered only to connections that negotiated it.
 - Per-tenant frps tunnel authentication via `metadatas.token`. Each tenant now has its own `tunnel_token` (UUID generated at registration) validated by the octos frps server plugin; the previous shared FRPS auth token is no longer needed and `auth.token` is set to `""` on both frps and frpc. `scripts/install.sh` and `scripts/install.ps1` recover the per-tenant token from an existing `/etc/frp/frpc.toml` on rerun and have updated prompt wording to reflect the per-tenant model.
 - README "Quick Start" restructured into a three-step cloud-deployment walkthrough (VPS bootstrap → portal registration → tenant install) with explicit uninstall instructions for both cloud and tenant machines. The developer build flow moved under a new "Build from source" heading.
 

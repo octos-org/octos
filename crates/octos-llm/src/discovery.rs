@@ -181,13 +181,25 @@ pub fn resolve_model_discovery(
     model: Option<&str>,
     base_url: Option<&str>,
 ) -> DiscoveryRoute {
-    if api_type == Some("anthropic") {
-        return ANTHROPIC_MODELS.into();
-    }
     let entry = family
         .map(str::trim)
         .filter(|f| !f.is_empty())
         .and_then(crate::registry::lookup);
+    let saved_base_url = base_url.map(str::trim).filter(|root| !root.is_empty());
+    if api_type == Some("anthropic") {
+        // No base_url: probe the root the runtime's anthropic arm targets,
+        // which for z.ai is not the family's (OpenAI) default root.
+        let base_url = match (saved_base_url, entry) {
+            (None, Some(entry)) => crate::registry::anthropic_api_type_default_root(entry)
+                .filter(|root| Some(*root) != entry.default_base_url)
+                .map(str::to_string),
+            _ => None,
+        };
+        return DiscoveryRoute {
+            discovery: ANTHROPIC_MODELS,
+            base_url,
+        };
+    }
     // api_type "responses" bypasses the registry at runtime
     // (OpenAIResponsesProvider at {base}), so the listing to probe is the
     // OpenAI-compatible `GET {base}/models` — never the family's declared
@@ -221,7 +233,13 @@ pub fn resolve_model_discovery(
                     base_url,
                 };
             }
-            entry.model_discovery.into()
+            // A saved root the family's factory migrates (z.ai's legacy
+            // Anthropic root) is probed where inference actually goes.
+            DiscoveryRoute {
+                discovery: entry.model_discovery,
+                base_url: base_url
+                    .and_then(|root| crate::registry::migrated_lane_base_url(entry, root)),
+            }
         }
         // Unknown family / `custom` without an anthropic override: the runtime
         // builds an OpenAI-compatible provider, so discovery matches that.
@@ -233,7 +251,7 @@ pub fn resolve_model_discovery(
 ///
 /// The root is the API root exactly as providers' own default base URLs spell
 /// it (`https://api.openai.com/v1`, `https://open.bigmodel.cn/api/paas/v4`,
-/// `https://api.z.ai/api/anthropic`); the strategy appends only its declared
+/// `https://api.z.ai/api/paas/v4`); the strategy appends only its declared
 /// path. No version segments are stripped or re-added heuristically, so a
 /// `/v4` root can never turn into `/v4/v1/models`.
 pub fn models_url(root: &str, protocol: DiscoveryProtocol) -> String {
@@ -420,6 +438,39 @@ mod tests {
         assert_eq!(
             resolve_model_discovery(Some("zai-coding"), None, None, None).discovery,
             OPENAI_MODELS
+        );
+    }
+
+    #[test]
+    fn should_probe_legacy_zai_routes_where_the_runtime_sends_them() {
+        const LEGACY: &str = "https://api.z.ai/api/anthropic";
+        // A saved pre-migration base_url on the lane is probed at the
+        // OpenAI-compatible root the provider factory migrates it to.
+        for (family, root) in [
+            ("zai", crate::registry::zai::DEFAULT_BASE_URL),
+            ("zai-coding", crate::registry::zai_coding::DEFAULT_BASE_URL),
+        ] {
+            let route = resolve_model_discovery(Some(family), None, None, Some(LEGACY));
+            assert_eq!(route.discovery, OPENAI_MODELS, "{family}");
+            assert_eq!(route.base_url.as_deref(), Some(root), "{family}");
+            // Any other override is kept verbatim (no rewrite).
+            let custom =
+                resolve_model_discovery(Some(family), None, None, Some("https://proxy.example/v4"));
+            assert_eq!(custom.base_url, None, "{family}");
+            // An explicit anthropic route without a base_url is probed at the
+            // Anthropic-compatible root, not the lane's OpenAI default.
+            let anthropic = resolve_model_discovery(Some(family), Some("anthropic"), None, None);
+            assert_eq!(anthropic.discovery, ANTHROPIC_MODELS, "{family}");
+            assert_eq!(anthropic.base_url.as_deref(), Some(LEGACY), "{family}");
+            // ... and at its own base_url when it carries one.
+            let explicit =
+                resolve_model_discovery(Some(family), Some("anthropic"), None, Some(LEGACY));
+            assert_eq!(explicit.base_url, None, "{family}");
+        }
+        // Other families' anthropic override keeps the family default root.
+        assert_eq!(
+            resolve_model_discovery(Some("anthropic"), Some("anthropic"), None, None).base_url,
+            None
         );
     }
 

@@ -84,8 +84,8 @@ mod openrouter;
 pub(crate) mod r9s;
 mod vertex;
 mod vllm;
-mod zai;
-mod zai_coding;
+pub(crate) mod zai;
+pub(crate) mod zai_coding;
 mod zhipu;
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -227,6 +227,44 @@ pub fn lookup(name: &str) -> Option<&'static ProviderEntry> {
         .find(|e| e.name == lower || e.aliases.iter().any(|a| a.eq_ignore_ascii_case(&lower)))
 }
 
+/// Root an explicit `api_type: "anthropic"` route on `entry`'s family targets
+/// when it carries no `base_url`.
+///
+/// For most families this is the family's own default root. The z.ai lanes
+/// moved their default root to Z.AI's OpenAI-compatible API, but the
+/// Anthropic Messages protocol is only served at the Anthropic-compatible
+/// root, so a saved `{"provider": "zai", "api_type": "anthropic"}` route
+/// without a `base_url` (documented in the user guide) keeps working there
+/// instead of posting `/v1/messages` to the OpenAI root.
+pub fn anthropic_api_type_default_root(entry: &ProviderEntry) -> Option<&'static str> {
+    match entry.name {
+        "zai" | "zai-coding" => Some(zai::LEGACY_ANTHROPIC_ROOT),
+        _ => entry.default_base_url,
+    }
+}
+
+/// The root a saved `base_url` is actually served at on `entry`'s own
+/// registry lane (no explicit `api_type` override), or `None` when the
+/// factory uses it verbatim. The z.ai lanes migrate a saved
+/// Anthropic-compatible root to their OpenAI-compatible one; surfaces that
+/// probe the route outside the factory (model discovery) must follow the
+/// same mapping or they probe an endpoint inference no longer uses.
+pub fn migrated_lane_base_url(entry: &ProviderEntry, base_url: &str) -> Option<String> {
+    let replacement = match entry.name {
+        "zai" => zai::DEFAULT_BASE_URL,
+        "zai-coding" => zai_coding::DEFAULT_BASE_URL,
+        _ => return None,
+    };
+    if !zai::is_legacy_anthropic_root(base_url) {
+        return None;
+    }
+    Some(zai::migrate_legacy_anthropic_root(
+        base_url,
+        replacement,
+        entry.name,
+    ))
+}
+
 /// All registered provider entries.
 pub fn all_entries() -> &'static [ProviderEntry] {
     ALL
@@ -275,6 +313,45 @@ pub fn detect_provider(model: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_keep_anthropic_api_type_routes_on_the_anthropic_root_for_zai_lanes() {
+        // A saved `{"provider": "zai", "api_type": "anthropic"}` route with no
+        // base_url (documented in the user guide) must not post Anthropic
+        // Messages to the lanes' new OpenAI-compatible default root.
+        for name in ["zai", "zai-coding"] {
+            let entry = lookup(name).unwrap();
+            assert_eq!(
+                anthropic_api_type_default_root(entry),
+                Some("https://api.z.ai/api/anthropic"),
+                "{name}"
+            );
+            assert_ne!(
+                entry.default_base_url,
+                anthropic_api_type_default_root(entry)
+            );
+        }
+        // Every other family keeps its own default root.
+        let anthropic = lookup("anthropic").unwrap();
+        assert_eq!(
+            anthropic_api_type_default_root(anthropic),
+            anthropic.default_base_url
+        );
+        // The lane migration only rewrites the legacy root.
+        let zai = lookup("zai").unwrap();
+        assert_eq!(
+            migrated_lane_base_url(zai, "https://api.z.ai/api/anthropic/").as_deref(),
+            Some(zai::DEFAULT_BASE_URL)
+        );
+        assert_eq!(
+            migrated_lane_base_url(zai, "https://proxy.example/v4"),
+            None
+        );
+        assert_eq!(
+            migrated_lane_base_url(anthropic, "https://api.z.ai/api/anthropic"),
+            None
+        );
+    }
 
     /// The catalog is the only place a default model is written down, so every
     /// family that claims one must actually find it there. A family silently
