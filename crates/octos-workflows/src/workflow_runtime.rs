@@ -245,4 +245,162 @@ mod tests {
             assert_eq!(workflow.kind, kind);
         }
     }
+
+    #[test]
+    fn detects_english_deep_research() {
+        assert_eq!(
+            WorkflowKind::detect_forced_background(
+                "Please run a deep research on the agentic OS landscape"
+            ),
+            Some(WorkflowKind::DeepResearch)
+        );
+    }
+
+    #[test]
+    fn detects_deep_research_across_zh_synonyms() {
+        for prompt in [
+            "深度研究一下这个课题",
+            "深入研究这个课题",
+            "深度调查这个事件",
+            "深度搜索相关资料",
+            "深度调研市场情况",
+        ] {
+            assert_eq!(
+                WorkflowKind::detect_forced_background(prompt),
+                Some(WorkflowKind::DeepResearch),
+                "prompt: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_research_podcast_in_english_and_zh_synonym() {
+        assert_eq!(
+            WorkflowKind::detect_forced_background("make a podcast about today's AI news"),
+            Some(WorkflowKind::ResearchPodcast)
+        );
+        assert_eq!(
+            WorkflowKind::detect_forced_background("把今日热点整理成语音播客"),
+            Some(WorkflowKind::ResearchPodcast)
+        );
+    }
+
+    #[test]
+    fn podcast_request_without_research_signal_stays_foreground() {
+        assert_eq!(
+            WorkflowKind::detect_forced_background("make a podcast about our chat just now"),
+            None
+        );
+    }
+
+    #[test]
+    fn research_signal_without_depth_or_podcast_stays_foreground() {
+        assert_eq!(
+            WorkflowKind::detect_forced_background("research the latest AI news for me"),
+            None
+        );
+    }
+
+    #[test]
+    fn podcast_signal_takes_precedence_over_deep_research() {
+        assert_eq!(
+            WorkflowKind::detect_forced_background(
+                "do a deep research on the news and then record a podcast"
+            ),
+            Some(WorkflowKind::ResearchPodcast)
+        );
+    }
+
+    #[test]
+    fn detection_is_case_insensitive_for_ascii_signals() {
+        assert_eq!(
+            WorkflowKind::detect_forced_background("DEEP RESEARCH the space race"),
+            Some(WorkflowKind::DeepResearch)
+        );
+        assert_eq!(
+            WorkflowKind::detect_forced_background("RESEARCH the News as a PODCAST"),
+            Some(WorkflowKind::ResearchPodcast)
+        );
+    }
+
+    #[test]
+    fn english_foreground_overrides_each_suppress_detection() {
+        for phrase in [
+            "wait synchronously",
+            "wait for completion",
+            "don't use background",
+            "do not use background",
+        ] {
+            let prompt = format!("deep research the topic and {phrase} right here");
+            assert_eq!(
+                WorkflowKind::detect_forced_background(&prompt),
+                None,
+                "override phrase: {phrase}"
+            );
+        }
+    }
+
+    #[test]
+    fn chinese_foreground_overrides_each_suppress_detection() {
+        for phrase in ["同步", "等待完成", "不要后台", "别后台"] {
+            let prompt = format!("深度研究这个课题，但请{phrase}，直接输出结果");
+            assert_eq!(
+                WorkflowKind::detect_forced_background(&prompt),
+                None,
+                "override phrase: {phrase}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_phase_replaces_only_current_phase() {
+        let workflow = WorkflowKind::Site.build();
+        let next = workflow.with_phase(WorkflowPhase::new("build"));
+        assert_eq!(next.current_phase.as_str(), "build");
+        assert_eq!(workflow.current_phase.as_str(), "scaffold");
+        assert_eq!(next.kind, workflow.kind);
+        assert_eq!(next.label, workflow.label);
+        assert_eq!(next.allowed_tools, workflow.allowed_tools);
+    }
+
+    #[test]
+    fn default_limits_serialize_to_empty_object() {
+        let value = serde_json::to_value(WorkflowLimits::default()).unwrap();
+        assert_eq!(value, serde_json::json!({}));
+    }
+
+    #[test]
+    fn populated_limits_skip_unset_fields() {
+        let limits = WorkflowLimits {
+            max_search_passes: Some(6),
+            max_pipeline_runs: Some(1),
+            ..WorkflowLimits::default()
+        };
+        let value = serde_json::to_value(&limits).unwrap();
+        let map = value.as_object().unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get("max_search_passes").and_then(|v| v.as_u64()),
+            Some(6)
+        );
+        assert_eq!(
+            map.get("max_pipeline_runs").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn workflow_kind_serde_roundtrips_all_variants() {
+        for (kind, name) in [
+            (WorkflowKind::DeepResearch, "deep_research"),
+            (WorkflowKind::ResearchPodcast, "research_podcast"),
+            (WorkflowKind::Slides, "slides"),
+            (WorkflowKind::Site, "site"),
+        ] {
+            let value = serde_json::to_value(kind).unwrap();
+            assert_eq!(value.as_str(), Some(name), "serialize {name}");
+            let parsed: WorkflowKind = serde_json::from_value(value).unwrap();
+            assert_eq!(parsed, kind, "deserialize {name}");
+        }
+    }
 }
