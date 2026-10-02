@@ -563,6 +563,23 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   staged member and is echoed in each result entry. The limit persists by peer
   slug across session reconnects. Usage is charged after each turn, so one
   turn can overshoot; later turns end with `peer_token_budget_exceeded`.)
+- `peer/prepare` native model override (`peer.model_override.v1`, advertised
+  whenever `peer/prepare` is available): optional
+  `model_override: {model_id: string}` selects a configured primary, fallback
+  or sub-provider model for every newly staged fleet member. The ID must
+  identify exactly one configured route; unknown, ambiguous, malformed or
+  locally unbuildable selections are refused **before staging**. Clients
+  must check the feature before sending the field: older servers can ignore
+  unknown fields. The selection is persisted by peer slug before success,
+  survives session reconnects and is used at session open and from the first
+  turn onward without editing the profile default, master or other peers.
+  Result `model` is `{lane: "override", provider, model}`. A later invalid
+  record or unavailable selection fails explicitly (`peer_model_unavailable`
+  at turn execution), never silently falling back to the primary model.
+  This field is for new native peers; combining it with `model`, `resume`
+  or `memory_namespace` is invalid. Existing `peer/model/set` authorization
+  still applies and an accepted lane change clears this initial override.
+  Omitting the field preserves existing lane/default behavior and permissions.
 - `peer/prepare` host-owned app peers (accepted `UPCR-2026-034`, additive
   fields; a server that lists `peer/context/open` honors them): optional
   `model` names a configured `sub_provider` lane exactly like
