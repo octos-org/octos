@@ -23177,6 +23177,10 @@ async fn open_session_result(
     // materializes (profile-less open), which makes the snapshot fail open
     // (publish without compacting) rather than guess a window.
     let mut open_context_provider: Option<Arc<dyn octos_llm::LlmProvider>> = None;
+    // UPCR-2026-038: the declared `client_commands` the session runtime
+    // accepted. Stays `None` when the open declared none or no runtime
+    // materializes to apply them.
+    let mut accepted_client_commands: Option<Vec<String>> = None;
     if let Some(profile_runtime) =
         resolve_session_profile_runtime(state, active_profile_id.as_deref())
     {
@@ -23213,10 +23217,11 @@ async fn open_session_result(
                 register_session_ledger_scope(state, ledger, &runtime);
                 // Every open re-declares: a client that omits the field must
                 // not inherit commands another client declared earlier.
-                runtime.apply_client_commands(
+                let accepted = runtime.apply_client_commands(
                     connection_id.0,
                     params.client_commands.as_deref().unwrap_or_default(),
                 );
+                accepted_client_commands = params.client_commands.is_some().then_some(accepted);
                 open_context_provider = Some(
                     peer_lane_provider_for(&params.session_id, &runtime)
                         .unwrap_or_else(|| runtime.profile.llm.clone()),
@@ -23434,6 +23439,7 @@ async fn open_session_result(
             panes,
             capabilities,
             reasoning_effort,
+            accepted_client_commands,
         }),
         connection_id,
     );

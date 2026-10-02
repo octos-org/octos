@@ -8336,6 +8336,63 @@ async fn session_open_client_commands_reach_the_session_agent_prompt() {
 }
 
 #[tokio::test]
+async fn session_open_result_echoes_the_accepted_client_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _runtime) = state_with_profile(dir.path(), "coding").await;
+    let session_id = SessionKey("local:tui#coding".into());
+    let ledger = UiProtocolLedger::new(16);
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let open = |client_commands: Option<Vec<String>>| {
+        open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            ConnectionId::next(),
+            Some("coding"),
+            None,
+            ConnectionUiFeatures::stdio_defaults(),
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                topic: None,
+                profile_id: None,
+                cwd: None,
+                sandbox: None,
+                after: None,
+                client_commands,
+            },
+        )
+    };
+
+    let declared = open(Some(vec![
+        "/model".into(),
+        "/router".into(),
+        "/bad name".into(),
+        "add-model".into(),
+    ]))
+    .await
+    .expect("session/open succeeds");
+    assert_eq!(
+        declared.result.opened.accepted_client_commands,
+        Some(vec!["/model".to_string(), "/add-model".to_string()]),
+        "the result must name the commands that survived the server-side filter"
+    );
+
+    let all_dropped = open(Some(vec!["/router".into()]))
+        .await
+        .expect("session/open succeeds");
+    assert_eq!(
+        all_dropped.result.opened.accepted_client_commands,
+        Some(Vec::new()),
+        "a fully dropped declaration must stay distinguishable from no declaration"
+    );
+
+    let undeclared = open(None).await.expect("session/open succeeds");
+    assert_eq!(undeclared.result.opened.accepted_client_commands, None);
+}
+
+#[tokio::test]
 async fn session_reopen_without_client_commands_clears_the_previous_declaration() {
     let dir = tempfile::tempdir().unwrap();
     let (state, runtime) = state_with_profile(dir.path(), "coding").await;
@@ -11757,6 +11814,7 @@ fn ledger_event_cursor_covers_every_cursor_bearing_variant() {
             panes: None,
             capabilities: octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
             reasoning_effort: None,
+            accepted_client_commands: None,
         }));
     assert_eq!(ledger_event_cursor(&opened), Some(cursor.clone()));
 
@@ -17117,6 +17175,7 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
             reasoning_effort: None,
+            accepted_client_commands: None,
         })
     };
 
@@ -19361,6 +19420,7 @@ fn semantic_cache_fields_are_absent_from_unnegotiated_session_open_payload() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     }));
     let lifecycle_only = ConnectionUiFeatures::from_requested_feature_tokens(
         [UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1],
@@ -21463,6 +21523,7 @@ fn session_opened_notification_capabilities_are_filtered_for_ingress() {
                 &[],
             ),
             reasoning_effort: None,
+            accepted_client_commands: None,
         }));
 
     if let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) = &mut event {
@@ -31099,6 +31160,7 @@ async fn live_forwarder_emits_event_appended_between_replay_and_forwarder_instal
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
             reasoning_effort: None,
+            accepted_client_commands: None,
         }),
         ws.connection_id(),
     );

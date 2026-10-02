@@ -60,16 +60,15 @@ serve intercepts them too, but a client can handle them locally.
 
 ### Result
 
-Dropped names are not reported. `SessionOpened` carries no field that echoes
-the accepted set, and `session/open` never fails because of a rejected name.
-Adding an echo is tracked in #2670 and would be a separate change request.
+`session/open` never fails because of a rejected name. This request adds no
+result field; the accepted set is echoed in `SessionOpened` by `UPCR-2026-038`.
 
 ## Risk
 
 - Declared names reach the system prompt. The character set and the length
   and count caps bound what a client can inject there.
-- A client that relies on a dropped name sees no error. Until #2670 lands,
-  clients should declare only names within the rules above.
+- A client that relies on a dropped name sees no error. It can detect the
+  drop from `accepted_client_commands` (`UPCR-2026-038`).
 
 ## Tests
 

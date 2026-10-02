@@ -2076,8 +2076,8 @@ pub struct SessionOpenParams {
     /// Names are filtered server-side (leading `/` optional): only ASCII
     /// alphanumerics, `-` and `_`, at most 32 characters, deduplicated, first
     /// 64 valid names kept. Commands that act on gateway server state
-    /// (`/adaptive`, `/router`, `/queue`, `/reset`) are dropped. The filtering
-    /// is silent: `SessionOpened` does not report which names were accepted.
+    /// (`/adaptive`, `/router`, `/queue`, `/reset`) are dropped. The names
+    /// that survive come back in `SessionOpened::accepted_client_commands`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_commands: Option<Vec<String>>,
 }
@@ -4682,6 +4682,16 @@ pub struct SessionOpened {
     /// field, and older serialized payloads decode it as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffortLevel>,
+    /// The `SessionOpenParams::client_commands` names the server accepted for
+    /// this open (UPCR-2026-038), each as `/name`, in declaration order. A
+    /// client learns what was dropped by comparing against what it declared.
+    ///
+    /// `Some(vec![])` means every declared name was dropped. `None` (omitted
+    /// on the wire) means this open declared none, which leaves the session
+    /// with no client commands. Additive + backward-compatible: older clients
+    /// ignore the field, and older serialized payloads decode it as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_client_commands: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

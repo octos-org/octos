@@ -197,6 +197,7 @@ fn should_surface_persisted_reasoning_effort_on_session_open() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: Some(ReasoningEffortLevel::High),
+        accepted_client_commands: None,
     };
     let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
     assert_eq!(wire["reasoning_effort"], json!("high"));
@@ -224,6 +225,52 @@ fn should_surface_persisted_reasoning_effort_on_session_open() {
     let parsed: SessionOpened =
         serde_json::from_value(legacy).expect("legacy payload without field decodes");
     assert_eq!(parsed.reasoning_effort, None);
+}
+
+#[test]
+fn session_opened_echoes_accepted_client_commands() {
+    let opened = SessionOpened {
+        session_id: SessionKey("local:demo".into()),
+        active_profile_id: None,
+        workspace_root: None,
+        context: None,
+        context_state: None,
+        cursor: None,
+        panes: None,
+        capabilities: UiProtocolCapabilities::first_server_slice(),
+        reasoning_effort: None,
+        accepted_client_commands: Some(vec!["/model".into()]),
+    };
+    let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
+    assert_eq!(wire["accepted_client_commands"], json!(["/model"]));
+    let back: SessionOpened = serde_json::from_value(wire).expect("round-trip");
+    assert_eq!(back.accepted_client_commands, Some(vec!["/model".into()]));
+
+    // A declaration the server dropped entirely stays distinguishable from
+    // an open that declared nothing.
+    let all_dropped = SessionOpened {
+        accepted_client_commands: Some(Vec::new()),
+        ..opened.clone()
+    };
+    let wire = serde_json::to_value(&all_dropped).expect("serialize empty");
+    assert_eq!(wire["accepted_client_commands"], json!([]));
+
+    let undeclared = SessionOpened {
+        accepted_client_commands: None,
+        ..opened
+    };
+    let wire = serde_json::to_value(&undeclared).expect("serialize None");
+    assert!(wire.get("accepted_client_commands").is_none());
+    let legacy = json!({
+        "session_id": "local:demo",
+        "capabilities": serde_json::to_value(
+            UiProtocolCapabilities::first_server_slice()
+        )
+        .unwrap()
+    });
+    let parsed: SessionOpened =
+        serde_json::from_value(legacy).expect("legacy payload without field decodes");
+    assert_eq!(parsed.accepted_client_commands, None);
 }
 
 #[test]
@@ -513,6 +560,7 @@ fn session_opened_pane_snapshot_round_trips() {
         }),
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
 
     let wire = serde_json::to_value(&opened).expect("serialize session/open panes");
@@ -547,6 +595,7 @@ fn session_open_result_includes_capabilities_field() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
     let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
     let capabilities = wire
@@ -2331,6 +2380,7 @@ fn typed_rpc_results_map_from_methods_and_round_trip() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
 
     let session_result = UiRpcResult::SessionOpen(SessionOpenResult::new(opened));
@@ -3313,6 +3363,7 @@ fn resumable_notifications_carry_event_ledger_cursors() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     });
 
     let opened_wire = opened

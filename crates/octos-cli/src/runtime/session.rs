@@ -22,7 +22,8 @@ use octos_core::{
 
 use super::ProfileRuntime;
 use crate::commands::gateway::prompt::{
-    SLASH_COMMANDS_SEGMENT_NAME, render_client_commands, strip_slash_commands,
+    SLASH_COMMANDS_SEGMENT_NAME, accepted_client_commands, render_client_commands,
+    strip_slash_commands,
 };
 
 /// All per-session state derived from a parent [`ProfileRuntime`].
@@ -283,16 +284,20 @@ impl SessionRuntime {
 
     /// Tell the agent which slash commands the client on connection `owner`
     /// declared on `session/open` (octoscode#664); an empty list clears them.
-    /// Per-turn agents inherit it via the snapshot.
-    pub fn apply_client_commands(&self, owner: u64, commands: &[String]) {
+    /// Per-turn agents inherit it via the snapshot. Returns the names that
+    /// were accepted, for the `session/open` result to echo.
+    pub fn apply_client_commands(&self, owner: u64, commands: &[String]) -> Vec<String> {
         let mut current = self
             .client_commands_owner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let rendered = render_client_commands(commands);
-        *current = (!rendered.is_empty()).then_some(owner);
-        self.agent
-            .set_prompt_segment(SLASH_COMMANDS_SEGMENT_NAME, rendered);
+        let accepted = accepted_client_commands(commands);
+        *current = (!accepted.is_empty()).then_some(owner);
+        self.agent.set_prompt_segment(
+            SLASH_COMMANDS_SEGMENT_NAME,
+            render_client_commands(&accepted),
+        );
+        accepted
     }
 
     /// Clear the declared commands when connection `owner` closes, unless a
@@ -1706,7 +1711,9 @@ tools = ["read_file"]
         assert!(!before.contains("## Slash Commands"));
         assert!(before.contains("be kind"));
 
-        rt.apply_client_commands(1, &["/model".into(), "/add-model".into()]);
+        let accepted =
+            rt.apply_client_commands(1, &["/model".into(), "/router".into(), "/add-model".into()]);
+        assert_eq!(accepted, ["/model", "/add-model"]);
         let after = rt.agent.system_prompt_snapshot();
         assert!(!after.contains("`/router`"));
         assert!(after.contains("`/model`"));

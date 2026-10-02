@@ -72,11 +72,11 @@ pub fn strip_slash_commands(prompt: &str) -> String {
     format!("{}{}", &prompt[..start], &prompt[end..])
 }
 
-/// Render the slash commands a client declared on `session/open`. Names are
-/// validated (alphanumeric, `-`, `_`), deduplicated and capped, since they
-/// land in the system prompt; gateway-only commands are dropped. Nothing
-/// valid renders as an empty section.
-pub fn render_client_commands(commands: &[String]) -> String {
+/// The slash commands the server accepts out of those a client declared on
+/// `session/open`, each as `/name`. Names are validated (alphanumeric, `-`,
+/// `_`), deduplicated and capped, since they land in the system prompt;
+/// gateway-only commands are dropped.
+pub fn accepted_client_commands(commands: &[String]) -> Vec<String> {
     let mut names: Vec<&str> = Vec::new();
     for command in commands {
         let name = command.trim().trim_start_matches('/');
@@ -95,12 +95,19 @@ pub fn render_client_commands(commands: &[String]) -> String {
             break;
         }
     }
+    names.iter().map(|name| format!("/{name}")).collect()
+}
+
+/// Render the slash commands a client declared on `session/open`, filtered
+/// by [`accepted_client_commands`]. Nothing valid renders as an empty section.
+pub fn render_client_commands(commands: &[String]) -> String {
+    let names = accepted_client_commands(commands);
     if names.is_empty() {
         return String::new();
     }
     let list = names
         .iter()
-        .map(|name| format!("`/{name}`"))
+        .map(|name| format!("`{name}`"))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -253,8 +260,8 @@ mod tests {
     //! breaking the test — but the load-bearing phrases must stay.
 
     use super::{
-        CLIENT_HANDLED_COMMANDS, SERVER_STATE_COMMANDS, render_client_commands,
-        strip_slash_commands,
+        CLIENT_HANDLED_COMMANDS, SERVER_STATE_COMMANDS, accepted_client_commands,
+        render_client_commands, strip_slash_commands,
     };
 
     const PROMPT: &str = include_str!("../../prompts/gateway_default.txt");
@@ -783,6 +790,24 @@ mod tests {
         assert_eq!(section.matches("`/c").count(), 64);
         assert!(section.contains("`/c63`"));
         assert!(!section.contains("`/c64`"));
+    }
+
+    #[test]
+    fn accepted_client_commands_lists_the_rendered_names_in_declaration_order() {
+        let declared: Vec<String> = vec![
+            "add-model".into(),
+            "/router".into(),
+            "/model".into(),
+            "/model".into(),
+            "/bad name".into(),
+        ];
+        let accepted = accepted_client_commands(&declared);
+        assert_eq!(accepted, ["/add-model", "/model"]);
+        let section = render_client_commands(&declared);
+        for name in &accepted {
+            assert!(section.contains(&format!("`{name}`")), "{section}");
+        }
+        assert!(accepted_client_commands(&["/router".into()]).is_empty());
     }
 
     #[test]

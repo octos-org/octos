@@ -351,6 +351,11 @@ Current M9 sandbox-parity decision:
   [UPCR-2026-037](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_037_CLIENT_COMMANDS.md).
   The param is ungated and the request records the contract as shipped; it
   changes no wire shape.
+- The additive `accepted_client_commands` field on `SessionOpened`, which
+  echoes the `client_commands` names the server accepted, is governed by
+  accepted
+  [UPCR-2026-038](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_038_ACCEPTED_CLIENT_COMMANDS.md).
+  The field is ungated.
 
 ## 5. Identity Model
 
@@ -930,7 +935,8 @@ Minimum params:
   connections the last open wins. Names are filtered server-side: at most 32
   characters of ASCII alphanumerics, `-` and `_`, deduplicated, first 64 kept,
   and the gateway server-state commands (`/adaptive`, `/router`, `/queue`,
-  `/reset`) dropped. Dropped names are not reported in the result.
+  `/reset`) dropped. The names that survive are echoed in the result's
+  `accepted_client_commands`.
 
 Expected result:
 
@@ -984,6 +990,15 @@ Optional result fields from the M16 `context.lifecycle.v1` contract:
   `UiContextState` shape documented under `session/status/read` and is sourced
   from the same canonical profile/session store used by `turn/start` and
   `session/hydrate`.
+
+Optional result fields from accepted `UPCR-2026-038`:
+
+- `accepted_client_commands`
+  The names the server accepted from this open's `client_commands`, each as
+  `/name`, in declaration order. Present whenever the request carried
+  `client_commands` and the server applied it, including as `[]` when every
+  name was dropped. Absent when the request omitted `client_commands`.
+  Ungated.
 
 ### `session/hydrate`
 
@@ -2267,6 +2282,10 @@ from accepted `UPCR-2026-007` (see § 7).
 When `context.lifecycle.v1` is available for the connection, the notification
 payload may also include `context` and `context_state` with the same semantics
 as the `session/open` result.
+
+The payload carries `accepted_client_commands` (accepted `UPCR-2026-038`) with
+the value of the open that produced it. A replayed notification reports that
+earlier open's declaration, not the session's current one.
 
 Optional pane fields from accepted `UPCR-2026-002`:
 
