@@ -2953,6 +2953,75 @@ async fn should_report_persisted_but_not_live_when_runtime_rebuild_fails() {
     assert_eq!(recovered.primary_model_id, "gpt-4o-mini");
 }
 
+/// A configuration commit while an in-flight turn still holds the profile's
+/// single-writer episode store (its agent keeps the store after every
+/// ProfileRuntime handle is dropped) must hand the replacement the open
+/// stores instead of failing to reopen `episodes.redb`.
+#[tokio::test]
+async fn should_reload_runtime_while_in_flight_turn_holds_episode_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let mut profile = profile_for_runtime_message("dev");
+    profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+        primary: Some(crate::profiles::LlmModelSelectionConfig {
+            family_id: Some("openai".to_string()),
+            model_id: Some("gpt-4o-mini".to_string()),
+            route: Some(crate::profiles::LlmRouteConfig {
+                api_key_env: Some("OCTOS_TEST_LLM_RUNTIME_INVALIDATION_KEY".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        fallbacks: Vec::new(),
+    });
+    profile.config.env_vars.insert(
+        "OCTOS_TEST_LLM_RUNTIME_INVALIDATION_KEY".to_string(),
+        "k".to_string(),
+    );
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+
+    let old = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("initial bootstrap")
+        .expect("runtime");
+    // What a live in-flight turn keeps: its agent's episode store and memory
+    // store, not the ProfileRuntime.
+    let held_by_agent = old.memory.clone();
+    let held_memory_store = old.memory_store.clone();
+    let old_cron = old.cron_service.clone().expect("cron service");
+    drop(old);
+
+    let result = raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-swap", "dev", "openai", "gpt-4o", None, true),
+        None,
+    )
+    .await
+    .expect("persistence must succeed");
+    assert_eq!(
+        result["runtime_disposition"], "reloaded",
+        "the replacement must take over the held stores: {result}"
+    );
+
+    let new = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("cached replacement")
+        .expect("runtime");
+    assert_eq!(new.primary_model_id, "gpt-4o");
+    assert!(Arc::ptr_eq(&new.memory, &held_by_agent));
+    assert!(Arc::ptr_eq(&new.memory_store, &held_memory_store));
+    assert!(Arc::ptr_eq(new.cron_service.as_ref().unwrap(), &old_cron));
+    assert!(
+        old_cron.is_running(),
+        "the shared cron service keeps running"
+    );
+}
+
 /// A same-address upsert (same family/model/route_id — including a
 /// missing route_id, which normalizes to the synthetic "official") is an
 /// endpoint edit: it replaces the primary outright instead of demoting
@@ -21679,6 +21748,17 @@ fn runtime_unavailable_errors_are_typed_for_protocol_clients() {
         error.data.as_ref().and_then(|data| data.get("kind")),
         Some(&json!("runtime_unavailable"))
     );
+}
+
+#[test]
+fn profile_runtime_switching_error_is_not_reported_as_a_second_process() {
+    let error = profile_runtime_switching_error("alan");
+    assert_eq!(
+        error.data.as_ref().and_then(|d| d.get("kind")),
+        Some(&json!("profile_runtime_switching"))
+    );
+    let message = error.data.as_ref().and_then(|d| d.get("message")).unwrap();
+    assert!(!message.as_str().unwrap().contains("another octos process"));
 }
 
 #[test]
