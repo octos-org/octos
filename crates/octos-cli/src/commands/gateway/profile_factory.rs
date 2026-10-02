@@ -1202,11 +1202,13 @@ mod tests {
 
     #[test]
     fn resolved_profile_llm_env_uses_runtime_config_and_replaces_stale_values() {
-        let mut config = Config::default();
-        config.provider = Some("google".into());
-        config.model = Some("resolved-model".into());
-        config.base_url = Some("https://example.invalid/v1beta".into());
-        config.api_type = Some("gemini".into());
+        let mut config = Config {
+            provider: Some("google".into()),
+            model: Some("resolved-model".into()),
+            base_url: Some("https://example.invalid/v1beta".into()),
+            api_type: Some("gemini".into()),
+            ..Default::default()
+        };
         let mut env = vec![
             ("OCTOS_PROFILE_LLM_MODEL".into(), "stale".into()),
             ("OCTOS_PROFILE_LLM_MODEL".into(), "duplicate".into()),
