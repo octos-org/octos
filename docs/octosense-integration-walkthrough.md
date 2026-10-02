@@ -245,7 +245,7 @@ let serving = runtime.spawn(async move {
 Spawn the serving future onto that runtime: `block_on` would poll it on the
 calling thread, whose stack may be smaller. Connection cleanup settles owned
 work and releases the writer; peer persistence has a separate lifetime.
-Follow the [OctoSense walkthrough](https://github.com/OctoSense-org/OctoSense/blob/docs/junior-architecture-walkthrough/docs/architecture-walkthrough.md)
+Follow the [OctoSense walkthrough](https://github.com/OctoSense-org/OctoSense/blob/c3011a2057ec59738b79466f48ff2ad8d0e60130/docs/architecture-walkthrough.md)
 for desktop, Home and ROM commands and the app-to-kernel bridge.
 
 ## Tests
