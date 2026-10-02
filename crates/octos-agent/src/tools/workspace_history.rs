@@ -525,6 +525,12 @@ mod tests {
             .collect()
     }
 
+    // Unix-gated: the PoC uses `touch` (a POSIX tool) for its marker files.
+    // On Windows this test would silently do nothing once the generated
+    // config parses (#2662/#2668) — a hollow false-green for the security
+    // assertion. A Windows-equivalent marker (e.g. `cmd /c type nul >`) is
+    // tracked as a follow-up in #2662 (MED-2).
+    #[cfg(unix)]
     #[tokio::test]
     async fn should_not_run_repo_config_programs_when_reading_history() {
         let temp = setup_test_repo();

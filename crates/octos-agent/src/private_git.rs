@@ -274,7 +274,15 @@ impl PrivateGitDir {
     /// invalid escapes ("bad config line N"). Forward slashes are
     /// accepted by git on every platform, including Git for Windows.
     fn config_hooks_value(path: &std::path::Path) -> String {
-        path.display().to_string().replace('\\', "/")
+        // The kernel controls this path (a tempdir under its own data
+        // dir), so quotes/newlines are not agent-reachable; reject them
+        // anyway rather than emit a config line they could break.
+        let rendered = path.display().to_string().replace('\\', "/");
+        assert!(
+            !rendered.contains('"') && !rendered.contains('\n'),
+            "hooks path contains characters that cannot be embedded in a quoted config value: {rendered}"
+        );
+        rendered
     }
 
     fn write_private_layout(&self) -> Result<()> {
