@@ -4257,6 +4257,9 @@ fn golden_session_hydrate_result_serde() {
             source: Some("user".into()),
             media: vec![],
             reasoning_content: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: vec![],
         }]),
         threads: Some(vec![ThreadGraphEntry {
             thread_id: "thread-1".into(),
@@ -4313,6 +4316,76 @@ fn golden_session_hydrate_result_serde() {
     // Bug C: a non-negotiated client never sees the new field.
     assert!(!object.contains_key("replayed_envelopes"));
     assert!(!object.contains_key("replayed_tool_envelopes"));
+}
+
+/// UPCR-2026-039: tool rows carry their call id and tool name, an assistant
+/// row its calls. A row without either keeps the pre-UPCR wire shape, and a
+/// pre-UPCR row decodes with the fields absent.
+#[test]
+fn should_carry_tool_call_identity_when_a_hydrated_row_is_a_tool_call_or_result() {
+    let row = |role: &str| HydratedMessage {
+        seq: 3,
+        role: role.into(),
+        content: String::new(),
+        turn_id: None,
+        thread_id: Some("thread-1".into()),
+        client_message_id: None,
+        persisted_at: sample_persisted_at(),
+        message_id: None,
+        source: None,
+        media: vec![],
+        reasoning_content: None,
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: vec![],
+    };
+    let call = HydratedMessage {
+        tool_calls: vec![HydratedToolCall {
+            tool_call_id: "call-1".into(),
+            tool_name: "peer_send_input".into(),
+        }],
+        ..row("assistant")
+    };
+    let result = HydratedMessage {
+        tool_call_id: Some("call-1".into()),
+        tool_name: Some("peer_send_input".into()),
+        ..row("tool")
+    };
+
+    let call_wire = serde_json::to_value(&call).expect("serialize call row");
+    assert_eq!(
+        call_wire["tool_calls"],
+        json!([{ "tool_call_id": "call-1", "tool_name": "peer_send_input" }])
+    );
+    assert!(call_wire.get("tool_call_id").is_none());
+    assert!(call_wire.get("tool_name").is_none());
+    let result_wire = serde_json::to_value(&result).expect("serialize result row");
+    assert_eq!(result_wire["tool_call_id"], "call-1");
+    assert_eq!(result_wire["tool_name"], "peer_send_input");
+    assert!(result_wire.get("tool_calls").is_none());
+    for parsed in [&call, &result] {
+        let wire = serde_json::to_value(parsed).expect("serialize");
+        let decoded: HydratedMessage = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(&decoded, parsed);
+    }
+
+    // Additive: a plain row serializes without the new keys, and a row from
+    // a server without UPCR-2026-039 decodes with them absent.
+    let plain = serde_json::to_value(row("user")).expect("serialize plain row");
+    for key in ["tool_call_id", "tool_name", "tool_calls"] {
+        assert!(plain.get(key).is_none(), "{key} must be omitted: {plain}");
+    }
+    let legacy: HydratedMessage = serde_json::from_value(json!({
+        "seq": 4,
+        "role": "tool",
+        "content": "ok",
+        "thread_id": "thread-1",
+        "persisted_at": "2026-04-30T12:00:00Z",
+    }))
+    .expect("deserialize a pre-UPCR-2026-039 row");
+    assert_eq!(legacy.tool_call_id, None);
+    assert_eq!(legacy.tool_name, None);
+    assert!(legacy.tool_calls.is_empty());
 }
 
 #[test]

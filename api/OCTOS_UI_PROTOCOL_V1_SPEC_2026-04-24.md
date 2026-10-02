@@ -356,6 +356,11 @@ Current M9 sandbox-parity decision:
   accepted
   [UPCR-2026-038](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_038_ACCEPTED_CLIENT_COMMANDS.md).
   The field is ungated.
+- The additive `tool_call_id`, `tool_name` and `tool_calls` fields on
+  `session/hydrate` message rows (and on `session/rollback`'s trimmed thread),
+  which name a tool row's call and tool, are governed by accepted
+  [UPCR-2026-039](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_039_HYDRATED_TOOL_CALL_IDENTITY.md).
+  The fields are ungated.
 
 ## 5. Identity Model
 
@@ -1027,6 +1032,21 @@ Optional result fields from the M16 `context.lifecycle.v1` contract:
   Typed model-visible context state for the hydrated session. This state must
   be read from the same canonical profile/session store used by `turn/start`,
   not reconstructed by the client from hydrated chat rows.
+
+Optional `messages` row fields from accepted `UPCR-2026-039` (ungated; the
+rows of `session/rollback`'s `thread` carry them too):
+
+- `tool_call_id`
+  On a tool-result row (`role: "tool"`), the id of the assistant tool call it
+  answers.
+- `tool_name`
+  On a tool-result row, the name of the tool that call ran (the `tool_name` of
+  `tool/started`), from the nearest earlier row whose `tool_calls` hold the
+  id, looked up in the whole transcript whatever `after` is. Absent when the
+  transcript lacks that call.
+- `tool_calls`
+  On an assistant row that called tools, `{tool_call_id, tool_name}` per call,
+  in call order, without the arguments. Omitted when the row made no call.
 
 ### `turn/state/get`
 

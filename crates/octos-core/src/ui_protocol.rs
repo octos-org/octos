@@ -3018,6 +3018,33 @@ pub struct HydratedMessage {
     /// running older protocol versions see the same shape they used to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<String>,
+    /// UPCR-2026-039: on a tool-result row (`role: "tool"`), the id of the
+    /// assistant tool call it answers, as stored with the row. Absent on
+    /// other rows. Ungated and additive, like `media`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// UPCR-2026-039: on a tool-result row, the name of the tool its call
+    /// ran (the `tool_name` of `tool/started`). The stored row has only the
+    /// call id; the name comes from the nearest earlier row whose
+    /// `tool_calls` hold that id (the assistant row that made the call),
+    /// looked up in the whole transcript, not only the rows after `after`.
+    /// Absent when the transcript no longer holds that call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// UPCR-2026-039: on an assistant row that called tools, each call's id
+    /// and tool name, in call order. Arguments are not included. Omitted
+    /// when the row made no tool call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<HydratedToolCall>,
+}
+
+/// One tool call made by an assistant row, in `HydratedMessage.tool_calls`
+/// (UPCR-2026-039). A tool-result row answering it carries the same
+/// `tool_call_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedToolCall {
+    pub tool_call_id: String,
+    pub tool_name: String,
 }
 
 /// Lifecycle state strings for a thread in `ThreadGraphEntry.status` and the

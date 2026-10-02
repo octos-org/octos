@@ -25873,6 +25873,68 @@ async fn session_rollback_drops_last_turn_and_returns_trimmed_thread() {
     );
 }
 
+/// UPCR-2026-039: `session/rollback` re-projects the trimmed transcript the
+/// way `session/hydrate` does, so the surviving turn's tool rows stay named.
+#[tokio::test(flavor = "current_thread")]
+async fn session_rollback_rows_carry_tool_call_identity() {
+    let session_id = SessionKey("local:rollback-tool-identity".into());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager = octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+    let manager = Arc::new(tokio::sync::Mutex::new(manager));
+    {
+        let mut guard = manager.lock().await;
+        let start = Utc::now();
+        let turns = tool_turn_rows("turn-1", &[("call-send", "peer_send_input")], start)
+            .into_iter()
+            .chain(tool_turn_rows(
+                "turn-2",
+                &[("call-read", "read_file")],
+                start + chrono::Duration::seconds(1),
+            ));
+        for message in turns {
+            guard
+                .add_message(&session_id, message)
+                .await
+                .expect("persist row");
+        }
+    }
+    let state = Arc::new(AppState {
+        sessions: Some(manager),
+        ..AppState::empty_for_tests()
+    });
+    let ledger = event_ledger(&state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+
+    handle_session_rollback(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns_registry(),
+        None,
+        None,
+        "rb-tools".into(),
+        SessionRollbackParams {
+            session_id: session_id.clone(),
+            num_turns: 1,
+        },
+    )
+    .await;
+
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["dropped_turns"], 1, "{frame}");
+    let rows = frame["result"]["thread"]["messages"]
+        .as_array()
+        .expect("messages array");
+    assert_eq!(rows.len(), 4, "turn 1 remains: {frame}");
+    assert_eq!(
+        rows[1]["tool_calls"],
+        json!([{ "tool_call_id": "call-send", "tool_name": "peer_send_input" }])
+    );
+    assert_eq!(rows[2]["tool_call_id"], "call-send");
+    assert_eq!(rows[2]["tool_name"], "peer_send_input");
+    assert!(rows.iter().all(|row| row["tool_call_id"] != "call-read"));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn session_rollback_survives_reload_from_disk() {
     let session_id = SessionKey("local:rollback-reload".into());
@@ -26556,6 +26618,221 @@ async fn session_hydrate_returns_full_chat_state() {
     assert_eq!(threads[0]["message_seqs"], json!([0, 1]));
     assert!(result["turns"].is_array());
     assert_eq!(result["pending_approvals"].as_array().unwrap().len(), 0);
+}
+
+/// One turn that calls two tools, as the turn path persists it: the user
+/// message, the assistant's tool calls (empty text), one result per call,
+/// then the answer.
+fn tool_turn_rows(turn: &str, calls: &[(&str, &str)], start: DateTime<Utc>) -> Vec<Message> {
+    let thread = || octos_core::ThreadId(turn.into());
+    let mut rows = vec![Message::user_rooting_thread(
+        format!("{turn}: go"),
+        octos_core::ClientMessageId(turn.into()),
+    )];
+    let mut call = Message::assistant_with_thread("", thread());
+    call.tool_calls = Some(
+        calls
+            .iter()
+            .map(|(id, name)| octos_core::ToolCall {
+                id: (*id).into(),
+                name: (*name).into(),
+                arguments: json!({ "text": "the draft" }),
+                metadata: None,
+            })
+            .collect(),
+    );
+    rows.push(call);
+    for (id, name) in calls {
+        rows.push(Message::tool_with_thread(
+            format!("{name} done"),
+            *id,
+            thread(),
+        ));
+    }
+    rows.push(Message::assistant_with_thread(
+        format!("{turn}: done"),
+        thread(),
+    ));
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.timestamp = start + chrono::Duration::milliseconds(index as i64);
+    }
+    rows
+}
+
+async fn hydrate_result_for_test(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    features: ConnectionUiFeatures,
+    after: Option<UiCursor>,
+) -> Value {
+    let ledger = event_ledger(state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_hydrate(
+        &ws,
+        state,
+        &ledger,
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        &active_turns_registry(),
+        None,
+        None,
+        features,
+        "tool-identity".into(),
+        SessionHydrateParams {
+            session_id: session_id.clone(),
+            after,
+            include: vec![],
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert!(frame.get("error").is_none(), "hydrate failed: {frame}");
+    frame["result"].clone()
+}
+
+/// UPCR-2026-039: a tool-result row carries its call id and tool name, and
+/// the assistant row that made the calls carries each call's id and name, on
+/// every connection. The stdio defaults (no `projection.envelope.v2`, so no
+/// v2 tool envelopes) are what a host such as OctoSense negotiates; there the
+/// rows are the only place a reloaded tool row's name can come from.
+#[tokio::test(flavor = "current_thread")]
+async fn session_hydrate_rows_carry_tool_call_identity() {
+    let session_id = SessionKey("local:hydrate-tool-identity".into());
+    let state = prg_state_with_session(&session_id, |session| {
+        session.messages = tool_turn_rows(
+            "turn-tools",
+            &[("call-send", "peer_send_input"), ("call-read", "read_file")],
+            Utc::now(),
+        );
+    });
+
+    for features in [
+        ConnectionUiFeatures::stdio_defaults(),
+        ConnectionUiFeatures::default(),
+        features_for_projection_envelope_v2_test(),
+    ] {
+        let result = hydrate_result_for_test(&state, &session_id, features, None).await;
+        let rows = result["messages"].as_array().expect("messages array");
+        assert_eq!(rows.len(), 5, "{result}");
+        let call = &rows[1];
+        assert_eq!(call["role"], "assistant");
+        assert_eq!(
+            call["tool_calls"],
+            json!([
+                { "tool_call_id": "call-send", "tool_name": "peer_send_input" },
+                { "tool_call_id": "call-read", "tool_name": "read_file" },
+            ]),
+            "the call row names its calls, without their arguments"
+        );
+        for (row, id, name) in [
+            (&rows[2], "call-send", "peer_send_input"),
+            (&rows[3], "call-read", "read_file"),
+        ] {
+            assert_eq!(row["role"], "tool");
+            assert_eq!(row["thread_id"], "turn-tools");
+            assert_eq!(row["tool_call_id"], id);
+            assert_eq!(row["tool_name"], name);
+            assert!(row.get("tool_calls").is_none(), "{row}");
+        }
+        assert!(call.get("tool_call_id").is_none() && call.get("tool_name").is_none());
+        // Rows that are neither keep their pre-UPCR shape.
+        for row in [&rows[0], &rows[4]] {
+            for key in ["tool_call_id", "tool_name", "tool_calls"] {
+                assert!(row.get(key).is_none(), "{key} on {row}");
+            }
+        }
+        // Ungated, unlike the v2-only row identity.
+        assert_eq!(
+            rows[2].get("message_id").is_some(),
+            features.projection_envelope_v2
+        );
+    }
+}
+
+/// UPCR-2026-039: the name is looked up in the whole transcript, so an
+/// incremental hydrate whose `after` skips the row that made the call still
+/// names the result.
+#[tokio::test(flavor = "current_thread")]
+async fn should_name_a_tool_row_when_the_after_cursor_skips_its_call() {
+    let session_id = SessionKey("local:hydrate-tool-after".into());
+    let state = prg_state_with_session(&session_id, |session| {
+        session.messages = tool_turn_rows(
+            "turn-after",
+            &[("call-send", "peer_send_input")],
+            Utc::now(),
+        );
+    });
+
+    let result = hydrate_result_for_test(
+        &state,
+        &session_id,
+        ConnectionUiFeatures::stdio_defaults(),
+        Some(UiCursor {
+            stream: session_id.0.clone(),
+            seq: 1,
+        }),
+    )
+    .await;
+    let rows = result["messages"].as_array().expect("messages array");
+    assert_eq!(rows[0]["seq"], 2, "rows after the call row: {result}");
+    assert_eq!(rows[0]["tool_call_id"], "call-send");
+    assert_eq!(rows[0]["tool_name"], "peer_send_input");
+}
+
+/// UPCR-2026-039: a provider can reuse a call id in a later turn; each result
+/// takes the name of the nearest earlier call with its id. A result whose
+/// call the transcript no longer holds keeps its id and has no name.
+#[tokio::test(flavor = "current_thread")]
+async fn should_name_each_tool_row_by_its_nearest_call_when_call_ids_repeat() {
+    let session_id = SessionKey("local:hydrate-tool-reused-id".into());
+    let start = Utc::now();
+    let state = prg_state_with_session(&session_id, |session| {
+        let mut orphan = Message::tool_with_thread(
+            "result of a call from a dropped segment",
+            "call-gone",
+            octos_core::ThreadId("turn-old".into()),
+        );
+        orphan.timestamp = start;
+        session.messages.push(orphan);
+        session.messages.extend(tool_turn_rows(
+            "turn-1",
+            &[("call_0", "read_file")],
+            start + chrono::Duration::seconds(1),
+        ));
+        session.messages.extend(tool_turn_rows(
+            "turn-2",
+            &[("call_0", "peer_send_input")],
+            start + chrono::Duration::seconds(2),
+        ));
+    });
+
+    let result = hydrate_result_for_test(
+        &state,
+        &session_id,
+        ConnectionUiFeatures::stdio_defaults(),
+        None,
+    )
+    .await;
+    let rows = result["messages"].as_array().expect("messages array");
+    let tool_rows = rows
+        .iter()
+        .filter(|row| row["role"] == "tool")
+        .map(|row| {
+            (
+                row["thread_id"].as_str().unwrap_or_default(),
+                row["tool_call_id"].as_str(),
+                row.get("tool_name").and_then(Value::as_str),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_rows,
+        vec![
+            ("turn-old", Some("call-gone"), None),
+            ("turn-1", Some("call_0"), Some("read_file")),
+            ("turn-2", Some("call_0"), Some("peer_send_input")),
+        ]
+    );
 }
 
 /// The canonical background writer can migrate the old flat transcript while

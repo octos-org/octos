@@ -29285,6 +29285,41 @@ async fn handle_task_restart_from_node(
 
 // ----- UPCR-2026-009 / -010 / -011 handlers -----
 
+/// The tool name of each transcript row, by index (UPCR-2026-039): for a
+/// tool-result row, the name in the nearest earlier `tool_calls` entry with
+/// the row's `tool_call_id` (a provider can reuse an id in a later turn);
+/// `None` for every other row and for a result whose call the transcript no
+/// longer holds. One pass over the whole transcript, so a hydrate `after`
+/// cursor that skips the call row still names its result.
+fn hydrated_tool_names(messages: &[Message]) -> Vec<Option<String>> {
+    let mut names: HashMap<&str, &str> = HashMap::new();
+    messages
+        .iter()
+        .map(|msg| {
+            for call in msg.tool_calls.iter().flatten() {
+                names.insert(call.id.as_str(), call.name.as_str());
+            }
+            msg.tool_call_id
+                .as_deref()
+                .and_then(|id| names.get(id))
+                .map(|name| (*name).to_owned())
+        })
+        .collect()
+}
+
+/// A transcript row's tool calls as hydrate carries them (UPCR-2026-039):
+/// id and tool name, in call order, without the arguments.
+fn hydrated_tool_calls(msg: &Message) -> Vec<octos_core::ui_protocol::HydratedToolCall> {
+    msg.tool_calls
+        .iter()
+        .flatten()
+        .map(|call| octos_core::ui_protocol::HydratedToolCall {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+        })
+        .collect()
+}
+
 /// Recover the identity of a committed row after the legacy flat/per-user
 /// merge changes its display index. The ledger's persisted timestamp and
 /// typed owner are provenance; content/media only verify that provenance and
@@ -29708,12 +29743,15 @@ async fn handle_session_hydrate(
                 session
                     .messages
                     .iter()
+                    // Named over the whole transcript: `after` may skip the
+                    // row that made a result's call (UPCR-2026-039).
+                    .zip(hydrated_tool_names(&session.messages))
                     .enumerate()
                     .filter(|(seq, _)| match params.after.as_ref() {
                         Some(after) => *seq as u64 > after.seq,
                         None => true,
                     })
-                    .map(|(seq, msg)| {
+                    .map(|(seq, (msg, tool_name))| {
                         let canonical_identity = canonical_identities.get(&seq);
                         let seq = seq as u64;
                         // V2 clients get a transcript identity that matches
@@ -29760,6 +29798,12 @@ async fn handle_session_hydrate(
                             // re-render the same `.md` / `.mp3` / `.pptx`
                             // attachment carried by the v2 projection.
                             media: msg.media.clone(),
+                            // UPCR-2026-039: ungated like media. A client
+                            // without v2 tool envelopes (a stdio host) names
+                            // reloaded tool rows from these.
+                            tool_call_id: msg.tool_call_id.clone(),
+                            tool_name,
+                            tool_calls: hydrated_tool_calls(msg),
                         }
                     })
                     .collect::<Vec<_>>(),
@@ -30008,8 +30052,9 @@ async fn handle_session_rollback(
         let messages = session
             .messages
             .iter()
+            .zip(hydrated_tool_names(&session.messages))
             .enumerate()
-            .map(|(seq, msg)| HydratedMessage {
+            .map(|(seq, (msg, tool_name))| HydratedMessage {
                 seq: seq as u64,
                 role: msg.role.as_str().to_owned(),
                 content: msg.content.clone(),
@@ -30021,6 +30066,9 @@ async fn handle_session_rollback(
                 source: None,
                 reasoning_content: None,
                 media: msg.media.clone(),
+                tool_call_id: msg.tool_call_id.clone(),
+                tool_name,
+                tool_calls: hydrated_tool_calls(msg),
             })
             .collect::<Vec<_>>();
         let (threads, orphans) = build_thread_graph_entries(session);
