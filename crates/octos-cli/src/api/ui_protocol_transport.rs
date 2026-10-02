@@ -2617,6 +2617,12 @@ impl ConnectionUiFeatures {
                 capabilities.supported_methods.push((*method).into());
             }
         }
+        if capabilities.supports_method(APPUI_METHOD_PEER_PREPARE) {
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_PEER_MODEL_OVERRIDE_V1,
+            );
+        }
         push_capability_feature(
             &mut capabilities.supported_features,
             APPUI_FEATURE_PERMISSION_PROFILE_V1,
@@ -14967,6 +14973,10 @@ struct RawPeerPrepareParams {
     /// the primary model. The result's `model` reports the effective choice.
     #[serde(default)]
     model: Option<String>,
+    /// Strict configured-model selection for a new native peer. Validated
+    /// and persisted before the response; mutually exclusive with `model`.
+    #[serde(default)]
+    model_override: Option<octos_core::ui_protocol::PeerModelOverride>,
     /// UPCR-2026-034 — marks a HOST-OWNED APP PEER and binds it to this
     /// app/account memory namespace. Requires `session_id` (the owning system
     /// agent session, recorded as originator), `cwd` (the app's host-owned
@@ -15179,6 +15189,22 @@ async fn raw_peer_prepare(
             ));
         }
     }
+    // Resolve and construct before reserving any slug/worktree. A failed
+    // explicit selection must never leave a peer running on the default.
+    let override_model = if let Some(selection) = params.model_override.as_ref() {
+        if params.model.is_some() || params.resume || host_namespace.is_some() {
+            return Err(RpcError::invalid_params(
+                "model_override is for new native peers and cannot be combined with model, resume or memory_namespace",
+            ));
+        }
+        let config = profile_peer_model_config(state, &profile_id)?;
+        let provider = build_peer_model_override(&config, &selection.model_id)?;
+        Some(
+            json!({"lane": "override", "provider": provider.provider_name(), "model": provider.model_id()}),
+        )
+    } else {
+        None
+    };
     let model_lanes = profile_model_lanes(state, &profile_id);
     let model_lane_keys: Vec<String> = model_lanes.iter().map(|sp| sp.key.clone()).collect();
 
@@ -15429,6 +15455,22 @@ async fn raw_peer_prepare(
         // Track the member for the fleet-level rollback: the reserved dir is
         // the brief's parent (`peers/<slug>`), same claim `stage_peer` made.
         staged.push((member.slug.clone(), peers_root.join(&member.slug)));
+        if let Some(selection) = params.model_override.as_ref() {
+            let encoded = serde_json::to_string(selection).expect("model selection serializes");
+            if let Err(error) = peer_io::write_peer_file_atomic(
+                &peers_root.join(&member.slug),
+                "model_override.json",
+                &encoded,
+            ) {
+                for (slug, _) in &staged {
+                    release_staged_peer_build_cache_slot(&peers_root, slug);
+                }
+                cleanup_staged_peers(&workspace_root, &staged).await;
+                return Err(RpcError::internal_error(format!(
+                    "failed to persist peer model override: {error}"
+                )));
+            }
+        }
         // UPCR-2026-034 — `peer_handoff` model parity: record the lane the
         // caller named (an unknown lane is a truthful note, never a failure)
         // and report the EFFECTIVE model.
@@ -15447,7 +15489,7 @@ async fn raw_peer_prepare(
             "worktree_branch": member.worktree_branch,
             "profile_id": profile_id.clone(),
             "token_budget": member_token_budget,
-            "model": peer_effective_model_json(&model_lanes, lane.as_deref()),
+            "model": override_model.clone().unwrap_or_else(|| peer_effective_model_json(&model_lanes, lane.as_deref())),
             "model_note": model_note,
             "memory_namespace": host_namespace.clone(),
             "resumed": false,
@@ -15588,6 +15630,9 @@ fn raw_peer_model_set(
             })?;
         }
     }
+    peer_io::write_peer_file_atomic(&dir, "model_override.json", "null").map_err(|error| {
+        RpcError::internal_error(format!("failed to clear peer model override: {error}"))
+    })?;
     let lane = read_peer_model_lane(&peers_root, &slug);
     Ok(json!({
         "slug": slug,
@@ -16880,7 +16925,148 @@ fn resolve_peer_lane_provider(
     build_peer_lane_provider(config, &lane)
 }
 
-/// #peer-model — the per-peer model LANE resolver used by the WS turn path.
+/// Resolve a configured model ID without editing the shared profile. A raw
+/// ID must identify exactly one route; guessing between credentials/endpoints
+/// would make an explicit per-peer selection unreliable.
+fn peer_model_override_config(
+    config: &crate::config::Config,
+    model_id: &str,
+) -> Result<crate::config::Config, RpcError> {
+    if model_id.trim().is_empty()
+        || model_id != model_id.trim()
+        || model_id.len() > 256
+        || model_id.chars().any(char::is_control)
+    {
+        return Err(RpcError::invalid_params(
+            "model_id must be a non-empty model ID (at most 256 bytes)",
+        ));
+    }
+    let mut candidates = Vec::new();
+    if config.model.as_deref() == Some(model_id) {
+        candidates.push(config.clone());
+    }
+    for fallback in &config.fallback_models {
+        if fallback.model.as_deref() != Some(model_id) {
+            continue;
+        }
+        let mut selected = config.clone();
+        selected.provider = Some(fallback.provider.clone());
+        selected.model = fallback.model.clone();
+        selected.base_url = fallback.base_url.clone();
+        selected.api_key_env = fallback.api_key_env.clone();
+        selected.api_type = fallback.api_type.clone();
+        selected.model_hints = fallback.model_hints.clone();
+        selected.context_window = fallback.context_window;
+        candidates.push(selected);
+    }
+    for lane in &config.sub_providers {
+        // Duplicate lane keys use the same last-wins rule as normal peers.
+        if lane.model.as_deref() != Some(model_id)
+            || !std::ptr::eq(select_peer_lane(config, &lane.key).unwrap(), lane)
+        {
+            continue;
+        }
+        let mut selected = lane_provider_config(config, lane);
+        selected.provider = Some(lane.provider.clone());
+        selected.model = lane.model.clone();
+        selected.base_url = lane.base_url.clone();
+        selected.api_type = lane.api_type.clone();
+        selected.model_hints = None;
+        selected.context_window = lane.default_context_window;
+        candidates.push(selected);
+    }
+    if candidates.is_empty() {
+        return Err(RpcError::invalid_params(format!(
+            "model '{model_id}' is not configured for this profile"
+        ))
+        .with_data(json!({"kind": "peer_model_unknown"})));
+    }
+    if candidates.len() != 1 {
+        return Err(RpcError::invalid_params(format!(
+            "model '{model_id}' is configured on multiple routes; use a unique model ID"
+        ))
+        .with_data(json!({"kind": "peer_model_ambiguous"})));
+    }
+    let mut selected = candidates.remove(0);
+    selected.fallback_models.clear();
+    Ok(selected)
+}
+
+fn build_peer_model_override(
+    config: &crate::config::Config,
+    model_id: &str,
+) -> Result<Arc<dyn octos_llm::LlmProvider>, RpcError> {
+    let selected = peer_model_override_config(config, model_id)?;
+    let provider = selected
+        .provider
+        .as_deref()
+        .filter(|provider| !provider.is_empty())
+        .or_else(|| crate::config::detect_provider(model_id))
+        .ok_or_else(|| RpcError::invalid_params("selected peer model has no provider"))?;
+    let llm = crate::commands::chat::create_provider_with_api_type(
+        provider,
+        &selected,
+        Some(model_id.to_owned()),
+        selected.base_url.clone(),
+        selected.api_type.as_deref(),
+    )
+    .map_err(|error| {
+        RpcError::invalid_params(format!("cannot activate peer model '{model_id}': {error}"))
+            .with_data(json!({"kind": "peer_model_unavailable"}))
+    })?;
+    let llm: Arc<dyn octos_llm::LlmProvider> = match selected.context_window {
+        Some(window) => Arc::new(octos_llm::ContextWindowOverride::new(llm, window)),
+        None => llm,
+    };
+    Ok(Arc::new(octos_llm::RetryProvider::new(llm)))
+}
+
+fn profile_peer_model_config(
+    state: &AppState,
+    profile_id: &str,
+) -> Result<crate::config::Config, RpcError> {
+    if let Some(runtime) = resolve_session_profile_runtime(state, Some(profile_id)) {
+        return Ok(runtime.config.clone());
+    }
+    let store = profile_store(state)?;
+    let profile = store
+        .get(profile_id)
+        .map_err(|error| RpcError::internal_error(format!("failed to read profile: {error}")))?
+        .ok_or_else(|| RpcError::not_found("profile", profile_id))?;
+    Ok(crate::profiles::config_from_profile(
+        &store.resolve_runtime_profile(&profile),
+        None,
+        None,
+    ))
+}
+
+/// The durable override is an ID only, never credentials. Invalid/unreadable
+/// control files fail closed instead of silently launching on the primary.
+fn resolve_peer_model_provider(
+    peers_root: &Path,
+    slug: &str,
+    config: &crate::config::Config,
+) -> Result<Option<Arc<dyn octos_llm::LlmProvider>>, RpcError> {
+    if let Some(dir) = staged_peer_dir(peers_root, slug) {
+        let encoded = peer_io::read_peer_control_file(&dir, "model_override.json", 1024).map_err(
+            |error| RpcError::internal_error(format!("cannot read peer model override: {error}")),
+        )?;
+        if let Some(encoded) = encoded {
+            let selection: Option<octos_core::ui_protocol::PeerModelOverride> =
+                serde_json::from_str(&encoded).map_err(|error| {
+                    RpcError::invalid_params(format!("invalid peer model override: {error}"))
+                })?;
+            if let Some(selection) = selection {
+                return build_peer_model_override(config, &selection.model_id).map(Some);
+            }
+        }
+    }
+    Ok(resolve_peer_lane_provider(peers_root, slug, config))
+}
+
+/// Per-peer provider resolver used by the OUP turn path. An explicit model
+/// override is strict: invalid records/configuration fail the turn. Legacy
+/// lane-only peers keep their existing fallback behavior.
 /// When THIS session is a peer whose staging recorded a `peers/<slug>/model`
 /// lane matching a configured `sub_provider`, run the peer's turns on THAT
 /// provider instead of the profile's primary. Returns `None` — so the caller
@@ -16892,21 +17078,25 @@ fn resolve_peer_lane_provider(
 fn peer_lane_provider_for(
     session_id: &SessionKey,
     session_runtime: &crate::runtime::SessionRuntime,
-) -> Option<Arc<dyn octos_llm::LlmProvider>> {
+) -> Result<Option<Arc<dyn octos_llm::LlmProvider>>, RpcError> {
     // UPCR-2026-034 — a request context runs on its owning peer's lane.
     let slug = match peer_slug_and_profile(session_id) {
         Some((_profile_id, slug)) => slug,
         None => {
-            let (slug, _context) =
-                crate::peers::app_binding::parse_context_topic(session_id.topic()?)?;
+            let Some((slug, _context)) = session_id
+                .topic()
+                .and_then(crate::peers::app_binding::parse_context_topic)
+            else {
+                return Ok(None);
+            };
             if !peer_slug_is_safe(slug) {
-                return None;
+                return Ok(None);
             }
             slug
         }
     };
     let peers_root = session_runtime.profile.data_dir.join("peers");
-    resolve_peer_lane_provider(&peers_root, slug, &session_runtime.profile.config)
+    resolve_peer_model_provider(&peers_root, slug, &session_runtime.profile.config)
 }
 
 /// Outcome of a peer awaiting-input WAKE attempt — a test-visible summary of
@@ -23234,7 +23424,7 @@ async fn open_session_result(
                 );
                 accepted_client_commands = params.client_commands.is_some().then_some(accepted);
                 open_context_provider = Some(
-                    peer_lane_provider_for(&params.session_id, &runtime)
+                    peer_lane_provider_for(&params.session_id, &runtime)?
                         .unwrap_or_else(|| runtime.profile.llm.clone()),
                 );
                 effective_workspace_root = Some(runtime.workspace_root.clone());
@@ -38697,8 +38887,27 @@ async fn run_standalone_turn(
     // the profile's primary; every other session (and any missing/unmatched/
     // unbuildable lane) falls back to the profile's primary provider.
     let llm_provider: Arc<dyn octos_llm::LlmProvider> =
-        peer_lane_provider_for(&session_id, &session_runtime)
-            .unwrap_or_else(|| session_runtime.profile.llm.clone());
+        match peer_lane_provider_for(&session_id, &session_runtime) {
+            Ok(provider) => provider.unwrap_or_else(|| session_runtime.profile.llm.clone()),
+            Err(error) => {
+                let peers_root = session_runtime.profile.data_dir.join("peers");
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("peer_model_unavailable", error.message.as_str())),
+                    None,
+                    steer_buffer.as_ref(),
+                    Some(&peers_root),
+                )
+                .await;
+                contracts.scopes.evict_turn(&session_id, &turn_id);
+                return;
+            }
+        };
     let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.memory.episodes.clone();
     let mut agent_config = session_runtime.agent.agent_config();
     // A human-driven turn does not become unattended merely because it
