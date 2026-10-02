@@ -68,6 +68,8 @@ test_a2.md
 *.md
 !README.md
 !README-zh.md
+!AGENTS.md
+!docs/octosense-integration-walkthrough.md
 !ORG-README.md
 !CLAUDE.md
 !CHANGELOG.md

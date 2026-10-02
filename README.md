@@ -385,6 +385,8 @@ state, and control primitives that make that policy observable through OUP.
 
 ## Developer documentation
 
+New to Rust agent hosts? Read the [OctoSense integration code walkthrough](docs/octosense-integration-walkthrough.md) for app peers, human/system conversations, host tools, storage boundaries, and the concrete Tokio task mapping. Contributor guidance is in [AGENTS.md](AGENTS.md).
+
 - [OUP specification](api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md)
 - [OUP types and codecs](crates/octos-core/src/ui_protocol.rs)
 - [Runtime architecture](docs/ARCHITECTURE.md)
