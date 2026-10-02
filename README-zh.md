@@ -27,7 +27,7 @@ Octos 的核心架构是 **可复用的内核 + 可编程的协议边界**。应
 [构建应用](#基于-octos-构建应用) · [通过 OUP 控制内核](#通过-oup-控制内核) ·
 [文档](https://octos-org.github.io/octos/zh/) · [English](README.md)
 
-面向初级 Rust 开发者的 [OctoSense 集成源码导读](docs/octosense-integration-walkthrough.md)
+[OctoSense 集成源码导读](docs/octosense-integration-walkthrough.md)
 解释 app peer、人与系统 agent 的会话、宿主工具、数据存储边界和 Tokio 任务映射；
 贡献约定见 [AGENTS.md](AGENTS.md)。导读明确区分当前源码与 OctoSense 锁定版本。
 
