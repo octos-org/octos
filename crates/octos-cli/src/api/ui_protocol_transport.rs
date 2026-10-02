@@ -2197,6 +2197,11 @@ struct ConnectionUiFeatures {
     /// UPCR-2026-029 additive semantic-context/provider-cache diagnostics.
     /// Meaningful only alongside the parent context lifecycle capability.
     context_semantic_cache_v1: bool,
+    /// `context.state.v1`: push `context/state_reported` with the live token
+    /// estimate as a turn's prompt grows. Meaningful only alongside the
+    /// parent context lifecycle capability; strictly opt-in because it adds
+    /// a notification kind older clients cannot decode.
+    context_state_v1: bool,
     /// UPCR-2026-023 `user_question.v1` negotiated. When set, the connection's
     /// turn task installs a [`SessionUserQuestionRequester`] so the agent's
     /// `ask_user_question` tool blocks on `user_question/respond`. When unset,
@@ -2307,6 +2312,11 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
             ),
+            context_state_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1,
+            ),
             user_question_v1: has_ui_feature(headers, query, UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
             skill_actions_v1: has_ui_feature(headers, query, APPUI_FEATURE_SKILL_ACTIONS_V1),
             skill_action_jobs_v1: has_ui_feature(
@@ -2354,6 +2364,9 @@ impl ConnectionUiFeatures {
             // capability slice before `client_hello`, so enabling this by
             // default would advertise fields the client never negotiated.
             context_semantic_cache_v1: false,
+            // Same rule: a client that never sent `client_hello` features
+            // cannot be assumed to decode `context/state_reported`.
+            context_state_v1: false,
             user_question_v1: true,
             skill_actions_v1: true,
             skill_action_jobs_v1: true,
@@ -2400,6 +2413,7 @@ impl ConnectionUiFeatures {
             review_start_v1: has(UI_PROTOCOL_FEATURE_REVIEW_START_V1),
             context_lifecycle_v1: has(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1),
             context_semantic_cache_v1: has(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
+            context_state_v1: has(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1),
             user_question_v1: has(UI_PROTOCOL_FEATURE_USER_QUESTION_V1),
             skill_actions_v1: has(APPUI_FEATURE_SKILL_ACTIONS_V1),
             skill_action_jobs_v1: has(APPUI_FEATURE_SKILL_ACTION_JOBS_V1),
@@ -2424,6 +2438,9 @@ impl ConnectionUiFeatures {
             capabilities
                 .supported_features
                 .retain(|feature| feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1);
+            capabilities.supported_features.retain(|feature| {
+                feature != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
+            });
             return capabilities;
         }
         let mut requested: Vec<&str> = Vec::with_capacity(8);
@@ -2498,6 +2515,9 @@ impl ConnectionUiFeatures {
             if self.context_semantic_cache_v1 {
                 requested.push(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1);
             }
+            if self.context_state_v1 {
+                requested.push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1);
+            }
         }
         if self.review_start_v1 {
             requested.push(UI_PROTOCOL_FEATURE_REVIEW_START_V1);
@@ -2551,6 +2571,13 @@ impl ConnectionUiFeatures {
 
     fn context_semantic_cache_available(self) -> bool {
         self.context_lifecycle_available() && self.context_semantic_cache_v1
+    }
+
+    /// `context.state.v1` needs the parent lifecycle capability AND an
+    /// explicit request: unlike the lifecycle baseline it is never implied
+    /// by a missing feature header.
+    fn context_state_available(self) -> bool {
+        self.context_lifecycle_available() && self.context_state_v1
     }
 
     fn skill_actions_available(self) -> bool {
@@ -2676,6 +2703,12 @@ impl ConnectionUiFeatures {
                 push_capability_feature(
                     &mut capabilities.supported_features,
                     UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+                );
+            }
+            if self.context_state_available() {
+                push_capability_feature(
+                    &mut capabilities.supported_features,
+                    octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1,
                 );
             }
         }
@@ -3371,6 +3404,9 @@ fn context_event_for_features(
             retain_negotiated_semantic_cache_diagnostics(&mut started.context_state, features);
         }
         UiNotification::ContextNormalizationReported(reported) => {
+            retain_negotiated_semantic_cache_diagnostics(&mut reported.context_state, features);
+        }
+        UiNotification::ContextStateReported(reported) => {
             retain_negotiated_semantic_cache_diagnostics(&mut reported.context_state, features);
         }
         _ => {}
@@ -4409,6 +4445,18 @@ struct AppUiLoopPromptScratch {
     /// Rows committed by a concurrent mid-turn path after this watermark are
     /// adopted before the next prompt projection and before scratch copyback.
     source_watermark: Option<usize>,
+    /// Token estimate last pushed to the client as `context/state_reported`
+    /// this turn (`context.state.v1`). `None` until the first report, so a
+    /// fresh turn always reports once.
+    last_reported_token_estimate: Option<usize>,
+}
+
+/// Minimum movement of the token estimate before another
+/// `context/state_reported` is pushed: 2% of the compaction threshold, never
+/// below 1024 tokens. Keeps the stream to a few dozen events over a long turn
+/// instead of one per iteration.
+fn context_state_report_step(threshold_tokens: usize) -> usize {
+    (threshold_tokens / 50).max(1024)
 }
 
 /// Default per-turn history budget (tokens) for the model prompt on a voice
@@ -4439,6 +4487,10 @@ struct AppUiPromptContextBridge {
     /// [`Self::prepare_prompt`] emits `ContextCompactionStarted`/`Completed`
     /// through this hook. `None` in tests and paths without a client.
     context_lifecycle_notify: Option<ContextLifecycleNotify>,
+    /// `context.state.v1` negotiated: [`Self::prepare_prompt`] also pushes
+    /// `context/state_reported` through the lifecycle hook as the estimate
+    /// moves. Off unless the client asked, since it is a new notification kind.
+    context_state_updates: bool,
     /// Provider for the OPT-IN LLM-summarization compaction path
     /// (`--llm-compaction` serve flag). `None` = heuristic only (also the
     /// fallback whenever an LLM summary fails, and the flag-off state). Set on
@@ -4473,6 +4525,7 @@ impl AppUiPromptContextBridge {
             scratch: StdMutex::new(None),
             voice_turn,
             context_lifecycle_notify: None,
+            context_state_updates: false,
             llm_compaction_provider: None,
             redact_memory_events: false,
             ephemeral_block: None,
@@ -4514,6 +4567,11 @@ impl AppUiPromptContextBridge {
 
     fn with_context_lifecycle_notify(mut self, notify: ContextLifecycleNotify) -> Self {
         self.context_lifecycle_notify = Some(notify);
+        self
+    }
+
+    fn with_context_state_updates(mut self, enabled: bool) -> Self {
+        self.context_state_updates = enabled;
         self
     }
 
@@ -4625,6 +4683,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 observed_messages: messages.len(),
                 runtime_system: None,
                 source_watermark,
+                last_reported_token_estimate: None,
             });
         }
         let scratch = scratch_guard
@@ -4746,6 +4805,37 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // trimmed view.
         let out_policy = self.outgoing_prompt_policy(&request);
         let frame = scratch.manager.for_prompt(&out_policy);
+        // `context.state.v1`: push the live estimate so the client's gauge
+        // follows the turn instead of freezing at the session-open value
+        // until the next compaction. Rate-limited by movement, collected
+        // here and emitted with the other lifecycle events after the scratch
+        // lock drops.
+        if self.context_state_updates && self.context_lifecycle_notify.is_some() {
+            let estimate = frame.report.token_estimate;
+            let moved = scratch
+                .last_reported_token_estimate
+                .is_none_or(|last| estimate.abs_diff(last) >= context_state_report_step(threshold));
+            if moved {
+                scratch.last_reported_token_estimate = Some(estimate);
+                let mut context_state = ui_context_state_for(&self.session_id, &scratch.manager);
+                // Report the size of the prompt the model will actually be
+                // sent, not the whole transcript's estimate: capped tool
+                // outputs and spilled artifacts make the transcript several
+                // times larger than the projection (a 210k-token prompt read
+                // "ctx 1M/1M ~100%" against the transcript number), and a
+                // gauge that says full while the provider bills a fifth of
+                // that is the misleading signal this feature exists to fix.
+                context_state.token_estimate = frame.report.token_estimate;
+                lifecycle_events.push(UiNotification::ContextStateReported(
+                    octos_core::ui_protocol::ContextStateReportedEvent {
+                        session_id: self.session_id.clone(),
+                        context_state,
+                        threshold_tokens: threshold,
+                        iteration: request.iteration,
+                    },
+                ));
+            }
+        }
         let prompt_replaced = messages.len() != frame.messages.len()
             || messages
                 .iter()
@@ -22950,8 +23040,20 @@ fn live_event_passes_capability_filter(
         if let UiProtocolLedgerEvent::Notification(
             UiNotification::ContextCompactionCompleted(_)
             | UiNotification::ContextCompactionStarted(_)
-            | UiNotification::ContextNormalizationReported(_),
+            | UiNotification::ContextNormalizationReported(_)
+            | UiNotification::ContextStateReported(_),
         ) = event
+        {
+            return false;
+        }
+    }
+    // `context.state.v1` gate. The live gauge is ledgered on the shared
+    // session stream, so a connection that negotiated only the lifecycle
+    // baseline (or sent no feature header, which implies that baseline) must
+    // not receive a `context/state_reported` produced for another
+    // connection, live or on reconnect replay.
+    if !features.context_state_available() {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::ContextStateReported(_)) = event
         {
             return false;
         }
@@ -40346,7 +40448,8 @@ async fn run_standalone_turn(
     )
     .with_context_lifecycle_notify(context_lifecycle_notify)
     .with_redacted_memory_events(!app_context_allowed)
-    .with_ephemeral_block(shared_history_block);
+    .with_ephemeral_block(shared_history_block)
+    .with_context_state_updates(features.context_state_available());
     // Only wire the provider when `--llm-compaction` is on; a present provider
     // is what flips the in-loop bridge to the LLM-summarization path.
     if session_compaction_llm_enabled(&session_id, &state) {
@@ -47312,6 +47415,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::ContextCompactionCompleted(_)
             | UiNotification::ContextCompactionStarted(_)
             | UiNotification::ContextNormalizationReported(_)
+            | UiNotification::ContextStateReported(_)
             // Whole-job orchestration status is a stateless lifecycle push
             // (no durable cursor of its own).
             | UiNotification::SessionOrchestration(_)

@@ -18,7 +18,7 @@ Octos supports 17 LLM providers out of the box. Each provider needs an API key s
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-M3 | OpenAI-compatible | -- |
 | `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI-compatible | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | OpenAI-compatible | `z.ai` |
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Auto (Anthropic/OpenAI) | `r9s.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | -- |
@@ -58,12 +58,11 @@ octos chat --provider deepseek --model deepseek-chat
 octos chat --model gpt-4o
 
 # Custom endpoint — name the real vendor, pick the wire protocol explicitly
-octos chat --provider zai --api-type anthropic \
-  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+octos chat --provider zai --api-type openai \
+  --base-url https://api.z.ai/api/paas/v4 --model glm-5.2
 
 # Full autonomy (bypass approvals + sandbox) alongside model selection
-octos chat --yolo --provider zai --api-type anthropic \
-  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+octos chat --yolo --provider zai --model glm-5.2
 ```
 
 | Flag | Meaning |
@@ -111,8 +110,7 @@ There is **no `--api-key` flag** — the key is resolved, in order:
 ```bash
 # Quickest — export the provider's env var, then run
 export ZAI_API_KEY=<your-key>
-octos chat --provider zai --api-type anthropic \
-  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+octos chat --provider zai --model glm-5.2
 
 # Or log in once (no env var afterward)
 octos auth login --provider zai      # prompts: "Paste your API key:"
@@ -126,8 +124,8 @@ Or bake it into `config.json` so nothing is needed at runtime:
 {
   "provider": "zai",
   "model": "glm-5.2",
-  "base_url": "https://api.z.ai/api/anthropic",
-  "api_type": "anthropic",
+  "base_url": "https://api.z.ai/api/paas/v4",
+  "api_type": "openai",
   "env_vars": { "ZAI_API_KEY": "<your-key>" }
 }
 ```
@@ -206,8 +204,8 @@ octos chat --provider zai --api-type anthropic \
   --base-url https://api.z.ai/api/anthropic --model glm-5.2
 ```
 
-- `"openai"` -- OpenAI Chat Completions format (default for most providers)
-- `"anthropic"` -- Anthropic Messages format (for Anthropic-compatible proxies, e.g. z.ai/GLM)
+- `"openai"` -- OpenAI Chat Completions format (default for most providers, including `zai` / `zai-coding`)
+- `"anthropic"` -- Anthropic Messages format (for Anthropic-compatible proxies). A `zai` / `zai-coding` route with `api_type: "anthropic"` and no `base_url` targets Z.AI's Anthropic-compatible root (`https://api.z.ai/api/anthropic`); that root reports no prompt-cache hits, so the default OpenAI-compatible lane is cheaper for long sessions
 - `"responses"` -- OpenAI Responses API format
 
 ## Fallback Chains

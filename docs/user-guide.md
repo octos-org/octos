@@ -304,7 +304,7 @@ Octos supports 17 LLM provider families out of the box. Cloud providers require 
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible | — |
 | `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI-compatible | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | OpenAI-compatible | `z.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | — |
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | — |
@@ -370,7 +370,7 @@ Octos supports 17 LLM provider families out of the box. Cloud providers require 
 4. Create a new API key
 5. Copy the key
 6. Set it: `export ZAI_API_KEY="your-key"`
-7. Note: Z.AI uses the Anthropic Messages API protocol (`api_type: "anthropic"`)
+7. Note: the `zai` (`api.z.ai/api/paas/v4`) and `zai-coding` (`api.z.ai/api/coding/paas/v4`) lanes speak OpenAI Chat Completions, the only Z.AI protocol that reports prompt-cache hits. A saved `base_url` of `https://api.z.ai/api/anthropic` is migrated to the lane's OpenAI-compatible root with a warning; set `api_type: "anthropic"` to keep the (uncached) Anthropic Messages protocol
 
 **Nvidia NIM:**
 1. Go to [Nvidia NIM](https://build.nvidia.com/)
@@ -469,7 +469,7 @@ The `api_type` field forces a specific API wire format:
 ```
 
 - `"openai"` — OpenAI Chat Completions format (default for most providers)
-- `"anthropic"` — Anthropic Messages format (for Anthropic-compatible proxies like Z.AI)
+- `"anthropic"` — Anthropic Messages format (for Anthropic-compatible proxies). For `zai` / `zai-coding` without a `base_url` this targets Z.AI's Anthropic-compatible root (`https://api.z.ai/api/anthropic`), which reports no prompt-cache hits
 
 ### 3.5 Auth Store (OAuth & Paste-Token)
 

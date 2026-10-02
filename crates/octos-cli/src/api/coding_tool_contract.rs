@@ -132,6 +132,11 @@ pub(crate) const OCTOS_KNOWN_MODEL_VISIBLE_TOOLS: &[&str] = &[
     "view_image",
     "tool_search",
     "tool_suggest",
+    // Compaction replaces evicted tool outputs with a placeholder that tells
+    // the model to `recall` them by tool_call_id; the tool has to be visible
+    // on the coding contract for that advice to be actionable, otherwise the
+    // only way back is a fresh read or command.
+    "recall",
     // #1172 — Codex naming-parity aliases. `bash` shares the runtime with
     // `shell` / `exec_command`; `delegate` chains `spawn_agent` +
     // `wait_agent` so the Codex-compatible one-call lifecycle is visible
@@ -538,6 +543,17 @@ const OCTOS_TOOL_SPECS: &[OctosToolSpec] = &[
         policy: "allowed",
         detail: Some(
             "Canonical Codex tool_suggest entry. Recommends tools for a free-form task description.",
+        ),
+    },
+    // Restore an evicted tool output by the tool_call_id carried on its
+    // compaction placeholder (exact recorded output, no re-execution).
+    OctosToolSpec {
+        name: "recall",
+        category: "read",
+        aliases: &[],
+        policy: "allowed",
+        detail: Some(
+            "Restores a tool output that compaction replaced with a placeholder, by the placeholder's tool_call_id.",
         ),
     },
     // #972 / M14-B P1: canonical Codex image-view surface.
