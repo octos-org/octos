@@ -1,11 +1,16 @@
 # OctoSense integration: agents, sessions, tools and Tokio
 
-Follow the implementation of host-owned app peers alongside the
+OctoSense supplies the app UI and app services. Octos runs the agent that
+interprets a request, calls those services and returns an answer. This guide
+follows one Calendar request through that boundary and the Rust tasks behind it.
+
+The host and kernel communicate through **OUP**, the Octos UI Protocol: JSON-RPC
+requests, responses and events over a connection. See the
 [runtime architecture](ARCHITECTURE.md) and
-[OUP specification](../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md).
-OctoSense pins Octos in its root
+[OUP specification](../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md) for the wider
+system. OctoSense selects an Octos revision in its root
 [Cargo.toml](https://github.com/OctoSense-org/OctoSense/blob/main/Cargo.toml);
-read the Octos source at that revision when debugging an integration.
+use that revision when tracing a running integration.
 
 ## Runtime concepts
 
@@ -21,39 +26,20 @@ read the Octos source at that revision when debugging an integration.
 | OS thread | Runtime worker or dedicated blocking worker | Executes polls or blocking work |
 
 The model proposes a tool call; Rust code checks and executes the operation.
-An agent can be idle without a running turn, and one active turn can create several tasks. Persistent identity,
-session lifetime and task lifetime are different.
+An agent can be idle without a running turn, and one active turn can create
+several tasks. Its identity and conversation survive after those tasks finish.
+A **profile** is the saved runtime configuration used to build an agent,
+including its model/provider settings and defaults.
 
-## Find the layers
+<a id="app-peer-creation-and-app-data-access"></a>
 
-Read these files in order:
-
-1. [OUP types](../crates/octos-core/src/ui_protocol.rs): commands, events,
-   `SessionKey` references, turn IDs, `TurnOrigin` and peer notifications.
-   OUP uses JSON-RPC requests, responses and notifications. `turn/start`
-   acknowledges admission; subsequent message events and terminal state carry
-   the answer and execution outcome.
-2. [Local runtime bootstrap](../crates/octos-cli/src/runtime/local_oup.rs):
-   builds runtime state from a configured profile and model provider.
-3. [OUP transport and dispatcher](../crates/octos-cli/src/api/ui_protocol_transport.rs):
-   WebSocket and stdio connection loops, session opening, admission, subscriptions,
-   `run_standalone_turn`, event forwarding and shutdown.
-4. [Peer app binding](../crates/octos-cli/src/peers/app_binding.rs): canonical
-   workspace, memory namespace, peer token and request-context bindings.
-5. [Host tools](../crates/octos-cli/src/peers/host_tools.rs) and
-   [tool wrapper](../crates/octos-agent/src/tools/peer_host_tool.rs): registration,
-   tool confinement, risk gating, outbound host calls and correlated replies.
-6. [Agent loop](../crates/octos-agent/src/agent/loop_runner.rs): model requests,
-   tool batches, history and context updates, convergence, budgets and output.
-7. [Turn origins](../crates/octos-cli/src/peers/turn_origin.rs) and
-   [shared history](../crates/octos-cli/src/peers/shared_history.rs): who is
-   speaking and how human and system lanes see bounded context from each other.
-
-## App peer creation and app data access
+## Prepare the app peer
 
 A host uses `peer/prepare` with a host binding. The durable binding fixes the
-app's canonical `cwd` and `memory_namespace`; Octos creates a peer capability
-token and stores its SHA-256 digest. The wire field is named `host_token`.
+app's canonical working directory (`cwd`) and `memory_namespace`. A **memory
+namespace** scopes which stored agent memories this app/account can capture and
+retrieve. Octos also creates a peer capability token and stores its SHA-256
+digest. The wire field is named `host_token`.
 Control calls require that token; a session ID alone is not accepted. This peer
 token is distinct from the server bearer credentials described below.
 Opening the app peer under a different workspace is refused.
@@ -64,35 +50,79 @@ whole and persisted in `host_tools.json`. `generic_tools` narrows the Octos
 tools already available to the peer. The code checks the owning host connection
 before allowing a host-driven turn to use the registered tools.
 
-For example, OctoSense Calendar declares
-[`calendar.events`](https://github.com/OctoSense-org/OctoSense/blob/main/apps/calendar/bundle/tools.json)
-with a JSON input schema. The model supplies arguments. `HostRoutedTool` applies its risk and approval rules;
-`TurnHostToolRouter` sends `peer/tool/call` to the registered host. The host's
-service or app adapter accesses its database or account API and answers
-`peer/tool/result`. The result is fed into the agent loop, which can explain
-it to the requester. The installed app's declarations define its available
-operations and schemas.
+<a id="how-this-maps-onto-tokio"></a>
+
+## Follow one Calendar request through Tokio
+
+Suppose a person asks Calendar, “What is on my calendar today?” The host has
+prepared Calendar's peer and opened the human conversation session described
+below. Follow the request in
+[the OUP dispatcher](../crates/octos-cli/src/api/ui_protocol_transport.rs):
+
+1. **Submit and check the turn.** OctoSense sends `turn/start` for that session
+   with the person's message and `origin.kind = person`. The dispatcher checks
+   the session and connection scope before preparing work for that session.
+2. **Register ownership before starting work.**
+   `handle_turn_start_with_accept` creates a Tokio `mpsc` interrupt channel
+   with capacity 1 and spawns an orchestration task. That task initially waits on a `oneshot` channel: a
+   one-message channel acting as a **start barrier**. The active-turn registry
+   checks for conflicting work. On admission, the dispatcher records the turn
+   and its owner, sends the admission response, then releases the barrier. If
+   admission or sending the response fails, it aborts the task.
+   Acceptance means the request can run; answer events arrive later.
+3. **Run the agent.** The released task calls `run_standalone_turn`, which spawns
+   the agent processing future, `process_message_tracked_with_attachments`.
+   The outer task coordinates output, interrupts and approvals while the inner
+   task drives model and tool processing. For this example, assume the model
+   chooses the registered
+   [`calendar.events`](https://github.com/OctoSense-org/OctoSense/blob/main/apps/calendar/bundle/tools.json)
+   tool with `from`, `to` and `limit` arguments. The model chooses a typed
+   operation; it does not open Calendar's database itself.
+4. **Ask the host for the data.**
+   [`HostRoutedTool`](../crates/octos-agent/src/tools/peer_host_tool.rs) applies
+   the tool's risk and approval rules.
+   [`TurnHostToolRouter`](../crates/octos-cli/src/peers/host_tools.rs) sends
+   `peer/tool/call` with a call ID to the owning host. OctoSense's Calendar
+   service reads the permitted records and sends `peer/tool/result` with that ID.
+5. **Wait without blocking a Tokio worker.** The pending tool call has its own
+   reply `oneshot`. `tokio::select!` waits for the result, cancellation or
+   timeout. While this future is waiting, the worker can poll other tasks.
+   The host chooses where its database or API operation runs; the waiting
+   future does not dictate a thread for that operation.
+6. **Answer and finish.** The tool result returns to the agent loop, which can
+   use it to write the answer. OUP message events and terminal state let
+   OctoSense show the answer and completion in the person's conversation.
+   The tasks finish; the peer binding and stored conversation remain available
+   for the next request.
 
 ```mermaid
 sequenceDiagram
-    participant M as App peer turn
-    participant K as Octos host tool router
-    participant H as OctoSense host adapter
-    participant D as App store or API
-    M->>K: Typed tool request
-    K->>K: Check registry, scope and risk
-    K->>H: peer/tool/call with call ID
-    H->>D: Execute allowed operation
-    D-->>H: Data or error
-    H-->>K: peer/tool/result with call ID
-    K-->>M: Tool result
-    M-->>H: Answer events and turn completion
+    participant H as OctoSense host
+    participant O as OUP dispatcher
+    participant T as Turn orchestration task
+    participant A as Agent processing task
+    H->>O: turn/start, person origin
+    O->>T: Spawn, wait at start barrier
+    O->>O: Admit and record owner
+    O-->>H: Admission response
+    O->>T: Release start barrier
+    T->>A: Spawn model and tool processing
+    A->>H: Routed calendar.events tool call
+    H-->>A: Correlated tool result
+    A-->>T: Answer and processing outcome
+    T-->>H: Answer events and terminal state
 ```
 
-The reply wait uses a Tokio `oneshot` channel, with timeout and interrupt
-handling. The router can emit `peer/tool/cancel`; an interrupted write can have
-an unknown outcome even after cancellation. Pending
-calls are bounded and tool calls are audited in `tool_audit.jsonl`.
+There is no fixed “one agent = one Tokio task” relationship. This request has
+orchestration and agent tasks; event forwarding and other work can add tasks.
+The Calendar peer is the longer-lived identity to which this work belongs.
+
+On interruption, the router can emit `peer/tool/cancel`. For operations that
+write data, cancellation may leave the outcome unknown: the host may already
+have performed the write. Pending calls are bounded, and their audit records
+are stored in `tool_audit.jsonl`.
+
+## App data and cross-app tools
 
 App records belong to host services; session transcripts preserve conversations;
 the peer memory namespace scopes agent memory capture and retrieval. Database
@@ -130,24 +160,33 @@ There are two relevant conversation arrangements:
 - For concurrent interaction the host opens a request context using
   `peer/context/open` with `share_history`. The peer's own session is the
   system lane; the context session is the human lane. Each has its own
-  transcript, so simultaneous writers cannot corrupt tool-call pairing or
-  compaction. Shared history is a bounded, labelled, read-only projection of
-  recent user and assistant text and in-progress status; it omits tool rows. It is
-  not copied into the other lane's durable transcript. A context does not see
-  its sibling contexts through this mechanism.
+  transcript, keeping each tool call beside its matching result. **Compaction**
+  shortens the conversation supplied to the model as its context fills up;
+  separate transcripts keep that process independent in each lane.
 
-A request context is a session, with a derived key such as
-`<originator base>#peerctx-<slug>.<context_id>`, its own workspace beneath the
-peer workspace and child memory namespace. It is not a new app peer. A closed
+When `share_history` is enabled, each lane sees a bounded, labelled view of
+recent user and assistant text and in-progress status from the other lane.
+This shared view is read-only and omits tool-call and tool-result entries. It
+is not copied into the receiving lane's durable transcript, and contexts do not
+see their sibling contexts through this mechanism.
+
+A request context is a session. Its key derives from the originating session,
+for example `<originator base>#peerctx-<slug>.<context_id>`. It has its own
+workspace beneath the peer workspace and child memory namespace. It is not a new app peer. A closed
 or unknown context is rejected at bootstrap and turn start. Mini-apps can also
 use such contexts; whether a context shares history is an explicit host choice.
 
 Answers reach the appropriate frontend as OUP events. System-input results
-also feed the peer blackboard; origin and correlation identify the requester.
+also feed the **peer blackboard**, the result records used for agent
+coordination. Origin and request/turn IDs identify which requester should
+receive an answer.
 
 ## Peer lifecycle
 
-The owning host also controls the lifecycle through the dispatcher:
+The owning host controls the lifecycle through the dispatcher. A **model lane**
+is a named model-routing choice from the configured profile. A **tombstone** is
+a retained deletion record: it lets a retry recognize a peer that was already
+purged.
 
 | Method | Effect |
 | --- | --- |
@@ -162,27 +201,6 @@ and [purge records](../crates/octos-cli/src/peers/purge.rs). A busy purge return
 OctoSense selects the model lane during peer preparation, closes released
 contexts and requests purge on account removal. Its broker does not currently
 expose `peer/model/set` as an app operation.
-
-## How this maps onto Tokio
-
-A turn spans several tasks; the table lists their ownership by runtime path.
-A session and its durable peer binding can survive after those tasks finish.
-
-| Path | Owners, tasks and channels |
-| --- | --- |
-| OUP WebSocket | `ui_protocol_connection` splits the socket; a bounded Tokio `mpsc` queue feeds a spawned `WsConnection::writer_loop`. The async connection loop dispatches input and owns per-connection turn and forwarder handles. |
-| OUP stdio, including the generic embedded adapter | `stdio_connection_with_io_policy` reads NDJSON asynchronously, but output uses a bounded standard-library `sync_channel` and dedicated OS thread, `octos-appui-stdio-writer`. That thread uses a current-thread Tokio runtime to drive the async writer; a `oneshot` reports completion. |
-| Admitted OUP turn | `handle_turn_start_with_accept` creates an interrupt `mpsc` channel with capacity 1 and a `oneshot` start barrier, spawns orchestration, records ownership and admission, then allows work to start. The active-turn registry serializes conflicting work per session. |
-| Agent processing within an OUP turn | `run_standalone_turn` spawns the `process_message_tracked_with_attachments` future and coordinates output, interrupts, approvals and terminal persistence. Progress forwarding, failover and heartbeat work can add tasks. Tool calls may add concurrency of their own. |
-| Host app tool request | A pending call stores a reply `oneshot`; `tokio::select!` handles result, cancellation and timeout. Waiting is asynchronous; the app's actual operation runs wherever its host adapter schedules it. |
-| CLI `chat --peers` | [`OupPeerHost`](../crates/octos-cli/src/commands/oup_peers.rs) stores `(CancellationToken, JoinHandle)` per presented peer. `serve_peer` opens and listens to a child OUP session and closes it on cancellation. This frontend task is additional to backend turn tasks. |
-| Gateway session actor path | `ActorFactory` in [session_actor.rs](../crates/octos-cli/src/session_actor.rs) creates a bounded `ActorMessage` inbox and outbound proxy queue, spawns `actor.run()` and an outbound forwarder. Agent turns and stream forwarding can spawn further tasks. This is the gateway actor path, separate from the OUP dispatcher above. |
-
-The shared-history registry uses a short mutex scope, released before awaiting
-other work. Blocking SQLite cost-ledger operations use `spawn_blocking` in
-[cost_ledger.rs](../crates/octos-agent/src/cost_ledger.rs); stdio output uses the
-dedicated thread above. Native hosts keep waits for turns and tool results off
-the UI thread.
 
 ## Hosting and running
 
@@ -247,6 +265,67 @@ calling thread, whose stack may be smaller. Connection cleanup settles owned
 work and releases the writer; peer persistence has a separate lifetime.
 Follow the [OctoSense walkthrough](https://github.com/OctoSense-org/OctoSense/blob/c3011a2057ec59738b79466f48ff2ad8d0e60130/docs/architecture-walkthrough.md)
 for desktop, Home and ROM commands and the app-to-kernel bridge.
+
+## Reference: transport and other task arrangements
+
+The Calendar trace above follows an OUP turn. These surrounding tasks depend on
+how the host connects or which frontend runs the agent.
+
+### OUP connection tasks
+
+For WebSocket connections, `ui_protocol_connection` splits the socket. A bounded
+Tokio `mpsc` queue (multiple senders, one receiver) feeds the spawned
+`WsConnection::writer_loop`. The connection loop dispatches input and owns its
+turn and event-forwarder handles.
+
+For stdio, including the generic embedded adapter,
+`stdio_connection_with_io_policy` reads newline-delimited JSON asynchronously.
+Output uses a bounded standard-library `sync_channel` and a dedicated OS thread,
+`octos-appui-stdio-writer`. That thread runs the async writer on a current-thread
+Tokio runtime; a `oneshot` reports completion. It is an additional thread,
+separate from the turn tasks in the Calendar example.
+
+### Other frontends
+
+| Frontend | Task ownership |
+| --- | --- |
+| CLI `chat --peers` | [`OupPeerHost`](../crates/octos-cli/src/commands/oup_peers.rs) stores a `CancellationToken` and `JoinHandle` per presented peer. `serve_peer` opens and listens to a child OUP session, then closes it on cancellation. This frontend task is additional to backend turn tasks. |
+| Gateway | [`ActorFactory`](../crates/octos-cli/src/session_actor.rs) creates a bounded `ActorMessage` inbox and outbound proxy queue. It spawns `actor.run()` and an outbound forwarder; turns and streaming can add tasks. This session-actor path has its own ownership structure, separate from the OUP dispatcher. |
+
+### Work that must not hold up the UI
+
+The shared-history registry holds its mutex only briefly and releases it before
+awaiting other work. Blocking SQLite cost-ledger operations use `spawn_blocking`
+in [cost_ledger.rs](../crates/octos-agent/src/cost_ledger.rs). Native hosts keep
+waits for turns and tool results off the UI thread. These choices let unrelated
+requests and UI events proceed while an agent is waiting.
+
+<a id="find-the-layers"></a>
+
+## Reference: source map
+
+Use these entry points when following a specific part of the request:
+
+1. [OUP types](../crates/octos-core/src/ui_protocol.rs): commands, events,
+   `SessionKey` references, turn IDs, `TurnOrigin` and peer notifications.
+   OUP uses JSON-RPC requests, responses and notifications. `turn/start`
+   acknowledges admission; subsequent message events and terminal state carry
+   the answer and execution outcome.
+2. [Local runtime bootstrap](../crates/octos-cli/src/runtime/local_oup.rs):
+   builds runtime state from a configured profile and model provider.
+3. [OUP transport and dispatcher](../crates/octos-cli/src/api/ui_protocol_transport.rs):
+   WebSocket and stdio connection loops, session opening, admission, subscriptions,
+   `run_standalone_turn`, event forwarding and shutdown.
+4. [Peer app binding](../crates/octos-cli/src/peers/app_binding.rs): canonical
+   workspace, memory namespace, peer token and request-context bindings.
+5. [Host tools](../crates/octos-cli/src/peers/host_tools.rs) and
+   [tool wrapper](../crates/octos-agent/src/tools/peer_host_tool.rs): registration,
+   tool confinement, risk gating, outbound host calls and correlated replies.
+6. [Agent loop](../crates/octos-agent/src/agent/loop_runner.rs): model requests,
+   tool batches, history and context updates, convergence, budgets and output.
+7. [Turn origins](../crates/octos-cli/src/peers/turn_origin.rs) and
+   [shared history](../crates/octos-cli/src/peers/shared_history.rs): who is
+   speaking and how human and system lanes see bounded context from each other.
 
 ## Tests
 
