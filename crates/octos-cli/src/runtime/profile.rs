@@ -1110,6 +1110,7 @@ impl ProfileRuntime {
     /// Keep this runtime's stores and long-lived services for its
     /// replacement. Held strongly: an in-flight turn's agent can keep the
     /// single-writer episode store open after every runtime handle is gone.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) fn retire(&self) -> RetiredProfileRuntime {
         RetiredProfileRuntime {
             data_dir: self.data_dir.clone(),
@@ -1133,6 +1134,7 @@ impl ProfileRuntime {
     /// custom endpoints, API styles and explicit CLI policy overrides.
     /// A supplied provider is an embedding seam, not a second runtime path.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
     pub(crate) async fn bootstrap_resolved(
         profile: &UserProfile,
         data_dir: &Path,
