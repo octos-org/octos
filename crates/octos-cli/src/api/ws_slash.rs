@@ -153,9 +153,8 @@ pub async fn try_dispatch_slash_command(
         }) =>
         {
             Some(format!(
-                "`{cmd}` is not yet wired on the web chat transport \
-             (gateway-only for now). Issue #1013 follow-up will surface \
-             the matching control in the SPA."
+                "`{cmd}` is not available on the web chat transport \
+                 (gateway-only)."
             ))
         }
         _ => Some(unknown_command_help()),
@@ -433,5 +432,15 @@ mod tests {
                 .unwrap();
             assert!(reply.contains("gateway-only"), "/{name}: {reply}");
         }
+    }
+
+    #[tokio::test]
+    async fn unavailable_gateway_command_reply_promises_no_tracked_follow_up() {
+        let (ctx, _tmp, _key) = setup().await;
+        let reply = try_dispatch_slash_command("/router", &ctx).await.unwrap();
+        assert!(
+            !reply.contains('#') && !reply.contains("follow-up"),
+            "the reply must not point users at an issue: {reply}"
+        );
     }
 }

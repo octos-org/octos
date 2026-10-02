@@ -345,6 +345,12 @@ Current M9 sandbox-parity decision:
   It lets clients observe manifest-declared background actions through generic
   projections of persisted supervised tasks. It does not introduce
   notebook-specific routes or a generic client-selected tool-call primitive.
+- The optional `client_commands` param of `session/open` (its per-open
+  lifecycle, release on disconnect, and server-side name filtering) is
+  governed by accepted
+  [UPCR-2026-037](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_037_CLIENT_COMMANDS.md).
+  The param is ungated and the request records the contract as shipped; it
+  changes no wire shape.
 
 ## 5. Identity Model
 
@@ -915,6 +921,16 @@ Minimum params:
   `session.workspace_cwd.v1`. The server must canonicalize and approve it
   against runtime filesystem roots before binding cwd-scoped tools.
 - optional `after`
+- optional `client_commands`
+  Slash commands the client handles itself, from accepted `UPCR-2026-037`
+  (leading `/` optional). The server lists the accepted names in the session's
+  system prompt. The declaration is per-open, not sticky: every `session/open`
+  replaces the session's previous one, omitting the field declares none, and
+  the server clears it when the declaring connection closes. Across concurrent
+  connections the last open wins. Names are filtered server-side: at most 32
+  characters of ASCII alphanumerics, `-` and `_`, deduplicated, first 64 kept,
+  and the gateway server-state commands (`/adaptive`, `/router`, `/queue`,
+  `/reset`) dropped. Dropped names are not reported in the result.
 
 Expected result:
 

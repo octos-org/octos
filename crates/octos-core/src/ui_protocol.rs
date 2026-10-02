@@ -2065,6 +2065,19 @@ pub struct SessionOpenParams {
     pub sandbox: Option<SessionSandboxParams>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<UiCursor>,
+    /// Slash commands this client handles itself (UPCR-2026-037). The server
+    /// lists them in the session's system prompt so the agent can point the
+    /// user to them.
+    ///
+    /// The declaration is per-open, not sticky: every `session/open` replaces
+    /// the session's previous one, so omitting the field declares none, and
+    /// the server releases it when the declaring connection closes.
+    ///
+    /// Names are filtered server-side (leading `/` optional): only ASCII
+    /// alphanumerics, `-` and `_`, at most 32 characters, deduplicated, first
+    /// 64 valid names kept. Commands that act on gateway server state
+    /// (`/adaptive`, `/router`, `/queue`, `/reset`) are dropped. The filtering
+    /// is silent: `SessionOpened` does not report which names were accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_commands: Option<Vec<String>>,
 }
