@@ -384,9 +384,7 @@ impl Tool for WorkspaceDiffTool {
         // (e.g. `--output=pwned..HEAD`), not as a revision. Slash-free
         // option strings currently pass the traversal check.
         for ref_str in [&input.from_commit, &input.to_commit] {
-            if ref_str.starts_with('-')
-                || (ref_str.contains('/') && !ref_str.starts_with("HEAD"))
-            {
+            if ref_str.starts_with('-') || (ref_str.contains('/') && !ref_str.starts_with("HEAD")) {
                 return Ok(ToolResult {
                     output: "invalid commit ref".to_string(),
                     success: false,
