@@ -11551,11 +11551,11 @@ fn deferred_model_tool_names(_registry: Option<&octos_agent::ToolRegistry>) -> V
     Vec::new()
 }
 
-async fn tool_status_list_result(
+async fn runtime_inventory_registry(
     state: &Arc<AppState>,
     session_id: &SessionKey,
     active_profile_id: Option<&str>,
-) -> Result<Value, RpcError> {
+) -> Result<Option<Arc<octos_agent::ToolRegistry>>, RpcError> {
     let profile_runtime = ensure_session_profile_runtime(state, active_profile_id).await?;
     let session_runtime = if let Some(profile_runtime) = profile_runtime.as_ref() {
         // Epoch BEFORE permission resolution so a concurrent downgrade
@@ -11587,12 +11587,22 @@ async fn tool_status_list_result(
     };
     let registry = session_runtime
         .as_ref()
-        .map(|runtime| runtime.tools.as_ref())
+        .map(|runtime| runtime.tools.clone())
         .or_else(|| {
             profile_runtime
                 .as_ref()
-                .map(|runtime| runtime.tool_specs.as_ref())
+                .map(|runtime| runtime.tool_specs.clone())
         });
+    Ok(registry)
+}
+
+async fn tool_status_list_result(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let registry = runtime_inventory_registry(state, session_id, active_profile_id).await?;
+    let registry = registry.as_deref();
     let tool_names = model_visible_tool_names(registry);
     let registered_names = registered_tool_names(registry);
     let deferred_names = deferred_model_tool_names(registry);
@@ -11652,16 +11662,27 @@ async fn tool_status_list_result(
     ))
 }
 
-fn mcp_status_list_result(session_id: &SessionKey, active_profile_id: Option<&str>) -> Value {
+async fn mcp_status_list_result(
+    state: &Arc<AppState>, session_id: &SessionKey, active_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let registry = runtime_inventory_registry(state, session_id, active_profile_id).await?;
+    let connections = registry.map(|r| r.mcp_server_statuses()).unwrap_or_default();
+    let tool_refs: Vec<Vec<&str>> = connections.iter()
+        .map(|s| s.tools.iter().map(String::as_str).collect()).collect();
+    let servers: Vec<_> = connections.iter().zip(&tool_refs).map(|(s, tools)|
+        super::coding_tool_contract::McpServerStatusView {
+            id:&s.id, display_name:Some(&s.display_name), transport:Some(&s.transport),
+            status:&s.status, tool_count:s.tools.len(), tools, error:s.error.as_deref(),
+        }).collect();
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
-    super::coding_tool_contract::mcp_status_list_payload(
+    Ok(super::coding_tool_contract::mcp_status_list_payload(
         super::coding_tool_contract::McpStatusListContext {
             profile_id: Some(profile_id.as_str()),
             session_id: session_id_wire.as_str(),
-            servers: &[],
+            servers: &servers,
         },
-    )
+    ))
 }
 
 fn runtime_policy_stamp_for_profile(
@@ -21274,20 +21295,16 @@ async fn handle_raw_appui_rpc(
                     return true;
                 }
             };
-            if request.method == APPUI_METHOD_MCP_STATUS_LIST {
-                Ok(mcp_status_list_result(
-                    &session_id,
-                    active_profile_id.as_deref(),
-                ))
+            let result = if request.method == APPUI_METHOD_MCP_STATUS_LIST {
+                mcp_status_list_result(state, &session_id, active_profile_id.as_deref()).await
             } else {
-                match tool_status_list_result(state, &session_id, active_profile_id.as_deref())
-                    .await
-                {
-                    Ok(result) => Ok(result),
-                    Err(error) => {
-                        let _ = send_rpc_error(ws, Some(id), error);
-                        return true;
-                    }
+                tool_status_list_result(state, &session_id, active_profile_id.as_deref()).await
+            };
+            match result {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                    return true;
                 }
             }
         }

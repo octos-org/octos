@@ -223,6 +223,7 @@ pub struct ToolRegistry {
     /// Type-erased: the registry does not care what kind of handle this is, only
     /// that dropping the tools must not drop the connection.
     mcp_services: Vec<Arc<dyn std::any::Any + Send + Sync>>,
+    mcp_connections: Vec<crate::mcp::McpConnection>,
     /// Tools whose execution is auto-redirected to a background tokio task
     /// in the execution loop (see `is_spawn_only` + the spawn_only branch
     /// in `agent/execution.rs`). These tools ARE visible in `specs()` and
@@ -323,6 +324,7 @@ impl ToolRegistry {
             plugin_tools: HashSet::new(),
             non_builtin_origins: HashMap::new(),
             mcp_services: Vec::new(),
+            mcp_connections: Vec::new(),
             spawn_only: HashSet::new(),
             spawn_only_messages: HashMap::new(),
             background_result_sender: None,
@@ -947,6 +949,19 @@ impl ToolRegistry {
         self.mcp_services.len()
     }
 
+    pub(crate) fn record_mcp_connection(&mut self, connection: crate::mcp::McpConnection) {
+        self.mcp_connections.push(connection);
+    }
+
+    /// The server connections owned by this registry, including failed starts
+    /// and zero-tool servers. Tool filters never erase connection state.
+    pub fn mcp_server_statuses(&self) -> Vec<crate::mcp::McpServerStatus> {
+        self.mcp_connections
+            .iter()
+            .map(crate::mcp::McpConnection::snapshot)
+            .collect()
+    }
+
     pub fn retain(&mut self, f: impl Fn(&str) -> bool) {
         self.tools.retain(|name, _| f(name));
         self.non_builtin_origins
@@ -1174,6 +1189,7 @@ impl ToolRegistry {
             // otherwise replace the last owner and let the transport die when
             // the original registry drops. Cheap — one Arc per server.
             mcp_services: self.mcp_services.clone(),
+            mcp_connections: self.mcp_connections.clone(),
             workspace_root: self.workspace_root.clone(),
             filesystem_scope: self.filesystem_scope,
             provider_policy: self.provider_policy.clone(),

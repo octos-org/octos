@@ -1811,6 +1811,21 @@ Clients must use that method list to enable or disable slash commands.
   config, provider config, MCP config, tool registry, memory, or sandbox state
   directly
 
+`mcp/status/list` reports the selected session runtime's actual MCP connection
+records, including failed starts and connected servers exposing zero tools.
+Rows contain `{ id, display_name, transport, status, tool_count, tools, error }`;
+`id` identifies a connection within the running server process. Names come from
+the MCP initialization response, falling back to a command basename or HTTP
+hostname. Arguments, environment, credentials, URL query strings, and raw
+transport errors are never returned. `status` is checked against the live
+transport on every read; a closed connection is reported as `failed` with a
+connection-closed error. Summary counts are derived from those rows.
+`tool_count` describes tools accepted from that server at discovery, independently
+of subsequent session tool visibility. Tool filtering and registry snapshots
+must preserve the server connection records. These are MCP server rows, not the
+general executable-tool inventory. Clients render MCP servers and general tools
+in separate views, preserving the existing session/Profile authorization checks.
+
 ### Coding Tool Contract Inspection
 
 Proposed `UPCR-2026-020` extends the existing runtime inspection methods for

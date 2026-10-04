@@ -49360,6 +49360,64 @@ async fn profile_skills_effective_catalog_excludes_tool_plugins_and_mcp_only_pac
 }
 
 #[tokio::test]
+async fn mcp_status_reports_runtime_connection_failures_and_preserves_profile_scope() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let mut state = Arc::try_unwrap(state).ok().unwrap();
+    let profile = Arc::get_mut(state.profiles.get_mut("memory-owner").unwrap()).unwrap();
+    let tools = Arc::get_mut(&mut profile.tool_specs).unwrap();
+    let config = serde_json::from_value::<octos_agent::McpServerConfig>(json!({
+        "command":"/nonexistent-octos-mcp-status-test/server",
+        "args":["secret-argument"],"env":{"API_KEY":"secret-env"}
+    })).unwrap();
+    octos_agent::McpClient::start(&[config]).await.unwrap().register_tools(tools);
+    #[cfg(unix)]
+    {
+        let script = _dir.path().join("mcp-status-server.sh");
+        std::fs::write(&script, r#"#!/bin/sh
+while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$request" in
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"inventory-test","version":"1.0"}}}\n' "$id" ;;
+    *'"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id" ;;
+  esac
+done
+"#).unwrap();
+        let config = serde_json::from_value::<octos_agent::McpServerConfig>(json!({
+            "command":"/bin/sh", "args":[script]
+        })).unwrap();
+        octos_agent::McpClient::start(&[config]).await.unwrap().register_tools(tools);
+    }
+    let state = Arc::new(state);
+    let (ws, mut rx) = ws_connection_for_test(16);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let active_turns = active_turns_registry();
+    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    for requested_profile in ["memory-owner", "memory-other"] {
+        let request = RpcRequest::new("mcp-status", APPUI_METHOD_MCP_STATUS_LIST,
+            json!({"profile_id":requested_profile,"session_id":format!("{requested_profile}:api:mcp-status")}));
+        assert!(handle_raw_appui_rpc(&ws, &state, &ledger, &contracts, &active_turns, &connection_turns,
+            ConnectionUiFeatures::stdio_defaults(), Some("memory-owner"), "mcp-status".into(), &request).await);
+        let reply = recv_rpc_json(&mut rx).await;
+        if requested_profile == "memory-other" {
+            assert_eq!(reply["error"]["code"], rpc_error_codes::INVALID_PARAMS);
+            assert_eq!(reply["error"]["data"]["auth_scope_violation"], true);
+        } else {
+            assert_eq!(reply["result"]["servers"].as_array().unwrap().len(), if cfg!(unix) {2} else {1}, "{reply}");
+            assert_eq!(reply["result"]["servers"][0]["status"], "failed");
+            assert_eq!(reply["result"]["summary"]["failed"], 1);
+            assert!(!reply.to_string().contains("secret-"));
+            #[cfg(unix)]
+            {
+                assert_eq!(reply["result"]["summary"]["connected"], 1, "{reply}");
+                assert_eq!(reply["result"]["servers"][1]["display_name"], "inventory-test");
+                assert_eq!(reply["result"]["servers"][1]["tool_count"], 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn session_history_catalog_preserves_same_id_in_two_workspace_stores() {
     let (dir, state) = memory_profile_fixture().await;
     let mut state = Arc::try_unwrap(state).ok().unwrap();
