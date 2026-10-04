@@ -49325,12 +49325,38 @@ async fn session_history_catalog_keeps_profiles_separate_and_pages() {
 async fn profile_skills_effective_catalog_reports_builtins_without_claiming_another_profile() {
     let (_dir, state) = memory_profile_fixture().await;
     let profile = &state.profiles["memory-owner"];
-    let rows = profile.skill_catalog(&profile.tool_specs, None).await.unwrap();
+    let rows = profile.skill_catalog(None).await.unwrap();
     assert!(rows.iter().any(|r| r["scope"] == "builtin"));
     assert!(rows.iter().all(|r| r["scope"] == "builtin"));
     let result = raw_profile_skills_list(&state, &RpcRequest::new("skills", APPUI_METHOD_PROFILE_SKILLS_LIST,
         json!({"profile_id":"memory-owner","session_id":"memory-other:api:chat"})), None).await;
     assert_eq!(result.unwrap_err().code, rpc_error_codes::PERMISSION_DENIED);
+}
+
+#[tokio::test]
+async fn profile_skills_effective_catalog_excludes_tool_plugins_and_mcp_only_packages() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let mut state = Arc::try_unwrap(state).ok().unwrap();
+    let profile = Arc::get_mut(state.profiles.get_mut("memory-owner").unwrap()).unwrap();
+    let skill_dir = profile.data_dir.join("skills/review-guide");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"),
+        "---\nname: review-guide\ndescription: Review code changes\n---\nCheck behavior and tests.\n").unwrap();
+    // The same package may provide both instructions and tools. It is still
+    // one instruction skill; tool-only and MCP-only packages are not skills.
+    for (id, tools) in [("review-guide", vec!["review_code".into()]),
+                        ("binary-tool-only", vec!["read_file".into()]),
+                        ("mcp-only", vec![])] {
+        profile.loaded_plugins.push(octos_agent::plugins::loader::LoadedPluginInfo {
+            id: id.into(), version: "1.0.0".into(),
+            path: profile.data_dir.join("skills").join(id), tools,
+        });
+    }
+    let rows = profile.skill_catalog(None).await.unwrap();
+    assert_eq!(rows.iter().filter(|r| r["name"] == "review-guide").count(), 1);
+    assert!(rows.iter().all(|r| r["kind"] == "instructions"), "{rows:?}");
+    assert!(!rows.iter().any(|r| r["name"] == "binary-tool-only" || r["name"] == "mcp-only"));
+    assert!(rows.iter().all(|r| r["path"].as_str().unwrap().ends_with("SKILL.md")));
 }
 
 #[tokio::test]

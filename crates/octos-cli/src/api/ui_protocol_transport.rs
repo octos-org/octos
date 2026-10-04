@@ -12190,7 +12190,7 @@ async fn raw_profile_skills_list(
             session_id: session.0.clone(), host_token: params.host_token.clone(),
         }))?;
         let rt = skill_action_session_runtime(state, session, Some(&profile_id)).await?;
-        Some(rt.profile.skill_catalog(&rt.tools, Some(&rt.workspace_root)).await
+        Some(rt.profile.skill_catalog(Some(&rt.workspace_root)).await
             .map_err(|e| RpcError::internal_error(format!("Skill catalog unavailable: {e}")))?)
     } else { None };
     Ok(json!({

@@ -3564,12 +3564,17 @@ Servers advertising `skills.effective_catalog.v1` accept optional `session_id`
 on raw `profile/skills/list` (and optional `host_token` for app-owned sessions).
 The same durable-binding and host-credential rules apply. `skills` remains the Profile installation list;
 installation/removal semantics are unchanged. The additive `effective_skills`
-array is derived from the selected session runtime, its retained accepted plugin
-manifests, actual tool registry, and filtered instruction loader. Rows contain
-`name`, `version`, `kind` (`instructions` or `plugin`), `scope` (`builtin`,
-`global` deployment, `profile`, `project`), `path`, `available`, `tool_count`, and
-optional `tools`/`description`. Source scope describes the runtime that actually
-loaded it; a project directory is not automatically active on every server.
+array is derived from the selected session runtime's filtered instruction
+loader, the same source used for its prompt. It contains only instruction skills
+backed by `SKILL.md` (including compiled-in skill documents). Rows contain
+`name`, `version`, `kind: "instructions"`, `scope` (`builtin`, `global` deployment,
+`profile`, `project`), `path`, `available`, and `description`. Tool-only plugins
+and MCP-only packages do not enter this catalog; a package with both instructions
+and tools contributes one instruction entry. Executable tool and MCP server
+inventory belong to `tool/status/list` and `mcp/status/list`. Clients should
+ignore non-instruction rows from earlier mixed-catalog servers. Source scope
+describes instruction sources actually loaded, so global/project groups may be
+empty; a directory on disk is not automatically active on every server.
 `profile_id` and `session_id` echo the answered context. A null catalog means no
 session was requested. This read never installs or executes a skill.
 

@@ -791,7 +791,10 @@ impl ProfileRuntime {
         self.rebuild_plugin_layer_using(&Arc::new(reload)).await
     }
 
-    pub(crate) async fn skill_catalog(&self, tools: &ToolRegistry, workspace: Option<&Path>) -> Result<Vec<serde_json::Value>> {
+    /// Instruction skills from the same filtered loader used for the prompt.
+    /// Accepted plugin manifests and executable tool registries are separate:
+    /// loading a binary or an MCP server does not make it an instruction skill.
+    pub(crate) async fn skill_catalog(&self, workspace: Option<&Path>) -> Result<Vec<serde_json::Value>> {
         let filter = self.plugin_reload.as_ref().and_then(|r| r.skill_filter.clone());
         let instructions = build_account_skills_loader(&self.data_dir).with_skill_filter(filter).list_skills().await?;
         let scope = |path: &Path| {
@@ -804,17 +807,9 @@ impl ProfileRuntime {
             rows.push(serde_json::json!({"name":skill.name,"version":skill.version,
                 "scope":if skill.builtin {"builtin"} else {scope(&skill.path)},
                 "path":skill.path,"kind":"instructions","available":skill.available,
-                "description":skill.description,"tool_count":0}));
+                "description":skill.description}));
         }
-        let tool_names = tools.tool_names();
-        for plugin in &self.loaded_plugins {
-            let active: Vec<_> = plugin.tools.iter().filter(|name| tool_names.contains(name)).collect();
-            rows.push(serde_json::json!({"name":plugin.id,"version":plugin.version,
-                "scope":scope(&plugin.path),"path":plugin.path,"kind":"plugin",
-                "available":plugin.tools.is_empty() || !active.is_empty(),
-                "tool_count":active.len(),"tools":active}));
-        }
-        rows.sort_by(|a,b| a["name"].as_str().cmp(&b["name"].as_str()).then_with(|| a["kind"].as_str().cmp(&b["kind"].as_str())));
+        rows.sort_by(|a,b| a["name"].as_str().cmp(&b["name"].as_str()));
         Ok(rows)
     }
 
