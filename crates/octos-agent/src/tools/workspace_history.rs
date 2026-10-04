@@ -245,8 +245,15 @@ impl Tool for WorkspaceShowTool {
         let input: WorkspaceShowInput =
             serde_json::from_value(args.clone()).wrap_err("invalid workspace_show input")?;
 
-        // Reject commit hashes with path traversal
-        if input.commit.contains("..") || input.commit.contains('/') {
+        // Reject commit hashes with path traversal, and anything that
+        // looks like a git option: a value starting with `-` is parsed as
+        // a flag by `git show` (e.g. `--output=/etc/passwd` writes a
+        // file), not as a revision. The traversal checks alone admit
+        // slash-free option strings (CVE-2025-68143 class).
+        if input.commit.starts_with('-')
+            || input.commit.contains("..")
+            || input.commit.contains('/')
+        {
             return Ok(ToolResult {
                 output: "invalid commit hash".to_string(),
                 success: false,
@@ -372,9 +379,12 @@ impl Tool for WorkspaceDiffTool {
         let input: WorkspaceDiffInput =
             serde_json::from_value(args.clone()).wrap_err("invalid workspace_diff input")?;
 
-        // Reject traversal in commit refs
+        // Reject traversal in commit refs, and anything option-like: a
+        // value starting with `-` is parsed as a flag by `git diff`
+        // (e.g. `--output=pwned..HEAD`), not as a revision. Slash-free
+        // option strings currently pass the traversal check.
         for ref_str in [&input.from_commit, &input.to_commit] {
-            if ref_str.contains('/') && !ref_str.starts_with("HEAD") {
+            if ref_str.starts_with('-') || (ref_str.contains('/') && !ref_str.starts_with("HEAD")) {
                 return Ok(ToolResult {
                     output: "invalid commit ref".to_string(),
                     success: false,
@@ -629,6 +639,29 @@ mod tests {
             .unwrap();
         assert!(!diff_to.success, "{}", diff_to.output);
         assert!(!out.exists(), "git must not treat a revision as an option");
+
+        // The slash-free variant is the real regression pin: before the
+        // option-like refusal, the traversal checks only caught values
+        // that happened to contain a slash — `--output=pwned2` (relative,
+        // no slash) wrote a file into the working tree.
+        let bare = WorkspaceShowTool::new(temp.path())
+            .execute(&serde_json::json!({
+                "project": "slides/test-deck", "commit": "--output=pwned2", "file": "script.js"
+            }))
+            .await
+            .unwrap();
+        assert!(!bare.success, "{}", bare.output);
+        let bare_diff = WorkspaceDiffTool::new(temp.path())
+            .execute(&serde_json::json!({
+                "project": "slides/test-deck", "from_commit": "--output=pwned2", "to_commit": "HEAD"
+            }))
+            .await
+            .unwrap();
+        assert!(!bare_diff.success, "{}", bare_diff.output);
+        assert!(
+            !temp.path().join("slides/test-deck/pwned2").exists(),
+            "git must not write files from slash-free option-like revisions"
+        );
     }
 
     // ── workspace_log tests ────────────────────────────────────────
