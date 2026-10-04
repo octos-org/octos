@@ -5124,7 +5124,6 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
     assert_eq!(decoded, bulk);
 
     let overview = MemoryOverviewResult {
-
         scope: None,
         profile_id: None,
         overview: serde_json::json!({ "ok": true, "long_term": "# MEMORY" }),
@@ -5134,7 +5133,6 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
     assert_eq!(decoded.overview, overview.overview);
 
     let entity = MemoryEntityResult {
-
         scope: None,
         profile_id: None,
         name: "acme-corp".into(),

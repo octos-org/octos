@@ -2684,8 +2684,14 @@ impl ConnectionUiFeatures {
             }
         }
         if state.profile_store.is_some() {
-            push_capability_feature(&mut capabilities.supported_features, "memory.session_scope.v1");
-            push_capability_feature(&mut capabilities.supported_features, "skills.effective_catalog.v1");
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                "memory.session_scope.v1",
+            );
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                "skills.effective_catalog.v1",
+            );
         }
         if state.profile_store.is_some() && self.skill_actions_available() {
             push_capability_feature(
@@ -11663,17 +11669,33 @@ async fn tool_status_list_result(
 }
 
 async fn mcp_status_list_result(
-    state: &Arc<AppState>, session_id: &SessionKey, active_profile_id: Option<&str>,
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
     let registry = runtime_inventory_registry(state, session_id, active_profile_id).await?;
-    let connections = registry.map(|r| r.mcp_server_statuses()).unwrap_or_default();
-    let tool_refs: Vec<Vec<&str>> = connections.iter()
-        .map(|s| s.tools.iter().map(String::as_str).collect()).collect();
-    let servers: Vec<_> = connections.iter().zip(&tool_refs).map(|(s, tools)|
-        super::coding_tool_contract::McpServerStatusView {
-            id:&s.id, display_name:Some(&s.display_name), transport:Some(&s.transport),
-            status:&s.status, tool_count:s.tools.len(), tools, error:s.error.as_deref(),
-        }).collect();
+    let connections = registry
+        .map(|r| r.mcp_server_statuses())
+        .unwrap_or_default();
+    let tool_refs: Vec<Vec<&str>> = connections
+        .iter()
+        .map(|s| s.tools.iter().map(String::as_str).collect())
+        .collect();
+    let servers: Vec<_> = connections
+        .iter()
+        .zip(&tool_refs)
+        .map(
+            |(s, tools)| super::coding_tool_contract::McpServerStatusView {
+                id: &s.id,
+                display_name: Some(&s.display_name),
+                transport: Some(&s.transport),
+                status: &s.status,
+                tool_count: s.tools.len(),
+                tools,
+                error: s.error.as_deref(),
+            },
+        )
+        .collect();
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
     Ok(super::coding_tool_contract::mcp_status_list_payload(
@@ -12204,16 +12226,29 @@ async fn raw_profile_skills_list(
         .collect::<Result<Vec<_>, _>>()?;
     let effective = if let Some(session) = params.session_id.as_ref() {
         if !session.0.starts_with(&format!("{profile_id}:")) {
-            return Err(RpcError::permission_denied("Skill session is outside the selected profile"));
+            return Err(RpcError::permission_denied(
+                "Skill session is outside the selected profile",
+            ));
         }
         validate_session_scope(session, Some(&profile_id), connection_profile_id)?;
-        resolve_memory_context(state, &profile_id, Some(&octos_core::ui_protocol::MemorySessionContext {
-            session_id: session.0.clone(), host_token: params.host_token.clone(),
-        }))?;
+        resolve_memory_context(
+            state,
+            &profile_id,
+            Some(&octos_core::ui_protocol::MemorySessionContext {
+                session_id: session.0.clone(),
+                host_token: params.host_token.clone(),
+            }),
+        )?;
         let rt = skill_action_session_runtime(state, session, Some(&profile_id)).await?;
-        Some(rt.profile.skill_catalog(Some(&rt.workspace_root)).await
-            .map_err(|e| RpcError::internal_error(format!("Skill catalog unavailable: {e}")))?)
-    } else { None };
+        Some(
+            rt.profile
+                .skill_catalog(Some(&rt.workspace_root))
+                .await
+                .map_err(|e| RpcError::internal_error(format!("Skill catalog unavailable: {e}")))?,
+        )
+    } else {
+        None
+    };
     Ok(json!({
         "profile_id": profile_id,
         "count": skills.len(),
@@ -21191,7 +21226,9 @@ async fn handle_raw_appui_rpc(
             ))
             .await
         }
-        APPUI_METHOD_SESSION_HISTORY_LIST => session_history::list(state, request, connection_profile_id).await,
+        APPUI_METHOD_SESSION_HISTORY_LIST => {
+            session_history::list(state, request, connection_profile_id).await
+        }
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id).await
         }
@@ -32882,26 +32919,36 @@ fn resolve_memory_context(
     context: Option<&octos_core::ui_protocol::MemorySessionContext>,
 ) -> Result<(Option<String>, Value), RpcError> {
     let Some(context) = context else {
-        return Ok((None, json!({"kind":"profile", "namespace":null, "session_id":null})));
+        return Ok((
+            None,
+            json!({"kind":"profile", "namespace":null, "session_id":null}),
+        ));
     };
     let session = SessionKey(context.session_id.clone());
     if context.session_id.trim().is_empty()
         || !context.session_id.starts_with(&format!("{profile_id}:"))
     {
-        return Err(RpcError::permission_denied("Memory session is outside the selected profile"));
+        return Err(RpcError::permission_denied(
+            "Memory session is outside the selected profile",
+        ));
     }
     validate_session_scope(&session, Some(profile_id), Some(profile_id))?;
     let ps = profile_store(state)?;
-    let profile = ps.get(profile_id).map_err(|e| RpcError::internal_error(e.to_string()))?
+    let profile = ps
+        .get(profile_id)
+        .map_err(|e| RpcError::internal_error(e.to_string()))?
         .ok_or_else(|| RpcError::not_found("profile", profile_id))?;
     let peers = ps.resolve_data_dir(&profile).join("peers");
     use crate::peers::app_binding::{self, SessionAppBinding};
     let namespace = match app_binding::resolve_session_app_binding(&peers, &session) {
         SessionAppBinding::Unbound => None,
         SessionAppBinding::Refused(reason) => return Err(RpcError::permission_denied(reason)),
-        SessionAppBinding::Bound { memory_namespace, .. } => {
+        SessionAppBinding::Bound {
+            memory_namespace, ..
+        } => {
             let topic = session.topic().unwrap_or_default();
-            let slug = app_binding::parse_context_topic(topic).map(|(s, _)| s)
+            let slug = app_binding::parse_context_topic(topic)
+                .map(|(s, _)| s)
                 .or_else(|| topic.strip_prefix("peer-"))
                 .ok_or_else(|| RpcError::permission_denied("Missing app memory binding"))?;
             let binding = app_binding::read_peer_host_binding(&peers, slug)
@@ -32909,8 +32956,10 @@ fn resolve_memory_context(
             if !app_binding::host_token_matches(&binding, context.host_token.as_deref()) {
                 return Err(host_token_error(slug));
             }
-            Some(crate::runtime::memory_namespace::validate_memory_namespace(&memory_namespace)
-                .map_err(RpcError::invalid_params)?)
+            Some(
+                crate::runtime::memory_namespace::validate_memory_namespace(&memory_namespace)
+                    .map_err(RpcError::invalid_params)?,
+            )
         }
     };
     let scope = json!({"kind": if namespace.is_some() {"namespace"} else {"profile"},
@@ -32951,11 +33000,20 @@ async fn handle_memory_overview(
             return;
         }
     };
-    let (namespace, scope) = match resolve_memory_context(state, &profile_id, params.context.as_ref()) {
-        Ok(scope) => scope,
-        Err(error) => { let _ = send_rpc_error(ws, Some(id), error); return; }
-    };
-    let result = super::memory_panel::profile_memory_scoped(state.clone(), &profile_id, namespace.as_deref()).await;
+    let (namespace, scope) =
+        match resolve_memory_context(state, &profile_id, params.context.as_ref()) {
+            Ok(scope) => scope,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
+    let result = super::memory_panel::profile_memory_scoped(
+        state.clone(),
+        &profile_id,
+        namespace.as_deref(),
+    )
+    .await;
     match result {
         Ok(axum::Json(overview)) => match serde_json::to_value(&overview) {
             // The REST body is forwarded whole under `overview` (the
@@ -33030,13 +33088,22 @@ async fn handle_memory_entity(
             return;
         }
     };
-    let (namespace, scope) = match resolve_memory_context(state, &profile_id, params.context.as_ref()) {
-        Ok(scope) => scope,
-        Err(error) => { let _ = send_rpc_error(ws, Some(id), error); return; }
-    };
+    let (namespace, scope) =
+        match resolve_memory_context(state, &profile_id, params.context.as_ref()) {
+            Ok(scope) => scope,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
     let entity_name = params.name.clone();
-    let result =
-        super::memory_panel::profile_memory_entity_scoped(state.clone(), &profile_id, namespace.as_deref(), params.name).await;
+    let result = super::memory_panel::profile_memory_entity_scoped(
+        state.clone(),
+        &profile_id,
+        namespace.as_deref(),
+        params.name,
+    )
+    .await;
     match result {
         Ok(axum::Json(entity)) => {
             // `ok` is dropped — RPC success is carried by the envelope.
@@ -33108,7 +33175,15 @@ async fn resolve_memory_profile_runtime(
     requested: Option<&str>,
     method: &str,
     context: Option<&octos_core::ui_protocol::MemorySessionContext>,
-) -> Result<(String, Arc<crate::runtime::ProfileRuntime>, crate::runtime::memory_namespace::SessionMemory, Value), RpcError> {
+) -> Result<
+    (
+        String,
+        Arc<crate::runtime::ProfileRuntime>,
+        crate::runtime::memory_namespace::SessionMemory,
+        Value,
+    ),
+    RpcError,
+> {
     let profile_id = resolve_memory_profile_id(state, headers, identity, requested, method)?;
     let (namespace, scope) = resolve_memory_context(state, &profile_id, context)?;
     // Boxed on purpose: the runtime lookup embeds the whole cold-bootstrap
@@ -33121,12 +33196,15 @@ async fn resolve_memory_profile_runtime(
         Some(runtime) => {
             use crate::runtime::memory_namespace::SessionMemory;
             let memory = match namespace {
-                Some(ns) => SessionMemory::namespaced(&runtime, &ns).await
-                    .map_err(|e| RpcError::internal_error(format!("memory namespace unavailable: {e}")))?,
+                Some(ns) => SessionMemory::namespaced(&runtime, &ns)
+                    .await
+                    .map_err(|e| {
+                        RpcError::internal_error(format!("memory namespace unavailable: {e}"))
+                    })?,
                 None => SessionMemory::profile(&runtime),
             };
             Ok((profile_id, runtime, memory, scope))
-        },
+        }
         None => Err(runtime_unavailable_error(
             profile_runtime_unavailable_message(state, &profile_id),
         )),
@@ -33377,7 +33455,11 @@ async fn handle_memory_load(
         // A load is a visit: bump the heat first so hot records keep
         // their vector and get nominated for promotion, and so the
         // returned snapshot already carries this visit.
-        match if count_visit { recall.touch(&lookup_id) } else { Ok(true) } {
+        match if count_visit {
+            recall.touch(&lookup_id)
+        } else {
+            Ok(true)
+        } {
             Ok(true) => {}
             Ok(false) => return Ok::<_, eyre::Report>(None),
             Err(error) => {
@@ -33457,8 +33539,7 @@ async fn handle_memory_load(
             return;
         }
     };
-    let mut body =
-        json!({ "profile_id": profile_id, "scope": scope, "record": record, "page_truncated": page_truncated });
+    let mut body = json!({ "profile_id": profile_id, "scope": scope, "record": record, "page_truncated": page_truncated });
     if let Some(page) = page {
         body["page"] = json!(page);
     }

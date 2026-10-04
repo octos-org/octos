@@ -794,22 +794,37 @@ impl ProfileRuntime {
     /// Instruction skills from the same filtered loader used for the prompt.
     /// Accepted plugin manifests and executable tool registries are separate:
     /// loading a binary or an MCP server does not make it an instruction skill.
-    pub(crate) async fn skill_catalog(&self, workspace: Option<&Path>) -> Result<Vec<serde_json::Value>> {
-        let filter = self.plugin_reload.as_ref().and_then(|r| r.skill_filter.clone());
-        let instructions = build_account_skills_loader(&self.data_dir).with_skill_filter(filter).list_skills().await?;
+    pub(crate) async fn skill_catalog(
+        &self,
+        workspace: Option<&Path>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let filter = self
+            .plugin_reload
+            .as_ref()
+            .and_then(|r| r.skill_filter.clone());
+        let instructions = build_account_skills_loader(&self.data_dir)
+            .with_skill_filter(filter)
+            .list_skills()
+            .await?;
         let scope = |path: &Path| {
-            if path.starts_with(self.data_dir.join("skills")) { "profile" }
-            else if workspace.is_some_and(|w| path.starts_with(w.join(".octos"))) { "project" }
-            else { "global" }
+            if path.starts_with(self.data_dir.join("skills")) {
+                "profile"
+            } else if workspace.is_some_and(|w| path.starts_with(w.join(".octos"))) {
+                "project"
+            } else {
+                "global"
+            }
         };
         let mut rows = Vec::new();
         for skill in instructions {
-            rows.push(serde_json::json!({"name":skill.name,"version":skill.version,
+            rows.push(
+                serde_json::json!({"name":skill.name,"version":skill.version,
                 "scope":if skill.builtin {"builtin"} else {scope(&skill.path)},
                 "path":skill.path,"kind":"instructions","available":skill.available,
-                "description":skill.description}));
+                "description":skill.description}),
+            );
         }
-        rows.sort_by(|a,b| a["name"].as_str().cmp(&b["name"].as_str()));
+        rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         Ok(rows)
     }
 
