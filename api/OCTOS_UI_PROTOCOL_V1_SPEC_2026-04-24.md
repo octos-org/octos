@@ -3541,3 +3541,58 @@ fields are open registries; clients must preserve unknown values. The
 `LoopFire` object mirrors the `loop/fire_now` result object (`queued`,
 optional `duplicate`, `continuation_id`, `dedupe_key`, `reason`,
 `priority`, and `message`).
+
+### Session resources and history (additive, 2026-10-04)
+
+Servers advertising `memory.session_scope.v1` accept optional
+`context: { session_id, host_token? }` on all five `memory/*` methods. Existing
+`profile_id` authorization applies first. The session must belong to that
+profile. Core derives the memory namespace from its durable app binding; the
+client cannot supply a namespace or path. Bound app peers/contexts require the
+owning host credential, including on admin connections. Closed, missing or
+invalid bindings are refused, never replaced with Profile memory.
+
+Every success includes `scope: { kind: "profile" | "namespace", session_id:
+string | null, namespace: string | null }`. Absent context preserves the legacy
+Profile scope. Ordinary session memory is shared across that Profile's projects;
+a namespace has no implicit Profile/global fallback. `memory/load` additionally
+accepts `count_visit: false` for inspection without changing visit counts or
+promotion heat (omitted/true retains retrieval behavior). Clients must reject
+missing/mismatched scope echoes when displaying session-scoped memory.
+
+Servers advertising `skills.effective_catalog.v1` accept optional `session_id`
+on raw `profile/skills/list` (and optional `host_token` for app-owned sessions).
+The same durable-binding and host-credential rules apply. `skills` remains the Profile installation list;
+installation/removal semantics are unchanged. The additive `effective_skills`
+array is derived from the selected session runtime, its retained accepted plugin
+manifests, actual tool registry, and filtered instruction loader. Rows contain
+`name`, `version`, `kind` (`instructions` or `plugin`), `scope` (`builtin`,
+`global` deployment, `profile`, `project`), `path`, `available`, `tool_count`, and
+optional `tools`/`description`. Source scope describes the runtime that actually
+loaded it; a project directory is not automatically active on every server.
+`profile_id` and `session_id` echo the answered context. A null catalog means no
+session was requested. This read never installs or executes a skill.
+
+Raw `session/history/list` is advertised in `supported_methods`. Params are
+`{ workspaces?: string[], profile_id?: string, offset?: number, limit?: number }`.
+It lists Profile stores and known project stores, subject to the connection's
+frozen Profile scope (admin/unscoped connections may list all Profiles). Up to
+128 workspace addresses are accepted; Core canonicalizes and validates each
+with the same workspace gate as `session/list`. Session-ingress credentials are
+denied by the shared raw-method guard. Internal child transcripts and host-bound
+app peer/context history are excluded.
+
+The result is `{ sessions, total, next_offset, workspaces,
+unavailable_workspaces, coverage: "profile_and_known_workspaces" }`; limit
+is 1..200, default 100. Rows carry the usual session-list metadata plus full
+`id`, `profile_id`, and `workspace_root` (null for a Profile store). Clients must
+key rows by all three fields, open with that exact Profile/cwd, and start a fresh
+history/replay authority when the same wire id belongs to another workspace.
+Workspace hints are navigation locations, never cached session authority. This
+catalog does not recursively scan the server filesystem; clients should persist
+workspace addresses and clearly report coverage and unavailable locations.
+
+On every accepted session change, clients invalidate resource caches, load the
+new session's effective catalog and memory scope, and discard replies from older
+connection/open generations. UI memory inspection must not increment model
+retrieval statistics.

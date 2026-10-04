@@ -3692,12 +3692,37 @@ pub struct ContentBulkDeleteResult {
     pub deleted: usize,
 }
 
+/// Bind a memory request to a session's durable memory assignment.
+/// The server derives the namespace; callers cannot select an arbitrary path.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySessionContext {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_token: Option<String>,
+}
+impl std::fmt::Debug for MemorySessionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemorySessionContext").field("session_id", &self.session_id).finish_non_exhaustive()
+    }
+}
+
+/// Server-attested effective storage scope. `namespace: null` means that the
+/// profile's sessions share the same persistent memory, regardless of cwd.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryScope {
+    pub kind: String,
+    pub session_id: Option<String>,
+    pub namespace: Option<String>,
+}
+
 /// Params for `memory/overview`. Optional profile selection; the struct exists so
 /// `{}` / `null` params decode uniformly (mirrors
 /// [`SystemStatusGetParams`]; the wire `params` MEMBER must still be
 /// present — the frame parser rejects requests without one).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryOverviewParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<MemorySessionContext>,
     /// Omit for the authenticated account/tenant profile. Explicit profiles require authorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
@@ -3717,6 +3742,8 @@ pub struct MemoryOverviewParams {
 /// marker is ever spliced into the markdown.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryOverviewResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<MemoryScope>,
     /// The profile that answered. Absent only when decoding an older server reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
@@ -3729,6 +3756,8 @@ pub struct MemoryOverviewResult {
 /// same string `memory/overview` returns in each entity summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEntityParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<MemorySessionContext>,
     /// Omit for the authenticated account/tenant profile. Explicit profiles require authorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
@@ -3743,6 +3772,8 @@ pub struct MemoryEntityParams {
 /// fit one ~1 MiB WS text frame).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEntityResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<MemoryScope>,
     /// The profile that answered. Absent only when decoding an older server reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
@@ -3775,6 +3806,8 @@ pub const MEMORY_INGEST_MAX_RECORDS: usize = 500;
 /// [`MEMORY_SEARCH_MAX_LIMIT`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemorySearchParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<MemorySessionContext>,
     /// Omit for the authenticated account/tenant profile. Explicit profiles require authorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
@@ -3798,6 +3831,8 @@ pub struct MemorySearchParams {
 /// `trust: "untrusted"`; callers must treat their text as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemorySearchResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<MemoryScope>,
     /// The profile that answered. Absent only when decoding an older server reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
@@ -3809,6 +3844,11 @@ pub struct MemorySearchResult {
 /// `id` a `memory/search` hit returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryLoadParams {
+    /// Omit/true for retrieval; false for a read-only inspector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_visit: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<MemorySessionContext>,
     /// Omit for the authenticated account/tenant profile. Explicit profiles require authorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
@@ -3825,6 +3865,8 @@ pub struct MemoryLoadParams {
 /// truth for its body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryLoadResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<MemoryScope>,
     /// The profile that answered. Absent only when decoding an older server reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
@@ -3847,6 +3889,8 @@ pub struct MemoryLoadResult {
 /// records are refused — they are written through the memory bank.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemoryIngestParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<MemorySessionContext>,
     /// Omit for the authenticated account/tenant profile. Explicit profiles require authorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
@@ -3864,6 +3908,8 @@ pub struct MemoryIngestParams {
 /// those the server embedded itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryIngestResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<MemoryScope>,
     /// The profile that answered. Absent only when decoding an older server reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,

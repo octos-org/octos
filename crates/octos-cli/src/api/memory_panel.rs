@@ -520,6 +520,14 @@ pub(super) async fn profile_memory(
     state: Arc<AppState>,
     profile_id: &str,
 ) -> Result<Json<MemoryOverviewResponse>, StatusCode> {
+    profile_memory_scoped(state, profile_id, None).await
+}
+
+pub(super) async fn profile_memory_scoped(
+    state: Arc<AppState>,
+    profile_id: &str,
+    namespace: Option<&str>,
+) -> Result<Json<MemoryOverviewResponse>, StatusCode> {
     let ps = state
         .profile_store
         .as_ref()
@@ -536,7 +544,11 @@ pub(super) async fn profile_memory(
     // exists → empty state; dangling → 500) and materializing dirs on
     // a read endpoint (codex #1611 r8 P2). The no-follow walk below is
     // the sole authority on what exists.
-    let store = octos_memory::MemoryStore::at_memory_dir(data_dir.join("memory"));
+    let memory_root = match namespace {
+        Some(ns) => crate::runtime::memory_namespace::memory_namespace_root(&data_dir, ns),
+        None => data_dir.clone(),
+    };
+    let store = octos_memory::MemoryStore::at_memory_dir(memory_root.join("memory"));
 
     let empty = |state: &AppState, profile| {
         Json(MemoryOverviewResponse {
@@ -549,7 +561,7 @@ pub(super) async fn profile_memory(
             entities_truncated: false,
             staging_notes: 0,
             staging_truncated: false,
-            refresh_enabled: effective_refresh_enabled(state, profile),
+            refresh_enabled: namespace.is_none() && effective_refresh_enabled(state, profile),
         })
     };
 
@@ -679,7 +691,7 @@ pub(super) async fn profile_memory(
         entities_truncated,
         staging_notes,
         staging_truncated,
-        refresh_enabled: effective_refresh_enabled(&state, &profile),
+        refresh_enabled: namespace.is_none() && effective_refresh_enabled(&state, &profile),
     }))
 }
 
@@ -705,6 +717,15 @@ pub(super) async fn profile_memory_entity(
     profile_id: &str,
     name: String,
 ) -> Result<Json<MemoryEntityResponse>, StatusCode> {
+    profile_memory_entity_scoped(state, profile_id, None, name).await
+}
+
+pub(super) async fn profile_memory_entity_scoped(
+    state: Arc<AppState>,
+    profile_id: &str,
+    namespace: Option<&str>,
+    name: String,
+) -> Result<Json<MemoryEntityResponse>, StatusCode> {
     let ps = state
         .profile_store
         .as_ref()
@@ -717,7 +738,11 @@ pub(super) async fn profile_memory_entity(
 
     // Path-derivation only — no create_dir_all on a read endpoint
     // (codex #1611 r8 P2, same rationale as the overview handler).
-    let store = octos_memory::MemoryStore::at_memory_dir(data_dir.join("memory"));
+    let memory_root = match namespace {
+        Some(ns) => crate::runtime::memory_namespace::memory_namespace_root(&data_dir, ns),
+        None => data_dir.clone(),
+    };
+    let store = octos_memory::MemoryStore::at_memory_dir(memory_root.join("memory"));
     // Same traversal-character sanitization `read_entity` applies, on
     // top of the FD-anchored walk — a symlinked page, bank dir or any
     // ancestor is a plain 404.
