@@ -3955,6 +3955,33 @@ pub(crate) fn resolve_my_profile_id(
     }
 }
 
+/// Resolve an optional explicitly requested profile for memory RPCs. Host scope
+/// remains authoritative even for administrators; account defaults stay unchanged.
+pub(crate) fn resolve_memory_profile_id(
+    identity: &AuthIdentity,
+    ps: &crate::profiles::ProfileStore,
+    state: &AppState,
+    headers: &HeaderMap,
+    requested: Option<&str>,
+) -> Result<String, StatusCode> {
+    let Some(requested) = requested else {
+        return resolve_my_profile_id(identity, ps, state, headers);
+    };
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if host_scoped_profile_id(state, headers).is_some_and(|host| host != requested)
+        || !is_authorized_for_profile(state, identity, requested)
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    ps.get(requested)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(requested.to_owned())
+}
+
 /// Resolve the full profile for "my" endpoints.
 fn resolve_my_profile(
     identity: &AuthIdentity,

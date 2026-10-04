@@ -2118,14 +2118,32 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `invalid_params` on the over-cap guard; `resource_not_found` with
   `data.resource_type = "content"` on REST 404 (collection endpoint).
 
+#### Memory profile scope
+
+All five `memory/*` methods accept optional `profile_id: string`. When omitted,
+identity/tenant-host resolution is unchanged. An explicit profile must exist and
+be authorized by the same account/owned-subprofile/admin rules as other profile
+operations. A tenant host remains authoritative: requesting another profile is
+refused even for an administrator. A blank profile is `invalid_params`; an
+unauthorized profile or host mismatch is `permission_denied` (`-32120`) with
+`data.kind = "forbidden"` and `data.rest_status = 403`. A missing authorized
+profile is `resource_not_found` (`-32170`). Authorization precedes memory file
+access, runtime lookup and index writes.
+
+Every successful response includes top-level `profile_id: string`, the actual
+answering profile. Clients may decode older replies without that field, but must
+not attribute them to a requested profile. Existing parameters, truncation
+budgets, the `auxiliary.rest_to_ws.v1` gate, and session-ingress/stdin restrictions
+are unchanged. REST `/api/my/memory` routes keep their identity-scoped behavior.
+
 #### `memory/overview`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/my/memory`
-- Params type: `MemoryOverviewParams` — `{}` (accepts `params: {}` or
+- Params type: `MemoryOverviewParams` — `{ profile_id?: string }` (accepts `params: {}` or
   `params: null`; the `params` member itself must be present — the
   shared frame parser rejects a request without one, codex #1621 r5).
-- Result type: `MemoryOverviewResult` — `{ overview: MemoryOverviewResponse }`.
+- Result type: `MemoryOverviewResult` — `{ profile_id: string, overview: MemoryOverviewResponse }`.
   `overview` carries the REST panel body whole (`memory_panel.rs`), plus
   RPC-layer truncation metadata: each document field is capped to a
   per-field JSON-ESCAPED byte budget (`long_term` 96 KiB, `today`
@@ -2142,9 +2160,9 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/my/memory/entities/{name}`
-- Params type: `MemoryEntityParams` — `{ name: string }` (the entity
+- Params type: `MemoryEntityParams` — `{ profile_id?: string, name: string }` (the entity
   page stem, as returned in each overview entity summary).
-- Result type: `MemoryEntityResult` — `{ name: string, content: string,
+- Result type: `MemoryEntityResult` — `{ profile_id: string, name: string, content: string,
   content_truncated: bool, content_total_bytes: number }`. `content` is
   capped at a 384 KiB JSON-ESCAPED budget; when capped it is a clean
   UTF-8 prefix with the truth declared in the two metadata fields.
@@ -2160,7 +2178,7 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   the caller's profile index (BM25 fused with vectors when the profile
   has an embedder; BM25-only otherwise — never refused for lack of one)
   and returns abstracts only. Bodies come from `memory/load`.
-- Params type: `MemorySearchParams` — `{ query: string, kinds?: string[],
+- Params type: `MemorySearchParams` — `{ profile_id?: string, query: string, kinds?: string[],
   sources?: string[], since?: string, until?: string, limit?: number }`.
   `query` must be non-blank. `kinds` narrows to `"episode"` /
   `"document"` / `"knowledge"` (empty = all; lenient aliases such as
@@ -2170,7 +2188,7 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `since` is the start of that UTC day, a bare `until` its end (`until`
   is inclusive). `limit` defaults to `MEMORY_SEARCH_DEFAULT_LIMIT` (10)
   and is clamped to `1..=MEMORY_SEARCH_MAX_LIMIT` (50).
-- Result type: `MemorySearchResult` — `{ hits: Hit[] }` where each hit is
+- Result type: `MemorySearchResult` — `{ profile_id: string, hits: Hit[] }` where each hit is
   the JSON of `octos_memory::Hit`: `{ id: string, kind: "episode" |
   "document" | "knowledge", source: string, title: string, abstract:
   string, score: number, timestamp: RFC3339, trust: "trusted" |
@@ -2182,7 +2200,7 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   or inverted time bound; `runtime_unavailable` when the resolved
   profile has no bootstrappable runtime (same message as session open).
 - Identity resolves to a profile exactly as `memory/overview` does
-  (`/api/my/*` host-scope rules); auth-bound — omitted from the stdio
+  (the shared memory profile scope rules above); auth-bound — omitted from the stdio
   capability set (see § stdio policy) and refused for session-ingress
   credentials.
 
@@ -2193,8 +2211,8 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `id` a `memory/search` hit returned. Counts a visit on the record
   (MemoryOS-style heat: hot records keep their vector and are nominated
   for promotion into Knowledge).
-- Params type: `MemoryLoadParams` — `{ id: string }` (non-blank).
-- Result type: `MemoryLoadResult` — `{ record: Record, page?: string,
+- Params type: `MemoryLoadParams` — `{ profile_id?: string, id: string }` (non-blank).
+- Result type: `MemoryLoadResult` — `{ profile_id: string, record: Record, page?: string,
   page_truncated: bool }`. `record` is the JSON of `octos_memory::Record`
   (`id`, `kind`, `source`, `parent?`, `timestamp`, `title`, `abstract`,
   `body?`, `trust`, `fingerprint?`, `visits`, `last_visit?`, `promoted`,
@@ -2218,9 +2236,9 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   protocol. Apps (Mail, Calendar, contacts, notes) push derived records
   into the profile's Recall index; the apps remain the record of truth.
   Runs on the same authenticated path as `memory/overview` (identity
-  required, `/api/my/*` profile resolution); session-ingress credentials
+  required, shared memory profile resolution); session-ingress credentials
   are refused by the scope guard.
-- Params type: `MemoryIngestParams` — `{ records: Record[], vectors?:
+- Params type: `MemoryIngestParams` — `{ profile_id?: string, records: Record[], vectors?:
   (number[] | null)[], embed?: bool }`. Each record is an
   `octos_memory::Record` JSON: required `id`, `kind`, `source`,
   `timestamp` (RFC 3339), `title`, `abstract`; optional `parent`,
@@ -2246,7 +2264,7 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   batches of 16 — re-submitting an unchanged batch embeds nothing; an
   embedding failure fails the call (retry with `embed: false` to store
   BM25-only). Without an embedder records are stored BM25-only.
-- Result type: `MemoryIngestResult` — `{ inserted: number, updated:
+- Result type: `MemoryIngestResult` — `{ profile_id: string, inserted: number, updated:
   number, unchanged: number, vectors_stored: number, embedded: number }`
   (the `octos_memory::UpsertReport` counts plus how many vectors the
   server actually embedded in this call — unchanged records that kept

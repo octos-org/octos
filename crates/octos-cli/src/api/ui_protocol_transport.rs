@@ -32801,6 +32801,34 @@ fn apply_memory_overview_budgets(overview: &mut Value) {
     }
 }
 
+fn resolve_memory_profile_id(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: &AuthIdentity,
+    requested: Option<&str>,
+    method: &str,
+) -> Result<String, RpcError> {
+    let store = state.profile_store.as_ref().ok_or_else(|| {
+        RpcError::runtime_not_ready(format!(
+            "{method}: profile store not configured on this server"
+        ))
+    })?;
+    super::auth_handlers::resolve_memory_profile_id(identity, store, state, headers, requested)
+        .map_err(|status| {
+            if status == axum::http::StatusCode::FORBIDDEN {
+                RpcError::permission_denied("Memory profile is outside the authorized scope")
+                    .with_data(json!({"kind": "forbidden", "rest_status": 403}))
+            } else {
+                rest_status_to_rpc_error(
+                    method,
+                    status,
+                    None,
+                    &RestResourceContext::resource("profile", requested.unwrap_or_default()),
+                )
+            }
+        })
+}
+
 async fn handle_memory_overview(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -32808,7 +32836,7 @@ async fn handle_memory_overview(
     identity: Option<&AuthIdentity>,
     close_on_auth_unavailable: bool,
     id: String,
-    _params: MemoryOverviewParams,
+    params: MemoryOverviewParams,
 ) {
     let method = octos_core::ui_protocol::methods::MEMORY_OVERVIEW;
     let Some(identity) = identity.cloned() else {
@@ -32821,9 +32849,20 @@ async fn handle_memory_overview(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result =
-        super::memory_panel::my_memory(State(state.clone()), headers.clone(), Extension(identity))
-            .await;
+    let profile_id = match resolve_memory_profile_id(
+        state,
+        headers,
+        &identity,
+        params.profile_id.as_deref(),
+        method,
+    ) {
+        Ok(profile_id) => profile_id,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let result = super::memory_panel::profile_memory(state.clone(), &profile_id).await;
     match result {
         Ok(axum::Json(overview)) => match serde_json::to_value(&overview) {
             // The REST body is forwarded whole under `overview` (the
@@ -32834,7 +32873,12 @@ async fn handle_memory_overview(
             // head+tail preview (codex #1621 r1 P1).
             Ok(mut value) => {
                 apply_memory_overview_budgets(&mut value);
-                send_aux_rpc_result(ws, id, method, json!({ "overview": value }))
+                send_aux_rpc_result(
+                    ws,
+                    id,
+                    method,
+                    json!({ "profile_id": profile_id, "overview": value }),
+                )
             }
             Err(error) => {
                 let _ = send_rpc_error(
@@ -32880,14 +32924,22 @@ async fn handle_memory_entity(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
+    let profile_id = match resolve_memory_profile_id(
+        state,
+        headers,
+        &identity,
+        params.profile_id.as_deref(),
+        method,
+    ) {
+        Ok(profile_id) => profile_id,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let entity_name = params.name.clone();
-    let result = super::memory_panel::my_memory_entity(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        axum_path(params.name),
-    )
-    .await;
+    let result =
+        super::memory_panel::profile_memory_entity(state.clone(), &profile_id, params.name).await;
     match result {
         Ok(axum::Json(entity)) => {
             // `ok` is dropped — RPC success is carried by the envelope.
@@ -32906,6 +32958,7 @@ async fn handle_memory_entity(
                 id,
                 method,
                 json!({
+                    "profile_id": profile_id,
                     "name": entity.name,
                     "content": content,
                     "content_truncated": content_truncated,
@@ -32949,29 +33002,16 @@ const MEMORY_INGEST_EMBED_BATCH: usize = 16;
 const MEMORY_INGEST_KNOWLEDGE_REFUSAL: &str =
     "knowledge pages are written through save_memory / the memory bank, not ingest";
 
-/// Resolve the caller to its profile's live runtime: the identity →
-/// profile-id step is the one `memory/overview` takes through
-/// `memory_panel::my_memory` (`resolve_my_profile_id`), and the runtime
-/// lookup is the session path's `ensure_session_profile_runtime`. A
-/// profile without a bootstrappable runtime answers with the same
-/// `runtime_unavailable` message the session helpers use.
+/// Resolve and authorize the requested (or identity-default) profile before
+/// looking up its runtime. All five memory methods share the same scope rules.
 async fn resolve_memory_profile_runtime(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: &AuthIdentity,
+    requested: Option<&str>,
     method: &str,
 ) -> Result<(String, Arc<crate::runtime::ProfileRuntime>), RpcError> {
-    let Some(profile_store) = state.profile_store.as_ref() else {
-        return Err(RpcError::runtime_not_ready(format!(
-            "{method}: profile store not configured on this server"
-        )));
-    };
-    let profile_id =
-        crate::api::auth_handlers::resolve_my_profile_id(identity, profile_store, state, headers)
-            .map_err(|status| {
-            let context = RestResourceContext::resource("profile", "");
-            rest_status_to_rpc_error(method, status, None, &context)
-        })?;
+    let profile_id = resolve_memory_profile_id(state, headers, identity, requested, method)?;
     // Boxed on purpose: the runtime lookup embeds the whole cold-bootstrap
     // future (`ProfileRuntime::bootstrap_with_host_plugins`), and the three
     // Recall handlers are inlined into the WS and stdio dispatch state
@@ -33108,14 +33148,21 @@ async fn handle_memory_search(
             return;
         }
     };
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
+    let (profile_id, runtime) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        params.profile_id.as_deref(),
+        method,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let query = params.query.trim().to_owned();
     let query_vector = match runtime.embedder.as_ref() {
         Some(embedder) => match embedder.embed(&[query.as_str()]).await {
@@ -33161,7 +33208,12 @@ async fn handle_memory_search(
         .iter()
         .filter_map(|hit| serde_json::to_value(hit).ok())
         .collect();
-    send_aux_rpc_result(ws, id, method, json!({ "hits": hits }));
+    send_aux_rpc_result(
+        ws,
+        id,
+        method,
+        json!({ "profile_id": profile_id, "hits": hits }),
+    );
 }
 
 /// `memory/load` — stage two: fetch one record by id and count the
@@ -33194,14 +33246,21 @@ async fn handle_memory_load(
         );
         return;
     }
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
+    let (profile_id, runtime) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        params.profile_id.as_deref(),
+        method,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let recall = runtime.recall.clone();
     let lookup_id = record_id.clone();
     let fetched = tokio::task::spawn_blocking(move || {
@@ -33288,7 +33347,8 @@ async fn handle_memory_load(
             return;
         }
     };
-    let mut body = json!({ "record": record, "page_truncated": page_truncated });
+    let mut body =
+        json!({ "profile_id": profile_id, "record": record, "page_truncated": page_truncated });
     if let Some(page) = page {
         body["page"] = json!(page);
     }
@@ -33447,6 +33507,7 @@ async fn handle_memory_ingest(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
+    let requested_profile = params.profile_id.clone();
     let embed_requested = params.embed.unwrap_or(true);
     let ValidatedMemoryIngest { records, vectors } = match validate_memory_ingest(params) {
         Ok(validated) => validated,
@@ -33455,14 +33516,21 @@ async fn handle_memory_ingest(
             return;
         }
     };
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
+    let (profile_id, runtime) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        requested_profile.as_deref(),
+        method,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let mut embedded = 0usize;
     let (records, vectors): (Vec<octos_memory::Record>, Vec<Option<Vec<f32>>>) = match vectors {
         Some(vectors) => (records, vectors),
@@ -33597,6 +33665,7 @@ async fn handle_memory_ingest(
         id,
         method,
         json!({
+            "profile_id": profile_id,
             "inserted": report.inserted,
             "updated": report.updated,
             "unchanged": report.unchanged,

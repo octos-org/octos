@@ -8898,7 +8898,10 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         None,
         false,
         "memory-entity-unauth".into(),
-        MemoryEntityParams { name: "e-1".into() },
+        MemoryEntityParams {
+            profile_id: None,
+            name: "e-1".into(),
+        },
     )
     .await;
     let frame = recv_rpc_json(&mut rx).await;
@@ -8913,6 +8916,7 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-search-unauth".into(),
         MemorySearchParams {
+            profile_id: None,
             query: "dentist".into(),
             ..Default::default()
         },
@@ -8930,6 +8934,7 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-load-unauth".into(),
         MemoryLoadParams {
+            profile_id: None,
             id: "doc:mail:1".into(),
         },
     )
@@ -8946,6 +8951,7 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-ingest-unauth".into(),
         MemoryIngestParams {
+            profile_id: None,
             records: vec![json!({ "id": "doc:mail:1" })],
             vectors: None,
             embed: Some(false),
@@ -9150,6 +9156,7 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         true,
         "mem-entity".into(),
         MemoryEntityParams {
+            profile_id: None,
             name: "fleet".into(),
         },
     )
@@ -9174,6 +9181,7 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         true,
         "mem-entity-miss".into(),
         MemoryEntityParams {
+            profile_id: None,
             name: "missing".into(),
         },
     )
@@ -9327,6 +9335,7 @@ async fn memory_rpc_methods_declare_truncation_when_over_budget() {
         true,
         "mem-entity-cap".into(),
         MemoryEntityParams {
+            profile_id: None,
             name: "whale".into(),
         },
     )
@@ -45664,6 +45673,7 @@ fn ingest_doc_record(id: &str) -> Value {
 
 fn ingest_params(records: Vec<Value>) -> MemoryIngestParams {
     MemoryIngestParams {
+        profile_id: None,
         records,
         vectors: None,
         embed: None,
@@ -45673,6 +45683,7 @@ fn ingest_params(records: Vec<Value>) -> MemoryIngestParams {
 #[test]
 fn memory_search_filter_defaults_limit_and_leaves_filters_open() {
     let filter = memory_search_filter(&MemorySearchParams {
+        profile_id: None,
         query: "  dentist ".into(),
         ..Default::default()
     })
@@ -45687,6 +45698,7 @@ fn memory_search_filter_defaults_limit_and_leaves_filters_open() {
 #[test]
 fn memory_search_filter_clamps_limit_to_one_through_max() {
     let over = memory_search_filter(&MemorySearchParams {
+        profile_id: None,
         query: "q".into(),
         limit: Some(MEMORY_SEARCH_MAX_LIMIT * 10),
         ..Default::default()
@@ -45694,6 +45706,7 @@ fn memory_search_filter_clamps_limit_to_one_through_max() {
     .expect("valid params");
     assert_eq!(over.limit, MEMORY_SEARCH_MAX_LIMIT);
     let zero = memory_search_filter(&MemorySearchParams {
+        profile_id: None,
         query: "q".into(),
         limit: Some(0),
         ..Default::default()
@@ -45705,6 +45718,7 @@ fn memory_search_filter_clamps_limit_to_one_through_max() {
 #[test]
 fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
     let filter = memory_search_filter(&MemorySearchParams {
+        profile_id: None,
         query: "hike".into(),
         kinds: vec!["document".into(), "doc".into(), "knowledge".into()],
         sources: vec![" mail ".into(), "".into(), "calendar".into()],
@@ -45740,6 +45754,7 @@ fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
     assert_eq!(filter.limit, 5);
 
     let rfc3339 = memory_search_filter(&MemorySearchParams {
+        profile_id: None,
         query: "hike".into(),
         since: Some("2026-01-01T10:00:00+02:00".into()),
         ..Default::default()
@@ -45755,6 +45770,7 @@ fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
 #[test]
 fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     let empty = memory_search_filter(&MemorySearchParams {
+        profile_id: None,
         query: "   ".into(),
         ..Default::default()
     })
@@ -45762,6 +45778,7 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert_eq!(empty.code, rpc_error_codes::INVALID_PARAMS);
 
     let kind = memory_search_filter(&MemorySearchParams {
+        profile_id: None,
         query: "q".into(),
         kinds: vec!["mail".into()],
         ..Default::default()
@@ -45771,6 +45788,7 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert!(kind.message.contains("unknown kind"), "{}", kind.message);
 
     let date = memory_search_filter(&MemorySearchParams {
+        profile_id: None,
         query: "q".into(),
         since: Some("yesterday".into()),
         ..Default::default()
@@ -45780,6 +45798,7 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert!(date.message.contains("`since`"), "{}", date.message);
 
     let ordered = memory_search_filter(&MemorySearchParams {
+        profile_id: None,
         query: "q".into(),
         since: Some("2026-03-01".into()),
         until: Some("2026-02-01".into()),
@@ -45984,6 +46003,7 @@ fn memory_ingest_rejects_malformed_records() {
 #[test]
 fn memory_ingest_requires_vectors_parallel_to_records() {
     let mismatch = validate_memory_ingest(MemoryIngestParams {
+        profile_id: None,
         records: vec![
             ingest_doc_record("doc:mail:1"),
             ingest_doc_record("doc:mail:2"),
@@ -45995,6 +46015,7 @@ fn memory_ingest_requires_vectors_parallel_to_records() {
     assert_eq!(mismatch.code, rpc_error_codes::INVALID_PARAMS);
 
     let parallel = validate_memory_ingest(MemoryIngestParams {
+        profile_id: None,
         records: vec![
             ingest_doc_record("doc:mail:1"),
             ingest_doc_record("doc:mail:2"),
@@ -48923,4 +48944,279 @@ async fn should_replay_an_external_prompt_to_its_owner_after_the_side_table_forg
     .await;
     assert!(hosted.is_empty(), "{hosted:?}");
     question_task.abort();
+}
+
+// Memory belongs to the selected session profile, not the admin token's profile.
+async fn memory_profile_fixture() -> (tempfile::TempDir, Arc<AppState>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::profiles::ProfileStore::open_unified(dir.path()).unwrap());
+    let mut profiles = HashMap::new();
+    for id in ["memory-owner", "memory-other"] {
+        let profile = panel_user_profile(id);
+        store.save(&profile).unwrap();
+        let runtime = make_m11e_profile_with_llm_and_sandbox(
+            id,
+            &store.resolve_data_dir(&profile),
+            Arc::new(M11EStubLlm),
+            octos_agent::SandboxConfig::default(),
+        )
+        .await;
+        runtime
+            .memory_store
+            .write_long_term(&format!("# {id} private memory"))
+            .await
+            .unwrap();
+        runtime
+            .memory_store
+            .write_entity("project", &format!("# {id} project"))
+            .await
+            .unwrap();
+        profiles.insert(id.to_owned(), runtime);
+    }
+    (
+        dir,
+        Arc::new(AppState {
+            profile_store: Some(store),
+            profiles,
+            ..AppState::empty_for_tests()
+        }),
+    )
+}
+
+async fn memory_profile_rpc(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: &AuthIdentity,
+    method: &str,
+    params: Value,
+) -> Value {
+    let (ws, mut rx) = ws_connection_for_test(8);
+    match method {
+        "overview" => {
+            handle_memory_overview(
+                &ws,
+                state,
+                headers,
+                Some(identity),
+                false,
+                "m".into(),
+                serde_json::from_value(params).unwrap(),
+            )
+            .await
+        }
+        "entity" => {
+            handle_memory_entity(
+                &ws,
+                state,
+                headers,
+                Some(identity),
+                false,
+                "m".into(),
+                serde_json::from_value(params).unwrap(),
+            )
+            .await
+        }
+        "search" => {
+            handle_memory_search(
+                &ws,
+                state,
+                headers,
+                Some(identity),
+                false,
+                "m".into(),
+                serde_json::from_value(params).unwrap(),
+            )
+            .await
+        }
+        "load" => {
+            handle_memory_load(
+                &ws,
+                state,
+                headers,
+                Some(identity),
+                false,
+                "m".into(),
+                serde_json::from_value(params).unwrap(),
+            )
+            .await
+        }
+        "ingest" => {
+            handle_memory_ingest(
+                &ws,
+                state,
+                headers,
+                Some(identity),
+                false,
+                "m".into(),
+                serde_json::from_value(params).unwrap(),
+            )
+            .await
+        }
+        _ => panic!("unknown test method"),
+    }
+    recv_rpc_json(&mut rx).await
+}
+
+#[tokio::test]
+async fn memory_profile_reads_and_echoes_the_named_profile() {
+    let (_dir, state) = memory_profile_fixture().await;
+    for profile in ["memory-owner", "memory-other"] {
+        let overview = memory_profile_rpc(
+            &state,
+            &HeaderMap::new(),
+            &AuthIdentity::Admin,
+            "overview",
+            json!({"profile_id":profile}),
+        )
+        .await;
+        assert_eq!(overview["result"]["profile_id"], profile, "{overview}");
+        assert_eq!(
+            overview["result"]["overview"]["long_term"],
+            format!("# {profile} private memory")
+        );
+        let entity = memory_profile_rpc(
+            &state,
+            &HeaderMap::new(),
+            &AuthIdentity::Admin,
+            "entity",
+            json!({"profile_id":profile,"name":"project"}),
+        )
+        .await;
+        assert_eq!(entity["result"]["profile_id"], profile, "{entity}");
+        assert_eq!(entity["result"]["content"], format!("# {profile} project"));
+    }
+    let legacy = memory_profile_rpc(
+        &state,
+        &HeaderMap::new(),
+        &AuthIdentity::Admin,
+        "overview",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        legacy["result"]["profile_id"], "admin",
+        "omitting the profile keeps legacy identity scope"
+    );
+    assert_eq!(legacy["result"]["overview"]["long_term"], "");
+}
+
+#[tokio::test]
+async fn memory_profile_ingest_search_load_use_the_named_runtime() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let headers = HeaderMap::new();
+    let record = ingest_doc_record("doc:mail:memory-profile-test");
+    let ingest = memory_profile_rpc(
+        &state,
+        &headers,
+        &AuthIdentity::Admin,
+        "ingest",
+        json!({"profile_id":"memory-owner", "records":[record], "embed":false}),
+    )
+    .await;
+    assert_eq!(ingest["result"]["profile_id"], "memory-owner", "{ingest}");
+    assert_eq!(ingest["result"]["inserted"], 1);
+    let search = memory_profile_rpc(
+        &state,
+        &headers,
+        &AuthIdentity::Admin,
+        "search",
+        json!({"profile_id":"memory-owner", "query":"Hike"}),
+    )
+    .await;
+    assert_eq!(search["result"]["profile_id"], "memory-owner", "{search}");
+    assert_eq!(
+        search["result"]["hits"][0]["id"],
+        "doc:mail:memory-profile-test"
+    );
+    let load = memory_profile_rpc(
+        &state,
+        &headers,
+        &AuthIdentity::Admin,
+        "load",
+        json!({"profile_id":"memory-owner", "id":"doc:mail:memory-profile-test"}),
+    )
+    .await;
+    assert_eq!(load["result"]["profile_id"], "memory-owner", "{load}");
+    assert_eq!(load["result"]["record"]["trust"], "untrusted");
+    assert!(
+        state.profiles["memory-other"]
+            .recall
+            .get("doc:mail:memory-profile-test")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !state.profiles.contains_key("admin"),
+        "the token identity need not have a runtime"
+    );
+}
+
+#[tokio::test]
+async fn memory_profile_refuses_cross_tenant_and_host_override_for_every_method() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let user = AuthIdentity::User {
+        id: "memory-owner".into(),
+        role: crate::user_store::UserRole::User,
+    };
+    let mut host = HeaderMap::new();
+    host.insert("host", "memory-owner.example.test".parse().unwrap());
+    for (identity, headers) in [(&user, HeaderMap::new()), (&AuthIdentity::Admin, host)] {
+        for method in ["overview", "entity", "search", "load", "ingest"] {
+            let result = memory_profile_rpc(&state, &headers, identity, method,
+                json!({"profile_id":"memory-other", "name":"project", "query":"Hike",
+                    "id":"doc:mail:memory-profile-test", "records":[ingest_doc_record("doc:mail:blocked")], "embed":false})).await;
+            assert_eq!(
+                result["error"]["code"],
+                octos_core::ui_protocol::rpc_error_codes::PERMISSION_DENIED,
+                "{method}: {result}"
+            );
+            assert_eq!(
+                result["error"]["data"]["kind"], "forbidden",
+                "{method}: {result}"
+            );
+        }
+    }
+    assert!(
+        state.profiles["memory-other"]
+            .recall
+            .get("doc:mail:blocked")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn memory_profile_allows_owned_subprofile_and_rejects_blank_or_missing() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let store = state.profile_store.as_ref().unwrap();
+    let mut child = store.get("memory-other").unwrap().unwrap();
+    child.parent_id = Some("memory-owner".into());
+    store.save(&child).unwrap();
+    let user = AuthIdentity::User {
+        id: "memory-owner".into(),
+        role: crate::user_store::UserRole::User,
+    };
+    let child_result = memory_profile_rpc(
+        &state,
+        &HeaderMap::new(),
+        &user,
+        "overview",
+        json!({"profile_id":"memory-other"}),
+    )
+    .await;
+    assert_eq!(
+        child_result["result"]["profile_id"], "memory-other",
+        "{child_result}"
+    );
+    for (profile, code) in [("  ", -32602), ("missing-profile", -32170)] {
+        let result = memory_profile_rpc(
+            &state,
+            &HeaderMap::new(),
+            &AuthIdentity::Admin,
+            "overview",
+            json!({"profile_id":profile}),
+        )
+        .await;
+        assert_eq!(result["error"]["code"], code, "{result}");
+    }
 }

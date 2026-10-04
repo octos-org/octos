@@ -3692,12 +3692,16 @@ pub struct ContentBulkDeleteResult {
     pub deleted: usize,
 }
 
-/// Params for `memory/overview`. Empty today; the struct exists so
+/// Params for `memory/overview`. Optional profile selection; the struct exists so
 /// `{}` / `null` params decode uniformly (mirrors
 /// [`SystemStatusGetParams`]; the wire `params` MEMBER must still be
 /// present — the frame parser rejects requests without one).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryOverviewParams {}
+pub struct MemoryOverviewParams {
+    /// Omit for the authenticated account/tenant profile. Explicit profiles require authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
 
 /// Result for `memory/overview`. `overview` is the JSON body of the
 /// existing `GET /api/my/memory` handler (`MemoryOverviewResponse` —
@@ -3713,6 +3717,10 @@ pub struct MemoryOverviewParams {}
 /// marker is ever spliced into the markdown.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryOverviewResult {
+    /// The profile that answered. Absent only when decoding an older server reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
     pub overview: Value,
 }
 
@@ -3721,6 +3729,10 @@ pub struct MemoryOverviewResult {
 /// same string `memory/overview` returns in each entity summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEntityParams {
+    /// Omit for the authenticated account/tenant profile. Explicit profiles require authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
     pub name: String,
 }
 
@@ -3731,6 +3743,10 @@ pub struct MemoryEntityParams {
 /// fit one ~1 MiB WS text frame).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEntityResult {
+    /// The profile that answered. Absent only when decoding an older server reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
     pub name: String,
     /// Page markdown. When `content_truncated` is true this is a clean
     /// UTF-8 PREFIX of the page capped at the RPC-layer byte budget —
@@ -3759,6 +3775,10 @@ pub const MEMORY_INGEST_MAX_RECORDS: usize = 500;
 /// [`MEMORY_SEARCH_MAX_LIMIT`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemorySearchParams {
+    /// Omit for the authenticated account/tenant profile. Explicit profiles require authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
     pub query: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
@@ -3778,6 +3798,10 @@ pub struct MemorySearchParams {
 /// `trust: "untrusted"`; callers must treat their text as data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemorySearchResult {
+    /// The profile that answered. Absent only when decoding an older server reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
     pub hits: Vec<Value>,
 }
 
@@ -3785,6 +3809,10 @@ pub struct MemorySearchResult {
 /// `id` a `memory/search` hit returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryLoadParams {
+    /// Omit for the authenticated account/tenant profile. Explicit profiles require authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
     pub id: String,
 }
 
@@ -3797,6 +3825,10 @@ pub struct MemoryLoadParams {
 /// truth for its body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryLoadResult {
+    /// The profile that answered. Absent only when decoding an older server reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
     pub record: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<String>,
@@ -3815,6 +3847,10 @@ pub struct MemoryLoadResult {
 /// records are refused — they are written through the memory bank.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemoryIngestParams {
+    /// Omit for the authenticated account/tenant profile. Explicit profiles require authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
     pub records: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors: Option<Vec<Option<Vec<f32>>>>,
@@ -3828,6 +3864,10 @@ pub struct MemoryIngestParams {
 /// those the server embedded itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryIngestResult {
+    /// The profile that answered. Absent only when decoding an older server reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+
     pub inserted: usize,
     pub updated: usize,
     pub unchanged: usize,

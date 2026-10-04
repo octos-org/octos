@@ -4958,12 +4958,14 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
         ),
         (
             UiCommand::MemoryEntity(MemoryEntityParams {
+                profile_id: None,
                 name: "acme-corp".into(),
             }),
             methods::MEMORY_ENTITY,
         ),
         (
             UiCommand::MemorySearch(MemorySearchParams {
+                profile_id: None,
                 query: "dentist".into(),
                 kinds: vec!["document".into()],
                 sources: vec!["calendar".into()],
@@ -4975,12 +4977,14 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
         ),
         (
             UiCommand::MemoryLoad(MemoryLoadParams {
+                profile_id: None,
                 id: "doc:mail:42".into(),
             }),
             methods::MEMORY_LOAD,
         ),
         (
             UiCommand::MemoryIngest(MemoryIngestParams {
+                profile_id: None,
                 records: vec![serde_json::json!({ "id": "doc:mail:42" })],
                 vectors: None,
                 embed: Some(false),
@@ -5115,6 +5119,7 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
     assert_eq!(decoded, bulk);
 
     let overview = MemoryOverviewResult {
+        profile_id: None,
         overview: serde_json::json!({ "ok": true, "long_term": "# MEMORY" }),
     };
     let value = serde_json::to_value(&overview).expect("serialize");
@@ -5122,6 +5127,7 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
     assert_eq!(decoded.overview, overview.overview);
 
     let entity = MemoryEntityResult {
+        profile_id: None,
         name: "acme-corp".into(),
         content: "# acme".into(),
         content_truncated: false,
@@ -5475,6 +5481,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/entity
     assert_eq!(
         serde_json::to_value(MemoryEntityParams {
+            profile_id: None,
             name: "acme-corp".into(),
         })
         .expect("serialize"),
@@ -5485,6 +5492,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // wire shape is `{ query, kinds?, sources?, since?, until?, limit? }`.
     assert_eq!(
         serde_json::to_value(MemorySearchParams {
+            profile_id: None,
             query: "dentist".into(),
             ..Default::default()
         })
@@ -5493,6 +5501,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     );
     assert_eq!(
         serde_json::to_value(MemorySearchParams {
+            profile_id: None,
             query: "dentist".into(),
             kinds: vec!["document".into(), "knowledge".into()],
             sources: vec!["calendar".into()],
@@ -5518,6 +5527,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/load — `{ id }`
     assert_eq!(
         serde_json::to_value(MemoryLoadParams {
+            profile_id: None,
             id: "bank:acme-corp".into(),
         })
         .expect("serialize"),
@@ -5527,6 +5537,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/ingest — `{ records, vectors?, embed? }`
     assert_eq!(
         serde_json::to_value(MemoryIngestParams {
+            profile_id: None,
             records: vec![serde_json::json!({ "id": "doc:mail:1" })],
             vectors: Some(vec![Some(vec![0.5, 0.25]), None]),
             embed: Some(false),
@@ -5719,6 +5730,7 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
     // memory/overview — `{ overview: <opaque REST body> }`
     assert_eq!(
         serde_json::to_value(MemoryOverviewResult {
+            profile_id: None,
             overview: serde_json::json!({ "ok": true, "staging_notes": 2 }),
         })
         .expect("serialize"),
@@ -5730,6 +5742,7 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
     // wire contract: capped fields must be DECLARED, never silent).
     assert_eq!(
         serde_json::to_value(MemoryEntityResult {
+            profile_id: None,
             name: "acme-corp".into(),
             content: "# acme".into(),
             content_truncated: false,
@@ -5747,6 +5760,7 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
     // memory/search — `{ hits: [<octos_memory::Hit JSON>...] }`
     assert_eq!(
         serde_json::to_value(MemorySearchResult {
+            profile_id: None,
             hits: vec![serde_json::json!({ "id": "doc:mail:1", "score": 0.9 })],
         })
         .expect("serialize"),
@@ -5757,6 +5771,7 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
     // omitted for Recall records and present for `bank:` knowledge.
     assert_eq!(
         serde_json::to_value(MemoryLoadResult {
+            profile_id: None,
             record: serde_json::json!({ "id": "doc:mail:1" }),
             page: None,
             page_truncated: false,
@@ -5766,6 +5781,7 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
     );
     assert_eq!(
         serde_json::to_value(MemoryLoadResult {
+            profile_id: None,
             record: serde_json::json!({ "id": "bank:acme" }),
             page: Some("# acme".into()),
             page_truncated: true,
@@ -5781,6 +5797,7 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
     // memory/ingest — the UpsertReport counts, all always present.
     assert_eq!(
         serde_json::to_value(MemoryIngestResult {
+            profile_id: None,
             inserted: 3,
             updated: 1,
             unchanged: 2,
