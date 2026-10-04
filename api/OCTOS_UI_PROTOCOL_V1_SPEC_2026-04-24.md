@@ -513,6 +513,11 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
   `docs/adr/personal-memory-tiers.md`; auth-bound like `memory/overview`,
   refused for session-ingress credentials)
 
+Session history catalog (raw AppUI):
+
+- `session/history/list` — paginated history across authorized profiles and
+  known workspace stores; refused for session-ingress credentials.
+
 Launch (per-project session UX, gated `session.workspace_cwd.v1`):
 
 - `launch/resolve`
