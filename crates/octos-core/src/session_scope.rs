@@ -2045,15 +2045,20 @@ mod tests {
 
     #[test]
     fn should_refuse_a_view_when_an_excluded_folder_is_outside_its_root() {
-        let scope = SessionScope::solo(PathBuf::from("/w"), vec![]).unwrap();
+        // Tempdir-derived roots: a literal "/w" is not absolute on Windows
+        // (no drive component), so solo() would refuse it before the view
+        // validation under test ever runs.
+        let tmp = tempfile::tempdir().unwrap();
+        let view = tmp.path().join("p");
+        let scope = SessionScope::solo(tmp.path().join("w"), vec![]).unwrap();
         assert!(matches!(
             scope
                 .clone()
-                .with_read_only_view(PathBuf::from("/p"), vec![PathBuf::from("/q/contexts")]),
+                .with_read_only_view(view.clone(), vec![tmp.path().join("q/contexts")]),
             Err(SessionScopeError::ReadOnlyViewInvalid(_))
         ));
         assert!(matches!(
-            scope.with_read_only_view(PathBuf::from("/p"), vec![PathBuf::from("/p")]),
+            scope.with_read_only_view(view.clone(), vec![view]),
             Err(SessionScopeError::ReadOnlyViewInvalid(_))
         ));
     }
