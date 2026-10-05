@@ -8,6 +8,14 @@ use super::*;
 use crate::peers::host_tools::{apply_session_host_tools, resolve_session_host_tools};
 use octos_core::ui_protocol::{ApprovalRespondParams, QuestionId, UserQuestionAnswer};
 
+/// How long a wait may budget for a turn to reach its next observable step
+/// (the model, an approval event, the peer's `result.md`). These are arrival
+/// assertions, not latency contracts, and the Windows CI shard runs this
+/// suite several times slower than Linux — arrival waits of 20–60s popped
+/// there repeatedly while the identical tests stayed green on Linux. Budget
+/// minutes, not milliseconds.
+const TURN_ARRIVAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// The chat id of this test's host sessions. Peer state (routes, the staged
 /// peers on disk) is process-wide and tests run in parallel, so each test
 /// (one thread per `#[tokio::test]`) gets its own id; every key in one test
@@ -5054,7 +5062,8 @@ async fn start_turn_in(
 async fn wait_result(e: &E2e, turn_id: &TurnId) -> String {
     let path = e.data_dir.join("peers/news/result.md");
     let needle = format!("turn_id: {}", turn_id.0);
-    for _ in 0..1500 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Ok(body) = std::fs::read_to_string(&path) {
             if body.contains(&needle) {
                 return body;
@@ -5418,7 +5427,7 @@ async fn should_refuse_a_second_turn_while_the_shared_peer_session_is_busy() {
         )
         .await
     );
-    tokio::time::timeout(std::time::Duration::from_secs(20), llm.entered.notified())
+    tokio::time::timeout(TURN_ARRIVAL_BUDGET, llm.entered.notified())
         .await
         .expect("the person's turn reached the model");
 
@@ -5827,7 +5836,7 @@ async fn should_run_the_person_lane_while_the_system_agent_lane_is_busy() {
         )
         .await
     );
-    tokio::time::timeout(std::time::Duration::from_secs(20), llm.entered.notified())
+    tokio::time::timeout(TURN_ARRIVAL_BUDGET, llm.entered.notified())
         .await
         .expect("the system agent's turn reached the model");
 
@@ -6230,7 +6239,7 @@ async fn wait_for_pending_approval(
     contracts: &UiProtocolContractStores,
     session: &SessionKey,
 ) -> Vec<ApprovalRequestedEvent> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
     while std::time::Instant::now() < deadline {
         let pending = contracts.approvals.pending_for_session(session);
         if !pending.is_empty() {
@@ -6365,7 +6374,7 @@ async fn should_show_the_peer_session_a_persons_turn_in_progress() {
         )
         .await
     );
-    tokio::time::timeout(std::time::Duration::from_secs(60), llm.held.notified())
+    tokio::time::timeout(TURN_ARRIVAL_BUDGET, llm.held.notified())
         .await
         .expect("the person's turn reached the model");
 
@@ -6954,7 +6963,7 @@ async fn should_fail_the_host_call_and_stop_the_turn_when_the_peer_is_purged_mid
     // The host is working on the call (never answers) when it purges. A
     // loaded test run can take a while to reach the call.
     let call = loop {
-        let message = tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv())
+        let message = tokio::time::timeout(TURN_ARRIVAL_BUDGET, rx.recv())
             .await
             .expect("the call reaches the host")
             .expect("connection open");
