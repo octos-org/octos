@@ -249,7 +249,7 @@ impl Tool for WorkspaceShowTool {
         // looks like a git option: a value starting with `-` is parsed as
         // a flag by `git show` (e.g. `--output=/etc/passwd` writes a
         // file), not as a revision. The traversal checks alone admit
-        // slash-free option strings (CVE-2025-68143 class).
+        // slash-free option strings (CVE-2025-68144/68145 class).
         if input.commit.starts_with('-')
             || input.commit.contains("..")
             || input.commit.contains('/')
