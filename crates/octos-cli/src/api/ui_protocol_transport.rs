@@ -16666,6 +16666,20 @@ fn raw_session_tool_list_set(
         &params.session_id,
         params.host_token.as_deref(),
     )?;
+    // Route-ownership gate (#2660): the session's tool route belongs to the
+    // connection that declared it — another live connection re-declaring
+    // would silently take over the session's kernel-tool surface.
+    if let Some(owner) =
+        crate::peers::host_tools::session_set_connection(&data_dir.join("peers"), &params.session_id)
+    {
+        if owner != ws.connection_id.0 {
+            return Err(RpcError::permission_denied(format!(
+                "session '{}' has its tool route on another connection of its host",
+                params.session_id
+            ))
+            .with_data(json!({ "kind": "peer_route_not_owner" })));
+        }
+    }
     let generic_tools = params
         .generic_tools
         .map(normalize_tool_list)
@@ -16796,6 +16810,18 @@ fn raw_peer_tools_register(
         &params.session_id,
         params.host_token.as_deref(),
     )?;
+    // Route-ownership gate (#2660): refuse to take over a live route another
+    // connection still owns — a leaked or stolen host token cannot silently
+    // redirect another consumer's tool traffic. Release there (unregister)
+    // or purge first.
+    if let Some(owner) = crate::peers::host_tools::host_route_connection(&peers_root, &slug) {
+        if owner != ws.connection_id.0 {
+            return Err(host_peer_error(
+                "peer_route_not_owner",
+                format!("peer '{slug}' is routed to another connection of its host; unregister it there"),
+            ));
+        }
+    }
     if crate::peers::app_binding::read_peer_host_binding(&peers_root, &slug).is_none() {
         return Err(host_peer_error(
             "peer_not_host_bound",
