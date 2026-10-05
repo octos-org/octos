@@ -889,6 +889,20 @@ mod tests {
     use octos_core::{InboundMessage, METADATA_SENDER_USER_ID};
     use tokio::sync::{Mutex, mpsc};
 
+    /// Wait for `slot` to hold at least one record, within 30 s: a loaded
+    /// runner can starve the spawned composer past any fixed sleep, so the
+    /// tests observe the send before they cancel the composer.
+    async fn wait_for_first<T>(slot: &Mutex<Vec<T>>) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while slot.lock().await.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the composer's first send timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     #[derive(Default)]
     struct MockChannel {
         sent: Arc<Mutex<Vec<OutboundMessage>>>,
@@ -1075,7 +1089,11 @@ mod tests {
             Some("@bot_mybot:localhost".to_string()),
         );
 
-        tokio::time::sleep(Duration::from_millis(3300)).await;
+        // The first visible status message lands after the composer's 2 s
+        // gate plus its first 1 s tick. A loaded runner can starve the
+        // spawned composer past any fixed sleep, and cancelling first would
+        // leave nothing to assert — wait for the send, then cancel.
+        wait_for_first(&channel.sent).await;
         handle.cancelled.store(true, Ordering::Release);
 
         let sent = channel.sent.lock().await;
@@ -1104,7 +1122,9 @@ mod tests {
             Some("@bot_mybot:localhost".to_string()),
         );
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The typing indicator is the spawned composer's first send; wait
+        // for it instead of gambling a fixed sleep against scheduler load.
+        wait_for_first(&channel.typing_senders).await;
         handle.cancelled.store(true, Ordering::Release);
 
         let typing = channel.typing_senders.lock().await;
@@ -1131,6 +1151,11 @@ mod tests {
             false,
         );
 
+        // The composer alive-control is its first typing send; observe it,
+        // then still give it the 2 s gate plus slack before stopping — the
+        // point is that even past the gate decision it never sends a status
+        // message. (A slower composer only weakens this, never flakes it.)
+        wait_for_first(&channel.typing_senders).await;
         tokio::time::sleep(Duration::from_millis(2200)).await;
         handle.stop().await;
 
