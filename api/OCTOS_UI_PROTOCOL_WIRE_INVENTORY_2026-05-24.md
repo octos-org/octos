@@ -158,6 +158,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `turn/completed` | shipped base notification |
 | `turn/error` | shipped base notification |
 | `turn/steer_dropped` | shipped steer return notification, UPCR-2026-033 |
+| `context/state_reported` | shipped live token-estimate notification (context.state.v1) |
 | `message/delta` | shipped base notification |
 | `message/reasoning_delta` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `tool/started` | shipped base notification |
