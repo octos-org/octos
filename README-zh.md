@@ -67,8 +67,12 @@ Rust workspace 可以按应用需要组合：
 | [`octos-memory`](crates/octos-memory) | 持久化记忆、任务经验与检索 |
 | [`octos-llm`](crates/octos-llm) | 模型提供者接口、路由、重试与故障转移 |
 | [`octos-plugin`](crates/octos-plugin) | 技能与插件集成 |
-| [`octos-pipeline`](crates/octos-pipeline) / [`octos-swarm`](crates/octos-swarm) | 工作流图、并行执行、验证与结果汇总 |
+| [`octos-workflows`](crates/octos-workflows) / [`octos-swarm`](crates/octos-swarm) | 原生工作流定义、并行执行、验证与结果汇总 |
 | [`octos-bus`](crates/octos-bus) / [`octos-cli`](crates/octos-cli) | 会话基础设施、运行时组装、OUP 托管与适配层 |
+
+CLI/服务端使用原生 `search` 和 `deep_crawl` 执行研究。运行时已移除
+`run_pipeline` 和 DOT 引擎；`octos-pipeline` 源码保留为独立开发 crate，
+不再是运行时依赖。
 
 在源码仓库中，构建原生 Agent 库或供其他语言调用的库：
 

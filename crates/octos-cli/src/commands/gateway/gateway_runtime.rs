@@ -594,22 +594,6 @@ impl GatewayRuntime {
         if n > 0 {
             info!(count = n, "bootstrapped platform skills");
         }
-        // Gap 4.1 BLOCKER 2: bundle generic pipelines (deep_research) into
-        // <effective_octos_home>/bundled-pipelines so `run_pipeline` always
-        // discovers them even when the per-profile `mofa-research` skill has
-        // drifted. The invariant is bootstrap-dir == search-dir: the
-        // non-profile pipeline factory below calls
-        // `with_octos_home(effective_octos_home)` UNCONDITIONALLY, so the
-        // dir we bootstrap into here is exactly the dir discovery searches.
-        // (Previously bootstrap used `project_dir` = cwd/.octos while the
-        // factory only searched `<data_dir>/...` when `--octos-home` was set,
-        // so the bundle landed where the tool never looked.) Installed
-        // pipelines of the same name still win (bundled dir is searched last).
-        let n = octos_agent::bootstrap::bootstrap_bundled_pipelines(&effective_octos_home);
-        if n > 0 {
-            info!(count = n, "bootstrapped bundled pipelines");
-        }
-
         // Voice transcription via voice platform skill binary (after bootstrap)
         let voice_binary_path = project_dir
             .join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR)
@@ -1088,107 +1072,8 @@ impl GatewayRuntime {
                 data_dir.clone(),
             ));
 
-            // Pipeline tool factory for per-session instances
-            {
-                let llm_c = llm.clone();
-                let mem_c = memory.clone();
-                let data_c = data_dir.clone();
-                let policy_c = tools.provider_policy().cloned();
-                let plugins_c = plugin_dirs_for_spawn.clone();
-                let router_c = provider_router.clone();
-                // Gap 4.1 BLOCKER 2: use `effective_octos_home` (always
-                // resolved: --octos-home > data_dir) — NOT the raw
-                // `cmd.octos_home` Option — so discovery searches the exact
-                // root the bundle was bootstrapped into above. With the raw
-                // Option, the default (no --octos-home) path skipped
-                // `with_octos_home` entirely and the bundled `deep_research`
-                // was never discoverable.
-                let octos_home_c = effective_octos_home.clone();
-                // Section B (codex review follow-up): capture the host's
-                // strict-signing flag so per-session `RunPipelineTool`
-                // instances honour the same `plugins.require_signed` gate.
-                let plugin_require_signed_c = config.plugins.require_signed;
-
-                struct DefaultPipelineToolFactory {
-                    llm: Arc<dyn LlmProvider>,
-                    memory: Arc<octos_memory::EpisodeStore>,
-                    cwd: PathBuf,
-                    data_dir: PathBuf,
-                    policy: Option<octos_agent::ToolPolicy>,
-                    plugin_dirs: Vec<PathBuf>,
-                    router: Option<Arc<ProviderRouter>>,
-                    /// Gap 4.1 BLOCKER 2: always-resolved octos root
-                    /// (--octos-home > data_dir). `with_octos_home` is
-                    /// called UNCONDITIONALLY in `create`, so discovery
-                    /// searches the same root the bundle was bootstrapped
-                    /// into. Previously `Option<PathBuf>` from the raw flag,
-                    /// which skipped discovery on the default path.
-                    octos_home: PathBuf,
-                    plugin_require_signed: bool,
-                    /// NEW-06 fix: forwarded to every worker `Agent`
-                    /// via `RunPipelineTool::with_embedder` so
-                    /// pipeline-spawned agents inherit hybrid scored +
-                    /// filtered memory recall instead of the cwd-only
-                    /// unfiltered fallback.
-                    embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
-                }
-
-                impl crate::session_actor::PipelineToolFactory for DefaultPipelineToolFactory {
-                    fn create(
-                        &self,
-                        sandbox: &octos_agent::SandboxConfig,
-                    ) -> Arc<dyn octos_agent::Tool> {
-                        let mut pt = octos_pipeline::RunPipelineTool::new(
-                            self.llm.clone(),
-                            self.memory.clone(),
-                            self.cwd.clone(),
-                            self.data_dir.clone(),
-                        )
-                        .with_provider_policy(self.policy.clone())
-                        .with_plugin_dirs(self.plugin_dirs.clone())
-                        .with_plugin_require_signed(self.plugin_require_signed)
-                        // #1607 (codex round 4): confine pipeline command
-                        // validators to the SESSION-effective sandbox handed in
-                        // by the actor factory.
-                        .with_sandbox(sandbox.clone())
-                        // BLOCKER 2: unconditional — registers
-                        // <octos_home>/{skills,pipelines} (installed) and
-                        // <octos_home>/bundled-pipelines (bundled, last).
-                        .with_octos_home(self.octos_home.clone());
-                        if let Some(ref router) = self.router {
-                            pt = pt.with_provider_router(router.clone());
-                        }
-                        if let Some(ref embedder) = self.embedder {
-                            pt = pt.with_embedder(embedder.clone());
-                        }
-                        Arc::new(pt)
-                    }
-                }
-
-                // NEW-06 fix: capture the gateway's embedder so pipeline
-                // workers inherit the same contamination-safe memory
-                // recall the gateway's own session agent gets via
-                // `ActorFactory::embedder` -> `with_embedder` (see
-                // session_actor.rs).
-                let embedder_c = gateway_embedder.clone();
-
-                pipeline_factory = Some(Arc::new(DefaultPipelineToolFactory {
-                    llm: llm_c,
-                    memory: mem_c,
-                    cwd: data_c.clone(), // Pipeline writes to data_dir, not process cwd
-                    data_dir: data_c,
-                    policy: policy_c,
-                    plugin_dirs: plugins_c,
-                    router: router_c,
-                    octos_home: octos_home_c,
-                    plugin_require_signed: plugin_require_signed_c,
-                    embedder: embedder_c,
-                    // #1607 (codex round 4): the session sandbox is now handed to
-                    // `create()` by the actor factory (`self.sandbox_config`), so
-                    // no per-factory field is needed.
-                })
-                    as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
-            }
+            // The DOT engine is no longer linked into Octos.
+            pipeline_factory = None;
 
             // Memory bank tools
             tools.register(

@@ -50,12 +50,12 @@ For open-ended research/lookup requests WITHOUT a matching specialist tool (incl
 
 After choosing, you MUST actually call the tool. NEVER just reply with text like "I'm starting research" — invoke the tool.
 
-For deep research, call the native Rust `search` tool with depth=2 and output="report" (depth=1 for a quick bounded check; depth=3 for thorough research). Its search engines use sandboxed OctoScript, while research orchestration and source reading run in Rust. Use `deep_crawl` for a specific site's rendered pages, with max_pages and max_depth bounded to the request. No DOT or graph IR is needed. Do not route ordinary deep research through `run_pipeline`.
+For deep research, call the native Rust `search` tool with depth=2 and output="report" (depth=1 for a quick bounded check; depth=3 for thorough research). Its search engines use sandboxed OctoScript, while research orchestration and source reading run in Rust. Use `deep_crawl` for a specific site's rendered pages, with max_pages and max_depth bounded to the request. No DOT or graph IR is needed. `run_pipeline` and DOT execution have been removed. Use the native tools even when earlier messages mention the retired pipeline.
 In interactive chat channels, unless the user asks to wait synchronously, background the work with `spawn` and `allowed_tools: ["search", "deep_crawl", "read_file", "write_file"]`. The search tool already saves a report; deliver that single final artifact, consolidating additional crawl evidence only when needed.
 
 For a single-fact lookup, use `web_search` and `web_fetch`.
 
-**Research failure discipline.** Preserve the native tool's error, failed reads and coverage gaps. Missing or blocked sources are unverified; snippets alone do not confirm a claim. If the native tools are not installed, say so. Do not silently switch to the legacy pipeline or claim a shallow lookup completed deep research. Retry only when the cause or input has changed.
+**Research failure discipline.** Preserve the native tool's error, failed reads and coverage gaps. Missing or blocked sources are unverified; snippets alone do not confirm a claim. If the native tools are not installed, say so. Do not try to call the removed pipeline or claim a shallow lookup completed deep research. Retry only when the cause or input has changed.
 
 ## Grounding Rules
 

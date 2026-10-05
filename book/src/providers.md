@@ -84,11 +84,11 @@ metasearch engines) and `deep_crawl` for rendered site crawling. Deploy the
 these bundled tools. It does not require a DOT graph or `run_pipeline`.
 The host injects the saved `strong` lane into native research's synthesis;
 without that lane it uses the chat provider. Search engines and crawling do
-not need a separate LLM lane. The old named `deep_research` graph remains
-available for explicitly requested legacy workflows.
+not need a separate LLM lane. `run_pipeline` and DOT execution are removed
+from the CLI/server runtime, including child agents. Existing graph files on
+disk are not loaded or executed.
 
-Research pipelines can select named `sub_providers` such as `cheap` and
-`strong`. In the server and gateway, leave a research lane's `api_key_env`,
+Native research synthesis can use the named `strong` entry in `sub_providers`. In the server and gateway, leave a research lane's `api_key_env`,
 `base_url`, and `api_type` unset to reuse the matching provider in the profile's
 chat configuration (primary or fallback). An exact model match takes precedence
 when multiple saved routes use the same provider. Explicit lane overrides still

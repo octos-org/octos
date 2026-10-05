@@ -73,7 +73,7 @@ impl std::fmt::Display for PipelineResolveError {
 impl std::error::Error for PipelineResolveError {}
 
 /// Subdirectory name (under an octos root) where the binary writes its
-/// embedded generic pipelines. Mirrors `octos_agent::bootstrap::BUNDLED_PIPELINES_DIR`.
+/// embedded generic pipelines. Mirrors `crate::bundled_pipelines::BUNDLED_PIPELINES_DIR`.
 ///
 /// Gap 4.1 BLOCKER 3: this is a DEDICATED dir, separate from the
 /// user-pipeline dir (`<root>/pipelines`), and is always searched LAST so

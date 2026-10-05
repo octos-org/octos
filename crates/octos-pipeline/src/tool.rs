@@ -26,7 +26,7 @@ pub const PIPELINE_EXTERNAL_CONTEXT_UNMANAGED_REASON: &str =
     "pipeline workers don't yet propagate ContextManager (M17-B)";
 
 /// Gap 4.1 — the sanctioned generic pipeline name. Bundled into the binary
-/// via `octos_agent::bundled_pipelines` and used as the no-discovery fallback
+/// via `crate::bundled_pipelines` and used as the no-discovery fallback
 /// for the `run_pipeline` `pipeline` arg enum so the advertised choices are
 /// never empty even before bootstrap has written the `.dot`.
 const FALLBACK_PIPELINE_NAME: &str = "deep_research";
@@ -409,7 +409,7 @@ impl RunPipelineTool {
             return Ok(ResolvedPipeline::Dot(dot));
         }
         // 2. Bundled IR — the canonical, audited rebuild.
-        if let Some(ir) = octos_agent::bundled_pipelines::bundled_ir(name) {
+        if let Some(ir) = crate::bundled_pipelines::bundled_ir(name) {
             return Ok(ResolvedPipeline::Ir(ir.to_string()));
         }
         // 3. Embedded bundled DOT (discovery full search + embedded bytes).
@@ -420,7 +420,7 @@ impl RunPipelineTool {
 
     /// Resolve a pipeline by name/path via on-disk discovery first, falling
     /// back to the EMBEDDED bundled `.dot` bytes (compiled into the binary
-    /// via `octos_agent::bundled_pipelines`) when discovery cannot find it.
+    /// via `crate::bundled_pipelines`) when discovery cannot find it.
     ///
     /// Gap 4.1 NIT 2 — the `run_pipeline` enum advertises the sanctioned
     /// `deep_research` name unconditionally (it is bundled into the binary).
@@ -463,7 +463,7 @@ impl RunPipelineTool {
                 // (when an installed copy exists, discovery now resolves both
                 // forms and this branch is never reached → installed-wins).
                 let want = crate::discovery::pipeline_name_stem(name_or_path.trim());
-                for &(file_name, dot) in octos_agent::bundled_pipelines::BUNDLED_PIPELINES {
+                for &(file_name, dot) in crate::bundled_pipelines::BUNDLED_PIPELINES {
                     let stem = file_name.strip_suffix(".dot").unwrap_or(file_name);
                     if want == stem {
                         tracing::info!(

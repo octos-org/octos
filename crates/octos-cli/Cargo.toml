@@ -29,7 +29,6 @@ octos-bus = { workspace = true }
 octos-workflows = { workspace = true }
 octos-store = { workspace = true }
 octos-services = { workspace = true }
-octos-pipeline = { workspace = true }
 octos-swarm = { workspace = true }
 # RFC-2 (issue #1291): `octos skills install` runs the manifest schema
 # validator at install time so the operator sees the error before the
