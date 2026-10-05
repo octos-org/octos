@@ -279,7 +279,7 @@ async fn main() {
 /// on Windows and the host's SIGKILL handles cleanup.
 #[cfg(unix)]
 fn install_sigterm_handler() {
-    use tokio::signal::unix::{SignalKind, signal};
+    use tokio::signal::unix::{signal, SignalKind};
     tokio::spawn(async {
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
@@ -809,9 +809,9 @@ async fn run_deep_search(
     // Save read pages (main text + metadata front matter)
     // -----------------------------------------------------------------------
     let mut saved_files: Vec<(String, String, String)> = Vec::new(); // (filename, url, preview)
-    // What the synthesis model sees per source, parallel to `saved_files`:
-    // the full main text (the prompt builder trims it to a character budget),
-    // not the short report preview.
+                                                                     // What the synthesis model sees per source, parallel to `saved_files`:
+                                                                     // the full main text (the prompt builder trims it to a character budget),
+                                                                     // not the short report preview.
     let mut synthesis_texts: Vec<String> = Vec::new();
     for (i, s) in st.sources.iter().enumerate() {
         let filename = format!("{:02}_{}.md", i + 1, host_slug(&s.page.final_url));
@@ -4223,7 +4223,8 @@ A second paragraph elaborates on alternatives [2]."
 
     const CUT_OFF: &str = "## Headline\nRegulators act early\n\n## Confidence\n0.4\n\n## Synthesis\n\
         Spain's regulator warned a company before launch [1]. Notably, the warning came before the tool";
-    const COMPLETE: &str = "## Headline\nRegulators act early\n\n## Confidence\n0.4\n\n## Synthesis\n\
+    const COMPLETE: &str =
+        "## Headline\nRegulators act early\n\n## Confidence\n0.4\n\n## Synthesis\n\
         Spain's regulator warned a company before launch [1].\n\nGaps: fines imposed so far.";
 
     #[test]
@@ -4306,11 +4307,9 @@ A second paragraph elaborates on alternatives [2]."
         let (synthesis, diagnostics, partial) =
             synthesis_diagnostics(SynthesisOutcome::Done(result));
         let syn = synthesis.unwrap();
-        assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.starts_with("Synthesis incomplete"))
-        );
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.starts_with("Synthesis incomplete")));
         let out = assemble_output(
             "report".to_string(),
             &diagnostics,
@@ -4386,11 +4385,9 @@ A second paragraph elaborates on alternatives [2]."
         assert_eq!(result.attempts, 1);
         assert!(result.truncated.is_none());
         assert_eq!(result.uncited_flagged, 1);
-        assert!(
-            result
-                .synthesis
-                .contains("two years of protest. [citation needed]")
-        );
+        assert!(result
+            .synthesis
+            .contains("two years of protest. [citation needed]"));
         let (_, diagnostics, partial) = synthesis_diagnostics(SynthesisOutcome::Done(result));
         assert!(!partial);
         assert!(diagnostics[0].contains("[citation needed]"));
