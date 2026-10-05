@@ -14,6 +14,13 @@ The `search` tool does multi-round research: octos's key-less metasearch first, 
 
 ## Parameters
 
+Use this native Rust tool for deep research; its search engines use sandboxed
+OctoScript internally. Do not route ordinary research to `run_pipeline`, DOT,
+or graph IR. The host supplies synthesis from the saved `strong` research
+lane, or the chat provider when no strong lane is configured. Use `deep_crawl`
+for bounded reading of a specific site's rendered pages, then consolidate
+that evidence into the final report when needed.
+
 - **query** (required); **depth** 1-3 (default 2; 10/30/50 pages); **max_results** per provider per round (default 8).
 - **output**: `report` (default, Markdown) or `items` (structured JSON; the report is still written).
 - **lang**: BCP-47 code(s), e.g. `"en"` or `["en", "zh-CN", "es"]`. Each language is searched separately and results are kept to those languages (unknown-language results are kept).

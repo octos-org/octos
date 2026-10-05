@@ -7,7 +7,7 @@
   "tools": [
     {
       "name": "search",
-      "description": "Single-binary research pipeline (one synthesis model, fixed flow): searches a focused topic from multiple angles, fetches pages in parallel, chases references, and writes one structured report.\n\nWHEN TO USE: focused single-topic lookups where one report suffices and you don't need parallel sub-queries or per-node model control.\n\nWHEN TO USE `run_pipeline` INSTEAD (PREFERRED for 深度研究 / deep research / comprehensive analysis): the user asks for multi-perspective research, comparative analysis across topics, or any query phrased as 深度研究/深入调研/深度分析/comprehensive/thorough — write an inline DOT graph with `run_pipeline` so each perspective gets its own search node (run in parallel), its own analysis node, and a final synthesis node. This gives you parallel fan-out, per-node model selection (cheap models for search, strong models for synthesis), and a much richer output than this single-binary tool.\n\nControls: lang (one or many), region, since, max_per_domain, domains_allow/deny. output=items returns structured items (title, url, source, lang, published date, summary, citation). News works without any API key. Report file path is printed at end of output.",
+      "description": "Deep multi-round web research implemented in Rust, with sandboxed OctoScript metasearch engines. Use for deep research, comprehensive analysis, comparative investigations, 深度研究 and 深入调研. Searches multiple angles, reads sources in parallel, follows references and writes a cited report plus structured items. No run_pipeline, DOT or graph IR is required. Use depth=2 by default, depth=1 for quick bounded research, depth=3 for thorough coverage. Use deep_crawl separately for a specific documentation site or rendered pages. Keep failed reads and gaps explicit; a search snippet alone is not verified source evidence. The host supplies the synthesis model and credentials; do not invent synthesis_config. Controls include lang, query_by_lang, region, since, category, max_per_domain, domains_allow/deny and render. output=report returns the report, output=items returns structured sources; both save the report and items files.",
       "concurrency_class": "exclusive",
       "entrypoint": "target/release/deep-search",
       "env": [
@@ -51,7 +51,10 @@
           },
           "output": {
             "type": "string",
-            "enum": ["report", "items"],
+            "enum": [
+              "report",
+              "items"
+            ],
             "description": "report (default): Markdown report. items: structured JSON items (url, title, source, lang, published, summary, citation) instead; the report and <slug>_report.items.json are written either way."
           },
           "lang": {
@@ -85,7 +88,14 @@
           },
           "category": {
             "type": "string",
-            "enum": ["auto", "news", "general", "science", "it", "social"],
+            "enum": [
+              "auto",
+              "news",
+              "general",
+              "science",
+              "it",
+              "social"
+            ],
             "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (DuckDuckGo, Bing, Brave and Google results pages, Wikipedia, Wikidata), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
           },
           "max_per_domain": {
@@ -108,7 +118,10 @@
           },
           "render": {
             "type": "string",
-            "enum": ["auto", "off"],
+            "enum": [
+              "auto",
+              "off"
+            ],
             "description": "auto (default): render JS-heavy pages in a headless browser when plain HTTP returns no main text. off: plain HTTP only."
           },
           "synthesis_config": {
@@ -134,8 +147,12 @@
             }
           }
         },
-        "required": ["query"],
-        "x-octos-host-config-keys": ["synthesis_config"]
+        "required": [
+          "query"
+        ],
+        "x-octos-host-config-keys": [
+          "synthesis_config"
+        ]
       }
     }
   ]

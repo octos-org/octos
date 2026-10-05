@@ -3,7 +3,6 @@ name: deep-crawl
 description: Recursively crawl websites using headless Chrome. Triggers: crawl, scrape website, 爬取, crawl site, deep crawl, website content.
 version: 1.0.0
 author: octos
-requires_bins: google-chrome
 always: false
 ---
 
@@ -28,7 +27,7 @@ Call the `deep_crawl` tool with a starting URL. The crawler will follow same-ori
 | Parameter     | Type    | Required | Default | Description                                              |
 |---------------|---------|----------|---------|----------------------------------------------------------|
 | `url`         | string  | yes      | --      | The seed URL to start crawling from                      |
-| `max_depth`   | integer | no       | 3       | Maximum link-following depth (1-10)                      |
+| `max_depth`   | integer | no       | 3       | Maximum link-following depth (0-10; 0 reads only the seed) |
 | `max_pages`   | integer | no       | 50      | Maximum number of pages to crawl (1-200)                 |
 | `path_prefix` | string  | no       | --      | Only follow links whose path starts with this prefix     |
 | `include_html`| boolean | no       | false   | Also return each page's rendered HTML and final URL in `pages` |

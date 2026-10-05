@@ -347,30 +347,15 @@ mod tests {
     }
 
     #[test]
-    fn should_route_deep_research_to_named_pipeline_not_inline_dot() {
-        // Contract-drift guard. When the unsafe inline-DOT path was removed
-        // (feat/pipeline-reject-inline-dot), this prompt still mandated
-        // "run_pipeline with an inline DOT graph" and "do NOT pass a pipeline
-        // name like deep_research" — the exact inverse of the new contract.
-        // A live deepseek-v4-pro mini5 soak then authored inline DOT, hit
-        // [VALIDATION FAILED], and fell back to web_search (the inline-web-tools
-        // regression). The prompt MUST name the sanctioned pipeline and MUST
-        // NOT instruct authoring inline DOT.
+    fn should_route_deep_research_to_native_search_and_crawl() {
+        assert!(PROMPT.contains("native Rust `search` tool"));
+        assert!(PROMPT.contains("`deep_crawl`"));
         assert!(
-            PROMPT.contains("pipeline=\"deep_research\""),
-            "prompt must route deep research to the sanctioned name \
-             `pipeline=\"deep_research\"`"
+            PROMPT
+                .contains(r#"allowed_tools: ["search", "deep_crawl", "read_file", "write_file"]"#)
         );
-        assert!(
-            !PROMPT.contains("do NOT pass a pipeline name"),
-            "stale inline-DOT mandate must not return: telling the model to \
-             avoid the pipeline name + author inline DOT is the inverse of the \
-             current contract (inline DOT is rejected by run_pipeline)"
-        );
-        assert!(
-            !PROMPT.contains("inline DOT graph** (digraph)"),
-            "prompt must not mandate authoring an inline DOT graph — rejected"
-        );
+        assert!(!PROMPT.contains(r#"pipeline="deep_research""#));
+        assert!(!PROMPT.contains("Use run_pipeline with an inline DOT"));
     }
 
     #[test]

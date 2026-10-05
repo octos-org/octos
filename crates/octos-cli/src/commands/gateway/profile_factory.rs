@@ -578,6 +578,21 @@ pub(crate) fn build_plugin_env(
 ///   2. We can't determine an OpenAI-compatible base URL for the provider.
 ///
 /// Tokens MUST NOT be logged. We log only the provider name on success.
+pub(crate) fn build_research_synthesis_config(
+    config: &crate::config::Config,
+) -> Option<octos_agent::SynthesisConfig> {
+    // Native research has one synthesis model. Reuse the saved strong lane
+    // when present, including its inherited chat-provider credentials.
+    let resolved = config
+        .sub_providers
+        .iter()
+        .find(|lane| lane.key == "strong")
+        .map(|lane| config.for_sub_provider(lane))
+        .unwrap_or_else(|| config.clone());
+    let provider = crate::runtime::profile::configured_provider_name(&resolved)?;
+    build_synthesis_config(&resolved, &provider)
+}
+
 pub(crate) fn build_synthesis_config(
     config: &crate::config::Config,
     provider_name: &str,
@@ -845,7 +860,7 @@ impl ProfileActorFactoryBuilder {
             if !plugin_dirs.is_empty() {
                 // S2 plumbing: pass profile-scoped synthesis config so per-tenant
                 // routing of synthesis credentials works.
-                let synthesis_config = build_synthesis_config(&profile_config, &provider_name);
+                let synthesis_config = build_research_synthesis_config(&profile_config);
                 match octos_agent::PluginLoader::load_into_with_options_and_filter(
                     &mut tools,
                     &plugin_dirs,
@@ -1560,6 +1575,37 @@ mod tests {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn native_research_synthesis_uses_shared_strong_route() {
+        let mut config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "provider":"openai", "model":"chat-model", "api_key_env":"PRIMARY_KEY",
+            "env_vars":{"PRIMARY_KEY":"primary-test-key", "CODING_KEY":"coding-test-key"},
+            "fallback_models":[{"provider":"moonshot-coding", "model":"k3", "base_url":"https://api.kimi.com/coding/v1", "api_key_env":"CODING_KEY", "api_type":"openai"}],
+            "sub_providers":[{"key":"strong", "provider":"moonshot-coding", "model":"k3"}]
+        })).unwrap();
+        config.bypass_auth_store = true;
+        let synthesis = build_research_synthesis_config(&config).unwrap();
+        assert_eq!(synthesis.provider, "moonshot-coding");
+        assert_eq!(synthesis.model, "k3");
+        assert_eq!(synthesis.endpoint, "https://api.kimi.com/coding/v1");
+        assert_eq!(synthesis.api_key, "coding-test-key");
+    }
+
+    #[test]
+    fn native_research_synthesis_defaults_to_chat_route() {
+        let mut config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "provider":"deepseek", "model":"deepseek-v4-flash",
+            "base_url":"https://api.deepseek.com/v1", "api_key_env":"SHARED_KEY",
+            "env_vars":{"SHARED_KEY":"shared-test-key"}
+        }))
+        .unwrap();
+        config.bypass_auth_store = true;
+        let synthesis = build_research_synthesis_config(&config).unwrap();
+        assert_eq!(synthesis.model, "deepseek-v4-flash");
+        assert_eq!(synthesis.api_key, "shared-test-key");
+        assert_eq!(synthesis.endpoint, "https://api.deepseek.com/v1");
     }
 
     #[test]

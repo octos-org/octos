@@ -78,6 +78,15 @@ CLI flags override config, which overrides the built-in default. The **API key i
 
 ### Auth Store
 
+Native deep research uses the Rust `search` app skill (including OctoScript
+metasearch engines) and `deep_crawl` for rendered site crawling. Deploy the
+`deep-search` and `deep_crawl` executables beside `octos` so startup can install
+these bundled tools. It does not require a DOT graph or `run_pipeline`.
+The host injects the saved `strong` lane into native research's synthesis;
+without that lane it uses the chat provider. Search engines and crawling do
+not need a separate LLM lane. The old named `deep_research` graph remains
+available for explicitly requested legacy workflows.
+
 Research pipelines can select named `sub_providers` such as `cheap` and
 `strong`. In the server and gateway, leave a research lane's `api_key_env`,
 `base_url`, and `api_type` unset to reuse the matching provider in the profile's

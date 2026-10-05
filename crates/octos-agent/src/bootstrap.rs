@@ -172,9 +172,10 @@ fn bootstrap_entries(skills_dir: &Path, entries: &[(&str, &str, &str, &str)]) ->
 /// which pinned the skill binary to whatever shipped on first install and so
 /// went stale across an octos UPGRADE — each skill records the sha256 of its
 /// source sibling binary in a `<skill_dir>/.bundle-src-sha256` marker. A skill
-/// is left untouched only when `main` exists AND the marker matches the current
-/// source hash; otherwise SKILL.md, manifest.json, and `main` are (re)written
-/// and the marker refreshed.
+/// is left untouched only when `main` exists, the marker matches the current
+/// source hash, and its bundled instructions and manifest are current.
+/// Metadata-only upgrades must refresh tool routing even when the sibling
+/// binary is unchanged.
 ///
 /// Best-effort: individual filesystem errors `continue` to the next entry,
 /// matching the prior behaviour.
@@ -207,7 +208,12 @@ fn bootstrap_entries_in(
         // matches the current sibling binary → leave it untouched, don't count.
         if main_path.exists() {
             if let Ok(recorded) = std::fs::read_to_string(&marker_path) {
-                if recorded == src_hash {
+                if recorded == src_hash
+                    && std::fs::read_to_string(skill_dir.join("SKILL.md"))
+                        .is_ok_and(|text| text == *skill_md)
+                    && std::fs::read_to_string(skill_dir.join("manifest.json"))
+                        .is_ok_and(|text| text == *manifest_json)
+                {
                     continue;
                 }
             }
@@ -410,6 +416,33 @@ mod tests {
             b"v2-bigger",
             "stale main must be refreshed with the new source binary bytes"
         );
+    }
+
+    #[test]
+    fn bootstrap_entries_in_refreshes_metadata_with_unchanged_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_dir = tmp.path().join("bin");
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(exe_dir.join("research"), b"same-binary").unwrap();
+        let old = &[("research", "research", "use pipeline", r#"{"tools":[]}"#)];
+        let current = &[(
+            "research",
+            "research",
+            "use native search",
+            r#"{"tools":[{"name":"search"}]}"#,
+        )];
+        assert_eq!(bootstrap_entries_in(&exe_dir, &skills_dir, old), 1);
+        assert_eq!(bootstrap_entries_in(&exe_dir, &skills_dir, current), 1);
+        assert_eq!(
+            std::fs::read_to_string(skills_dir.join("research/SKILL.md")).unwrap(),
+            "use native search"
+        );
+        assert_eq!(
+            std::fs::read_to_string(skills_dir.join("research/manifest.json")).unwrap(),
+            current[0].3
+        );
+        assert_eq!(bootstrap_entries_in(&exe_dir, &skills_dir, current), 0);
     }
 
     #[test]

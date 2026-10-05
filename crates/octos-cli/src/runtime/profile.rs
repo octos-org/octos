@@ -1403,7 +1403,8 @@ impl ProfileRuntime {
             plugin_dirs: plugin_dirs.clone(),
             plugin_env: plugin_env_template.clone(),
             work_dir: plugin_work_dir,
-            synthesis_config: None,
+            synthesis_config:
+                crate::commands::gateway::profile_factory::build_research_synthesis_config(&config),
             require_signed: config.plugins.require_signed,
             verified_cache_dir: effective_octos_home.join("cache").join("verified"),
             tool_policy: config.tool_policy.clone(),
@@ -3367,6 +3368,31 @@ mod tests {
         assert!(
             child_registry.get("run_pipeline").is_some(),
             "spawned child registry must carry `run_pipeline` so the spawn preflight succeeds",
+        );
+    }
+
+    #[tokio::test]
+    async fn native_research_synthesis_is_retained_for_plugin_reload() {
+        let _key = ScopedEnvKey::set("OCTOS_NATIVE_RESEARCH_KEY");
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = fixture_profile("native-research", "OCTOS_NATIVE_RESEARCH_KEY");
+        let rt = ProfileRuntime::bootstrap(&profile, tmp.path(), None, BootstrapRole::Serve)
+            .await
+            .unwrap();
+        let config = rt
+            .plugin_reload
+            .as_ref()
+            .unwrap()
+            .synthesis_config
+            .as_ref()
+            .expect(
+                "serve must inject the current route into native research, including skill reloads",
+            );
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.model, "gpt-4o-mini");
+        assert_eq!(
+            config.api_key,
+            std::env::var("OCTOS_NATIVE_RESEARCH_KEY").unwrap()
         );
     }
 

@@ -27,8 +27,8 @@ use tracing::{info, warn};
 use super::build_system_prompt;
 use super::message_preprocessing;
 use super::profile_factory::{
-    ProfileActorFactoryBuilder, build_plugin_env, build_synthesis_config, profile_plugin_env,
-    profile_search_provider_keys,
+    ProfileActorFactoryBuilder, build_plugin_env, build_research_synthesis_config,
+    profile_plugin_env, profile_search_provider_keys,
 };
 use super::{account_handler, adapters, skills_handler};
 use super::{build_profiled_session_key, resolve_dispatch_profile_id};
@@ -883,7 +883,7 @@ impl GatewayRuntime {
                 }
                 plugin_result = octos_agent::PluginLoadResult::default();
                 if !plugin_dirs.is_empty() {
-                    let synthesis_config = build_synthesis_config(&config, &provider_name);
+                    let synthesis_config = build_research_synthesis_config(&config);
                     match octos_agent::PluginLoader::load_into_with_options_and_filter(
                         &mut tools,
                         &plugin_dirs,
