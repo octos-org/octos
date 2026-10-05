@@ -1075,7 +1075,15 @@ mod tests {
             Some("@bot_mybot:localhost".to_string()),
         );
 
-        tokio::time::sleep(Duration::from_millis(3300)).await;
+        // The first visible status message lands after the composer's 2 s
+        // gate plus its first 1 s tick. A loaded runner can starve the
+        // spawned composer past any fixed sleep, and cancelling first would
+        // leave nothing to assert — wait for the send, then cancel.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while channel.sent.lock().await.is_empty() {
+            assert!(Instant::now() < deadline, "status message should be sent");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         handle.cancelled.store(true, Ordering::Release);
 
         let sent = channel.sent.lock().await;

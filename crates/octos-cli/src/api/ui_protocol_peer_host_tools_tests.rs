@@ -235,13 +235,18 @@ fn frame_json(message: WsMessage) -> Value {
     serde_json::from_str(text.as_str()).expect("json frame")
 }
 
-/// Next notification with `method` (skips any other frame).
+/// Next notification with `method` (skips any other frame), within
+/// [`TURN_ARRIVAL_BUDGET`].
 async fn next_frame(rx: &mut mpsc::Receiver<WsMessage>, method: &str) -> Value {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
     loop {
-        let message = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a frame in time")
-            .expect("connection open");
+        let message = tokio::time::timeout(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            rx.recv(),
+        )
+        .await
+        .expect("a frame in time")
+        .expect("connection open");
         let frame = frame_json(message);
         if frame["method"] == method {
             return frame["params"].clone();
@@ -4903,12 +4908,16 @@ async fn should_refuse_a_turn_start_with_a_rejected_inputs_turn_id() {
     )
     .await;
     assert!(!started, "the turn is refused");
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
     let refused = loop {
         let frame = frame_json(
-            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .expect("a frame in time")
-                .expect("connection open"),
+            tokio::time::timeout(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                rx.recv(),
+            )
+            .await
+            .expect("a frame in time")
+            .expect("connection open"),
         );
         if frame["id"] == "start-rejected" {
             break frame;
