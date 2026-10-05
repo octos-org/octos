@@ -1115,6 +1115,12 @@ mod tests {
             .args(["log", "--format=%s"])
             .output()
             .unwrap();
+        assert!(
+            out.status.success(),
+            "git log failed in {}: {}",
+            project.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
         String::from_utf8_lossy(&out.stdout)
             .lines()
             .map(str::to_string)
