@@ -9,11 +9,12 @@ use crate::peers::host_tools::{apply_session_host_tools, resolve_session_host_to
 use octos_core::ui_protocol::{ApprovalRespondParams, QuestionId, UserQuestionAnswer};
 
 /// How long a wait may budget for a turn to reach its next observable step
-/// (the model, an approval event, the peer's `result.md`). These are arrival
-/// assertions, not latency contracts, and the Windows CI shard runs this
-/// suite several times slower than Linux — arrival waits of 20–60s popped
-/// there repeatedly while the identical tests stayed green on Linux. Budget
-/// minutes, not milliseconds.
+/// (the model, a `peer/tool/call` frame, an approval event, the peer's
+/// `result.md`). These are arrival assertions, not latency contracts, and the
+/// Windows CI shard runs this suite noticeably slower than Linux (suite level
+/// ~1.5-1.7x, with individual peer-lane waits observed exceeding 60s) —
+/// arrival waits of 20-60s popped there repeatedly while the identical tests
+/// stayed green on Linux. Budget minutes, not milliseconds.
 const TURN_ARRIVAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// The chat id of this test's host sessions. Peer state (routes, the staged
@@ -575,7 +576,8 @@ async fn wait_for_pending(
     contracts: &UiProtocolContractStores,
     key: &SessionKey,
 ) -> Vec<ApprovalRequestedEvent> {
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while std::time::Instant::now() < deadline {
         let pending = contracts.approvals.pending_for_session(key);
         if !pending.is_empty() {
             return pending;
@@ -1146,7 +1148,8 @@ async fn should_keep_a_host_tool_approval_and_turn_controls_on_the_host_connecti
     // Another connection of the profile, on the same session.
     let (spoof_ws, mut spoof_rx) = ws_connection_for_test(64);
     let mut requested = None;
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while std::time::Instant::now() < deadline {
         requested = ledger
             .replay_after(
                 &key,
@@ -2137,7 +2140,8 @@ async fn e2e_turn_with(
     )
     .await;
     // Generous: under a loaded test run the turn can take seconds.
-    for _ in 0..3000 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while std::time::Instant::now() < deadline {
         if llm.calls.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
             break;
         }
@@ -2509,7 +2513,8 @@ async fn recorded_turn(
         )
         .await;
     }
-    for _ in 0..500 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while std::time::Instant::now() < deadline {
         if llm.requests.lock().unwrap().len() > before {
             break;
         }
@@ -4973,9 +4978,10 @@ fn collect_frames(mut rx: mpsc::Receiver<WsMessage>) -> Frames {
     frames
 }
 
-/// The first frame matching `pick`, waiting up to 10 s.
+/// The first frame matching `pick`, within [`TURN_ARRIVAL_BUDGET`].
 async fn wait_frame(frames: &Frames, pick: impl Fn(&Value) -> bool) -> Value {
-    for _ in 0..500 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while std::time::Instant::now() < deadline {
         if let Some(frame) = frames.lock().unwrap().iter().find(|f| pick(f)) {
             return frame.clone();
         }
@@ -5113,7 +5119,8 @@ async fn should_run_a_persons_turn_on_the_peer_session_labelled_with_its_origin(
     // it is recorded as covered.
     let peers = e.data_dir.join("peers");
     let mut covered = false;
-    for _ in 0..250 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while std::time::Instant::now() < deadline {
         if matches!(
             read_peer_fleet_synthesis_marks(&peers, &e.system.0),
             FleetSynthesisMarks::Rounds(ref rounds) if rounds.get("news") == Some(&1)
@@ -5137,7 +5144,9 @@ async fn should_run_a_persons_turn_on_the_peer_session_labelled_with_its_origin(
     // turn is still finishing.)
     let app_turn = TurnId::new();
     let mut admitted = false;
-    for attempt in 0..250 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    let mut attempt = 0usize;
+    while std::time::Instant::now() < deadline {
         if start_turn(
             &e,
             &e.ws,
@@ -5153,6 +5162,7 @@ async fn should_run_a_persons_turn_on_the_peer_session_labelled_with_its_origin(
             admitted = true;
             break;
         }
+        attempt += 1;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(admitted, "the app's turn starts once the person's ended");
@@ -5480,7 +5490,8 @@ async fn should_refuse_a_second_turn_while_the_shared_peer_session_is_busy() {
     let result = wait_result(&e, &person_turn).await;
     assert!(result.contains("\norigin: person\n"), "{result}");
     let mut admitted = false;
-    for _ in 0..250 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while std::time::Instant::now() < deadline {
         if start_turn(
             &e,
             &e.ws,
@@ -5684,7 +5695,9 @@ async fn start_turn_when_free(
     text: &str,
     origin: Option<octos_core::ui_protocol::TurnOrigin>,
 ) {
-    for attempt in 0..1000 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    let mut attempt = 0usize;
+    while std::time::Instant::now() < deadline {
         if start_turn(
             e,
             &e.ws,
@@ -5699,6 +5712,7 @@ async fn start_turn_when_free(
         {
             return;
         }
+        attempt += 1;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     panic!("turn {request_id} was never admitted");
@@ -5892,7 +5906,8 @@ async fn should_run_the_person_lane_while_the_system_agent_lane_is_busy() {
     let dir = e.data_dir.join("peers/news");
     // (`turns.txt` is appended just after `result.md`.)
     let mut turns = String::new();
-    for _ in 0..1000 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while std::time::Instant::now() < deadline {
         turns = std::fs::read_to_string(dir.join("turns.txt")).unwrap();
         if turns.lines().count() >= 3 {
             break;
@@ -6064,8 +6079,10 @@ async fn should_let_only_the_host_open_a_sharing_context_and_label_its_turns() {
     // The plain context's turn writes no blackboard round.
     let plain_turn = TurnId::new();
     start_turn_when_free(&e, &active, "o5", &plain, &plain_turn, "mini", None).await;
-    // (Slow runners: wait up to 20 s for the plain turn to reach the model.)
-    for _ in 0..1000 {
+    // (Slow runners: the arrival budget above applies to the plain turn
+    // reaching the model.)
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while std::time::Instant::now() < deadline {
         if llm.requests.lock().unwrap().len() >= 2 {
             break;
         }
