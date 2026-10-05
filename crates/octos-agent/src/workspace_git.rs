@@ -1115,6 +1115,12 @@ mod tests {
             .args(["log", "--format=%s"])
             .output()
             .unwrap();
+        assert!(
+            out.status.success(),
+            "git log failed in {}: {}",
+            project.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
         String::from_utf8_lossy(&out.stdout)
             .lines()
             .map(str::to_string)
@@ -1132,6 +1138,12 @@ mod tests {
         );
     }
 
+    /// The repo-owned clean filter must never execute during a kernel
+    /// snapshot. The poison path is rendered with forward slashes (the same
+    /// convention as `private_git`'s `config_hooks_value`): git config
+    /// quoting treats a backslash as an escape, so a verbatim Windows path
+    /// would make the repo config unparseable and reduce this to a
+    /// parse-error test instead of a suppression test.
     #[test]
     fn should_not_run_repo_clean_filter_when_snapshotting_workspace() {
         let (temp, project, markers) = seeded_site_repo();
@@ -1140,7 +1152,7 @@ mod tests {
             &project,
             &format!(
                 "[filter \"p\"]\n\tclean = \"touch '{}'; cat\"\n",
-                pwned.display()
+                pwned.display().to_string().replace('\\', "/")
             ),
         );
         std::fs::write(project.join(".gitattributes"), "* filter=p\n").unwrap();
@@ -1155,6 +1167,22 @@ mod tests {
             !pwned.exists(),
             "clean filter from .git/config must not run"
         );
+    }
+
+    /// Snapshot commits stay visible through plain `git` in the project's
+    /// own .git. Deliberately unpoisoned: plain `git` reads the repo config
+    /// that the snapshot kernel ignores, so the clean-filter test above
+    /// keeps its poison to itself.
+    #[test]
+    fn should_keep_project_git_history_visible_when_snapshotting_workspace() {
+        let (temp, project, _) = seeded_site_repo();
+        std::fs::write(project.join("index.html"), "<h1>v2</h1>\n").unwrap();
+
+        let message =
+            snapshot_workspace_change(temp.path(), &project.join("index.html"), "write_file")
+                .unwrap();
+        assert!(message.is_some(), "the change is still committed");
+
         let log = plain_git_log(&project);
         assert_eq!(
             log.len(),
