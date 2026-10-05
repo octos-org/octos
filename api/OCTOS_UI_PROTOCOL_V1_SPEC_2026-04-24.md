@@ -546,6 +546,10 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `profile/sub_providers/list`, `profile/sub_providers/upsert`,
   `profile/sub_providers/remove` (named provider lanes for per-node pipeline
   routing — e.g. `deep_research`'s isolated `cheap`/`strong` lanes)
+  Research lanes with omitted `api_key_env`, `base_url`, or `api_type` inherit
+  those fields from the matching saved chat provider route. Explicit overrides
+  win; a different endpoint does not inherit a route's custom credential.
+  Without a matching route, the lane uses its own provider defaults.
 - `snapshot/list`, `snapshot/restore` (#1768 workspace snapshot undo: list
   the session workspace's pre-mutation undo points; restore rolls the
   workspace back — refused while a turn is in flight, itself undoable via

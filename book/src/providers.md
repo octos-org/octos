@@ -78,6 +78,21 @@ CLI flags override config, which overrides the built-in default. The **API key i
 
 ### Auth Store
 
+Research pipelines can select named `sub_providers` such as `cheap` and
+`strong`. In the server and gateway, leave a research lane's `api_key_env`,
+`base_url`, and `api_type` unset to reuse the matching provider in the profile's
+chat configuration (primary or fallback). An exact model match takes precedence
+when multiple saved routes use the same provider. Explicit lane overrides still
+win; a different endpoint does not inherit a saved route's custom credential.
+An unmatched provider uses its own defaults, never another provider's key.
+
+The credentials remain in the shared profile environment/auth store. Updating
+the saved provider credential therefore applies to both chat and research when
+the profile runtime reloads. Separate model lanes retain independent runtime
+state; sharing a credential does not switch the active chat model. A rejected
+credential still needs replacement: HTTP 401 is an authentication failure, not
+a missing research tool or a reason to repeatedly retry the same key.
+
 Instead of environment variables, you can store API keys through the auth CLI:
 
 ```bash

@@ -166,22 +166,15 @@ fn build_sub_provider_router(config: &Config) -> Option<Arc<octos_llm::ProviderR
     let router = Arc::new(octos_llm::ProviderRouter::new());
     let mut registered = 0usize;
     for sp in &config.sub_providers {
-        // Per-sub-provider key override, matching the gateway path: an explicit
-        // `api_key_env` selects a distinct credential; otherwise inherit the
-        // profile's default for the provider.
-        let sp_config = if sp.api_key_env.is_some() {
-            let mut c = config.clone();
-            c.api_key_env = sp.api_key_env.clone();
-            c
-        } else {
-            config.clone()
-        };
+        // Share the matching chat provider's saved route/credential unless
+        // this lane explicitly overrides it. Circuit breakers remain isolated.
+        let sp_config = config.for_sub_provider(sp);
         match chat::create_provider_with_api_type(
             &sp.provider,
             &sp_config,
             sp.model.clone(),
-            sp.base_url.clone(),
-            sp.api_type.as_deref(),
+            sp_config.base_url.clone(),
+            sp_config.api_type.as_deref(),
         ) {
             Ok(p) => {
                 router.register_with_full_meta(
@@ -3375,6 +3368,46 @@ mod tests {
             child_registry.get("run_pipeline").is_some(),
             "spawned child registry must carry `run_pipeline` so the spawn preflight succeeds",
         );
+    }
+
+    #[tokio::test]
+    async fn research_lane_router_sends_the_matching_chat_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let capture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 16384];
+            let n = socket.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..n]).to_string();
+            let body = r#"{"id":"test","object":"chat.completion","model":"deepseek-v4-flash","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            request
+        });
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "provider":"openai", "api_key_env":"CHAT_KEY",
+            "env_vars":{"CHAT_KEY":"wrong-primary-key", "SHARED_KEY":"matching-chat-key"},
+            "fallback_models":[{"provider":"deepseek", "model":"deepseek-v4-flash", "base_url":url, "api_key_env":"SHARED_KEY", "api_type":"openai"}],
+            "sub_providers":[{"key":"cheap", "provider":"deepseek", "model":"deepseek-v4-flash", "base_url":url}]
+        })).unwrap();
+        config.bypass_auth_store = true;
+        let router = build_sub_provider_router(&config).unwrap();
+        let provider = router.resolve("cheap").unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.chat(
+                &[octos_core::Message::user("Reply OK")],
+                &[],
+                &octos_llm::ChatConfig::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.content.as_deref(), Some("OK"));
+        let request = capture.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer matching-chat-key"));
+        assert!(!request.contains("wrong-primary-key"));
     }
 
     /// #1935 — a `sub_providers` entry keyed [`GOAL_VERIFIER_LANE_KEY`]

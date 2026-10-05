@@ -949,19 +949,13 @@ impl GatewayRuntime {
 
                 // 1. Register explicit sub_providers (highest priority)
                 for sp in &config.sub_providers {
-                    let sp_config = if sp.api_key_env.is_some() {
-                        let mut c = config.clone();
-                        c.api_key_env = sp.api_key_env.clone();
-                        c
-                    } else {
-                        config.clone()
-                    };
+                    let sp_config = config.for_sub_provider(sp);
                     match chat::create_provider_with_api_type(
                         &sp.provider,
                         &sp_config,
                         sp.model.clone(),
-                        sp.base_url.clone(),
-                        sp.api_type.as_deref(),
+                        sp_config.base_url.clone(),
+                        sp_config.api_type.as_deref(),
                     ) {
                         Ok(p) => {
                             router.register_with_full_meta(
