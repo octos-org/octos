@@ -3369,15 +3369,17 @@ async fn should_cancel_an_in_flight_host_call_when_the_turn_is_interrupted() {
     assert_eq!(cancel["call_id"], call["call_id"]);
     assert_eq!(cancel["reason"], "cancelled");
     // ...and the call ends as an unknown outcome (it is not resent later).
+    // The row is written by the call task when it observes the cancellation,
+    // so like the cancel frame it is an arrival the loaded shard can delay.
     let mut unknown = false;
-    for _ in 0..200 {
+    let deadline = std::time::Instant::now() + TURN_ARRIVAL_BUDGET;
+    while !unknown && std::time::Instant::now() < deadline {
         let audit =
             std::fs::read_to_string(peers_root.join("news/tool_audit.jsonl")).unwrap_or_default();
-        if audit.contains("\"outcome\":\"unknown\"") {
-            unknown = true;
-            break;
+        unknown = audit.contains("\"outcome\":\"unknown\"");
+        if !unknown {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(unknown, "the interrupted call is audited as unknown");
     assert!(crate::peers::host_tools::pending_calls_for(&peers_root, "news").is_empty());
