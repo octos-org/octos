@@ -453,6 +453,9 @@ const APPUI_METHOD_PEER_TOOLS_UNREGISTER: &str = "peer/tools/unregister";
 /// `NoActiveTurn` fallback). Steering is NOT an interrupt — the in-flight
 /// round always completes; `turn/interrupt` stays a separate op.
 const APPUI_METHOD_TURN_STEER: &str = "turn/steer";
+#[path = "session_history.rs"]
+mod session_history;
+const APPUI_METHOD_SESSION_HISTORY_LIST: &str = "session/history/list";
 const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
@@ -524,6 +527,7 @@ const APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1: &str = "onboarding.workspace_
 /// affordance (fail closed).
 const APPUI_FEATURE_ONBOARDING_WORKSPACE_BROWSE_V1: &str = "onboarding.workspace_browse.v1";
 const APPUI_EXTRA_METHODS: &[&str] = &[
+    APPUI_METHOD_SESSION_HISTORY_LIST,
     APPUI_METHOD_CLIENT_HELLO,
     APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
     APPUI_METHOD_SESSION_STATUS_READ,
@@ -2765,6 +2769,16 @@ impl ConnectionUiFeatures {
                     octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1,
                 );
             }
+        }
+        if state.profile_store.is_some() {
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                "memory.session_scope.v1",
+            );
+            push_capability_feature(
+                &mut capabilities.supported_features,
+                "skills.effective_catalog.v1",
+            );
         }
         if state.profile_store.is_some() && self.skill_actions_available() {
             push_capability_feature(
@@ -9531,6 +9545,10 @@ struct PreAdmittedVoice {
 #[derive(Debug, Default, Deserialize)]
 struct RawProfileSkillsListParams {
     #[serde(default)]
+    host_token: Option<String>,
+    #[serde(default)]
+    session_id: Option<SessionKey>,
+    #[serde(default)]
     profile_id: Option<String>,
 }
 
@@ -11683,11 +11701,11 @@ fn deferred_model_tool_names(_registry: Option<&octos_agent::ToolRegistry>) -> V
     Vec::new()
 }
 
-async fn tool_status_list_result(
+async fn runtime_inventory_registry(
     state: &Arc<AppState>,
     session_id: &SessionKey,
     active_profile_id: Option<&str>,
-) -> Result<Value, RpcError> {
+) -> Result<Option<Arc<octos_agent::ToolRegistry>>, RpcError> {
     let profile_runtime = ensure_session_profile_runtime(state, active_profile_id).await?;
     let session_runtime = if let Some(profile_runtime) = profile_runtime.as_ref() {
         // Epoch BEFORE permission resolution so a concurrent downgrade
@@ -11719,12 +11737,22 @@ async fn tool_status_list_result(
     };
     let registry = session_runtime
         .as_ref()
-        .map(|runtime| runtime.tools.as_ref())
+        .map(|runtime| runtime.tools.clone())
         .or_else(|| {
             profile_runtime
                 .as_ref()
-                .map(|runtime| runtime.tool_specs.as_ref())
+                .map(|runtime| runtime.tool_specs.clone())
         });
+    Ok(registry)
+}
+
+async fn tool_status_list_result(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let registry = runtime_inventory_registry(state, session_id, active_profile_id).await?;
+    let registry = registry.as_deref();
     let tool_names = model_visible_tool_names(registry);
     let registered_names = registered_tool_names(registry);
     let deferred_names = deferred_model_tool_names(registry);
@@ -11784,16 +11812,43 @@ async fn tool_status_list_result(
     ))
 }
 
-fn mcp_status_list_result(session_id: &SessionKey, active_profile_id: Option<&str>) -> Value {
+async fn mcp_status_list_result(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_profile_id: Option<&str>,
+) -> Result<Value, RpcError> {
+    let registry = runtime_inventory_registry(state, session_id, active_profile_id).await?;
+    let connections = registry
+        .map(|r| r.mcp_server_statuses())
+        .unwrap_or_default();
+    let tool_refs: Vec<Vec<&str>> = connections
+        .iter()
+        .map(|s| s.tools.iter().map(String::as_str).collect())
+        .collect();
+    let servers: Vec<_> = connections
+        .iter()
+        .zip(&tool_refs)
+        .map(
+            |(s, tools)| super::coding_tool_contract::McpServerStatusView {
+                id: &s.id,
+                display_name: Some(&s.display_name),
+                transport: Some(&s.transport),
+                status: &s.status,
+                tool_count: s.tools.len(),
+                tools,
+                error: s.error.as_deref(),
+            },
+        )
+        .collect();
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
-    super::coding_tool_contract::mcp_status_list_payload(
+    Ok(super::coding_tool_contract::mcp_status_list_payload(
         super::coding_tool_contract::McpStatusListContext {
             profile_id: Some(profile_id.as_str()),
             session_id: session_id_wire.as_str(),
-            servers: &[],
+            servers: &servers,
         },
-    )
+    ))
 }
 
 fn runtime_policy_stamp_for_profile(
@@ -12300,8 +12355,8 @@ fn skill_entry_with_status(skill: crate::commands::skills::SkillEntry) -> Result
     Ok(value)
 }
 
-fn raw_profile_skills_list(
-    state: &AppState,
+async fn raw_profile_skills_list(
+    state: &Arc<AppState>,
     request: &RpcRequest<Value>,
     connection_profile_id: Option<&str>,
 ) -> Result<Value, RpcError> {
@@ -12313,10 +12368,37 @@ fn raw_profile_skills_list(
         .into_iter()
         .map(skill_entry_with_status)
         .collect::<Result<Vec<_>, _>>()?;
+    let effective = if let Some(session) = params.session_id.as_ref() {
+        if !session.0.starts_with(&format!("{profile_id}:")) {
+            return Err(RpcError::permission_denied(
+                "Skill session is outside the selected profile",
+            ));
+        }
+        validate_session_scope(session, Some(&profile_id), connection_profile_id)?;
+        resolve_memory_context(
+            state,
+            &profile_id,
+            Some(&octos_core::ui_protocol::MemorySessionContext {
+                session_id: session.0.clone(),
+                host_token: params.host_token.clone(),
+            }),
+        )?;
+        let rt = skill_action_session_runtime(state, session, Some(&profile_id)).await?;
+        Some(
+            rt.profile
+                .skill_catalog(Some(&rt.workspace_root))
+                .await
+                .map_err(|e| RpcError::internal_error(format!("Skill catalog unavailable: {e}")))?,
+        )
+    } else {
+        None
+    };
     Ok(json!({
         "profile_id": profile_id,
         "count": skills.len(),
         "skills": skills,
+        "session_id":params.session_id,
+        "effective_skills":effective,
     }))
 }
 
@@ -21288,8 +21370,11 @@ async fn handle_raw_appui_rpc(
             ))
             .await
         }
+        APPUI_METHOD_SESSION_HISTORY_LIST => {
+            session_history::list(state, request, connection_profile_id).await
+        }
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
-            raw_profile_skills_list(state, request, connection_profile_id)
+            raw_profile_skills_list(state, request, connection_profile_id).await
         }
         APPUI_METHOD_SKILL_ACTION_LIST => {
             raw_skill_action_list(state, request, connection_profile_id, features).await
@@ -21391,20 +21476,16 @@ async fn handle_raw_appui_rpc(
                     return true;
                 }
             };
-            if request.method == APPUI_METHOD_MCP_STATUS_LIST {
-                Ok(mcp_status_list_result(
-                    &session_id,
-                    active_profile_id.as_deref(),
-                ))
+            let result = if request.method == APPUI_METHOD_MCP_STATUS_LIST {
+                mcp_status_list_result(state, &session_id, active_profile_id.as_deref()).await
             } else {
-                match tool_status_list_result(state, &session_id, active_profile_id.as_deref())
-                    .await
-                {
-                    Ok(result) => Ok(result),
-                    Err(error) => {
-                        let _ = send_rpc_error(ws, Some(id), error);
-                        return true;
-                    }
+                tool_status_list_result(state, &session_id, active_profile_id.as_deref()).await
+            };
+            match result {
+                Ok(result) => Ok(result),
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                    return true;
                 }
             }
         }
@@ -21709,7 +21790,8 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
     }
     if matches!(
         method,
-        APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+        APPUI_METHOD_SESSION_HISTORY_LIST
+            | APPUI_METHOD_CONFIG_CAPABILITIES_LIST
             | APPUI_METHOD_SERVER_SHUTDOWN
             | APPUI_METHOD_SESSION_STATUS_READ
             | APPUI_METHOD_PROFILE_LLM_CATALOG
@@ -32961,6 +33043,90 @@ fn apply_memory_overview_budgets(overview: &mut Value) {
     }
 }
 
+fn resolve_memory_profile_id(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: &AuthIdentity,
+    requested: Option<&str>,
+    method: &str,
+) -> Result<String, RpcError> {
+    let store = state.profile_store.as_ref().ok_or_else(|| {
+        RpcError::runtime_not_ready(format!(
+            "{method}: profile store not configured on this server"
+        ))
+    })?;
+    super::auth_handlers::resolve_memory_profile_id(identity, store, state, headers, requested)
+        .map_err(|status| {
+            if status == axum::http::StatusCode::FORBIDDEN {
+                RpcError::permission_denied("Memory profile is outside the authorized scope")
+                    .with_data(json!({"kind": "forbidden", "rest_status": 403}))
+            } else {
+                rest_status_to_rpc_error(
+                    method,
+                    status,
+                    None,
+                    &RestResourceContext::resource("profile", requested.unwrap_or_default()),
+                )
+            }
+        })
+}
+
+/// Resolve a durable assignment only after authorizing its profile. An app
+/// namespace additionally requires the credential of the host that owns it.
+fn resolve_memory_context(
+    state: &AppState,
+    profile_id: &str,
+    context: Option<&octos_core::ui_protocol::MemorySessionContext>,
+) -> Result<(Option<String>, Value), RpcError> {
+    let Some(context) = context else {
+        return Ok((
+            None,
+            json!({"kind":"profile", "namespace":null, "session_id":null}),
+        ));
+    };
+    let session = SessionKey(context.session_id.clone());
+    if context.session_id.trim().is_empty()
+        || !context.session_id.starts_with(&format!("{profile_id}:"))
+    {
+        return Err(RpcError::permission_denied(
+            "Memory session is outside the selected profile",
+        ));
+    }
+    validate_session_scope(&session, Some(profile_id), Some(profile_id))?;
+    let ps = profile_store(state)?;
+    let profile = ps
+        .get(profile_id)
+        .map_err(|e| RpcError::internal_error(e.to_string()))?
+        .ok_or_else(|| RpcError::not_found("profile", profile_id))?;
+    let peers = ps.resolve_data_dir(&profile).join("peers");
+    use crate::peers::app_binding::{self, SessionAppBinding};
+    let namespace = match app_binding::resolve_session_app_binding(&peers, &session) {
+        SessionAppBinding::Unbound => None,
+        SessionAppBinding::Refused(reason) => return Err(RpcError::permission_denied(reason)),
+        SessionAppBinding::Bound {
+            memory_namespace, ..
+        } => {
+            let topic = session.topic().unwrap_or_default();
+            let slug = app_binding::parse_context_topic(topic)
+                .map(|(s, _)| s)
+                .or_else(|| topic.strip_prefix("peer-"))
+                .ok_or_else(|| RpcError::permission_denied("Missing app memory binding"))?;
+            let binding = app_binding::read_peer_host_binding(&peers, slug)
+                .ok_or_else(|| host_token_error(slug))?;
+            if !app_binding::host_token_matches(&binding, context.host_token.as_deref()) {
+                return Err(host_token_error(slug));
+            }
+            Some(
+                crate::runtime::memory_namespace::validate_memory_namespace(&memory_namespace)
+                    .map_err(RpcError::invalid_params)?,
+            )
+        }
+    };
+    let scope = json!({"kind": if namespace.is_some() {"namespace"} else {"profile"},
+        "namespace":namespace, "session_id":context.session_id});
+    Ok((namespace, scope))
+}
+
 async fn handle_memory_overview(
     ws: &WsConnection,
     state: &Arc<AppState>,
@@ -32968,7 +33134,7 @@ async fn handle_memory_overview(
     identity: Option<&AuthIdentity>,
     close_on_auth_unavailable: bool,
     id: String,
-    _params: MemoryOverviewParams,
+    params: MemoryOverviewParams,
 ) {
     let method = octos_core::ui_protocol::methods::MEMORY_OVERVIEW;
     let Some(identity) = identity.cloned() else {
@@ -32981,9 +33147,33 @@ async fn handle_memory_overview(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result =
-        super::memory_panel::my_memory(State(state.clone()), headers.clone(), Extension(identity))
-            .await;
+    let profile_id = match resolve_memory_profile_id(
+        state,
+        headers,
+        &identity,
+        params.profile_id.as_deref(),
+        method,
+    ) {
+        Ok(profile_id) => profile_id,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let (namespace, scope) =
+        match resolve_memory_context(state, &profile_id, params.context.as_ref()) {
+            Ok(scope) => scope,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
+    let result = super::memory_panel::profile_memory_scoped(
+        state.clone(),
+        &profile_id,
+        namespace.as_deref(),
+    )
+    .await;
     match result {
         Ok(axum::Json(overview)) => match serde_json::to_value(&overview) {
             // The REST body is forwarded whole under `overview` (the
@@ -32994,7 +33184,12 @@ async fn handle_memory_overview(
             // head+tail preview (codex #1621 r1 P1).
             Ok(mut value) => {
                 apply_memory_overview_budgets(&mut value);
-                send_aux_rpc_result(ws, id, method, json!({ "overview": value }))
+                send_aux_rpc_result(
+                    ws,
+                    id,
+                    method,
+                    json!({ "profile_id": profile_id, "scope": scope, "overview": value }),
+                )
             }
             Err(error) => {
                 let _ = send_rpc_error(
@@ -33040,12 +33235,33 @@ async fn handle_memory_entity(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
+    let profile_id = match resolve_memory_profile_id(
+        state,
+        headers,
+        &identity,
+        params.profile_id.as_deref(),
+        method,
+    ) {
+        Ok(profile_id) => profile_id,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let (namespace, scope) =
+        match resolve_memory_context(state, &profile_id, params.context.as_ref()) {
+            Ok(scope) => scope,
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        };
     let entity_name = params.name.clone();
-    let result = super::memory_panel::my_memory_entity(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        axum_path(params.name),
+    let result = super::memory_panel::profile_memory_entity_scoped(
+        state.clone(),
+        &profile_id,
+        namespace.as_deref(),
+        params.name,
     )
     .await;
     match result {
@@ -33066,6 +33282,7 @@ async fn handle_memory_entity(
                 id,
                 method,
                 json!({
+                    "profile_id": profile_id, "scope": scope,
                     "name": entity.name,
                     "content": content,
                     "content_truncated": content_truncated,
@@ -33109,29 +33326,26 @@ const MEMORY_INGEST_EMBED_BATCH: usize = 16;
 const MEMORY_INGEST_KNOWLEDGE_REFUSAL: &str =
     "knowledge pages are written through save_memory / the memory bank, not ingest";
 
-/// Resolve the caller to its profile's live runtime: the identity →
-/// profile-id step is the one `memory/overview` takes through
-/// `memory_panel::my_memory` (`resolve_my_profile_id`), and the runtime
-/// lookup is the session path's `ensure_session_profile_runtime`. A
-/// profile without a bootstrappable runtime answers with the same
-/// `runtime_unavailable` message the session helpers use.
+/// Resolve and authorize the requested (or identity-default) profile before
+/// looking up its runtime. All five memory methods share the same scope rules.
 async fn resolve_memory_profile_runtime(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: &AuthIdentity,
+    requested: Option<&str>,
     method: &str,
-) -> Result<(String, Arc<crate::runtime::ProfileRuntime>), RpcError> {
-    let Some(profile_store) = state.profile_store.as_ref() else {
-        return Err(RpcError::runtime_not_ready(format!(
-            "{method}: profile store not configured on this server"
-        )));
-    };
-    let profile_id =
-        crate::api::auth_handlers::resolve_my_profile_id(identity, profile_store, state, headers)
-            .map_err(|status| {
-            let context = RestResourceContext::resource("profile", "");
-            rest_status_to_rpc_error(method, status, None, &context)
-        })?;
+    context: Option<&octos_core::ui_protocol::MemorySessionContext>,
+) -> Result<
+    (
+        String,
+        Arc<crate::runtime::ProfileRuntime>,
+        crate::runtime::memory_namespace::SessionMemory,
+        Value,
+    ),
+    RpcError,
+> {
+    let profile_id = resolve_memory_profile_id(state, headers, identity, requested, method)?;
+    let (namespace, scope) = resolve_memory_context(state, &profile_id, context)?;
     // Boxed on purpose: the runtime lookup embeds the whole cold-bootstrap
     // future (`ProfileRuntime::bootstrap_with_host_plugins`), and the three
     // Recall handlers are inlined into the WS and stdio dispatch state
@@ -33139,7 +33353,18 @@ async fn resolve_memory_profile_runtime(
     // — which tests await on a 2 MiB thread stack — from growing by three
     // bootstraps.
     match Box::pin(ensure_session_profile_runtime(state, Some(&profile_id))).await? {
-        Some(runtime) => Ok((profile_id, runtime)),
+        Some(runtime) => {
+            use crate::runtime::memory_namespace::SessionMemory;
+            let memory = match namespace {
+                Some(ns) => SessionMemory::namespaced(&runtime, &ns)
+                    .await
+                    .map_err(|e| {
+                        RpcError::internal_error(format!("memory namespace unavailable: {e}"))
+                    })?,
+                None => SessionMemory::profile(&runtime),
+            };
+            Ok((profile_id, runtime, memory, scope))
+        }
         None => Err(runtime_unavailable_error(
             profile_runtime_unavailable_message(state, &profile_id),
         )),
@@ -33268,14 +33493,22 @@ async fn handle_memory_search(
             return;
         }
     };
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
+    let (profile_id, runtime, memory, scope) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        params.profile_id.as_deref(),
+        method,
+        params.context.as_ref(),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let query = params.query.trim().to_owned();
     let query_vector = match runtime.embedder.as_ref() {
         Some(embedder) => match embedder.embed(&[query.as_str()]).await {
@@ -33293,7 +33526,7 @@ async fn handle_memory_search(
         },
         None => None,
     };
-    let recall = runtime.recall.clone();
+    let recall = memory.recall.clone();
     let searched = tokio::task::spawn_blocking(move || {
         recall.search(&query, query_vector.as_deref(), &filter)
     })
@@ -33321,7 +33554,12 @@ async fn handle_memory_search(
         .iter()
         .filter_map(|hit| serde_json::to_value(hit).ok())
         .collect();
-    send_aux_rpc_result(ws, id, method, json!({ "hits": hits }));
+    send_aux_rpc_result(
+        ws,
+        id,
+        method,
+        json!({ "profile_id": profile_id, "scope": scope, "hits": hits }),
+    );
 }
 
 /// `memory/load` — stage two: fetch one record by id and count the
@@ -33354,21 +33592,34 @@ async fn handle_memory_load(
         );
         return;
     }
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
-    let recall = runtime.recall.clone();
+    let (profile_id, _runtime, memory, scope) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        params.profile_id.as_deref(),
+        method,
+        params.context.as_ref(),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let recall = memory.recall.clone();
     let lookup_id = record_id.clone();
+    let count_visit = params.count_visit.unwrap_or(true);
     let fetched = tokio::task::spawn_blocking(move || {
         // A load is a visit: bump the heat first so hot records keep
         // their vector and get nominated for promotion, and so the
         // returned snapshot already carries this visit.
-        match recall.touch(&lookup_id) {
+        match if count_visit {
+            recall.touch(&lookup_id)
+        } else {
+            Ok(true)
+        } {
             Ok(true) => {}
             Ok(false) => return Ok::<_, eyre::Report>(None),
             Err(error) => {
@@ -33413,7 +33664,7 @@ async fn handle_memory_load(
     let mut page: Option<String> = None;
     let mut page_truncated = false;
     if let Some(slug) = record_id.strip_prefix(MEMORY_RECORD_BANK_PREFIX) {
-        match runtime.memory_store.read_entity(slug).await {
+        match memory.memory_store.read_entity(slug).await {
             Ok(Some(mut text)) => {
                 let cut = cap_index_by_escaped_len(&text, MEMORY_RPC_ENTITY_CONTENT_BUDGET);
                 page_truncated = cut < text.len();
@@ -33448,7 +33699,7 @@ async fn handle_memory_load(
             return;
         }
     };
-    let mut body = json!({ "record": record, "page_truncated": page_truncated });
+    let mut body = json!({ "profile_id": profile_id, "scope": scope, "record": record, "page_truncated": page_truncated });
     if let Some(page) = page {
         body["page"] = json!(page);
     }
@@ -33607,6 +33858,8 @@ async fn handle_memory_ingest(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
+    let requested_profile = params.profile_id.clone();
+    let requested_context = params.context.clone();
     let embed_requested = params.embed.unwrap_or(true);
     let ValidatedMemoryIngest { records, vectors } = match validate_memory_ingest(params) {
         Ok(validated) => validated,
@@ -33615,14 +33868,22 @@ async fn handle_memory_ingest(
             return;
         }
     };
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
+    let (profile_id, runtime, memory, scope) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        requested_profile.as_deref(),
+        method,
+        requested_context.as_ref(),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let mut embedded = 0usize;
     let (records, vectors): (Vec<octos_memory::Record>, Vec<Option<Vec<f32>>>) = match vectors {
         Some(vectors) => (records, vectors),
@@ -33632,7 +33893,7 @@ async fn handle_memory_ingest(
                 // changed fingerprint / index text, or no usable stored
                 // vector) BEFORE embedding, so re-submitting an unchanged
                 // batch does no embedding work at all.
-                let recall = runtime.recall.clone();
+                let recall = memory.recall.clone();
                 let probed = tokio::task::spawn_blocking(move || {
                     let needs = recall.needs_vectors(&records);
                     (records, needs)
@@ -33715,7 +33976,7 @@ async fn handle_memory_ingest(
         },
     };
     let record_count = records.len();
-    let recall = runtime.recall.clone();
+    let recall = memory.recall.clone();
     let upserted = tokio::task::spawn_blocking(move || {
         let report = recall.upsert(records, vectors)?;
         recall.persist_index()?;
@@ -33757,6 +34018,7 @@ async fn handle_memory_ingest(
         id,
         method,
         json!({
+            "profile_id": profile_id, "scope": scope,
             "inserted": report.inserted,
             "updated": report.updated,
             "unchanged": report.unchanged,

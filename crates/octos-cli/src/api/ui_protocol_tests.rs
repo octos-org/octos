@@ -9000,7 +9000,11 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         None,
         false,
         "memory-entity-unauth".into(),
-        MemoryEntityParams { name: "e-1".into() },
+        MemoryEntityParams {
+            context: None,
+            profile_id: None,
+            name: "e-1".into(),
+        },
     )
     .await;
     let frame = recv_rpc_json(&mut rx).await;
@@ -9015,6 +9019,8 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-search-unauth".into(),
         MemorySearchParams {
+            context: None,
+            profile_id: None,
             query: "dentist".into(),
             ..Default::default()
         },
@@ -9032,6 +9038,9 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-load-unauth".into(),
         MemoryLoadParams {
+            context: None,
+            count_visit: None,
+            profile_id: None,
             id: "doc:mail:1".into(),
         },
     )
@@ -9048,6 +9057,8 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-ingest-unauth".into(),
         MemoryIngestParams {
+            context: None,
+            profile_id: None,
             records: vec![json!({ "id": "doc:mail:1" })],
             vectors: None,
             embed: Some(false),
@@ -9252,6 +9263,8 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         true,
         "mem-entity".into(),
         MemoryEntityParams {
+            context: None,
+            profile_id: None,
             name: "fleet".into(),
         },
     )
@@ -9276,6 +9289,8 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         true,
         "mem-entity-miss".into(),
         MemoryEntityParams {
+            context: None,
+            profile_id: None,
             name: "missing".into(),
         },
     )
@@ -9429,6 +9444,8 @@ async fn memory_rpc_methods_declare_truncation_when_over_budget() {
         true,
         "mem-entity-cap".into(),
         MemoryEntityParams {
+            context: None,
+            profile_id: None,
             name: "whale".into(),
         },
     )
@@ -9605,7 +9622,9 @@ async fn profile_skills_appui_installs_lists_and_removes_local_skill() {
         APPUI_METHOD_PROFILE_SKILLS_LIST,
         json!({ "profile_id": "ada" }),
     );
-    let listed = raw_profile_skills_list(&state, &list, None).expect("list skills");
+    let listed = raw_profile_skills_list(&state, &list, None)
+        .await
+        .expect("list skills");
     assert_eq!(listed["count"], json!(1));
     assert_eq!(listed["skills"][0]["name"], json!("fixture-skill"));
     assert_eq!(listed["skills"][0]["version"], json!("1.2.3"));
@@ -9623,7 +9642,9 @@ async fn profile_skills_appui_installs_lists_and_removes_local_skill() {
     assert_eq!(removed["ok"], json!(true));
     assert_eq!(removed["removed"], json!("fixture-skill"));
 
-    let listed = raw_profile_skills_list(&state, &list, None).expect("list after remove");
+    let listed = raw_profile_skills_list(&state, &list, None)
+        .await
+        .expect("list after remove");
     assert_eq!(listed["count"], json!(0));
     assert!(listed["skills"].as_array().unwrap().is_empty());
 }
@@ -9949,8 +9970,8 @@ async fn should_keep_current_runtime_when_force_install_cannot_reload_plugin() {
     assert!(after_failure.tool_specs.get("broken_reload_tool").is_none());
 }
 
-#[test]
-fn profile_skills_appui_rejects_cross_profile_under_authenticated_connection() {
+#[tokio::test]
+async fn profile_skills_appui_rejects_cross_profile_under_authenticated_connection() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state(dir.path());
     let request = RpcRequest::new(
@@ -9959,8 +9980,9 @@ fn profile_skills_appui_rejects_cross_profile_under_authenticated_connection() {
         json!({ "profile_id": "other" }),
     );
 
-    let error =
-        raw_profile_skills_list(&state, &request, Some("ada")).expect_err("scope violation");
+    let error = raw_profile_skills_list(&Arc::new(state), &request, Some("ada"))
+        .await
+        .expect_err("scope violation");
 
     assert_eq!(error.code, rpc_error_codes::PERMISSION_DENIED);
     assert_eq!(
@@ -32263,6 +32285,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         snapshots: None,
         tool_specs: Arc::new(base_tools),
         plugin_tool_names: Vec::new(),
+        loaded_plugins: Vec::new(),
         skill_actions: Vec::new(),
         plugin_reload: None,
         plugin_dirs: Vec::new(),
@@ -46090,6 +46113,8 @@ fn ingest_doc_record(id: &str) -> Value {
 
 fn ingest_params(records: Vec<Value>) -> MemoryIngestParams {
     MemoryIngestParams {
+        context: None,
+        profile_id: None,
         records,
         vectors: None,
         embed: None,
@@ -46099,6 +46124,8 @@ fn ingest_params(records: Vec<Value>) -> MemoryIngestParams {
 #[test]
 fn memory_search_filter_defaults_limit_and_leaves_filters_open() {
     let filter = memory_search_filter(&MemorySearchParams {
+        context: None,
+        profile_id: None,
         query: "  dentist ".into(),
         ..Default::default()
     })
@@ -46113,6 +46140,8 @@ fn memory_search_filter_defaults_limit_and_leaves_filters_open() {
 #[test]
 fn memory_search_filter_clamps_limit_to_one_through_max() {
     let over = memory_search_filter(&MemorySearchParams {
+        context: None,
+        profile_id: None,
         query: "q".into(),
         limit: Some(MEMORY_SEARCH_MAX_LIMIT * 10),
         ..Default::default()
@@ -46120,6 +46149,8 @@ fn memory_search_filter_clamps_limit_to_one_through_max() {
     .expect("valid params");
     assert_eq!(over.limit, MEMORY_SEARCH_MAX_LIMIT);
     let zero = memory_search_filter(&MemorySearchParams {
+        context: None,
+        profile_id: None,
         query: "q".into(),
         limit: Some(0),
         ..Default::default()
@@ -46131,6 +46162,8 @@ fn memory_search_filter_clamps_limit_to_one_through_max() {
 #[test]
 fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
     let filter = memory_search_filter(&MemorySearchParams {
+        context: None,
+        profile_id: None,
         query: "hike".into(),
         kinds: vec!["document".into(), "doc".into(), "knowledge".into()],
         sources: vec![" mail ".into(), "".into(), "calendar".into()],
@@ -46166,6 +46199,8 @@ fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
     assert_eq!(filter.limit, 5);
 
     let rfc3339 = memory_search_filter(&MemorySearchParams {
+        context: None,
+        profile_id: None,
         query: "hike".into(),
         since: Some("2026-01-01T10:00:00+02:00".into()),
         ..Default::default()
@@ -46181,6 +46216,8 @@ fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
 #[test]
 fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     let empty = memory_search_filter(&MemorySearchParams {
+        context: None,
+        profile_id: None,
         query: "   ".into(),
         ..Default::default()
     })
@@ -46188,6 +46225,8 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert_eq!(empty.code, rpc_error_codes::INVALID_PARAMS);
 
     let kind = memory_search_filter(&MemorySearchParams {
+        context: None,
+        profile_id: None,
         query: "q".into(),
         kinds: vec!["mail".into()],
         ..Default::default()
@@ -46197,6 +46236,8 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert!(kind.message.contains("unknown kind"), "{}", kind.message);
 
     let date = memory_search_filter(&MemorySearchParams {
+        context: None,
+        profile_id: None,
         query: "q".into(),
         since: Some("yesterday".into()),
         ..Default::default()
@@ -46206,6 +46247,8 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert!(date.message.contains("`since`"), "{}", date.message);
 
     let ordered = memory_search_filter(&MemorySearchParams {
+        context: None,
+        profile_id: None,
         query: "q".into(),
         since: Some("2026-03-01".into()),
         until: Some("2026-02-01".into()),
@@ -46410,6 +46453,8 @@ fn memory_ingest_rejects_malformed_records() {
 #[test]
 fn memory_ingest_requires_vectors_parallel_to_records() {
     let mismatch = validate_memory_ingest(MemoryIngestParams {
+        context: None,
+        profile_id: None,
         records: vec![
             ingest_doc_record("doc:mail:1"),
             ingest_doc_record("doc:mail:2"),
@@ -46421,6 +46466,8 @@ fn memory_ingest_requires_vectors_parallel_to_records() {
     assert_eq!(mismatch.code, rpc_error_codes::INVALID_PARAMS);
 
     let parallel = validate_memory_ingest(MemoryIngestParams {
+        context: None,
+        profile_id: None,
         records: vec![
             ingest_doc_record("doc:mail:1"),
             ingest_doc_record("doc:mail:2"),
@@ -49402,4 +49449,624 @@ async fn should_replay_an_external_prompt_to_its_owner_after_the_side_table_forg
     .await;
     assert!(hosted.is_empty(), "{hosted:?}");
     question_task.abort();
+}
+
+// Memory belongs to the selected session profile, not the admin token's profile.
+async fn memory_profile_fixture() -> (tempfile::TempDir, Arc<AppState>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::profiles::ProfileStore::open_unified(dir.path()).unwrap());
+    let mut profiles = HashMap::new();
+    for id in ["memory-owner", "memory-other"] {
+        let profile = panel_user_profile(id);
+        store.save(&profile).unwrap();
+        let runtime = make_m11e_profile_with_llm_and_sandbox(
+            id,
+            &store.resolve_data_dir(&profile),
+            Arc::new(M11EStubLlm),
+            octos_agent::SandboxConfig::default(),
+        )
+        .await;
+        runtime
+            .memory_store
+            .write_long_term(&format!("# {id} private memory"))
+            .await
+            .unwrap();
+        runtime
+            .memory_store
+            .write_entity("project", &format!("# {id} project"))
+            .await
+            .unwrap();
+        profiles.insert(id.to_owned(), runtime);
+    }
+    (
+        dir,
+        Arc::new(AppState {
+            profile_store: Some(store),
+            profiles,
+            ..AppState::empty_for_tests()
+        }),
+    )
+}
+
+async fn memory_profile_rpc(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: &AuthIdentity,
+    method: &str,
+    params: Value,
+) -> Value {
+    let (ws, mut rx) = ws_connection_for_test(8);
+    match method {
+        "overview" => {
+            handle_memory_overview(
+                &ws,
+                state,
+                headers,
+                Some(identity),
+                false,
+                "m".into(),
+                serde_json::from_value(params).unwrap(),
+            )
+            .await
+        }
+        "entity" => {
+            handle_memory_entity(
+                &ws,
+                state,
+                headers,
+                Some(identity),
+                false,
+                "m".into(),
+                serde_json::from_value(params).unwrap(),
+            )
+            .await
+        }
+        "search" => {
+            handle_memory_search(
+                &ws,
+                state,
+                headers,
+                Some(identity),
+                false,
+                "m".into(),
+                serde_json::from_value(params).unwrap(),
+            )
+            .await
+        }
+        "load" => {
+            handle_memory_load(
+                &ws,
+                state,
+                headers,
+                Some(identity),
+                false,
+                "m".into(),
+                serde_json::from_value(params).unwrap(),
+            )
+            .await
+        }
+        "ingest" => {
+            handle_memory_ingest(
+                &ws,
+                state,
+                headers,
+                Some(identity),
+                false,
+                "m".into(),
+                serde_json::from_value(params).unwrap(),
+            )
+            .await
+        }
+        _ => panic!("unknown test method"),
+    }
+    recv_rpc_json(&mut rx).await
+}
+
+#[tokio::test]
+async fn memory_profile_reads_and_echoes_the_named_profile() {
+    let (_dir, state) = memory_profile_fixture().await;
+    for profile in ["memory-owner", "memory-other"] {
+        let overview = memory_profile_rpc(
+            &state,
+            &HeaderMap::new(),
+            &AuthIdentity::Admin,
+            "overview",
+            json!({"profile_id":profile}),
+        )
+        .await;
+        assert_eq!(overview["result"]["profile_id"], profile, "{overview}");
+        assert_eq!(
+            overview["result"]["overview"]["long_term"],
+            format!("# {profile} private memory")
+        );
+        let entity = memory_profile_rpc(
+            &state,
+            &HeaderMap::new(),
+            &AuthIdentity::Admin,
+            "entity",
+            json!({"profile_id":profile,"name":"project"}),
+        )
+        .await;
+        assert_eq!(entity["result"]["profile_id"], profile, "{entity}");
+        assert_eq!(entity["result"]["content"], format!("# {profile} project"));
+    }
+    let legacy = memory_profile_rpc(
+        &state,
+        &HeaderMap::new(),
+        &AuthIdentity::Admin,
+        "overview",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        legacy["result"]["profile_id"], "admin",
+        "omitting the profile keeps legacy identity scope"
+    );
+    assert_eq!(legacy["result"]["overview"]["long_term"], "");
+}
+
+#[tokio::test]
+async fn memory_session_context_rejects_a_different_profile() {
+    let (_dir, state) = memory_profile_fixture().await;
+    for method in ["overview", "entity", "search", "load", "ingest"] {
+        let reply = memory_profile_rpc(
+            &state,
+            &HeaderMap::new(),
+            &AuthIdentity::Admin,
+            method,
+            json!({"profile_id":"memory-owner",
+                "context":{"session_id":"memory-other:api:chat"},
+                "name":"project", "query":"private", "id":"missing",
+                "records":[ingest_doc_record("doc:mail:scope")], "embed":false}),
+        )
+        .await;
+        assert!(reply.get("error").is_some(), "{method}: {reply}");
+    }
+}
+
+#[tokio::test]
+async fn memory_profile_ingest_search_load_use_the_named_runtime() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let headers = HeaderMap::new();
+    let record = ingest_doc_record("doc:mail:memory-profile-test");
+    let ingest = memory_profile_rpc(
+        &state,
+        &headers,
+        &AuthIdentity::Admin,
+        "ingest",
+        json!({"profile_id":"memory-owner", "records":[record], "embed":false}),
+    )
+    .await;
+    assert_eq!(ingest["result"]["profile_id"], "memory-owner", "{ingest}");
+    assert_eq!(ingest["result"]["inserted"], 1);
+    let search = memory_profile_rpc(
+        &state,
+        &headers,
+        &AuthIdentity::Admin,
+        "search",
+        json!({"profile_id":"memory-owner", "query":"Hike"}),
+    )
+    .await;
+    assert_eq!(search["result"]["profile_id"], "memory-owner", "{search}");
+    assert_eq!(
+        search["result"]["hits"][0]["id"],
+        "doc:mail:memory-profile-test"
+    );
+    let load = memory_profile_rpc(
+        &state,
+        &headers,
+        &AuthIdentity::Admin,
+        "load",
+        json!({"profile_id":"memory-owner", "id":"doc:mail:memory-profile-test"}),
+    )
+    .await;
+    assert_eq!(load["result"]["profile_id"], "memory-owner", "{load}");
+    assert_eq!(load["result"]["record"]["trust"], "untrusted");
+    assert!(
+        state.profiles["memory-other"]
+            .recall
+            .get("doc:mail:memory-profile-test")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !state.profiles.contains_key("admin"),
+        "the token identity need not have a runtime"
+    );
+}
+
+#[tokio::test]
+async fn memory_profile_refuses_cross_tenant_and_host_override_for_every_method() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let user = AuthIdentity::User {
+        id: "memory-owner".into(),
+        role: crate::user_store::UserRole::User,
+    };
+    let mut host = HeaderMap::new();
+    host.insert("host", "memory-owner.example.test".parse().unwrap());
+    for (identity, headers) in [(&user, HeaderMap::new()), (&AuthIdentity::Admin, host)] {
+        for method in ["overview", "entity", "search", "load", "ingest"] {
+            let result = memory_profile_rpc(&state, &headers, identity, method,
+                json!({"profile_id":"memory-other", "name":"project", "query":"Hike",
+                    "id":"doc:mail:memory-profile-test", "records":[ingest_doc_record("doc:mail:blocked")], "embed":false})).await;
+            assert_eq!(
+                result["error"]["code"],
+                octos_core::ui_protocol::rpc_error_codes::PERMISSION_DENIED,
+                "{method}: {result}"
+            );
+            assert_eq!(
+                result["error"]["data"]["kind"], "forbidden",
+                "{method}: {result}"
+            );
+        }
+    }
+    assert!(
+        state.profiles["memory-other"]
+            .recall
+            .get("doc:mail:blocked")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn memory_profile_allows_owned_subprofile_and_rejects_blank_or_missing() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let store = state.profile_store.as_ref().unwrap();
+    let mut child = store.get("memory-other").unwrap().unwrap();
+    child.parent_id = Some("memory-owner".into());
+    store.save(&child).unwrap();
+    let user = AuthIdentity::User {
+        id: "memory-owner".into(),
+        role: crate::user_store::UserRole::User,
+    };
+    let child_result = memory_profile_rpc(
+        &state,
+        &HeaderMap::new(),
+        &user,
+        "overview",
+        json!({"profile_id":"memory-other"}),
+    )
+    .await;
+    assert_eq!(
+        child_result["result"]["profile_id"], "memory-other",
+        "{child_result}"
+    );
+    for (profile, code) in [("  ", -32602), ("missing-profile", -32170)] {
+        let result = memory_profile_rpc(
+            &state,
+            &HeaderMap::new(),
+            &AuthIdentity::Admin,
+            "overview",
+            json!({"profile_id":profile}),
+        )
+        .await;
+        assert_eq!(result["error"]["code"], code, "{result}");
+    }
+}
+
+#[tokio::test]
+async fn memory_session_namespace_isolated_and_requires_host_credential() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let profile = &state.profiles["memory-owner"];
+    let peers = profile.data_dir.join("peers");
+    let origin = SessionKey::with_profile("memory-owner", "api", "owner");
+    let (slug, session) = stage_and_open_peer(&peers, "memory-owner", "memory-scope-test", &origin);
+    bind_peer_to_host(&peers, &slug);
+    let memory = crate::runtime::memory_namespace::SessionMemory::namespaced(profile, "app/test")
+        .await
+        .unwrap();
+    memory
+        .memory_store
+        .write_long_term("# App-private knowledge")
+        .await
+        .unwrap();
+    memory
+        .memory_store
+        .write_entity("project", "# Namespace page")
+        .await
+        .unwrap();
+    for method in ["overview", "entity", "search", "load", "ingest"] {
+        let denied = memory_profile_rpc(
+            &state,
+            &HeaderMap::new(),
+            &AuthIdentity::Admin,
+            method,
+            json!({"profile_id":"memory-owner", "context":{"session_id":session.0},
+                "name":"project", "query":"private", "id":"missing",
+                "records":[ingest_doc_record("doc:mail:no-token")], "embed":false}),
+        )
+        .await;
+        assert_eq!(
+            denied["error"]["code"],
+            rpc_error_codes::PERMISSION_DENIED,
+            "{method}: {denied}"
+        );
+    }
+    let context = json!({"session_id":session.0, "host_token":"host-token"});
+    let overview = memory_profile_rpc(
+        &state,
+        &HeaderMap::new(),
+        &AuthIdentity::Admin,
+        "overview",
+        json!({"profile_id":"memory-owner","context":context}),
+    )
+    .await;
+    assert_eq!(
+        overview["result"]["overview"]["long_term"], "# App-private knowledge",
+        "{overview}"
+    );
+    assert_eq!(overview["result"]["scope"]["namespace"], "app/test");
+    assert_eq!(overview["result"]["overview"]["refresh_enabled"], false);
+    let entity = memory_profile_rpc(
+        &state,
+        &HeaderMap::new(),
+        &AuthIdentity::Admin,
+        "entity",
+        json!({"profile_id":"memory-owner","context":context,"name":"project"}),
+    )
+    .await;
+    assert_eq!(entity["result"]["content"], "# Namespace page");
+    let record = ingest_doc_record("doc:mail:namespaced");
+    let ingest = memory_profile_rpc(
+        &state,
+        &HeaderMap::new(),
+        &AuthIdentity::Admin,
+        "ingest",
+        json!({"profile_id":"memory-owner","context":context,"records":[record],"embed":false}),
+    )
+    .await;
+    assert_eq!(ingest["result"]["inserted"], 1, "{ingest}");
+    assert!(profile.recall.get("doc:mail:namespaced").unwrap().is_none());
+    let before = memory
+        .recall
+        .get("doc:mail:namespaced")
+        .unwrap()
+        .unwrap()
+        .visits;
+    let load = memory_profile_rpc(&state, &HeaderMap::new(), &AuthIdentity::Admin, "load",
+        json!({"profile_id":"memory-owner","context":context,"id":"doc:mail:namespaced","count_visit":false})).await;
+    assert!(load.get("result").is_some(), "{load}");
+    assert_eq!(
+        memory
+            .recall
+            .get("doc:mail:namespaced")
+            .unwrap()
+            .unwrap()
+            .visits,
+        before
+    );
+}
+
+#[tokio::test]
+async fn session_history_catalog_keeps_profiles_separate_and_pages() {
+    let (_dir, state) = memory_profile_fixture().await;
+    for (profile, runtime) in &state.profiles {
+        let mut mgr = octos_bus::SessionManager::open(&runtime.data_dir).unwrap();
+        mgr.add_message(
+            &SessionKey("web-shared".into()),
+            octos_core::Message::user(format!("{profile} history")),
+        )
+        .await
+        .unwrap();
+    }
+    let request = RpcRequest::new(
+        "history",
+        APPUI_METHOD_SESSION_HISTORY_LIST,
+        json!({"limit":1}),
+    );
+    let first = session_history::list(&state, &request, None).await.unwrap();
+    assert_eq!(first["total"], 2);
+    assert_eq!(first["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(first["next_offset"], 1);
+    let own = session_history::list(&state, &request, Some("memory-owner"))
+        .await
+        .unwrap();
+    assert_eq!(own["total"], 1);
+    assert_eq!(own["sessions"][0]["id"], "memory-owner:api:web-shared");
+    let denied = session_history::list(
+        &state,
+        &RpcRequest::new(
+            "history",
+            APPUI_METHOD_SESSION_HISTORY_LIST,
+            json!({"profile_id":"memory-other"}),
+        ),
+        Some("memory-owner"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(denied.code, rpc_error_codes::PERMISSION_DENIED);
+    assert!(raw_method_is_dispatched(
+        APPUI_METHOD_SESSION_HISTORY_LIST,
+        false
+    ));
+}
+
+#[tokio::test]
+async fn profile_skills_effective_catalog_reports_builtins_without_claiming_another_profile() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let profile = &state.profiles["memory-owner"];
+    let rows = profile.skill_catalog(None).await.unwrap();
+    assert!(rows.iter().any(|r| r["scope"] == "builtin"));
+    assert!(rows.iter().all(|r| r["scope"] == "builtin"));
+    let result = raw_profile_skills_list(
+        &state,
+        &RpcRequest::new(
+            "skills",
+            APPUI_METHOD_PROFILE_SKILLS_LIST,
+            json!({"profile_id":"memory-owner","session_id":"memory-other:api:chat"}),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(result.unwrap_err().code, rpc_error_codes::PERMISSION_DENIED);
+}
+
+#[tokio::test]
+async fn profile_skills_effective_catalog_excludes_tool_plugins_and_mcp_only_packages() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let mut state = Arc::try_unwrap(state).ok().unwrap();
+    let profile = Arc::get_mut(state.profiles.get_mut("memory-owner").unwrap()).unwrap();
+    let skill_dir = profile.data_dir.join("skills/review-guide");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"),
+        "---\nname: review-guide\ndescription: Review code changes\n---\nCheck behavior and tests.\n").unwrap();
+    // The same package may provide both instructions and tools. It is still
+    // one instruction skill; tool-only and MCP-only packages are not skills.
+    for (id, tools) in [
+        ("review-guide", vec!["review_code".into()]),
+        ("binary-tool-only", vec!["read_file".into()]),
+        ("mcp-only", vec![]),
+    ] {
+        profile
+            .loaded_plugins
+            .push(octos_agent::plugins::loader::LoadedPluginInfo {
+                id: id.into(),
+                version: "1.0.0".into(),
+                path: profile.data_dir.join("skills").join(id),
+                tools,
+            });
+    }
+    let rows = profile.skill_catalog(None).await.unwrap();
+    assert_eq!(
+        rows.iter().filter(|r| r["name"] == "review-guide").count(),
+        1
+    );
+    assert!(rows.iter().all(|r| r["kind"] == "instructions"), "{rows:?}");
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r["name"] == "binary-tool-only" || r["name"] == "mcp-only")
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r["path"].as_str().unwrap().ends_with("SKILL.md"))
+    );
+}
+
+#[tokio::test]
+async fn mcp_status_reports_runtime_connection_failures_and_preserves_profile_scope() {
+    let (_dir, state) = memory_profile_fixture().await;
+    let mut state = Arc::try_unwrap(state).ok().unwrap();
+    let profile = Arc::get_mut(state.profiles.get_mut("memory-owner").unwrap()).unwrap();
+    let tools = Arc::get_mut(&mut profile.tool_specs).unwrap();
+    let config = serde_json::from_value::<octos_agent::McpServerConfig>(json!({
+        "command":"/nonexistent-octos-mcp-status-test/server",
+        "args":["secret-argument"],"env":{"API_KEY":"secret-env"}
+    }))
+    .unwrap();
+    octos_agent::McpClient::start(&[config])
+        .await
+        .unwrap()
+        .register_tools(tools);
+    #[cfg(unix)]
+    {
+        let script = _dir.path().join("mcp-status-server.sh");
+        std::fs::write(&script, r#"#!/bin/sh
+while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$request" in
+    *'"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"inventory-test","version":"1.0"}}}\n' "$id" ;;
+    *'"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id" ;;
+  esac
+done
+"#).unwrap();
+        let config = serde_json::from_value::<octos_agent::McpServerConfig>(json!({
+            "command":"/bin/sh", "args":[script]
+        }))
+        .unwrap();
+        octos_agent::McpClient::start(&[config])
+            .await
+            .unwrap()
+            .register_tools(tools);
+    }
+    let state = Arc::new(state);
+    let (ws, mut rx) = ws_connection_for_test(16);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let active_turns = active_turns_registry();
+    let connection_turns: SharedConnectionTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    for requested_profile in ["memory-owner", "memory-other"] {
+        let request = RpcRequest::new(
+            "mcp-status",
+            APPUI_METHOD_MCP_STATUS_LIST,
+            json!({"profile_id":requested_profile,"session_id":format!("{requested_profile}:api:mcp-status")}),
+        );
+        assert!(
+            handle_raw_appui_rpc(
+                &ws,
+                &state,
+                &ledger,
+                &contracts,
+                &active_turns,
+                &connection_turns,
+                ConnectionUiFeatures::stdio_defaults(),
+                Some("memory-owner"),
+                "mcp-status".into(),
+                &request
+            )
+            .await
+        );
+        let reply = recv_rpc_json(&mut rx).await;
+        if requested_profile == "memory-other" {
+            assert_eq!(reply["error"]["code"], rpc_error_codes::INVALID_PARAMS);
+            assert_eq!(reply["error"]["data"]["auth_scope_violation"], true);
+        } else {
+            assert_eq!(
+                reply["result"]["servers"].as_array().unwrap().len(),
+                if cfg!(unix) { 2 } else { 1 },
+                "{reply}"
+            );
+            assert_eq!(reply["result"]["servers"][0]["status"], "failed");
+            assert_eq!(reply["result"]["summary"]["failed"], 1);
+            assert!(!reply.to_string().contains("secret-"));
+            #[cfg(unix)]
+            {
+                assert_eq!(reply["result"]["summary"]["connected"], 1, "{reply}");
+                assert_eq!(
+                    reply["result"]["servers"][1]["display_name"],
+                    "inventory-test"
+                );
+                assert_eq!(reply["result"]["servers"][1]["tool_count"], 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_history_catalog_preserves_same_id_in_two_workspace_stores() {
+    let (dir, state) = memory_profile_fixture().await;
+    let mut state = Arc::try_unwrap(state).ok().unwrap();
+    state.session_cache = Arc::new(
+        crate::runtime::SessionRuntimeCache::new(8, Duration::from_secs(60))
+            .with_sessions_in_cwd(true),
+    );
+    let state = Arc::new(state);
+    let mut roots = Vec::new();
+    for name in ["workspace-a", "workspace-b"] {
+        let root = dir.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = dunce::canonicalize(&root).unwrap();
+        let store = crate::runtime::session::project_sessions_root(&root, "memory-owner");
+        let mut mgr = octos_bus::SessionManager::open(&store).unwrap();
+        mgr.add_message(&SessionKey("main".into()), octos_core::Message::user(name))
+            .await
+            .unwrap();
+        roots.push(root);
+    }
+    let result = session_history::list(
+        &state,
+        &RpcRequest::new(
+            "history",
+            APPUI_METHOD_SESSION_HISTORY_LIST,
+            json!({"workspaces":roots}),
+        ),
+        Some("memory-owner"),
+    )
+    .await
+    .unwrap();
+    let rows = result["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{result}");
+    assert_eq!(rows[0]["id"], rows[1]["id"]);
+    assert_ne!(rows[0]["workspace_root"], rows[1]["workspace_root"]);
 }

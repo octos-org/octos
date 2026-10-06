@@ -36,6 +36,8 @@ const GENERATIVE_SKILL_ENV_ALLOWLIST: &[&str] = &[
 /// Aggregated result from loading plugins across directories.
 #[derive(Debug, Default)]
 pub struct PluginLoadResult {
+    /// Accepted plugin manifests; metadata only, never a second discovery/load.
+    pub loaded_plugins: Vec<LoadedPluginInfo>,
     /// Number of tools registered into the `ToolRegistry`.
     pub tool_count: usize,
     /// Names of all tools registered by plugins.
@@ -60,6 +62,14 @@ pub struct PluginLoadResult {
     /// Legacy startup callers continue with successfully loaded plugins;
     /// mutation-time rebuilds may fail closed on this structured record.
     pub plugin_errors: Vec<PluginLoadError>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedPluginInfo {
+    pub id: String,
+    pub version: String,
+    pub path: PathBuf,
+    pub tools: Vec<String>,
 }
 
 /// A plugin-specific failure observed by the aggregating loader.
@@ -318,6 +328,7 @@ impl PluginLoader {
             // re-checking and head straight into the rich load path.
             match Self::load_plugin_with_options_and_risks(&path, extra_env, options.clone()) {
                 Ok((tools, extras, actions)) => {
+                    let tools_start = result.tool_names.len();
                     let mut n = tools.len();
                     let spawn_only = extras.spawn_only_tools.clone();
                     for loaded in tools {
@@ -363,6 +374,12 @@ impl PluginLoader {
                             "registered spawn-only tools (auto-redirect to background)"
                         );
                     }
+                    result.loaded_plugins.push(LoadedPluginInfo {
+                        id: plugin.manifest.id.clone(),
+                        version: plugin.manifest.version.to_string(),
+                        path: path.clone(),
+                        tools: result.tool_names[tools_start..].to_vec(),
+                    });
                     result.tool_count += n;
                     result.loaded_actions.extend(actions);
                     result.merge_extras(extras);

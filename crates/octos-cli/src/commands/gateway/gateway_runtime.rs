@@ -823,6 +823,7 @@ impl GatewayRuntime {
                 // prompt fragments, hook executor merge, base-tool pin
                 // set extension) sees the same shape it always did.
                 plugin_result = octos_agent::PluginLoadResult {
+                    loaded_plugins: rt.loaded_plugins.clone(),
                     tool_count: rt.plugin_tool_names.len(),
                     tool_names: rt.plugin_tool_names.clone(),
                     loaded_actions: rt.skill_actions.clone(),

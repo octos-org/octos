@@ -850,6 +850,7 @@ mod tests {
             snapshots: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
+            loaded_plugins: Vec::new(),
             skill_actions: Vec::new(),
             plugin_reload: None,
             plugin_dirs: Vec::new(),

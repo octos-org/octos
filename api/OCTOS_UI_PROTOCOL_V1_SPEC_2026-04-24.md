@@ -513,6 +513,11 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
   `docs/adr/personal-memory-tiers.md`; auth-bound like `memory/overview`,
   refused for session-ingress credentials)
 
+Session history catalog (raw AppUI):
+
+- `session/history/list` — paginated history across authorized profiles and
+  known workspace stores; refused for session-ingress credentials.
+
 Launch (per-project session UX, gated `session.workspace_cwd.v1`):
 
 - `launch/resolve`
@@ -1816,6 +1821,21 @@ Clients must use that method list to enable or disable slash commands.
   config, provider config, MCP config, tool registry, memory, or sandbox state
   directly
 
+`mcp/status/list` reports the selected session runtime's actual MCP connection
+records, including failed starts and connected servers exposing zero tools.
+Rows contain `{ id, display_name, transport, status, tool_count, tools, error }`;
+`id` identifies a connection within the running server process. Names come from
+the MCP initialization response, falling back to a command basename or HTTP
+hostname. Arguments, environment, credentials, URL query strings, and raw
+transport errors are never returned. `status` is checked against the live
+transport on every read; a closed connection is reported as `failed` with a
+connection-closed error. Summary counts are derived from those rows.
+`tool_count` describes tools accepted from that server at discovery, independently
+of subsequent session tool visibility. Tool filtering and registry snapshots
+must preserve the server connection records. These are MCP server rows, not the
+general executable-tool inventory. Clients render MCP servers and general tools
+in separate views, preserving the existing session/Profile authorization checks.
+
 ### Coding Tool Contract Inspection
 
 Proposed `UPCR-2026-020` extends the existing runtime inspection methods for
@@ -2123,14 +2143,32 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `invalid_params` on the over-cap guard; `resource_not_found` with
   `data.resource_type = "content"` on REST 404 (collection endpoint).
 
+#### Memory profile scope
+
+All five `memory/*` methods accept optional `profile_id: string`. When omitted,
+identity/tenant-host resolution is unchanged. An explicit profile must exist and
+be authorized by the same account/owned-subprofile/admin rules as other profile
+operations. A tenant host remains authoritative: requesting another profile is
+refused even for an administrator. A blank profile is `invalid_params`; an
+unauthorized profile or host mismatch is `permission_denied` (`-32120`) with
+`data.kind = "forbidden"` and `data.rest_status = 403`. A missing authorized
+profile is `resource_not_found` (`-32170`). Authorization precedes memory file
+access, runtime lookup and index writes.
+
+Every successful response includes top-level `profile_id: string`, the actual
+answering profile. Clients may decode older replies without that field, but must
+not attribute them to a requested profile. Existing parameters, truncation
+budgets, the `auxiliary.rest_to_ws.v1` gate, and session-ingress/stdin restrictions
+are unchanged. REST `/api/my/memory` routes keep their identity-scoped behavior.
+
 #### `memory/overview`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/my/memory`
-- Params type: `MemoryOverviewParams` — `{}` (accepts `params: {}` or
+- Params type: `MemoryOverviewParams` — `{ profile_id?: string }` (accepts `params: {}` or
   `params: null`; the `params` member itself must be present — the
   shared frame parser rejects a request without one, codex #1621 r5).
-- Result type: `MemoryOverviewResult` — `{ overview: MemoryOverviewResponse }`.
+- Result type: `MemoryOverviewResult` — `{ profile_id: string, overview: MemoryOverviewResponse }`.
   `overview` carries the REST panel body whole (`memory_panel.rs`), plus
   RPC-layer truncation metadata: each document field is capped to a
   per-field JSON-ESCAPED byte budget (`long_term` 96 KiB, `today`
@@ -2147,9 +2185,9 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/my/memory/entities/{name}`
-- Params type: `MemoryEntityParams` — `{ name: string }` (the entity
+- Params type: `MemoryEntityParams` — `{ profile_id?: string, name: string }` (the entity
   page stem, as returned in each overview entity summary).
-- Result type: `MemoryEntityResult` — `{ name: string, content: string,
+- Result type: `MemoryEntityResult` — `{ profile_id: string, name: string, content: string,
   content_truncated: bool, content_total_bytes: number }`. `content` is
   capped at a 384 KiB JSON-ESCAPED budget; when capped it is a clean
   UTF-8 prefix with the truth declared in the two metadata fields.
@@ -2165,7 +2203,7 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   the caller's profile index (BM25 fused with vectors when the profile
   has an embedder; BM25-only otherwise — never refused for lack of one)
   and returns abstracts only. Bodies come from `memory/load`.
-- Params type: `MemorySearchParams` — `{ query: string, kinds?: string[],
+- Params type: `MemorySearchParams` — `{ profile_id?: string, query: string, kinds?: string[],
   sources?: string[], since?: string, until?: string, limit?: number }`.
   `query` must be non-blank. `kinds` narrows to `"episode"` /
   `"document"` / `"knowledge"` (empty = all; lenient aliases such as
@@ -2175,7 +2213,7 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `since` is the start of that UTC day, a bare `until` its end (`until`
   is inclusive). `limit` defaults to `MEMORY_SEARCH_DEFAULT_LIMIT` (10)
   and is clamped to `1..=MEMORY_SEARCH_MAX_LIMIT` (50).
-- Result type: `MemorySearchResult` — `{ hits: Hit[] }` where each hit is
+- Result type: `MemorySearchResult` — `{ profile_id: string, hits: Hit[] }` where each hit is
   the JSON of `octos_memory::Hit`: `{ id: string, kind: "episode" |
   "document" | "knowledge", source: string, title: string, abstract:
   string, score: number, timestamp: RFC3339, trust: "trusted" |
@@ -2187,7 +2225,7 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   or inverted time bound; `runtime_unavailable` when the resolved
   profile has no bootstrappable runtime (same message as session open).
 - Identity resolves to a profile exactly as `memory/overview` does
-  (`/api/my/*` host-scope rules); auth-bound — omitted from the stdio
+  (the shared memory profile scope rules above); auth-bound — omitted from the stdio
   capability set (see § stdio policy) and refused for session-ingress
   credentials.
 
@@ -2198,8 +2236,8 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `id` a `memory/search` hit returned. Counts a visit on the record
   (MemoryOS-style heat: hot records keep their vector and are nominated
   for promotion into Knowledge).
-- Params type: `MemoryLoadParams` — `{ id: string }` (non-blank).
-- Result type: `MemoryLoadResult` — `{ record: Record, page?: string,
+- Params type: `MemoryLoadParams` — `{ profile_id?: string, id: string }` (non-blank).
+- Result type: `MemoryLoadResult` — `{ profile_id: string, record: Record, page?: string,
   page_truncated: bool }`. `record` is the JSON of `octos_memory::Record`
   (`id`, `kind`, `source`, `parent?`, `timestamp`, `title`, `abstract`,
   `body?`, `trust`, `fingerprint?`, `visits`, `last_visit?`, `promoted`,
@@ -2223,9 +2261,9 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   protocol. Apps (Mail, Calendar, contacts, notes) push derived records
   into the profile's Recall index; the apps remain the record of truth.
   Runs on the same authenticated path as `memory/overview` (identity
-  required, `/api/my/*` profile resolution); session-ingress credentials
+  required, shared memory profile resolution); session-ingress credentials
   are refused by the scope guard.
-- Params type: `MemoryIngestParams` — `{ records: Record[], vectors?:
+- Params type: `MemoryIngestParams` — `{ profile_id?: string, records: Record[], vectors?:
   (number[] | null)[], embed?: bool }`. Each record is an
   `octos_memory::Record` JSON: required `id`, `kind`, `source`,
   `timestamp` (RFC 3339), `title`, `abstract`; optional `parent`,
@@ -2251,7 +2289,7 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   batches of 16 — re-submitting an unchanged batch embeds nothing; an
   embedding failure fails the call (retry with `embed: false` to store
   BM25-only). Without an embedder records are stored BM25-only.
-- Result type: `MemoryIngestResult` — `{ inserted: number, updated:
+- Result type: `MemoryIngestResult` — `{ profile_id: string, inserted: number, updated:
   number, unchanged: number, vectors_stored: number, embedded: number }`
   (the `octos_memory::UpsertReport` counts plus how many vectors the
   server actually embedded in this call — unchanged records that kept
@@ -3556,3 +3594,63 @@ fields are open registries; clients must preserve unknown values. The
 `LoopFire` object mirrors the `loop/fire_now` result object (`queued`,
 optional `duplicate`, `continuation_id`, `dedupe_key`, `reason`,
 `priority`, and `message`).
+
+### Session resources and history (additive, 2026-10-04)
+
+Servers advertising `memory.session_scope.v1` accept optional
+`context: { session_id, host_token? }` on all five `memory/*` methods. Existing
+`profile_id` authorization applies first. The session must belong to that
+profile. Core derives the memory namespace from its durable app binding; the
+client cannot supply a namespace or path. Bound app peers/contexts require the
+owning host credential, including on admin connections. Closed, missing or
+invalid bindings are refused, never replaced with Profile memory.
+
+Every success includes `scope: { kind: "profile" | "namespace", session_id:
+string | null, namespace: string | null }`. Absent context preserves the legacy
+Profile scope. Ordinary session memory is shared across that Profile's projects;
+a namespace has no implicit Profile/global fallback. `memory/load` additionally
+accepts `count_visit: false` for inspection without changing visit counts or
+promotion heat (omitted/true retains retrieval behavior). Clients must reject
+missing/mismatched scope echoes when displaying session-scoped memory.
+
+Servers advertising `skills.effective_catalog.v1` accept optional `session_id`
+on raw `profile/skills/list` (and optional `host_token` for app-owned sessions).
+The same durable-binding and host-credential rules apply. `skills` remains the Profile installation list;
+installation/removal semantics are unchanged. The additive `effective_skills`
+array is derived from the selected session runtime's filtered instruction
+loader, the same source used for its prompt. It contains only instruction skills
+backed by `SKILL.md` (including compiled-in skill documents). Rows contain
+`name`, `version`, `kind: "instructions"`, `scope` (`builtin`, `global` deployment,
+`profile`, `project`), `path`, `available`, and `description`. Tool-only plugins
+and MCP-only packages do not enter this catalog; a package with both instructions
+and tools contributes one instruction entry. Executable tool and MCP server
+inventory belong to `tool/status/list` and `mcp/status/list`. Clients should
+ignore non-instruction rows from earlier mixed-catalog servers. Source scope
+describes instruction sources actually loaded, so global/project groups may be
+empty; a directory on disk is not automatically active on every server.
+`profile_id` and `session_id` echo the answered context. A null catalog means no
+session was requested. This read never installs or executes a skill.
+
+Raw `session/history/list` is advertised in `supported_methods`. Params are
+`{ workspaces?: string[], profile_id?: string, offset?: number, limit?: number }`.
+It lists Profile stores and known project stores, subject to the connection's
+frozen Profile scope (admin/unscoped connections may list all Profiles). Up to
+128 workspace addresses are accepted; Core canonicalizes and validates each
+with the same workspace gate as `session/list`. Session-ingress credentials are
+denied by the shared raw-method guard. Internal child transcripts and host-bound
+app peer/context history are excluded.
+
+The result is `{ sessions, total, next_offset, workspaces,
+unavailable_workspaces, coverage: "profile_and_known_workspaces" }`; limit
+is 1..200, default 100. Rows carry the usual session-list metadata plus full
+`id`, `profile_id`, and `workspace_root` (null for a Profile store). Clients must
+key rows by all three fields, open with that exact Profile/cwd, and start a fresh
+history/replay authority when the same wire id belongs to another workspace.
+Workspace hints are navigation locations, never cached session authority. This
+catalog does not recursively scan the server filesystem; clients should persist
+workspace addresses and clearly report coverage and unavailable locations.
+
+On every accepted session change, clients invalidate resource caches, load the
+new session's effective catalog and memory scope, and discard replies from older
+connection/open generations. UI memory inspection must not increment model
+retrieval statistics.

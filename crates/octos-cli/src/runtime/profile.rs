@@ -488,6 +488,7 @@ pub struct ProfileRuntime {
     /// pin-as-base step (so plugin tools never get LRU-evicted) and
     /// for diagnostics. Populated from `PluginLoadResult::tool_names`.
     pub plugin_tool_names: Vec<String>,
+    pub loaded_plugins: Vec<octos_agent::plugins::loader::LoadedPluginInfo>,
 
     /// UI-callable actions accepted by the same canonical load that registered
     /// their owning plugin tools.
@@ -790,6 +791,43 @@ impl ProfileRuntime {
         self.rebuild_plugin_layer_using(&Arc::new(reload)).await
     }
 
+    /// Instruction skills from the same filtered loader used for the prompt.
+    /// Accepted plugin manifests and executable tool registries are separate:
+    /// loading a binary or an MCP server does not make it an instruction skill.
+    pub(crate) async fn skill_catalog(
+        &self,
+        workspace: Option<&Path>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let filter = self
+            .plugin_reload
+            .as_ref()
+            .and_then(|r| r.skill_filter.clone());
+        let instructions = build_account_skills_loader(&self.data_dir)
+            .with_skill_filter(filter)
+            .list_skills()
+            .await?;
+        let scope = |path: &Path| {
+            if path.starts_with(self.data_dir.join("skills")) {
+                "profile"
+            } else if workspace.is_some_and(|w| path.starts_with(w.join(".octos"))) {
+                "project"
+            } else {
+                "global"
+            }
+        };
+        let mut rows = Vec::new();
+        for skill in instructions {
+            rows.push(
+                serde_json::json!({"name":skill.name,"version":skill.version,
+                "scope":if skill.builtin {"builtin"} else {scope(&skill.path)},
+                "path":skill.path,"kind":"instructions","available":skill.available,
+                "description":skill.description}),
+            );
+        }
+        rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok(rows)
+    }
+
     /// Reapply the effective envelope after cwd rebinding or dynamic tool
     /// registration. A cloned registry must never resurrect excluded tools.
     pub(crate) fn apply_tool_envelope(&self, tools: &mut ToolRegistry) {
@@ -953,6 +991,7 @@ impl ProfileRuntime {
             snapshots: self.snapshots.clone(),
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
+            loaded_plugins: plugin_result.loaded_plugins.clone(),
             skill_actions: plugin_result.loaded_actions.clone(),
             plugin_reload: Some(reload.clone()),
             plugin_dirs: reload.plugin_dirs.clone(),
@@ -1913,6 +1952,7 @@ impl ProfileRuntime {
             snapshots: config.snapshots.clone(),
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
+            loaded_plugins: plugin_result.loaded_plugins.clone(),
             skill_actions: plugin_result.loaded_actions.clone(),
             plugin_reload: Some(plugin_reload),
             plugin_dirs,

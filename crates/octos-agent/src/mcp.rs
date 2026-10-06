@@ -39,6 +39,88 @@ use crate::tools::{Tool, ToolRegistry, ToolResult};
 /// `BLOCKED_ENV_VARS` from every spawned stdio server.
 pub(crate) type McpService = Arc<RunningService<RoleClient, ClientInfo>>;
 
+/// Public connection metadata. Never contains launch arguments, environment,
+/// authorization headers, URL credentials, or raw transport errors.
+#[derive(Debug, Clone, Serialize)]
+pub struct McpServerStatus {
+    pub id: String,
+    pub display_name: String,
+    pub transport: String,
+    pub status: String,
+    pub tools: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Retained independently of tool visibility, alongside the live transport.
+#[derive(Clone)]
+pub(crate) struct McpConnection {
+    id: String,
+    display_name: String,
+    transport: String,
+    service: Option<McpService>,
+    tools: Vec<String>,
+    error: Option<&'static str>,
+}
+
+impl McpConnection {
+    fn pending(config: &McpServerConfig) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let display_name = if let Some(url) = &config.url {
+            url::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+                .unwrap_or_else(|| "HTTP MCP server".into())
+        } else {
+            config
+                .command
+                .as_deref()
+                .and_then(|c| std::path::Path::new(c).file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Stdio MCP server".into())
+        };
+        Self {
+            id: format!(
+                "mcp-{}",
+                NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+            display_name,
+            transport: if config.url.is_some() {
+                "http"
+            } else {
+                "stdio"
+            }
+            .into(),
+            service: None,
+            tools: Vec::new(),
+            error: None,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> McpServerStatus {
+        let closed = self
+            .service
+            .as_ref()
+            .is_some_and(|s| s.is_closed() || s.peer().is_transport_closed());
+        let (status, error) = if let Some(error) = self.error {
+            ("failed", Some(error))
+        } else if closed {
+            ("failed", Some("The MCP connection closed."))
+        } else if self.service.is_some() {
+            ("connected", None)
+        } else {
+            ("connecting", None)
+        };
+        McpServerStatus {
+            id: self.id.clone(),
+            display_name: self.display_name.clone(),
+            transport: self.transport.clone(),
+            status: status.into(),
+            tools: self.tools.clone(),
+            error: error.map(str::to_owned),
+        }
+    }
+}
+
 /// How long to wait for the MCP `initialize` handshake before giving up.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a single `tools/call` may run before it is cancelled.
@@ -332,15 +414,11 @@ struct McpToolSpec {
 
 /// A running set of MCP server connections and the tools they expose.
 pub struct McpClient {
-    /// The live transports (and their stdio child processes).
-    ///
-    /// These are MOVED into the registry by [`McpClient::register_tools`], which
-    /// then owns them for its lifetime. That matters: `register_tools` consumes
-    /// `self`, so this field is dropped as soon as registration returns — it
-    /// never kept anything alive on its own, despite once claiming to. The
-    /// registered tools were the only owners, so any `retain()` that removed the
-    /// last MCP tool cancelled the transport and killed the child (#1886).
-    services: Vec<(String, McpService)>,
+    /// Connection records and live transports. Registration transfers these
+    /// into the registry independently of the tools, including zero-tool
+    /// servers and failed starts. Tool filtering must not erase the inventory
+    /// or terminate a connection.
+    connections: Vec<McpConnection>,
     tools: Vec<McpToolSpec>,
 }
 
@@ -387,31 +465,51 @@ impl McpClient {
     /// Start all configured MCP servers and discover their tools. Fail-soft: a
     /// server that fails to start is logged and skipped, never aborting the rest.
     pub async fn start(configs: &[McpServerConfig]) -> Result<Self> {
-        let mut services = Vec::new();
+        let mut connections = Vec::new();
         let mut tools = Vec::new();
 
         for config in configs {
+            let mut connection = McpConnection::pending(config);
             let server_name = config.display_name().to_string();
             match Self::connect(config).await {
                 Ok(service) => {
+                    if let Some(info) = service.peer_info() {
+                        connection.display_name = info
+                            .server_info
+                            .name
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(160)
+                            .collect();
+                    }
                     let concurrency_class = config.resolved_concurrency_class();
                     // Bound tool discovery: a server that completes `initialize`
                     // but never answers `tools/list` must not wedge startup (and
                     // block later servers) — fail-soft on timeout.
-                    let discovered = match timeout(HANDSHAKE_TIMEOUT, service.list_all_tools())
-                        .await
-                    {
-                        Ok(Ok(t)) => t,
-                        Ok(Err(e)) => {
-                            warn!(server = server_name, error = %e, "MCP tools/list failed, skipping server");
-                            continue;
-                        }
-                        Err(_) => {
-                            warn!(
-                                server = server_name,
-                                "MCP tools/list timed out, skipping server"
-                            );
-                            continue;
+                    let has_tools = service
+                        .peer_info()
+                        .is_some_and(|info| info.capabilities.tools.is_some());
+                    let discovered = if !has_tools {
+                        Vec::new()
+                    } else {
+                        match timeout(HANDSHAKE_TIMEOUT, service.list_all_tools()).await {
+                            Ok(Ok(t)) => t,
+                            Ok(Err(e)) => {
+                                warn!(server = server_name, error = %e, "MCP tools/list failed, skipping server");
+                                connection.error =
+                                    Some("Could not discover MCP tools. Check the server logs.");
+                                connections.push(connection);
+                                continue;
+                            }
+                            Err(_) => {
+                                warn!(
+                                    server = server_name,
+                                    "MCP tools/list timed out, skipping server"
+                                );
+                                connection.error = Some("MCP tool discovery timed out.");
+                                connections.push(connection);
+                                continue;
+                            }
                         }
                     };
                     info!(
@@ -440,16 +538,21 @@ impl McpClient {
                             service: service.clone(),
                             concurrency_class,
                         });
+                        connection.tools.push(tool.name.to_string());
                     }
-                    services.push((server_name, service));
+                    connection.tools.sort();
+                    connection.tools.dedup();
+                    connection.service = Some(service);
                 }
                 Err(e) => {
                     warn!(server = server_name, error = %e, "failed to start MCP server, skipping");
+                    connection.error = Some("MCP connection failed. Check the server logs.");
                 }
             }
+            connections.push(connection);
         }
 
-        Ok(Self { services, tools })
+        Ok(Self { connections, tools })
     }
 
     /// Connect to one MCP server, returning the live rmcp session.
@@ -549,8 +652,14 @@ impl McpClient {
         // even if every tool below is later filtered out. Without this the tools
         // are the sole owners and profile narrowing tears down the connection
         // (#1886) — a visibility filter must not end a child process.
-        for (_server, service) in self.services {
-            registry.keep_mcp_service_alive(service as Arc<dyn std::any::Any + Send + Sync>);
+        for mut connection in self.connections {
+            connection.tools.retain(|name| {
+                !Self::PROTECTED_NAMES.contains(&name.as_str()) && !registry.is_builtin_name(name)
+            });
+            if let Some(service) = &connection.service {
+                registry.keep_mcp_service_alive(service.clone() as Arc<dyn std::any::Any + Send + Sync>);
+            }
+            registry.record_mcp_connection(connection);
         }
         for spec in self.tools {
             if Self::PROTECTED_NAMES.contains(&spec.name.as_str())
@@ -637,6 +746,67 @@ impl Tool for McpTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connection_status_retains_zero_tool_servers_and_observes_disconnect() {
+        use rmcp::ServiceExt;
+        struct EmptyServer;
+        impl rmcp::ServerHandler for EmptyServer {}
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (server, client) = tokio::join!(
+            EmptyServer.serve(server_io),
+            serve_client(octos_client_info(), client_io)
+        );
+        let mut server = server.unwrap();
+        let service = Arc::new(client.unwrap());
+        let mut connection = McpConnection::pending(&cfg());
+        connection.service = Some(service.clone());
+        let id = connection.id.clone();
+        let client = McpClient {
+            connections: vec![connection],
+            tools: vec![],
+        };
+        let mut registry = ToolRegistry::new();
+        client.register_tools(&mut registry);
+        registry.retain(|_| false);
+        let snapshot = registry.snapshot_excluding(&[]);
+        drop(registry);
+        assert_eq!(snapshot.live_mcp_transport_count(), 1);
+        let status = snapshot.mcp_server_statuses();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].id, id);
+        assert_eq!(status[0].status, "connected");
+        assert!(status[0].tools.is_empty());
+        server.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while snapshot.mcp_server_statuses()[0].status == "connected" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(snapshot.mcp_server_statuses()[0].status, "failed");
+    }
+
+    #[tokio::test]
+    async fn connection_status_records_failed_starts_without_exposing_configuration_secrets() {
+        let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "url":"http://secret-user:secret-password@127.0.0.1/mcp?token=secret-token",
+            "headers":{"Authorization":"Bearer secret-header"}, "env":{"KEY":"secret-env"}
+        }))
+        .unwrap();
+        let mut registry = ToolRegistry::new();
+        McpClient::start(&[config.clone(), config])
+            .await
+            .unwrap()
+            .register_tools(&mut registry);
+        let status = registry.mcp_server_statuses();
+        assert_eq!(status.len(), 2);
+        assert_ne!(status[0].id, status[1].id);
+        assert!(status.iter().all(|s| s.status == "failed"));
+        assert_eq!(status[0].display_name, "127.0.0.1");
+        assert!(!serde_json::to_string(&status).unwrap().contains("secret-"));
+    }
     use crate::tools::ConcurrencyClass;
 
     fn cfg() -> McpServerConfig {

@@ -35,12 +35,17 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use axum::Json;
+#[cfg(test)]
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
+#[cfg(test)]
+use axum::http::HeaderMap;
+use axum::http::StatusCode;
 use serde::Serialize;
 
 use super::AppState;
+#[cfg(test)]
 use super::router::AuthIdentity;
+#[cfg(test)]
 use crate::api::auth_handlers::resolve_my_profile_id;
 
 /// One recent daily-note file (`memory/YYYY-MM-DD.md`).
@@ -495,7 +500,8 @@ fn rfc3339(mtime: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(mtime).to_rfc3339()
 }
 
-/// GET /api/my/memory
+/// Legacy REST adapter retained for the file-access and isolation regression tests.
+#[cfg(test)]
 pub async fn my_memory(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -506,6 +512,26 @@ pub async fn my_memory(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
+    profile_memory(state, &profile_id).await
+}
+
+/// Read an already authorized profile using the same anchored file access as REST.
+pub(super) async fn profile_memory(
+    state: Arc<AppState>,
+    profile_id: &str,
+) -> Result<Json<MemoryOverviewResponse>, StatusCode> {
+    profile_memory_scoped(state, profile_id, None).await
+}
+
+pub(super) async fn profile_memory_scoped(
+    state: Arc<AppState>,
+    profile_id: &str,
+    namespace: Option<&str>,
+) -> Result<Json<MemoryOverviewResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let profile = ps
         .get(&profile_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -518,7 +544,11 @@ pub async fn my_memory(
     // exists → empty state; dangling → 500) and materializing dirs on
     // a read endpoint (codex #1611 r8 P2). The no-follow walk below is
     // the sole authority on what exists.
-    let store = octos_memory::MemoryStore::at_memory_dir(data_dir.join("memory"));
+    let memory_root = match namespace {
+        Some(ns) => crate::runtime::memory_namespace::memory_namespace_root(&data_dir, ns),
+        None => data_dir.clone(),
+    };
+    let store = octos_memory::MemoryStore::at_memory_dir(memory_root.join("memory"));
 
     let empty = |state: &AppState, profile| {
         Json(MemoryOverviewResponse {
@@ -531,7 +561,7 @@ pub async fn my_memory(
             entities_truncated: false,
             staging_notes: 0,
             staging_truncated: false,
-            refresh_enabled: effective_refresh_enabled(state, profile),
+            refresh_enabled: namespace.is_none() && effective_refresh_enabled(state, profile),
         })
     };
 
@@ -661,11 +691,12 @@ pub async fn my_memory(
         entities_truncated,
         staging_notes,
         staging_truncated,
-        refresh_enabled: effective_refresh_enabled(&state, &profile),
+        refresh_enabled: namespace.is_none() && effective_refresh_enabled(&state, &profile),
     }))
 }
 
-/// GET /api/my/memory/entities/{name}
+/// Legacy REST adapter retained for the file-access and isolation regression tests.
+#[cfg(test)]
 pub async fn my_memory_entity(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -677,6 +708,28 @@ pub async fn my_memory_entity(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
+    profile_memory_entity(state, &profile_id, name).await
+}
+
+/// Read an already authorized profile using the same anchored file access as REST.
+pub(super) async fn profile_memory_entity(
+    state: Arc<AppState>,
+    profile_id: &str,
+    name: String,
+) -> Result<Json<MemoryEntityResponse>, StatusCode> {
+    profile_memory_entity_scoped(state, profile_id, None, name).await
+}
+
+pub(super) async fn profile_memory_entity_scoped(
+    state: Arc<AppState>,
+    profile_id: &str,
+    namespace: Option<&str>,
+    name: String,
+) -> Result<Json<MemoryEntityResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let profile = ps
         .get(&profile_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -685,7 +738,11 @@ pub async fn my_memory_entity(
 
     // Path-derivation only — no create_dir_all on a read endpoint
     // (codex #1611 r8 P2, same rationale as the overview handler).
-    let store = octos_memory::MemoryStore::at_memory_dir(data_dir.join("memory"));
+    let memory_root = match namespace {
+        Some(ns) => crate::runtime::memory_namespace::memory_namespace_root(&data_dir, ns),
+        None => data_dir.clone(),
+    };
+    let store = octos_memory::MemoryStore::at_memory_dir(memory_root.join("memory"));
     // Same traversal-character sanitization `read_entity` applies, on
     // top of the FD-anchored walk — a symlinked page, bank dir or any
     // ancestor is a plain 404.

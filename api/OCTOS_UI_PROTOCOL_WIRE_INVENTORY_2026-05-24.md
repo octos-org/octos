@@ -30,6 +30,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `server/shutdown` | shipped local-solo AppUI extra, UPCR-2026-032; stops this `octos serve` exactly as Ctrl+C would |
 | `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038 |
 | `session/list` | shipped REST-to-WS method |
+| `session/history/list` | shipped AppUI extra; paginated history across authorized profiles and known workspace stores |
 | `session/snapshot` | shipped REST-to-WS method |
 | `session/messages_page` | shipped REST-to-WS method |
 | `session/status.get` | shipped REST-to-WS method |
