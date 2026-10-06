@@ -1575,6 +1575,11 @@ mod tests {
             || NOW,
         )
         .await;
+        // Platform-true verdict pin: on Unix the CommandExit validator runs and
+        // must accept; on Windows a real sandbox fails command validators closed
+        // (#1607), so the same run must end Rejected. The factory-once pin below
+        // is platform-independent.
+        #[cfg(unix)]
         assert!(
             matches!(
                 outcome,
@@ -1583,6 +1588,16 @@ mod tests {
                 }
             ),
             "CommandExit `true` must be accepted, got {outcome:?}",
+        );
+        #[cfg(windows)]
+        assert!(
+            matches!(
+                outcome,
+                AttemptOutcome::Completed {
+                    verdict: AcceptanceVerdict::Rejected { .. }
+                }
+            ),
+            "a real sandbox must fail the CommandExit validator closed on Windows (#1607), got {outcome:?}",
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1736,6 +1751,10 @@ mod tests {
         assert_eq!(child.status, ChildStatus::Failed);
     }
 
+    // POSIX premise (`sleep` is a Unix command); a Windows real sandbox also
+    // fails command validators closed (#1607) — pinned in octos-agent's
+    // validator_runner tests.
+    #[cfg(unix)]
     #[tokio::test]
     async fn acceptance_command_terminates_past_deadline() {
         // P1-5b: a CommandExit validator that sleeps past the remaining

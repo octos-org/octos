@@ -1301,6 +1301,9 @@ mod tests {
 
     // ---- PR C: worktree workers on the operator's FsGrant::Host ----
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_runs_worker_in_git_worktree_and_keeps_branch() {
         // A `FsGrant::Host` task on a git controller root: the pool runs the
@@ -1373,6 +1376,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_reconciles_preexisting_worktree_on_relaunch() {
         // A dead attempt left the branch + checkout behind (task-stable). A
@@ -1597,6 +1603,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test]
     async fn worktree_deliverable_autocommitted_even_without_worker_commit() {
         // A worker WRITES a file but does NOT commit. After completion the BRANCH
@@ -1793,6 +1802,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_dispatch_of_one_task_does_not_corrupt_the_worktree() {
         // Two concurrent dispatches of the SAME task must be serialized by the
@@ -1856,6 +1868,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn escalation_to_host_upgrades_next_attempt_to_a_worktree_worker() {
         // §6 (PR B interaction): the worktree decision is a pure per-attempt
@@ -2058,6 +2073,9 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: drives the worker's `sh -c` command strings
+    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hung_deliverable_commit_is_killed_at_deadline() {
         // codex fix #4: the sandboxed deliverable commit is BOUNDED. A worker
