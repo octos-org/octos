@@ -501,6 +501,10 @@ Router (Wave4-A):
 
 - `router/set_mode`, `router/get_metrics`
 
+Cross-project history (raw AppUI, advertised in `supported_methods`):
+
+- `session/history/list` (UPCR-2026-040 — authorized profile and known project stores)
+
 M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 
 - `session/list`, `session/snapshot`, `session/messages_page`,
@@ -1034,8 +1038,8 @@ local terminal/server processes using that profile; it holds no transcripts
 and grants no permission. Each saved path is revalidated before listing.
 Missing projects are reported in `unavailable_workspaces`, never recreated.
 The catalog does not recursively scan the filesystem. Older projects can be
-included by adding their workspace once. App-owned and ephemeral stores are
-not registered as project history.
+included by adding their workspace once. Runtime startup does not register
+app-owned or ephemeral stores as project history.
 
 ### `session/hydrate`
 
