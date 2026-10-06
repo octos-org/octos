@@ -4924,10 +4924,7 @@ pub async fn register_setup_script_public(
     // Constant-time: the auth token gates the tenant's setup script (the
     // #2344 face — a plaintext compare leaks the token byte-by-byte
     // through response timing).
-    if !crate::api::router::constant_time_eq(
-        tenant.auth_token.as_bytes(),
-        auth_token.as_bytes(),
-    ) {
+    if !crate::api::router::constant_time_eq(tenant.auth_token.as_bytes(), auth_token.as_bytes()) {
         return Err((StatusCode::UNAUTHORIZED, "invalid auth token".into()));
     }
 
