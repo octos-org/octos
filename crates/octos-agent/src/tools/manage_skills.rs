@@ -1000,9 +1000,11 @@ mod tests {
             !dst.join("sub/escape").exists(),
             "symlinked entries must not be followed into the install (#2680)"
         );
-        assert!(!std::fs::read_to_string(dst.join("sub/escape/secret.txt"))
-            .map(|c| c.contains("outside"))
-            .unwrap_or(false));
+        assert!(
+            !std::fs::read_to_string(dst.join("sub/escape/secret.txt"))
+                .map(|c| c.contains("outside"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
