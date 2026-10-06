@@ -484,7 +484,7 @@ async fn should_open_isolated_request_contexts_and_refuse_them_after_close() {
     assert!(!peer_handoff_allowed_for_session(&key_a));
     // It runs on its owning peer's model lane.
     assert!(
-        peer_lane_provider_for(&key_a, &rt_a).is_none(),
+        peer_lane_provider_for(&key_a, &rt_a).unwrap().is_none(),
         "primary until a lane is set"
     );
     raw_peer_model_set(
@@ -498,6 +498,7 @@ async fn should_open_isolated_request_contexts_and_refuse_them_after_close() {
     .unwrap();
     assert_eq!(
         peer_lane_provider_for(&key_a, &rt_a)
+            .unwrap()
             .map(|p| p.model_id().to_owned())
             .as_deref(),
         Some("gpt-4o")

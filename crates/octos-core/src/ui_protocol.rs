@@ -302,6 +302,19 @@ pub const UI_PROTOCOL_FEATURE_PLAN_TODOS_V1: &str = "plan.todos.v1";
 /// return the playback URL).
 pub const UI_PROTOCOL_FEATURE_SMART_HOME_V1: &str = "smart_home.v1";
 
+/// AppUI server support for a durable, per-peer configured model selection
+/// on `peer/prepare`. Advertised when that staging method is available.
+pub const UI_PROTOCOL_FEATURE_PEER_MODEL_OVERRIDE_V1: &str = "peer.model_override.v1";
+
+/// `peer/prepare.model_override`: select one configured model for each new
+/// native peer without editing the profile default. Unknown/ambiguous IDs
+/// are rejected before staging. Requires `peer.model_override.v1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerModelOverride {
+    pub model_id: String,
+}
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the

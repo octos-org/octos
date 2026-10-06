@@ -36232,6 +36232,313 @@ fn per_turn_snapshot_creates_fresh_dispatcher() {
 // peer/prepare (#1800)
 // ---------------------------------------------------------------------------
 
+fn peer_model_override_test_state(dir: &Path) -> Arc<AppState> {
+    let state = local_profile_state(dir);
+    let mut profile = profile_for_runtime_message("peer-model-test");
+    let selection = |id: &str| crate::profiles::LlmModelSelectionConfig {
+        family_id: Some("local".into()),
+        model_id: Some(id.into()),
+        ..Default::default()
+    };
+    profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+        primary: Some(selection("small")),
+        fallbacks: vec![selection("strong")],
+    });
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+    Arc::new(state)
+}
+
+#[tokio::test]
+async fn peer_model_override_is_staged_for_every_member_without_changing_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = peer_model_override_test_state(tmp.path());
+    let before = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("peer-model-test")
+        .unwrap()
+        .unwrap();
+    let result = raw_peer_prepare(
+        &state,
+        &RpcRequest::new(
+            "override",
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "Use the stronger configured model.", "n": 2,
+                "cwd": tmp.path(), "profile_id": "peer-model-test",
+                "model_override": {"model_id": "strong"}
+            }),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    for peer in result["peers"].as_array().unwrap() {
+        assert_eq!(peer["model"]["model"], "strong");
+        let dir = Path::new(peer["brief_path"].as_str().unwrap())
+            .parent()
+            .unwrap();
+        let recorded: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("model_override.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recorded, json!({"model_id": "strong"}));
+        // The same disk resolver used at turn start sees the choice before
+        // any session is opened, and can reconstruct it after a reconnect.
+        let config = crate::profiles::config_from_profile(&before, None, None);
+        let provider = resolve_peer_model_provider(
+            dir.parent().unwrap(),
+            peer["slug"].as_str().unwrap(),
+            &config,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(provider.model_id(), "strong");
+        assert!(provider.provider_name().starts_with("local"));
+    }
+    let after = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("peer-model-test")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(before).unwrap(),
+        serde_json::to_value(after).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn peer_model_override_rejects_unknown_model_before_staging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = peer_model_override_test_state(tmp.path());
+    let error = raw_peer_prepare(
+        &state,
+        &RpcRequest::new(
+            "override",
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "Must not be staged.", "cwd": tmp.path(), "profile_id": "peer-model-test",
+                "model_override": {"model_id": "not-configured"}
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("unknown model must not silently run on the primary");
+    assert!(
+        error.message.contains("not configured"),
+        "{}",
+        error.message
+    );
+    let (_, data_dir) = resolve_profile_data_dir(&state, Some("peer-model-test")).unwrap();
+    assert!(!data_dir.join("peers").exists());
+}
+
+#[test]
+fn peer_model_override_rejects_ambiguous_ids_and_keeps_route_credentials() {
+    let mut config = config_with_lane("strong");
+    config.provider = Some("openai".into());
+    config.model = Some("small".into());
+    config.api_key_env = Some("PRIMARY_KEY".into());
+    let lane = config.sub_providers.last_mut().unwrap();
+    lane.model = Some("strong-model".into());
+    lane.api_key_env = Some("PEER_KEY".into());
+    lane.base_url = Some("https://peer.example/v1".into());
+    let selected = peer_model_override_config(&config, "strong-model").unwrap();
+    assert_eq!(selected.api_key_env.as_deref(), Some("PEER_KEY"));
+    assert_eq!(
+        selected.base_url.as_deref(),
+        Some("https://peer.example/v1")
+    );
+    assert_eq!(config.api_key_env.as_deref(), Some("PRIMARY_KEY"));
+    config.model = Some("strong-model".into());
+    assert!(
+        peer_model_override_config(&config, "strong-model")
+            .unwrap_err()
+            .message
+            .contains("multiple routes")
+    );
+    for invalid in ["", " ", " strong-model", "strong\nmodel"] {
+        assert!(peer_model_override_config(&config, invalid).is_err());
+    }
+}
+
+#[test]
+fn peer_model_override_invalid_record_never_falls_back_to_primary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let dir = stage_peer_dir_with(&peers_root, "override");
+    let config = config_with_lane("strong");
+    // Unrelated legacy peers keep their original model-lane behavior.
+    stage_peer_dir_with(&peers_root, "ordinary");
+    assert!(
+        resolve_peer_model_provider(&peers_root, "ordinary", &config)
+            .unwrap()
+            .is_none()
+    );
+    for encoded in ["bad json", "{}", r#"{"model_id":"removed-model"}"#] {
+        std::fs::write(dir.join("model_override.json"), encoded).unwrap();
+        assert!(resolve_peer_model_provider(&peers_root, "override", &config).is_err());
+    }
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(dir.join("model_override.json")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("missing"), dir.join("model_override.json"))
+            .unwrap();
+        assert!(resolve_peer_model_provider(&peers_root, "override", &config).is_err());
+    }
+}
+
+#[tokio::test]
+async fn peer_model_override_replacement_requires_originator_and_is_isolated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = peer_model_override_test_state(tmp.path());
+    let owner = SessionKey::with_profile_topic("peer-model-test", "local", "tui", "coding");
+    let result = raw_peer_prepare(
+        &state,
+        &RpcRequest::new(
+            "prepare",
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "model override", "n": 2, "cwd": tmp.path(), "session_id": owner,
+                "model_override": {"model_id": "strong"}
+            }),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    let config = profile_peer_model_config(&state, "peer-model-test").unwrap();
+    let (_, data_dir) = resolve_profile_data_dir(&state, Some("peer-model-test")).unwrap();
+    let peers_root = data_dir.join("peers");
+    let slug = result["peers"][0]["slug"].as_str().unwrap();
+    let stranger = SessionKey::with_profile_topic("peer-model-test", "local", "tui", "unrelated");
+    let set = |session| {
+        RpcRequest::new(
+            "set",
+            APPUI_METHOD_PEER_MODEL_SET,
+            json!({"session_id": session, "peer": slug, "model": null}),
+        )
+    };
+    assert!(raw_peer_model_set(&state, &set(stranger), None).is_err());
+    assert_eq!(
+        resolve_peer_model_provider(&peers_root, slug, &config)
+            .unwrap()
+            .unwrap()
+            .model_id(),
+        "strong"
+    );
+    raw_peer_model_set(&state, &set(owner), None).unwrap();
+    assert!(
+        resolve_peer_model_provider(&peers_root, slug, &config)
+            .unwrap()
+            .is_none()
+    );
+    let sibling = result["peers"][1]["slug"].as_str().unwrap();
+    assert_eq!(
+        resolve_peer_model_provider(&peers_root, sibling, &config)
+            .unwrap()
+            .unwrap()
+            .model_id(),
+        "strong"
+    );
+}
+
+#[test]
+fn peer_model_override_capability_is_advertised_with_prepare() {
+    let state = AppState::empty_for_tests();
+    let capabilities = ConnectionUiFeatures::stdio_defaults().advertised_capabilities(&state);
+    assert!(capabilities.supports_method(APPUI_METHOD_PEER_PREPARE));
+    assert!(
+        capabilities
+            .supports_feature(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_PEER_MODEL_OVERRIDE_V1)
+    );
+}
+
+#[tokio::test]
+async fn peer_model_override_first_request_uses_selected_model() {
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{body_partial_json, method, path},
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({"model": "strong"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "peer-first", "object": "chat.completion", "created": 0, "model": "strong",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }))).expect(1).mount(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = peer_model_override_test_state(tmp.path());
+    let store = state.profile_store.as_ref().unwrap();
+    let mut profile = store.get("peer-model-test").unwrap().unwrap();
+    profile.config.llm.as_mut().unwrap().fallbacks[0].route =
+        Some(crate::profiles::LlmRouteConfig {
+            base_url: Some(format!("{}/v1", server.uri())),
+            ..Default::default()
+        });
+    store.save(&profile).unwrap();
+    let result = raw_peer_prepare(
+        &state,
+        &RpcRequest::new(
+            "prepare",
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "first model call", "cwd": tmp.path(), "profile_id": "peer-model-test",
+                "model_override": {"model_id": "strong"}
+            }),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    let (_, data_dir) = resolve_profile_data_dir(&state, Some("peer-model-test")).unwrap();
+    let config = profile_peer_model_config(&state, "peer-model-test").unwrap();
+    let provider = resolve_peer_model_provider(
+        &data_dir.join("peers"),
+        result["slug"].as_str().unwrap(),
+        &config,
+    )
+    .unwrap()
+    .unwrap();
+    provider
+        .chat(
+            &[Message::user("begin")],
+            &[],
+            &octos_llm::ChatConfig::default(),
+        )
+        .await
+        .unwrap();
+    server.verify().await;
+    assert_eq!(config.model.as_deref(), Some("small"));
+}
+
+#[test]
+fn peer_model_override_resolves_inherited_cold_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = peer_model_override_test_state(tmp.path());
+    let mut child = profile_for_runtime_message("peer-model-child");
+    child.parent_id = Some("peer-model-test".into());
+    state.profile_store.as_ref().unwrap().save(&child).unwrap();
+    let config = profile_peer_model_config(&state, &child.id).unwrap();
+    assert_eq!(
+        build_peer_model_override(&config, "strong")
+            .unwrap()
+            .model_id(),
+        "strong"
+    );
+}
+
 #[test]
 fn reserve_peer_dir_claims_atomically_and_suffixes_collisions() {
     let tmp = tempfile::tempdir().unwrap();
