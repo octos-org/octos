@@ -16669,9 +16669,10 @@ fn raw_session_tool_list_set(
     // Route-ownership gate (#2660): the session's tool route belongs to the
     // connection that declared it — another live connection re-declaring
     // would silently take over the session's kernel-tool surface.
-    if let Some(owner) =
-        crate::peers::host_tools::session_set_connection(&data_dir.join("peers"), &params.session_id)
-    {
+    if let Some(owner) = crate::peers::host_tools::session_set_connection(
+        &data_dir.join("peers"),
+        &params.session_id,
+    ) {
         if owner != ws.connection_id.0 {
             return Err(RpcError::permission_denied(format!(
                 "session '{}' has its tool route on another connection of its host",
@@ -16818,7 +16819,9 @@ fn raw_peer_tools_register(
         if owner != ws.connection_id.0 {
             return Err(host_peer_error(
                 "peer_route_not_owner",
-                format!("peer '{slug}' is routed to another connection of its host; unregister it there"),
+                format!(
+                    "peer '{slug}' is routed to another connection of its host; unregister it there"
+                ),
             ));
         }
     }
