@@ -757,6 +757,34 @@ pub(crate) struct WsConnection {
     /// executes code, administers the server or reaches peers
     /// (`host_managed::external_turn_tool_allowed`).
     external: Arc<std::sync::atomic::AtomicBool>,
+    /// Sessions with a live ledger forwarder running for this connection,
+    /// counted per session. Held by [`LiveForwarderRegistration`] for the
+    /// forwarder task's lifetime, so the synchronous send helpers can tell
+    /// whether an untagged ledger append will reach this connection.
+    live_forwarder_sessions: Arc<StdMutex<HashMap<SessionKey, usize>>>,
+}
+
+/// A live forwarder's entry in [`WsConnection::live_forwarder_sessions`],
+/// released when the forwarder task ends — including on abort, which drops
+/// the task's future.
+struct LiveForwarderRegistration {
+    sessions: Arc<StdMutex<HashMap<SessionKey, usize>>>,
+    session_id: SessionKey,
+}
+
+impl Drop for LiveForwarderRegistration {
+    fn drop(&mut self) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = sessions.get_mut(&self.session_id) {
+            *count -= 1;
+            if *count == 0 {
+                sessions.remove(&self.session_id);
+            }
+        }
+    }
 }
 
 impl WsConnection {
@@ -770,6 +798,7 @@ impl WsConnection {
             failed_notify: Arc::new(tokio::sync::Notify::new()),
             live_features: Arc::new(std::sync::RwLock::new(ConnectionUiFeatures::default())),
             external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live_forwarder_sessions: Arc::default(),
         }
     }
 
@@ -797,7 +826,32 @@ impl WsConnection {
                 ConnectionUiFeatures::stdio_defaults(),
             )),
             external: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live_forwarder_sessions: Arc::default(),
         }
+    }
+
+    /// Record a live forwarder for `session_id` until the returned
+    /// registration drops (see [`spawn_live_forwarder`]).
+    fn register_live_forwarder(&self, session_id: &SessionKey) -> LiveForwarderRegistration {
+        *self
+            .live_forwarder_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(session_id.clone())
+            .or_default() += 1;
+        LiveForwarderRegistration {
+            sessions: self.live_forwarder_sessions.clone(),
+            session_id: session_id.clone(),
+        }
+    }
+
+    /// Whether a live forwarder for `session_id` runs for this connection,
+    /// i.e. whether an untagged ledger append for the session reaches it.
+    fn has_live_forwarder(&self, session_id: &SessionKey) -> bool {
+        self.live_forwarder_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(session_id)
     }
 
     /// True for the `octos serve --stdio` transport (see [`Self::new_stdio`]).
@@ -22787,7 +22841,11 @@ async fn spawn_live_forwarder(
     }
 
     let session_for_log = session_id.clone();
+    // Registered before the pump can run and owned by its task, so the entry
+    // lasts exactly as long as the forwarder (finished or aborted).
+    let registration = ws.register_live_forwarder(&session_id);
     let task = tokio::spawn(async move {
+        let _registration = registration;
         loop {
             match rx.recv().await {
                 Ok(event) => {
@@ -47054,11 +47112,10 @@ fn send_notification_lifecycle(
     notification: UiNotification,
 ) -> Result<(), SendError> {
     let features = ws.snapshot_live_features();
-    if features.projection_envelope_v2
-        && matches!(
-            &notification,
-            UiNotification::TurnCompleted(_) | UiNotification::TurnError(_)
-        )
+    if matches!(
+        &notification,
+        UiNotification::TurnCompleted(_) | UiNotification::TurnError(_)
+    ) && (features.projection_envelope_v2 || ws.has_live_forwarder(notification.session_id()))
     {
         // A canonical v2 persisted row is produced by the commit observer and
         // reaches this connection through the ordered ledger forwarder. If we
@@ -47072,8 +47129,15 @@ fn send_notification_lifecycle(
         // connection's forwarder deliver it after every earlier ledger row.
         // The v2 stream is cursor-replayable, so a writer failure is recovered
         // by session hydration rather than by letting a lifecycle-priority
-        // frame violate the projection's ordering contract. Legacy/v1 clients
-        // retain the direct lifecycle path below unchanged.
+        // frame violate the projection's ordering contract.
+        //
+        // A connection without v2 takes this lane too whenever a live
+        // forwarder runs for the session: it receives the same v2
+        // projection, and on the direct lane a `serve --stdio` client saw
+        // `turn_terminal` seq 48 ahead of the turn's queued `assistant_delta`
+        // rows 16..47. With no forwarder (`turn/start` without
+        // `session/open`) nothing would deliver an untagged terminal, so it
+        // keeps the direct lifecycle path below.
         ledger.append_notification(notification);
         return Ok(());
     }
@@ -47260,6 +47324,23 @@ fn send_notification_durable(
     // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
     // set `OCTOSCODE_M15_UX_OUTPUT_DIR`, so this is free in normal production.
     record_task_evidence(&notification);
+    // A lifecycle source that `project_lifecycle_event_to_v2_wire` turns
+    // into a v2 row takes the ordered forwarder lane while a live forwarder
+    // runs for its session, like the terminal in `send_notification_lifecycle`:
+    // its projected per-thread `seq` follows every earlier ledger row, so a
+    // direct send could overtake rows still queued on that forwarder. Without
+    // one, the direct path below is the only live delivery.
+    if matches!(
+        &notification,
+        UiNotification::TurnCompleted(_)
+            | UiNotification::TurnError(_)
+            | UiNotification::FileAttached(_)
+            | UiNotification::TurnSpawnComplete(_)
+    ) && ws.has_live_forwarder(notification.session_id())
+    {
+        ledger.append_notification(notification);
+        return Ok(());
+    }
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
     // Codex #1336 round-2 BLOCKER 1: apply the per-connection

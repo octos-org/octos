@@ -31509,6 +31509,225 @@ async fn v2_terminal_waits_behind_canonical_persist_on_session_forwarder() {
     abort_live_forwarders(&forwarders, &ledger).await;
 }
 
+/// Install the per-session live forwarder that `handle_session_open` gives a
+/// connection, keeping the connection's negotiated features. Turn terminals
+/// reach the wire only through it, so a test that drives turn handlers
+/// without `session/open` installs it before waiting for one.
+async fn install_session_forwarder(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+) -> SharedLiveForwarders {
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ws.snapshot_live_features(),
+        None,
+        None,
+        ledger.subscribe(session_id),
+        forwarders.clone(),
+    )
+    .await;
+    forwarders
+}
+
+/// The same ordering must hold on a connection that never negotiated
+/// `projection.envelope.v2` — every `octos serve --stdio` connection starts
+/// that way. A lifecycle row projected to v2 at send time used to be
+/// direct-sent there, overtaking the turn's `assistant_delta` rows still
+/// queued on the session forwarder: the client saw seq 1..15, then the
+/// `turn_terminal` (48), then 16..47, breaking the strictly monotonic
+/// per-thread `seq` and the § 14.6 barrier.
+async fn assert_projected_row_follows_queued_deltas(
+    expected_last: &str,
+    send_projected: impl FnOnce(&WsConnection, &UiProtocolLedger, &SessionKey, TurnId),
+) {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(64);
+    let ws = WsConnection::new_stdio(writer_tx);
+    assert!(
+        !ws.snapshot_live_features().projection_envelope_v2,
+        "a stdio connection starts without projection.envelope.v2"
+    );
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let session_id = SessionKey("local:non-v2-projection-order".into());
+    let turn_id = TurnId::new();
+    let thread_id = turn_id.0.to_string();
+    let forwarders = install_session_forwarder(&ws, &ledger, &session_id).await;
+
+    // The answer streams as native v2 rows. Nothing yields before the
+    // projected row is sent, so all of them are still queued on the
+    // forwarder — the window a live turn hits.
+    const DELTAS: u64 = 4;
+    for index in 0..DELTAS {
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                thread_id.clone(),
+                PayloadV2::AssistantDelta {
+                    text: format!("part {index} "),
+                    assistant_segment_id: format!("{thread_id}:assistant:1"),
+                },
+                None,
+            )
+            .expect("assistant delta row");
+    }
+    send_projected(&ws, ledger.as_ref(), &session_id, turn_id);
+
+    let mut wire = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while wire.len() <= DELTAS as usize {
+        match writer_rx.try_recv() {
+            Ok(WsMessage::Text(text)) => {
+                let value: Value = serde_json::from_str(text.as_str()).expect("valid JSON frame");
+                if value["method"] == "projection/envelope"
+                    && value["params"]["thread_id"] == thread_id
+                {
+                    wire.push((
+                        value["params"]["seq"].as_u64().expect("envelope seq"),
+                        value["params"]["payload"]["type"]
+                            .as_str()
+                            .expect("v2 payload type")
+                            .to_owned(),
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "every envelope of the turn arrives: {wire:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+    let seqs: Vec<u64> = wire.iter().map(|(seq, _)| *seq).collect();
+    assert_eq!(
+        seqs,
+        (1..=DELTAS + 1).collect::<Vec<_>>(),
+        "per-thread seq must be strictly monotonic on the wire: {wire:?}"
+    );
+    assert_eq!(
+        wire.last().map(|(_, kind)| kind.as_str()),
+        Some(expected_last),
+        "the projected row follows every queued delta: {wire:?}"
+    );
+
+    // Delivered exactly once: nothing else arrives for the thread.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        writer_rx.try_iter().all(|frame| match frame {
+            WsMessage::Text(text) => serde_json::from_str::<Value>(text.as_str())
+                .map(|value| value["params"]["thread_id"] != thread_id)
+                .unwrap_or(true),
+            _ => true,
+        }),
+        "the projected row must be delivered exactly once"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+#[tokio::test]
+async fn should_deliver_turn_terminal_after_queued_envelopes_when_v2_not_negotiated() {
+    assert_projected_row_follows_queued_deltas(
+        "turn_terminal",
+        |ws, ledger, session_id, turn_id| {
+            send_notification_lifecycle(
+                ws,
+                ledger,
+                UiNotification::TurnCompleted(TurnCompletedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id,
+                    cursor: None,
+                    tokens_in: Some(3),
+                    tokens_out: Some(2),
+                    session_result: None,
+                    token_usage: None,
+                }),
+            )
+            .expect("terminal accepted");
+        },
+    )
+    .await;
+}
+
+/// `send_notification_durable` projects the same lifecycle sources (here a
+/// file attachment), so it must not direct-send them past queued rows either.
+#[tokio::test]
+async fn should_deliver_durable_file_attached_after_queued_envelopes() {
+    assert_projected_row_follows_queued_deltas(
+        "file_attached",
+        |ws, ledger, session_id, turn_id| {
+            send_notification_durable(
+                ws,
+                ledger,
+                UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id,
+                    path: "/tmp/answer.pdf".into(),
+                    tool_call_id: None,
+                    attachment_owner: None,
+                    mime: Some("application/pdf".into()),
+                }),
+            )
+            .expect("attachment accepted");
+        },
+    )
+    .await;
+}
+
+/// Without a live forwarder for the session nothing would deliver an
+/// untagged terminal, so it keeps the direct lane: a `turn/start` without
+/// `session/open` still gets its terminal live, and so does a session whose
+/// forwarder was retired.
+#[tokio::test]
+async fn should_direct_send_turn_terminal_when_session_has_no_forwarder() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(8);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let unopened = SessionKey("local:unopened-terminal".into());
+    let retired = SessionKey("local:retired-forwarder-terminal".into());
+    let forwarders = install_session_forwarder(&ws, &ledger, &retired).await;
+    // Let the forwarder start before retiring it, as a live one would have.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    abort_live_forwarders(&forwarders, &ledger).await;
+
+    for session_id in [unopened, retired] {
+        let turn_id = TurnId::new();
+        send_notification_lifecycle(
+            &ws,
+            &ledger,
+            UiNotification::TurnCompleted(TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: Some(3),
+                tokens_out: Some(2),
+                session_result: None,
+                token_usage: None,
+            }),
+        )
+        .expect("terminal delivered");
+        // Already on the writer without yielding: no forwarder is involved.
+        let Ok(WsMessage::Text(text)) = writer_rx.try_recv() else {
+            panic!("the terminal for {session_id:?} must be written directly");
+        };
+        let value: Value = serde_json::from_str(text.as_str()).expect("valid JSON frame");
+        assert_eq!(value["method"], "projection/envelope", "{session_id:?}");
+        assert_eq!(value["params"]["thread_id"], turn_id.0.to_string());
+        assert_eq!(value["params"]["payload"]["type"], "turn_terminal");
+    }
+    assert!(writer_rx.try_recv().is_err(), "each terminal is sent once");
+}
+
 /// There is no old-client persisted-message fallback: background results
 /// remain deliverable as the canonical v2 child frame.
 #[tokio::test]
