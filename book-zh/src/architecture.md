@@ -253,7 +253,7 @@ pub struct CreateParams {
 
 | 提供商 | 别名 | 基础 URL | 默认模型 | API 密钥环境变量 |
 |----------|---------|----------|---------------|-------------|
-| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5-turbo | ZAI_API_KEY |
+| Z.AI | zai, z.ai | api.z.ai/api/paas/v4 | glm-5-turbo | ZAI_API_KEY |
 
 ### ModelHints（OpenAI 提供商）
 

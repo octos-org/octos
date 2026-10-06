@@ -18,7 +18,7 @@ Octos 开箱即用地支持 17 家 LLM 服务商。每个服务商需要一个�
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-M3 | OpenAI 兼容 | -- |
 | `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI 兼容 | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI 兼容 | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic 兼容 | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | OpenAI 兼容 | `z.ai` |
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | 自动（Anthropic/OpenAI） | `r9s.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI 兼容 | `nim` |
 | `ollama` | *（无需）* | llama3.2 | OpenAI 兼容 | -- |
@@ -141,7 +141,7 @@ octos chat --model qwen-max         # -> dashscope
 ```
 
 - `"openai"` -- OpenAI Chat Completions 格式（大多数服务商的默认值）
-- `"anthropic"` -- Anthropic Messages 格式（用于 Anthropic 兼容代理）
+- `"anthropic"` -- Anthropic Messages 格式（用于 Anthropic 兼容代理）。`zai` / `zai-coding` 路由设置 `api_type: "anthropic"` 且未指定 `base_url` 时，使用 Z.AI 的 Anthropic 兼容根地址（`https://api.z.ai/api/anthropic`），该地址不报告提示缓存命中；默认的 OpenAI 兼容通道在长会话中更省钱
 
 ## 降级链
 

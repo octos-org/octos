@@ -838,15 +838,20 @@ fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDi
 
 impl Executable for ServeCommand {
     fn execute(self) -> Result<()> {
-        tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             // Serve runs agent turns, skill actions and profile bootstraps on
             // its workers; give them the same 8 MiB the chat/acp/mcp runtimes
             // use for deep agent futures (debug builds overflowed 2 MiB).
             .thread_stack_size(8 * 1024 * 1024)
             .build()
-            .wrap_err("failed to create tokio runtime")?
-            .block_on(self.run_async())
+            .wrap_err("failed to create tokio runtime")?;
+        let result = runtime.block_on(self.run_async());
+        // Background tasks (including blocking stdin watchers) must not hold
+        // the CLI open after gateway cleanup. Return to main so its tracing
+        // guard flushes shutdown records before the process exits.
+        runtime.shutdown_background();
+        result
     }
 }
 
@@ -2296,7 +2301,7 @@ impl ServeCommand {
 
         // Cap the drain: after the stop signal axum waits for in-flight
         // connections, and an SSE stream never closes on its own. Past the
-        // cap we proceed to stop_all() + exit(0) anyway — better to cut a
+        // cap we proceed to stop_all() + runtime shutdown anyway — better to cut a
         // long-lived stream than to let the supervisor SIGKILL us with the
         // gateways still running (#2086).
         // Both arms funnel into the gateway cleanup below: a serve-loop
@@ -2331,9 +2336,10 @@ impl ServeCommand {
             let _ = serve_console::print_stdout(&format!("  stopped {} gateway(s)", stopped));
         }
 
-        // Force exit — background tokio tasks (profile watcher, auth cleanup,
-        // admin bot) have no shutdown signal and would hang indefinitely.
-        std::process::exit(if serve_result.is_ok() { 0 } else { 1 });
+        // execute() shuts the runtime down without waiting for background
+        // tasks. Returning lets main drop the asynchronous log writer's
+        // guard; process::exit would discard the queued cleanup records.
+        serve_result.wrap_err("HTTP serve loop failed")
     }
 
     /// F-010: construct an `Option<Arc<SwarmState>>` from the

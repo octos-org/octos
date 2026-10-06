@@ -236,21 +236,10 @@ mod serve_broken_pipe {
         let stderr_log = std::fs::read_to_string(&err_path).unwrap_or_default();
         // Cleanup evidence must come from a NON-stdout sink: serve's rolling
         // tracing log under data_dir/logs (created by init_tracing).
-        // #37 — POLL the log instead of a single immediate read: on a slow
-        // CI runner the tracing writer's flush trails process exit (local
-        // 11s vs CI 431s for the same tip), so the one-shot read raced the
-        // marker and failed. Poll up to 60s in 200ms steps (300 attempts);
-        // fall through to the original assert with the final content.
+        // The log guard must flush before process exit. Polling after the
+        // process has exited cannot recover records lost by process::exit.
         let log_dir = data_dir.join("logs");
-        let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut tracing_log = read_dir_logs_concat(&log_dir);
-        while !(tracing_log.contains("stopping all gateway child processes")
-            || tracing_log.contains("gateways stopped"))
-            && std::time::Instant::now() < marker_deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            tracing_log = read_dir_logs_concat(&log_dir);
-        }
+        let tracing_log = read_dir_logs_concat(&log_dir);
         let orphaned = unsafe { libc::kill(pid, 0) } == 0;
         let _ = std::fs::remove_dir_all(&data_dir);
 
