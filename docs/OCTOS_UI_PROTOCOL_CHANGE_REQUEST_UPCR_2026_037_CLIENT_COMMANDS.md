@@ -63,6 +63,14 @@ serve intercepts them too, but a client can handle them locally.
 `session/open` never fails because of a rejected name. This request adds no
 result field; the accepted set is echoed in `SessionOpened` by `UPCR-2026-038`.
 
+## Adoption
+
+Shipped, awaiting a first client. As of 2026-10-06 no client in the octos-org
+repositories sends `client_commands`; the only senders are this repository's
+tests (#2661 item 5). The first client to send it should expect the lifecycle
+above from its first open: its declaration replaces whatever the session held
+and is cleared when its connection closes.
+
 ## Risk
 
 - Declared names reach the system prompt. The character set and the length

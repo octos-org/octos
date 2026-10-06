@@ -46,6 +46,14 @@ The ledger replays earlier `session/open` notifications with the value they
 had when written. A replayed value is history, not the current declaration.
 The `session/open` result is authoritative for the connection that sent it.
 
+## Adoption
+
+Shipped, awaiting a first client. As of 2026-10-06 no client in the octos-org
+repositories reads `accepted_client_commands`, and none sends the
+`client_commands` it answers (#2661). Until a client reads the field, #2670 is
+fixed on the wire only: a user of the shipped clients still cannot see which
+names were dropped.
+
 ## Risk
 
 - The echoed names are the same strings already rendered into the system
