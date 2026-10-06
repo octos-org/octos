@@ -6951,6 +6951,133 @@ async fn should_refuse_a_purge_when_the_caller_is_not_the_peers_host() {
     crate::peers::host_tools::drop_routes_for_connection(host_ws.connection_id.0);
 }
 
+/// A failed entry must not finalize the purge: the tombstone would answer
+/// every retry `already_purged` and the leftovers would never be erased.
+#[cfg(unix)]
+#[tokio::test]
+async fn should_not_finalize_a_purge_when_the_erase_partially_fails_and_a_retry_finishes_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    // The peer's memory namespace holds a file, and the namespace directory
+    // is made unremovable so the erase step fails on it.
+    let ns_root =
+        crate::runtime::memory_namespace::memory_namespace_root(&fx.data_dir, "app/news/acct-1");
+    std::fs::create_dir_all(&ns_root).unwrap();
+    std::fs::write(ns_root.join("MEMORY.md"), "- the account's fact\n").unwrap();
+    std::fs::set_permissions(&ns_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let (ws, _rx) = ws_connection_for_test(8);
+    let error = purge(&fx.state, &ws, &fx.system, "news", &token)
+        .await
+        .unwrap_err();
+    let data = error.data.unwrap();
+    assert_eq!(data["kind"], "peer_purge_incomplete");
+    assert!(
+        !data["errors"].as_array().unwrap().is_empty(),
+        "the failing entries are reported: {data}"
+    );
+    // Nothing is finalized: the peer stays staged, and no tombstone answers
+    // a retry.
+    assert!(peers_root(&fx).join("news/brief.md").exists());
+    assert!(
+        !fx.data_dir
+            .join(crate::peers::purge::PEER_PURGES_DIR)
+            .exists()
+    );
+    // The failed attempt is audited.
+    let audit =
+        std::fs::read_to_string(fx.data_dir.join(crate::peers::purge::PEER_PURGE_AUDIT_LEAF))
+            .unwrap();
+    assert!(audit.contains("\"event\":\"peer_purge_incomplete\""));
+
+    // Storage recovers: the retry runs the whole (idempotent) erase again.
+    std::fs::set_permissions(&ns_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let result = purge(&fx.state, &ws, &fx.system, "news", &token)
+        .await
+        .expect("the retry finishes the purge");
+    assert_eq!(result["purged"], true);
+    assert_eq!(result["already_purged"], false);
+    assert_eq!(result["errors"], json!([]), "{result}");
+    assert!(!ns_root.exists());
+    assert!(!peers_root(&fx).join("news").exists());
+    let audit =
+        std::fs::read_to_string(fx.data_dir.join(crate::peers::purge::PEER_PURGE_AUDIT_LEAF))
+            .unwrap();
+    assert!(audit.contains("\"event\":\"peer_purged\""));
+    // Only now is the retry answered `already_purged`.
+    let again = purge(&fx.state, &ws, &fx.system, "news", &token)
+        .await
+        .unwrap();
+    assert_eq!(again["already_purged"], true);
+}
+
+/// The same for a peer whose workspace the kernel provisioned (what a peer
+/// staged without `cwd` gets): attempt one erases the workspace before the
+/// purge stops, so the retry must treat the gone workspace as already
+/// erased instead of refusing it forever. The workspace is staged under the
+/// kernel's provisioned root directly, so the branch is taken on every
+/// platform (a macOS tempdir's `/var` symlink would otherwise misroute a
+/// data-dir-relative path to the kept branch).
+#[cfg(unix)]
+#[tokio::test]
+async fn should_finish_a_retry_when_an_earlier_attempt_erased_the_provisioned_workspace() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = fixture().await;
+    let provisioned = dunce::canonicalize(&fx.data_dir)
+        .unwrap()
+        .join(crate::runtime::memory_namespace::APP_WORKSPACES_DIR)
+        .join("app/mail/acct-1");
+    std::fs::create_dir_all(&provisioned).unwrap();
+    let prepared = raw_peer_prepare(
+        &fx.state,
+        &rpc(
+            APPUI_METHOD_PEER_PREPARE,
+            json!({
+                "brief": "You are the Mail app's assistant.",
+                "names": ["Mail"],
+                "session_id": fx.system,
+                "memory_namespace": "app/mail/acct-1",
+                "cwd": provisioned.to_string_lossy(),
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("stage the mail peer");
+    let token = prepared["host_token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        prepared["cwd"].as_str().unwrap(),
+        provisioned.to_string_lossy()
+    );
+    // The peer's memory namespace holds a file, made unremovable.
+    let ns_root =
+        crate::runtime::memory_namespace::memory_namespace_root(&fx.data_dir, "app/mail/acct-1");
+    std::fs::create_dir_all(&ns_root).unwrap();
+    std::fs::write(ns_root.join("MEMORY.md"), "- the account's fact\n").unwrap();
+    std::fs::set_permissions(&ns_root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let (ws, _rx) = ws_connection_for_test(8);
+    let error = purge(&fx.state, &ws, &fx.system, "mail", &token)
+        .await
+        .unwrap_err();
+    let data = error.data.unwrap();
+    assert_eq!(data["kind"], "peer_purge_incomplete");
+    assert!(!provisioned.exists(), "the attempt erased the workspace");
+
+    // The retry: the gone workspace must not fail it again.
+    std::fs::set_permissions(&ns_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let result = purge(&fx.state, &ws, &fx.system, "mail", &token)
+        .await
+        .expect("the retry finishes the purge");
+    assert_eq!(result["erased"]["workspace"], "erased", "{result}");
+    assert_eq!(result["errors"], json!([]), "{result}");
+    assert!(!ns_root.exists());
+    assert!(!peers_root(&fx).join("mail").exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn should_fail_the_host_call_and_stop_the_turn_when_the_peer_is_purged_mid_call() {
     let llm = ScriptedHostToolLlm::new("news_topics_set", json!({"topics": ["rust"]}));

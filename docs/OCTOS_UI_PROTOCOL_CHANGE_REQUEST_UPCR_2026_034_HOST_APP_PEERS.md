@@ -523,8 +523,17 @@ In order, the kernel:
    and are left to the existing retention. **Nothing is erased through a
    symlink**: every removal must resolve inside its expected root (the
    profile's `peers/`, memory stores, app workspaces or session store, or the
-   peer's own real `contexts/` folder); a bound workspace that no longer is
-   its canonical path is not touched, and the refusal is listed in `errors`.
+   peer's own real `contexts/` folder); a bound workspace that still exists
+   but no longer is its canonical path is not touched, and the refusal is
+   listed in `errors` — the host restores the real path before a purge can
+   complete. A workspace that is already gone has nothing left to erase (an
+   earlier attempt of the same purge may have erased it before stopping) and
+   does not fail the retry.
+   **A failed entry finalizes nothing**: the purge stops with
+   `peer_purge_incomplete` (the failing entries in `data.errors`), the peer
+   stays closed and staged — no tombstone, `peers/<slug>/` kept — and the
+   attempt is audited (`event: "peer_purge_incomplete"`, the same row shape
+   as a completed purge); a retry runs the whole idempotent erase again.
 5. **Records** a tombstone and an audit row outside `peers/`:
    `<data_dir>/peer-purges/tokens/<sha256(host token)>.json`,
    `<data_dir>/peer-purges/slugs/<slug>` and a row in
@@ -542,9 +551,10 @@ erased peer cannot run on as an ordinary profile session.
 returns `{session_id, profile_id, slug, purged: false, already_purged: true,
 purged_at}`, also after a new peer took the name (the new peer is not
 touched: its token differs). A purge that failed part-way is retried the
-ordinary way (the peer is still staged). Two purges of one peer at once:
-the second gets `peer_purge_in_progress`. Erase failures of single files do
-not fail the purge; they are listed in `errors` and in the audit row.
+ordinary way (the peer is still staged) — a partially-failed erase
+(`peer_purge_incomplete`) is one of those: nothing was finalized, so the
+retry erases from the top. Two purges of one peer at once:
+the second gets `peer_purge_in_progress`.
 
 Other kinds: `peer_not_found`, `peer_originator_mismatch`,
 `peer_host_token_mismatch`.

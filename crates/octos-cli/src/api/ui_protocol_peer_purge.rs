@@ -448,31 +448,33 @@ pub(super) async fn raw_peer_purge(
     // Nothing is erased through a symlink: the bound workspace must still be
     // the real (canonical) folder it was bound as, and every removal stays
     // inside its expected root.
-    let workspace_is_real = is_real_path(&binding.cwd);
+    // A workspace that is gone has nothing left to protect: an earlier
+    // attempt of this very purge may have erased it before stopping, and a
+    // retry must finish rather than fail forever on our own leftover. Only
+    // a path still on disk that is no longer its canonical form (a swapped
+    // symlink) is refused.
+    let workspace_missing = std::fs::symlink_metadata(&binding.cwd)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    let workspace_is_real = !workspace_missing && is_real_path(&binding.cwd);
     let provisioned_dir = data_dir.join(crate::runtime::memory_namespace::APP_WORKSPACES_DIR);
     let provisioned_root = dunce::canonicalize(&data_dir)
         .unwrap_or_else(|_| data_dir.clone())
         .join(crate::runtime::memory_namespace::APP_WORKSPACES_DIR);
     let workspace = if binding.cwd.starts_with(&provisioned_root) {
-        if !workspace_is_real {
+        if workspace_is_real {
+            if let Err(error) = remove_tree_within(&provisioned_dir, &binding.cwd) {
+                errors.push(format!("workspace {}: {error}", binding.cwd.display()));
+            }
+        } else if !workspace_missing {
             errors.push(format!(
                 "workspace {}: no longer its real path; not erased",
                 binding.cwd.display()
             ));
-        } else if let Err(error) = remove_tree_within(&provisioned_dir, &binding.cwd) {
-            errors.push(format!("workspace {}: {error}", binding.cwd.display()));
         }
         "erased"
     } else {
         let contexts_root = binding.cwd.join("contexts");
-        if !workspace_is_real {
-            if !contexts.is_empty() {
-                errors.push(format!(
-                    "workspace {}: no longer its real path; context folders not erased",
-                    binding.cwd.display()
-                ));
-            }
-        } else {
+        if workspace_is_real {
             for (_, context) in &contexts {
                 if context.cwd.parent() == Some(contexts_root.as_path()) {
                     if let Err(error) = remove_tree_within(&contexts_root, &context.cwd) {
@@ -482,9 +484,58 @@ pub(super) async fn raw_peer_purge(
             }
             // Only when nothing else is left in it.
             let _ = std::fs::remove_dir(&contexts_root);
+        } else if !workspace_missing && !contexts.is_empty() {
+            errors.push(format!(
+                "workspace {}: no longer its real path; context folders not erased",
+                binding.cwd.display()
+            ));
         }
         "kept"
     };
+    // A partially-failed erase must not finalize: the tombstone would answer
+    // every retry `already_purged`, and the leftovers — files the account
+    // still owns — would never be erased. The peer stays closed and staged,
+    // so a retry runs the whole (idempotent) erase again.
+    if !errors.is_empty() {
+        append_audit(
+            &peers_root,
+            &json!({
+                "ts": Utc::now().to_rfc3339(),
+                "event": "peer_purge_incomplete",
+                "profile_id": profile_id,
+                "session_id": originator,
+                "slug": &slug,
+                "name": &name,
+                "memory_namespace": &binding.memory_namespace,
+                "cwd": binding.cwd.to_string_lossy(),
+                "connection": ws.connection_id.0,
+                "was_open": was_open,
+                "contexts": context_sessions.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+                "interrupted": interrupted,
+                "host_calls_failed": host_calls_failed,
+                "erased": {
+                    "transcript_entries": transcript_entries,
+                    "memory_namespace": &binding.memory_namespace,
+                    "memory": memory_erased,
+                    "workspace": workspace,
+                    "peer_dir": !peer_dir.exists(),
+                },
+                "errors": &errors,
+            }),
+        );
+        return Err(purge_error(
+            "peer_purge_incomplete",
+            format!(
+                "peer '{slug}': {} of its entries could not be erased; the peer stays \
+                 closed, retry the purge",
+                errors.len()
+            ),
+        )
+        .with_data(json!({
+            "kind": "peer_purge_incomplete",
+            "errors": errors,
+        })));
+    }
     // The tombstones go down BEFORE the peer dir: from here on a retry with
     // the same token is answered `already_purged`, and a stale client's
     // `#peer-<slug>` session is refused.
