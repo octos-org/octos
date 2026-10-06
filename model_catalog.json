@@ -591,6 +591,28 @@
       "max_output": 131072
     },
     {
+      "provider": "minimax-coding/MiniMax-M3.1-Flash-Preview",
+      "type": "strong",
+      "default": true,
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.0,
+      "cost_out": 0.0,
+      "context_window": 1000000,
+      "max_output": 0,
+      "endpoints": [
+        {
+          "id": "minimax-coding",
+          "label": "MiniMax M Plan (Coding Plan)",
+          "base_url": "https://api.minimax.io/v1",
+          "api_key_env": "MINIMAX_CODING_API_KEY"
+        }
+      ]
+    },
+    {
       "provider": "minimax-cn/MiniMax-M3",
       "type": "strong",
       "default": true,

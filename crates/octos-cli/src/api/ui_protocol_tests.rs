@@ -2577,6 +2577,99 @@ async fn should_reload_startup_profile_llm_mutations_without_restart() {
     assert_eq!(result["restart_required"], json!(false), "{result}");
 }
 
+/// The configured M Plan fallback is activatable in a startup profile, and
+/// switching back retains both configurations and the already-running turn.
+#[tokio::test]
+async fn minimax_coding_select_reloads_startup_session_and_switches_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let model = "MiniMax-M3.1-Flash-Preview";
+    for (family, model, primary) in [
+        ("moonshot-coding", "k3", true),
+        ("minimax-coding", model, false),
+    ] {
+        raw_profile_llm_upsert(
+            &state,
+            &llm_upsert_rpc(family, "dev", family, model, None, primary),
+            Some("dev"),
+        )
+        .await
+        .expect("save configured model");
+    }
+    let original = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut state = Arc::try_unwrap(state).ok().unwrap();
+    let key = dynamic_profile_runtime_key(&state, "dev").unwrap();
+    dynamic_profile_runtimes().write().unwrap().remove(&key);
+    profile_runtime_generations().write().unwrap().remove(&key);
+    state.profiles.insert("dev".into(), original.clone());
+    let state = Arc::new(state);
+    let session = SessionKey("dev:local:tui#coding".into());
+    let old_session = state
+        .session_cache
+        .get_or_init(&original, session.clone(), None)
+        .await
+        .unwrap();
+
+    for (family, model) in [("minimax-coding", model), ("moonshot-coding", "k3")] {
+        let request = RpcRequest::new(
+            "select-plan",
+            "profile/llm/select",
+            json!({
+                "profile_id": "dev", "session_id": session, "family_id": family,
+                "model_id": model, "route_id": "official"
+            }),
+        );
+        let result = raw_profile_llm_select(&state, &request, Some("dev"))
+            .await
+            .expect("select plan model");
+        assert_eq!(result["applied"], true, "{result}");
+        assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+        assert_eq!(result["restart_required"], false);
+        assert_eq!(result["selected"]["model"], model);
+        assert_eq!(result["runtime_policy_stamp"]["model"], model);
+        assert_eq!(result["runtime_policy_stamp"]["provider"], family);
+        let next = ensure_session_profile_runtime(&state, Some("dev"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.primary_model_id, model);
+        assert!(Arc::ptr_eq(&next.memory, &original.memory));
+        let next_session = state
+            .session_cache
+            .get_or_init(&next, session.clone(), None)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&old_session, &next_session));
+        assert_eq!(next_session.profile.primary_model_id, model);
+        assert_eq!(
+            old_session.profile.primary_model_id, "k3",
+            "an admitted turn keeps its model"
+        );
+    }
+}
+
+#[test]
+fn minimax_coding_catalog_advertises_subscription_route_and_flash_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = raw_catalog_result(&local_profile_state(dir.path()), None).unwrap();
+    let family = &catalog["families"]["minimax-coding"];
+    assert_eq!(family["env"], "MINIMAX_CODING_API_KEY");
+    let model = family["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == "MiniMax-M3.1-Flash-Preview")
+        .expect("M3.1 Flash in catalog");
+    assert_eq!(model["context_window"], 1_000_000);
+    let route = &model["endpoints"][0];
+    assert_eq!(route["id"], "minimax-coding");
+    assert_eq!(route["base_url"], "https://api.minimax.io/v1");
+    assert_eq!(route["api_key_env"], "MINIMAX_CODING_API_KEY");
+}
+
 /// A startup model switch changes the provider used to bootstrap the next
 /// session, leaves an already admitted turn on its old runtime, and never
 /// resurrects the startup model after the final configured model is removed.
