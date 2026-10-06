@@ -28,7 +28,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `config/capabilities/list` | shipped AppUI extra, UPCR-2026-017 |
 | `profile/local/create` | shipped, UPCR-2026-018 |
 | `server/shutdown` | shipped local-solo AppUI extra, UPCR-2026-032; stops this `octos serve` exactly as Ctrl+C would |
-| `session/open` | shipped base method |
+| `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038 |
 | `session/list` | shipped REST-to-WS method |
 | `session/snapshot` | shipped REST-to-WS method |
 | `session/messages_page` | shipped REST-to-WS method |
@@ -153,7 +153,7 @@ spec and UPCR documents. The authoritative source remains code:
 
 | Method | Status |
 |---|---|
-| `session/open` | shipped open/resume notification |
+| `session/open` | shipped open/resume notification; carries `accepted_client_commands` (UPCR-2026-038) |
 | `turn/started` | shipped base notification |
 | `turn/completed` | shipped base notification |
 | `turn/error` | shipped base notification |
