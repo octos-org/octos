@@ -1156,4 +1156,122 @@ mod tests {
             "a bare keychain account a sibling bot still references must be kept"
         );
     }
+
+    // The release must happen only once deletion is final: the
+    // unregister-failure path restores the profile, and a restored profile
+    // must never come back pointing at a released keychain item.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_delete_bot_failure_path_keeps_the_keychain_items() {
+        use crate::auth::keychain;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::profiles::ProfileStore::open_unified(dir.path()).unwrap());
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root = keychain::test_override_secrets_root(secrets.path().to_path_buf());
+
+        let mut parent = make_profile("botfather", None);
+        parent
+            .config
+            .channels
+            .push(crate::profiles::ChannelCredentials::Matrix {
+                homeserver: "http://localhost:6167".to_string(),
+                as_token: "as-token".to_string(),
+                hs_token: "hs-token".to_string(),
+                server_name: "localhost".to_string(),
+                sender_localpart: "bot".to_string(),
+                user_prefix: "bot_".to_string(),
+                port: MATRIX_DEFAULT_PORT,
+                allowed_senders: vec![],
+                mention_only: true,
+                mode: String::new(),
+                user_id: String::new(),
+                access_token: String::new(),
+                password: String::new(),
+                device_name: String::new(),
+                rooms: vec![],
+                auto_join: "off".to_string(),
+                auto_join_allowlist: vec![],
+                group_policy: "allowlist".to_string(),
+                require_mention: true,
+            });
+        store.save(&parent).unwrap();
+
+        let mut sub = make_profile("botfather--weatherbot", None);
+        sub.parent_id = Some(parent.id.clone());
+        sub.config.env_vars.insert(
+            "VERTEX_SA_JSON".into(),
+            keychain::marker_for(&keychain::scoped_account(
+                "VERTEX_SA_JSON",
+                "botfather--weatherbot",
+            )),
+        );
+        store.save(&sub).unwrap();
+
+        let scoped = keychain::scoped_account("VERTEX_SA_JSON", "botfather--weatherbot");
+        keychain::set_secret(&scoped, "sa-json").unwrap();
+
+        let channel = Arc::new(
+            octos_bus::MatrixChannel::new(
+                "http://localhost:6167",
+                "as-token",
+                "hs-token",
+                "localhost",
+                "bot",
+                "bot_",
+                6166,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_bot_router(dir.path()),
+        );
+        channel
+            .bot_router()
+            .register_entry(
+                "@bot_weatherbot:localhost",
+                &sub.id,
+                "@alice:localhost",
+                octos_bus::BotVisibility::Private,
+            )
+            .await
+            .unwrap();
+
+        // A read-only data dir makes the router persist inside
+        // unregister_bot fail (it needs to create a temp file), sending
+        // delete_bot down its profile-restore path; the profile row itself
+        // unlinks inside dir/profiles, whose permissions are untouched (the
+        // room-leave round-trip is best-effort and never fails).
+        let original_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        let manager = GatewayBotManager {
+            store: store.clone(),
+            channel: channel.clone(),
+            parent_profile_id: parent.id.clone(),
+            cron_service: test_cron_service(dir.path()),
+        };
+
+        let result = manager
+            .delete_bot("@bot_weatherbot:localhost", "@alice:localhost")
+            .await;
+
+        let mut restore = std::fs::metadata(dir.path()).unwrap().permissions();
+        restore.set_mode(original_mode);
+        std::fs::set_permissions(dir.path(), restore).unwrap();
+
+        assert!(
+            result.is_err(),
+            "the failing router persist must fail the delete: {result:?}"
+        );
+        assert!(
+            store.get(&sub.id).unwrap().is_some(),
+            "the profile must be restored when the bot cannot be unregistered"
+        );
+        assert_eq!(
+            keychain::get_secret(&scoped).unwrap().as_deref(),
+            Some("sa-json"),
+            "a restored profile's keychain item must never be released by the failed deletion"
+        );
+    }
 }

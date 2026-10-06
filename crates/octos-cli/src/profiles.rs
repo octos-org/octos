@@ -2520,6 +2520,88 @@ pub(crate) fn release_deleted_profiles_keychain_items<'a>(
     }
 }
 
+#[cfg(test)]
+mod keychain_release_tests {
+    use super::*;
+    use crate::auth::keychain;
+
+    fn profile_with_env_vars(id: &str, env_vars: &[(&str, &str)]) -> UserProfile {
+        let mut profile = UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        profile.config.env_vars = env_vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        profile
+    }
+
+    // Pure-decision tests for the shared-account logic — the cases the
+    // handler-level fixtures can't reach cheaply. Lives next to the function
+    // (and outside the `api` feature) so the minimal lane runs it too.
+    #[test]
+    fn releasable_accounts_follow_the_remove_key_shared_account_contract() {
+        let marker = keychain::marker_for;
+
+        // A survivor referencing a bare account under a DIFFERENT env var
+        // name still keeps it: the survivor scan spans every env var name,
+        // never just the removed one.
+        let removed = [profile_with_env_vars(
+            "gone",
+            &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON"))],
+        )];
+        let survivors = [profile_with_env_vars(
+            "kept",
+            &[("VERTEX_API_KEY", &marker("VERTEX_SA_JSON"))],
+        )];
+        assert!(releasable_keychain_accounts(removed.iter(), &survivors).is_empty());
+
+        // Markers shared between two REMOVED profiles are released once.
+        let removed = [
+            profile_with_env_vars(
+                "parent",
+                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
+            ),
+            profile_with_env_vars(
+                "sub",
+                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
+            ),
+        ];
+        assert_eq!(
+            releasable_keychain_accounts(removed.iter(), &[]),
+            ["VERTEX_SA_JSON::parent".to_string()]
+        );
+
+        // Duplicate accounts within one removed profile dedup to one release.
+        let removed = [profile_with_env_vars(
+            "dup",
+            &[
+                ("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::dup")),
+                ("CUSTOM_KEY", &marker("VERTEX_SA_JSON::dup")),
+            ],
+        )];
+        assert_eq!(
+            releasable_keychain_accounts(removed.iter(), &[]),
+            ["VERTEX_SA_JSON::dup".to_string()]
+        );
+
+        // Plain values (no marker) never name a keychain account.
+        let removed = [profile_with_env_vars(
+            "plain",
+            &[("OPENAI_API_KEY", "sk-real")],
+        )];
+        assert!(releasable_keychain_accounts(removed.iter(), &[]).is_empty());
+    }
+}
+
 fn validate_public_subdomain(slug: &str) -> Result<()> {
     // Only the SHAPE is shared with profile ids. The channel-name
     // reservation does NOT apply here: a public subdomain never

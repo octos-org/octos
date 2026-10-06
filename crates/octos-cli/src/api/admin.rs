@@ -5708,7 +5708,6 @@ mod register_flow_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiles::releasable_keychain_accounts;
     use tokio::io::AsyncWriteExt;
 
     /// Strictly-newer only, with full semver precedence: the rc train flows
@@ -6272,73 +6271,6 @@ mod tests {
             None,
             "a bare keychain account with no surviving reference must be released"
         );
-    }
-
-    // Pure-decision tests for the shared-account logic — the cases the
-    // handler-level fixtures can't reach cheaply.
-    fn profile_with_env_vars(id: &str, env_vars: &[(&str, &str)]) -> UserProfile {
-        let mut profile = parent_profile();
-        profile.id = id.to_string();
-        profile.config.env_vars = env_vars
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect();
-        profile
-    }
-
-    #[test]
-    fn releasable_accounts_follow_the_remove_key_shared_account_contract() {
-        use crate::auth::keychain;
-        let marker = keychain::marker_for;
-
-        // A survivor referencing a bare account under a DIFFERENT env var
-        // name still keeps it: the survivor scan spans every env var name,
-        // never just the removed one.
-        let removed = [profile_with_env_vars(
-            "gone",
-            &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON"))],
-        )];
-        let survivors = [profile_with_env_vars(
-            "kept",
-            &[("VERTEX_API_KEY", &marker("VERTEX_SA_JSON"))],
-        )];
-        assert!(releasable_keychain_accounts(removed.iter(), &survivors).is_empty());
-
-        // Markers shared between two REMOVED profiles are released once.
-        let removed = [
-            profile_with_env_vars(
-                "parent",
-                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
-            ),
-            profile_with_env_vars(
-                "sub",
-                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
-            ),
-        ];
-        assert_eq!(
-            releasable_keychain_accounts(removed.iter(), &[]),
-            ["VERTEX_SA_JSON::parent".to_string()]
-        );
-
-        // Duplicate accounts within one removed profile dedup to one release.
-        let removed = [profile_with_env_vars(
-            "dup",
-            &[
-                ("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::dup")),
-                ("CUSTOM_KEY", &marker("VERTEX_SA_JSON::dup")),
-            ],
-        )];
-        assert_eq!(
-            releasable_keychain_accounts(removed.iter(), &[]),
-            ["VERTEX_SA_JSON::dup".to_string()]
-        );
-
-        // Plain values (no marker) never name a keychain account.
-        let removed = [profile_with_env_vars(
-            "plain",
-            &[("OPENAI_API_KEY", "sk-real")],
-        )];
-        assert!(releasable_keychain_accounts(removed.iter(), &[]).is_empty());
     }
 
     // The delete cascade removes sub-accounts too, so their per-profile
