@@ -53,7 +53,9 @@ marked under both the raw and the folded session id, since `turn/state/get`
 takes no topic. The admission check is read under the same registry lock as
 the registry lookup, and an admission inserts before dropping its marker, so a
 start finishing on another connection is seen as admitting or as registered,
-never as neither.
+never as neither. This ordering is pinned by the hold-window tests rather than
+by a dedicated concurrent test: a deterministic one would need a seam inside
+the insert window, so no such test exists.
 
 ## Tests
 
@@ -63,3 +65,6 @@ never as neither.
 - `should_withhold_not_running_while_a_real_turn_start_is_mid_admission`
   (a real `turn/start` held at a test seam inside its admission window)
 - `should_withhold_not_running_for_a_topic_turn_asked_by_its_folded_id`
+- `should_surface_the_recorded_state_once_a_held_admission_proceeds`
+  (the released start must settle at a terminal notification and its
+  recorded state must stay queryable afterwards)

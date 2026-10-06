@@ -46713,8 +46713,13 @@ fn should_bar_session_scoped_connections_from_server_shutdown() {
 // UPCR-2026-031 wiring: a REAL `turn/start` held inside its admission window
 // (after the marker, before the registry insert) must not be reported as
 // certainly not running — under the raw id and, for a topic turn, the folded
-// id the registry keys on. Deleting the marker wiring fails these.
-async fn state_get_during_held_admission(topic: Option<&str>) -> (Value, Value, Value) {
+// id the registry keys on. Deleting the marker wiring fails these. Callers
+// that pass `true` additionally ride the release: the start must settle at a
+// terminal notification and its recorded state must stay queryable after.
+async fn state_get_during_held_admission(
+    topic: Option<&str>,
+    await_settlement: bool,
+) -> (Value, Value, Value, Option<Value>) {
     let temp = tempfile::TempDir::new().expect("temp dir");
     let provider = Arc::new(AppuiContinuationLlm::new("done"));
     let (state, _profile_runtime) =
@@ -46725,7 +46730,7 @@ async fn state_get_during_held_admission(topic: Option<&str>) -> (Value, Value, 
     let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
     let ledger = Arc::new(UiProtocolLedger::new(64));
     let contracts = Arc::new(UiProtocolContractStores::default());
-    let (ws, _rx) = ws_connection_for_test(256);
+    let (ws, mut start_rx) = ws_connection_for_test(256);
     // Make the session known to the same manager `turn/state/get` consults,
     // as any open session is.
     for sid in std::iter::once(&session_id).chain(folded.as_ref()) {
@@ -46798,22 +46803,55 @@ async fn state_get_during_held_admission(topic: Option<&str>) -> (Value, Value, 
         },
     );
     let probe = async {
-        reached.notified().await;
+        tokio::time::timeout(waiting_budget(Duration::from_secs(5)), reached.notified())
+            .await
+            .expect("the held turn/start must reach its admission pause");
         let raw = query(session_id.clone(), turn_id.clone()).await;
         let folded_frame = match folded.clone() {
             Some(f) => query(f, turn_id.clone()).await,
             None => raw.clone(),
         };
         release.notify_one();
-        (raw, folded_frame)
+        if !await_settlement {
+            return (raw, folded_frame, None);
+        }
+        tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+            loop {
+                let frame = recv_rpc_json(&mut start_rx).await;
+                let method = frame.get("method").and_then(Value::as_str);
+                let is_v2_terminal = method == Some("projection/envelope")
+                    && frame
+                        .get("params")
+                        .and_then(|p| p.get("payload"))
+                        .and_then(|p| p.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("turn_terminal");
+                if method == Some("turn/completed")
+                    || method == Some("turn/error")
+                    || is_v2_terminal
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the released turn must settle");
+        // A topic turn's record lives under the folded key the handler
+        // splices in, so ask by the same key the start itself used.
+        let post = query(
+            folded.clone().unwrap_or(session_id.clone()),
+            turn_id.clone(),
+        )
+        .await;
+        (raw, folded_frame, Some(post))
     };
-    let (_, (raw, folded_frame)) = tokio::join!(start, probe);
-    (control, raw, folded_frame)
+    let (_, (raw, folded_frame, post)) = tokio::join!(start, probe);
+    (control, raw, folded_frame, post)
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn should_withhold_not_running_while_a_real_turn_start_is_mid_admission() {
-    let (control, raw, _) = state_get_during_held_admission(None).await;
+    let (control, raw, _, _) = state_get_during_held_admission(None, false).await;
     assert_eq!(control["result"]["running"], false, "control: {control}");
     assert_eq!(raw["result"]["state"], "unknown", "held: {raw}");
     assert!(raw["result"].get("running").is_none(), "held: {raw}");
@@ -46821,12 +46859,27 @@ async fn should_withhold_not_running_while_a_real_turn_start_is_mid_admission() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn should_withhold_not_running_for_a_topic_turn_asked_by_its_folded_id() {
-    let (control, raw, folded) = state_get_during_held_admission(Some("t1")).await;
+    let (control, raw, folded, _) = state_get_during_held_admission(Some("t1"), false).await;
     assert_eq!(control["result"]["running"], false, "control: {control}");
     for frame in [&raw, &folded] {
         assert_eq!(frame["result"]["state"], "unknown", "held: {frame}");
         assert!(frame["result"].get("running").is_none(), "held: {frame}");
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_surface_the_recorded_state_once_a_held_admission_proceeds() {
+    let (control, _, _, post) = state_get_during_held_admission(None, true).await;
+    assert_eq!(control["result"]["running"], false, "control: {control}");
+    let post = post.expect("settlement caller receives the post frame");
+    assert_eq!(
+        post["result"]["state"], "completed",
+        "the released turn must proceed to a queryable record: {post}"
+    );
+    assert!(
+        post["result"].get("running").is_none(),
+        "a recorded terminal turn must not claim `running: false`: {post}"
+    );
 }
 
 /// A scripted model that keeps calling `read_file`, driving a REAL
