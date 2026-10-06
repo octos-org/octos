@@ -71,33 +71,34 @@ pub async fn purge_by_profile_id(
     }
 
     // 2. Cascade sub-accounts: stop, remove data dir, delete profile JSON
-    if let Ok(subs) = profile_store.list_sub_accounts(profile_id) {
-        for sub in &subs {
-            if let Some(pm) = state.process_manager.as_ref() {
-                let _ = pm.stop(&sub.id).await;
-            }
-            let sub_data_dir = profile_store.resolve_data_dir(sub);
-            if sub_data_dir.exists() {
-                let bytes = dir_size(&sub_data_dir);
-                if let Err(e) = std::fs::remove_dir_all(&sub_data_dir) {
-                    tracing::warn!(
-                        sub_account = %sub.id,
-                        dir = %sub_data_dir.display(),
-                        error = %e,
-                        "purge: failed to remove sub-account data dir"
-                    );
-                } else {
-                    report.bytes_freed += bytes;
-                    report
-                        .files_removed
-                        .push(sub_data_dir.display().to_string());
-                }
-            }
-            let _ = profile_store.delete(&sub.id);
-            report
-                .files_removed
-                .push(format!("profiles/{}.json", sub.id));
+    let subs = profile_store
+        .list_sub_accounts(profile_id)
+        .unwrap_or_default();
+    for sub in &subs {
+        if let Some(pm) = state.process_manager.as_ref() {
+            let _ = pm.stop(&sub.id).await;
         }
+        let sub_data_dir = profile_store.resolve_data_dir(sub);
+        if sub_data_dir.exists() {
+            let bytes = dir_size(&sub_data_dir);
+            if let Err(e) = std::fs::remove_dir_all(&sub_data_dir) {
+                tracing::warn!(
+                    sub_account = %sub.id,
+                    dir = %sub_data_dir.display(),
+                    error = %e,
+                    "purge: failed to remove sub-account data dir"
+                );
+            } else {
+                report.bytes_freed += bytes;
+                report
+                    .files_removed
+                    .push(sub_data_dir.display().to_string());
+            }
+        }
+        let _ = profile_store.delete(&sub.id);
+        report
+            .files_removed
+            .push(format!("profiles/{}.json", sub.id));
     }
 
     // 3. Delete profile data dir + profile JSON
@@ -115,6 +116,12 @@ pub async fn purge_by_profile_id(
     report
         .files_removed
         .push(format!("profiles/{profile_id}.json"));
+    // The purge's whole point is "the same tenant can re-register cleanly" —
+    // its scoped keychain items must not outlive it either.
+    crate::api::admin::release_deleted_profiles_keychain_items(
+        profile_store,
+        std::iter::once(&profile).chain(subs.iter()),
+    );
 
     // 4. Delete user record (capture email first for the report)
     if let Some(us) = state.user_store.as_ref() {
@@ -496,5 +503,43 @@ mod tests {
         assert!(ps.get(parent_id).unwrap().is_none());
         assert!(ps.get(sub1).unwrap().is_none());
         assert!(ps.get(sub2).unwrap().is_none());
+    }
+
+    // #2315: the purge's whole point is "the tenant can re-register
+    // cleanly" — its scoped keychain items must not outlive it either.
+    #[tokio::test]
+    async fn should_release_keychain_items_when_purging_a_profile() {
+        use crate::auth::keychain;
+        let (_temp, state) = build_test_state();
+        let store = state.profile_store.as_ref().unwrap();
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root = keychain::test_override_secrets_root(secrets.path().to_path_buf());
+
+        let tenant_account = keychain::scoped_account("VERTEX_SA_JSON", "tenant");
+        let mut profile = make_profile("tenant");
+        profile.config.env_vars.insert(
+            "VERTEX_SA_JSON".into(),
+            keychain::marker_for(&tenant_account),
+        );
+        store.save(&profile).unwrap();
+        keychain::set_secret(&tenant_account, "sa-json").unwrap();
+
+        let report = purge_by_profile_id(&state, "tenant")
+            .await
+            .expect("purge")
+            .expect("Some(report)");
+        assert!(
+            report
+                .files_removed
+                .iter()
+                .any(|f| f.contains("profiles/tenant.json")),
+            "the profile row itself is purged"
+        );
+
+        assert_eq!(
+            keychain::get_secret(&tenant_account).unwrap(),
+            None,
+            "the purged tenant's scoped keychain item must be released"
+        );
     }
 }
