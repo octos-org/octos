@@ -2815,7 +2815,7 @@ tools = ["read_file"]
         assert_eq!(rt.sessions_root, expected_root);
         assert_eq!(
             crate::runtime::workspace_history::load(&profile.data_dir).unwrap(),
-            vec![rt.workspace_root.clone()]
+            vec![dunce::canonicalize(&rt.workspace_root).unwrap()]
         );
         {
             let mgr = rt.sessions.lock().await;
