@@ -1028,4 +1028,132 @@ mod tests {
             None
         );
     }
+
+    // #2702: deleting a bot must release the keychain items the deleted
+    // bot profile's markers point at; a bare account a surviving profile
+    // still references stays (the remove-key shared-account contract, #2261).
+    #[tokio::test]
+    async fn test_delete_bot_releases_keychain_items_but_keeps_shared_ones() {
+        use crate::auth::keychain;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::profiles::ProfileStore::open_unified(dir.path()).unwrap());
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root = keychain::test_override_secrets_root(secrets.path().to_path_buf());
+
+        let mut parent = make_profile("botfather", None);
+        parent
+            .config
+            .channels
+            .push(crate::profiles::ChannelCredentials::Matrix {
+                homeserver: "http://localhost:6167".to_string(),
+                as_token: "as-token".to_string(),
+                hs_token: "hs-token".to_string(),
+                server_name: "localhost".to_string(),
+                sender_localpart: "bot".to_string(),
+                user_prefix: "bot_".to_string(),
+                port: MATRIX_DEFAULT_PORT,
+                allowed_senders: vec![],
+                mention_only: true,
+                mode: String::new(),
+                user_id: String::new(),
+                access_token: String::new(),
+                password: String::new(),
+                device_name: String::new(),
+                rooms: vec![],
+                auto_join: "off".to_string(),
+                auto_join_allowlist: vec![],
+                group_policy: "allowlist".to_string(),
+                require_mention: true,
+            });
+        store.save(&parent).unwrap();
+
+        let mut sub = make_profile("botfather--weatherbot", None);
+        sub.parent_id = Some(parent.id.clone());
+        sub.config.env_vars.insert(
+            "VERTEX_SA_JSON".into(),
+            keychain::marker_for(&keychain::scoped_account(
+                "VERTEX_SA_JSON",
+                "botfather--weatherbot",
+            )),
+        );
+        store.save(&sub).unwrap();
+
+        let mut sibling = make_profile("botfather--clockbot", None);
+        sibling.parent_id = Some(parent.id.clone());
+        sibling
+            .config
+            .env_vars
+            .insert("ZAI_API_KEY".into(), keychain::marker_for("ZAI_API_KEY"));
+        store.save(&sibling).unwrap();
+
+        keychain::set_secret(
+            &keychain::scoped_account("VERTEX_SA_JSON", "botfather--weatherbot"),
+            "sa-json",
+        )
+        .unwrap();
+        keychain::set_secret("ZAI_API_KEY", "shared-key").unwrap();
+
+        let channel = Arc::new(
+            octos_bus::MatrixChannel::new(
+                "http://localhost:6167",
+                "as-token",
+                "hs-token",
+                "localhost",
+                "bot",
+                "bot_",
+                6166,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_bot_router(dir.path()),
+        );
+        channel
+            .bot_router()
+            .register_entry(
+                "@bot_weatherbot:localhost",
+                &sub.id,
+                "@alice:localhost",
+                octos_bus::BotVisibility::Private,
+            )
+            .await
+            .unwrap();
+
+        let manager = GatewayBotManager {
+            store: store.clone(),
+            channel: channel.clone(),
+            parent_profile_id: parent.id.clone(),
+            cron_service: test_cron_service(dir.path()),
+        };
+
+        let result = manager
+            .delete_bot("@bot_weatherbot:localhost", "@alice:localhost")
+            .await;
+
+        assert!(result.is_ok(), "owner delete should succeed: {result:?}");
+        assert_eq!(
+            channel
+                .bot_router()
+                .route("@bot_weatherbot:localhost")
+                .await,
+            None
+        );
+        assert!(
+            store.get(&sub.id).unwrap().is_none(),
+            "the bot profile itself must be gone"
+        );
+        assert_eq!(
+            keychain::get_secret(&keychain::scoped_account(
+                "VERTEX_SA_JSON",
+                "botfather--weatherbot"
+            ))
+            .unwrap(),
+            None,
+            "the deleted bot's scoped keychain item must be released"
+        );
+        assert_eq!(
+            keychain::get_secret("ZAI_API_KEY").unwrap().as_deref(),
+            Some("shared-key"),
+            "a bare keychain account a sibling bot still references must be kept"
+        );
+    }
 }
