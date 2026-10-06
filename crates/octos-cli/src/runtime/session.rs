@@ -932,6 +932,18 @@ impl SessionRuntime {
         let sessions = Arc::new(tokio::sync::Mutex::new(
             SessionManager::open(&sessions_root).wrap_err("failed to open session manager")?,
         ));
+        // Remember only an actual project transcript store. A gateway's
+        // derived workspace, an app-owned namespace or an ephemeral chat must
+        // not be rediscovered as a project session after a restart.
+        if !bootstrapped_binding.is_bound_or_refused()
+            && sessions_root == project_sessions_root(&workspace_root, &profile.profile_id)
+        {
+            if let Err(error) =
+                super::workspace_history::remember(&profile.data_dir, &workspace_root)
+            {
+                tracing::warn!(%error, profile_id = %profile.profile_id, "could not remember project session store");
+            }
+        }
 
         Ok(Arc::new(Self {
             session_key,
@@ -2801,6 +2813,10 @@ tools = ["read_file"]
         // <cwd>/.octos/<profile_id>.
         let expected_root = cwd_canon.join(".octos").join(&profile.profile_id);
         assert_eq!(rt.sessions_root, expected_root);
+        assert_eq!(
+            crate::runtime::workspace_history::load(&profile.data_dir).unwrap(),
+            vec![rt.workspace_root.clone()]
+        );
         {
             let mgr = rt.sessions.lock().await;
             assert_eq!(mgr.data_dir(), expected_root);

@@ -453,6 +453,9 @@ const APPUI_METHOD_PEER_TOOLS_UNREGISTER: &str = "peer/tools/unregister";
 /// `NoActiveTurn` fallback). Steering is NOT an interrupt — the in-flight
 /// round always completes; `turn/interrupt` stays a separate op.
 const APPUI_METHOD_TURN_STEER: &str = "turn/steer";
+#[path = "session_history.rs"]
+mod session_history;
+const APPUI_METHOD_SESSION_HISTORY_LIST: &str = "session/history/list";
 const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
@@ -561,6 +564,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PEER_PURGE,
     APPUI_METHOD_PEER_TOOLS_UNREGISTER,
     APPUI_METHOD_TURN_STEER,
+    APPUI_METHOD_SESSION_HISTORY_LIST,
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
@@ -21288,6 +21292,9 @@ async fn handle_raw_appui_rpc(
             ))
             .await
         }
+        APPUI_METHOD_SESSION_HISTORY_LIST => {
+            session_history::list(state, request, connection_profile_id).await
+        }
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
         }
@@ -21712,6 +21719,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST
             | APPUI_METHOD_SERVER_SHUTDOWN
             | APPUI_METHOD_SESSION_STATUS_READ
+            | APPUI_METHOD_SESSION_HISTORY_LIST
             | APPUI_METHOD_PROFILE_LLM_CATALOG
             | APPUI_METHOD_PROFILE_LLM_LIST
             | APPUI_METHOD_PROFILE_LLM_UPSERT

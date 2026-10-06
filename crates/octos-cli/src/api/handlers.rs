@@ -922,7 +922,7 @@ pub async fn list_sessions(
 /// is needed inside this helper. The caller (`list_sessions`) handles
 /// header/identity authorization via [`resolve_profile_data_dir`]
 /// before invoking us.
-fn list_profile_sessions(
+pub(super) fn list_profile_sessions(
     profile_data_dir: &std::path::Path,
     active_turns: &std::collections::HashSet<SessionKey>,
     effective_profile_id: &str,

@@ -49403,3 +49403,5 @@ async fn should_replay_an_external_prompt_to_its_owner_after_the_side_table_forg
     assert!(hosted.is_empty(), "{hosted:?}");
     question_task.abort();
 }
+#[path = "session_history_tests.rs"]
+mod session_history_tests;
