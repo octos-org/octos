@@ -665,9 +665,13 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   in-flight host tool calls (`peer_purged`), stops its and its contexts'
   running turns, then erases their transcripts, the memory namespace, the
   blackboard and a kernel-provisioned workspace, and frees the (app,
-  account) binding; a retry with the same token answers `already_purged`;
+  account) binding; a failed erase entry finalizes nothing — the purge
+  fails `peer_purge_incomplete` with the entries in `data.errors`, the peer
+  stays closed and staged, and a retry runs the whole idempotent erase
+  again; a retry after completion answers `already_purged`;
   host connection only; typed `data.kind` `peer_purge_not_owner`,
-  `peer_purge_busy`, `peer_purge_in_progress`, `peer_not_host_bound`)
+  `peer_purge_busy`, `peer_purge_in_progress`, `peer_purge_incomplete`,
+  `peer_not_host_bound`)
 - `peer/input/reject` (accepted `UPCR-2026-035`, #2618: the host refuses a
   `peer/input`; `{session_id, peer, host_token, input_id, reason:
   "signed_out" | "no_consent" | "busy" | "other", message?}` → `{input_id,
