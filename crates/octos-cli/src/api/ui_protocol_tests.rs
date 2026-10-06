@@ -2478,11 +2478,10 @@ async fn should_delete_last_model_evict_dynamic_runtime_and_report_deferred() {
     );
 }
 
-/// #2164 acceptance — startup-pinned profile: upsert and delete persist but
-/// return `restart_required: true` with disposition `restart_required`, and
-/// the boot-snapshot runtime is left untouched (no fake reload).
+/// Startup profiles reload for subsequent turns while existing runtime handles
+/// keep their original configuration and share long-lived storage safely.
 #[tokio::test]
-async fn should_report_restart_required_for_startup_pinned_llm_mutations() {
+async fn should_reload_startup_profile_llm_mutations_without_restart() {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
     raw_profile_llm_upsert(
@@ -2521,6 +2520,8 @@ async fn should_report_restart_required_for_startup_pinned_llm_mutations() {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&key);
     }
+    let key = dynamic_profile_runtime_key(&state, "dev").unwrap();
+    profile_runtime_generations().write().unwrap().remove(&key);
     let state = Arc::new(state);
 
     let result = raw_profile_llm_upsert(
@@ -2538,19 +2539,30 @@ async fn should_report_restart_required_for_startup_pinned_llm_mutations() {
     .await
     .expect("pinned upsert");
     assert_eq!(result["applied"], json!(true), "{result}");
-    assert_eq!(
-        result["runtime_disposition"], "restart_required",
-        "{result}"
-    );
-    assert_eq!(result["restart_required"], json!(true), "{result}");
+    assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+    assert_eq!(result["restart_required"], json!(false), "{result}");
     assert_eq!(result["effective_from"], "next_turn", "{result}");
+    let next = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!Arc::ptr_eq(&pinned, &next));
     assert!(
-        dynamic_cached_profile_runtime(&state, "dev").is_none(),
-        "a pinned profile must not fake a reload into the dynamic cache"
+        Arc::ptr_eq(&pinned.memory, &next.memory),
+        "reuse the open episode store"
     );
+    assert_eq!(
+        next.config.base_url.as_deref(),
+        Some("http://127.0.0.1:9/v1")
+    );
+    assert_ne!(pinned.config.base_url, next.config.base_url);
+    assert!(Arc::ptr_eq(
+        &next,
+        &resolve_session_profile_runtime(&state, Some("dev")).unwrap()
+    ));
     assert!(
         Arc::ptr_eq(&pinned, state.profiles.get("dev").unwrap()),
-        "the boot-snapshot runtime stays as-is until restart"
+        "existing turns retain the immutable boot snapshot"
     );
 
     let result = raw_profile_llm_delete(
@@ -2561,11 +2573,171 @@ async fn should_report_restart_required_for_startup_pinned_llm_mutations() {
     .await
     .expect("pinned delete");
     assert_eq!(result["applied"], json!(true), "{result}");
-    assert_eq!(
-        result["runtime_disposition"], "restart_required",
-        "{result}"
+    assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+    assert_eq!(result["restart_required"], json!(false), "{result}");
+}
+
+/// A startup model switch changes the provider used to bootstrap the next
+/// session, leaves an already admitted turn on its old runtime, and never
+/// resurrects the startup model after the final configured model is removed.
+#[tokio::test]
+async fn should_switch_startup_model_for_next_turn_and_not_restore_deleted_boot_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    for (id, model, primary) in [("first", "gpt-4o-mini", true), ("second", "gpt-4o", false)] {
+        raw_profile_llm_upsert(
+            &state,
+            &llm_upsert_rpc(id, "dev", "openai", model, None, primary),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let mut original = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut state = Arc::try_unwrap(state).ok().unwrap();
+    let key = dynamic_profile_runtime_key(&state, "dev").unwrap();
+    dynamic_profile_runtimes().write().unwrap().remove(&key);
+    profile_runtime_generations().write().unwrap().remove(&key);
+    Arc::get_mut(&mut original)
+        .unwrap()
+        .config
+        .plugins
+        .require_signed = true;
+    state.profiles.insert("dev".into(), original.clone());
+    let state = Arc::new(state);
+    let session = SessionKey("dev:local:tui#coding".into());
+    let old_session = state
+        .session_cache
+        .get_or_init(&original, session.clone(), None)
+        .await
+        .unwrap();
+    let request = RpcRequest::new(
+        "switch",
+        "profile/llm/select",
+        json!({
+            "profile_id":"dev", "session_id":session, "family_id":"openai",
+            "model_id":"gpt-4o", "route_id":"official"
+        }),
     );
-    assert_eq!(result["restart_required"], json!(true), "{result}");
+    let result = raw_profile_llm_select(&state, &request, None)
+        .await
+        .unwrap();
+    assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+    assert_eq!(result["restart_required"], false);
+    assert_eq!(result["runtime_policy_stamp"]["model"], "gpt-4o");
+    let next = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.primary_model_id, "gpt-4o");
+    assert_eq!(next.config.model.as_deref(), Some("gpt-4o"));
+    assert_eq!(
+        original.primary_model_id, "gpt-4o-mini",
+        "the running turn keeps its provider"
+    );
+    assert!(Arc::ptr_eq(&next.memory, &original.memory));
+    assert!(
+        next.config.plugins.require_signed,
+        "the startup signing floor survives reload"
+    );
+    let next_session = state
+        .session_cache
+        .get_or_init(&next, session.clone(), None)
+        .await
+        .unwrap();
+    assert!(!Arc::ptr_eq(&old_session, &next_session));
+    assert!(Arc::ptr_eq(&old_session.profile, &original));
+    assert!(Arc::ptr_eq(&next_session.profile, &next));
+    let unchanged = raw_profile_llm_select(&state, &request, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged["restart_required"], false,
+        "reselect must not invent a restart"
+    );
+    for model in ["gpt-4o-mini", "gpt-4o"] {
+        raw_profile_llm_delete(
+            &state,
+            &llm_delete_rpc("delete", "dev", "openai", model),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        ensure_session_profile_runtime(&state, Some("dev"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(resolve_session_profile_runtime(&state, Some("dev")).is_none());
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .unwrap();
+    let stamp = runtime_policy_stamp_for_profile(&state, "dev", Some(&session), Some(&profile));
+    assert!(
+        stamp["model"].is_null(),
+        "deleted startup model must not reappear: {stamp}"
+    );
+}
+
+#[tokio::test]
+async fn should_not_fall_back_to_startup_runtime_when_replacement_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("seed", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .unwrap();
+    let original = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut state = Arc::try_unwrap(state).ok().unwrap();
+    state.profiles.insert("dev".into(), original.clone());
+    let key = dynamic_profile_runtime_key(&state, "dev").unwrap();
+    dynamic_profile_runtimes().write().unwrap().remove(&key);
+    profile_runtime_generations().write().unwrap().remove(&key);
+    let state = Arc::new(state);
+    let store = state.profile_store.as_ref().unwrap();
+    let mut profile = store.get("dev").unwrap().unwrap();
+    let blocker = dir.path().join("blocked-data");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    profile.data_dir = Some(blocker.to_string_lossy().into_owned());
+    store.save(&profile).unwrap();
+    let result = raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("switch", "dev", "openai", "gpt-4o", None, true),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["runtime_disposition"], "persisted_but_not_live");
+    assert_eq!(result["restart_required"], false);
+    assert!(result["runtime_policy_stamp"]["model"].is_null());
+    assert!(resolve_session_profile_runtime(&state, Some("dev")).is_none());
+    assert!(
+        ensure_session_profile_runtime(&state, Some("dev"))
+            .await
+            .is_err()
+    );
+    assert_eq!(original.primary_model_id, "gpt-4o-mini");
+    std::fs::remove_file(&blocker).unwrap();
+    let recovered = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.primary_model_id, "gpt-4o");
 }
 
 /// #2164 acceptance — a concurrent old bootstrap cannot repopulate the cache
@@ -11780,11 +11952,9 @@ fn runtime_policy_stamp_exposes_effective_permission_fields() {
 
 /// The stamp's model/provider must reflect the runtime that will SERVE
 /// the next turn, mirroring `resolve_session_profile_runtime`: a profile
-/// pinned in startup-config `state.profiles` keeps its boot snapshot
-/// (immutable until restart — reporting the file would falsely claim a
-/// select took effect), while a store-backed profile re-bootstraps from
-/// the FILE after select evicts — the old unconditional runtime-first
-/// order made every status/read stomp a freshly-applied selection back.
+/// loaded at startup still serves its boot snapshot until a runtime transition
+/// occurs. With no live or retired runtime, the saved primary describes the
+/// first lazy bootstrap. Reload and failed-reload stamps are covered above.
 #[tokio::test]
 async fn runtime_policy_stamp_reports_the_runtime_that_serves_turns() {
     use crate::profiles::{
@@ -11841,19 +12011,19 @@ async fn runtime_policy_stamp_reports_the_runtime_that_serves_turns() {
     state.profiles.insert("dev".to_string(), runtime);
 
     // …and the profile FILE has since been switched to deepseek-chat.
-    // A PINNED profile keeps serving the boot runtime until restart, so
-    // the stamp must keep reporting the snapshot, not the file.
+    // No runtime transition has happened (this legacy state has no store),
+    // so changing a file value alone must not change the reported runtime.
     let file_profile = make_profile("deepseek-chat", "deepseek");
     let stamp = runtime_policy_stamp_for_profile(&state, "dev", None, Some(&file_profile));
     assert_eq!(
         stamp["model"],
         json!("gpt-4o-mini"),
-        "startup-pinned profiles serve the boot snapshot until restart: {stamp}"
+        "without a runtime transition the boot snapshot is still active: {stamp}"
     );
     assert_eq!(stamp["provider"], json!("openai"));
 
-    // A store-backed (dynamic) profile re-bootstraps from the file after
-    // `profile/llm/select` evicts — the FILE is what serves next.
+    // Before any runtime exists, the saved primary describes the first
+    // lazy bootstrap. No configuration commit has retired a runtime here.
     let dynamic_state = AppState::empty_for_tests();
     let stamp = runtime_policy_stamp_for_profile(&dynamic_state, "dev", None, Some(&file_profile));
     assert_eq!(

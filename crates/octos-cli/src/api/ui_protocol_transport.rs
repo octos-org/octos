@@ -11802,18 +11802,14 @@ fn runtime_policy_stamp_for_profile(
     session_id: Option<&SessionKey>,
     profile: Option<&crate::profiles::UserProfile>,
 ) -> Value {
-    let runtime = state.profiles.get(profile_id);
-    let primary = profile.and_then(|profile| profile.config.primary_llm());
-    // The stamp reports the model that will actually SERVE the next turn,
-    // matching `resolve_session_profile_runtime`'s precedence:
-    // - a profile pinned in startup-config `state.profiles` keeps serving
-    //   that immutable runtime until restart (`profile/llm/select` only
-    //   warns for these), so the boot snapshot is the truth even when the
-    //   stored file has since changed;
-    // - a store-backed (dynamic) profile re-bootstraps from the FILE after
-    //   select evicts, so the file's primary is the truth — the old
-    //   unconditional runtime-first order made every status/read stomp a
-    //   freshly-applied selection back to the boot-time model.
+    let runtime = resolve_session_profile_runtime(state, Some(profile_id));
+    let invalidated = dynamic_profile_runtime_key(state, profile_id)
+        .is_some_and(|key| current_profile_runtime_generation(&key) > 0);
+    // A failed/deferred replacement must not advertise either the retired
+    // startup model or a saved model that has not become live yet.
+    let primary = (!invalidated)
+        .then(|| profile.and_then(|profile| profile.config.primary_llm()))
+        .flatten();
     let (model, provider) = if let Some(runtime) = runtime {
         (
             Some(runtime.primary_model_id.clone()),
@@ -14016,14 +14012,6 @@ async fn raw_profile_llm_select(
             .as_ref()
             .unwrap_or(&ProfileLlmRuntimeTransition::unchanged()),
     );
-    if state.profiles.contains_key(&profile_id) {
-        // Startup-pinned runtime: the selection is saved but turns keep the
-        // boot snapshot until restart (the stamp above says so too). Tell
-        // the caller instead of letting the switch silently not take —
-        // including for an idempotent re-select of the already-active
-        // primary, which performs no transition of its own.
-        result["restart_required"] = json!(true);
-    }
     Ok(result)
 }
 
@@ -14793,39 +14781,41 @@ impl ProfileLlmRuntimeTransition {
 /// The ONE post-commit transition shared by `profile/llm/select`, `upsert`,
 /// and `delete` (#2164): evict every cached SessionRuntime for the profile,
 /// bump the dynamic-runtime generation and drop the cached ProfileRuntime,
-/// then either rebuild it (dynamic profile) or report `restart_required`
-/// (startup-pinned boot snapshot). A caller whose persistence FAILED must not
+/// then rebuild it for the next turn, including profiles loaded at startup.
+/// Existing turns retain their runtime. A caller whose persistence FAILED must not
 /// reach this — a healthy runtime stays healthy.
 async fn commit_profile_llm_runtime_transition(
     state: &AppState,
     profile_id: &str,
     config_revision: Option<String>,
 ) -> ProfileLlmRuntimeTransition {
-    let startup_pinned = state.profiles.contains_key(profile_id);
     // Evict FIRST, generation before removal: the session cache bumps its own
     // guard inside `invalidate_profile`, and the dynamic map's guard must be
     // bumped before the drop so an in-flight bootstrap that read the
     // pre-commit file is refused at insert time.
     state.session_cache.invalidate_profile(profile_id).await;
     if let Some(key) = dynamic_profile_runtime_key(state, profile_id) {
-        bump_profile_runtime_generation(&key);
+        // Serialize retirement with bootstrap so a replacement always receives
+        // the stores held by the runtime it replaces.
+        let bootstrap_lock = profile_bootstrap_lock(&key);
+        let _guard = bootstrap_lock.lock().await;
+        let generation = bump_profile_runtime_generation(&key);
         let removed = dynamic_profile_runtimes()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&key);
         if let Some(removed) = removed {
             retire_profile_runtime(&key, &removed);
+        } else if generation == 1 {
+            if let Some(startup) = state.profiles.get(profile_id) {
+                retire_profile_runtime(&key, startup);
+            }
         }
-    }
-
-    if startup_pinned {
-        // Startup-config profiles live in an immutable map — the saved
-        // mutation persists but cannot rebuild without a restart.
-        tracing::warn!(
-            profile_id = %profile_id,
-            "profile LLM mutation saved, but this startup-config profile's runtime \
-             rebuilds on restart only"
-        );
+        // Cover a session initialized while we waited for the bootstrap lock.
+        state.session_cache.invalidate_profile(profile_id).await;
+    } else if state.profiles.contains_key(profile_id) {
+        // A legacy runtime with no profile store has no persisted configuration
+        // from which to assemble a replacement.
         return ProfileLlmRuntimeTransition {
             disposition: ProfileRuntimeDisposition::RestartRequired,
             config_revision,
@@ -24633,7 +24623,22 @@ pub(crate) fn resolve_session_profile_runtime(
             .get(&key)
             .cloned()
     });
-    dynamic.or_else(|| state.profiles.get(candidate).cloned())
+    dynamic.or_else(|| current_startup_profile_runtime(state, candidate))
+}
+
+/// Startup entries are immutable, but cease to be eligible after the first
+/// configuration commit. In particular, a failed rebuild or final-model
+/// deletion must not resurrect the old provider through a cache miss.
+fn current_startup_profile_runtime(
+    state: &AppState,
+    profile_id: &str,
+) -> Option<Arc<crate::runtime::ProfileRuntime>> {
+    if dynamic_profile_runtime_key(state, profile_id)
+        .is_some_and(|key| current_profile_runtime_generation(&key) > 0)
+    {
+        return None;
+    }
+    state.profiles.get(profile_id).cloned()
 }
 
 fn dynamic_profile_runtimes() -> &'static DynamicProfileRuntimeMap {
@@ -24779,8 +24784,8 @@ pub(crate) async fn ensure_session_profile_runtime(
     {
         return Ok(Some(runtime));
     }
-    if let Some(runtime) = state.profiles.get(profile_id) {
-        return Ok(Some(runtime.clone()));
+    if let Some(runtime) = current_startup_profile_runtime(state, profile_id) {
+        return Ok(Some(runtime));
     }
 
     // #2164: a profile/llm select/upsert/delete that commits while this
@@ -24797,6 +24802,7 @@ pub(crate) async fn ensure_session_profile_runtime(
         let Some(profile) = profile else {
             return Ok(None);
         };
+        let profile = store.resolve_runtime_profile(&profile);
         let profile_data_dir = store.resolve_data_dir(&profile);
         // Restart recovery belongs exclusively to `octos serve` startup, which
         // scans every persisted profile before runtimes are bootstrapped. This
@@ -24824,8 +24830,11 @@ pub(crate) async fn ensure_session_profile_runtime(
             &profile_data_dir,
             Some(store.octos_home_dir()),
             crate::runtime::BootstrapRole::Serve,
-            None,
-            None,
+            state
+                .profiles
+                .get(profile_id)
+                .map(|runtime| &runtime.config.plugins),
+            state.profiles.get(profile_id).map(|runtime| &runtime.voice),
             state.host_memory.as_ref(),
             &mut retired,
         ))
@@ -24952,9 +24961,8 @@ async fn rebuild_profile_runtime_after_skill_mutation(
         replacement,
     ) {
         // The racing commit already invalidated the session cache and dropped
-        // the stale entry; for a dynamic profile it also re-bootstrapped from
-        // the committed file (which includes this skill mutation), and for a
-        // startup-pinned one it already reported restart_required. Dropping
+        // the stale entry and re-bootstrapped from the committed file (which
+        // includes this skill mutation). Dropping
         // the stale replacement is the conservative outcome either way.
         tracing::debug!(
             profile_id = %profile_id,
