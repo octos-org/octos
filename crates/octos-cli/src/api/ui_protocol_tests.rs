@@ -3603,6 +3603,7 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         }),
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST
         | APPUI_METHOD_SESSION_STATUS_READ
+        | APPUI_METHOD_SESSION_HISTORY_LIST
         | APPUI_METHOD_PROFILE_LLM_LIST
         | APPUI_METHOD_PROFILE_LLM_SELECT
         | APPUI_METHOD_MCP_STATUS_LIST
@@ -21563,6 +21564,7 @@ fn raw_method_is_dispatched_covers_full_raw_surface() {
         APPUI_METHOD_REVIEW_START,
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST,
         APPUI_METHOD_SESSION_STATUS_READ,
+        APPUI_METHOD_SESSION_HISTORY_LIST,
         APPUI_METHOD_PROFILE_LLM_CATALOG,
         APPUI_METHOD_PROFILE_LLM_LIST,
         APPUI_METHOD_PROFILE_LLM_UPSERT,
@@ -49403,3 +49405,5 @@ async fn should_replay_an_external_prompt_to_its_owner_after_the_side_table_forg
     assert!(hosted.is_empty(), "{hosted:?}");
     question_task.abort();
 }
+#[path = "session_history_tests.rs"]
+mod session_history_tests;

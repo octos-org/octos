@@ -501,6 +501,10 @@ Router (Wave4-A):
 
 - `router/set_mode`, `router/get_metrics`
 
+Cross-project history (raw AppUI, advertised in `supported_methods`):
+
+- `session/history/list` (UPCR-2026-040 — authorized profile and known project stores)
+
 M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 
 - `session/list`, `session/snapshot`, `session/messages_page`,
@@ -1009,6 +1013,33 @@ Optional result fields from accepted `UPCR-2026-038`:
   `client_commands` and the server applied it, including as `[]` when every
   name was dropped. Absent when the request omitted `client_commands`.
   Ungated.
+
+### `session/history/list`
+
+This raw AppUI method is advertised in `supported_methods`. Params are
+`{ workspaces?: string[], profile_id?: string, offset?: number, limit?: number }`.
+It lists profile stores and known project stores, respecting the connection's
+frozen profile scope. Admin/unscoped connections may list all profiles;
+session-ingress credentials cannot call it. Up to 128 workspace hints are
+accepted; paths pass the same canonicalization and workspace gate as `session/list`.
+Internal child transcripts and host-bound app peer/context history are excluded.
+
+The result is `{ sessions, total, next_offset, workspaces,
+unavailable_workspaces, coverage: "profile_and_known_workspaces" }`.
+`limit` is 1..200, default 100. Rows carry the usual session metadata plus full
+`id`, `profile_id`, and `workspace_root` (null for a profile store). Clients key
+rows by all three fields and reopen with that exact profile/workspace, using a
+fresh history/replay authority when one wire id occurs in different stores.
+
+Project addresses are remembered under the owning profile's data directory
+when a project session opens. A validated hint naming an existing session
+store is also remembered. This index survives server restarts and is shared by
+local terminal/server processes using that profile; it holds no transcripts
+and grants no permission. Each saved path is revalidated before listing.
+Missing projects are reported in `unavailable_workspaces`, never recreated.
+The catalog does not recursively scan the filesystem. Older projects can be
+included by adding their workspace once. Runtime startup does not register
+app-owned or ephemeral stores as project history.
 
 ### `session/hydrate`
 
