@@ -297,7 +297,8 @@ pub async fn get_profile(
 /// already relocated stay in the keychain when a later key fails. Those
 /// entries are scoped per profile id, so they cannot leak across accounts,
 /// and a same-id retry (after the caller's profile rollback) overwrites
-/// them (#2316); deleting the profile releases what relocation left behind.
+/// them (#2316); the admin API deletion paths release what relocation left
+/// behind (the CLI sub-account deletions still don't — #2702).
 pub(crate) fn relocate_keychain_backed_secrets(
     env_vars: &mut std::collections::HashMap<String, String>,
     profile_id: &str,
@@ -523,8 +524,12 @@ pub async fn update_profile(
 /// every marker account their configs hold, minus the accounts a surviving
 /// profile still references. Scoped accounts (`VAR::id`) are unique to their
 /// profile and always released; legacy bare accounts can be shared across
-/// profiles and survive until the last reference goes — the same contract as
-/// `octos auth remove-key`'s shared-key preservation (#2261). Pure, so the
+/// profiles and survive until the last reference goes. This is a deliberate
+/// superset of `octos auth remove-key`'s shared-key preservation (#2261):
+/// the survivor check spans every env var name, not just the one being
+/// removed, so it never releases an account `remove-key` would keep. Like
+/// `remove-key`, it builds on `ProfileStore::list()`, so a profile the store
+/// skips (unparsable row) counts as non-referencing. Pure, so the
 /// shared-account decision is unit-testable without a keychain.
 fn releasable_keychain_accounts<'a>(
     removed: impl IntoIterator<Item = &'a UserProfile>,
@@ -549,6 +554,34 @@ fn releasable_keychain_accounts<'a>(
             })
         })
         .collect()
+}
+
+/// Release the keychain items the just-deleted `removed` profiles' markers
+/// pointed at. Shared by every API deletion path (`delete_profile`, the
+/// tenant purge, and the user-admin delete cascade) so a deleted tenant's
+/// scoped service-account item never outlives its profile (#2315). Best
+/// effort on purpose: the profiles are already gone, so a failure here can
+/// only be logged — the warn names the account, which is the only recovery
+/// path. Without a secret-store backend there is nothing to release.
+pub(crate) fn release_deleted_profiles_keychain_items<'a>(
+    store: &ProfileStore,
+    removed: impl IntoIterator<Item = &'a UserProfile>,
+) {
+    if !crate::auth::keychain::is_available() {
+        return;
+    }
+    match store.list() {
+        Ok(survivors) => {
+            for account in releasable_keychain_accounts(removed, &survivors) {
+                if let Err(e) = crate::auth::keychain::delete_secret(&account) {
+                    tracing::warn!(account = %account, error = %e, "failed to release deleted profile keychain item");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot list profiles to tell which deleted keychain items are unreferenced; keeping them")
+        }
+    }
 }
 
 /// DELETE /api/admin/profiles/:id
@@ -596,25 +629,7 @@ pub async fn delete_profile(
         return Err((StatusCode::NOT_FOUND, format!("profile '{id}' not found")));
     }
 
-    // Release the keychain items the deleted profiles' markers pointed at.
-    // Scoped accounts (`VAR::id`) were unique to these profiles and always
-    // go; a legacy bare account stays until no surviving profile references
-    // it (the remove-key shared-account contract, #2261). Best effort — a
-    // failed release never fails the deletion itself.
-    match store.list() {
-        Ok(survivors) => {
-            for account in
-                releasable_keychain_accounts(profile.iter().chain(subs.iter()), &survivors)
-            {
-                if let Err(e) = crate::auth::keychain::delete_secret(&account) {
-                    tracing::warn!(profile = %id, account = %account, error = %e, "failed to release deleted profile keychain item");
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(profile = %id, error = %e, "cannot list profiles to tell which deleted keychain items are unreferenced; keeping them")
-        }
-    }
+    release_deleted_profiles_keychain_items(store, profile.iter().chain(subs.iter()));
 
     let before_summary = profile
         .as_ref()
@@ -6264,6 +6279,11 @@ mod tests {
             .config
             .env_vars
             .insert("ZAI_API_KEY".into(), keychain::marker_for("ZAI_API_KEY"));
+        // A bare account nothing else references: it goes with the profile.
+        parent.config.env_vars.insert(
+            "OPENAI_API_KEY".into(),
+            keychain::marker_for("OPENAI_API_KEY"),
+        );
         profile_store.save(&parent).unwrap();
         let mut sibling = parent_profile();
         sibling.id = "sibling".into();
@@ -6280,6 +6300,7 @@ mod tests {
         )
         .unwrap();
         keychain::set_secret("ZAI_API_KEY", "shared-key").unwrap();
+        keychain::set_secret("OPENAI_API_KEY", "solo-key").unwrap();
 
         let Json(resp) = delete_profile(
             None,
@@ -6304,6 +6325,78 @@ mod tests {
             Some("shared-key"),
             "a bare keychain account a surviving profile still references must be kept"
         );
+        assert_eq!(
+            keychain::get_secret("OPENAI_API_KEY").unwrap(),
+            None,
+            "a bare keychain account with no surviving reference must be released"
+        );
+    }
+
+    // Pure-decision tests for the shared-account logic — the cases the
+    // handler-level fixtures can't reach cheaply.
+    fn profile_with_env_vars(id: &str, env_vars: &[(&str, &str)]) -> UserProfile {
+        let mut profile = parent_profile();
+        profile.id = id.to_string();
+        profile.config.env_vars = env_vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        profile
+    }
+
+    #[test]
+    fn releasable_accounts_follow_the_remove_key_shared_account_contract() {
+        use crate::auth::keychain;
+        let marker = keychain::marker_for;
+
+        // A survivor referencing a bare account under a DIFFERENT env var
+        // name still keeps it: the survivor scan spans every env var name,
+        // never just the removed one.
+        let removed = [profile_with_env_vars(
+            "gone",
+            &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON"))],
+        )];
+        let survivors = [profile_with_env_vars(
+            "kept",
+            &[("VERTEX_API_KEY", &marker("VERTEX_SA_JSON"))],
+        )];
+        assert!(releasable_keychain_accounts(removed.iter(), &survivors).is_empty());
+
+        // Markers shared between two REMOVED profiles are released once.
+        let removed = [
+            profile_with_env_vars(
+                "parent",
+                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
+            ),
+            profile_with_env_vars(
+                "sub",
+                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
+            ),
+        ];
+        assert_eq!(
+            releasable_keychain_accounts(removed.iter(), &[]),
+            ["VERTEX_SA_JSON::parent".to_string()]
+        );
+
+        // Duplicate accounts within one removed profile dedup to one release.
+        let removed = [profile_with_env_vars(
+            "dup",
+            &[
+                ("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::dup")),
+                ("CUSTOM_KEY", &marker("VERTEX_SA_JSON::dup")),
+            ],
+        )];
+        assert_eq!(
+            releasable_keychain_accounts(removed.iter(), &[]),
+            ["VERTEX_SA_JSON::dup".to_string()]
+        );
+
+        // Plain values (no marker) never name a keychain account.
+        let removed = [profile_with_env_vars(
+            "plain",
+            &[("OPENAI_API_KEY", "sk-real")],
+        )];
+        assert!(releasable_keychain_accounts(removed.iter(), &[]).is_empty());
     }
 
     // The delete cascade removes sub-accounts too, so their per-profile
