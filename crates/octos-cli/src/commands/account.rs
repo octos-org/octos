@@ -482,7 +482,7 @@ fn delete_sub_account(store: &ProfileStore, id: &str) -> Result<()> {
     }
 
     store.delete(id)?;
-    crate::api::admin::release_deleted_profiles_keychain_items(store, std::iter::once(&profile));
+    crate::profiles::release_deleted_profiles_keychain_items(store, std::iter::once(&profile));
     println!("Deleted sub-account: {id}");
     Ok(())
 }

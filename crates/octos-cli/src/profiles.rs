@@ -2454,6 +2454,72 @@ pub fn resolve_effective_profile(
     Ok(effective)
 }
 
+/// Keychain accounts safe to release once the `removed` profiles are gone:
+/// every marker account their configs hold, minus the accounts a surviving
+/// profile still references. Scoped accounts (`VAR::id`) are unique to their
+/// profile and always released; legacy bare accounts can be shared across
+/// profiles and survive until the last reference goes. This is a deliberate
+/// superset of `octos auth remove-key`'s shared-key preservation (#2261):
+/// the survivor check spans every env var name, not just the one being
+/// removed, so it never releases an account `remove-key` would keep. Like
+/// `remove-key`, it builds on `ProfileStore::list()`, so a profile the store
+/// skips (unparsable row) counts as non-referencing. Pure, so the
+/// shared-account decision is unit-testable without a keychain.
+pub(crate) fn releasable_keychain_accounts<'a>(
+    removed: impl IntoIterator<Item = &'a UserProfile>,
+    survivors: &[UserProfile],
+) -> Vec<String> {
+    let mut accounts: Vec<String> = removed
+        .into_iter()
+        .flat_map(|profile| profile.config.env_vars.iter())
+        .filter(|(_, value)| crate::auth::keychain::is_marker(value))
+        .map(|(name, value)| crate::auth::keychain::marker_account(value, name).to_string())
+        .collect();
+    accounts.sort();
+    accounts.dedup();
+    accounts
+        .into_iter()
+        .filter(|account| {
+            !survivors.iter().any(|profile| {
+                profile.config.env_vars.iter().any(|(name, value)| {
+                    crate::auth::keychain::is_marker(value)
+                        && crate::auth::keychain::marker_account(value, name) == account.as_str()
+                })
+            })
+        })
+        .collect()
+}
+
+/// Release the keychain items the just-deleted `removed` profiles' markers
+/// pointed at. Shared by every profile deletion path — the admin API
+/// (`delete_profile`, the tenant purge, and the user-admin delete cascade,
+/// #2315), `octos account delete`, the gateway `/account delete` command,
+/// and the Matrix botfather's `delete_bot` (#2702) — so a deleted tenant's
+/// scoped service-account item never outlives its profile. Best effort on
+/// purpose: the profiles are already gone, so a failure here can only be
+/// logged — the warn names the account, which is the only recovery path.
+/// Without a secret-store backend there is nothing to release.
+pub(crate) fn release_deleted_profiles_keychain_items<'a>(
+    store: &ProfileStore,
+    removed: impl IntoIterator<Item = &'a UserProfile>,
+) {
+    if !crate::auth::keychain::is_available() {
+        return;
+    }
+    match store.list() {
+        Ok(survivors) => {
+            for account in releasable_keychain_accounts(removed, &survivors) {
+                if let Err(e) = crate::auth::keychain::delete_secret(&account) {
+                    tracing::warn!(account = %account, error = %e, "failed to release deleted profile keychain item");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot list profiles to tell which deleted keychain items are unreferenced; keeping them")
+        }
+    }
+}
+
 fn validate_public_subdomain(slug: &str) -> Result<()> {
     // Only the SHAPE is shared with profile ids. The channel-name
     // reservation does NOT apply here: a public subdomain never

@@ -119,7 +119,7 @@ pub async fn handle_account_command(
             };
             match store.delete(sub_id) {
                 Ok(true) => {
-                    crate::api::admin::release_deleted_profiles_keychain_items(
+                    crate::profiles::release_deleted_profiles_keychain_items(
                         store,
                         std::iter::once(&profile),
                     );
