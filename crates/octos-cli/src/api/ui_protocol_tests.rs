@@ -1,4 +1,6 @@
 use super::*;
+#[path = "ui_protocol_escalation_tests.rs"]
+mod sandbox_escalation_tests;
 // `UiProtocolContractStores`'s audit writer moved with the contract stores to
 // `crate::approvals_audit`; the parent module no longer imports these two names
 // directly, so name them here.

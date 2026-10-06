@@ -27,7 +27,7 @@ use super::{
     ToolContext, ToolResult,
 };
 use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, FileAccessMode, FilesystemScope};
-use crate::sandbox::Sandbox;
+use crate::sandbox::{NoSandbox, Sandbox};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::task_supervisor::{RelaunchOpts, TaskRelaunchError, TaskStatus};
 use crate::tools::policy::BashFileWrites;
@@ -331,6 +331,30 @@ struct ExecCommandInput {
     max_output_tokens: Option<usize>,
     #[serde(default)]
     tty: Option<bool>,
+    #[serde(default)]
+    sandbox_permissions: ExecSandboxPermissions,
+    #[serde(default)]
+    justification: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExecSandboxPermissions {
+    #[default]
+    UseDefault,
+    RequireEscalated,
+}
+
+fn escalation_refused(message: &str) -> ToolResult {
+    ToolResult {
+        output: message.to_owned(),
+        success: false,
+        structured_metadata: Some(json!({
+            "do_not_retry_same_turn": true,
+            "reason": "sandbox_escalation_refused",
+        })),
+        ..Default::default()
+    }
 }
 
 pub struct ExecCommandTool {
@@ -406,7 +430,12 @@ impl Tool for ExecCommandTool {
                 "timeout_secs": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_SECS},
                 "yield_time_ms": {"type": "integer", "minimum": 0},
                 "max_output_tokens": {"type": "integer", "minimum": 1},
-                "tty": {"type": "boolean"}
+                "tty": {"type": "boolean"},
+                "sandbox_permissions": {
+                    "type": "string", "enum": ["use_default", "require_escalated"],
+                    "description": "Use require_escalated only for a foreground command that needs a fresh user approval to run outside confinement. Cannot be combined with tty or yield_time_ms; never automatically retry a command that already ran."
+                },
+                "justification": {"type": "string", "description": "Why this exact command needs to run outside confinement; required for require_escalated."}
             }
         })
     }
@@ -421,6 +450,13 @@ impl Tool for ExecCommandTool {
                 ..Default::default()
             });
         };
+        if input.sandbox_permissions == ExecSandboxPermissions::RequireEscalated
+            && (input.tty.unwrap_or(false) || input.yield_time_ms.is_some())
+        {
+            return Ok(escalation_refused(
+                "Sandbox escalation is limited to one foreground command; tty and yield_time_ms cannot be used.",
+            ));
+        }
         let cwd = match resolve_optional_workdir(
             &self.base_dir,
             input.workdir.as_deref(),
@@ -508,8 +544,65 @@ impl ExecCommandTool {
             });
         }
 
+        // A new explicit call is approved BEFORE any part of it executes.
+        // Child output never selects NoSandbox or triggers an automatic retry.
+        let sandbox: &dyn Sandbox = if input.sandbox_permissions
+            == ExecSandboxPermissions::RequireEscalated
+            && !self.sandbox.is_noop()
+        {
+            if self.approval_policy == ApprovalPolicy::Never {
+                return Ok(escalation_refused(
+                    "Sandbox escalation is disabled by approval policy.",
+                ));
+            }
+            let Some(reason) = input
+                .justification
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Ok(escalation_refused(
+                    "Sandbox escalation requires a justification.",
+                ));
+            };
+            let Ok(requester) = TOOL_APPROVAL_CTX.try_with(Arc::clone) else {
+                return Ok(escalation_refused(
+                    "No interactive sandbox-escalation approval bridge is available.",
+                ));
+            };
+            use octos_core::ui_protocol::{
+                ApprovalSandboxEscalationDetails, ApprovalSandboxEscalationEndpoint,
+            };
+            let decision = requester.request_sandbox_escalation(
+                ToolApprovalRequest {
+                    tool_id: TOOL_CTX.try_with(|ctx| ctx.tool_id.clone()).unwrap_or_default(),
+                    tool_name: self.name().to_owned(),
+                    title: "Run this command outside the sandbox once?".to_owned(),
+                    body: format!("Command: {command}\nWorking directory: {}\nRequested reason: {reason}\n\nThis command has not started. Approval runs the entire command once with this account's filesystem and network access. If an earlier attempt already ran, its side effects will not be undone and may happen again.", cwd.display()),
+                    command: Some(command.clone()),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    once_only: true,
+                    host_tool: None,
+                },
+                ApprovalSandboxEscalationDetails {
+                    from: Some(ApprovalSandboxEscalationEndpoint { mode: Some("confined".into()), network_access: None }),
+                    to: Some(ApprovalSandboxEscalationEndpoint { mode: Some("none".into()), network_access: Some(true) }),
+                    requested_permissions: vec!["filesystem access as the server account".into(), "network access as the server account".into()],
+                    justification: Some(reason.to_owned()),
+                    suggested_prefix_rule: Vec::new(),
+                },
+            ).await;
+            if decision != ToolApprovalDecision::Approve {
+                return Ok(escalation_refused(
+                    "Sandbox escalation was denied or is unsupported. The command was not started.",
+                ));
+            }
+            &NoSandbox
+        } else {
+            self.sandbox.as_ref()
+        };
         let dirty_before = super::shell::snapshot_dirty_paths(&snapshot_root);
-        let mut cmd = self.sandbox.wrap_command(&command, &cwd);
+        let mut cmd = sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // Put the child in its own process group so the timeout path can
         // signal the WHOLE tree (wrapper shell + grandchildren) with a
@@ -578,8 +671,7 @@ impl ExecCommandTool {
                 }
                 // Scan BEFORE truncation (the denial line may be what gets
                 // cut), append AFTER (so the hint itself survives the cut).
-                let hint =
-                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
+                let hint = sandbox_denial_hint(!sandbox.is_noop(), output.status.success(), &text);
                 let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
                 let mut out = truncate_output(text, max);
                 if let Some(hint) = hint {
@@ -3770,3 +3862,7 @@ fn catalog_score(entry: &ToolCatalogEntry, query: &str, tokens: &[String]) -> i3
 #[cfg(test)]
 #[path = "coding_tools_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "coding_tools_escalation_tests.rs"]
+mod escalation_tests;

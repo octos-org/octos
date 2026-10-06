@@ -2387,6 +2387,29 @@ Compatibility rules:
   `typed_details.diff.preview_id`; full diffs are not embedded in
   `approval/requested`.
 
+Sandbox escalation for the native `exec_command` tool:
+
+- With confinement active, a call explicitly sets `sandbox_permissions: "require_escalated"` and a
+  nonempty `justification`. The command waits for approval before executing;
+  permission-error text from an earlier command cannot trigger a retry.
+- The request uses the existing `sandbox_escalation` kind and includes the
+  exact command/cwd, source and destination modes, requested permissions and
+  justification. The default decision is deny.
+- Each approval covers one foreground command. Remembered tool, turn and
+  session approvals do not answer it; a scope in the response cannot create
+  a lasting grant. `tty` and `yield_time_ms` are refused for these calls.
+  Only the local connection that raised the approval can answer it; other
+  connections receive `permission_denied` / `sandbox_escalation_owner_only`.
+- The initial implementation accepts this request only on trusted local
+  stdio with `approval.typed.v1` (and the local interactive CLI). WebSocket,
+  external, host-managed and peer sessions cannot relax confinement this way.
+  Headless or unsupported approval bridges deny the request.
+- A denial or cancelled approval does not start the command. Escalation refusals
+  carry `do_not_retry_same_turn` tool-result metadata. Existing command policy,
+  write policy, sandbox-unavailable refusals and subprocess cleanup still apply.
+- If confinement is already disabled, ordinary command policy still applies
+  and there is no escalation prompt.
+
 Capability feature:
 
 - `approval.typed.v1`

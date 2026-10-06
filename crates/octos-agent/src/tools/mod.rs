@@ -460,6 +460,18 @@ pub enum ToolApprovalDecision {
 #[async_trait]
 pub trait ToolApprovalRequester: Send + Sync {
     async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision;
+
+    /// A separate, fail-closed bridge for one command outside confinement.
+    /// Implementations must require a fresh decision, ignore remembered
+    /// scopes, and refuse callers whose confinement cannot be relaxed.
+    /// Generic tool approval and replay bridges deliberately cannot grant it.
+    async fn request_sandbox_escalation(
+        &self,
+        _request: ToolApprovalRequest,
+        _details: octos_core::ui_protocol::ApprovalSandboxEscalationDetails,
+    ) -> ToolApprovalDecision {
+        ToolApprovalDecision::Deny
+    }
 }
 
 tokio::task_local! {

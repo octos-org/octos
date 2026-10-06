@@ -4,7 +4,6 @@
 //! sandbox-exec on macOS, AppContainer on Windows, or no sandbox (pass-through).
 
 mod bwrap;
-mod denial;
 mod docker;
 #[cfg(target_os = "linux")]
 mod landlock;
@@ -13,7 +12,6 @@ mod macos;
 mod windows;
 
 pub use bwrap::BwrapSandbox;
-pub use denial::{SandboxDenial, detect_sandbox_denials};
 pub use docker::DockerSandbox;
 #[cfg(target_os = "linux")]
 pub use landlock::LinuxContainerSandbox;
@@ -330,15 +328,9 @@ const DENIAL_PHRASES: &[&str] = &[
     "Read-only file system",
 ];
 
-/// Explain a sandbox denial the kernel reports as a bare errno string.
-///
-/// Inside the sandbox, a denied access surfaces as the failing program's
-/// own confused error ("could not read settings file: Operation not
-/// permitted"), which reads as a bug in the command — the one party that
-/// knows the sandbox denied it is the harness, so the harness must say so.
-/// Observed cost of not saying so: a coding session whose every `cargo`
-/// invocation died on the rustup settings lock, with the model (and user)
-/// left debugging cargo instead of the sandbox.
+/// Explain a possible sandbox denial reported as a bare errno string.
+/// Child output cannot distinguish confinement from ordinary permissions
+/// or a program's own text. This diagnostic must never authorize a retry.
 ///
 /// Returns a hint ONLY when the command FAILED under a real sandbox and
 /// `scan_text` carries one of the kernel's denial phrases — a successful
@@ -365,8 +357,9 @@ pub(crate) fn sandbox_denial_hint(
     }
     if cfg!(target_os = "macos") {
         Some(
-            "\n[sandbox] This denial usually means the OS sandbox blocked a file access \
-             outside the workspace — not a bug in the command. With \
+            "\n[sandbox] Output contains a permission-error message. It may come from \
+             sandbox policy, ordinary file permissions, or the program itself. \
+             The command already ran; do not automatically retry its side effects. With \
              `sandbox.allow_toolchains` on (the default), builds with CACHED \
              dependencies work; fetching NEW crates is denied unless \
              `sandbox.allow_network` is also enabled. Other paths need an \
@@ -374,9 +367,10 @@ pub(crate) fn sandbox_denial_hint(
         )
     } else {
         Some(
-            "\n[sandbox] This denial usually means the OS sandbox blocked a file access \
-             outside the workspace — not a bug in the command. Grant the path in the \
-             sandbox config, or run under a less restrictive sandbox mode.",
+            "\n[sandbox] Output contains a permission-error message. It may come from \
+             sandbox policy, ordinary file permissions, or the program itself. \
+             The command already ran; do not automatically retry its side effects. \
+             A change to the sandbox's permissions requires an explicit decision.",
         )
     }
 }

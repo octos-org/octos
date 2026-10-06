@@ -3134,6 +3134,22 @@ mod tests {
             approver.request_approval(request(false)).await,
             ToolApprovalDecision::Approve
         );
+        assert_eq!(
+            approver
+                .request_sandbox_escalation(
+                    request(false),
+                    octos_core::ui_protocol::ApprovalSandboxEscalationDetails {
+                        from: None,
+                        to: None,
+                        requested_permissions: vec![],
+                        justification: Some("fixture".into()),
+                        suggested_prefix_rule: vec![],
+                    },
+                )
+                .await,
+            ToolApprovalDecision::Deny,
+            "gateway replay approval must never authorize a privilege change"
+        );
     }
 
     use super::{
