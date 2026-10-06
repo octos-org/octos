@@ -1030,6 +1030,16 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test -p octos-cli --features api --lib relocate
 
+      # #2663: a representative Windows test step at PR time. Before this,
+      # every Windows Test step was main-only, so the PR lane validated
+      # compilation only and Windows-only behavior breaks leaked to
+      # main/nightly by design (the #2662 family: 18-19 tests red for a
+      # week). octos-core is the smallest sharded crate and hosts the
+      # platform-path-sensitive session_scope tests.
+      - name: Test octos-core (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo test -p octos-core
+
       # Sharded per-crate tests — same rationale as the `check` job.
       #
       # Every test step runs even after an earlier one fails. GitHub aborts a
@@ -1539,9 +1549,12 @@ jobs:
           fi
           echo "Changed files:"
           echo "$FILES"
-          # `session_scope` is the path-containment boundary behind
-          # `classify_canonical_path`; it is NOT covered by `session_actor`.
-          if echo "$FILES" | grep -qE '(sandbox|ssrf|security|tools/mod|session_actor|session_scope|profiles)'; then
+          # #2681: run the suite by DEFAULT — a path allowlist let
+          # host-tool and transport changes (host_tools.rs, peers/*,
+          # ui_protocol_transport.rs, mcp.rs) skip the suite entirely while
+          # the required `security` badge reported Success. Opt out only
+          # for pure-documentation and workflow-metadata changes.
+          if echo "$FILES" | grep -qEv '(^|/)(docs|book|book-zh|\.github)/.*\.md$|^\.github/workflows/'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
