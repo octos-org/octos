@@ -104,6 +104,8 @@ pub struct UpdateProfileRequest {
 
 #[derive(Serialize)]
 pub struct ProfileResponse {
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<super::ui_protocol_transport::ProfileRuntimeStatus>,
     #[serde(flatten)]
     pub profile: UserProfile,
     pub status: crate::process_manager::ProcessStatus,
@@ -118,7 +120,15 @@ impl ProfileResponse {
             profile,
             status,
             email: None,
+            runtime: None,
         }
+    }
+    pub(crate) fn with_runtime_transition(
+        mut self,
+        transition: Option<super::ui_protocol_transport::ProfileLlmRuntimeTransition>,
+    ) -> Self {
+        self.runtime = transition.map(|transition| transition.wire_status());
+        self
     }
     pub fn with_email_lookup(mut self, user_store: Option<&crate::user_store::UserStore>) -> Self {
         self.email = user_store
@@ -178,6 +188,7 @@ pub async fn overview(
             running += 1;
         }
         items.push(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&p),
             status,
@@ -231,6 +242,7 @@ pub async fn list_profiles(
     for p in page {
         let status = pm.status(&p.id).await;
         items.push(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&p),
             status,
@@ -261,6 +273,7 @@ pub async fn get_profile(
     let status = pm.status(&id).await;
     Ok(Json(
         ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&profile),
             status,
@@ -365,6 +378,7 @@ pub async fn create_profile(
     tracing::info!(profile = %profile.id, name = %profile.name, "profile created");
     let status = pm.status(&profile.id).await;
     let response = ProfileResponse {
+        runtime: None,
         email: None,
         profile: mask_secrets(&profile),
         status,
@@ -487,6 +501,7 @@ pub async fn update_profile(
     tracing::info!(profile = %id, "profile updated");
     let status = pm.status(&id).await;
     let response = ProfileResponse {
+        runtime: None,
         email: None,
         profile: mask_secrets(&profile),
         status,
@@ -1813,6 +1828,7 @@ pub async fn list_sub_accounts(
     for s in subs {
         let status = pm.status(&s.id).await;
         items.push(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&s),
             status,
@@ -2011,6 +2027,7 @@ pub async fn create_sub_account(
     Ok((
         StatusCode::CREATED,
         Json(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&sub),
             status,
@@ -5736,9 +5753,9 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn relocate_keychain_backed_secrets_never_persists_raw_vertex_json_off_macos() {
-        #[cfg(target_os = "linux")]
+        let secrets = tempfile::tempdir().unwrap();
         let _secrets_root =
-            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
         // #2234/45a — the availability predicate is now `keychain::is_available()`
         // (true on Linux: the file backend exists), NOT `cfg!(macos)`. The
         // never-plaintext contract holds where NO backend exists (unsupported
@@ -5789,9 +5806,9 @@ mod tests {
         // INJECTED temp root) the JSON is legitimately relocated: Ok, the
         // slot becomes a keychain marker, the raw value never remains.
         // Hosts with NO backend keep the rejection.
-        #[cfg(target_os = "linux")]
+        let secrets = tempfile::tempdir().unwrap();
         let _secrets_root =
-            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
         let mut env = std::collections::HashMap::new();
         env.insert(
             "VERTEX_API_KEY".to_string(),

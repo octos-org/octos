@@ -197,6 +197,7 @@ fn should_surface_persisted_reasoning_effort_on_session_open() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: Some(ReasoningEffortLevel::High),
+        accepted_client_commands: None,
     };
     let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
     assert_eq!(wire["reasoning_effort"], json!("high"));
@@ -224,6 +225,52 @@ fn should_surface_persisted_reasoning_effort_on_session_open() {
     let parsed: SessionOpened =
         serde_json::from_value(legacy).expect("legacy payload without field decodes");
     assert_eq!(parsed.reasoning_effort, None);
+}
+
+#[test]
+fn session_opened_echoes_accepted_client_commands() {
+    let opened = SessionOpened {
+        session_id: SessionKey("local:demo".into()),
+        active_profile_id: None,
+        workspace_root: None,
+        context: None,
+        context_state: None,
+        cursor: None,
+        panes: None,
+        capabilities: UiProtocolCapabilities::first_server_slice(),
+        reasoning_effort: None,
+        accepted_client_commands: Some(vec!["/model".into()]),
+    };
+    let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
+    assert_eq!(wire["accepted_client_commands"], json!(["/model"]));
+    let back: SessionOpened = serde_json::from_value(wire).expect("round-trip");
+    assert_eq!(back.accepted_client_commands, Some(vec!["/model".into()]));
+
+    // A declaration the server dropped entirely stays distinguishable from
+    // an open that declared nothing.
+    let all_dropped = SessionOpened {
+        accepted_client_commands: Some(Vec::new()),
+        ..opened.clone()
+    };
+    let wire = serde_json::to_value(&all_dropped).expect("serialize empty");
+    assert_eq!(wire["accepted_client_commands"], json!([]));
+
+    let undeclared = SessionOpened {
+        accepted_client_commands: None,
+        ..opened
+    };
+    let wire = serde_json::to_value(&undeclared).expect("serialize None");
+    assert!(wire.get("accepted_client_commands").is_none());
+    let legacy = json!({
+        "session_id": "local:demo",
+        "capabilities": serde_json::to_value(
+            UiProtocolCapabilities::first_server_slice()
+        )
+        .unwrap()
+    });
+    let parsed: SessionOpened =
+        serde_json::from_value(legacy).expect("legacy payload without field decodes");
+    assert_eq!(parsed.accepted_client_commands, None);
 }
 
 #[test]
@@ -513,6 +560,7 @@ fn session_opened_pane_snapshot_round_trips() {
         }),
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
 
     let wire = serde_json::to_value(&opened).expect("serialize session/open panes");
@@ -547,6 +595,7 @@ fn session_open_result_includes_capabilities_field() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
     let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
     let capabilities = wire
@@ -2334,6 +2383,7 @@ fn typed_rpc_results_map_from_methods_and_round_trip() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
 
     let session_result = UiRpcResult::SessionOpen(SessionOpenResult::new(opened));
@@ -3316,6 +3366,7 @@ fn resumable_notifications_carry_event_ledger_cursors() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     });
 
     let opened_wire = opened
@@ -4209,6 +4260,9 @@ fn golden_session_hydrate_result_serde() {
             source: Some("user".into()),
             media: vec![],
             reasoning_content: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: vec![],
         }]),
         threads: Some(vec![ThreadGraphEntry {
             thread_id: "thread-1".into(),
@@ -4265,6 +4319,76 @@ fn golden_session_hydrate_result_serde() {
     // Bug C: a non-negotiated client never sees the new field.
     assert!(!object.contains_key("replayed_envelopes"));
     assert!(!object.contains_key("replayed_tool_envelopes"));
+}
+
+/// UPCR-2026-039: tool rows carry their call id and tool name, an assistant
+/// row its calls. A row without either keeps the pre-UPCR wire shape, and a
+/// pre-UPCR row decodes with the fields absent.
+#[test]
+fn should_carry_tool_call_identity_when_a_hydrated_row_is_a_tool_call_or_result() {
+    let row = |role: &str| HydratedMessage {
+        seq: 3,
+        role: role.into(),
+        content: String::new(),
+        turn_id: None,
+        thread_id: Some("thread-1".into()),
+        client_message_id: None,
+        persisted_at: sample_persisted_at(),
+        message_id: None,
+        source: None,
+        media: vec![],
+        reasoning_content: None,
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: vec![],
+    };
+    let call = HydratedMessage {
+        tool_calls: vec![HydratedToolCall {
+            tool_call_id: "call-1".into(),
+            tool_name: "peer_send_input".into(),
+        }],
+        ..row("assistant")
+    };
+    let result = HydratedMessage {
+        tool_call_id: Some("call-1".into()),
+        tool_name: Some("peer_send_input".into()),
+        ..row("tool")
+    };
+
+    let call_wire = serde_json::to_value(&call).expect("serialize call row");
+    assert_eq!(
+        call_wire["tool_calls"],
+        json!([{ "tool_call_id": "call-1", "tool_name": "peer_send_input" }])
+    );
+    assert!(call_wire.get("tool_call_id").is_none());
+    assert!(call_wire.get("tool_name").is_none());
+    let result_wire = serde_json::to_value(&result).expect("serialize result row");
+    assert_eq!(result_wire["tool_call_id"], "call-1");
+    assert_eq!(result_wire["tool_name"], "peer_send_input");
+    assert!(result_wire.get("tool_calls").is_none());
+    for parsed in [&call, &result] {
+        let wire = serde_json::to_value(parsed).expect("serialize");
+        let decoded: HydratedMessage = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(&decoded, parsed);
+    }
+
+    // Additive: a plain row serializes without the new keys, and a row from
+    // a server without UPCR-2026-039 decodes with them absent.
+    let plain = serde_json::to_value(row("user")).expect("serialize plain row");
+    for key in ["tool_call_id", "tool_name", "tool_calls"] {
+        assert!(plain.get(key).is_none(), "{key} must be omitted: {plain}");
+    }
+    let legacy: HydratedMessage = serde_json::from_value(json!({
+        "seq": 4,
+        "role": "tool",
+        "content": "ok",
+        "thread_id": "thread-1",
+        "persisted_at": "2026-04-30T12:00:00Z",
+    }))
+    .expect("deserialize a pre-UPCR-2026-039 row");
+    assert_eq!(legacy.tool_call_id, None);
+    assert_eq!(legacy.tool_name, None);
+    assert!(legacy.tool_calls.is_empty());
 }
 
 #[test]

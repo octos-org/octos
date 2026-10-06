@@ -345,6 +345,22 @@ Current M9 sandbox-parity decision:
   It lets clients observe manifest-declared background actions through generic
   projections of persisted supervised tasks. It does not introduce
   notebook-specific routes or a generic client-selected tool-call primitive.
+- The optional `client_commands` param of `session/open` (its per-open
+  lifecycle, release on disconnect, and server-side name filtering) is
+  governed by accepted
+  [UPCR-2026-037](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_037_CLIENT_COMMANDS.md).
+  The param is ungated and the request records the contract as shipped; it
+  changes no wire shape.
+- The additive `accepted_client_commands` field on `SessionOpened`, which
+  echoes the `client_commands` names the server accepted, is governed by
+  accepted
+  [UPCR-2026-038](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_038_ACCEPTED_CLIENT_COMMANDS.md).
+  The field is ungated.
+- The additive `tool_call_id`, `tool_name` and `tool_calls` fields on
+  `session/hydrate` message rows (and on `session/rollback`'s trimmed thread),
+  which name a tool row's call and tool, are governed by accepted
+  [UPCR-2026-039](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_039_HYDRATED_TOOL_CALL_IDENTITY.md).
+  The fields are ungated.
 
 ## 5. Identity Model
 
@@ -916,6 +932,17 @@ Minimum params:
   `session.workspace_cwd.v1`. The server must canonicalize and approve it
   against runtime filesystem roots before binding cwd-scoped tools.
 - optional `after`
+- optional `client_commands`
+  Slash commands the client handles itself, from accepted `UPCR-2026-037`
+  (leading `/` optional). The server lists the accepted names in the session's
+  system prompt. The declaration is per-open, not sticky: every `session/open`
+  replaces the session's previous one, omitting the field declares none, and
+  the server clears it when the declaring connection closes. Across concurrent
+  connections the last open wins. Names are filtered server-side: at most 32
+  characters of ASCII alphanumerics, `-` and `_`, deduplicated, first 64 kept,
+  and the gateway server-state commands (`/adaptive`, `/router`, `/queue`,
+  `/reset`) dropped. The names that survive are echoed in the result's
+  `accepted_client_commands`.
 
 Expected result:
 
@@ -970,6 +997,15 @@ Optional result fields from the M16 `context.lifecycle.v1` contract:
   from the same canonical profile/session store used by `turn/start` and
   `session/hydrate`.
 
+Optional result fields from accepted `UPCR-2026-038`:
+
+- `accepted_client_commands`
+  The names the server accepted from this open's `client_commands`, each as
+  `/name`, in declaration order. Present whenever the request carried
+  `client_commands` and the server applied it, including as `[]` when every
+  name was dropped. Absent when the request omitted `client_commands`.
+  Ungated.
+
 ### `session/hydrate`
 
 Purpose:
@@ -997,6 +1033,21 @@ Optional result fields from the M16 `context.lifecycle.v1` contract:
   Typed model-visible context state for the hydrated session. This state must
   be read from the same canonical profile/session store used by `turn/start`,
   not reconstructed by the client from hydrated chat rows.
+
+Optional `messages` row fields from accepted `UPCR-2026-039` (ungated; the
+rows of `session/rollback`'s `thread` carry them too):
+
+- `tool_call_id`
+  On a tool-result row (`role: "tool"`), the id of the assistant tool call it
+  answers.
+- `tool_name`
+  On a tool-result row, the name of the tool that call ran (the `tool_name` of
+  `tool/started`), from the nearest earlier row whose `tool_calls` hold the
+  id, looked up in the whole transcript whatever `after` is. Absent when the
+  transcript lacks that call.
+- `tool_calls`
+  On an assistant row that called tools, `{tool_call_id, tool_name}` per call,
+  in call order, without the arguments. Omitted when the row made no call.
 
 ### `turn/state/get`
 
@@ -2252,6 +2303,10 @@ from accepted `UPCR-2026-007` (see § 7).
 When `context.lifecycle.v1` is available for the connection, the notification
 payload may also include `context` and `context_state` with the same semantics
 as the `session/open` result.
+
+The payload carries `accepted_client_commands` (accepted `UPCR-2026-038`) with
+the value of the open that produced it. A replayed notification reports that
+earlier open's declaration, not the session's current one.
 
 Optional pane fields from accepted `UPCR-2026-002`:
 

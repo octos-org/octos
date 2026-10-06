@@ -873,6 +873,7 @@ pub async fn me(
                     crate::process_manager::ProcessStatus::stopped()
                 };
                 Some(ProfileResponse {
+                    runtime: None,
                     email: None,
                     profile: mask_secrets(&p),
                     status,
@@ -949,6 +950,7 @@ pub async fn me(
                 crate::process_manager::ProcessStatus::stopped()
             };
             Some(ProfileResponse {
+                runtime: None,
                 email: None,
                 profile: mask_secrets(&p),
                 status,
@@ -1379,14 +1381,18 @@ pub async fn update_my_profile(
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
 
-    if runtime_config_changed {
-        crate::api::ui_protocol_transport::refresh_profile_runtime_after_profile_update(
-            &state,
-            &profile.id,
-            Some(profile.updated_at.to_rfc3339()),
+    let runtime_transition = if runtime_config_changed {
+        Some(
+            crate::api::ui_protocol_transport::refresh_profile_runtime_after_profile_update(
+                &state,
+                &profile.id,
+                Some(profile.updated_at.to_rfc3339()),
+            )
+            .await,
         )
-        .await;
-    }
+    } else {
+        None
+    };
 
     tracing::info!(profile = %profile.id, "user profile updated");
     let status = if let Some(ref pm) = state.process_manager {
@@ -1401,7 +1407,8 @@ pub async fn update_my_profile(
     // and again right after a save on PUT.
     Ok(Json(
         ProfileResponse::from(mask_secrets(&profile), status)
-            .with_email_lookup(state.user_store.as_deref()),
+            .with_email_lookup(state.user_store.as_deref())
+            .with_runtime_transition(runtime_transition),
     ))
 }
 
@@ -3571,6 +3578,7 @@ pub async fn my_sub_accounts(
     for s in subs {
         let status = pm.status(&s.id).await;
         items.push(crate::api::admin::ProfileResponse {
+            runtime: None,
             email: None,
             profile: crate::profiles::mask_secrets(&s),
             status,
@@ -3611,6 +3619,7 @@ pub async fn my_sub_account(
     let sub = resolve_my_sub_account(&identity, ps, &state, &headers, &sub_id)?;
     let status = pm.status(&sub.id).await;
     Ok(Json(crate::api::admin::ProfileResponse {
+        runtime: None,
         email: None,
         profile: crate::profiles::mask_secrets(&sub),
         status,
@@ -3669,6 +3678,7 @@ pub async fn create_my_sub_account(
     Ok((
         StatusCode::CREATED,
         Json(crate::api::admin::ProfileResponse {
+            runtime: None,
             email: None,
             profile: crate::profiles::mask_secrets(&sub),
             status,
@@ -3774,6 +3784,7 @@ pub async fn update_my_sub_account(
 
     let status = pm.status(&sub.id).await;
     Ok(Json(crate::api::admin::ProfileResponse {
+        runtime: None,
         email: None,
         profile: crate::profiles::mask_secrets(&sub),
         status,
@@ -5851,6 +5862,364 @@ mod tests {
         assert_eq!(home["events"][0]["title"], "Dinner");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    #[ignore = "requires built learning-coach and an explicitly supplied Gemini test key"]
+    async fn profile_model_real_coach_acceptance() {
+        use std::os::unix::fs::PermissionsExt;
+        let coach = std::path::PathBuf::from(std::env::var("OCTOS_TEST_COACH_ROOT").unwrap());
+        let key = std::env::var("OCTOS_TEST_LESSON_KEY").unwrap();
+        let (_dir, mut state, _, store) = temp_app_state();
+        state.deployment_mode = crate::config::DeploymentMode::Cloud;
+        state.solo_login_enabled = false;
+        let state = Arc::new(state);
+        let profile = make_user_profile("lesson-test", "Lesson Test");
+        store.save(&profile).unwrap();
+        let data = store.resolve_data_dir(&profile);
+        let skill = data.join("skills/learning-coach");
+        std::fs::create_dir_all(&skill).unwrap();
+        for name in ["main", "lesson-plan.js", "manifest.json"] {
+            std::fs::copy(coach.join(name), skill.join(name)).unwrap();
+        }
+        std::fs::set_permissions(skill.join("main"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let identity = || {
+            axum::Extension(AuthIdentity::User {
+                id: "lesson-test".into(),
+                role: UserRole::User,
+            })
+        };
+        let patch = |model: &str| {
+            serde_json::json!({"config":{
+                "llm":{"primary":{"family_id":"google","model_id":model},"fallbacks":[]},
+                "env_vars":{"GEMINI_API_KEY":key}
+            }})
+            .to_string()
+        };
+        let _ = update_my_profile(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity(),
+            patch("gemini-3.6-flash"),
+        )
+        .await
+        .unwrap();
+        assert!(state.profiles.is_empty());
+        let old = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("lesson-test"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let tool = old.tool_specs.get("oll_generate_lesson").unwrap().clone();
+        let running = tokio::spawn(async move {
+            tool.execute(&serde_json::json!({
+            "turn_id":"real-m1", "learner_request":"解释一次函数 y=2x+1 的斜率和截距。", "request_source":"self_contained", "language":"zh-CN"
+        })).await.unwrap()
+        });
+        let trace_path = data.join("skill-output/study/oll/real-m1.generation-trace.jsonl");
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if std::fs::read_to_string(&trace_path)
+                    .unwrap_or_default()
+                    .contains("model-call")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = update_my_profile(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity(),
+            patch("gemini-3.5-flash"),
+        )
+        .await
+        .unwrap();
+        let first = running.await.unwrap();
+        assert!(
+            first.success,
+            "M1 real course failed: {:?}",
+            first.structured_metadata
+        );
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&trace_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for event in events.iter().filter(|event| event["stage"] == "model-call") {
+            assert_eq!(event["model"], "gemini-3.6-flash");
+            assert_eq!(event["route_source"], "profile");
+        }
+        drop(old);
+        let new = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("lesson-test"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let second = new.tool_specs.get("oll_generate_lesson").unwrap().execute(&serde_json::json!({
+            "turn_id":"real-m2", "learner_request":"解释一次函数 y=2x+1 的斜率和截距。", "request_source":"self_contained", "language":"zh-CN"
+        })).await.unwrap();
+        assert!(
+            second.success,
+            "M2 real course failed: {:?}",
+            second.structured_metadata
+        );
+        let trace = std::fs::read_to_string(
+            data.join("skill-output/study/oll/real-m2.generation-trace.jsonl"),
+        )
+        .unwrap();
+        for event in trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["stage"] == "model-call")
+        {
+            assert_eq!(event["model"], "gemini-3.5-flash");
+            assert_eq!(event["route_source"], "profile");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn profile_model_dynamic_skill_acceptance() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, mut state, _, store) = temp_app_state();
+        state.deployment_mode = crate::config::DeploymentMode::Cloud;
+        state.solo_login_enabled = false;
+        let state = Arc::new(state);
+        let patch = |model: &str, key: &str| {
+            serde_json::json!({"config":{
+                "llm":{"primary":{"family_id":"google","model_id":model},"fallbacks":[]},
+                "env_vars":{"GEMINI_API_KEY":key}
+            }})
+            .to_string()
+        };
+        let identity = |id: &str| {
+            axum::Extension(AuthIdentity::User {
+                id: id.into(),
+                role: UserRole::User,
+            })
+        };
+        for id in ["user-a", "user-b"] {
+            let profile = make_user_profile(id, id);
+            store.save(&profile).unwrap();
+            let skill = store.resolve_data_dir(&profile).join("skills/env-probe");
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("manifest.json"), r#"{"name":"env-probe","version":"1.0","tools":[{"name":"env_probe","description":"fixture","input_schema":{"type":"object"},"env":["GEMINI_API_KEY","OCTOS_PROFILE_ID","OCTOS_DATA_DIR","OCTOS_PROFILE_LLM_MODEL","OCTOS_PROFILE_LLM_CONFIG_REVISION"]}]}"#).unwrap();
+            let binary = skill.join("env-probe");
+            std::fs::write(&binary, r#"#!/bin/sh
+read INPUT || true
+ok=false
+if [ "$GEMINI_API_KEY" = "fixture-$OCTOS_PROFILE_ID" ]; then ok=true; fi
+if [ -f "$OCTOS_DATA_DIR/hold" ]; then
+  touch "$OCTOS_DATA_DIR/started"
+  while [ -f "$OCTOS_DATA_DIR/hold" ]; do sleep 0.02; done
+fi
+printf '{"success":%s,"output":"%s","structured_metadata":{"revision":"%s"}}\n' "$ok" "$OCTOS_PROFILE_LLM_MODEL" "$OCTOS_PROFILE_LLM_CONFIG_REVISION"
+"#).unwrap();
+            std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let Json(response) = update_my_profile(
+                State(state.clone()),
+                HeaderMap::new(),
+                identity(id),
+                patch("gemini-m1", &format!("fixture-{id}")),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.runtime.unwrap().runtime_disposition, "reloaded");
+        }
+        assert!(
+            state.profiles.is_empty(),
+            "acceptance must use dynamic profiles"
+        );
+        let old = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("user-a"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let other = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("user-b"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let old_revision = old
+            .plugin_env_template
+            .iter()
+            .find(|(k, _)| k == "OCTOS_PROFILE_LLM_CONFIG_REVISION")
+            .unwrap()
+            .1
+            .clone();
+        let data = store.resolve_data_dir(&store.get("user-a").unwrap().unwrap());
+        std::fs::write(data.join("hold"), "hold").unwrap();
+        let old_tool = old.tool_specs.get("env_probe").unwrap().clone();
+        let running =
+            tokio::spawn(async move { old_tool.execute(&serde_json::json!({})).await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !data.join("started").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let Json(saved) = update_my_profile(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity("user-a"),
+            patch("gemini-m2", "fixture-user-a"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            saved.runtime.as_ref().unwrap().runtime_disposition,
+            "restart_required"
+        );
+        let b_result = other
+            .tool_specs
+            .get("env_probe")
+            .unwrap()
+            .execute(&serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(b_result.success, "user B must retain its own key");
+        assert_eq!(b_result.output, "gemini-m1");
+        std::fs::remove_file(data.join("hold")).unwrap();
+        let old_result = running.await.unwrap();
+        assert!(
+            old_result.success,
+            "in-flight user A must retain its own key"
+        );
+        assert_eq!(old_result.output, "gemini-m1");
+        assert_eq!(
+            old_result.structured_metadata.as_ref().unwrap()["revision"],
+            old_revision
+        );
+        drop(old);
+        let new = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("user-a"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let result = new
+            .tool_specs
+            .get("env_probe")
+            .unwrap()
+            .execute(&serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output, "gemini-m2");
+        assert_ne!(
+            result.structured_metadata.as_ref().unwrap()["revision"],
+            old_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn my_profile_runtime_response_reports_all_save_outcomes() {
+        for outcome in [
+            "reloaded",
+            "restart_required",
+            "persisted_but_not_live",
+            "save_failed",
+        ] {
+            let (dir, state, _, store) = temp_app_state();
+            let profile = make_user_profile("tenant", "Tenant");
+            store.save(&profile).unwrap();
+            let mut state = Arc::new(state);
+            let patch = serde_json::json!({"config":{
+                "llm":{"primary":{"family_id":"openai","model_id":"gpt-4o-mini",
+                    "route":{"api_key_env":"OCTOS_TEST_REST_RUNTIME_KEY"}},"fallbacks":[]},
+                "env_vars":{"OCTOS_TEST_REST_RUNTIME_KEY":"fixture"}
+            }})
+            .to_string();
+            let identity = || {
+                axum::Extension(AuthIdentity::User {
+                    id: "tenant".into(),
+                    role: UserRole::User,
+                })
+            };
+            let _ = update_my_profile(
+                State(state.clone()),
+                HeaderMap::new(),
+                identity(),
+                patch.clone(),
+            )
+            .await
+            .unwrap();
+            let original = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+                &state,
+                Some("tenant"),
+            )
+            .unwrap();
+            match outcome {
+                "restart_required" => {
+                    let mut owned = Arc::try_unwrap(state).ok().unwrap();
+                    owned.profiles.insert("tenant".into(), original.clone());
+                    state = Arc::new(owned);
+                }
+                "persisted_but_not_live" => {
+                    let blocker = dir.path().join("blocked-data");
+                    std::fs::write(&blocker, "not a directory").unwrap();
+                    let mut saved = store.get("tenant").unwrap().unwrap();
+                    saved.data_dir = Some(blocker.to_string_lossy().into_owned());
+                    store.save(&saved).unwrap();
+                }
+                "save_failed" => {
+                    std::fs::create_dir(store.profile_path("tenant").with_extension("json.tmp"))
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let original = if outcome == "save_failed" {
+                Some(original)
+            } else {
+                drop(original);
+                None
+            };
+            let result =
+                update_my_profile(State(state.clone()), HeaderMap::new(), identity(), patch).await;
+            if outcome == "save_failed" {
+                assert!(result.is_err());
+                let current = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+                    &state,
+                    Some("tenant"),
+                )
+                .unwrap();
+                assert!(
+                    Arc::ptr_eq(original.as_ref().unwrap(), &current),
+                    "failed save must not invalidate runtime"
+                );
+                continue;
+            }
+            let response = serde_json::to_value(result.ok().unwrap().0).unwrap();
+            assert_eq!(response["runtime_disposition"], outcome);
+            assert_eq!(response["restart_required"], outcome == "restart_required");
+            assert_eq!(
+                chrono::DateTime::parse_from_rfc3339(response["config_revision"].as_str().unwrap())
+                    .unwrap(),
+                chrono::DateTime::parse_from_rfc3339(response["updated_at"].as_str().unwrap())
+                    .unwrap()
+            );
+            assert_eq!(response["effective_from"], "next_turn");
+            assert_eq!(
+                response.get("runtime_error").is_some(),
+                outcome == "persisted_but_not_live"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn my_profile_llm_patch_bootstraps_on_demand_appui_runtime() {
         let (_dir, state, _user_store, profile_store) = temp_app_state();
@@ -6128,9 +6497,9 @@ mod tests {
         // legitimately relocated: the call succeeds and the slot becomes a
         // keychain marker, never the raw value. Hosts with NO backend keep
         // the rejection.
-        #[cfg(target_os = "linux")]
+        let secrets = tempfile::tempdir().unwrap();
         let _secrets_root =
-            crate::auth::keychain::test_override_secrets_root(tempfile::tempdir().unwrap().keep());
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
         let (_dir, state, _user_store, profile_store) = temp_app_state();
         profile_store
             .save(&make_user_profile("tenant", "Tenant Owner"))

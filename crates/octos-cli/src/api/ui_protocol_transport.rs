@@ -14693,7 +14693,7 @@ impl ProfileRuntimeDisposition {
 /// The runtime transition a committed Profile LLM mutation performed, stamped
 /// onto the wire result next to `applied` (#2164).
 #[derive(Debug, Clone)]
-struct ProfileLlmRuntimeTransition {
+pub(crate) struct ProfileLlmRuntimeTransition {
     disposition: ProfileRuntimeDisposition,
     /// Persisted profile revision (`updated_at`) the runtime was — or was
     /// demonstrably not — synced to.
@@ -14702,7 +14702,31 @@ struct ProfileLlmRuntimeTransition {
     error: Option<String>,
 }
 
+/// Shared REST/OUP projection of post-save runtime state.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProfileRuntimeStatus {
+    pub runtime_disposition: String,
+    pub restart_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_error: Option<String>,
+}
+
 impl ProfileLlmRuntimeTransition {
+    pub(crate) fn wire_status(&self) -> ProfileRuntimeStatus {
+        ProfileRuntimeStatus {
+            runtime_disposition: self.disposition.as_str().to_string(),
+            restart_required: self.disposition == ProfileRuntimeDisposition::RestartRequired,
+            config_revision: self.config_revision.clone(),
+            effective_from: (self.disposition != ProfileRuntimeDisposition::Unchanged)
+                .then(|| "next_turn".to_string()),
+            runtime_error: self.error.clone(),
+        }
+    }
+
     fn unchanged() -> Self {
         Self {
             disposition: ProfileRuntimeDisposition::Unchanged,
@@ -14731,10 +14755,13 @@ async fn commit_profile_llm_runtime_transition(
     state.session_cache.invalidate_profile(profile_id).await;
     if let Some(key) = dynamic_profile_runtime_key(state, profile_id) {
         bump_profile_runtime_generation(&key);
-        dynamic_profile_runtimes()
+        let removed = dynamic_profile_runtimes()
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&key);
+        if let Some(removed) = removed {
+            retire_profile_runtime(&key, &removed);
+        }
     }
 
     if startup_pinned {
@@ -14786,27 +14813,11 @@ fn stamp_profile_llm_runtime_transition(
     result: &mut Value,
     transition: &ProfileLlmRuntimeTransition,
 ) {
-    if let Value::Object(object) = result {
-        object.insert(
-            "runtime_disposition".into(),
-            json!(transition.disposition.as_str()),
-        );
-        if let Some(config_revision) = &transition.config_revision {
-            object.insert("config_revision".into(), json!(config_revision));
-        }
-        object.insert(
-            "restart_required".into(),
-            json!(matches!(
-                transition.disposition,
-                ProfileRuntimeDisposition::RestartRequired
-            )),
-        );
-        if transition.disposition != ProfileRuntimeDisposition::Unchanged {
-            object.insert("effective_from".into(), json!("next_turn"));
-        }
-        if let Some(error) = &transition.error {
-            object.insert("runtime_error".into(), json!(error));
-        }
+    if let (Value::Object(object), Value::Object(status)) = (
+        result,
+        serde_json::to_value(transition.wire_status()).expect("runtime status serializes"),
+    ) {
+        object.extend(status);
     }
 }
 
@@ -23279,6 +23290,10 @@ async fn open_session_result(
     // materializes (profile-less open), which makes the snapshot fail open
     // (publish without compacting) rather than guess a window.
     let mut open_context_provider: Option<Arc<dyn octos_llm::LlmProvider>> = None;
+    // UPCR-2026-038: the declared `client_commands` the session runtime
+    // accepted. Stays `None` when the open declared none or no runtime
+    // materializes to apply them.
+    let mut accepted_client_commands: Option<Vec<String>> = None;
     if let Some(profile_runtime) =
         resolve_session_profile_runtime(state, active_profile_id.as_deref())
     {
@@ -23315,10 +23330,11 @@ async fn open_session_result(
                 register_session_ledger_scope(state, ledger, &runtime);
                 // Every open re-declares: a client that omits the field must
                 // not inherit commands another client declared earlier.
-                runtime.apply_client_commands(
+                let accepted = runtime.apply_client_commands(
                     connection_id.0,
                     params.client_commands.as_deref().unwrap_or_default(),
                 );
+                accepted_client_commands = params.client_commands.is_some().then_some(accepted);
                 open_context_provider = Some(
                     peer_lane_provider_for(&params.session_id, &runtime)
                         .unwrap_or_else(|| runtime.profile.llm.clone()),
@@ -23536,6 +23552,7 @@ async fn open_session_result(
             panes,
             capabilities,
             reasoning_effort,
+            accepted_client_commands,
         }),
         connection_id,
     );
@@ -24566,6 +24583,47 @@ fn dynamic_profile_runtimes() -> &'static DynamicProfileRuntimeMap {
     RUNTIMES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
+/// Stores of runtimes a configuration commit removed from the cache, held
+/// until a replacement takes them over. An in-flight turn's agent keeps the
+/// single-writer episode store open even after the runtime itself is gone,
+/// so the replacement must reuse these handles rather than reopen the files.
+fn retired_profile_runtimes()
+-> &'static std::sync::Mutex<HashMap<String, crate::runtime::profile::RetiredProfileRuntime>> {
+    static RETIRED: OnceLock<
+        std::sync::Mutex<HashMap<String, crate::runtime::profile::RetiredProfileRuntime>>,
+    > = OnceLock::new();
+    RETIRED.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn retire_profile_runtime(key: &str, runtime: &crate::runtime::ProfileRuntime) {
+    retired_profile_runtimes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.to_owned(), runtime.retire());
+}
+
+fn take_retired_profile_runtime(
+    key: &str,
+) -> Option<crate::runtime::profile::RetiredProfileRuntime> {
+    retired_profile_runtimes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(key)
+}
+
+/// Return a retiree whose replacement failed, unless a newer commit already
+/// retired another runtime under the same key.
+fn restore_retired_profile_runtime(
+    key: &str,
+    retired: crate::runtime::profile::RetiredProfileRuntime,
+) {
+    retired_profile_runtimes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(key.to_owned())
+        .or_insert(retired);
+}
+
 fn dynamic_profile_runtime_key(state: &AppState, profile_id: &str) -> Option<String> {
     let store = state.profile_store.as_ref()?;
     Some(format!(
@@ -24699,7 +24757,11 @@ pub(crate) async fn ensure_session_profile_runtime(
         // Lazily-created profiles must honour host-level policy too — without
         // host_memory, a host opt-out of (default-on) memory refresh would not
         // bind profiles created after startup.
-        let runtime = crate::runtime::ProfileRuntime::bootstrap_with_host_plugins(
+        let mut retired = take_retired_profile_runtime(&key);
+        let had_retired = retired.is_some();
+        // Boxed: the bootstrap future is large, and this function is awaited
+        // inside many request futures that run on worker-thread stacks.
+        let bootstrap = Box::pin(crate::runtime::ProfileRuntime::bootstrap_replacing(
             &profile,
             &profile_data_dir,
             Some(store.octos_home_dir()),
@@ -24707,9 +24769,15 @@ pub(crate) async fn ensure_session_profile_runtime(
             None,
             None,
             state.host_memory.as_ref(),
-        )
-        .await
-        .map_err(|error| {
+            &mut retired,
+        ))
+        .await;
+        if bootstrap.is_err() {
+            if let Some(retired) = retired.take() {
+                restore_retired_profile_runtime(&key, retired);
+            }
+        }
+        let runtime = bootstrap.map_err(|error| {
             // Lock contention is a config mistake with a concrete fix, so it gets
             // its own typed kind and a sentence the operator can act on. Anything
             // else stays `runtime_unavailable` — but formatted with `{error:#}`
@@ -24717,7 +24785,12 @@ pub(crate) async fn ensure_session_profile_runtime(
             // only the outermost context, which is how "failed to open episode
             // store for profile 'x'" used to reach the TUI with its actual cause
             // (and its remedy) silently dropped.
-            if octos_memory::is_episode_store_locked(&error) {
+            if octos_memory::is_episode_store_locked(&error) && had_retired {
+                // This process still holds the stores through the runtime a
+                // configuration change retired; it frees them when its
+                // in-flight work ends. Not a second octos process.
+                profile_runtime_switching_error(profile_id)
+            } else if octos_memory::is_episode_store_locked(&error) {
                 data_dir_locked_error(profile_id, &error)
             } else {
                 runtime_unavailable_error(format!(
@@ -24875,8 +24948,8 @@ pub(crate) async fn refresh_profile_runtime_after_profile_update(
     state: &AppState,
     profile_id: &str,
     config_revision: Option<String>,
-) {
-    let _ = commit_profile_llm_runtime_transition(state, profile_id, config_revision).await;
+) -> ProfileLlmRuntimeTransition {
+    commit_profile_llm_runtime_transition(state, profile_id, config_revision).await
 }
 
 /// Resolve the canonical `SessionManager` handle for read operations
@@ -29381,6 +29454,41 @@ async fn handle_task_restart_from_node(
 
 // ----- UPCR-2026-009 / -010 / -011 handlers -----
 
+/// The tool name of each transcript row, by index (UPCR-2026-039): for a
+/// tool-result row, the name in the nearest earlier `tool_calls` entry with
+/// the row's `tool_call_id` (a provider can reuse an id in a later turn);
+/// `None` for every other row and for a result whose call the transcript no
+/// longer holds. One pass over the whole transcript, so a hydrate `after`
+/// cursor that skips the call row still names its result.
+fn hydrated_tool_names(messages: &[Message]) -> Vec<Option<String>> {
+    let mut names: HashMap<&str, &str> = HashMap::new();
+    messages
+        .iter()
+        .map(|msg| {
+            for call in msg.tool_calls.iter().flatten() {
+                names.insert(call.id.as_str(), call.name.as_str());
+            }
+            msg.tool_call_id
+                .as_deref()
+                .and_then(|id| names.get(id))
+                .map(|name| (*name).to_owned())
+        })
+        .collect()
+}
+
+/// A transcript row's tool calls as hydrate carries them (UPCR-2026-039):
+/// id and tool name, in call order, without the arguments.
+fn hydrated_tool_calls(msg: &Message) -> Vec<octos_core::ui_protocol::HydratedToolCall> {
+    msg.tool_calls
+        .iter()
+        .flatten()
+        .map(|call| octos_core::ui_protocol::HydratedToolCall {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+        })
+        .collect()
+}
+
 /// Recover the identity of a committed row after the legacy flat/per-user
 /// merge changes its display index. The ledger's persisted timestamp and
 /// typed owner are provenance; content/media only verify that provenance and
@@ -29804,12 +29912,15 @@ async fn handle_session_hydrate(
                 session
                     .messages
                     .iter()
+                    // Named over the whole transcript: `after` may skip the
+                    // row that made a result's call (UPCR-2026-039).
+                    .zip(hydrated_tool_names(&session.messages))
                     .enumerate()
                     .filter(|(seq, _)| match params.after.as_ref() {
                         Some(after) => *seq as u64 > after.seq,
                         None => true,
                     })
-                    .map(|(seq, msg)| {
+                    .map(|(seq, (msg, tool_name))| {
                         let canonical_identity = canonical_identities.get(&seq);
                         let seq = seq as u64;
                         // V2 clients get a transcript identity that matches
@@ -29856,6 +29967,12 @@ async fn handle_session_hydrate(
                             // re-render the same `.md` / `.mp3` / `.pptx`
                             // attachment carried by the v2 projection.
                             media: msg.media.clone(),
+                            // UPCR-2026-039: ungated like media. A client
+                            // without v2 tool envelopes (a stdio host) names
+                            // reloaded tool rows from these.
+                            tool_call_id: msg.tool_call_id.clone(),
+                            tool_name,
+                            tool_calls: hydrated_tool_calls(msg),
                         }
                     })
                     .collect::<Vec<_>>(),
@@ -30104,8 +30221,9 @@ async fn handle_session_rollback(
         let messages = session
             .messages
             .iter()
+            .zip(hydrated_tool_names(&session.messages))
             .enumerate()
-            .map(|(seq, msg)| HydratedMessage {
+            .map(|(seq, (msg, tool_name))| HydratedMessage {
                 seq: seq as u64,
                 role: msg.role.as_str().to_owned(),
                 content: msg.content.clone(),
@@ -30117,6 +30235,9 @@ async fn handle_session_rollback(
                 source: None,
                 reasoning_content: None,
                 media: msg.media.clone(),
+                tool_call_id: msg.tool_call_id.clone(),
+                tool_name,
+                tool_calls: hydrated_tool_calls(msg),
             })
             .collect::<Vec<_>>();
         let (threads, orphans) = build_thread_graph_entries(session);
@@ -44546,6 +44667,18 @@ fn workspace_not_writable_error(workspace: Option<&str>) -> RpcError {
 /// fault, so it gets its own `kind` (clients can render a remedy instead of a
 /// stack-shaped string) and the sentence names both ways out. `data.message`
 /// is rendered verbatim by clients, matching [`workspace_not_writable_error`].
+fn profile_runtime_switching_error(profile_id: &str) -> RpcError {
+    let sentence = format!(
+        "Profile '{profile_id}' is switching to its updated configuration while earlier \
+         work finishes; retry shortly."
+    );
+    RpcError::internal_error(sentence.clone()).with_data(json!({
+        "kind": "profile_runtime_switching",
+        "profile_id": profile_id,
+        "message": sentence,
+    }))
+}
+
 fn data_dir_locked_error(profile_id: &str, error: &eyre::Report) -> RpcError {
     let sentence = format!(
         "Can't start a session for profile '{profile_id}' — another octos process already \

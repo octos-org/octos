@@ -146,6 +146,33 @@ fn push_env_once(env: &mut Vec<(String, String)>, key: impl Into<String>, value:
     env.push((key, value));
 }
 
+/// Export the immutable, resolved runtime route, replacing raw profile metadata.
+pub(crate) fn apply_resolved_profile_llm_env(
+    env: &mut Vec<(String, String)>,
+    config: &Config,
+    config_revision: &str,
+) {
+    let values = [
+        (
+            "OCTOS_PROFILE_LLM_PROVIDER",
+            crate::runtime::profile::configured_provider_name(config),
+        ),
+        ("OCTOS_PROFILE_LLM_MODEL", config.model.clone()),
+        ("OCTOS_PROFILE_LLM_BASE_URL", config.base_url.clone()),
+        ("OCTOS_PROFILE_LLM_API_TYPE", config.api_type.clone()),
+        (
+            "OCTOS_PROFILE_LLM_CONFIG_REVISION",
+            Some(config_revision.to_string()),
+        ),
+    ];
+    env.retain(|(name, _)| !values.iter().any(|(key, _)| name == key));
+    env.extend(values.into_iter().filter_map(|(name, value)| {
+        value
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| (name.to_string(), value))
+    }));
+}
+
 pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = profile_search_provider_keys(profile)
         .into_iter()
@@ -1172,6 +1199,44 @@ mod tests {
         SearchProviderConfig, SlidesAppConfig, UserProfile,
     };
     use chrono::Utc;
+
+    #[test]
+    fn resolved_profile_llm_env_uses_runtime_config_and_replaces_stale_values() {
+        let mut config = Config {
+            provider: Some("google".into()),
+            model: Some("resolved-model".into()),
+            base_url: Some("https://example.invalid/v1beta".into()),
+            api_type: Some("gemini".into()),
+            ..Default::default()
+        };
+        let mut env = vec![
+            ("OCTOS_PROFILE_LLM_MODEL".into(), "stale".into()),
+            ("OCTOS_PROFILE_LLM_MODEL".into(), "duplicate".into()),
+            ("UNRELATED".into(), "retained".into()),
+        ];
+        apply_resolved_profile_llm_env(&mut env, &config, "revision-1");
+        let map: HashMap<_, _> = env.iter().cloned().collect();
+        assert_eq!(env.len(), map.len());
+        assert_eq!(map["OCTOS_PROFILE_LLM_PROVIDER"], "google");
+        assert_eq!(map["OCTOS_PROFILE_LLM_MODEL"], "resolved-model");
+        assert_eq!(
+            map["OCTOS_PROFILE_LLM_BASE_URL"],
+            "https://example.invalid/v1beta"
+        );
+        assert_eq!(map["OCTOS_PROFILE_LLM_API_TYPE"], "gemini");
+        assert_eq!(map["OCTOS_PROFILE_LLM_CONFIG_REVISION"], "revision-1");
+        assert_eq!(map["UNRELATED"], "retained");
+        config.provider = None;
+        config.model = Some("gemini-3.6-flash".into());
+        config.base_url = None;
+        config.api_type = None;
+        apply_resolved_profile_llm_env(&mut env, &config, "revision-2");
+        let map: HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(map["OCTOS_PROFILE_LLM_PROVIDER"], "gemini");
+        assert!(!map.contains_key("OCTOS_PROFILE_LLM_BASE_URL"));
+        assert!(!map.contains_key("OCTOS_PROFILE_LLM_API_TYPE"));
+        assert_eq!(map["OCTOS_PROFILE_LLM_CONFIG_REVISION"], "revision-2");
+    }
 
     #[test]
     fn profile_plugin_env_forwards_canonical_skill_env_without_arbitrary_secrets() {

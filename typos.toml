@@ -14,6 +14,9 @@ AttributeIDSupressMenu = "AttributeIDSupressMenu"
 # an invalid concurrency_class value. Allowlist the misspelling so
 # the typos lint doesn't flag the negative-test JSON literal.
 exlusive = "exlusive"
+# "OLL" (Octos Lesson Language): the learning-coach skill's tool names
+# (`oll_generate_lesson`) and output paths used by the acceptance tests.
+oll = "oll"
 # Don't correct the surname "Teh"
 teh = "teh"
 Hashi = "Hashi"

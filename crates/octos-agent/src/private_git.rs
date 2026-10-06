@@ -266,6 +266,25 @@ impl PrivateGitDir {
         self.dir.path().join("no-hooks")
     }
 
+    /// Render a path for embedding in a generated `.git/config` value.
+    ///
+    /// Git config values are quoted strings where a backslash starts an
+    /// escape sequence, so a bare Windows path (`C:\Users\...`) written
+    /// verbatim both breaks out of the quoting context and parses as
+    /// invalid escapes ("bad config line N"). Forward slashes are
+    /// accepted by git on every platform, including Git for Windows.
+    fn config_hooks_value(path: &std::path::Path) -> String {
+        // The kernel controls this path (a tempdir under its own data
+        // dir), so quotes/newlines are not agent-reachable; reject them
+        // anyway rather than emit a config line they could break.
+        let rendered = path.display().to_string().replace('\\', "/");
+        assert!(
+            !rendered.contains('"') && !rendered.contains('\n'),
+            "hooks path contains characters that cannot be embedded in a quoted config value: {rendered}"
+        );
+        rendered
+    }
+
     fn write_private_layout(&self) -> Result<()> {
         let root = self.dir.path();
         std::fs::create_dir_all(root.join("objects"))?;
@@ -277,13 +296,13 @@ impl PrivateGitDir {
         } else {
             "\trepositoryformatversion = 0\n"
         };
+        let hooks = Self::config_hooks_value(&self.missing_hooks_dir());
         let config = format!(
             "[core]\n{format}\tbare = false\n\tlogallrefupdates = false\n\tfsmonitor = false\n\
-             \thooksPath = {hooks}\n\tuntrackedCache = false\n\tsymlinks = true\n\
+             \thooksPath = \"{hooks}\"\n\tuntrackedCache = false\n\tsymlinks = true\n\
              [gc]\n\tauto = 0\n[maintenance]\n\tauto = false\n[commit]\n\tgpgSign = false\n\
              [tag]\n\tgpgSign = false\n[log]\n\tshowSignature = false\n\
              [user]\n\tname = Octos Workspace\n\temail = octos@local\n",
-            hooks = self.missing_hooks_dir().display(),
         );
         std::fs::write(root.join("config"), config)?;
         match (&self.head, &self.tip) {
@@ -453,6 +472,22 @@ mod tests {
         ] {
             assert!(!valid_branch_ref(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn should_render_config_hooks_value_without_backslashes() {
+        // A bare Windows path written into the generated config produced
+        // "bad config line 6" on every git invocation (#2662): the
+        // backslash starts an invalid config escape and the unquoted
+        // value could not contain spaces either.
+        let windowsish =
+            std::path::Path::new("C:\\Users\\runneradmin\\app\\.octos-git-1\\no-hooks");
+        let rendered = PrivateGitDir::config_hooks_value(windowsish);
+        assert_eq!(rendered, "C:/Users/runneradmin/app/.octos-git-1/no-hooks");
+        assert!(
+            !rendered.contains('\\'),
+            "backslashes must not survive: {rendered}"
+        );
     }
 
     #[cfg(unix)]

@@ -148,13 +148,20 @@ pub(crate) fn backoff_after(consecutive_failures: u32) -> Duration {
 /// releases the profile lock.
 pub struct MemoryRefreshService {
     shutdown: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Drop for MemoryRefreshService {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        self.task.abort();
+        if let Some(task) = self
+            .task
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
+        }
     }
 }
 
@@ -264,7 +271,26 @@ impl MemoryRefreshService {
                 }
             }
         });
-        Some(Self { shutdown, task })
+        Some(Self {
+            shutdown,
+            task: std::sync::Mutex::new(Some(task)),
+        })
+    }
+
+    /// Stop the sweep and wait until its task has released the profile lock,
+    /// so a replacement runtime that shares this profile's stores can take
+    /// ownership immediately. Idempotent.
+    pub async fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -1202,6 +1228,48 @@ mod tests {
             .unwrap();
         assert_eq!(report.candidates, 0);
         assert_eq!(provider.calls.load(Ordering::SeqCst), calls_before);
+    }
+
+    #[tokio::test]
+    async fn should_release_lock_after_shutdown_for_replacement_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        let provider = || -> Arc<dyn LlmProvider> {
+            Arc::new(ScriptedProvider {
+                response: "{}".to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                prompts: std::sync::Mutex::new(Vec::new()),
+            })
+        };
+        let first = MemoryRefreshService::try_start(
+            dir.path().to_path_buf(),
+            store.clone(),
+            provider(),
+            provider(),
+            knobs_for_test(),
+        )
+        .expect("first owner starts");
+        // Wait until the task has taken the lock fd into its own scope.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(acquire_refresh_lock(dir.path()).unwrap().is_none());
+        first.shutdown().await;
+        first.shutdown().await; // idempotent
+        let mut replacement = None;
+        for _ in 0..40 {
+            replacement = MemoryRefreshService::try_start(
+                dir.path().to_path_buf(),
+                store.clone(),
+                provider(),
+                provider(),
+                knobs_for_test(),
+            );
+            if replacement.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(replacement.is_some(), "replacement must own the sweep");
+        drop(first);
     }
 
     #[tokio::test]
