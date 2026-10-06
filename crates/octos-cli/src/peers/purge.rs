@@ -222,12 +222,12 @@ mod tests {
         assert_eq!(back.errors.len(), 1);
         // A pre-#2659 tombstone carries no errors field; the additive
         // default keeps old records loadable and reads as a clean purge.
-        let legacy_json = String::from(
-            "{\"slug\":\"news\",\"originator\":\"dev:api:host#system\","
-                + "\"memory_namespace\":\"app/news/acct-1\","
-                + "\"purged_at\":\"2026-09-30T00:00:00Z\"}",
+        let legacy_json = concat!(
+            "{\"slug\":\"news\",\"originator\":\"dev:api:host#system\",",
+            "\"memory_namespace\":\"app/news/acct-1\",",
+            "\"purged_at\":\"2026-09-30T00:00:00Z\"}",
         );
-        let legacy: PurgeTombstone = serde_json::from_str(&legacy_json).unwrap();
+        let legacy: PurgeTombstone = serde_json::from_str(legacy_json).unwrap();
         assert!(legacy.errors.is_empty());
     }
     fn tombstone(slug: &str) -> PurgeTombstone {
