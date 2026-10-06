@@ -200,4 +200,16 @@ async fn session_history_should_remember_existing_hints_but_not_create_empty_sto
         crate::runtime::workspace_history::load(&state.profiles["history-owner"].data_dir).unwrap(),
         vec![root]
     );
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&panel_user_profile("history-unconfigured"))
+        .unwrap();
+    let all = session_history::list(&state, &request, None).await.unwrap();
+    assert_eq!(all["total"], 1);
+    assert!(
+        all["unavailable_workspaces"].as_array().unwrap().is_empty(),
+        "An unrelated unconfigured profile must not mark accessible paths unavailable: {all}"
+    );
 }

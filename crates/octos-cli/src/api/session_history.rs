@@ -43,6 +43,7 @@ pub(super) async fn list(
     let mut stores = Vec::new();
     let mut unavailable = Vec::new();
     let mut scanned = Vec::new();
+    let mut available_hints = std::collections::HashSet::new();
     for profile in profiles {
         let data_dir = store.resolve_data_dir(&profile);
         stores.push((
@@ -92,6 +93,7 @@ pub(super) async fn list(
                 }
             };
             let project = crate::runtime::session::project_sessions_root(&canonical, &profile.id);
+            available_hints.insert(root.to_string_lossy().into_owned());
             scanned.push(canonical.to_string_lossy().into_owned());
             if project.join("sessions").is_dir() {
                 // A validated existing store becomes discoverable after a restart.
@@ -167,6 +169,9 @@ pub(super) async fn list(
     scanned.dedup();
     unavailable.sort();
     unavailable.dedup();
+    // These are path-level diagnostics. A profile without a runtime must
+    // not label a project unavailable when another authorized profile read it.
+    unavailable.retain(|root| !available_hints.contains(root));
     let next = offset.saturating_add(rows.1.len());
     Ok(
         json!({"sessions":rows.1,"total":rows.0,"next_offset":(next < rows.0).then_some(next),
