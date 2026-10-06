@@ -698,6 +698,7 @@ mod tests {
             ("local", &["llamacpp", "llama.cpp", "llama-server", "llama_server", "lmstudio", "lm-studio", "openai-compatible"], None, &[], Some("http://127.0.0.1:8080/v1"), false, false, false, &[]),
             ("minimax", &[], Some("MINIMAX_API_KEY"), &[], Some("https://api.minimax.io/v1"), true, false, false, &["minimax"]),
             ("minimax-cn", &["minimaxi"], Some("MINIMAX_CN_API_KEY"), &["MINIMAX_API_KEY"], Some("https://api.minimaxi.com/v1"), true, false, false, &[]),
+            ("minimax-coding", &["minimax-m-plan", "minimax-token-plan"], Some("MINIMAX_CODING_API_KEY"), &[], Some("https://api.minimax.io/v1"), true, false, false, &[]),
             ("moonshot", &["kimi"], Some("MOONSHOT_API_KEY"), &["KIMI_API_KEY"], Some("https://api.moonshot.ai/v1"), true, false, false, &["kimi", "moonshot"]),
             ("moonshot-coding", &["kimi-coding"], Some("KIMI_CODING_API_KEY"), &["KIMI_API_KEY", "MOONSHOT_API_KEY"], Some("https://api.kimi.com/coding/v1"), true, false, false, &[]),
             ("nvidia", &["nim"], Some("NVIDIA_API_KEY"), &[], Some("https://integrate.api.nvidia.com/v1"), true, false, false, &[]),

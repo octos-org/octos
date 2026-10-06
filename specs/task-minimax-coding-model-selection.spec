@@ -22,6 +22,7 @@ back preserves both configurations and does not require another server restart.
 
 - `minimax_coding_uses_subscription_key_and_latest_plan_model`
 - `every_family_with_a_default_resolves_it_from_the_catalog`
+- `every_entry_pins_its_user_facing_configuration_surface`
 - `minimax_coding_catalog_advertises_subscription_route_and_flash_preview`
 - `minimax_coding_select_reloads_startup_session_and_switches_back`
 - `llm_select_rejects_keyless_models_before_persisting`
