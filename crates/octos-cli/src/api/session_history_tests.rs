@@ -42,6 +42,15 @@ async fn session_history_should_isolate_profiles_and_paginate() {
             )
             .await
             .unwrap();
+        // A context whose binding is unavailable must fail closed, never
+        // become ordinary account history even if its transcript remains.
+        manager
+            .add_message(
+                &SessionKey(format!("{id}:api:app#peerctx-missing.context")),
+                octos_core::Message::user("host context"),
+            )
+            .await
+            .unwrap();
     }
     let request = RpcRequest::new(
         "history",
