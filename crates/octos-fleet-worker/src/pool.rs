@@ -1301,8 +1301,8 @@ mod tests {
 
     // ---- PR C: worktree workers on the operator's FsGrant::Host ----
 
-    // POSIX-sh contract: drives the worker's `sh -c` command strings
-    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_runs_worker_in_git_worktree_and_keeps_branch() {
@@ -1376,8 +1376,8 @@ mod tests {
         );
     }
 
-    // POSIX-sh contract: drives the worker's `sh -c` command strings
-    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
     #[cfg(unix)]
     #[tokio::test]
     async fn dispatch_reconciles_preexisting_worktree_on_relaunch() {
@@ -1603,8 +1603,8 @@ mod tests {
         );
     }
 
-    // POSIX-sh contract: drives the worker's `sh -c` command strings
-    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
     #[cfg(unix)]
     #[tokio::test]
     async fn worktree_deliverable_autocommitted_even_without_worker_commit() {
@@ -1802,8 +1802,8 @@ mod tests {
         );
     }
 
-    // POSIX-sh contract: drives the worker's `sh -c` command strings
-    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_dispatch_of_one_task_does_not_corrupt_the_worktree() {
@@ -1868,8 +1868,8 @@ mod tests {
         );
     }
 
-    // POSIX-sh contract: drives the worker's `sh -c` command strings
-    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn escalation_to_host_upgrades_next_attempt_to_a_worktree_worker() {
@@ -2073,8 +2073,8 @@ mod tests {
         );
     }
 
-    // POSIX-sh contract: drives the worker's `sh -c` command strings
-    // (`populate`/`deliverable_commit_command`), which `cmd /C` cannot run.
+    // POSIX-sh contract: the attempt settles via `deliverable_commit_command` —
+    // a multi-clause POSIX sh string `cmd /C` cannot run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hung_deliverable_commit_is_killed_at_deadline() {
