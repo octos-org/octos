@@ -39894,6 +39894,136 @@ fn resolve_peer_lane_provider_none_for_unmatched_lane() {
     );
 }
 
+/// #2674 — the effective-model projection: a recorded lane keeps its own
+/// identity, everything else reports the profile's primary, and the bare
+/// `{lane: "primary"}` shape only remains when no primary is resolvable.
+#[test]
+fn peer_effective_model_reports_the_recorded_lane_identity() {
+    let lanes = [test_sub_provider("strong", "gpt-4o")];
+    let primary = Some(("openai".to_string(), "gpt-4o-mini".to_string()));
+    assert_eq!(
+        peer_effective_model_json(&lanes, Some("strong"), primary.as_ref()),
+        json!({ "lane": "strong", "provider": "openai", "model": "gpt-4o" })
+    );
+}
+
+#[test]
+fn peer_effective_model_reports_the_profile_primary_when_no_lane_is_recorded() {
+    let lanes = [test_sub_provider("strong", "gpt-4o")];
+    let primary = Some(("openai".to_string(), "gpt-4o-mini".to_string()));
+    assert_eq!(
+        peer_effective_model_json(&lanes, None, primary.as_ref()),
+        json!({ "lane": "primary", "provider": "openai", "model": "gpt-4o-mini" })
+    );
+}
+
+#[test]
+fn peer_effective_model_reports_the_primary_when_the_recorded_lane_vanished() {
+    let lanes = [test_sub_provider("strong", "gpt-4o")];
+    let primary = Some(("openai".to_string(), "gpt-4o-mini".to_string()));
+    assert_eq!(
+        peer_effective_model_json(&lanes, Some("turbo"), primary.as_ref()),
+        json!({ "lane": "primary", "provider": "openai", "model": "gpt-4o-mini" })
+    );
+}
+
+#[test]
+fn peer_effective_model_stays_bare_without_a_resolvable_primary() {
+    let lanes = [test_sub_provider("strong", "gpt-4o")];
+    assert_eq!(
+        peer_effective_model_json(&lanes, None, None),
+        json!({ "lane": "primary" })
+    );
+}
+
+fn test_sub_provider(key: &str, model: &str) -> crate::config::SubProviderConfig {
+    serde_json::from_value(json!({
+        "key": key,
+        "provider": "openai",
+        "model": model,
+    }))
+    .unwrap()
+}
+
+fn test_llm_primary() -> crate::profiles::LlmProfileConfig {
+    crate::profiles::LlmProfileConfig {
+        primary: Some(crate::profiles::LlmModelSelectionConfig {
+            family_id: Some("openai".to_string()),
+            model_id: Some("gpt-4o-mini".to_string()),
+            ..Default::default()
+        }),
+        fallbacks: Vec::new(),
+    }
+}
+
+/// #2674 — without a bootstrapped runtime the view falls back to the stored
+/// profile: the identity from `llm.primary`, the lanes from the profile's own
+/// `sub_providers`.
+#[test]
+fn profile_peer_model_view_falls_back_to_the_stored_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let mut profile = profile_for_runtime_message("stored-primary");
+    profile.config.llm = Some(test_llm_primary());
+    profile.config.sub_providers = vec![test_sub_provider("strong", "gpt-4o")];
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+    let (lanes, primary) = profile_peer_model_view(&state, "stored-primary");
+    assert_eq!(lanes.len(), 1, "the profile's own lanes");
+    assert_eq!(
+        primary,
+        Some(("openai".to_string(), "gpt-4o-mini".to_string()))
+    );
+}
+
+#[test]
+fn profile_peer_model_view_is_empty_without_llm_primary_or_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let profile = profile_for_runtime_message("bare-primary");
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+    assert_eq!(profile_peer_model_view(&state, "bare-primary").1, None);
+    assert_eq!(profile_peer_model_view(&state, "ghost").1, None);
+}
+
+/// #2674 — a sub-account runs on its parent's primary, so its identity is
+/// inherited through the store's resolution while its LANES deliberately
+/// stay its own (never inherited).
+#[test]
+fn profile_peer_model_view_inherits_the_parent_primary_for_a_sub_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let mut parent = profile_for_runtime_message("parent-org");
+    parent.config.llm = Some(test_llm_primary());
+    parent.config.sub_providers = vec![test_sub_provider("strong", "gpt-4o")];
+    let mut child = profile_for_runtime_message("child-assist");
+    child.parent_id = Some("parent-org".to_string());
+    {
+        let store = state.profile_store.as_ref().unwrap();
+        store.save(&parent).unwrap();
+        store.save(&child).unwrap();
+    }
+    let (lanes, primary) = profile_peer_model_view(&state, "child-assist");
+    assert!(
+        lanes.is_empty(),
+        "lanes stay the sub-account's own (never inherited)"
+    );
+    assert_eq!(
+        primary,
+        Some(("openai".to_string(), "gpt-4o-mini".to_string())),
+        "the primary identity is inherited from the parent"
+    );
+}
+
 /// #peer-model (part 3): a peer with NO recorded lane falls back to the
 /// primary model (None) even when lanes are configured.
 #[test]
