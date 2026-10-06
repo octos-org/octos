@@ -4503,6 +4503,108 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
 }
 
 #[test]
+fn appui_prompt_context_bridge_reports_live_context_state_when_negotiated() {
+    use octos_core::ui_protocol::UiNotification;
+
+    let session_id = SessionKey::new("api", "context-state-reported");
+    let history = vec![
+        test_message(MessageRole::User, "old request"),
+        test_message(MessageRole::Assistant, "old answer"),
+    ];
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let dir = tempfile::tempdir().unwrap();
+    let events: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = events.clone();
+    let bridge =
+        AppUiPromptContextBridge::new(session_id.clone(), dir.path().to_path_buf(), manager, false)
+            .with_context_lifecycle_notify(Arc::new(move |notification| {
+                sink.lock().unwrap().push(notification);
+            }))
+            .with_context_state_updates(true);
+    let request = |phase: PromptContextPhase, iteration: u32| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".to_string(),
+        model_id: "large-context".to_string(),
+        context_window: 16_000,
+    };
+
+    // Turn start: the first report of the turn always goes out and carries
+    // the PROMPT estimate the bridge just built, not the transcript's.
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history.clone());
+    prompt.push(test_message(MessageRole::User, "current request"));
+    let report = bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("prepare prompt");
+    let reported: Vec<_> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            UiNotification::ContextStateReported(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reported.len(), 1, "one live state report at turn start");
+    assert_eq!(reported[0].session_id, session_id);
+    assert_eq!(reported[0].iteration, 1);
+    assert_eq!(
+        reported[0].context_state.token_estimate,
+        report
+            .token_estimate
+            .expect("bridge reports a prompt estimate"),
+        "the gauge must show the projected prompt size"
+    );
+    assert!(reported[0].threshold_tokens > 0);
+
+    // Next iteration with an unchanged prompt: no movement, no report.
+    let mut same = prompt.clone();
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut same)
+        .expect("prepare prompt");
+    let count = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, UiNotification::ContextStateReported(_)))
+        .count();
+    assert_eq!(count, 1, "an unmoved estimate is not re-reported");
+
+    // Without the negotiated feature nothing is emitted at all.
+    let quiet: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+    let quiet_sink = quiet.clone();
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let unnegotiated =
+        AppUiPromptContextBridge::new(session_id.clone(), dir.path().to_path_buf(), manager, false)
+            .with_context_lifecycle_notify(Arc::new(move |notification| {
+                quiet_sink.lock().unwrap().push(notification);
+            }));
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history);
+    prompt.push(test_message(MessageRole::User, "current request"));
+    unnegotiated
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("prepare prompt");
+    assert!(
+        !quiet
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, UiNotification::ContextStateReported(_))),
+        "context/state_reported is strictly opt-in"
+    );
+}
+
+#[test]
 fn appui_prompt_context_bridge_preserves_current_user_turn() {
     let session_id = SessionKey::new("api", "context-current-user");
     let history = vec![
@@ -11118,8 +11220,11 @@ async fn profile_llm_fetch_models_zai_never_gets_a_bearer_v1_models_probe() {
     let (root, captured) =
         spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"glm-5.2"},{"id":"glm-4.7"}]}"#).await;
     let state = Arc::new(AppState::empty_for_tests());
-    // Saved AppUI routes default api_type to "openai" — exactly the shape
-    // that used to force the Bearer /v1/models probe onto zai.
+    // Saved AppUI routes default api_type to "openai". The zai family now
+    // speaks OpenAI Chat Completions on the versioned `/api/paas/v4` root
+    // (the only Z.AI root that reports its implicit prompt cache), so the
+    // probe is the OpenAI listing off THAT root — `/models`, never a
+    // synthesized `/v4/v1/models` — with Bearer auth.
     let request = RpcRequest::new(
         "1",
         APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
@@ -11128,7 +11233,7 @@ async fn profile_llm_fetch_models_zai_never_gets_a_bearer_v1_models_probe() {
                 "family_id": "zai",
                 "route": {
                     "route_id": "official",
-                    "base_url": format!("{root}/api/anthropic"),
+                    "base_url": format!("{root}/api/paas/v4"),
                     "api_type": "openai"
                 }
             },
@@ -11144,12 +11249,12 @@ async fn profile_llm_fetch_models_zai_never_gets_a_bearer_v1_models_probe() {
     assert_eq!(result["models"], json!(["glm-4.7", "glm-5.2"]));
     let requests = captured.lock().await;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].path, "/api/anthropic/v1/models");
-    assert!(
-        requests[0].authorization.is_none(),
-        "zai speaks the Anthropic Messages protocol — never a Bearer probe"
+    assert_eq!(requests[0].path, "/api/paas/v4/models");
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer zai-secret-key"),
+        "zai speaks OpenAI Chat Completions — Bearer auth on the listing probe"
     );
-    assert_eq!(requests[0].x_api_key.as_deref(), Some("zai-secret-key"));
 }
 
 #[tokio::test]
@@ -14348,6 +14453,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -14421,6 +14527,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -14539,6 +14646,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -14612,6 +14720,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -14678,6 +14787,7 @@ fn shell_approval_still_emits_risk_field() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -14789,6 +14899,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -19164,6 +19275,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             review_start_v1: false,
             context_lifecycle_v1: false,
             context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -19519,7 +19631,7 @@ fn semantic_cache_fields_are_absent_from_unnegotiated_session_open_payload() {
 }
 
 #[test]
-fn semantic_cache_fields_are_gated_on_compaction_and_normalization_payloads() {
+fn semantic_cache_fields_are_gated_on_compaction_normalization_and_state_payloads() {
     let session_id = SessionKey("local:semantic-events".into());
     let mut compaction = context_compaction_completed_for(&session_id);
     let UiNotification::ContextCompactionCompleted(compaction_event) = &mut compaction else {
@@ -19532,12 +19644,21 @@ fn semantic_cache_fields_are_gated_on_compaction_and_normalization_payloads() {
         unreachable!()
     };
     normalization_event.context_state = semantic_context_state_for_test(&session_id);
+    let mut state_reported = context_state_reported_for(&session_id);
+    let UiNotification::ContextStateReported(state_reported_event) = &mut state_reported else {
+        unreachable!()
+    };
+    state_reported_event.context_state = semantic_context_state_for_test(&session_id);
 
     let lifecycle_only = ConnectionUiFeatures::from_requested_feature_tokens(
         [UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1],
         true,
     );
-    for notification in [compaction.clone(), normalization.clone()] {
+    for notification in [
+        compaction.clone(),
+        normalization.clone(),
+        state_reported.clone(),
+    ] {
         let projected = context_event_for_features(
             UiProtocolLedgerEvent::Notification(notification),
             lifecycle_only,
@@ -19556,7 +19677,7 @@ fn semantic_cache_fields_are_gated_on_compaction_and_normalization_payloads() {
         ],
         true,
     );
-    for notification in [compaction, normalization] {
+    for notification in [compaction, normalization, state_reported] {
         let projected = context_event_for_features(
             UiProtocolLedgerEvent::Notification(notification),
             negotiated,
@@ -29126,6 +29247,15 @@ fn context_normalization_reported_for(session: &SessionKey) -> UiNotification {
     })
 }
 
+fn context_state_reported_for(session: &SessionKey) -> UiNotification {
+    UiNotification::ContextStateReported(octos_core::ui_protocol::ContextStateReportedEvent {
+        session_id: session.clone(),
+        context_state: context_state_for_test(session),
+        threshold_tokens: 100_000,
+        iteration: 3,
+    })
+}
+
 /// Builds the canonical background-result projection emitted by the
 /// post-commit observer.
 fn background_child_v2_for(session: &SessionKey) -> UiNotification {
@@ -29439,6 +29569,41 @@ fn capability_filter_routes_context_lifecycle_gating() {
     assert!(
         live_event_passes_capability_filter(&normalization, new),
         "clients with context.lifecycle.v1 receive normalization events",
+    );
+
+    // `context/state_reported` additionally needs an explicit
+    // `context.state.v1`: lifecycle-only, header-less legacy and
+    // lifecycle-less connections never receive it, live or on replay.
+    let state_reported = UiProtocolLedgerEvent::Notification(context_state_reported_for(&session));
+    let legacy_no_header = ConnectionUiFeatures::default();
+    assert!(legacy_no_header.context_lifecycle_available());
+    for (features, label) in [
+        (old, "no context.lifecycle.v1"),
+        (new, "lifecycle-only"),
+        (legacy_no_header, "header-less legacy"),
+    ] {
+        assert!(
+            !live_event_passes_capability_filter(&state_reported, features),
+            "{label} connections must not receive context/state_reported",
+        );
+    }
+    let state = ConnectionUiFeatures {
+        context_lifecycle_v1: true,
+        context_state_v1: true,
+        header_present: true,
+        ..ConnectionUiFeatures::default()
+    };
+    assert!(
+        live_event_passes_capability_filter(&state_reported, state),
+        "clients with context.state.v1 receive context/state_reported",
+    );
+    let state_without_lifecycle = ConnectionUiFeatures {
+        context_lifecycle_v1: false,
+        ..state
+    };
+    assert!(
+        !live_event_passes_capability_filter(&state_reported, state_without_lifecycle),
+        "context.state.v1 without its parent lifecycle capability is not enough",
     );
 }
 
@@ -31342,6 +31507,225 @@ async fn v2_terminal_waits_behind_canonical_persist_on_session_forwarder() {
     assert_eq!(payload_types, ["assistant_persisted", "turn_terminal"]);
 
     abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// Install the per-session live forwarder that `handle_session_open` gives a
+/// connection, keeping the connection's negotiated features. Turn terminals
+/// reach the wire only through it, so a test that drives turn handlers
+/// without `session/open` installs it before waiting for one.
+async fn install_session_forwarder(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+) -> SharedLiveForwarders {
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ws.snapshot_live_features(),
+        None,
+        None,
+        ledger.subscribe(session_id),
+        forwarders.clone(),
+    )
+    .await;
+    forwarders
+}
+
+/// The same ordering must hold on a connection that never negotiated
+/// `projection.envelope.v2` — every `octos serve --stdio` connection starts
+/// that way. A lifecycle row projected to v2 at send time used to be
+/// direct-sent there, overtaking the turn's `assistant_delta` rows still
+/// queued on the session forwarder: the client saw seq 1..15, then the
+/// `turn_terminal` (48), then 16..47, breaking the strictly monotonic
+/// per-thread `seq` and the § 14.6 barrier.
+async fn assert_projected_row_follows_queued_deltas(
+    expected_last: &str,
+    send_projected: impl FnOnce(&WsConnection, &UiProtocolLedger, &SessionKey, TurnId),
+) {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(64);
+    let ws = WsConnection::new_stdio(writer_tx);
+    assert!(
+        !ws.snapshot_live_features().projection_envelope_v2,
+        "a stdio connection starts without projection.envelope.v2"
+    );
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let session_id = SessionKey("local:non-v2-projection-order".into());
+    let turn_id = TurnId::new();
+    let thread_id = turn_id.0.to_string();
+    let forwarders = install_session_forwarder(&ws, &ledger, &session_id).await;
+
+    // The answer streams as native v2 rows. Nothing yields before the
+    // projected row is sent, so all of them are still queued on the
+    // forwarder — the window a live turn hits.
+    const DELTAS: u64 = 4;
+    for index in 0..DELTAS {
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                thread_id.clone(),
+                PayloadV2::AssistantDelta {
+                    text: format!("part {index} "),
+                    assistant_segment_id: format!("{thread_id}:assistant:1"),
+                },
+                None,
+            )
+            .expect("assistant delta row");
+    }
+    send_projected(&ws, ledger.as_ref(), &session_id, turn_id);
+
+    let mut wire = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while wire.len() <= DELTAS as usize {
+        match writer_rx.try_recv() {
+            Ok(WsMessage::Text(text)) => {
+                let value: Value = serde_json::from_str(text.as_str()).expect("valid JSON frame");
+                if value["method"] == "projection/envelope"
+                    && value["params"]["thread_id"] == thread_id
+                {
+                    wire.push((
+                        value["params"]["seq"].as_u64().expect("envelope seq"),
+                        value["params"]["payload"]["type"]
+                            .as_str()
+                            .expect("v2 payload type")
+                            .to_owned(),
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "every envelope of the turn arrives: {wire:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+    let seqs: Vec<u64> = wire.iter().map(|(seq, _)| *seq).collect();
+    assert_eq!(
+        seqs,
+        (1..=DELTAS + 1).collect::<Vec<_>>(),
+        "per-thread seq must be strictly monotonic on the wire: {wire:?}"
+    );
+    assert_eq!(
+        wire.last().map(|(_, kind)| kind.as_str()),
+        Some(expected_last),
+        "the projected row follows every queued delta: {wire:?}"
+    );
+
+    // Delivered exactly once: nothing else arrives for the thread.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        writer_rx.try_iter().all(|frame| match frame {
+            WsMessage::Text(text) => serde_json::from_str::<Value>(text.as_str())
+                .map(|value| value["params"]["thread_id"] != thread_id)
+                .unwrap_or(true),
+            _ => true,
+        }),
+        "the projected row must be delivered exactly once"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+#[tokio::test]
+async fn should_deliver_turn_terminal_after_queued_envelopes_when_v2_not_negotiated() {
+    assert_projected_row_follows_queued_deltas(
+        "turn_terminal",
+        |ws, ledger, session_id, turn_id| {
+            send_notification_lifecycle(
+                ws,
+                ledger,
+                UiNotification::TurnCompleted(TurnCompletedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id,
+                    cursor: None,
+                    tokens_in: Some(3),
+                    tokens_out: Some(2),
+                    session_result: None,
+                    token_usage: None,
+                }),
+            )
+            .expect("terminal accepted");
+        },
+    )
+    .await;
+}
+
+/// `send_notification_durable` projects the same lifecycle sources (here a
+/// file attachment), so it must not direct-send them past queued rows either.
+#[tokio::test]
+async fn should_deliver_durable_file_attached_after_queued_envelopes() {
+    assert_projected_row_follows_queued_deltas(
+        "file_attached",
+        |ws, ledger, session_id, turn_id| {
+            send_notification_durable(
+                ws,
+                ledger,
+                UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id,
+                    path: "/tmp/answer.pdf".into(),
+                    tool_call_id: None,
+                    attachment_owner: None,
+                    mime: Some("application/pdf".into()),
+                }),
+            )
+            .expect("attachment accepted");
+        },
+    )
+    .await;
+}
+
+/// Without a live forwarder for the session nothing would deliver an
+/// untagged terminal, so it keeps the direct lane: a `turn/start` without
+/// `session/open` still gets its terminal live, and so does a session whose
+/// forwarder was retired.
+#[tokio::test]
+async fn should_direct_send_turn_terminal_when_session_has_no_forwarder() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(8);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let unopened = SessionKey("local:unopened-terminal".into());
+    let retired = SessionKey("local:retired-forwarder-terminal".into());
+    let forwarders = install_session_forwarder(&ws, &ledger, &retired).await;
+    // Let the forwarder start before retiring it, as a live one would have.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    abort_live_forwarders(&forwarders, &ledger).await;
+
+    for session_id in [unopened, retired] {
+        let turn_id = TurnId::new();
+        send_notification_lifecycle(
+            &ws,
+            &ledger,
+            UiNotification::TurnCompleted(TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: Some(3),
+                tokens_out: Some(2),
+                session_result: None,
+                token_usage: None,
+            }),
+        )
+        .expect("terminal delivered");
+        // Already on the writer without yielding: no forwarder is involved.
+        let Ok(WsMessage::Text(text)) = writer_rx.try_recv() else {
+            panic!("the terminal for {session_id:?} must be written directly");
+        };
+        let value: Value = serde_json::from_str(text.as_str()).expect("valid JSON frame");
+        assert_eq!(value["method"], "projection/envelope", "{session_id:?}");
+        assert_eq!(value["params"]["thread_id"], turn_id.0.to_string());
+        assert_eq!(value["params"]["payload"]["type"], "turn_terminal");
+    }
+    assert!(writer_rx.try_recv().is_err(), "each terminal is sent once");
 }
 
 /// There is no old-client persisted-message fallback: background results
@@ -38470,9 +38854,9 @@ fn config_with_lane(key: &str) -> crate::config::Config {
 /// RECOMMENDED `sub_providers` shape: `provider: "zai"`, `model: "glm-5.2"`,
 /// explicit `api_key_env: "ZAI_API_KEY"` (whose credential is seeded offline
 /// through `env_vars`), and NO `base_url` / `api_type` — the zai registry
-/// entry supplies both defaults (`https://api.z.ai/api/anthropic`, Anthropic
-/// Messages protocol) and returns the provider directly without an `api_type`
-/// dispatch.
+/// entry supplies both defaults (`https://api.z.ai/api/paas/v4`, OpenAI Chat
+/// Completions protocol) and returns the provider directly without an
+/// `api_type` dispatch.
 fn config_with_zai_lane() -> crate::config::Config {
     let mut config = crate::config::Config::default();
     config
@@ -39576,12 +39960,12 @@ fn zai_lane_peer_handoff_hit_records_and_resolves_zai_glm52() {
 
     let provider = resolve_peer_lane_provider(&peers_root, &staged.slug, &config)
         .expect("a recorded zai lane resolves a provider");
-    assert_eq!(provider.provider_name(), "zai");
+    assert_eq!(provider.provider_name(), "zai@api");
     assert_eq!(provider.model_id(), "glm-5.2");
 }
 
 /// #19-S2 (zai lane config shape): the recommended zai lane selects and
-/// builds to the zai registry provider (Anthropic Messages protocol, default
+/// builds to the zai registry provider (OpenAI Chat Completions on the versioned Z.AI root, default
 /// base URL) even when the PRIMARY profile config points at another provider
 /// — the lane keeps its own `ZAI_API_KEY` credential, never borrows the
 /// primary's.
@@ -39613,7 +39997,7 @@ fn zai_lane_config_selects_and_builds_zai_glm52_provider() {
 
     let provider =
         build_peer_lane_provider(&config, "zai").expect("the zai lane builds a provider");
-    assert_eq!(provider.provider_name(), "zai");
+    assert_eq!(provider.provider_name(), "zai@api");
     assert_eq!(provider.model_id(), "glm-5.2");
 }
 
@@ -39680,7 +40064,7 @@ fn zai_lane_peer_handoff_miss_warns_and_falls_back_to_primary() {
 
 /// #19-S3 — REAL-machine three-layer acceptance probe for the zai GLM-5.2
 /// peer model lane. NOT a mock: drives the full lane path and makes ONE real
-/// LLM call to `https://api.z.ai/api/anthropic`. Gated `#[ignore]` so CI never
+/// LLM call to `https://api.z.ai/api/paas/v4`. Gated `#[ignore]` so CI never
 /// needs the key; run explicitly with the key in env:
 ///   ZAI_API_KEY=… cargo test -p octos-cli --lib --features api -- \
 ///     --ignored --exact \
@@ -44363,6 +44747,48 @@ fn should_not_advertise_semantic_cache_before_stdio_client_hello() {
 }
 
 #[test]
+fn should_only_advertise_context_state_when_the_client_requested_it() {
+    use octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1;
+
+    // Stdio before `client_hello`: unknown client, never claimed.
+    let defaults = ConnectionUiFeatures::stdio_defaults();
+    assert!(!defaults.context_state_available());
+    assert!(
+        !defaults
+            .negotiated_capabilities()
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+    );
+
+    // Requested alongside the parent lifecycle feature: honoured.
+    let requested = ConnectionUiFeatures::from_requested_feature_tokens(
+        [
+            UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1,
+        ],
+        false,
+    );
+    assert!(requested.context_state_available());
+    assert!(
+        requested
+            .negotiated_capabilities()
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+    );
+
+    // Requested WITHOUT the parent lifecycle feature: not available, since
+    // the event is a lifecycle payload.
+    let orphan = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1],
+        false,
+    );
+    assert!(!orphan.context_state_available());
+    assert!(
+        !orphan
+            .negotiated_capabilities()
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+    );
+}
+
+#[test]
 fn should_surface_all_failed_lanes_when_composite_summary_wraps_a_typed_llm_error() {
     let summary = "all lanes failed: moonshot-coding@api/k3 (api_style=openai_chat_completions): \
                    API error (moonshot-coding@api/k3): HTTP 500 upstream exploded; \
@@ -46287,8 +46713,13 @@ fn should_bar_session_scoped_connections_from_server_shutdown() {
 // UPCR-2026-031 wiring: a REAL `turn/start` held inside its admission window
 // (after the marker, before the registry insert) must not be reported as
 // certainly not running — under the raw id and, for a topic turn, the folded
-// id the registry keys on. Deleting the marker wiring fails these.
-async fn state_get_during_held_admission(topic: Option<&str>) -> (Value, Value, Value) {
+// id the registry keys on. Deleting the marker wiring fails these. Callers
+// that pass `true` additionally ride the release: the start must settle at a
+// terminal notification and its recorded state must stay queryable after.
+async fn state_get_during_held_admission(
+    topic: Option<&str>,
+    await_settlement: bool,
+) -> (Value, Value, Value, Option<Value>) {
     let temp = tempfile::TempDir::new().expect("temp dir");
     let provider = Arc::new(AppuiContinuationLlm::new("done"));
     let (state, _profile_runtime) =
@@ -46299,7 +46730,7 @@ async fn state_get_during_held_admission(topic: Option<&str>) -> (Value, Value, 
     let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
     let ledger = Arc::new(UiProtocolLedger::new(64));
     let contracts = Arc::new(UiProtocolContractStores::default());
-    let (ws, _rx) = ws_connection_for_test(256);
+    let (ws, mut start_rx) = ws_connection_for_test(256);
     // Make the session known to the same manager `turn/state/get` consults,
     // as any open session is.
     for sid in std::iter::once(&session_id).chain(folded.as_ref()) {
@@ -46372,22 +46803,55 @@ async fn state_get_during_held_admission(topic: Option<&str>) -> (Value, Value, 
         },
     );
     let probe = async {
-        reached.notified().await;
+        tokio::time::timeout(waiting_budget(Duration::from_secs(5)), reached.notified())
+            .await
+            .expect("the held turn/start must reach its admission pause");
         let raw = query(session_id.clone(), turn_id.clone()).await;
         let folded_frame = match folded.clone() {
             Some(f) => query(f, turn_id.clone()).await,
             None => raw.clone(),
         };
         release.notify_one();
-        (raw, folded_frame)
+        if !await_settlement {
+            return (raw, folded_frame, None);
+        }
+        tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+            loop {
+                let frame = recv_rpc_json(&mut start_rx).await;
+                let method = frame.get("method").and_then(Value::as_str);
+                let is_v2_terminal = method == Some("projection/envelope")
+                    && frame
+                        .get("params")
+                        .and_then(|p| p.get("payload"))
+                        .and_then(|p| p.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("turn_terminal");
+                if method == Some("turn/completed")
+                    || method == Some("turn/error")
+                    || is_v2_terminal
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the released turn must settle");
+        // A topic turn's record lives under the folded key the handler
+        // splices in, so ask by the same key the start itself used.
+        let post = query(
+            folded.clone().unwrap_or(session_id.clone()),
+            turn_id.clone(),
+        )
+        .await;
+        (raw, folded_frame, Some(post))
     };
-    let (_, (raw, folded_frame)) = tokio::join!(start, probe);
-    (control, raw, folded_frame)
+    let (_, (raw, folded_frame, post)) = tokio::join!(start, probe);
+    (control, raw, folded_frame, post)
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn should_withhold_not_running_while_a_real_turn_start_is_mid_admission() {
-    let (control, raw, _) = state_get_during_held_admission(None).await;
+    let (control, raw, _, _) = state_get_during_held_admission(None, false).await;
     assert_eq!(control["result"]["running"], false, "control: {control}");
     assert_eq!(raw["result"]["state"], "unknown", "held: {raw}");
     assert!(raw["result"].get("running").is_none(), "held: {raw}");
@@ -46395,12 +46859,27 @@ async fn should_withhold_not_running_while_a_real_turn_start_is_mid_admission() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn should_withhold_not_running_for_a_topic_turn_asked_by_its_folded_id() {
-    let (control, raw, folded) = state_get_during_held_admission(Some("t1")).await;
+    let (control, raw, folded, _) = state_get_during_held_admission(Some("t1"), false).await;
     assert_eq!(control["result"]["running"], false, "control: {control}");
     for frame in [&raw, &folded] {
         assert_eq!(frame["result"]["state"], "unknown", "held: {frame}");
         assert!(frame["result"].get("running").is_none(), "held: {frame}");
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_surface_the_recorded_state_once_a_held_admission_proceeds() {
+    let (control, _, _, post) = state_get_during_held_admission(None, true).await;
+    assert_eq!(control["result"]["running"], false, "control: {control}");
+    let post = post.expect("settlement caller receives the post frame");
+    assert_eq!(
+        post["result"]["state"], "completed",
+        "the released turn must proceed to a queryable record: {post}"
+    );
+    assert!(
+        post["result"].get("running").is_none(),
+        "a recorded terminal turn must not claim `running: false`: {post}"
+    );
 }
 
 /// A scripted model that keeps calling `read_file`, driving a REAL

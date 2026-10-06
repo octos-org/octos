@@ -39,6 +39,11 @@ pub(crate) struct PurgeTombstone {
     pub(crate) memory_namespace: String,
     /// RFC 3339.
     pub(crate) purged_at: String,
+    /// The erase steps that failed, if any: a purge with residue records
+    /// them here so retries and audits can see the job was partial
+    /// (#2659) instead of presenting an unconditional `already_purged`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) errors: Vec<String>,
 }
 
 impl PurgeTombstone {
@@ -202,6 +207,29 @@ mod tests {
         assert!(!remove_tree_within(&root, &root.join("gone")).unwrap());
     }
 
+    #[test]
+    fn tombstone_errors_round_trip_and_old_format_defaults_empty() {
+        let mut t = tombstone("news");
+        assert!(t.errors.is_empty(), "a clean purge carries no errors");
+        t.errors
+            .push(String::from("memory namespace: remove failed"));
+        let rendered = serde_json::to_string(&t).unwrap();
+        assert!(
+            rendered.contains("memory namespace: remove failed"),
+            "errors must be recorded on the tombstone"
+        );
+        let back: PurgeTombstone = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(back.errors.len(), 1);
+        // A pre-#2659 tombstone carries no errors field; the additive
+        // default keeps old records loadable and reads as a clean purge.
+        let legacy_json = String::from(
+            "{\"slug\":\"news\",\"originator\":\"dev:api:host#system\","
+                + "\"memory_namespace\":\"app/news/acct-1\","
+                + "\"purged_at\":\"2026-09-30T00:00:00Z\"}",
+        );
+        let legacy: PurgeTombstone = serde_json::from_str(&legacy_json).unwrap();
+        assert!(legacy.errors.is_empty());
+    }
     fn tombstone(slug: &str) -> PurgeTombstone {
         PurgeTombstone {
             slug: slug.into(),
@@ -209,6 +237,7 @@ mod tests {
             originator: "dev:api:host#system".into(),
             memory_namespace: "app/news/acct-1".into(),
             purged_at: "2026-09-30T00:00:00Z".into(),
+            errors: Vec::new(),
         }
     }
 

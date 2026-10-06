@@ -167,6 +167,9 @@ mod serve_host_managed {
     fn serve_host_managed_stops_when_its_host_is_sigkilled() {
         let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
+        // A feature-less harness bootstraps an API binary in command(). On
+        // cold CI that build can outlast the mock host's entire lifetime.
+        let mut server = command(dir.path(), &["--port", "0"]);
         let mut host = Command::new("sh")
             .args([
                 "-c",
@@ -176,10 +179,7 @@ mod serve_host_managed {
             .spawn()
             .unwrap();
         let lifeline = host.stdout.take().unwrap();
-        let mut child = command(dir.path(), &["--port", "0"])
-            .stdin(Stdio::from(lifeline))
-            .spawn()
-            .unwrap();
+        let mut child = server.stdin(Stdio::from(lifeline)).spawn().unwrap();
         let (port, _lines) = announced_port(&mut child);
         assert!(health(port).contains(" 200 "));
         host.kill().unwrap(); // SIGKILL

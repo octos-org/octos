@@ -28,6 +28,82 @@ impl AssetStore for EmbeddedAssets {
     }
 }
 
+/// The three SPA entry files, shared by the serve-time branches below and
+/// the doctor introspection so the two surfaces cannot drift apart.
+const WEB_INDEX: &str = "web/index.html";
+const ADMIN_INDEX: &str = "admin/index.html";
+const SWARM_INDEX: &str = "swarm/index.html";
+
+/// Doctor introspection (#2384): one web UI bundle's availability to this
+/// binary, with the script that produces it — the same remediation the 503
+/// responses below hand out at serve time.
+pub(crate) struct UiBundleStatus {
+    /// Human-readable bundle name with its serve route, e.g. `web (/app)`.
+    pub(crate) label: &'static str,
+    /// Build script that produces the bundle, relative to the repo root.
+    pub(crate) build_script: &'static str,
+    /// Whether the bundle is available to this binary. Compile-time embed in
+    /// release; debug builds fall back to reading the folder on disk at
+    /// runtime (rust-embed's default), so there the flag reflects the
+    /// checkout's current `static/` contents.
+    pub(crate) embedded: bool,
+}
+
+/// Which web UI bundles this binary can serve. The SPAs live in gitignored
+/// `static/{web,admin,swarm}/` and only exist when their build scripts ran
+/// before the cargo build, so a fresh-clone build has none of the three UI
+/// bundles and every UI route serves the 503 JSONs below — doctor surfaces
+/// that before the first `octos serve` instead of at it (#2384).
+pub(crate) fn embedded_ui_bundles() -> [UiBundleStatus; 3] {
+    ui_bundles_from_store(&EmbeddedAssets)
+}
+
+fn ui_bundles_from_store(assets: &dyn AssetStore) -> [UiBundleStatus; 3] {
+    let mut admin = bundle_status(
+        assets,
+        "admin (/admin)",
+        "./scripts/build-dashboard.sh",
+        ADMIN_INDEX,
+    );
+    // Serve-time parity with the Bug-3 guard (#958): an index.html that
+    // references hashed assets missing from the bundle 503s at every /admin
+    // path, so present-but-inconsistent must not count as available here
+    // either.
+    if admin.embedded
+        && let Some(index) = assets.get(ADMIN_INDEX)
+    {
+        admin.embedded = admin_index_missing_assets(assets, &index).is_none();
+    }
+    [
+        bundle_status(
+            assets,
+            "web (/app)",
+            "./scripts/build-web-app.sh",
+            WEB_INDEX,
+        ),
+        admin,
+        bundle_status(
+            assets,
+            "swarm (/swarm)",
+            "./scripts/build-swarm-app.sh",
+            SWARM_INDEX,
+        ),
+    ]
+}
+
+fn bundle_status(
+    assets: &dyn AssetStore,
+    label: &'static str,
+    build_script: &'static str,
+    index: &str,
+) -> UiBundleStatus {
+    UiBundleStatus {
+        label,
+        build_script,
+        embedded: assets.get(index).is_some(),
+    }
+}
+
 /// Fallback handler: serves embedded static files, falls back to admin/index.html for SPA routing.
 /// The admin dashboard SPA handles all UI routes (login, profiles, users, etc.).
 ///
@@ -105,8 +181,8 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
         if let Some(data) = assets.get(&swarm_path) {
             return serve_file(&swarm_path, &data);
         }
-        if let Some(data) = assets.get("swarm/index.html") {
-            return serve_file("swarm/index.html", &data);
+        if let Some(data) = assets.get(SWARM_INDEX) {
+            return serve_file(SWARM_INDEX, &data);
         }
         let body = serde_json::json!({
             "error": "swarm_bundle_missing",
@@ -144,8 +220,8 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
         if let Some(data) = assets.get(&web_path) {
             return serve_file(&web_path, &data);
         }
-        if let Some(data) = assets.get("web/index.html") {
-            return serve_file("web/index.html", &data);
+        if let Some(data) = assets.get(WEB_INDEX) {
+            return serve_file(WEB_INDEX, &data);
         }
         let body = serde_json::json!({
             "error": "web_bundle_missing",
@@ -189,7 +265,7 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
     // and return 503 with a structured `bundle_inconsistent` body so
     // the operator gets a diagnostic instead of a silent blank UI.
     if path == "admin" || path.starts_with("admin/") {
-        if let Some(data) = assets.get("admin/index.html") {
+        if let Some(data) = assets.get(ADMIN_INDEX) {
             if let Some(missing) = admin_index_missing_assets(assets, &data) {
                 return admin_bundle_inconsistent_response(missing);
             }
@@ -211,7 +287,7 @@ async fn serve_with<A: AssetStore>(assets: &A, state: &AppState, request_path: &
 /// checkouts, dashboard-only builds) on the previous `/admin/` behavior,
 /// including all of its missing-bundle 503 diagnostics.
 fn redirect_to_default_ui_or_503<A: AssetStore>(assets: &A) -> Response {
-    if assets.get("web/index.html").is_some() {
+    if assets.get(WEB_INDEX).is_some() {
         return (
             StatusCode::TEMPORARY_REDIRECT,
             [(header::LOCATION, "/app/")],
@@ -234,7 +310,7 @@ fn redirect_to_default_ui_or_503<A: AssetStore>(assets: &A) -> Response {
 /// 200, the browser's `<script type="module">` errors silently, and the
 /// user sees a blank `<div id="root">`. Surfacing the mismatch as 503
 /// gives the operator a clear `bundle_inconsistent` diagnostic.
-fn admin_index_missing_assets<A: AssetStore>(assets: &A, html: &[u8]) -> Option<Vec<String>> {
+fn admin_index_missing_assets(assets: &dyn AssetStore, html: &[u8]) -> Option<Vec<String>> {
     let html = std::str::from_utf8(html).ok()?;
     let mut missing = Vec::new();
     // We don't pull in `regex` here — the structure of a Vite-emitted
@@ -387,6 +463,41 @@ mod tests {
         fn get(&self, path: &str) -> Option<Vec<u8>> {
             self.files.get(path).cloned()
         }
+    }
+
+    /// The doctor table keys off the same index paths the serve branches do:
+    /// only a present `web/index.html` lights up the web bundle row.
+    #[test]
+    fn should_report_only_bundles_whose_index_is_present() {
+        let assets = StubAssets::with(&[(WEB_INDEX, b"<html/>")]);
+        let [web, admin, swarm] = ui_bundles_from_store(&assets);
+        assert!(web.embedded);
+        assert!(!admin.embedded);
+        assert!(!swarm.embedded);
+    }
+
+    /// #2384 parity with the Bug-3 guard (#958): an admin index.html that
+    /// references hashed assets missing from the bundle must NOT count as
+    /// available to doctor — serve would 503 it
+    /// (`admin_bundle_inconsistent`) either way. The scan stays admin-only,
+    /// matching serve: a web bundle whose index carries admin-needle text
+    /// still counts as available.
+    #[test]
+    fn should_not_count_inconsistent_admin_index_as_available() {
+        let html = br#"<script type="module" src="/admin/assets/index-MISSING.js"></script>"#;
+        let inconsistent =
+            StubAssets::with(&[(ADMIN_INDEX, html.as_slice()), (WEB_INDEX, html.as_slice())]);
+        let [web, admin, swarm] = ui_bundles_from_store(&inconsistent);
+        assert!(web.embedded, "the reference scan is admin-only, like serve");
+        assert!(!admin.embedded, "inconsistent admin bundle must not pass");
+        assert!(!swarm.embedded);
+
+        let consistent = StubAssets::with(&[
+            (ADMIN_INDEX, html.as_slice()),
+            ("admin/assets/index-MISSING.js", b"export {};"),
+        ]);
+        let [_, admin, _] = ui_bundles_from_store(&consistent);
+        assert!(admin.embedded, "resolved references count as available");
     }
 
     #[tokio::test]

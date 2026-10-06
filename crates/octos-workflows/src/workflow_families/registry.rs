@@ -45,3 +45,32 @@ pub fn default_request_for_kind(kind: WorkflowKind) -> WorkflowPlanRequest {
         .map(|family| family.default_request)
         .expect("supported workflow kind")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_names_are_stable() {
+        let names: Vec<_> = registry().iter().map(|family| family.name).collect();
+        assert_eq!(
+            names,
+            vec!["deep_research", "research_podcast", "slides", "site"]
+        );
+    }
+
+    #[test]
+    fn registry_default_requests_match_their_kind() {
+        for family in registry() {
+            let expected = match family.kind {
+                WorkflowKind::DeepResearch => WorkflowPlanRequest::DeepResearch,
+                WorkflowKind::ResearchPodcast => WorkflowPlanRequest::ResearchPodcast,
+                WorkflowKind::Slides => WorkflowPlanRequest::Slides,
+                WorkflowKind::Site => WorkflowPlanRequest::Site {
+                    template: SiteTemplate::Docs,
+                },
+            };
+            assert_eq!(family.default_request, expected, "kind {:?}", family.kind);
+        }
+    }
+}

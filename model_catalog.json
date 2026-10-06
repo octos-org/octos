@@ -2136,7 +2136,7 @@
         {
           "id": "zai-coding",
           "label": "GLM Coding Plan",
-          "base_url": "https://api.z.ai/api/anthropic",
+          "base_url": "https://api.z.ai/api/coding/paas/v4",
           "api_key_env": "ZAI_API_KEY"
         }
       ]
@@ -2157,7 +2157,7 @@
         {
           "id": "zai-coding",
           "label": "GLM Coding Plan",
-          "base_url": "https://api.z.ai/api/anthropic",
+          "base_url": "https://api.z.ai/api/coding/paas/v4",
           "api_key_env": "ZAI_API_KEY"
         }
       ]

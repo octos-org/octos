@@ -669,9 +669,13 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   in-flight host tool calls (`peer_purged`), stops its and its contexts'
   running turns, then erases their transcripts, the memory namespace, the
   blackboard and a kernel-provisioned workspace, and frees the (app,
-  account) binding; a retry with the same token answers `already_purged`;
+  account) binding; a failed erase entry finalizes nothing — the purge
+  fails `peer_purge_incomplete` with the entries in `data.errors`, the peer
+  stays closed and staged, and a retry runs the whole idempotent erase
+  again; a retry after completion answers `already_purged`;
   host connection only; typed `data.kind` `peer_purge_not_owner`,
-  `peer_purge_busy`, `peer_purge_in_progress`, `peer_not_host_bound`)
+  `peer_purge_busy`, `peer_purge_in_progress`, `peer_purge_incomplete`,
+  `peer_not_host_bound`)
 - `peer/input/reject` (accepted `UPCR-2026-035`, #2618: the host refuses a
   `peer/input`; `{session_id, peer, host_token, input_id, reason:
   "signed_out" | "no_consent" | "busy" | "other", message?}` → `{input_id,
@@ -849,6 +853,7 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
 - `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
+- `context/state_reported` (additionally gated on `context.state.v1`: live token estimate mid-turn)
 
 Session orchestration status (whole-job indicator; ungated; accepted
 `UPCR-2026-033`):
@@ -2699,6 +2704,34 @@ Capability gate: `context.lifecycle.v1`.
 Required fields: `session_id`, `context_state`, `trigger`,
 `threshold_tokens`. Documented by
 [UPCR-2026-026](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_026_COMPACTION_STARTED.md).
+
+### `context/state_reported`
+
+Gate: `context.lifecycle.v1` **and** `context.state.v1` (both requested by the
+client; never implied by a missing feature header, because legacy clients cannot
+decode this notification kind).
+
+Pushed by the in-loop prompt bridge as a turn's prompt grows between
+compactions, so a client's context gauge follows the real estimate instead of
+the value from `session/open` or the last compaction. Emitted at most once per
+agent-loop iteration and only when `token_estimate` moved by at least 2% of
+`threshold_tokens` (minimum 1024 tokens).
+
+```json
+{
+  "session_id": "local:abc",
+  "context_state": { "…": "UiContextState" },
+  "threshold_tokens": 800000,
+  "iteration": 57
+}
+```
+
+- `context_state` — the same `UiContextState` shape carried by the compaction
+  events; `token_estimate` is the live estimate.
+- `threshold_tokens` — the token count at which the server will compact this
+  session (context-window derived), the honest denominator for a fullness
+  fraction.
+- `iteration` — agent-loop iteration within the current turn (0 = turn start).
 
 ### `context/normalization_reported`
 
