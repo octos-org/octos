@@ -2,7 +2,9 @@
 //! or permission grants; readers must validate a saved path before using it.
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(feature = "api", test))]
+use std::path::PathBuf;
 
 pub(crate) fn remember(data_dir: &Path, workspace: &Path) -> io::Result<()> {
     let workspace = dunce::canonicalize(workspace)?;
@@ -28,6 +30,7 @@ pub(crate) fn remember(data_dir: &Path, workspace: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "api", test))]
 pub(crate) fn load(data_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(data_dir.join("session-workspaces")) {
         Ok(entries) => entries,
