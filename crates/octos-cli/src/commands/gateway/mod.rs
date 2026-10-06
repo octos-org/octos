@@ -331,21 +331,23 @@ mod tests {
             registry.get("web_search").is_some(),
             "child bot should expose normal-mode web_search"
         );
-        assert!(
-            registry.get("search").is_some(),
-            "child bot should expose bundled deep_search skill"
+        assert_eq!(
+            registry.origin("search"),
+            Some(octos_agent::tools::ToolOrigin::Builtin),
+            "child bot should expose native research search"
         );
         assert!(
             registry.get("synthesize_research").is_some(),
             "child bot should expose research synthesis tooling"
         );
         assert!(
-            factory.pipeline_factory.is_some(),
-            "child bot should build its own pipeline factory instead of inheriting admin-only None"
+            factory.pipeline_factory.is_none(),
+            "child bots must not restore the retired DOT pipeline factory"
         );
+        assert!(registry.get("run_pipeline").is_none());
         assert!(
             factory.provider_router.is_some(),
-            "child bot should build a provider router for fallback-aware spawn/pipeline"
+            "child bot should build a provider router for fallback-aware spawning"
         );
         assert_eq!(
             factory.data_dir, expected_data_dir,
