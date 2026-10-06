@@ -585,22 +585,21 @@ impl Tool for ViewSessionsTool {
                         .unwrap_or("?");
 
                     let mut out = format!(
-                        "Session '{}' ({} total messages, showing last {}, updated: {}):\n\n",
-                        key, total, returned, updated
+                        "Session '{key}' ({total} total messages, showing last {returned}, updated: {updated}):\n\n"
                     );
 
                     if let Some(messages) = data.get("messages").and_then(|v| v.as_array()) {
                         for msg in messages {
                             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("?");
                             let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                            out.push_str(&format!("[{}] {}\n", role, content));
+                            out.push_str(&format!("[{role}] {content}\n"));
                             if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                                 for tc in tcs {
                                     let name =
                                         tc.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                                     let args =
                                         tc.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
-                                    out.push_str(&format!("  -> tool_call: {}({})\n", name, args));
+                                    out.push_str(&format!("  -> tool_call: {name}({args})\n"));
                                 }
                             }
                         }

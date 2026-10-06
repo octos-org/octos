@@ -199,6 +199,10 @@ impl WorkSecretGrantStore {
         Ok(changed)
     }
 
+    pub fn list(&self) -> Result<Vec<WorkSecretGrantRecord>> {
+        Ok(self.load_file()?.grants)
+    }
+
     fn load_file(&self) -> Result<WorkSecretGrantFile> {
         if !self.path.exists() {
             return Ok(WorkSecretGrantFile::default());
@@ -317,5 +321,40 @@ mod tests {
             store.validate("profile:local:demo", "plain-token"),
             Err(WorkSecretValidationError::Revoked)
         ));
+    }
+
+    #[test]
+    fn grant_store_lists_grants_with_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WorkSecretGrantStore::new(dir.path());
+        assert!(store.list().unwrap().is_empty());
+
+        store
+            .issue("s1", "token-1", "http://x", Duration::minutes(5), None)
+            .unwrap();
+        store
+            .issue(
+                "s2",
+                "token-2",
+                "http://x",
+                Duration::minutes(5),
+                Some("p".into()),
+            )
+            .unwrap();
+        // Re-issuing s1 replaces its earlier grant instead of appending.
+        store
+            .issue("s1", "token-3", "http://x", Duration::minutes(5), None)
+            .unwrap();
+
+        let grants = store.list().unwrap();
+        assert_eq!(grants.len(), 2);
+        // issue() retains matching grants out and pushes the renewed record,
+        // so the listing order is by latest issue, not first creation.
+        let sessions: Vec<_> = grants.iter().map(|g| g.session_id.as_str()).collect();
+        assert_eq!(sessions, ["s2", "s1"]);
+        assert_eq!(grants[1].token_hash, hash_token("token-3"));
+        // Revocation is visible in the listing.
+        store.revoke_token("token-3").unwrap();
+        assert!(store.list().unwrap()[1].revoked_at.is_some());
     }
 }

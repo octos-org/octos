@@ -28,12 +28,14 @@ use approvals::PendingApprovalStore;
 use diff::{DiffPreviewConfig, PendingDiffPreviewStore};
 use questions::PendingQuestionStore;
 use scope::ScopePolicy;
+use voice_admission::VoiceAdmissionStore;
 
 pub(crate) mod approvals;
 pub(crate) mod diff;
 pub(crate) mod questions;
 pub(crate) mod sanitize;
 pub(crate) mod scope;
+pub(crate) mod voice_admission;
 
 #[derive(Default)]
 pub(crate) struct UiProtocolContractStores {
@@ -58,6 +60,8 @@ pub(crate) struct UiProtocolContractStores {
     /// `<data_dir>/audit/approvals-<epoch>.log`; subsequent decisions reuse
     /// the same writer.
     audit: OnceLock<Arc<ApprovalsAuditLog>>,
+    /// Single-use proof that ASR accepted an utterance before a voice turn is committed.
+    pub(crate) voice_admissions: VoiceAdmissionStore,
 }
 
 impl UiProtocolContractStores {

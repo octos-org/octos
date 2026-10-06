@@ -107,6 +107,17 @@ pub enum RegisterTaskError {
         parent_tool_call_id: String,
         parent_status: TaskStatus,
     },
+    /// #21 (round-4, codex #17 B3) — the registration's FIRST durable
+    /// task-ledger write failed, so the task row (which must already carry
+    /// the workspace stamp: the crash window between a `workspace_root=None`
+    /// insert and a later `set_workspace_root` second write is exactly the
+    /// gap this variant exists to close) was ROLLED BACK: the in-memory
+    /// insert is removed and no half-bound task exists. The caller must
+    /// treat the bind as failed (no registry binding, no task id).
+    WorkspacePersistFailed {
+        tool_call_id: String,
+        source: String,
+    },
 }
 
 impl std::fmt::Display for RegisterTaskError {
@@ -128,6 +139,14 @@ impl std::fmt::Display for RegisterTaskError {
                 "parent task (tool_call_id='{parent_tool_call_id}') is already {} — refusing child registration",
                 parent_status.as_str(),
             ),
+            Self::WorkspacePersistFailed {
+                tool_call_id,
+                source,
+            } => write!(
+                f,
+                "task (tool_call_id='{tool_call_id}') registration rollback: the first durable \
+                 task-ledger write (including the workspace stamp) failed: {source}"
+            ),
         }
     }
 }
@@ -148,6 +167,16 @@ pub enum TaskStatus {
     /// `Failed` so dashboards can surface "user cancelled" instead of
     /// "the task crashed".
     Cancelled,
+    /// #27c — an orphaned task parked for CLIENT REATTACHMENT. The
+    /// supervisor lost its in-process worker to a serve restart, but the
+    /// task's durable work (a staged peer's brief + worktree) is intact
+    /// and a returning client can adopt it — so it is RECOVERABLE, unlike
+    /// `Failed`. Not `is_active()` (no worker drives it here), not
+    /// `is_terminal()` (it must stay re-attachable). The boot sweep
+    /// (`refresh_from_persistence`) parks cross-restart orphans here
+    /// instead of failing them; `mark_running` (a re-attached client's
+    /// first action) revives Parked → Running.
+    Parked,
 }
 
 impl TaskStatus {
@@ -158,17 +187,20 @@ impl TaskStatus {
     /// Whether this status is a terminal (non-recoverable, non-running)
     /// state. Used by the API layer to reject `cancel`/`restart` against
     /// already-terminal tasks with a `409 Conflict` response.
+    /// `Parked` is deliberately NOT terminal: it awaits client re-attach
+    /// (#27c) and may transition back to `Running`.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Spawned => "spawned",
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Parked => "parked",
         }
     }
 }
@@ -344,6 +376,35 @@ pub struct BackgroundTask {
     /// domain-specific views from the canonical task lifecycle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection_metadata: Option<Value>,
+    /// #1707 round 5 codex round 2 (board item #13 round 2) — the MASTER
+    /// session's workspace root, captured at registration time.
+    ///
+    /// The background-task agent mirror derives its `cwd` stamp from this
+    /// value (falling back to the legacy `output_files[0]` parent-dir
+    /// derivation when absent), so the continuation queue's workspace stamps
+    /// — which the `/stop` terminal purge matches against the interrupted
+    /// turn's `session_runtime.workspace_root` — share ONE source with the
+    /// purge argument instead of depending on how the task completed
+    /// (`retire_peer_supervised_task` completes with EMPTY output files →
+    /// `cwd=None`; orphan adoption completes with `<profile-data>/peers/
+    /// <slug>/result.md` → `cwd=<…>/peers/<slug>` — NEITHER equalled the
+    /// master's workspace root, so the `/stop` purge matched ZERO
+    /// `peer_handoff` items in production).
+    ///
+    /// `#[serde(default)]` so pre-existing persisted snapshots deserialize
+    /// unchanged; `None` preserves the legacy derivation bit-for-bit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    /// #1595: first-class relaunch lineage — the predecessor task id when
+    /// this task was created by [`TaskSupervisor::relaunch`]. The relaunch
+    /// path also stamps the edge into `runtime_detail` JSON for the spawn
+    /// transition, but the next `mark_runtime_state` overwrite drops that
+    /// JSON; this dedicated field survives every later transition, so
+    /// `task/updated` frames can carry the chain explicitly on every tick.
+    /// `#[serde(default)]` so pre-existing persisted snapshots deserialize
+    /// as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relaunched_from: Option<String>,
 }
 
 impl BackgroundTask {
@@ -353,6 +414,11 @@ impl BackgroundTask {
             TaskStatus::Completed => TaskLifecycleState::Ready,
             TaskStatus::Failed => TaskLifecycleState::Failed,
             TaskStatus::Cancelled => TaskLifecycleState::Cancelled,
+            // #27c — awaiting client re-attach: not queued (no worker here),
+            // not failed (the work is recoverable). Reuse `Cancelled`'s
+            // idle lifecycle slot so dashboards read it as "stopped",
+            // with the `parked` status string carrying the distinction.
+            TaskStatus::Parked => TaskLifecycleState::Cancelled,
             TaskStatus::Running => match self.runtime_state {
                 TaskRuntimeState::Spawned | TaskRuntimeState::ExecutingTool => {
                     TaskLifecycleState::Running
@@ -732,6 +798,23 @@ struct PersistedTaskRecord {
     #[serde(default = "default_task_ledger_schema")]
     schema_version: u32,
     task: BackgroundTask,
+}
+
+// Wall-clock order remains authoritative across supervisors. On an exact
+// tie, accept only lifecycle progress supported by the live transition rules.
+fn task_snapshot_advances(candidate: &BackgroundTask, existing: &BackgroundTask) -> bool {
+    match candidate.updated_at.cmp(&existing.updated_at) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            (candidate.status.is_terminal() && !existing.status.is_terminal())
+                || (existing.status == TaskStatus::Failed
+                    && existing.failed_by_observer
+                    && (candidate.status == TaskStatus::Completed
+                        || (candidate.status == TaskStatus::Failed
+                            && !candidate.failed_by_observer)))
+        }
+    }
 }
 
 fn default_task_ledger_schema() -> u32 {
@@ -1423,6 +1506,21 @@ impl TaskSupervisor {
     /// supervisor itself stays alive) are NOT addressed here — that needs
     /// a heartbeat-based reaper, which is a follow-up if observed.
     pub fn enable_persistence(&self, path: impl Into<PathBuf>) -> std::io::Result<usize> {
+        self.enable_persistence_with_recovery(path, |_, _| {})
+    }
+
+    /// Restore host-owned logical lifetimes before the dead-worker sweep.
+    ///
+    /// The callback runs once, after replay/persistence are installed and with
+    /// no supervisor locks held. Hosts may reinstate a proven external
+    /// lifetime's liveness lease or settle an already-closed lifetime. Ordinary
+    /// workers and unproved lifetimes still pass through the normal orphan
+    /// transition; the post-sweep restore observers retain their ordering.
+    pub fn enable_persistence_with_recovery(
+        &self,
+        path: impl Into<PathBuf>,
+        recover: impl FnOnce(&Self, &[BackgroundTask]),
+    ) -> std::io::Result<usize> {
         let path = path.into();
         // Idempotence guard (#1906): already persisting to THIS ledger —
         // nothing new to restore and nothing stale to re-append.
@@ -1453,7 +1551,7 @@ impl TaskSupervisor {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             for (task_id, task) in restored {
                 match tasks.get(&task_id) {
-                    Some(existing) if existing.updated_at >= task.updated_at => {}
+                    Some(existing) if !task_snapshot_advances(&task, existing) => {}
                     _ => {
                         restored_won.insert(task_id.clone());
                         tasks.insert(task_id, task);
@@ -1485,6 +1583,8 @@ impl TaskSupervisor {
         for task in snapshots {
             self.persist_snapshot(&task);
         }
+
+        recover(self, &self.get_all_tasks());
 
         // Sweep orphans: any task whose runtime_state is non-terminal at
         // this point has no live worker behind it (we are still in startup,
@@ -1566,8 +1666,27 @@ impl TaskSupervisor {
                 })
                 .collect()
         };
-        for (task_id, _, _) in &orphans {
-            self.mark_failed(task_id, "orphaned across restart".to_string());
+        // #27c — park cross-restart TOP-LEVEL orphans for CLIENT
+        // REATTACHMENT instead of failing them: the durable work (a staged
+        // peer's brief + worktree) survives the restart, so a returning
+        // client can adopt the task (`mark_running` revives Parked →
+        // Running). Live evidence: the 2026-08-26/27 f182/a9c4 streams
+        // recorded 24+28 "orphaned across restart" FAILED children whose
+        // work was fully recoverable.
+        //
+        // RED LINE ① — parking is scoped to `peer_handoff` tasks ONLY: a
+        // staged peer has durable state (brief + worktree on disk) that a
+        // returning client can adopt. Every OTHER orphan (pipeline
+        // children, run_pipeline parents, generic spawned work) has no
+        // independent re-attach path, so it keeps the legacy genuine
+        // `Failed` verdict — a real failure must never masquerade as
+        // recoverable.
+        for (task_id, _, tool_name) in &orphans {
+            if tool_name == "peer_handoff" {
+                self.mark_parked(task_id, "orphaned across restart".to_string());
+            } else {
+                self.mark_failed(task_id, "orphaned across restart".to_string());
+            }
         }
         if !orphans.is_empty() {
             counter!("octos_orphaned_tasks_reaped_total").increment(orphans.len() as u64);
@@ -1670,6 +1789,21 @@ impl TaskSupervisor {
             .restore_notify_hook
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hook));
+    }
+
+    /// #2353 — liveness probe for the SHARED `on_restore` slot, so a test can
+    /// assert the supervisor's inner state is actually reclaimed once every
+    /// external owner drops (i.e. no observer callback is pinning it through
+    /// a captured strong clone). Detects leaks that pin the slot's `Arc`
+    /// itself — the structural-clone cycle shape; a capture of an individual
+    /// inner `Arc` would need its own probe. Returns a closure because the
+    /// slot type is private.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn on_restore_slot_alive_probe_for_test(
+        &self,
+    ) -> impl Fn() -> bool + Send + Sync + 'static {
+        let weak = std::sync::Arc::downgrade(&self.on_restore);
+        move || weak.upgrade().is_some()
     }
 
     /// #2056 round 3 — THE install path for the restore observer, shared by
@@ -1968,6 +2102,22 @@ impl TaskSupervisor {
             "from_node": opts.from_node,
         })
         .to_string();
+        // #1595: also record the edge on the durable first-class field
+        // BEFORE the runtime-state stamp below — the spawn snapshot that
+        // `mark_runtime_state` persists then carries the lineage, and the
+        // field survives the `runtime_detail` overwrite on every later
+        // transition. Note the register above already persisted a
+        // lineage-less snapshot; that placeholder is superseded here by a
+        // strictly-newer `updated_at` (so `task_snapshot_advances` lets
+        // this snapshot win on restore), and the successor's first
+        // UI-visible frame is the `mark_runtime_state` emit below, which
+        // carries the field.
+        {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = tasks.get_mut(&new_task_id) {
+                task.relaunched_from = Some(task_id.to_string());
+            }
+        }
         self.mark_runtime_state(&new_task_id, TaskRuntimeState::Spawned, Some(detail));
 
         let request = RelaunchRequest {
@@ -2258,6 +2408,48 @@ impl TaskSupervisor {
         )
     }
 
+    /// #21 (round-4, codex #17 B3) — STRICT peer-task registration whose
+    /// FIRST durable ledger row already carries the workspace stamp.
+    ///
+    /// The pre-#21 shape (`register` + `set_workspace_root`) persisted the
+    /// task row with `workspace_root: None` first and stamped the workspace
+    /// in a SECOND snapshot append; a crash between the two (or a failed
+    /// second write — which was only warned) left the restored task
+    /// unstamped, and the `/stop` purge / continuation workspace scoping
+    /// fell back to the never-matching `output_files` derivation.
+    ///
+    /// This entry point closes the window structurally: the task is built
+    /// WITH the workspace stamp, and the registration only completes if the
+    /// first `persist_snapshot` write SUCCEEDS. On failure the task is never
+    /// inserted or published to registration observers, and
+    /// [`RegisterTaskError::WorkspacePersistFailed`] is returned. When the
+    /// supervisor has NO persistence path configured the write is trivially
+    /// "successful" (in-memory supervision only) and the registration
+    /// proceeds — the same no-store contract as every other register path.
+    ///
+    /// The stamp accepts a lossless-encoded workspace scope (see
+    /// `peers::workspace_scope_encode`); an empty string is normalized to
+    /// `None` (unstamped, legacy shape).
+    pub fn try_register_peer_with_workspace(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        workspace_scope: Option<&str>,
+    ) -> Result<String, RegisterTaskError> {
+        self.register_full_with_workspace(
+            tool_name,
+            tool_call_id,
+            session_key,
+            None,
+            None,
+            None,
+            None,
+            workspace_scope,
+            true,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn register_full(
         &self,
@@ -2268,6 +2460,32 @@ impl TaskSupervisor {
         tool_input: Option<Value>,
         originating_client_message_id: Option<String>,
         parent_terminal_check_tool_call_id: Option<&str>,
+    ) -> Result<String, RegisterTaskError> {
+        self.register_full_with_workspace(
+            tool_name,
+            tool_call_id,
+            session_key,
+            task_ledger_path,
+            tool_input,
+            originating_client_message_id,
+            parent_terminal_check_tool_call_id,
+            None,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_full_with_workspace(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        task_ledger_path: Option<&str>,
+        tool_input: Option<Value>,
+        originating_client_message_id: Option<String>,
+        parent_terminal_check_tool_call_id: Option<&str>,
+        workspace_scope: Option<&str>,
+        require_persistence: bool,
     ) -> Result<String, RegisterTaskError> {
         // Codex P2 follow-up: early terminal-parent check, BEFORE the
         // fan-out cap path. The cap path has side effects (poisoning
@@ -2506,7 +2724,20 @@ impl TaskSupervisor {
             artifact_count: None,
             runtime_policy_stamp: None,
             projection_metadata: None,
+            workspace_root: workspace_scope
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            // Set by `relaunch` post-registration when the task is a
+            // relaunch successor; plain registrations have no predecessor.
+            relaunched_from: None,
         };
+        // Read configuration before locking the task table: enable_persistence
+        // may consult the task table while holding the configuration lock.
+        let persistence_path = self
+            .persistence_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         // Codex P2 atomicity: when this is a child-task registration
         // that requested the parent-terminal guard, recheck parent
@@ -2540,9 +2771,22 @@ impl TaskSupervisor {
                 parent_status: status,
             });
         }
+        // Publish the task only after its first, already-stamped row has
+        // been accepted. Holding the task lock also prevents readers from
+        // observing an uncommitted registration.
+        if require_persistence {
+            Self::persist_snapshot_strict(persistence_path.as_ref(), &task).map_err(|error| {
+                RegisterTaskError::WorkspacePersistFailed {
+                    tool_call_id: tool_call_id.to_string(),
+                    source: error.to_string(),
+                }
+            })?;
+        }
         tasks.insert(id.clone(), task);
         drop(tasks);
-        self.persist_snapshot_by_id(&id);
+        if !require_persistence {
+            self.persist_snapshot_by_id(&id);
+        }
         record_child_session_lifecycle(
             "tracked",
             if session_key.is_some() {
@@ -2613,6 +2857,35 @@ impl TaskSupervisor {
             // Stamp updated_at so reconnect hydration / dashboards see
             // the projection update even when no lifecycle transition
             // fires.
+            task.updated_at = Utc::now();
+            task.clone()
+        };
+        self.persist_snapshot(&snapshot);
+        self.notify_change(&snapshot);
+        self.emit_progress_for_state(&snapshot);
+    }
+
+    /// #1707 round 5 codex round 2 (board item #13 round 2) — stamp the
+    /// MASTER session's workspace root onto an already-registered task.
+    /// Same post-registration shape as [`Self::set_m13b_projection`]:
+    /// keeps every `register_*` signature unchanged (octos-agent stays
+    /// additive) while letting the registration site record the purge-side
+    /// workspace value the background-task mirror derives `cwd` from. A
+    /// `None` / empty value is ignored — the task keeps any existing stamp
+    /// (and the legacy `output_files` derivation stays the fallback).
+    pub fn set_workspace_root(&self, task_id: &str, workspace_root: Option<&str>) {
+        let Some(workspace_root) = workspace_root.filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(task) = tasks.get_mut(task_id) else {
+                return;
+            };
+            if task.workspace_root.as_deref() == Some(workspace_root) {
+                return;
+            }
+            task.workspace_root = Some(workspace_root.to_string());
             task.updated_at = Utc::now();
             task.clone()
         };
@@ -2914,6 +3187,45 @@ impl TaskSupervisor {
     /// survived and finished (mini4 `review-octos-web-v3` regression).
     pub fn mark_failed_observed(&self, task_id: &str, error: String) {
         self.mark_failed_inner(task_id, error, true)
+    }
+
+    /// #27c — park a task as awaiting CLIENT REATTACHMENT. The boot sweep
+    /// uses this for cross-restart orphans instead of `mark_failed`: the
+    /// worker is gone (serve restarted), but the task's durable work (a
+    /// staged peer's brief + worktree) is intact and a returning client
+    /// can adopt it — `mark_running` revives Parked → Running. A terminal
+    /// task (already Completed/Failed/Cancelled) is left untouched.
+    pub fn mark_parked(&self, task_id: &str, reason: String) {
+        let snapshot = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(task) = tasks.get_mut(task_id) {
+                if task.status.is_terminal() {
+                    tracing::debug!(
+                        task_id = %task_id,
+                        current_status = task.status.as_str(),
+                        "ignoring mark_parked on terminal task"
+                    );
+                    return;
+                }
+                task.status = TaskStatus::Parked;
+                task.runtime_state = TaskRuntimeState::Failed;
+                // Mirror mark_failed's field placement so operators and the
+                // restored-persistence views find the park reason in `error`
+                // (the stable, greppable slot) — `runtime_detail` keeps the
+                // richer context copy.
+                task.error = Some(reason.clone());
+                task.runtime_detail = Some(reason);
+                task.updated_at = Utc::now();
+                Some(task.clone())
+            } else {
+                tracing::warn!(task_id = %task_id, "mark_parked: unknown task");
+                return;
+            }
+        };
+        if let Some(snapshot) = snapshot {
+            self.persist_snapshot_by_id(&snapshot.id);
+            self.notify_change(&snapshot);
+        }
     }
 
     fn mark_failed_inner(&self, task_id: &str, error: String, observed: bool) {
@@ -3438,6 +3750,27 @@ impl TaskSupervisor {
         }
     }
 
+    /// #21 (round-4, codex #17 B3) — CHECKED variant of
+    /// [`Self::persist_snapshot`]: returns the write error instead of
+    /// warning it away, so the strict registration entry point can roll the
+    /// in-memory insert back and surface the failure. `Ok(())` when no
+    /// persistence path is configured (in-memory supervision contract).
+    fn persist_snapshot_strict(
+        path: Option<&PathBuf>,
+        task: &BackgroundTask,
+    ) -> std::io::Result<()> {
+        let Some(path) = path else {
+            return Ok(());
+        };
+        let record = PersistedTaskRecord {
+            schema_version: CURRENT_TASK_LEDGER_SCHEMA,
+            task: task.clone(),
+        };
+        let json = serde_json::to_string(&record)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Self::append_persisted_task(path, &json)
+    }
+
     fn persist_snapshot(&self, task: &BackgroundTask) {
         let Some(path) = self
             .persistence_path
@@ -3514,7 +3847,7 @@ impl TaskSupervisor {
             // append to the SAME per-session ledger, so rows can interleave
             // such that an older snapshot lands after a newer one. (codex P2.)
             match restored.get(&record.task.id) {
-                Some(existing) if existing.updated_at >= record.task.updated_at => {}
+                Some(existing) if !task_snapshot_advances(&record.task, existing) => {}
                 _ => {
                     restored.insert(record.task.id.clone(), record.task);
                 }
@@ -3524,7 +3857,8 @@ impl TaskSupervisor {
     }
 
     /// Re-read the persistence ledger and merge any snapshot newer (by
-    /// `updated_at`) than the in-memory copy into `self.tasks`. Unlike
+    /// `updated_at`, with lifecycle progress breaking exact ties) than the
+    /// in-memory copy into `self.tasks`. Unlike
     /// [`Self::enable_persistence`] this does NOT run the orphan sweep, persist
     /// snapshots, or fire callbacks — it only freshens stale in-memory rows.
     ///
@@ -3556,7 +3890,7 @@ impl TaskSupervisor {
             // `cancel_task`/`relaunch_task` (oldest-first) would then fire the
             // wrong supervisor's token while the real worker runs on (codex P1).
             if let Some(existing) = tasks.get(&task_id) {
-                if task.updated_at > existing.updated_at {
+                if task_snapshot_advances(&task, existing) {
                     tasks.insert(task_id, task);
                     refreshed += 1;
                 }
@@ -3587,7 +3921,7 @@ impl TaskSupervisor {
                 // Update only if this supervisor already owns the task — never
                 // import an absent row (codex P1; see `refresh_from_persistence`).
                 if let Some(existing) = tasks.get(task_id) {
-                    if task.updated_at > existing.updated_at {
+                    if task_snapshot_advances(task, existing) {
                         tasks.insert(task_id.to_string(), task.clone());
                     }
                 }
@@ -3693,8 +4027,11 @@ impl TaskSupervisor {
                 })
             }
             // Non-terminal status — defensive; callers only invoke this on
-            // terminal transitions.
-            TaskStatus::Spawned | TaskStatus::Running => return,
+            // terminal transitions. #27c: `Parked` is non-terminal (it
+            // awaits client re-attach) and must NOT fire the terminal
+            // callback — that is the whole point of parking an orphan
+            // instead of failing it.
+            TaskStatus::Spawned | TaskStatus::Running | TaskStatus::Parked => return,
         };
         // Idempotency under the shared mutex so the live → cascade → orphan
         // re-mark paths cannot double-fire.
@@ -3815,27 +4152,36 @@ impl TaskSupervisor {
     ///
     /// Idempotent: only the first call spawns the loop; later calls are
     /// no-ops (the flag is shared across `Clone`s). The loop holds only
-    /// a weak liveness story — it keeps running as long as the process
-    /// does; dropping the supervisor's last clone does not stop the
-    /// spawned task until the runtime shuts down (acceptable: the
-    /// production supervisor lives for the process lifetime).
+    /// a `Weak` self-reference and upgrades per tick (#1930): when the
+    /// owning session actor drops the last external `Arc` (session
+    /// deleted or idled out), the next tick's upgrade fails and the loop
+    /// exits instead of pinning the supervisor until process shutdown.
+    /// The upgrade is never held across the sleep, so an in-flight tick
+    /// does not defer the drop either.
     pub fn start_reaper(self: &Arc<Self>) {
         if self.reaper_started.swap(true, Ordering::SeqCst) {
             return;
         }
-        let supervisor = Arc::clone(self);
+        let supervisor = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
-                let interval = *supervisor
+                let Some(strong) = supervisor.upgrade() else {
+                    break;
+                };
+                let interval = *strong
                     .reap_interval
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                drop(strong);
                 tokio::time::sleep(interval).await;
-                let timeout = *supervisor
+                let Some(strong) = supervisor.upgrade() else {
+                    break;
+                };
+                let timeout = *strong
                     .stuck_timeout
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                supervisor.reap_stuck_tasks(Utc::now(), timeout);
+                strong.reap_stuck_tasks(Utc::now(), timeout);
             }
         });
     }

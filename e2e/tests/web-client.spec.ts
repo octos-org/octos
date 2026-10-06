@@ -4,12 +4,21 @@
  * M9-α-7 (#836): rewritten to drive the chat turn through the M9 WebSocket
  * UI Protocol via `chatWS()` instead of the legacy `/api/chat` SSE endpoint.
  * The original SSE assertions on UTF-8 byte integrity are preserved by
- * inspecting the cumulative `content` produced from `message/delta`
- * notifications — the JSON-RPC frame layer carries text losslessly so any
- * encoding bug regressing in the LLM provider chain still surfaces.
+ * inspecting the cumulative `content` produced from the canonical
+ * `projection/envelope` assistant_delta payloads — the JSON-RPC frame layer
+ * carries text losslessly so any encoding bug regressing in the LLM provider
+ * chain still surfaces.
  *
  * Run against a live octos-serve instance:
  *   OCTOS_TEST_URL=http://localhost:3000 npx playwright test web-client
+ *
+ * NOTE: on the deterministic fixture protocol server (`OCTOS_M9_PROTOCOL_FIXTURES=1`,
+ * the nightly protocol lane's config) the CJK / literal-token specs route to
+ * dedicated fixtures that echo the declared content (#2483), so their content
+ * assertions run there. The history-check half of `session persists across
+ * requests` still only runs against a live serve: fixture turns do not
+ * persist session JSONL and the aux `session/messages_page` REST backing
+ * needs the gateway/profile runtime the deterministic serve does not wire.
  */
 import { test, expect } from '@playwright/test';
 import {
@@ -152,14 +161,14 @@ test('WS chat handles long CJK response without garbling', async ({
 });
 
 // ---------------------------------------------------------------------------
-// Test 3: WS chat completes with a turn/completed -> synthesized done
+// Test 3: WS chat completes with a terminal envelope -> synthesized done
 //
 // Verifies the basic chat lifecycle terminates with a `done` event
-// synthesized from `turn/completed`.
+// synthesized from the canonical `turn_terminal` envelope.
 //
 // NOTE on token counts: The legacy SSE `done` event carried `tokens_in` /
-// `tokens_out`. The M9 `turn/completed` notification does NOT yet carry
-// them (deferred follow-up — α-3 punted token usage to γ-3). For now this
+// `tokens_out`. The envelope terminal carries `token_usage`, but chatWS
+// does not project it onto the synthesized `done` event yet. For now this
 // test asserts on the lifecycle terminal only; the cost-tracking spec
 // covers token math via the REST /api/sessions/:id/tasks snapshot.
 // ---------------------------------------------------------------------------
@@ -174,7 +183,7 @@ test('WS chat completes with terminal done event', async ({
 
   expect(events.length).toBeGreaterThan(0);
 
-  // Exactly one synthesized `done` event from `turn/completed`.
+  // Exactly one synthesized `done` event from the terminal envelope.
   const doneEvents = events.filter((e) => e.type === 'done');
   expect(doneEvents.length).toBe(1);
   expect(doneEvent).toBeTruthy();
@@ -189,6 +198,12 @@ test('WS chat completes with terminal done event', async ({
 // retired); the WS chat path drives the live turn.
 // ---------------------------------------------------------------------------
 test('session persists across requests', async ({ request, baseURL }) => {
+  // #2483: on the fixture lane the history-check half below cannot run —
+  // fixture turns never persist session JSONL and the deterministic serve
+  // wires no gateway/profile runtime for the `session/messages_page` REST
+  // backing — so it is gated on a live serve. The chat-turn half still runs
+  // everywhere.
+  const fixtureLane = process.env.OCTOS_M9_PROTOCOL_FIXTURES === '1';
 
   const sid = `test-persist-${Date.now()}`;
 
@@ -200,6 +215,10 @@ test('session persists across requests', async ({ request, baseURL }) => {
   );
 
   expect(content.toUpperCase()).toContain('OK');
+
+  if (fixtureLane) {
+    return;
+  }
 
   const messages = await getSessionMessages(request, baseURL!, sid, { source: 'full' });
   expect(messages.some((message: any) => message.role === 'user')).toBeTruthy();

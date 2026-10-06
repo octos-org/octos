@@ -367,6 +367,21 @@ impl McpClient {
         "recall_memory",
         "record_memory_use",
         "configure_tool",
+        // The rest of the compiled-in tools an external client of
+        // `octos serve --host-managed` keeps (UPCR-2026-036), and the
+        // delegation aliases.
+        "apply_patch",
+        "code_structure",
+        "check_workspace_contract",
+        "ask_user_question",
+        "recall",
+        "memory_search",
+        "memory_load",
+        "view_image",
+        "view_video",
+        "tool_search",
+        "spawn_agent",
+        "delegate",
     ];
 
     /// Start all configured MCP servers and discover their tools. Fail-soft: a
@@ -538,20 +553,25 @@ impl McpClient {
             registry.keep_mcp_service_alive(service as Arc<dyn std::any::Any + Send + Sync>);
         }
         for spec in self.tools {
-            if Self::PROTECTED_NAMES.contains(&spec.name.as_str()) {
+            if Self::PROTECTED_NAMES.contains(&spec.name.as_str())
+                || registry.is_builtin_name(&spec.name)
+            {
                 warn!(
                     tool = spec.name,
                     "MCP tool name collides with built-in tool, skipping"
                 );
                 continue;
             }
-            registry.register(McpTool {
-                name: spec.name,
-                description: spec.description,
-                input_schema: spec.input_schema,
-                service: spec.service,
-                concurrency_class: spec.concurrency_class,
-            });
+            registry.register_with_origin(
+                McpTool {
+                    name: spec.name,
+                    description: spec.description,
+                    input_schema: spec.input_schema,
+                    service: spec.service,
+                    concurrency_class: spec.concurrency_class,
+                },
+                crate::tools::ToolOrigin::Mcp,
+            );
         }
     }
 }
@@ -667,6 +687,16 @@ mod tests {
         // Oversized flat schema.
         let big: String = "x".repeat(MAX_SCHEMA_SIZE + 10);
         assert!(!validate_schema(&serde_json::json!({ "d": big })));
+    }
+
+    #[test]
+    fn protected_names_cover_every_reserved_builtin() {
+        for name in crate::tools::RESERVED_BUILTIN_TOOL_NAMES {
+            assert!(
+                McpClient::PROTECTED_NAMES.contains(name),
+                "{name} must be protected from MCP shadowing"
+            );
+        }
     }
 
     #[test]

@@ -68,10 +68,15 @@ test_a2.md
 *.md
 !README.md
 !README-zh.md
+!AGENTS.md
+!docs/octosense-integration-walkthrough.md
 !ORG-README.md
 !CLAUDE.md
 !CHANGELOG.md
 !.octos/AGENTS.md
+!specs/task-issue-2236-fenced-peer-build-cache.spec.md
+!specs/task-issue-2237-goal-create-admits-archived.spec.md
+!specs/task-olp-obs-p2-producers.spec.md
 !specs/task-approval-post-tool-continuation.spec.md
 !specs/kv-cache-friendly-compaction.spec.md
 !specs/task-compaction-instruction-priority.spec.md
@@ -136,6 +141,9 @@ test_a2.md
 # api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md.
 !docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_TEMPLATE.md
 !docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*.md
+# `octos serve --host-managed` operator/host contract (UPCR-2026-036), cited
+# from the CLI help and crates/octos-cli/src/api/host_managed.rs.
+!docs/HOST_MANAGED_SERVE.md
 # Architecture Decision Records — landed under docs/adr/ to keep the
 # top-level docs/ flat for one-off design notes. Allowlist the whole
 # directory so future ADRs don't need per-file edits.

@@ -114,6 +114,7 @@ fn reasoning_effort_level_wire_shape() {
         reasoning_effort: Some(ReasoningEffortLevel::Max),
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let wire = serde_json::to_value(&params).unwrap();
     assert_eq!(wire["reasoning_effort"], json!("max"));
@@ -153,6 +154,7 @@ fn turn_start_live_video_roundtrips_and_is_omitted_when_false() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let wire = serde_json::to_value(&params).unwrap();
     assert!(wire.get("live_video").is_none());
@@ -195,6 +197,7 @@ fn should_surface_persisted_reasoning_effort_on_session_open() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: Some(ReasoningEffortLevel::High),
+        accepted_client_commands: None,
     };
     let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
     assert_eq!(wire["reasoning_effort"], json!("high"));
@@ -222,6 +225,52 @@ fn should_surface_persisted_reasoning_effort_on_session_open() {
     let parsed: SessionOpened =
         serde_json::from_value(legacy).expect("legacy payload without field decodes");
     assert_eq!(parsed.reasoning_effort, None);
+}
+
+#[test]
+fn session_opened_echoes_accepted_client_commands() {
+    let opened = SessionOpened {
+        session_id: SessionKey("local:demo".into()),
+        active_profile_id: None,
+        workspace_root: None,
+        context: None,
+        context_state: None,
+        cursor: None,
+        panes: None,
+        capabilities: UiProtocolCapabilities::first_server_slice(),
+        reasoning_effort: None,
+        accepted_client_commands: Some(vec!["/model".into()]),
+    };
+    let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
+    assert_eq!(wire["accepted_client_commands"], json!(["/model"]));
+    let back: SessionOpened = serde_json::from_value(wire).expect("round-trip");
+    assert_eq!(back.accepted_client_commands, Some(vec!["/model".into()]));
+
+    // A declaration the server dropped entirely stays distinguishable from
+    // an open that declared nothing.
+    let all_dropped = SessionOpened {
+        accepted_client_commands: Some(Vec::new()),
+        ..opened.clone()
+    };
+    let wire = serde_json::to_value(&all_dropped).expect("serialize empty");
+    assert_eq!(wire["accepted_client_commands"], json!([]));
+
+    let undeclared = SessionOpened {
+        accepted_client_commands: None,
+        ..opened
+    };
+    let wire = serde_json::to_value(&undeclared).expect("serialize None");
+    assert!(wire.get("accepted_client_commands").is_none());
+    let legacy = json!({
+        "session_id": "local:demo",
+        "capabilities": serde_json::to_value(
+            UiProtocolCapabilities::first_server_slice()
+        )
+        .unwrap()
+    });
+    let parsed: SessionOpened =
+        serde_json::from_value(legacy).expect("legacy payload without field decodes");
+    assert_eq!(parsed.accepted_client_commands, None);
 }
 
 #[test]
@@ -340,6 +389,7 @@ fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
             read_allow_paths: vec!["/repo/docs".into()],
         }),
         after: None,
+        client_commands: None,
     };
 
     let wire = serde_json::to_value(&params).expect("serialize session/open params");
@@ -362,6 +412,39 @@ fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
     assert!(decoded_legacy.topic.is_none());
     assert!(decoded_legacy.cwd.is_none());
     assert!(decoded_legacy.sandbox.is_none());
+}
+
+#[test]
+fn session_open_client_commands_round_trip() {
+    let params = SessionOpenParams {
+        session_id: SessionKey("local:demo".into()),
+        topic: None,
+        profile_id: None,
+        cwd: None,
+        sandbox: None,
+        after: None,
+        client_commands: Some(vec!["/model".into(), "/add-model".into()]),
+    };
+
+    let wire = serde_json::to_value(&params).expect("serialize session/open params");
+    assert_eq!(wire["client_commands"], json!(["/model", "/add-model"]));
+    let decoded: SessionOpenParams =
+        serde_json::from_value(wire).expect("deserialize session/open params");
+    assert_eq!(decoded, params);
+}
+
+#[test]
+fn session_open_client_commands_stay_off_the_wire_when_absent() {
+    let legacy: SessionOpenParams =
+        serde_json::from_value(json!({"session_id": "local:demo"})).expect("legacy params");
+    assert!(legacy.client_commands.is_none());
+    let wire = serde_json::to_value(&legacy).expect("serialize legacy params");
+    assert!(wire.get("client_commands").is_none());
+
+    let declared_none: SessionOpenParams =
+        serde_json::from_value(json!({"session_id": "local:demo", "client_commands": []}))
+            .expect("an empty declaration is distinct from an absent one");
+    assert_eq!(declared_none.client_commands, Some(Vec::new()));
 }
 
 #[test]
@@ -477,6 +560,7 @@ fn session_opened_pane_snapshot_round_trips() {
         }),
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
 
     let wire = serde_json::to_value(&opened).expect("serialize session/open panes");
@@ -511,6 +595,7 @@ fn session_open_result_includes_capabilities_field() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
     let wire = serde_json::to_value(&opened).expect("serialize SessionOpened");
     let capabilities = wire
@@ -532,7 +617,10 @@ fn session_open_result_includes_capabilities_field() {
         .as_array()
         .expect("supported_features array");
     for feature in UI_PROTOCOL_KNOWN_FEATURES {
-        if *feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2 {
+        if *feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2
+            || *feature == UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1
+            || *feature == UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
+        {
             continue;
         }
         assert!(
@@ -548,6 +636,12 @@ fn session_open_result_includes_capabilities_field() {
             .any(|advertised| advertised == &json!(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)),
         "strictly opt-in v2 must not change the no-header SessionOpened wire"
     );
+    assert!(
+        !supported_features
+            .iter()
+            .any(|advertised| advertised == &json!(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1)),
+        "strictly opt-in semantic cache diagnostics must not change the no-header SessionOpened wire"
+    );
 
     // Older payloads (e.g. ledger replays from before the field
     // existed) decode successfully because the field carries
@@ -561,6 +655,44 @@ fn session_open_result_includes_capabilities_field() {
         decoded.capabilities,
         UiProtocolCapabilities::first_server_slice()
     );
+}
+
+#[test]
+fn should_not_claim_semantic_cache_when_session_opened_carries_no_negotiated_capabilities() {
+    // UPCR-2026-029: `context.semantic_cache.v1` is advertised only after a
+    // client explicitly REQUESTS it. The no-header baseline
+    // (`first_server_slice`) doubles as the serde default for legacy
+    // `SessionOpened` payloads, so both must stay silent about it exactly
+    // like the opt-in `projection.envelope.v2`.
+    let baseline = UiProtocolCapabilities::first_server_slice();
+    assert!(
+        !baseline.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
+        "the no-header baseline must not advertise the opt-in semantic cache diagnostics"
+    );
+    assert!(
+        baseline.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1),
+        "the parent lifecycle capability stays in the baseline"
+    );
+
+    let legacy = json!({ "session_id": "local:demo" });
+    let decoded: SessionOpened =
+        serde_json::from_value(legacy).expect("legacy SessionOpened decode");
+    assert!(
+        !decoded
+            .capabilities
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
+        "a legacy payload without capabilities must not decode into a semantic-cache claim"
+    );
+
+    // The feature stays in the known registry and is still advertised once a
+    // client asks for it.
+    assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1));
+    let negotiated = UiProtocolCapabilities::for_negotiated_features([
+        UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+        UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+    ]);
+    assert!(negotiated.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1));
+    assert!(negotiated.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1));
 }
 
 #[test]
@@ -701,10 +833,6 @@ fn ui_protocol_v1_wire_contract_is_golden() {
         "state.turn_state_get.v1"
     );
     assert_eq!(
-        UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1,
-        "projection.envelope.v1"
-    );
-    assert_eq!(
         UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
         "projection.envelope.v2"
     );
@@ -733,6 +861,10 @@ fn ui_protocol_v1_wire_contract_is_golden() {
     assert_eq!(
         UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
         "context.lifecycle.v1"
+    );
+    assert_eq!(
+        UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+        "context.semantic_cache.v1"
     );
     assert_eq!(
         UI_PROTOCOL_FEATURE_HARNESS_TASK_SUPERVISION_INSPECTION_V1,
@@ -778,6 +910,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "session/goal/get",
             "session/goal/set",
             "session/goal/clear",
+            "session/goal/operator_transition",
             "loop/create",
             "loop/list",
             "loop/delete",
@@ -805,6 +938,9 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "content/bulk_delete",
             "memory/overview",
             "memory/entity",
+            "memory/search",
+            "memory/load",
+            "memory/ingest",
             "cron/list",
             "cron/toggle",
             "router/set_mode",
@@ -824,6 +960,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "turn/started",
             "turn/completed",
             "turn/error",
+            "turn/steer_dropped",
             "message/delta",
             "message/reasoning_delta",
             "tool/started",
@@ -860,16 +997,20 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "session/goal/cleared",
             "loop/updated",
             "loop/fired",
-            "loop/completed",
             "monitor/fired",
             "monitor/updated",
             "monitor/expired",
             "context/compaction_completed",
             "context/compaction_started",
             "context/normalization_reported",
+            "context/state_reported",
+            "session/orchestration",
             "peer/staged",
             "peer/closed",
             "background/activity",
+            "peer/tool/call",
+            "peer/tool/cancel",
+            "peer/input",
         ]
     );
     assert_eq!(
@@ -906,6 +1047,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "session/goal/get",
             "session/goal/set",
             "session/goal/clear",
+            "session/goal/operator_transition",
             "loop/create",
             "loop/list",
             "loop/delete",
@@ -933,6 +1075,9 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "content/bulk_delete",
             "memory/overview",
             "memory/entity",
+            "memory/search",
+            "memory/load",
+            "memory/ingest",
             "cron/list",
             "cron/toggle",
             "router/set_mode",
@@ -997,6 +1142,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "session/goal/get",
                 "session/goal/set",
                 "session/goal/clear",
+                "session/goal/operator_transition",
                 "loop/create",
                 "loop/list",
                 "loop/delete",
@@ -1024,6 +1170,9 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "content/bulk_delete",
                 "memory/overview",
                 "memory/entity",
+                "memory/search",
+                "memory/load",
+                "memory/ingest",
                 "cron/list",
                 "cron/toggle",
                 "router/set_mode",
@@ -1040,6 +1189,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "turn/started",
                 "turn/completed",
                 "turn/error",
+                "turn/steer_dropped",
                 "message/delta",
                 "message/reasoning_delta",
                 "tool/started",
@@ -1076,16 +1226,20 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "session/goal/cleared",
                 "loop/updated",
                 "loop/fired",
-                "loop/completed",
                 "monitor/fired",
                 "monitor/updated",
                 "monitor/expired",
                 "context/compaction_completed",
                 "context/compaction_started",
                 "context/normalization_reported",
+                "context/state_reported",
+                "session/orchestration",
                 "peer/staged",
                 "peer/closed",
-                "background/activity"
+                "background/activity",
+                "peer/tool/call",
+                "peer/tool/cancel",
+                "peer/input"
             ],
             "supported_features": [
                 "approval.typed.v1",
@@ -1098,7 +1252,6 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "state.turn_state_get.v1",
                 "event.spawn_complete.v1",
                 "event.file_attached.v1",
-                "projection.envelope.v1",
                 "auxiliary.rest_to_ws.v1",
                 "coding.autonomy.v1",
                 "coding.agent_control.v1",
@@ -1131,6 +1284,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     })
     .into_rpc_request("req-turn-start")
     .expect("serialize turn/start");
@@ -1323,6 +1477,8 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        started_at: None,
+        relaunched_from: None,
         turn_id: None,
     })
     .into_rpc_notification()
@@ -1392,7 +1548,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
         ApprovalCommandDetails {
             argv: vec!["cargo".into(), "test".into()],
             command_line: Some("cargo test".into()),
-            cwd: Some("/Users/yuechen/home/octos".into()),
+            cwd: Some("/workspace/octos".into()),
             env_keys: vec!["RUST_LOG".into()],
             tool_call_id: Some("tool-1".into()),
         },
@@ -1400,7 +1556,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
             mode: Some("workspace_write".into()),
             filesystem_access: Some("workspace_write".into()),
             network_access: Some(false),
-            writable_roots: vec!["/Users/yuechen/home/octos".into()],
+            writable_roots: vec!["/workspace/octos".into()],
         }),
     );
     assert_typed_approval_round_trips(
@@ -1441,6 +1597,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
                 filesystem: None,
                 network: None,
                 sandbox_escalation: None,
+                host_tool: None,
             }),
             ..generic.clone()
         },
@@ -1459,10 +1616,11 @@ fn generic_and_typed_approval_payloads_round_trip() {
                     operation: "write".into(),
                     paths: vec!["docs/example.md".into()],
                     outside_workspace: false,
-                    writable_roots: vec!["/Users/yuechen/home/octos".into()],
+                    writable_roots: vec!["/workspace/octos".into()],
                 }),
                 network: None,
                 sandbox_escalation: None,
+                host_tool: None,
             }),
             ..generic.clone()
         },
@@ -1485,6 +1643,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
                     urls: vec!["https://api.openai.com/v1/responses".into()],
                 }),
                 sandbox_escalation: None,
+                host_tool: None,
             }),
             ..generic.clone()
         },
@@ -1517,6 +1676,7 @@ fn generic_and_typed_approval_payloads_round_trip() {
                     justification: Some("Run integration tests".into()),
                     suggested_prefix_rule: vec!["cargo".into(), "test".into()],
                 }),
+                host_tool: None,
             }),
             ..generic
         },
@@ -1888,6 +2048,7 @@ fn ui_command_builds_and_parses_json_rpc_request() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let request = command
@@ -1956,6 +2117,7 @@ fn turn_start_round_trips_with_media_field() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(
@@ -1998,6 +2160,7 @@ fn turn_start_round_trips_with_topic_field() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(
@@ -2040,6 +2203,7 @@ fn turn_start_round_trips_with_rewrite_for_field() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(
@@ -2087,6 +2251,7 @@ fn turn_start_round_trips_with_all_beta1_fields() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     });
 
     let wire = serde_json::to_value(
@@ -2218,6 +2383,7 @@ fn typed_rpc_results_map_from_methods_and_round_trip() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     };
 
     let session_result = UiRpcResult::SessionOpen(SessionOpenResult::new(opened));
@@ -2970,19 +3136,6 @@ fn m15_autonomy_notifications_register_methods_and_round_trip() {
             }),
             methods::LOOP_FIRED,
         ),
-        (
-            UiNotification::LoopCompleted(LoopCompletedEvent {
-                session_id,
-                profile_id: Some("coding".into()),
-                loop_id: "loop_01".into(),
-                loop_state: Some(loop_state),
-                status: Some("completed".into()),
-                completed_at_ms: Some(1_778_870_090_000),
-                result: Some(json!({ "message": "iteration completed" })),
-                error: None,
-            }),
-            methods::LOOP_COMPLETED,
-        ),
     ];
 
     for (event, method) in cases {
@@ -3213,6 +3366,7 @@ fn resumable_notifications_carry_event_ledger_cursors() {
         panes: None,
         capabilities: UiProtocolCapabilities::first_server_slice(),
         reasoning_effort: None,
+        accepted_client_commands: None,
     });
 
     let opened_wire = opened
@@ -3239,6 +3393,7 @@ fn resumable_notifications_carry_event_ledger_cursors() {
         tokens_in: None,
         tokens_out: None,
         session_result: None,
+        token_usage: None,
     });
     let completed_wire = completed
         .clone()
@@ -3699,28 +3854,48 @@ fn input_item_unknown_kind_falls_through() {
 
 #[test]
 fn rpc_error_codes_partition_is_disjoint() {
-    // Application-layer codes must live in -32100..=-32199; the
-    // spec-pinned APPROVAL_NOT_PENDING is the documented exception.
-    for code in [
-        rpc_error_codes::UNKNOWN_SESSION,
-        rpc_error_codes::UNKNOWN_TURN,
-        rpc_error_codes::UNKNOWN_APPROVAL_ID,
-        rpc_error_codes::UNKNOWN_PREVIEW_ID,
-        rpc_error_codes::UNKNOWN_TASK_ID,
-        rpc_error_codes::APPROVAL_CANCELLED,
-        rpc_error_codes::CURSOR_OUT_OF_RANGE,
-        rpc_error_codes::CURSOR_INVALID,
-        rpc_error_codes::PERMISSION_DENIED,
-        rpc_error_codes::UNSUPPORTED_CAPABILITY,
-        rpc_error_codes::RUNTIME_NOT_READY,
-        rpc_error_codes::MALFORMED_RESULT,
-        rpc_error_codes::RATE_LIMITED,
-    ] {
+    // Application-layer codes must live in -32100..=-32199. The set under
+    // check is derived from the module's own constants rather than
+    // hand-copied, so a new constant is range-checked the moment it lands;
+    // only the documented out-of-band slots below are exempt, and each
+    // exemption must itself sit in its docblock band, so the exemption
+    // lists cannot silently swallow an application code.
+    let json_rpc_reserved = [
+        rpc_error_codes::PARSE_ERROR,
+        rpc_error_codes::INVALID_REQUEST,
+        rpc_error_codes::METHOD_NOT_FOUND,
+        rpc_error_codes::INVALID_PARAMS,
+        rpc_error_codes::INTERNAL_ERROR,
+    ];
+    let server_band = [
+        rpc_error_codes::METHOD_NOT_SUPPORTED,
+        rpc_error_codes::APPROVAL_NOT_PENDING,
+    ];
+    for &code in &json_rpc_reserved {
         assert!(
-            (-32199..=-32100).contains(&code),
-            "{code} outside -32100..=-32199",
+            (-32700..=-32600).contains(&code),
+            "{code} outside the JSON-RPC reserved block -32700..=-32600",
         );
     }
+    for &code in &server_band {
+        assert!(
+            (-32099..=-32000).contains(&code),
+            "{code} outside the server band -32000..=-32099",
+        );
+    }
+    let mut outside_band = Vec::new();
+    for (name, code) in parse_rpc_error_code_constants() {
+        if json_rpc_reserved.contains(&code) || server_band.contains(&code) {
+            continue;
+        }
+        if !(-32199..=-32100).contains(&code) {
+            outside_band.push(format!("{name}={code}"));
+        }
+    }
+    assert!(
+        outside_band.is_empty(),
+        "codes outside -32100..=-32199: {outside_band:?}",
+    );
     assert_eq!(rpc_error_codes::APPROVAL_NOT_PENDING, -32011);
     assert_eq!(rpc_error_codes::APPROVAL_CANCELLED, -32105);
 }
@@ -3810,6 +3985,8 @@ fn task_updated_event_round_trips_with_cancelled_state() {
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        started_at: None,
+        relaunched_from: None,
         turn_id: None,
     });
     let rpc = event
@@ -3891,6 +4068,14 @@ fn task_updated_event_round_trips_m13b_projection_fields() {
         summary: Some("found 1 issue".into()),
         artifact_count: Some(2),
         runtime_policy_stamp: Some(json!({ "approval_policy": "on-request" })),
+        // #1595: server clock and relaunch lineage round-trip alongside
+        // the projection fields.
+        started_at: Some(
+            DateTime::parse_from_rfc3339("2026-09-15T07:46:43Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ),
+        relaunched_from: Some("01900000-0000-7000-8000-0000000000aa".into()),
         // C1 step 4: turn_id round-trips alongside the projection fields.
         turn_id: Some(TurnId(Uuid::from_u128(0xCAFE))),
     };
@@ -3902,6 +4087,16 @@ fn task_updated_event_round_trips_m13b_projection_fields() {
     assert_eq!(
         value.get("runtime_policy_stamp"),
         Some(&json!({ "approval_policy": "on-request" })),
+    );
+    assert_eq!(
+        value.get("started_at"),
+        Some(&json!("2026-09-15T07:46:43Z")),
+        "started_at must appear on the wire in RFC 3339 form",
+    );
+    assert_eq!(
+        value.get("relaunched_from"),
+        Some(&json!("01900000-0000-7000-8000-0000000000aa")),
+        "relaunched_from must appear on the wire when set",
     );
     assert_eq!(
         value.get("turn_id"),
@@ -3927,6 +4122,8 @@ fn task_updated_event_round_trips_m13b_projection_fields() {
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        started_at: None,
+        relaunched_from: None,
         turn_id: None,
     };
     let bare_value = serde_json::to_value(&bare).expect("serialize bare task/updated");
@@ -3940,6 +4137,14 @@ fn task_updated_event_round_trips_m13b_projection_fields() {
     assert!(
         bare_value.get("runtime_policy_stamp").is_none(),
         "absent runtime_policy_stamp omits",
+    );
+    assert!(
+        bare_value.get("started_at").is_none(),
+        "absent started_at omits (#1595)",
+    );
+    assert!(
+        bare_value.get("relaunched_from").is_none(),
+        "absent relaunched_from omits (#1595)",
     );
     assert!(
         bare_value.get("turn_id").is_none(),
@@ -3958,6 +4163,8 @@ fn task_updated_event_round_trips_m13b_projection_fields() {
     assert_eq!(parsed_legacy.summary, None);
     assert_eq!(parsed_legacy.artifact_count, None);
     assert_eq!(parsed_legacy.runtime_policy_stamp, None);
+    assert_eq!(parsed_legacy.started_at, None);
+    assert_eq!(parsed_legacy.relaunched_from, None);
     assert_eq!(parsed_legacy.turn_id, None);
 }
 
@@ -4053,6 +4260,9 @@ fn golden_session_hydrate_result_serde() {
             source: Some("user".into()),
             media: vec![],
             reasoning_content: None,
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: vec![],
         }]),
         threads: Some(vec![ThreadGraphEntry {
             thread_id: "thread-1".into(),
@@ -4073,6 +4283,8 @@ fn golden_session_hydrate_result_serde() {
         pending_questions: Some(vec![sample_user_question_requested_event()]),
         replayed_envelopes: Some(vec![]),
         replayed_tool_envelopes: Some(vec![]),
+        replayed_projection_envelopes: Some(vec![]),
+        projection_thread_sequences: Some(BTreeMap::new()),
     };
     let value = serde_json::to_value(&result).expect("serialize hydrate result");
     let parsed: SessionHydrateResult =
@@ -4092,6 +4304,8 @@ fn golden_session_hydrate_result_serde() {
         pending_questions: None,
         replayed_envelopes: None,
         replayed_tool_envelopes: None,
+        replayed_projection_envelopes: None,
+        projection_thread_sequences: None,
     };
     let value = serde_json::to_value(&messages_only).expect("serialize messages-only");
     let object = value.as_object().expect("hydrate result is object");
@@ -4105,6 +4319,76 @@ fn golden_session_hydrate_result_serde() {
     // Bug C: a non-negotiated client never sees the new field.
     assert!(!object.contains_key("replayed_envelopes"));
     assert!(!object.contains_key("replayed_tool_envelopes"));
+}
+
+/// UPCR-2026-039: tool rows carry their call id and tool name, an assistant
+/// row its calls. A row without either keeps the pre-UPCR wire shape, and a
+/// pre-UPCR row decodes with the fields absent.
+#[test]
+fn should_carry_tool_call_identity_when_a_hydrated_row_is_a_tool_call_or_result() {
+    let row = |role: &str| HydratedMessage {
+        seq: 3,
+        role: role.into(),
+        content: String::new(),
+        turn_id: None,
+        thread_id: Some("thread-1".into()),
+        client_message_id: None,
+        persisted_at: sample_persisted_at(),
+        message_id: None,
+        source: None,
+        media: vec![],
+        reasoning_content: None,
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: vec![],
+    };
+    let call = HydratedMessage {
+        tool_calls: vec![HydratedToolCall {
+            tool_call_id: "call-1".into(),
+            tool_name: "peer_send_input".into(),
+        }],
+        ..row("assistant")
+    };
+    let result = HydratedMessage {
+        tool_call_id: Some("call-1".into()),
+        tool_name: Some("peer_send_input".into()),
+        ..row("tool")
+    };
+
+    let call_wire = serde_json::to_value(&call).expect("serialize call row");
+    assert_eq!(
+        call_wire["tool_calls"],
+        json!([{ "tool_call_id": "call-1", "tool_name": "peer_send_input" }])
+    );
+    assert!(call_wire.get("tool_call_id").is_none());
+    assert!(call_wire.get("tool_name").is_none());
+    let result_wire = serde_json::to_value(&result).expect("serialize result row");
+    assert_eq!(result_wire["tool_call_id"], "call-1");
+    assert_eq!(result_wire["tool_name"], "peer_send_input");
+    assert!(result_wire.get("tool_calls").is_none());
+    for parsed in [&call, &result] {
+        let wire = serde_json::to_value(parsed).expect("serialize");
+        let decoded: HydratedMessage = serde_json::from_value(wire).expect("deserialize");
+        assert_eq!(&decoded, parsed);
+    }
+
+    // Additive: a plain row serializes without the new keys, and a row from
+    // a server without UPCR-2026-039 decodes with them absent.
+    let plain = serde_json::to_value(row("user")).expect("serialize plain row");
+    for key in ["tool_call_id", "tool_name", "tool_calls"] {
+        assert!(plain.get(key).is_none(), "{key} must be omitted: {plain}");
+    }
+    let legacy: HydratedMessage = serde_json::from_value(json!({
+        "seq": 4,
+        "role": "tool",
+        "content": "ok",
+        "thread_id": "thread-1",
+        "persisted_at": "2026-04-30T12:00:00Z",
+    }))
+    .expect("deserialize a pre-UPCR-2026-039 row");
+    assert_eq!(legacy.tool_call_id, None);
+    assert_eq!(legacy.tool_name, None);
+    assert!(legacy.tool_calls.is_empty());
 }
 
 #[test]
@@ -4149,6 +4433,8 @@ fn session_rollback_command_and_result_round_trip() {
             pending_questions: None,
             replayed_envelopes: None,
             replayed_tool_envelopes: None,
+            replayed_projection_envelopes: None,
+            projection_thread_sequences: None,
         },
     };
     let wire = UiRpcResult::SessionRollback(result.clone());
@@ -4224,6 +4510,7 @@ fn golden_turn_state_get_result_serde() {
         started_at: Some(sample_persisted_at()),
         completed_at: None,
         thread_id: Some("thread-1".into()),
+        running: None,
         committed_seqs: vec![17, 18, 19],
     };
     let value = serde_json::to_value(&result).expect("serialize");
@@ -4250,6 +4537,7 @@ fn golden_turn_state_get_result_serde() {
             started_at: None,
             completed_at: None,
             thread_id: None,
+            running: None,
             committed_seqs: vec![],
         };
         let v = serde_json::to_value(&r).expect("serialize state");
@@ -4364,6 +4652,8 @@ fn task_updated_and_spawn_complete_events_round_trip_tool_call_id() {
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        started_at: None,
+        relaunched_from: None,
         turn_id: None,
     };
     let task_value = serde_json::to_value(&task_event).expect("serialize task_updated");
@@ -4391,6 +4681,8 @@ fn task_updated_and_spawn_complete_events_round_trip_tool_call_id() {
         summary: None,
         artifact_count: None,
         runtime_policy_stamp: None,
+        started_at: None,
+        relaunched_from: None,
         turn_id: None,
     };
     let legacy_value = serde_json::to_value(&task_legacy).expect("serialize legacy");
@@ -4674,6 +4966,31 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
             methods::MEMORY_ENTITY,
         ),
         (
+            UiCommand::MemorySearch(MemorySearchParams {
+                query: "dentist".into(),
+                kinds: vec!["document".into()],
+                sources: vec!["calendar".into()],
+                since: Some("2026-01-01".into()),
+                until: None,
+                limit: Some(5),
+            }),
+            methods::MEMORY_SEARCH,
+        ),
+        (
+            UiCommand::MemoryLoad(MemoryLoadParams {
+                id: "doc:mail:42".into(),
+            }),
+            methods::MEMORY_LOAD,
+        ),
+        (
+            UiCommand::MemoryIngest(MemoryIngestParams {
+                records: vec![serde_json::json!({ "id": "doc:mail:42" })],
+                vectors: None,
+                embed: Some(false),
+            }),
+            methods::MEMORY_INGEST,
+        ),
+        (
             UiCommand::CronList(CronListParams::default()),
             methods::CRON_LIST,
         ),
@@ -4687,13 +5004,14 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
     ];
     assert_eq!(
         cases.len(),
-        17,
-        "17 UiCommand arms cover the 17 auxiliary methods \
+        20,
+        "20 UiCommand arms cover the 20 auxiliary methods \
              (`session/list`, `session/snapshot`, `session/messages_page`, \
              `session/status.get`, `session/files.list`, `session/tasks.list`, \
              `session/workspace.get`, `session/title.set`, `session/delete`, \
              `system/status.get`, `content/list`, `content/delete`, \
              `content/bulk_delete`, `memory/overview`, `memory/entity`, \
+             `memory/search`, `memory/load`, `memory/ingest`, \
              `cron/list`, `cron/toggle`) — `content/delete` and \
              `content/bulk_delete` are distinct methods"
     );
@@ -4744,6 +5062,8 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
     // existing REST contract emits.
     let listing = SessionListResult {
         sessions: serde_json::json!([{ "id": "s-1", "message_count": 3 }]),
+        workspace_root: None,
+        profile_id: None,
     };
     let value = serde_json::to_value(&listing).expect("serialize");
     let decoded: SessionListResult = serde_json::from_value(value).expect("deserialize");
@@ -4901,6 +5221,9 @@ fn aux_rest_to_ws_v1_methods_are_capability_gated() {
         methods::CONTENT_BULK_DELETE,
         methods::MEMORY_OVERVIEW,
         methods::MEMORY_ENTITY,
+        methods::MEMORY_SEARCH,
+        methods::MEMORY_LOAD,
+        methods::MEMORY_INGEST,
         methods::CRON_LIST,
         methods::CRON_TOGGLE,
     ] {
@@ -4929,6 +5252,9 @@ fn aux_rest_to_ws_v1_methods_are_capability_gated() {
         methods::CONTENT_BULK_DELETE,
         methods::MEMORY_OVERVIEW,
         methods::MEMORY_ENTITY,
+        methods::MEMORY_SEARCH,
+        methods::MEMORY_LOAD,
+        methods::MEMORY_INGEST,
         methods::CRON_LIST,
         methods::CRON_TOGGLE,
     ] {
@@ -4988,6 +5314,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // new wire shape so a rename/type-flip of the field fails here.
     let with_cwd = SessionListParams {
         cwd: Some("/home/me/proj".into()),
+        profile_id: None,
     };
     assert_eq!(
         serde_json::to_value(&with_cwd).expect("serialize"),
@@ -4996,6 +5323,21 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let parsed_cwd: SessionListParams =
         serde_json::from_value(serde_json::json!({ "cwd": "/home/me/proj" })).expect("decode");
     assert_eq!(parsed_cwd, with_cwd);
+    // session/list — WITH the additive `profile_id` (names the per-project
+    // store's profile, same as session/open). Also optional and skipped
+    // when absent, so the two pins above stay byte-identical.
+    let with_profile = SessionListParams {
+        cwd: Some("/home/me/proj".into()),
+        profile_id: Some("dev".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&with_profile).expect("serialize"),
+        serde_json::json!({ "cwd": "/home/me/proj", "profile_id": "dev" }),
+    );
+    let parsed_profile: SessionListParams =
+        serde_json::from_value(serde_json::json!({ "cwd": "/home/me/proj", "profile_id": "dev" }))
+            .expect("decode");
+    assert_eq!(parsed_profile, with_profile);
 
     // session/snapshot
     let p = SessionSnapshotParams {
@@ -5142,6 +5484,68 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
         serde_json::json!({ "name": "acme-corp" }),
     );
 
+    // memory/search — optional filters are omitted when unset; the
+    // wire shape is `{ query, kinds?, sources?, since?, until?, limit? }`.
+    assert_eq!(
+        serde_json::to_value(MemorySearchParams {
+            query: "dentist".into(),
+            ..Default::default()
+        })
+        .expect("serialize"),
+        serde_json::json!({ "query": "dentist" }),
+    );
+    assert_eq!(
+        serde_json::to_value(MemorySearchParams {
+            query: "dentist".into(),
+            kinds: vec!["document".into(), "knowledge".into()],
+            sources: vec!["calendar".into()],
+            since: Some("2026-01-01".into()),
+            until: Some("2026-02-01T00:00:00Z".into()),
+            limit: Some(5),
+        })
+        .expect("serialize"),
+        serde_json::json!({
+            "query": "dentist",
+            "kinds": ["document", "knowledge"],
+            "sources": ["calendar"],
+            "since": "2026-01-01",
+            "until": "2026-02-01T00:00:00Z",
+            "limit": 5,
+        }),
+    );
+    let decoded: MemorySearchParams =
+        serde_json::from_value(serde_json::json!({ "query": "q" })).expect("decode");
+    assert_eq!(decoded.kinds, Vec::<String>::new());
+    assert_eq!(decoded.limit, None);
+
+    // memory/load — `{ id }`
+    assert_eq!(
+        serde_json::to_value(MemoryLoadParams {
+            id: "bank:acme-corp".into(),
+        })
+        .expect("serialize"),
+        serde_json::json!({ "id": "bank:acme-corp" }),
+    );
+
+    // memory/ingest — `{ records, vectors?, embed? }`
+    assert_eq!(
+        serde_json::to_value(MemoryIngestParams {
+            records: vec![serde_json::json!({ "id": "doc:mail:1" })],
+            vectors: Some(vec![Some(vec![0.5, 0.25]), None]),
+            embed: Some(false),
+        })
+        .expect("serialize"),
+        serde_json::json!({
+            "records": [{ "id": "doc:mail:1" }],
+            "vectors": [[0.5, 0.25], null],
+            "embed": false,
+        }),
+    );
+    let decoded: MemoryIngestParams =
+        serde_json::from_value(serde_json::json!({ "records": [] })).expect("decode");
+    assert_eq!(decoded.vectors, None);
+    assert_eq!(decoded.embed, None);
+
     // cron/list — empty
     assert_eq!(
         serde_json::to_value(CronListParams::default()).expect("serialize"),
@@ -5165,14 +5569,38 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
 /// downstream client. Each `assert_eq!` is the contract.
 #[test]
 fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
-    // session/list — `{ sessions: <opaque> }`
+    // session/list — `{ sessions: <opaque> }` for a legacy (unscoped)
+    // listing: the scope fields are absent, not null, so a client can tell
+    // "not scoped" from "scoped to nothing".
     assert_eq!(
         serde_json::to_value(SessionListResult {
             sessions: serde_json::json!([{ "id": "s-1" }]),
+            workspace_root: None,
+            profile_id: None,
         })
         .expect("serialize"),
         serde_json::json!({ "sessions": [{ "id": "s-1" }] }),
     );
+    // session/list — a workspace-scoped listing attests the canonical root
+    // and profile whose `<root>/.octos/<profile>` store it read.
+    let scoped = SessionListResult {
+        sessions: serde_json::json!([{ "id": "s-1" }]),
+        workspace_root: Some("/srv/project".into()),
+        profile_id: Some("dev".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(&scoped).expect("serialize"),
+        serde_json::json!({
+            "sessions": [{ "id": "s-1" }],
+            "workspace_root": "/srv/project",
+            "profile_id": "dev",
+        }),
+    );
+    // Older servers never send the scope fields; they still decode.
+    let legacy: SessionListResult =
+        serde_json::from_value(serde_json::json!({ "sessions": [] })).expect("decode");
+    assert_eq!(legacy.workspace_root, None);
+    assert_eq!(legacy.profile_id, None);
 
     // session/snapshot — `{ status, files, tasks }`
     assert_eq!(
@@ -5319,6 +5747,59 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
         }),
     );
 
+    // memory/search — `{ hits: [<octos_memory::Hit JSON>...] }`
+    assert_eq!(
+        serde_json::to_value(MemorySearchResult {
+            hits: vec![serde_json::json!({ "id": "doc:mail:1", "score": 0.9 })],
+        })
+        .expect("serialize"),
+        serde_json::json!({ "hits": [{ "id": "doc:mail:1", "score": 0.9 }] }),
+    );
+
+    // memory/load — `{ record, page?, page_truncated }`; `page` is
+    // omitted for Recall records and present for `bank:` knowledge.
+    assert_eq!(
+        serde_json::to_value(MemoryLoadResult {
+            record: serde_json::json!({ "id": "doc:mail:1" }),
+            page: None,
+            page_truncated: false,
+        })
+        .expect("serialize"),
+        serde_json::json!({ "record": { "id": "doc:mail:1" }, "page_truncated": false }),
+    );
+    assert_eq!(
+        serde_json::to_value(MemoryLoadResult {
+            record: serde_json::json!({ "id": "bank:acme" }),
+            page: Some("# acme".into()),
+            page_truncated: true,
+        })
+        .expect("serialize"),
+        serde_json::json!({
+            "record": { "id": "bank:acme" },
+            "page": "# acme",
+            "page_truncated": true,
+        }),
+    );
+
+    // memory/ingest — the UpsertReport counts, all always present.
+    assert_eq!(
+        serde_json::to_value(MemoryIngestResult {
+            inserted: 3,
+            updated: 1,
+            unchanged: 2,
+            vectors_stored: 4,
+            embedded: 4,
+        })
+        .expect("serialize"),
+        serde_json::json!({
+            "inserted": 3,
+            "updated": 1,
+            "unchanged": 2,
+            "vectors_stored": 4,
+            "embedded": 4,
+        }),
+    );
+
     // cron/list — `{ jobs, count, gateway_running, truncated }`
     assert_eq!(
         serde_json::to_value(CronListResult {
@@ -5373,416 +5854,6 @@ fn content_bulk_delete_max_ids_constant_is_pinned() {
         CONTENT_BULK_DELETE_MAX_IDS, 256,
         "wire-contract cap; bump server dispatcher AND any client adapters together",
     );
-}
-
-// ===== UPCR-2026-014 M9-γ projection envelope golden tests =====
-
-fn envelope(seq: u64, payload: Payload) -> Envelope {
-    Envelope {
-        thread_id: "thread-1".into(),
-        seq,
-        client_message_id: None,
-        payload,
-    }
-}
-
-#[test]
-fn golden_envelope_assistant_delta_round_trips() {
-    let env = envelope(
-        1,
-        Payload::AssistantDelta {
-            text: "hello".into(),
-        },
-    );
-    let value = serde_json::to_value(&env).expect("serialize");
-    assert_eq!(value.get("thread_id"), Some(&json!("thread-1")));
-    assert_eq!(value.get("seq"), Some(&json!(1)));
-    assert!(
-        value.get("client_message_id").is_none(),
-        "client_message_id is absent on internal events"
-    );
-    let payload = value.get("payload").expect("payload");
-    assert_eq!(payload.get("type"), Some(&json!("assistant_delta")));
-    assert_eq!(
-        payload.get("data").and_then(|d| d.get("text")),
-        Some(&json!("hello"))
-    );
-    let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
-    assert_eq!(parsed, env);
-}
-
-#[test]
-fn golden_envelope_user_message_round_trips() {
-    // user_message envelopes are the turn root — server-mirrored
-    // from the client send. They carry `client_message_id` (and
-    // ONLY they do, per UPCR-2026-014 § 14.1) so the optimistic
-    // <GhostBubble> overlay can match its server reflection. The
-    // projection itself MUST NOT consult the field.
-    let env = Envelope {
-        thread_id: "thread-1".into(),
-        seq: 1,
-        client_message_id: Some("cmid-abc".into()),
-        payload: Payload::UserMessage {
-            text: "Q1 — what's 2+2?".into(),
-            files: vec![FileRef {
-                path: "/tmp/upload.png".into(),
-                mime: "image/png".into(),
-                size_bytes: 2048,
-            }],
-        },
-    };
-    let value = serde_json::to_value(&env).expect("serialize");
-    assert_eq!(value.get("client_message_id"), Some(&json!("cmid-abc")));
-    let payload = value.get("payload").expect("payload");
-    assert_eq!(payload.get("type"), Some(&json!("user_message")));
-    let data = payload.get("data").expect("data");
-    assert_eq!(data.get("text"), Some(&json!("Q1 — what's 2+2?")));
-    let files = data.get("files").and_then(|f| f.as_array()).expect("files");
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0].get("path"), Some(&json!("/tmp/upload.png")));
-    assert_eq!(files[0].get("mime"), Some(&json!("image/png")));
-    assert_eq!(files[0].get("size_bytes"), Some(&json!(2048)));
-    let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
-    assert_eq!(parsed, env);
-}
-
-#[test]
-fn golden_envelope_user_message_omits_empty_files() {
-    // `files` is omitted on the wire when empty (matches the rest
-    // of the protocol's `Vec<_>` skip-empty convention).
-    let env = Envelope {
-        thread_id: "thread-1".into(),
-        seq: 1,
-        client_message_id: Some("cmid-1".into()),
-        payload: Payload::UserMessage {
-            text: "hi".into(),
-            files: vec![],
-        },
-    };
-    let value = serde_json::to_value(&env).expect("serialize");
-    let data = value
-        .get("payload")
-        .and_then(|p| p.get("data"))
-        .expect("data");
-    assert!(
-        data.get("files").is_none(),
-        "empty files array MUST be omitted on the wire"
-    );
-    let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
-    assert_eq!(parsed, env);
-}
-
-#[test]
-fn golden_envelope_assistant_delta_omits_client_message_id_on_wire() {
-    // Per spec § 14.1 + Envelope doc: client_message_id is ONLY
-    // populated on user_message envelopes. Internal events
-    // (assistant_delta and friends) leave it None and the wire
-    // shape MUST omit the field entirely.
-    let env = envelope(
-        2,
-        Payload::AssistantDelta {
-            text: "Q1 answer…".into(),
-        },
-    );
-    let value = serde_json::to_value(&env).expect("serialize");
-    assert!(
-        value.get("client_message_id").is_none(),
-        "client_message_id is absent on non-user_message envelopes"
-    );
-}
-
-#[test]
-fn golden_envelope_assistant_persisted_round_trips() {
-    let env = envelope(
-        3,
-        Payload::AssistantPersisted {
-            text: "final answer".into(),
-            meta: MessageMeta {
-                message_id: "msg-7".into(),
-                persisted_at: sample_persisted_at(),
-                media: vec!["report.md".into()],
-            },
-        },
-    );
-    let value = serde_json::to_value(&env).expect("serialize");
-    let payload = value.get("payload").expect("payload");
-    assert_eq!(payload.get("type"), Some(&json!("assistant_persisted")));
-    let data = payload.get("data").expect("data");
-    assert_eq!(data.get("text"), Some(&json!("final answer")));
-    assert_eq!(
-        data.get("meta").and_then(|m| m.get("message_id")),
-        Some(&json!("msg-7"))
-    );
-    let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
-    assert_eq!(parsed, env);
-}
-
-#[test]
-fn golden_envelope_tool_fidelity_round_trip_and_legacy_decode() {
-    // Enriched shape: arguments/output previews + duration survive the
-    // wire round-trip.
-    let start = envelope(
-        4,
-        Payload::ToolStart {
-            tool_call_id: "tc-1".into(),
-            name: "shell".into(),
-            arguments_preview: Some("command: \"cargo test\"".into()),
-        },
-    );
-    let end = envelope(
-        5,
-        Payload::ToolEnd {
-            tool_call_id: "tc-1".into(),
-            status: EnvelopeToolEndStatus::Complete,
-            error: None,
-            reason: None,
-            output_preview: Some("test result: ok. 815 passed".into()),
-            duration_ms: Some(1234),
-        },
-    );
-    for env in [start, end] {
-        let value = serde_json::to_value(&env).expect("serialize");
-        let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
-        assert_eq!(parsed, env);
-    }
-
-    // Legacy wire (envelopes persisted before the fidelity fields
-    // existed) must still decode — fields default to None. Build the
-    // legacy shape by stripping the new keys from a modern envelope so
-    // the fixture tracks the real tag/content encoding.
-    let strip = |env: &Envelope, keys: &[&str]| -> Envelope {
-        let mut value = serde_json::to_value(env).expect("serialize");
-        let data = value["payload"]["data"]
-            .as_object_mut()
-            .expect("payload data object");
-        for key in keys {
-            data.remove(*key);
-        }
-        serde_json::from_value(value).expect("legacy envelope decodes")
-    };
-    let start = envelope(
-        8,
-        Payload::ToolStart {
-            tool_call_id: "tc-9".into(),
-            name: "read_file".into(),
-            arguments_preview: Some("path: \"x\"".into()),
-        },
-    );
-    match strip(&start, &["arguments_preview"]).payload {
-        Payload::ToolStart {
-            arguments_preview, ..
-        } => assert_eq!(arguments_preview, None),
-        other => panic!("expected ToolStart, got {other:?}"),
-    }
-    let end = envelope(
-        9,
-        Payload::ToolEnd {
-            tool_call_id: "tc-9".into(),
-            status: EnvelopeToolEndStatus::Complete,
-            error: None,
-            reason: None,
-            output_preview: Some("ok".into()),
-            duration_ms: Some(1),
-        },
-    );
-    match strip(&end, &["output_preview", "duration_ms"]).payload {
-        Payload::ToolEnd {
-            output_preview,
-            duration_ms,
-            ..
-        } => {
-            assert_eq!(output_preview, None);
-            assert_eq!(duration_ms, None);
-        }
-        other => panic!("expected ToolEnd, got {other:?}"),
-    }
-}
-
-#[test]
-fn golden_envelope_tool_start_progress_end_round_trip() {
-    let start = envelope(
-        4,
-        Payload::ToolStart {
-            tool_call_id: "tc-1".into(),
-            name: "shell".into(),
-            arguments_preview: None,
-        },
-    );
-    let progress = envelope(
-        5,
-        Payload::ToolProgress {
-            tool_call_id: "tc-1".into(),
-            message: "running…".into(),
-        },
-    );
-    let end_ok = envelope(
-        6,
-        Payload::ToolEnd {
-            tool_call_id: "tc-1".into(),
-            status: EnvelopeToolEndStatus::Complete,
-            error: None,
-            reason: None,
-            output_preview: None,
-            duration_ms: None,
-        },
-    );
-    let end_err = envelope(
-        7,
-        Payload::ToolEnd {
-            tool_call_id: "tc-2".into(),
-            status: EnvelopeToolEndStatus::Error,
-            error: Some("boom".into()),
-            reason: None,
-            output_preview: None,
-            duration_ms: None,
-        },
-    );
-
-    for env in [&start, &progress, &end_ok, &end_err] {
-        let value = serde_json::to_value(env).expect("serialize");
-        let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
-        assert_eq!(&parsed, env);
-    }
-
-    // Wire-form discriminator check.
-    let start_val = serde_json::to_value(&start).expect("serialize");
-    assert_eq!(
-        start_val.get("payload").and_then(|p| p.get("type")),
-        Some(&json!("tool_start"))
-    );
-    let end_err_val = serde_json::to_value(&end_err).expect("serialize");
-    assert_eq!(
-        end_err_val
-            .get("payload")
-            .and_then(|p| p.get("data"))
-            .and_then(|d| d.get("status")),
-        Some(&json!("error"))
-    );
-    // ToolEnd `error` and `reason` fields omitted when None.
-    let end_ok_val = serde_json::to_value(&end_ok).expect("serialize");
-    let end_ok_data = end_ok_val
-        .get("payload")
-        .and_then(|p| p.get("data"))
-        .expect("tool_end data");
-    assert!(end_ok_data.get("error").is_none());
-    assert!(end_ok_data.get("reason").is_none());
-}
-
-#[test]
-fn golden_envelope_tool_end_skipped_and_aborted_round_trip() {
-    // Codex M9-γ-1 BLOCK 3: `complete | error` was too lossy. The
-    // sealed v1 union now also covers deadline-skip (`skipped`) and
-    // user/system-driven cancellation (`aborted`). Optional
-    // `reason` carries the human-readable detail.
-    let skipped = envelope(
-        10,
-        Payload::ToolEnd {
-            tool_call_id: "tc-3".into(),
-            status: EnvelopeToolEndStatus::Skipped,
-            error: None,
-            reason: Some("deadline elapsed before tool started".into()),
-            output_preview: None,
-            duration_ms: None,
-        },
-    );
-    let aborted = envelope(
-        11,
-        Payload::ToolEnd {
-            tool_call_id: "tc-4".into(),
-            status: EnvelopeToolEndStatus::Aborted,
-            error: None,
-            reason: Some("user issued turn/interrupt".into()),
-            output_preview: None,
-            duration_ms: None,
-        },
-    );
-    for (env, expected_status) in [(&skipped, "skipped"), (&aborted, "aborted")] {
-        let value = serde_json::to_value(env).expect("serialize");
-        let data = value
-            .get("payload")
-            .and_then(|p| p.get("data"))
-            .expect("tool_end data");
-        assert_eq!(data.get("status"), Some(&json!(expected_status)));
-        assert!(
-            data.get("reason").is_some(),
-            "reason populated for skipped/aborted"
-        );
-        assert!(data.get("error").is_none(), "error omitted when None");
-        let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
-        assert_eq!(&parsed, env);
-    }
-}
-
-#[test]
-fn golden_envelope_file_attached_round_trips() {
-    let env = envelope(
-        8,
-        Payload::FileAttached {
-            path: "/tmp/report.md".into(),
-            mime: "text/markdown".into(),
-            size_bytes: 4096,
-        },
-    );
-    let value = serde_json::to_value(&env).expect("serialize");
-    assert_eq!(
-        value.get("payload").and_then(|p| p.get("type")),
-        Some(&json!("file_attached"))
-    );
-    let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
-    assert_eq!(parsed, env);
-}
-
-#[test]
-fn golden_envelope_turn_completed_round_trips() {
-    let env = envelope(
-        9,
-        Payload::TurnCompleted {
-            token_usage: EnvelopeTokenUsage {
-                input_tokens: 100,
-                output_tokens: 250,
-                reasoning_tokens: 0,
-                cache_read_tokens: 80,
-                cache_write_tokens: 0,
-            },
-        },
-    );
-    let value = serde_json::to_value(&env).expect("serialize");
-    assert_eq!(
-        value.get("payload").and_then(|p| p.get("type")),
-        Some(&json!("turn_completed"))
-    );
-    let usage = value
-        .get("payload")
-        .and_then(|p| p.get("data"))
-        .and_then(|d| d.get("token_usage"))
-        .expect("token_usage");
-    assert_eq!(usage.get("input_tokens"), Some(&json!(100)));
-    assert_eq!(usage.get("output_tokens"), Some(&json!(250)));
-    // Zero fields are omitted on the wire.
-    assert!(usage.get("reasoning_tokens").is_none());
-    assert!(usage.get("cache_write_tokens").is_none());
-    let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
-    assert_eq!(parsed, env);
-}
-
-#[test]
-fn golden_envelope_token_usage_zero_default_round_trips() {
-    // turn_completed with all-zero usage emits an empty `token_usage: {}`.
-    let env = envelope(
-        10,
-        Payload::TurnCompleted {
-            token_usage: EnvelopeTokenUsage::default(),
-        },
-    );
-    let value = serde_json::to_value(&env).expect("serialize");
-    let usage = value
-        .get("payload")
-        .and_then(|p| p.get("data"))
-        .and_then(|d| d.get("token_usage"))
-        .expect("token_usage");
-    assert!(usage.as_object().expect("object").is_empty());
-    let parsed: Envelope = serde_json::from_value(value).expect("deserialize");
-    assert_eq!(parsed, env);
 }
 
 #[test]
@@ -5937,366 +6008,6 @@ fn projection_envelope_v2_payloads_cover_terminal_attachment_and_child_completio
             .and_then(|data| data.get("response_to_client_message_id")),
         Some(&json!("cmid-v2-parent")),
     );
-}
-
-#[test]
-fn golden_envelope_capability_feature_flag_registered() {
-    // The projection feature flag must be in the known-features
-    // registry so capability negotiation honours it.
-    assert!(
-        UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1),
-        "projection.envelope.v1 must be registered for capability negotiation"
-    );
-    assert!(
-        UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
-        "projection.envelope.v2 must be registered for capability negotiation"
-    );
-    assert!(
-        !UiProtocolCapabilities::first_server_slice()
-            .supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
-        "v2 is strictly opt-in and must not alter the no-header capability baseline"
-    );
-}
-
-#[test]
-fn envelope_notification_method_is_projection_envelope() {
-    let notif = UiNotification::Envelope(EnvelopeNotification {
-        session_id: SessionKey("local:demo".into()),
-        topic: None,
-        envelope: Envelope {
-            thread_id: "thread-1".into(),
-            seq: 1,
-            client_message_id: None,
-            payload: Payload::AssistantDelta { text: "hi".into() },
-        },
-    });
-    assert_eq!(notif.method(), "projection/envelope");
-    assert_eq!(notif.session_id(), &SessionKey("local:demo".into()));
-}
-
-#[test]
-fn envelope_notification_round_trips_through_rpc_envelope_with_routing() {
-    // feat(envelope-wire-routing): the wire now carries `session_id`
-    // (the bare base key) + optional `topic` FLATTENED alongside the
-    // bare Envelope fields so a multi-session client can route the
-    // envelope to the right session. The envelope fields stay at the
-    // top level (no `envelope` nesting) so the existing tolerant web
-    // SPA bridge — which reads `thread_id`/`seq`/`payload` top-level
-    // and ignores unknown keys — keeps decoding it unchanged.
-    let envelope = Envelope {
-        thread_id: "thread-7".into(),
-        seq: 42,
-        client_message_id: Some("cmid-x".into()),
-        payload: Payload::UserMessage {
-            text: "hi".into(),
-            files: vec![FileRef {
-                path: "/tmp/a.png".into(),
-                mime: "image/png".into(),
-                size_bytes: 12,
-            }],
-        },
-    };
-    let notif = UiNotification::Envelope(EnvelopeNotification {
-        session_id: SessionKey("local:demo".into()),
-        topic: Some("planning".into()),
-        envelope: envelope.clone(),
-    });
-    let rpc = notif.into_rpc_notification().expect("serialize");
-    assert_eq!(rpc.method, "projection/envelope");
-    // Wire shape: flattened — bare Envelope keys PLUS routing keys.
-    let params = &rpc.params;
-    assert_eq!(
-        params.get("session_id"),
-        Some(&json!("local:demo")),
-        "session_id must reach the wire so the client can route",
-    );
-    assert_eq!(
-        params.get("topic"),
-        Some(&json!("planning")),
-        "topic must reach the wire for topic-scoped routing",
-    );
-    // Bare Envelope keys stay at the top level (web-bridge compat).
-    assert_eq!(params.get("thread_id"), Some(&json!("thread-7")));
-    assert_eq!(params.get("seq"), Some(&json!(42)));
-    assert_eq!(params.get("client_message_id"), Some(&json!("cmid-x")));
-    // No `envelope` nesting on the wire — the flatten keeps the bare
-    // shape the web bridge already reads.
-    assert!(
-        params.get("envelope").is_none(),
-        "wire is flattened, not nested under `envelope`",
-    );
-
-    // Round-trip decode: session_id + topic survive byte-for-byte and
-    // the envelope is byte-equal.
-    let parsed = UiNotification::from_rpc_notification(rpc).expect("decode");
-    match parsed {
-        UiNotification::Envelope(ev) => {
-            assert_eq!(ev.envelope, envelope);
-            assert_eq!(
-                ev.session_id,
-                SessionKey("local:demo".into()),
-                "decode must recover the routing session_id from the wire",
-            );
-            assert_eq!(ev.topic, Some("planning".into()));
-        }
-        other => panic!("expected Envelope variant, got {other:?}"),
-    }
-}
-
-/// feat(envelope-wire-routing) backward-compat: an OLD bare-envelope
-/// wire frame (no `session_id` / `topic` keys — emitted by a server
-/// before this change) must still decode without error. The routing
-/// fields default to empty/None; the consumer is expected to fall
-/// back to ambient connection context for those legacy frames.
-#[test]
-fn envelope_notification_decodes_legacy_bare_wire_frame_without_routing() {
-    // OLD wire shape: bare Envelope, no session_id/topic.
-    let legacy_params = json!({
-        "thread_id": "thread-legacy",
-        "seq": 3,
-        "payload": { "type": "assistant_delta", "data": { "text": "hi" } }
-    });
-    let decoded =
-        UiNotification::from_method_and_params(methods::PROJECTION_ENVELOPE, legacy_params)
-            .expect("legacy bare-envelope frame must still decode");
-    match decoded {
-        UiNotification::Envelope(ev) => {
-            assert_eq!(
-                ev.session_id,
-                SessionKey(String::new()),
-                "absent session_id defaults to empty for legacy frames",
-            );
-            assert_eq!(ev.topic, None, "absent topic defaults to None");
-            assert_eq!(ev.envelope.thread_id, "thread-legacy");
-            assert_eq!(ev.envelope.seq, 3);
-        }
-        other => panic!("expected Envelope variant, got {other:?}"),
-    }
-}
-
-/// Codex #1336 round-2 BLOCKER 4: the durable ledger writes records
-/// via `serde_json::to_string(&LedgerDiskRecord)`, which chains
-/// through the global `Serialize` impl on `EnvelopeNotification`.
-/// Before the fix, that global impl stripped `session_id` + `topic`
-/// to mirror the wire shape — so disk records lost their routing
-/// context and recovery deserialized them with empty/None routing.
-/// Topic-scoped envelope replay after restart silently mis-routed.
-///
-/// Post-fix: the global Serialize/Deserialize is derive-based and
-/// preserves ALL fields. The wire shape is opted into only at the
-/// JSON-RPC boundary inside `into_rpc_notification`.
-#[test]
-fn envelope_notification_serde_preserves_routing_fields_for_disk_persistence() {
-    // Persistent shape: routing fields survive a JSON round-trip.
-    // This is the path the durable ledger uses for its on-disk
-    // records, NOT the wire path.
-    let original = EnvelopeNotification {
-        session_id: SessionKey("local:disk-routing".into()),
-        topic: Some("planning".into()),
-        envelope: Envelope {
-            thread_id: "thread-disk".into(),
-            seq: 7,
-            client_message_id: None,
-            payload: Payload::AssistantDelta {
-                text: "persisted delta".into(),
-            },
-        },
-    };
-
-    // Serialize the EnvelopeNotification directly (NOT via
-    // into_rpc_notification) — this mirrors how the ledger writes
-    // it inside a LedgerDiskRecord. The output MUST contain the
-    // routing fields.
-    let serialized =
-        serde_json::to_value(&original).expect("EnvelopeNotification serializes for disk");
-    assert_eq!(
-        serialized.get("session_id"),
-        Some(&json!("local:disk-routing")),
-        "session_id must persist on disk so recovery can rebuild routing",
-    );
-    assert_eq!(
-        serialized.get("topic"),
-        Some(&json!("planning")),
-        "topic must persist on disk so topic-scoped recovery routes correctly",
-    );
-    assert!(
-        serialized.get("envelope").is_some(),
-        "envelope body must be present on disk",
-    );
-
-    // Deserialize back — routing fields must round-trip byte-equal.
-    let parsed: EnvelopeNotification =
-        serde_json::from_value(serialized).expect("EnvelopeNotification deserializes from disk");
-    assert_eq!(
-        parsed, original,
-        "disk round-trip must preserve all fields including routing",
-    );
-
-    // Defensive: a `topic: None` envelope omits the field on disk
-    // (no behavioural change — just keeps the disk shape compact
-    // when topic isn't set).
-    let no_topic = EnvelopeNotification {
-        session_id: SessionKey("local:disk-no-topic".into()),
-        topic: None,
-        envelope: original.envelope.clone(),
-    };
-    let serialized = serde_json::to_value(&no_topic).expect("serialize");
-    assert!(
-        serialized.get("topic").is_none(),
-        "absent topic is omitted on disk; deserialize defaults back to None",
-    );
-    let parsed: EnvelopeNotification = serde_json::from_value(serialized).expect("deserialize");
-    assert_eq!(parsed, no_topic);
-}
-
-/// feat(envelope-wire-routing) — wire shape guard. The wire is the
-/// FLATTENED form: bare Envelope keys (`thread_id`, `seq`, `payload`,
-/// no `envelope` nesting) PLUS the routing keys `session_id` +
-/// `topic` so a multi-session client can route. Codex #1336
-/// BLOCKER-4's actual invariant — that the DISK derive preserves
-/// routing — is pinned by
-/// `envelope_notification_serde_preserves_routing_fields_for_disk_persistence`
-/// above; that disk path is untouched by un-stripping the wire.
-#[test]
-fn envelope_notification_into_rpc_notification_flattens_routing_onto_wire() {
-    let notif = UiNotification::Envelope(EnvelopeNotification {
-        session_id: SessionKey("local:wire-route".into()),
-        topic: Some("planning".into()),
-        envelope: Envelope {
-            thread_id: "thread-wire".into(),
-            seq: 5,
-            client_message_id: None,
-            payload: Payload::AssistantDelta { text: "x".into() },
-        },
-    });
-    let rpc = notif.into_rpc_notification().expect("serialize");
-    assert_eq!(rpc.method, methods::PROJECTION_ENVELOPE);
-    let params = &rpc.params;
-    assert_eq!(
-        params.get("session_id"),
-        Some(&json!("local:wire-route")),
-        "wire carries session_id for routing",
-    );
-    assert_eq!(
-        params.get("topic"),
-        Some(&json!("planning")),
-        "wire carries topic for topic-scoped routing",
-    );
-    // Bare envelope fields stay top-level (no `envelope` nesting) so
-    // the existing web-bridge top-level reader is unaffected.
-    assert_eq!(params.get("thread_id"), Some(&json!("thread-wire")));
-    assert_eq!(params.get("seq"), Some(&json!(5)));
-    assert!(
-        params.get("envelope").is_none(),
-        "wire is flattened, not nested under `envelope`",
-    );
-}
-
-/// feat(envelope-wire-routing): a `topic: None` envelope omits the
-/// `topic` key on the wire (compact shape) but still carries
-/// `session_id`. Decode recovers session_id and defaults topic.
-#[test]
-fn envelope_notification_wire_omits_absent_topic_but_keeps_session_id() {
-    let notif = UiNotification::Envelope(EnvelopeNotification {
-        session_id: SessionKey("local:no-topic".into()),
-        topic: None,
-        envelope: Envelope {
-            thread_id: "thread-nt".into(),
-            seq: 9,
-            client_message_id: None,
-            payload: Payload::AssistantDelta { text: "y".into() },
-        },
-    });
-    let rpc = notif.into_rpc_notification().expect("serialize");
-    let params = &rpc.params;
-    assert_eq!(params.get("session_id"), Some(&json!("local:no-topic")));
-    assert!(
-        params.get("topic").is_none(),
-        "absent topic omitted on the wire",
-    );
-    let parsed = UiNotification::from_rpc_notification(rpc).expect("decode");
-    match parsed {
-        UiNotification::Envelope(ev) => {
-            assert_eq!(ev.session_id, SessionKey("local:no-topic".into()));
-            assert_eq!(ev.topic, None);
-        }
-        other => panic!("expected Envelope variant, got {other:?}"),
-    }
-}
-
-/// feat(envelope-wire-routing) — codex BLOCKER: on a TOPIC turn the
-/// `turn/start` flow folds the topic into `session_id` as
-/// `"base#topic"`, which is carried forward into the emitted
-/// `EnvelopeNotification.session_id`. The WIRE `session_id` MUST be
-/// normalized to the bare base key (`"base"`) — a client only knows
-/// the base key, so a `"base#topic"` wire key misroutes the message
-/// and defeats the orphan-chip self-heal. The topic MUST NOT be lost:
-/// it is preserved on the wire's separate `topic` field (recovered
-/// from the suffix when the explicit `topic` field is empty). The
-/// DISK derive on `EnvelopeNotification` keeps `"base#topic"`
-/// untouched (pinned by the disk-persistence test above).
-#[test]
-fn envelope_wire_session_id_is_normalized_to_base_key_with_topic_preserved() {
-    let envelope = Envelope {
-        thread_id: "thread-topic".into(),
-        seq: 11,
-        client_message_id: None,
-        payload: Payload::AssistantDelta {
-            text: "topic delta".into(),
-        },
-    };
-
-    // Case 1: topic folded into session_id ("base#topic"), explicit
-    // `topic` field is None — the suffix must be recovered onto the
-    // wire's separate `topic` field while session_id is stripped.
-    let notif = UiNotification::Envelope(EnvelopeNotification {
-        session_id: SessionKey("local:demo#research".into()),
-        topic: None,
-        envelope: envelope.clone(),
-    });
-    let rpc = notif.into_rpc_notification().expect("serialize");
-    let params = &rpc.params;
-    assert_eq!(
-        params.get("session_id"),
-        Some(&json!("local:demo")),
-        "wire session_id must be the bare base key, not base#topic",
-    );
-    assert_eq!(
-        params.get("topic"),
-        Some(&json!("research")),
-        "topic must be preserved on the wire (recovered from suffix)",
-    );
-    // Decode must round-trip to the bare base key + separate topic.
-    let parsed = UiNotification::from_rpc_notification(rpc).expect("decode");
-    match parsed {
-        UiNotification::Envelope(ev) => {
-            assert_eq!(
-                ev.session_id,
-                SessionKey("local:demo".into()),
-                "decode recovers the bare base key from the wire",
-            );
-            assert_eq!(ev.topic, Some("research".into()));
-            assert_eq!(ev.envelope, envelope);
-        }
-        other => panic!("expected Envelope variant, got {other:?}"),
-    }
-
-    // Case 2: topic folded into session_id AND an explicit `topic`
-    // field also set — the explicit topic wins, session_id still
-    // strips to the base key.
-    let notif = UiNotification::Envelope(EnvelopeNotification {
-        session_id: SessionKey("local:demo#research".into()),
-        topic: Some("research".into()),
-        envelope: envelope.clone(),
-    });
-    let rpc = notif.into_rpc_notification().expect("serialize");
-    let params = &rpc.params;
-    assert_eq!(
-        params.get("session_id"),
-        Some(&json!("local:demo")),
-        "wire session_id must be the bare base key even with explicit topic",
-    );
-    assert_eq!(params.get("topic"), Some(&json!("research")));
 }
 
 // ------------------------------------------------------------------
@@ -6759,6 +6470,7 @@ fn file_attached_topic_method_reads_explicit_field_then_session_suffix() {
         turn_id: TurnId::new(),
         path: "/tmp/deck.pptx".into(),
         tool_call_id: Some("tc-slides".into()),
+        attachment_owner: None,
         mime: None,
     });
     assert_eq!(with_field.topic(), Some("slides"));
@@ -6769,6 +6481,7 @@ fn file_attached_topic_method_reads_explicit_field_then_session_suffix() {
         turn_id: TurnId::new(),
         path: "/tmp/deck.pptx".into(),
         tool_call_id: None,
+        attachment_owner: None,
         mime: None,
     });
     assert_eq!(fallback.topic(), Some("slides"));
@@ -6884,6 +6597,7 @@ fn stamp_topic_from_session_populates_new_topic_class_events() {
         turn_id: TurnId::new(),
         path: "/tmp/deck.pptx".into(),
         tool_call_id: None,
+        attachment_owner: None,
         mime: None,
     });
     event.stamp_topic_from_session();
@@ -7173,6 +6887,10 @@ fn monitor_error_kinds_are_registered() {
         "monitor_policy_denied"
     );
     assert_eq!(autonomy_error_kinds::MONITOR_FLOODED, "monitor_flooded");
+    assert_eq!(
+        autonomy_error_kinds::MONITOR_INVALID_STATE,
+        "monitor_invalid_state"
+    );
 }
 
 /// #1977 — the monitor notifications roundtrip through `UiNotification`
@@ -7302,4 +7020,238 @@ fn turn_steer_dropped_topic_routing_matches_other_turn_events() {
         .into_rpc_notification()
         .expect("serialize with explicit topic");
     assert_eq!(rpc.params["topic"], json!("explicit"));
+}
+
+// #2540: both notifications ship on the wire — `turn/steer_dropped` from the
+// steer path (negotiated `event.turn_steer_dropped.v1`, delivery unfiltered)
+// and `session/orchestration` from the whole-job indicator — but neither sat
+// in `UI_PROTOCOL_NOTIFICATION_METHODS`, so `client_hello` never advertised
+// them and a strict client validating frames against the advertised set
+// would reject legitimate ones.
+#[test]
+fn wire_shipped_steer_dropped_and_orchestration_notifications_are_advertised() {
+    let capabilities = UiProtocolCapabilities::first_server_slice();
+    for method in [methods::TURN_STEER_DROPPED, methods::SESSION_ORCHESTRATION] {
+        assert!(
+            UI_PROTOCOL_NOTIFICATION_METHODS.contains(&method),
+            "{method} ships on the wire and must be advertised"
+        );
+        assert!(
+            capabilities
+                .supported_notifications
+                .iter()
+                .any(|advertised| advertised == method),
+            "first_server_slice must advertise {method}"
+        );
+    }
+}
+
+#[test]
+fn context_state_semantic_cache_diagnostics_are_optional_and_backward_compatible() {
+    let legacy = json!({
+        "session_id": "local:demo",
+        "generation": 2,
+        "transcript_hash": "sha256:history",
+        "item_count": 3,
+        "token_estimate": 42,
+        "recovery_state": "exact"
+    });
+    let legacy_state: UiContextState = serde_json::from_value(legacy).unwrap();
+    assert!(legacy_state.cache_epoch_id.is_none());
+    assert!(legacy_state.semantic_head_id.is_none());
+
+    let current = UiContextState {
+        session_id: SessionKey("local:demo".into()),
+        thread_id: None,
+        generation: 3,
+        transcript_hash: "sha256:history".into(),
+        item_count: 4,
+        token_estimate: 64,
+        recovery_state: "exact".into(),
+        last_checkpoint_id: None,
+        last_compaction_id: None,
+        cache_epoch_id: Some("sha256:epoch".into()),
+        last_cache_invalidation_reason: Some("tool_schema_changed".into()),
+        semantic_head_id: Some("semblk_000004".into()),
+        semantic_head_kind: Some("tool_interaction".into()),
+    };
+    let encoded = serde_json::to_value(current).unwrap();
+    assert_eq!(encoded["cache_epoch_id"], "sha256:epoch");
+    assert_eq!(encoded["semantic_head_kind"], "tool_interaction");
+}
+
+// §10 ↔ `rpc_error_codes` parity: spec §10 pins every numeric error code by
+// name and value, so docblocks may cite "Spec pins this at N" truthfully and
+// the two sides cannot drift apart silently.
+
+/// The §10 slice of the UI Protocol spec, cut the same fail-closed way as the
+/// §6 catalog test in `octos-cli`'s `api::ui_protocol_tests`: header to the
+/// next `## ` heading, erroring when either boundary moves.
+fn spec_section_10_slice() -> String {
+    let spec_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md"
+    );
+    let spec = std::fs::read_to_string(spec_path)
+        .unwrap_or_else(|e| panic!("cannot read UI Protocol spec at {spec_path}: {e}"));
+    let start = spec
+        .find("## 10. Error Model")
+        .expect("UI Protocol spec is missing `## 10. Error Model`");
+    let rest = &spec[start..];
+    let end = rest
+        .find("\n## ")
+        .expect("UI Protocol spec §10 must be followed by a `## ` section heading");
+    rest[..end].to_string()
+}
+
+/// Parse the `pub const NAME: i64 = VALUE;` lines out of the
+/// `rpc_error_codes` module. Reading the constants from source (instead of
+/// hand-copying them here) is what makes the §10 parity test fail when a new
+/// constant lands without a spec pin.
+fn parse_rpc_error_code_constants() -> Vec<(String, i64)> {
+    let source_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui_protocol.rs");
+    let source = std::fs::read_to_string(source_path)
+        .unwrap_or_else(|e| panic!("cannot read ui_protocol.rs at {source_path}: {e}"));
+    let module = &source[source
+        .find("pub mod rpc_error_codes")
+        .expect("ui_protocol.rs is missing `pub mod rpc_error_codes`")..];
+    // Bound the module at its column-0 closing brace; everything inside is
+    // indented, so a bare `\n}` can only be the module's own terminator.
+    let module = module
+        .split("\n}")
+        .next()
+        .expect("rpc_error_codes module must be closed by a column-0 `}`");
+
+    let mut constants = Vec::new();
+    for line in module.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("pub const ") else {
+            continue;
+        };
+        let Some((name, value)) = rest.split_once(": i64 = ") else {
+            panic!("rpc_error_codes constant not in `pub const NAME: i64 = VALUE;` form: {line}");
+        };
+        let value: i64 = value
+            .trim_end_matches(';')
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("cannot parse rpc_error_codes value for {name}: {e}"));
+        constants.push((name.to_string(), value));
+    }
+    assert!(
+        constants.len() >= 20,
+        "parsed only {} constants from rpc_error_codes — the §10 parity scan \
+         must fail closed when the constant format changes",
+        constants.len()
+    );
+    constants
+}
+
+/// Every `-32ddd` literal in `slice` that is not one of `pinned`. Digit
+/// guards on both sides keep longer numeric runs from partially matching.
+fn unpinned_numeric_codes(slice: &str, pinned: &[i64]) -> Vec<i64> {
+    let bytes = slice.as_bytes();
+    let mut orphans = Vec::new();
+    let mut i = 0;
+    while i + 6 <= bytes.len() {
+        let candidate = bytes[i] == b'-'
+            && bytes[i + 1] == b'3'
+            && bytes[i + 2] == b'2'
+            && bytes[i + 3..i + 6].iter().all(|b| b.is_ascii_digit())
+            && (i == 0 || !bytes[i - 1].is_ascii_digit())
+            && (i + 6 == bytes.len() || !bytes[i + 6].is_ascii_digit());
+        if candidate {
+            let code: i64 = slice[i..i + 6]
+                .parse()
+                .expect("candidate bytes validated as digits");
+            if !pinned.contains(&code) && !orphans.contains(&code) {
+                orphans.push(code);
+            }
+            i += 6;
+        } else {
+            i += 1;
+        }
+    }
+    orphans
+}
+
+#[test]
+fn unpinned_numeric_code_scan_flags_unknown_and_accepts_pinned_codes() {
+    let pinned = [-32100i64, -32004];
+    assert_eq!(
+        unpinned_numeric_codes("mix `-32100` and `-32004` with orphan `-32999`", &pinned),
+        vec![-32999]
+    );
+    assert!(unpinned_numeric_codes("no numeric codes in this slice", &pinned).is_empty());
+    // A longer numeric run must not partially match a code literal.
+    assert!(unpinned_numeric_codes(" `-3200004` is out of range", &pinned).is_empty());
+    // A code literal glued to a preceding digit is part of that longer run,
+    // and the scanner's start-of-slice / end-of-slice boundaries must hold.
+    assert!(unpinned_numeric_codes("9-32999", &pinned).is_empty());
+    assert_eq!(unpinned_numeric_codes("-32999", &pinned), vec![-32999]);
+    assert_eq!(
+        unpinned_numeric_codes("orphan -32998", &pinned),
+        vec![-32998]
+    );
+}
+
+#[test]
+fn rpc_error_code_names_and_values_are_unique() {
+    let constants = parse_rpc_error_code_constants();
+    let mut names: Vec<&str> = constants.iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    let mut values: Vec<i64> = constants.iter().map(|(_, value)| *value).collect();
+    values.sort_unstable();
+    let duplicate_names: Vec<_> = names.windows(2).filter(|pair| pair[0] == pair[1]).collect();
+    assert!(
+        duplicate_names.is_empty(),
+        "rpc_error_codes must not reuse a constant name: {duplicate_names:?}"
+    );
+    let duplicate_values: Vec<_> = values
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .collect();
+    assert!(
+        duplicate_values.is_empty(),
+        "rpc_error_codes must not reuse a numeric code: {duplicate_values:?}"
+    );
+}
+
+#[test]
+fn spec_section_10_pins_every_rpc_error_code() {
+    let constants = parse_rpc_error_code_constants();
+    let slice = spec_section_10_slice();
+
+    let mut missing = Vec::new();
+    for (name, value) in &constants {
+        // §10 names codes in snake_case, so the constant's name is pinned in
+        // its lowercase form (`UNKNOWN_SESSION` must appear as
+        // `unknown_session`). Both pins must land on one line — the catalog
+        // rows read `-32100` (`unknown_session`) — so swapping the number
+        // between two rows cannot satisfy the name and value separately.
+        let name_pin = format!("`{}`", name.to_lowercase());
+        let value_pin = format!("`{value}`");
+        if !slice
+            .lines()
+            .any(|line| line.contains(&name_pin) && line.contains(&value_pin))
+        {
+            missing.push(format!("{value_pin} ({name_pin})"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "spec §10 is missing pins that rpc_error_codes declares: {missing:?} — \
+         every constant must be pinned in §10 by name and value on one line"
+    );
+}
+
+#[test]
+fn spec_section_10_carries_no_numeric_code_outside_rpc_error_codes() {
+    let constants = parse_rpc_error_code_constants();
+    let pinned: Vec<i64> = constants.iter().map(|(_, value)| *value).collect();
+    let orphans = unpinned_numeric_codes(&spec_section_10_slice(), &pinned);
+    assert!(
+        orphans.is_empty(),
+        "spec §10 carries numeric codes that rpc_error_codes does not declare: {orphans:?}"
+    );
 }

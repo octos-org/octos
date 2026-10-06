@@ -58,6 +58,9 @@ pub enum RecoveryHint {
     /// requests, content filtered responses, and structural budget violations
     /// like delegation depth exceeded.
     FailFast,
+    /// Expected policy behaviour, not a fault — e.g. a lifecycle hook denied
+    /// the call (#2249). Surface for audit, never page, never retry.
+    Expected,
     /// Internal invariant violation — log and bail out; operators must
     /// investigate. Not retryable.
     Bug,
@@ -72,6 +75,7 @@ impl RecoveryHint {
             RecoveryHint::SwitchProvider => "switch_provider",
             RecoveryHint::CompactContext => "compact_context",
             RecoveryHint::FailFast => "fail_fast",
+            RecoveryHint::Expected => "expected",
             RecoveryHint::Bug => "bug",
         }
     }
@@ -155,6 +159,11 @@ pub enum HarnessError {
         limit: u32,
         message: String,
     },
+    /// A lifecycle hook denied the operation (#2249). Expected policy
+    /// behaviour, not a harness fault — classified apart from `Internal` so
+    /// operator dashboards and alerting do not treat a policy decision as a
+    /// bug.
+    PolicyDeny { message: String },
     /// Catch-all for agent-internal bugs (poisoned locks, unexpected state,
     /// etc.). Treat as `RecoveryHint::Bug`.
     Internal { message: String },
@@ -211,6 +220,7 @@ impl HarnessError {
             HarnessError::PluginTimeout { .. } => "plugin_timeout",
             HarnessError::PluginProtocol { .. } => "plugin_protocol",
             HarnessError::DelegateDepthExceeded { .. } => "delegate_depth_exceeded",
+            HarnessError::PolicyDeny { .. } => "policy",
             HarnessError::Internal { .. } => "internal",
         }
     }
@@ -251,15 +261,35 @@ impl HarnessError {
             // Conversation too large — compaction, not retries, unblocks it.
             HarnessError::ContextOverflow { .. } => RecoveryHint::CompactContext,
 
-            // Non-retryable — surface to operator.
+            // #27b — quota exhaustion (HTTP 402 / 429-with-billing-marker /
+            // 403-with-quota-marker) is PROVIDER-DEGRADED, not fatal: the
+            // provider's billing window is dead for hours-to-days, but the
+            // configured ProviderChain may hold a healthy fallback lane
+            // (profile `llm.fallbacks`). Live evidence (2026-08-26/27): k3's
+            // 7-day-window quota burn surfaced as `variant=authentication
+            // recovery=fail_fast`, the chain's fallback slot never fired, and
+            // the only recovery was hand-editing profile JSON. The chain
+            // already exists (`build_adaptive_provider_chain`); the missing
+            // piece was this recovery hint. `Authentication` (a real 401) is
+            // a DIFFERENT failure — a wrong key fails on every lane, so it
+            // STAYS FailFast (pinned contract, see
+            // `quota_switches_provider_but_401_stays_fail_fast`).
+            HarnessError::Quota { .. } => RecoveryHint::SwitchProvider,
+
+            // Non-retryable — surface to operator. #27b red line: a TRUE 401
+            // (invalid/expired key) fails identically on every fallback lane,
+            // so its FailFast contract must NOT loosen.
             HarnessError::Authentication { .. }
-            | HarnessError::Quota { .. }
             | HarnessError::InvalidRequest { .. }
             | HarnessError::ContentFiltered { .. }
             | HarnessError::DelegateDepthExceeded { .. }
             | HarnessError::ToolExecution { .. }
             | HarnessError::PluginSpawn { .. }
             | HarnessError::PluginProtocol { .. } => RecoveryHint::FailFast,
+
+            // Non-retryable, but NOT a fault: a lifecycle hook denied the
+            // call (#2249). Surface for audit; never page, never retry.
+            HarnessError::PolicyDeny { .. } => RecoveryHint::Expected,
 
             // Internal invariant broken — bug, not recoverable.
             HarnessError::Internal { .. } => RecoveryHint::Bug,
@@ -284,6 +314,7 @@ impl HarnessError {
             | HarnessError::PluginTimeout { message, .. }
             | HarnessError::PluginProtocol { message, .. }
             | HarnessError::DelegateDepthExceeded { message, .. }
+            | HarnessError::PolicyDeny { message }
             | HarnessError::Internal { message } => message,
         }
     }
@@ -309,8 +340,10 @@ impl HarnessError {
     }
 
     /// Classify a raw `eyre::Report` at an agent-loop boundary. Downcasts to
-    /// `LlmError` first; falls back to `ToolExecution` with the provided
-    /// `tool_name`, or `Internal` when no tool context is available.
+    /// `LlmError` first, then to [`crate::hooks::HookDeniedError`] (#2249 — a
+    /// hook deny is policy, not a bug); falls back to `ToolExecution` with
+    /// the provided `tool_name`, or `Internal` when no tool context is
+    /// available.
     ///
     /// This is the canonical entry point that enforces invariant #1 ("no raw
     /// `eyre::Report` escapes the agent loop without classification"): every
@@ -318,6 +351,16 @@ impl HarnessError {
     pub fn classify_report(report: &eyre::Report, tool_name: Option<&str>) -> Self {
         if let Some(llm) = report.downcast_ref::<LlmError>() {
             return Self::from_llm_error(llm);
+        }
+        // #2249 — a before-hook deny is expected policy behaviour: classify it
+        // `policy`/`expected` so dashboards stop paging on it as `internal`/`bug`.
+        if report
+            .downcast_ref::<crate::hooks::HookDeniedError>()
+            .is_some()
+        {
+            return HarnessError::PolicyDeny {
+                message: truncate(&report.to_string(), MAX_HARNESS_ERROR_MESSAGE_BYTES),
+            };
         }
         let message = truncate(&report.to_string(), MAX_HARNESS_ERROR_MESSAGE_BYTES);
         match tool_name {
@@ -482,6 +525,7 @@ impl HarnessError {
             | HarnessError::ContentFiltered { .. }
             | HarnessError::Network { .. }
             | HarnessError::Timeout { .. }
+            | HarnessError::PolicyDeny { .. }
             | HarnessError::Internal { .. } => {}
         }
         out
@@ -526,6 +570,31 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #27b — the pinned contract pair: quota (HTTP 402 / 429-with-billing-
+    /// marker) is provider-DEGRADED and must hint `SwitchProvider` so the
+    /// ProviderChain advances to a healthy fallback lane (live evidence:
+    /// the 2026-08-26/27 k3 7-day-window burn never reached the configured
+    /// fallback slot because the hint said FailFast); a TRUE 401
+    /// authentication failure fails identically on every lane and MUST
+    /// stay `FailFast` — that contract must not loosen.
+    #[test]
+    fn quota_switches_provider_but_401_stays_fail_fast() {
+        let quota = HarnessError::Quota {
+            message: "API error (moonshot-coding@api/k3): 402 quota will reset when the current 7-day window ends".into(),
+        };
+        assert!(
+            matches!(quota.recovery_hint(), RecoveryHint::SwitchProvider),
+            "quota exhaustion must hint SwitchProvider so the chain advances to the fallback slot"
+        );
+        let auth = HarnessError::Authentication {
+            message: "API error: 401 invalid api key".into(),
+        };
+        assert!(
+            matches!(auth.recovery_hint(), RecoveryHint::FailFast),
+            "a true 401 fails on every lane — FailFast is the pinned red line (#27b)"
+        );
+    }
 
     #[test]
     fn variant_name_covers_every_variant() {
@@ -655,9 +724,27 @@ mod tests {
         let llm = LlmError::from_status_with_label(403, body, "MiniMax-M2.5-highspeed");
         let err: HarnessError = llm.into();
         assert_eq!(err.variant_name(), "quota");
-        assert_eq!(err.recovery_hint(), RecoveryHint::FailFast);
+        // #27b — quota is provider-degraded: hint SwitchProvider so the
+        // ProviderChain advances to the fallback lane (was FailFast, which
+        // stranded the configured fallback during the 2026-08-26/27 k3 burn).
+        assert_eq!(err.recovery_hint(), RecoveryHint::SwitchProvider);
         assert!(err.message().contains("MiniMax-M2.5-highspeed"));
         assert!(err.message().contains("top up or switch provider"));
+    }
+
+    #[test]
+    fn classify_report_downcasts_hook_deny_through_eyre() {
+        // #2249 — a `before_llm_call` deny bails with a typed HookDeniedError;
+        // the loop boundary must classify it `policy`/`expected`, never
+        // `internal`/`bug` (a policy deny pages nobody).
+        let report: eyre::Report = crate::hooks::HookDeniedError {
+            reason: "no network calls today".into(),
+        }
+        .into();
+        let classified = HarnessError::classify_report(&report, None);
+        assert_eq!(classified.variant_name(), "policy");
+        assert_eq!(classified.recovery_hint(), RecoveryHint::Expected);
+        assert!(classified.message().contains("no network calls today"));
     }
 
     #[test]

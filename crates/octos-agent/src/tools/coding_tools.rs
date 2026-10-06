@@ -27,9 +27,10 @@ use super::{
     ToolContext, ToolResult,
 };
 use crate::policy::{ApprovalPolicy, CommandPolicy, Decision, FileAccessMode, FilesystemScope};
-use crate::sandbox::{NoSandbox, Sandbox, detect_sandbox_denials};
+use crate::sandbox::Sandbox;
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 use crate::task_supervisor::{RelaunchOpts, TaskRelaunchError, TaskStatus};
+use crate::tools::policy::BashFileWrites;
 
 const MAX_EXEC_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 120;
@@ -51,6 +52,7 @@ struct ExecSession {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     output: Arc<Mutex<String>>,
     exit_code: Arc<Mutex<Option<i32>>>,
+    sandboxed: bool,
 }
 
 fn next_exec_session_id() -> String {
@@ -63,6 +65,108 @@ fn next_exec_session_id() -> String {
 fn truncate_output(mut output: String, max_bytes: usize) -> String {
     let cap = max_bytes.max(256);
     octos_core::truncate_utf8(&mut output, cap, "\n... (output truncated)");
+    output
+}
+
+/// #28c-r1 — resolve the RECEIPT SNAPSHOT ROOT from the command text.
+///
+/// Coding sessions habitually run `cd <target> && <mutate>` with the tool
+/// workdir left at the session workspace root; a receipt snapshotted at the
+/// root then reports `files_changed: 0` for a real write inside the target
+/// — a FALSE phantom signal, worse than no receipt (outer-loop live
+/// verdict, w4). Ruling implementation:
+///   * a SINGLE leading `cd <literal-path> && ...` prefix (one token, no
+///     `$`/backtick/whitespace, optional matching quotes, `~` expanded)
+///     makes that path the snapshot root (`scope: cd-target`);
+///   * anything ambiguous — no cd prefix, cd without `&&`, `;` chains,
+///     variable paths — falls back to the session workdir
+///     (`scope: workdir`), matching the pre-r1 behavior.
+///
+/// #34g-D — the platform home directory (`HOME` on Unix, `USERPROFILE`
+/// fallback on Windows where `HOME` is typically unset). The 34g ruling:
+/// the resolver's tilde expansion must not be Unix-only in a resolver that
+/// otherwise has no POSIX dependency.
+fn platform_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn receipt_scope_root(workdir: &Path, command: &str) -> (PathBuf, &'static str) {
+    let fallback = || (workdir.to_path_buf(), "workdir");
+    let trimmed = command.trim_start();
+    let Some(rest) = trimmed.strip_prefix("cd ") else {
+        return fallback();
+    };
+    let Some((target, _tail)) = rest.split_once("&&") else {
+        return fallback();
+    };
+    let target = target.trim();
+    if target.is_empty() || target.contains(';') {
+        return fallback();
+    }
+    let literal = if target.len() >= 2 {
+        let bytes = target.as_bytes();
+        let (first, last) = (bytes[0], bytes[target.len() - 1]);
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            &target[1..target.len() - 1]
+        } else {
+            target
+        }
+    } else {
+        target
+    };
+    if literal.is_empty()
+        || literal.contains('$')
+        || literal.contains('`')
+        || literal.contains(' ')
+        || literal.contains('\\')
+        || literal.starts_with('-')
+    {
+        return fallback();
+    }
+    let path = if literal == "~" {
+        match platform_home() {
+            Some(home) => home,
+            None => return fallback(),
+        }
+    } else if let Some(sub) = literal.strip_prefix("~/") {
+        match platform_home() {
+            Some(home) => Path::new(&home).join(sub),
+            None => return fallback(),
+        }
+    } else {
+        Path::new(literal).to_path_buf()
+    };
+    let root = if path.is_absolute() {
+        path
+    } else {
+        workdir.join(path)
+    };
+    (root, "cd-target")
+}
+
+use crate::sandbox::sandbox_denial_hint;
+
+/// Session-output payload shared by `exec_command`'s yielded path and
+/// `write_stdin` (#2136 review, P1: the principal ASYNC execution path
+/// returned permission failures without the [sandbox] explanation the
+/// synchronous paths carry). Scans the FULL captured text, truncates,
+/// then appends the hint so it survives the cap — same ordering contract
+/// as the synchronous assemblers.
+fn session_output_payload(
+    captured: String,
+    exit_code: Option<i32>,
+    sandboxed: bool,
+    cap: usize,
+) -> String {
+    let failed = matches!(exit_code, Some(code) if code != 0);
+    let hint = sandbox_denial_hint(sandboxed, !failed, &captured);
+    let mut output = truncate_output(captured, cap);
+    if let Some(hint) = hint {
+        output.push_str(hint);
+    }
     output
 }
 
@@ -184,6 +288,8 @@ async fn request_command_approval(
                     body: format!("Run command: {command}"),
                     command: Some(command.to_owned()),
                     cwd: Some(cwd.to_string_lossy().into_owned()),
+                    once_only: false,
+                    host_tool: None,
                 })
                 .await;
             if matches!(decision, ToolApprovalDecision::Deny) {
@@ -228,39 +334,14 @@ struct ExecCommandInput {
 }
 
 pub struct ExecCommandTool {
+    /// #28d — bash file-writes knob (shared judge/escape-hatch; see
+    /// `super::shell`), loaded ONCE at construction.
+    bash_file_writes: BashFileWrites,
     base_dir: PathBuf,
     filesystem_scope: FilesystemScope,
     policy: Arc<dyn CommandPolicy>,
     approval_policy: ApprovalPolicy,
     sandbox: Arc<dyn Sandbox>,
-}
-
-/// How many denied paths an escalation prompt lists before it stops. A command
-/// that trips the sandbox on a dozen paths is the same decision as one that
-/// trips on three, and the dialog has to stay readable in a terminal.
-const MAX_REPORTED_DENIALS: usize = 5;
-
-/// Outcome of a single attempt at a command.
-///
-/// `completed` distinguishes "the child ran and exited" from a spawn failure or
-/// a timeout. Only the former can be a sandbox denial worth escalating — the
-/// other two are not policy decisions and re-running unconfined would not fix
-/// them.
-struct ExecRun {
-    text: String,
-    success: bool,
-    completed: bool,
-}
-
-impl ExecRun {
-    /// An attempt that never produced a process exit status.
-    fn failed(text: String) -> Self {
-        Self {
-            text,
-            success: false,
-            completed: false,
-        }
-    }
 }
 
 impl ExecCommandTool {
@@ -271,7 +352,14 @@ impl ExecCommandTool {
             policy: Arc::new(crate::policy::SafePolicy::default()),
             approval_policy: ApprovalPolicy::Ask,
             sandbox,
+            bash_file_writes: BashFileWrites::default(),
         }
+    }
+
+    /// #28d — set the bash file-writes knob (defaults to `allow`).
+    pub fn with_bash_file_writes(mut self, mode: BashFileWrites) -> Self {
+        self.bash_file_writes = mode;
+        self
     }
 
     pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
@@ -378,129 +466,50 @@ impl ExecCommandTool {
             .timeout_secs
             .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
             .clamp(1, MAX_EXEC_TIMEOUT_SECS);
-        let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
-
-        let run = Self::run_once(self.sandbox.as_ref(), &command, &cwd, timeout_secs).await;
-
-        // A confined run that *completed* can still have been refused a path
-        // partway through while the wrapper shell exited 0. Offer the user the
-        // escalation now, rather than handing the model an error it can only
-        // narrate back. A spawn failure or a timeout is not a policy decision,
-        // so neither is escalated.
-        if run.completed {
-            if let Some(escalated) = self
-                .escalate_if_denied(&command, &cwd, timeout_secs, max, &run)
-                .await
-            {
-                return Ok(escalated);
-            }
+        // #28d — deny knob on the CODING bash path: same heuristic judge
+        // and escape hatch as ShellTool (single shared implementation in
+        // `super::shell`), loaded at construction. A refusal happens BEFORE
+        // any spawn/approval/snapshot.
+        if self.bash_file_writes == BashFileWrites::Deny
+            && !super::shell::command_allows_write_explicitly(&command)
+            && super::shell::command_looks_like_file_write(&command)
+        {
+            return Ok(ToolResult {
+                output: "Command refused by tool_policy.bash_file_writes=deny (it looks like a \
+                         file-writing shell command). Use the edit_file / diff_edit tools for \
+                         code changes instead. If this refusal is a false positive, append the \
+                         comment `# octos:allow-write` to the command line to run it \
+                         explicitly. Command: "
+                    .to_owned()
+                    + &command,
+                success: false,
+                ..Default::default()
+            });
         }
-
-        Ok(ToolResult {
-            output: truncate_output(run.text, max),
-            success: run.success,
-            ..Default::default()
-        })
-    }
-
-    /// Ask the user whether to re-run a sandbox-denied command unconfined, and
-    /// do it if they agree.
-    ///
-    /// `None` means there was nothing to escalate — no confinement in force, no
-    /// denial in the output, or no interactive client attached to ask — and the
-    /// caller should report the original run unchanged.
-    async fn escalate_if_denied(
-        &self,
-        command: &str,
-        cwd: &Path,
-        timeout_secs: u64,
-        max: usize,
-        run: &ExecRun,
-    ) -> Option<ToolResult> {
-        // Without a real backend an EPERM is a genuine filesystem error rather
-        // than a policy decision, and re-running would change nothing.
-        if self.sandbox.is_noop() {
-            return None;
-        }
-
-        let denials = detect_sandbox_denials(&run.text, MAX_REPORTED_DENIALS);
-        if denials.is_empty() {
-            return None;
-        }
-
-        // Non-interactive callers (cron fires, headless runs) have nobody to
-        // ask; they keep today's behaviour.
-        let requester = TOOL_APPROVAL_CTX.try_with(Arc::clone).ok()?;
-        let tool_id = TOOL_CTX
-            .try_with(|inner| inner.tool_id.clone())
-            .unwrap_or_default();
-
-        let blocked = denials
-            .iter()
-            .map(|denial| format!("  {}", denial.line))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let decision = requester
-            .request_approval(ToolApprovalRequest {
-                tool_id,
-                tool_name: self.name().to_owned(),
-                title: "Allow command to run outside the sandbox?".to_owned(),
-                body: format!(
-                    "The sandbox refused part of this command:\n{blocked}\n\n\
-                     Approving re-runs the whole command with no confinement, so it can \
-                     read and write anything this account can. Denying keeps the output above.",
-                ),
-                command: Some(command.to_owned()),
-                cwd: Some(cwd.to_string_lossy().into_owned()),
-            })
-            .await;
-
-        if matches!(decision, ToolApprovalDecision::Deny) {
-            tracing::info!(command = %command, "sandbox escalation denied by user");
-            // Keep the original exit status: the command ran, and the user
-            // declining the retry does not retroactively change how it ended.
-            return Some(ToolResult {
-                output: truncate_output(
-                    format!(
-                        "{}\n\n[sandbox] The user declined to re-run this command outside \
-                         the sandbox. The paths above stay unreadable for this session — \
-                         do not retry the same command expecting a different result.",
-                        run.text
-                    ),
-                    max,
-                ),
-                success: run.success,
+        // #28c-r1 — receipt snapshot root: a leading literal `cd X &&`
+        // prefix (the coding-session idiom) makes X the root; otherwise the
+        // session workdir. Prevents the false `files_changed: 0` on writes
+        // outside the workspace root (outer-loop live verdict).
+        let (snapshot_root, receipt_scope) = receipt_scope_root(&cwd, &command);
+        // #28c — BEFORE snapshot for the file-change receipt, reusing the
+        // SAME shared 28a module as ShellTool. `None` on non-git/fail-open
+        // omits the receipt.
+        // Fail closed on an unhonorable sandbox config BEFORE spawning
+        // anything: the typed refusal (model-facing Display — operator
+        // remediation stays in the logs) IS the tool result. The wrap-level
+        // refusal command would also fail, but a background command discards
+        // its stderr, and the model deserves the full refusal text, not a
+        // truncated stderr line.
+        if let Some(refusal) = self.sandbox.refusal() {
+            return Ok(ToolResult {
+                output: refusal.to_string(),
+                success: false,
                 ..Default::default()
             });
         }
 
-        tracing::warn!(
-            command = %command,
-            "re-running command outside the sandbox after user approval",
-        );
-        let rerun = Self::run_once(&NoSandbox, command, cwd, timeout_secs).await;
-        Some(ToolResult {
-            output: truncate_output(
-                format!(
-                    "[sandbox] Re-ran outside the sandbox with the user's approval.\n\n{}",
-                    rerun.text
-                ),
-                max,
-            ),
-            success: rerun.success,
-            ..Default::default()
-        })
-    }
-
-    /// Run `command` to completion under `sandbox`, capturing merged output.
-    async fn run_once(
-        sandbox: &dyn Sandbox,
-        command: &str,
-        cwd: &Path,
-        timeout_secs: u64,
-    ) -> ExecRun {
-        let mut cmd = sandbox.wrap_command(command, cwd);
+        let dirty_before = super::shell::snapshot_dirty_paths(&snapshot_root);
+        let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // Put the child in its own process group so the timeout path can
         // signal the WHOLE tree (wrapper shell + grandchildren) with a
@@ -514,7 +523,11 @@ impl ExecCommandTool {
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
-                return ExecRun::failed(format!("Failed to execute command: {error}"));
+                return Ok(ToolResult {
+                    output: format!("Failed to execute command: {error}"),
+                    success: false,
+                    ..Default::default()
+                });
             }
         };
         // Capture the pid BEFORE `wait_with_output` consumes the child — the
@@ -543,13 +556,46 @@ impl ExecCommandTool {
                     "\n\nExit code: {}",
                     output.status.code().unwrap_or(-1)
                 ));
-                ExecRun {
-                    text,
-                    success: output.status.success(),
-                    completed: true,
+                // #28c — file-change receipt on the coding-session exec
+                // path too (same shared 28a module; same five acceptance
+                // semantics as ShellTool / BashTool).
+                if let Some(receipt) = super::shell::diff_to_receipt(
+                    dirty_before,
+                    super::shell::snapshot_dirty_paths(&snapshot_root),
+                ) {
+                    text.push_str(&receipt);
+                    text.push_str(&format!("\nscope: {receipt_scope}"));
+                    // #28d — warn knob: nudge ONLY when files actually
+                    // changed (same after-snapshot as the receipt; no
+                    // second scan). Zero behavior under `allow`.
+                    if self.bash_file_writes == BashFileWrites::Warn
+                        && !receipt.trim_end().ends_with("files_changed: 0")
+                    {
+                        text.push_str(
+                            "\nnote: prefer the edit_file / diff_edit tools for code changes (tool_policy.bash_file_writes=warn)",
+                        );
+                    }
                 }
+                // Scan BEFORE truncation (the denial line may be what gets
+                // cut), append AFTER (so the hint itself survives the cut).
+                let hint =
+                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
+                let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
+                let mut out = truncate_output(text, max);
+                if let Some(hint) = hint {
+                    out.push_str(hint);
+                }
+                Ok(ToolResult {
+                    output: out,
+                    success: output.status.success(),
+                    ..Default::default()
+                })
             }
-            Ok(Err(error)) => ExecRun::failed(format!("Failed to execute command: {error}")),
+            Ok(Err(error)) => Ok(ToolResult {
+                output: format!("Failed to execute command: {error}"),
+                success: false,
+                ..Default::default()
+            }),
             Err(_) => {
                 // Dropping the wait future does NOT kill a tokio child, so
                 // the wrapper shell and any grandchildren keep running. Kill
@@ -557,7 +603,11 @@ impl ExecCommandTool {
                 // SIGKILL on Unix, `taskkill /F /T` on Windows) — the same
                 // helper the `bash` tool uses.
                 kill_timed_out_child(child_pid).await;
-                ExecRun::failed(format!("Command timed out after {timeout_secs} seconds"))
+                Ok(ToolResult {
+                    output: format!("Command timed out after {timeout_secs} seconds"),
+                    success: false,
+                    ..Default::default()
+                })
             }
         }
     }
@@ -568,6 +618,20 @@ impl ExecCommandTool {
         cwd: PathBuf,
         input: ExecCommandInput,
     ) -> Result<ToolResult> {
+        // Fail closed on an unhonorable sandbox config BEFORE spawning
+        // anything: the typed refusal (model-facing Display — operator
+        // remediation stays in the logs) IS the tool result. The wrap-level
+        // refusal command would also fail, but a background command discards
+        // its stderr, and the model deserves the full refusal text, not a
+        // truncated stderr line.
+        if let Some(refusal) = self.sandbox.refusal() {
+            return Ok(ToolResult {
+                output: refusal.to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -589,15 +653,34 @@ impl ExecCommandTool {
         let session_id = next_exec_session_id();
         let output = Arc::new(Mutex::new(String::new()));
         let exit_code = Arc::new(Mutex::new(None));
-        if let Some(stdout) = stdout {
-            tokio::spawn(append_reader_output(stdout, output.clone(), "stdout"));
-        }
-        if let Some(stderr) = stderr {
-            tokio::spawn(append_reader_output(stderr, output.clone(), "stderr"));
-        }
+        // #2136 review: after the child exits, give the pipe readers a
+        // BOUNDED grace to drain before publishing the exit code, then
+        // publish regardless. A plain reader-join deadlocked when a
+        // descendant (a backgrounded `server &`, a daemon that inherits
+        // stdout) keeps a pipe write-end open — EOF never arrives and the
+        // session reported `running` forever. The grace closes the
+        // round-2 race (a fast-exiting command's final output — e.g. a
+        // denial line — is captured within the window, since its fds close
+        // at exit) without hanging on a surviving descendant; combined
+        // with sampling the exit code BEFORE the output, "not running"
+        // implies "output drained" in the common case.
+        const READER_DRAIN_GRACE: Duration = Duration::from_millis(200);
+        let stdout_reader = stdout
+            .map(|stdout| tokio::spawn(append_reader_output(stdout, output.clone(), "stdout")));
+        let stderr_reader = stderr
+            .map(|stderr| tokio::spawn(append_reader_output(stderr, output.clone(), "stderr")));
         let exit_code_for_wait = exit_code.clone();
         tokio::spawn(async move {
             let code = child.wait().await.ok().and_then(|status| status.code());
+            let _ = tokio::time::timeout(READER_DRAIN_GRACE, async {
+                if let Some(handle) = stdout_reader {
+                    let _ = handle.await;
+                }
+                if let Some(handle) = stderr_reader {
+                    let _ = handle.await;
+                }
+            })
+            .await;
             *exit_code_for_wait.lock().await = Some(code.unwrap_or(-1));
         });
         exec_sessions().lock().await.insert(
@@ -606,20 +689,31 @@ impl ExecCommandTool {
                 stdin: Arc::new(Mutex::new(stdin)),
                 output: output.clone(),
                 exit_code: exit_code.clone(),
+                sandboxed: !self.sandbox.is_noop(),
             },
         );
         tokio::time::sleep(Duration::from_millis(
             input.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_MS),
         ))
         .await;
-        let captured = output.lock().await.clone();
+        // #2136 review round 3, P2: sample the exit code FIRST, then the
+        // output. The exit-code task sets the code only AFTER joining the
+        // pipe readers, so `code.is_some()` (not running) guarantees the
+        // output buffer is fully drained — reading output after the code
+        // therefore never sees a stale/empty capture with running:false.
         let code = *exit_code.lock().await;
+        let captured = output.lock().await.clone();
         Ok(ToolResult {
             output: json!({
                 "session_id": session_id,
                 "running": code.is_none(),
                 "exit_code": code,
-                "output": truncate_output(captured, input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES)),
+                "output": session_output_payload(
+                    captured,
+                    code,
+                    !self.sandbox.is_noop(),
+                    input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES),
+                ),
             })
             .to_string(),
             success: true,
@@ -692,14 +786,20 @@ impl Tool for WriteStdinTool {
             }
         }
         tokio::time::sleep(Duration::from_millis(input.yield_time_ms.unwrap_or(250))).await;
-        let output = session.output.lock().await.clone();
+        // #2136 review round 3, P2: code before output (see spawn_session).
         let code = *session.exit_code.lock().await;
+        let output = session.output.lock().await.clone();
         Ok(ToolResult {
             output: json!({
                 "session_id": input.session_id,
                 "running": code.is_none(),
                 "exit_code": code,
-                "output": truncate_output(output, input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES)),
+                "output": session_output_payload(
+                    output,
+                    code,
+                    session.sandboxed,
+                    input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES),
+                ),
             })
             .to_string(),
             success: true,
@@ -749,7 +849,7 @@ macro_rules! simple_codex_tool {
 /// typed [`UiPlanRecord`]. Accepts item text under `step` / `title` / `content`
 /// and tolerates a few status spellings; assigns a stable 1-based `id` when the
 /// caller doesn't supply one so downstream clients can re-render in place.
-fn normalize_plan(args: &Value, now_ms: i64) -> octos_core::ui_protocol::UiPlanRecord {
+pub(crate) fn normalize_plan(args: &Value, now_ms: i64) -> octos_core::ui_protocol::UiPlanRecord {
     use octos_core::ui_protocol::{PlanItemStatus, UiPlanItem, UiPlanRecord};
     let items = args
         .get("plan")
@@ -832,7 +932,7 @@ async fn request_user_input_body(
             "status": "requested",
             "request": args,
             "response": null,
-            "message": "User input request recorded; no synchronous host response channel is attached to this runtime."
+            "message": "User input request recorded in the transcript; no synchronous host response channel is attached to this runtime (non-interactive or unattended run). Do NOT wait or re-ask: proceed with your best judgment, state the assumption in one line, and continue the task so the user can redirect you later if needed."
         })
         .to_string(),
         success: true,
@@ -1803,6 +1903,10 @@ pub struct BashTool {
     policy: Arc<dyn CommandPolicy>,
     approval_policy: ApprovalPolicy,
     sandbox: Arc<dyn Sandbox>,
+    /// #28d — the bash-file-writes knob, loaded ONCE at construction from
+    /// the session's ToolPolicy (never re-read per call). Shared
+    /// judge/escape-hatch with ShellTool — see `super::shell`.
+    bash_file_writes: BashFileWrites,
 }
 
 impl BashTool {
@@ -1813,9 +1917,15 @@ impl BashTool {
             policy: Arc::new(crate::policy::SafePolicy::default()),
             approval_policy: ApprovalPolicy::Ask,
             sandbox,
+            bash_file_writes: BashFileWrites::default(),
         }
     }
 
+    /// #28d — set the bash file-writes knob (defaults to `allow`).
+    pub fn with_bash_file_writes(mut self, mode: BashFileWrites) -> Self {
+        self.bash_file_writes = mode;
+        self
+    }
     pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
         self.filesystem_scope = filesystem_scope;
         self
@@ -1836,6 +1946,10 @@ impl BashTool {
 impl Tool for BashTool {
     fn name(&self) -> &str {
         "bash"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn description(&self) -> &str {
@@ -1918,6 +2032,50 @@ impl Tool for BashTool {
             .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
             .clamp(1, MAX_BASH_TIMEOUT_SECS);
 
+        // #28d — deny knob on the CODING bash path: same heuristic judge
+        // and escape hatch as ShellTool (single shared implementation in
+        // `super::shell`), loaded at construction. A refusal happens BEFORE
+        // any spawn/snapshot.
+        if self.bash_file_writes == BashFileWrites::Deny
+            && !super::shell::command_allows_write_explicitly(&command)
+            && super::shell::command_looks_like_file_write(&command)
+        {
+            return Ok(ToolResult {
+                output: "Command refused by tool_policy.bash_file_writes=deny (it looks like a \
+                         file-writing shell command). Use the edit_file / diff_edit tools for \
+                         code changes instead. If this refusal is a false positive, append the \
+                         comment `# octos:allow-write` to the command line to run it \
+                         explicitly. Command: "
+                    .to_owned()
+                    + &command,
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        // #28c-r1 — receipt snapshot root: a leading literal `cd X &&`
+        // prefix (the coding-session idiom) makes X the root; otherwise the
+        // session workdir. Prevents the false `files_changed: 0` on writes
+        // outside the workspace root (outer-loop live verdict).
+        let (snapshot_root, receipt_scope) = receipt_scope_root(&cwd, &command);
+        // #28c — BEFORE snapshot for the file-change receipt, reusing the
+        // SAME shared 28a module as ShellTool. `None` on non-git/fail-open
+        // omits the receipt.
+        // Fail closed on an unhonorable sandbox config BEFORE spawning
+        // anything: the typed refusal (model-facing Display — operator
+        // remediation stays in the logs) IS the tool result. The wrap-level
+        // refusal command would also fail, but a background command discards
+        // its stderr, and the model deserves the full refusal text, not a
+        // truncated stderr line.
+        if let Some(refusal) = self.sandbox.refusal() {
+            return Ok(ToolResult {
+                output: refusal.to_string(),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        let dirty_before = super::shell::snapshot_dirty_paths(&snapshot_root);
         let mut cmd = self.sandbox.wrap_command(&command, &cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         // codex review (#1172) P2 (follow-up): put the child in its own
@@ -1970,8 +2128,36 @@ impl Tool for BashTool {
                 }
                 let exit_code = output.status.code().unwrap_or(-1);
                 text.push_str(&format!("\n\nExit code: {exit_code}"));
+                // #28c — file-change receipt appended ONCE to THIS result's
+                // tail (28a semantics: prompt-cache stable, never a system
+                // prompt / history rewrite). Non-git fail-open ⇒ None ⇒
+                // omitted (acceptance ④ of the 28a set).
+                if let Some(receipt) = super::shell::diff_to_receipt(
+                    dirty_before,
+                    super::shell::snapshot_dirty_paths(&snapshot_root),
+                ) {
+                    text.push_str(&receipt);
+                    text.push_str(&format!("\nscope: {receipt_scope}"));
+                    // #28d — warn knob: nudge ONLY when files actually
+                    // changed (same after-snapshot as the receipt; no
+                    // second scan). Zero behavior under `allow`.
+                    if self.bash_file_writes == BashFileWrites::Warn
+                        && !receipt.trim_end().ends_with("files_changed: 0")
+                    {
+                        text.push_str(
+                            "\nnote: prefer the edit_file / diff_edit tools for code changes (tool_policy.bash_file_writes=warn)",
+                        );
+                    }
+                }
+                // Scan BEFORE truncation, append AFTER — see run_to_completion.
+                let hint =
+                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
+                let mut out = truncate_output(text, MAX_CAPTURE_BYTES);
+                if let Some(hint) = hint {
+                    out.push_str(hint);
+                }
                 Ok(ToolResult {
-                    output: truncate_output(text, MAX_CAPTURE_BYTES),
+                    output: out,
                     success: output.status.success(),
                     structured_metadata: Some(json!({
                         "codex_tool": "bash",
@@ -2550,9 +2736,12 @@ struct ViewImageInput {
 /// Reads an image file from the workspace (respecting `FilesystemScope` and
 /// `FileAccessMode`), detects the format from the magic header bytes, and
 /// returns a structured metadata envelope the AppUI image-view flow can render
-/// without re-reading the file. The tool intentionally does NOT inline the raw
-/// image bytes — the host UI fetches them through the workspace artifact
-/// channel.
+/// without re-reading the file. The tool output stays text — the bytes are
+/// not inlined there, the host UI fetches them through the workspace artifact
+/// channel — but a raster image the provider can accept is handed back as
+/// `model_media`, so the model that asked actually gets to look at it. A
+/// vision-capable model that could only learn "png, 2.1 MB" from its own
+/// screenshot had to wait for a person to attach it.
 pub struct ViewImageTool {
     base_dir: PathBuf,
     filesystem_scope: FilesystemScope,
@@ -2738,14 +2927,43 @@ impl Tool for ViewImageTool {
                 });
             }
         };
+        // Shown to the model when the provider can take it: a raster format
+        // every vision API accepts, under the smallest common size ceiling,
+        // and with an extension the providers' image detection recognises
+        // (they key on the path, not the bytes). Otherwise the model gets
+        // the metadata and a reason, never a silent nothing.
+        let shown = if !VISION_FORMATS.contains(&format) {
+            Err(format!(
+                "{format} is not a format the model can view; convert it to PNG or JPEG"
+            ))
+        } else if byte_length > MAX_MODEL_IMAGE_BYTES {
+            Err(format!(
+                "{byte_length} bytes is over the {MAX_MODEL_IMAGE_BYTES}-byte limit for showing an image to the model; downscale it"
+            ))
+        } else if !octos_llm::vision::is_image(&resolved.to_string_lossy()) {
+            Err("the file needs a .png, .jpg, .jpeg, .gif or .webp extension to be shown to the model".to_string())
+        } else {
+            Ok(())
+        };
+        let mut payload = json!({
+            "path": path,
+            "format": format,
+            "mime_type": mime,
+            "byte_length": byte_length,
+        });
+        let model_media = match &shown {
+            Ok(()) => {
+                payload["shown_to_model"] = json!(true);
+                vec![resolved.clone()]
+            }
+            Err(reason) => {
+                payload["shown_to_model"] = json!(false);
+                payload["not_shown_because"] = json!(reason);
+                Vec::new()
+            }
+        };
         Ok(ToolResult {
-            output: json!({
-                "path": path,
-                "format": format,
-                "mime_type": mime,
-                "byte_length": byte_length,
-            })
-            .to_string(),
+            output: payload.to_string(),
             success: true,
             structured_metadata: Some(json!({
                 "codex_tool": "view_image",
@@ -2753,11 +2971,224 @@ impl Tool for ViewImageTool {
                 "format": format,
                 "mime_type": mime,
                 "byte_length": byte_length,
+                "shown_to_model": shown.is_ok(),
             })),
+            model_media,
             ..Default::default()
         })
     }
 }
+
+/// `view_video`: the video counterpart of [`ViewImageTool`].
+///
+/// Same workspace scope and symlink rules, same contract: the tool output is
+/// metadata, and a container the multimodal endpoints take inline (MP4, MOV,
+/// MKV, WebM, under the size ceiling) comes back as `model_media` so the
+/// model that asked gets to watch it. Which endpoints can is decided on the
+/// wire: GLM's coding endpoint and Kimi take a `video_url` part, DeepSeek
+/// refuses one and the provider's retry tells the model it could not watch
+/// the file, Anthropic's protocol has no video at all.
+pub struct ViewVideoTool {
+    base_dir: PathBuf,
+    filesystem_scope: FilesystemScope,
+}
+
+impl ViewVideoTool {
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+            filesystem_scope: FilesystemScope::Workspace,
+        }
+    }
+
+    pub fn with_filesystem_scope(mut self, filesystem_scope: FilesystemScope) -> Self {
+        self.filesystem_scope = filesystem_scope;
+        self
+    }
+}
+
+/// Container detected from the header bytes: ISO BMFF (`ftyp` at offset 4:
+/// MP4, M4V, MOV) or EBML (MKV, WebM). Returned as (format, mime).
+fn detect_video_format(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        let brand = &bytes[8..12];
+        return Some(if brand == b"qt  " {
+            ("mov", "video/quicktime")
+        } else {
+            ("mp4", "video/mp4")
+        });
+    }
+    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        // EBML: WebM and Matroska share the header; the DocType string
+        // inside the first bytes tells them apart.
+        let head = &bytes[..bytes.len().min(64)];
+        return Some(if head.windows(4).any(|w| w == b"webm") {
+            ("webm", "video/webm")
+        } else {
+            ("mkv", "video/x-matroska")
+        });
+    }
+    None
+}
+
+#[async_trait]
+impl Tool for ViewVideoTool {
+    fn name(&self) -> &str {
+        "view_video"
+    }
+
+    fn description(&self) -> &str {
+        "Watch a local video file (MP4 / MOV / MKV / WebM) in the workspace. The video is shown to you when the model can take video; otherwise you get its format and size and a reason."
+    }
+
+    fn tags(&self) -> &[&str] {
+        &["fs", "code"]
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path to the video"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+
+    async fn execute_with_context(&self, _ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let input: ViewImageInput =
+            serde_json::from_value(args.clone()).wrap_err("invalid view_video input")?;
+        let Some(path) = input
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            return Ok(ToolResult {
+                output: "view_video requires `path`".to_string(),
+                success: false,
+                ..Default::default()
+            });
+        };
+        let resolved =
+            match super::resolve_path_with_scope(&self.base_dir, path, self.filesystem_scope) {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "view_video: path outside allowed filesystem scope: {path}"
+                        ),
+                        success: false,
+                        structured_metadata: Some(json!({
+                            "codex_tool": "view_video",
+                            "error_kind": "coding_tool_denied",
+                            "path": path,
+                        })),
+                        ..Default::default()
+                    });
+                }
+            };
+        let ancestor_stop: Option<&std::path::Path> = match self.filesystem_scope {
+            FilesystemScope::Workspace => Some(self.base_dir.as_path()),
+            FilesystemScope::Host => None,
+        };
+        let (bytes, byte_length) = match read_image_header_no_follow(&resolved, ancestor_stop) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return Ok(ToolResult {
+                    output: format!("view_video: failed to read {path}: {error}"),
+                    success: false,
+                    structured_metadata: Some(json!({
+                        "codex_tool": "view_video",
+                        "error_kind": "coding_tool_missing",
+                        "path": path,
+                    })),
+                    ..Default::default()
+                });
+            }
+        };
+        let Some((format, mime)) = detect_video_format(&bytes) else {
+            return Ok(ToolResult {
+                output: format!(
+                    "view_video: {path} does not match a recognised video container (MP4 / MOV / MKV / WebM)"
+                ),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": "view_video",
+                    "error_kind": "coding_tool_denied",
+                    "reason": "unrecognised_video_format",
+                    "path": path,
+                })),
+                ..Default::default()
+            });
+        };
+        let shown = if byte_length > MAX_MODEL_VIDEO_BYTES {
+            Err(format!(
+                "{byte_length} bytes is over the {MAX_MODEL_VIDEO_BYTES}-byte limit for showing a video to the model; trim or downscale it"
+            ))
+        } else if !octos_llm::vision::is_video(&resolved.to_string_lossy()) {
+            Err("the file needs a .mp4, .m4v, .mov, .mkv or .webm extension to be shown to the model".to_string())
+        } else {
+            Ok(())
+        };
+        let mut payload = json!({
+            "path": path,
+            "format": format,
+            "mime_type": mime,
+            "byte_length": byte_length,
+        });
+        let model_media = match &shown {
+            Ok(()) => {
+                payload["shown_to_model"] = json!(true);
+                payload["note"] = json!(
+                    "Shown when the model takes video; a model that does not is told it could not watch the file."
+                );
+                vec![resolved.clone()]
+            }
+            Err(reason) => {
+                payload["shown_to_model"] = json!(false);
+                payload["not_shown_because"] = json!(reason);
+                Vec::new()
+            }
+        };
+        Ok(ToolResult {
+            output: payload.to_string(),
+            success: true,
+            structured_metadata: Some(json!({
+                "codex_tool": "view_video",
+                "path": path,
+                "format": format,
+                "mime_type": mime,
+                "byte_length": byte_length,
+                "shown_to_model": shown.is_ok(),
+            })),
+            model_media,
+            ..Default::default()
+        })
+    }
+}
+
+/// Base64 in a JSON body grows a file by a third and the endpoints that take
+/// inline video cap requests in the tens of megabytes; 20 MB keeps the
+/// request under those limits.
+const MAX_MODEL_VIDEO_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Formats every vision API takes inline. SVG and BMP are recognised by
+/// [`detect_image_format`] for the UI's sake but no provider renders them,
+/// and GIF is refused by Gemini, so it is metadata-only too.
+const VISION_FORMATS: &[&str] = &["png", "jpeg", "webp"];
+
+/// The smallest per-image ceiling among the providers (Anthropic's 5 MB);
+/// above it the request would be rejected, so the model gets a reason
+/// instead of a failed turn.
+const MAX_MODEL_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// #1148 codex P2: bounded-read helper for `view_image` that refuses
 /// to follow symlinks. Reads only the first 512 bytes for magic-byte
@@ -2820,7 +3251,10 @@ fn read_image_header_no_follow(
     // so a host symlink like `C:\tmp\link.png -> C:\secret\real.png`
     // doesn't quietly follow on Windows.
     match workspace_root {
-        Some(root) => reject_symlink_ancestors(resolved, root)?,
+        // The walk lives in `octos_llm::vision` (#2480): the request build
+        // re-runs the exact same walk on the same paths, so it must have one
+        // canonical implementation.
+        Some(root) => octos_llm::vision::reject_symlink_ancestors(resolved, root)?,
         None => reject_leaf_symlink(resolved)?,
     }
 
@@ -2864,57 +3298,6 @@ fn reject_leaf_symlink(resolved: &std::path::Path) -> std::io::Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
-}
-
-/// Walk every ancestor of `resolved` (including `resolved` itself)
-/// and refuse if any one is a symlink or Windows reparse point.
-/// Stops at `workspace_root` (inclusive) so we never recurse into
-/// system roots. Returns `Ok(())` when none of the inspected entries
-/// are symlinks; returns `PermissionDenied` with a descriptive
-/// message when any are.
-///
-/// Safety properties:
-///
-/// * Uses `symlink_metadata`, which does NOT follow the link, so a
-///   symlinked ancestor is correctly classified.
-/// * Terminates at the workspace root even if `resolved` does not
-///   actually live under it (in which case the walk runs out of
-///   ancestors and returns `Ok(())` — containment was already
-///   checked by `resolve_path_with_scope`).
-/// * Hard-bounded by `Path::ancestors`, which is finite.
-fn reject_symlink_ancestors(
-    resolved: &std::path::Path,
-    workspace_root: &std::path::Path,
-) -> std::io::Result<()> {
-    for ancestor in resolved.ancestors() {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!(
-                            "refusing to follow symlink ancestor: {}",
-                            ancestor.display()
-                        ),
-                    ));
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // The leaf may not exist yet — keep walking up so a
-                // symlinked PARENT still gets caught. The actual
-                // open below will surface NotFound for the leaf.
-            }
-            Err(err) => return Err(err),
-        }
-        // Stop walking once we hit (and have inspected) the
-        // configured workspace root. Going further would inspect
-        // system directories that the caller has no jurisdiction
-        // over.
-        if ancestor == workspace_root {
-            break;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

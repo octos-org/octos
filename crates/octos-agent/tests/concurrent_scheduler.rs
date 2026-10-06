@@ -298,10 +298,7 @@ async fn executor_dispatches_all_safe_in_parallel() {
     let min_end = spans.iter().map(|s| s.ended_us).min().unwrap();
     assert!(
         max_start < min_end,
-        "safe batch did not overlap: max_start={}us min_end={}us spans={:?}",
-        max_start,
-        min_end,
-        spans
+        "safe batch did not overlap: max_start={max_start}us min_end={min_end}us spans={spans:?}"
     );
 }
 
@@ -361,8 +358,7 @@ async fn executor_dispatches_exclusive_serially_in_call_order() {
     for pair in spans.windows(2) {
         assert!(
             pair[1].started_us >= pair[0].ended_us,
-            "exclusive batch was not serialized: {:?}",
-            spans
+            "exclusive batch was not serialized: {spans:?}"
         );
     }
 }
@@ -572,8 +568,7 @@ async fn executor_preserves_tool_call_ids_across_cascade() {
         events
             .iter()
             .any(|(name, id, _)| name == "excl_fail" && id == "call_alpha"),
-        "expected a ToolCompleted for the failing call_alpha; saw {:?}",
-        events
+        "expected a ToolCompleted for the failing call_alpha; saw {events:?}"
     );
 
     // 2) Every LLM-issued tool_call_id must appear exactly once among the
@@ -590,20 +585,14 @@ async fn executor_preserves_tool_call_ids_across_cascade() {
         .iter()
         .filter_map(|m| m.tool_call_id.as_deref())
         .collect();
-    assert!(
-        ids.contains(&"call_alpha"),
-        "missing call_alpha in {:?}",
-        ids
-    );
+    assert!(ids.contains(&"call_alpha"), "missing call_alpha in {ids:?}");
     assert!(
         ids.contains(&"call_beta"),
-        "missing cancelled call_beta in {:?}",
-        ids
+        "missing cancelled call_beta in {ids:?}"
     );
     assert!(
         ids.contains(&"call_gamma"),
-        "missing completed call_gamma in {:?}",
-        ids
+        "missing completed call_gamma in {ids:?}"
     );
 
     // 3) The cancelled Exclusive peer carries a "cancelled" marker so the

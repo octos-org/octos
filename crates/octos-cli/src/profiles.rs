@@ -192,6 +192,13 @@ pub struct ProfileConfig {
     /// coding provider, unchanged behavior).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sub_providers: Vec<crate::config::SubProviderConfig>,
+    /// MCP servers to attach to this profile's agent (e.g. the OLP-MCP
+    /// outer-loop server). Loaded into the runtime `Config.mcp_servers` by
+    /// `config_from_profile` — before OLP #29 S2b the field was missing here
+    /// and the runtime field was hard-zeroed, so a profile-level
+    /// `[[mcp_servers]]` block silently never registered any tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<octos_agent::McpServerConfig>,
     /// Per-tenant reply-voice (TTS timbre) choice. Voice route/ASR settings stay
     /// platform-level on the serve config; only the chosen timbre is per-user.
     /// Applied at profile bootstrap over the shared `VoiceConfig.default_voice`
@@ -266,6 +273,24 @@ pub struct ProfileConfig {
     /// Lifecycle hooks for agent events (per-profile).
     #[serde(default)]
     pub hooks: Vec<octos_agent::HookConfig>,
+    /// #2168: per-profile tool-visibility policy (allow / deny / require_tags,
+    /// with `group:*` support). Projected into `Config.tool_policy`, which the
+    /// serve path already applies — it just had no way to be set from a
+    /// profile, so a serve / UserProfile session could not slim its roster the
+    /// way the built-in `coding` profile does (#2133). `None` = no filtering.
+    ///
+    /// NOTE on the mechanism: this goes through `ToolRegistry::apply_policy`
+    /// (deny-wins, then an allow-list `retain`), NOT the built-in profile's
+    /// `filter_by_profile`. The difference: `apply_policy` has NO `spawn_only`
+    /// carve-out (by design, so a `deny: ["run_pipeline"]` actually works). So
+    /// an `allow` list here also drops the per-session serve tools that are not
+    /// in it — `run_pipeline` (spawn_only), `message`, `send_file`,
+    /// `send_app_card`, `read_task_output`, `check_background_tasks`, `recall`,
+    /// `cron`. For a lean *coding* surface that is fine; for a general serve
+    /// profile prefer a **`deny`** list of the heavy web/research/media tools,
+    /// which keeps every coding + channel + task tool intact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy: Option<octos_agent::ToolPolicy>,
     /// Human-approval rules for tool calls requiring a human decision
     /// (per-profile; see `docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,6 +307,11 @@ pub struct ProfileConfig {
     /// (`snapshots.enabled` + `keep_last`). Default OFF.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots: Option<octos_agent::SnapshotConfig>,
+    /// Build-cache pool configuration (outer-loop #3; design
+    /// docs/build-cache-pool.md §2). Projected into
+    /// `Config.build_cache`. Absent = defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_cache: Option<crate::build_cache::BuildCacheConfig>,
     /// Sandbox configuration for tool isolation.
     #[serde(default)]
     pub sandbox: octos_agent::SandboxConfig,
@@ -815,6 +845,39 @@ pub struct LlmModelSelectionConfig {
     /// Whether this is considered a strong model for large tool-heavy runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strong: Option<bool>,
+    /// Per-model default sampling temperature (#2166 AppUI typed inference
+    /// schema). `None` = inherit: the runtime falls through to the profile
+    /// gateway `llm_temperature`, then the provider's own default.
+    /// Validated on the AppUI wire (finite, 0.0..=2.0) before persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Per-model default `top_p` (nucleus sampling) (#2166). `None` =
+    /// inherit. Unlike `temperature` there is no typed `ChatConfig` field
+    /// yet, so at runtime it rides the sampler passthrough channel: it
+    /// overrides a same-named `top_p` key in the profile gateway
+    /// `llm_sampling_params` map (#2176). Validated on the AppUI wire
+    /// (finite, 0.0..=1.0) before persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Per-model default reasoning effort for thinking models (#2166). This
+    /// is the *model default* tier of the documented reasoning-precedence
+    /// chain: a per-session/turn override
+    /// (`ui_protocol_reasoning_effort.rs`) wins over it, and it in turn wins
+    /// over the profile gateway `reasoning_effort`. `None` = inherit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<octos_llm::ReasoningEffort>,
+    /// Operator override for the effective context window, in tokens. When
+    /// set it takes precedence over BOTH the static catalog and the runtime
+    /// probe (#2135): the provider is wrapped in `ContextWindowOverride` as
+    /// the outermost layer, so `context_window()` resolves to this value
+    /// through the entire runtime stack. Use it to pin a smaller window than
+    /// a server advertises (e.g. cap a 262K llama-server at 16384 to bound
+    /// KV/compaction) or to correct a mis-probed backend. `None` = defer to
+    /// probe/catalog. Applies to the primary and to each fallback
+    /// independently. (#2142, split from #2127.) Exposed through the AppUI
+    /// typed inference schema by #2166.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 }
 
 /// A provider route / endpoint choice for one model.
@@ -1183,6 +1246,14 @@ impl LlmModelSelectionConfig {
             && self.model_hints.is_none()
             && self.cost_per_m.is_none()
             && self.strong.is_none()
+            // #2142: a selection that pins ONLY a context_window override is
+            // meaningful — it must not be collapsed as "empty" and dropped.
+            && self.context_window.is_none()
+            // #2166: same for the typed inference defaults — a selection
+            // carrying only sampling/reasoning defaults is meaningful.
+            && self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.reasoning_effort.is_none()
     }
 }
 
@@ -1465,6 +1536,15 @@ pub struct GatewaySettings {
     /// Overrides the built-in default from model_limits.json.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Sampling temperature override for chat LLM calls. `None` keeps the
+    /// built-in default (`0.0`/greedy). Primarily for local / OpenAI-compatible
+    /// models, where forced greedy decoding causes repetition collapse. #2172.
+    #[serde(default)]
+    pub llm_temperature: Option<f32>,
+    /// Extra sampler params (e.g. `repeat_penalty`) flattened into the request
+    /// for OpenAI-compatible servers. `None` → nothing added. #2172.
+    #[serde(default)]
+    pub llm_sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
     /// Per-profile watchdog override. `None` inherits the system monitor default.
     #[serde(default)]
     pub watchdog_enabled: Option<bool>,
@@ -2139,6 +2219,11 @@ pub(crate) fn merge_profile_defaults(
     if effective.cost_budget.is_none() {
         effective.cost_budget = defaults.cost_budget.clone();
     }
+    // #2168: tool_policy inherits like its sibling Option fields — the
+    // profile's own wins, else the operator default applies.
+    if effective.tool_policy.is_none() {
+        effective.tool_policy = defaults.tool_policy.clone();
+    }
 
     effective
 }
@@ -2242,6 +2327,12 @@ fn merge_sandbox_defaults(
     // workspace_write: restrictive `false` (type default `true`). A read-only
     // workspace mandated by the defaults can never be lifted by a profile.
     eff.workspace_write = eff.workspace_write && defaults.workspace_write;
+
+    // fail_closed: restrictive `true` (type default `false`). An operator
+    // defaults file that mandates refuse-over-unconfined is inherited by
+    // profiles that omit the field and can never be loosened back to
+    // degrading by one that sets `false` (deny-wins, like workspace_write).
+    eff.fail_closed = eff.fail_closed || defaults.fail_closed;
 
     // read_allow_paths: a non-empty defaults list restricts reads to those
     // roots. A profile may only narrow to a subset (paths at/under an operator
@@ -2349,6 +2440,10 @@ pub fn resolve_effective_profile(
     // Inherit email config if sub-account doesn't have its own
     if ec.email.is_none() {
         ec.email = pc.email.clone();
+    }
+    // #2168: inherit the parent's tool_policy when the sub-account has none.
+    if ec.tool_policy.is_none() {
+        ec.tool_policy = pc.tool_policy.clone();
     }
 
     // Merge env_vars: parent as base, sub-account overrides win
@@ -2698,12 +2793,22 @@ pub(crate) fn config_from_profile(
             api_type: fb.route.as_ref().and_then(|route| route.api_type.clone()),
             cost_per_m: fb.cost_per_m,
             strong: fb.strong.unwrap_or_else(crate::config::default_true),
+            // #2142: per-fallback operator override of the effective window.
+            context_window: fb.context_window,
         })
         .collect();
 
     Config {
         provider: primary.and_then(|selection| selection.family_id.clone()),
         model: primary.and_then(|selection| selection.model_id.clone()),
+        // #2142: operator override of the primary's effective context window.
+        context_window: primary.and_then(|selection| selection.context_window),
+        // #2166: primary model's typed inference defaults (sampling /
+        // reasoning), projected for the session-bootstrap precedence chain:
+        // model default → profile-gateway knob → provider default.
+        model_temperature: primary.and_then(|selection| selection.temperature),
+        model_top_p: primary.and_then(|selection| selection.top_p),
+        model_reasoning_effort: primary.and_then(|selection| selection.reasoning_effort),
         base_url: primary.and_then(|selection| {
             selection
                 .route
@@ -2734,19 +2839,31 @@ pub(crate) fn config_from_profile(
             max_concurrent_sessions: profile.config.gateway.max_concurrent_sessions.unwrap_or(10),
             browser_timeout_secs: profile.config.gateway.browser_timeout_secs,
             max_output_tokens: profile.config.gateway.max_output_tokens,
+            // #2172: surface the profile's temperature override to serve /
+            // octoscode sessions (which run via a profile), so a local model
+            // can escape forced greedy decoding.
+            llm_temperature: profile.config.gateway.llm_temperature,
+            // #2172: same for the sampler passthrough (repeat_penalty, …).
+            llm_sampling_params: profile.config.gateway.llm_sampling_params.clone(),
             ..Default::default()
         }),
         fallback_models,
         // Fields not configured through profiles — use defaults
         version: None,
         model_hints: primary.and_then(|selection| selection.model_hints.clone()),
-        mcp_servers: vec![],
+        // OLP #29 S2b: thread the profile's [[mcp_servers]] into the runtime
+        // config so the gateway actually spawns them and registers their
+        // tools (was hard-zeroed: profile-level MCP config never took effect).
+        mcp_servers: profile.config.mcp_servers.clone(),
         sandbox: profile.config.sandbox.clone(),
         // (serve-side wiring lands with the UI/RPC follow-up).
         // #1768: thread the profile's snapshot opt-in so serve sessions
         // honor it (parity with format_after_edit).
         snapshots: profile.config.snapshots.clone(),
-        tool_policy: None,
+        build_cache: profile.config.build_cache.clone(),
+        // #2168: carry the profile's tool policy so a serve / UserProfile
+        // session can slim its roster (the serve path already applies this).
+        tool_policy: profile.config.tool_policy.clone(),
         tool_policy_by_provider: Default::default(),
         embedding: None,
         memory: profile.config.memory.clone(),
@@ -3077,7 +3194,8 @@ pub enum ProfileChange {
 /// Compare two profiles and classify the nature of changes.
 ///
 /// Restart-required: llm, review, search, deep_crawl, apps, robot, channels,
-///   env_vars, email, hooks, sandbox, routing, credential_pool, plugins.
+///   env_vars, email, hooks, sandbox, routing, credential_pool, plugins,
+///   tool_policy.
 /// Hot-reloadable: system_prompt, max_history, max_iterations,
 ///   max_concurrent_sessions, browser_timeout_secs.
 pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
@@ -3150,6 +3268,13 @@ pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
     }
     if oc.lane_routing != nc.lane_routing {
         restart_fields.push("lane_routing".into());
+    }
+    // #2217: tool_policy is applied to the tool registry only at bootstrap
+    // (`apply_policy` in gateway setup), so a policy-only edit must trigger
+    // a restart — otherwise the running gateway keeps enforcing the stale
+    // allow/deny list indefinitely, with no signal.
+    if oc.tool_policy != nc.tool_policy {
+        restart_fields.push("tool_policy".into());
     }
 
     if !restart_fields.is_empty() {
@@ -3675,6 +3800,69 @@ mod tests {
         assert_eq!(config.sub_providers[1].key, "strong");
     }
 
+    /// #24 — REAL-machine verification that the LIVE profile config
+    /// (`~/.octos/profiles/octos.json`, the registry the running serve actually
+    /// loads) carries the `zai` + `goal_verifier` lanes written by the #24
+    /// fix, and that both resolve to a buildable provider through the REAL
+    /// config-from-profile path — not a test-constructed one (S2/S3's gap).
+    /// Gated `#[ignore]` so CI never depends on the operator's live box; run:
+    ///   cargo test -p octos-cli --lib --features api -- --ignored --exact \
+    ///     profiles::tests::live_profile_carries_zai_and_goal_verifier_lanes
+    #[test]
+    #[ignore = "reads the operator's live ~/.octos/profiles/octos.json; run explicitly"]
+    fn live_profile_carries_zai_and_goal_verifier_lanes() {
+        let path = dirs::home_dir()
+            .expect("home dir")
+            .join(".octos")
+            .join("profiles")
+            .join("octos.json");
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("live profile unreadable at {}: {e}", path.display()));
+        let profile: UserProfile =
+            serde_json::from_str(&content).expect("live profile must deserialize into UserProfile");
+
+        // Both lanes present in the LIVE config.
+        let keys: Vec<&str> = profile
+            .config
+            .sub_providers
+            .iter()
+            .map(|sp| sp.key.as_str())
+            .collect();
+        assert!(
+            keys.contains(&"zai"),
+            "zai lane missing from live config: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"goal_verifier"),
+            "goal_verifier lane missing from live config: {keys:?}"
+        );
+
+        // The zai lane carries the right model through the REAL
+        // config-from-profile mapping.
+        let config = config_from_profile(&profile, None, None);
+        let zai = config
+            .sub_providers
+            .iter()
+            .find(|sp| sp.key == "zai")
+            .expect("zai lane survives config_from_profile");
+        assert_eq!(zai.provider, "zai");
+        assert_eq!(zai.model.as_deref(), Some("glm-5.2"));
+
+        // The goal_verifier lane BUILDS a provider via the #1935 path — the
+        // exact call that was returning None (empty verifier) before the lane
+        // was configured. This needs the lane's credential in env to fully
+        // build; without it we assert the lane is at least FOUND (not None
+        // because the key is absent).
+        let verifier_lane = config
+            .sub_providers
+            .iter()
+            .find(|sp| sp.key == crate::runtime::profile::GOAL_VERIFIER_LANE_KEY);
+        assert!(
+            verifier_lane.is_some(),
+            "goal_verifier lane must be FOUND (its absence was the empty-verifier root cause)"
+        );
+    }
+
     #[test]
     fn config_from_profile_threads_format_after_edit() {
         // #1774 review: `octos serve` builds session configs through
@@ -3705,6 +3893,69 @@ mod tests {
             ..profile
         };
         assert!(!config_from_profile(&off, None, None).format_after_edit);
+    }
+
+    #[test]
+    fn config_from_profile_threads_tool_policy() {
+        // #2168: config_from_profile hardcoded `tool_policy: None`, so a serve /
+        // UserProfile session could never slim its tool roster (the lean #2133
+        // roster only reaches the built-in `coding` ProfileDefinition). A
+        // profile-level tool_policy must now reach the runtime Config, where the
+        // serve path already applies it.
+        let policy: octos_agent::ToolPolicy = serde_json::from_value(serde_json::json!({
+            "allow": ["read_file", "write_file", "group:runtime", "check", "update_plan"]
+        }))
+        .expect("valid tool policy");
+        let profile = UserProfile {
+            id: "lean-serve".into(),
+            name: "Lean Serve".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                tool_policy: Some(policy.clone()),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert_eq!(
+            config_from_profile(&profile, None, None).tool_policy,
+            Some(policy),
+            "a profile tool_policy must reach the runtime config (serve applies it)"
+        );
+        // A profile without one stays None (no filtering) — unchanged behavior.
+        let off = UserProfile {
+            config: ProfileConfig::default(),
+            ..profile
+        };
+        assert_eq!(config_from_profile(&off, None, None).tool_policy, None);
+    }
+
+    #[test]
+    fn tool_policy_inherits_from_defaults_but_own_wins() {
+        // #2168 review (item 4): tool_policy inherits like its sibling Option
+        // fields — an operator profile-default applies when the profile has
+        // none, and the profile's own always wins.
+        let default_policy: octos_agent::ToolPolicy =
+            serde_json::from_value(serde_json::json!({ "deny": ["group:web"] })).unwrap();
+        let own_policy: octos_agent::ToolPolicy =
+            serde_json::from_value(serde_json::json!({ "allow": ["read_file"] })).unwrap();
+        let defaults = ProfileConfig {
+            tool_policy: Some(default_policy.clone()),
+            ..Default::default()
+        };
+        // No own policy -> inherits the default.
+        let inherited = merge_profile_defaults(&ProfileConfig::default(), &defaults);
+        assert_eq!(inherited.tool_policy, Some(default_policy));
+        // Own policy set -> the profile wins.
+        let with_own = ProfileConfig {
+            tool_policy: Some(own_policy.clone()),
+            ..Default::default()
+        };
+        let merged = merge_profile_defaults(&with_own, &defaults);
+        assert_eq!(merged.tool_policy, Some(own_policy));
     }
 
     #[test]
@@ -3861,11 +4112,18 @@ mod tests {
                             uses_completion_tokens: true,
                             fixed_temperature: false,
                             lacks_vision: false,
+                            lacks_video: false,
                             merge_system_messages: false,
                             reasoning_style: octos_llm::openai::ReasoningStyle::None,
                         }),
                         cost_per_m: Some(4.5),
                         strong: Some(true),
+                        // #2142: operator window override on the primary.
+                        context_window: Some(16_384),
+                        // #2166: typed inference defaults (unset here).
+                        temperature: None,
+                        top_p: None,
+                        reasoning_effort: None,
                     }),
                     fallbacks: vec![LlmModelSelectionConfig {
                         family_id: Some("minimax".into()),
@@ -3881,11 +4139,19 @@ mod tests {
                             uses_completion_tokens: false,
                             fixed_temperature: false,
                             lacks_vision: false,
+                            lacks_video: false,
                             merge_system_messages: true,
                             reasoning_style: octos_llm::openai::ReasoningStyle::None,
                         }),
                         cost_per_m: Some(3.2),
                         strong: Some(true),
+                        // #2142: a DIFFERENT per-fallback window override —
+                        // must project independently of the primary's.
+                        context_window: Some(8_192),
+                        // #2166: typed inference defaults (unset here).
+                        temperature: None,
+                        top_p: None,
+                        reasoning_effort: None,
                     }],
                 }),
                 ..Default::default()
@@ -3927,6 +4193,12 @@ mod tests {
                 .map(|h| h.merge_system_messages),
             Some(true)
         );
+        // #2142: the per-selection context_window overrides project through
+        // to the flattened Config — primary onto `config.context_window`, and
+        // each fallback onto its own `FallbackModel.context_window`,
+        // independently (16384 vs 8192).
+        assert_eq!(config.context_window, Some(16_384));
+        assert_eq!(config.fallback_models[0].context_window, Some(8_192));
     }
 
     #[test]
@@ -4876,6 +5148,51 @@ mod tests {
     }
 
     #[test]
+    fn test_diff_profiles_tool_policy_requires_restart() {
+        // #2217: a tool_policy-only edit must classify as restart-required —
+        // the policy is applied to the tool registry at bootstrap
+        // (`apply_policy`), so without a restart the running gateway keeps
+        // enforcing the stale allow/deny list.
+        let base = UserProfile {
+            id: "diff-test".into(),
+            name: "Diff".into(),
+            enabled: false,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut changed = base.clone();
+        changed.config.tool_policy = Some(octos_agent::ToolPolicy {
+            deny: vec!["bash".into()],
+            ..Default::default()
+        });
+
+        assert!(matches!(
+            diff_profiles(&base, &changed),
+            ProfileChange::RestartRequired(fields) if fields == vec!["tool_policy"]
+        ));
+
+        // Policy-to-policy edit and policy removal are the same transition class.
+        let mut edited = changed.clone();
+        edited.config.tool_policy = Some(octos_agent::ToolPolicy {
+            allow: vec!["read_file".into()],
+            ..Default::default()
+        });
+        assert!(matches!(
+            diff_profiles(&changed, &edited),
+            ProfileChange::RestartRequired(fields) if fields == vec!["tool_policy"]
+        ));
+        assert!(matches!(
+            diff_profiles(&changed, &base),
+            ProfileChange::RestartRequired(fields) if fields == vec!["tool_policy"]
+        ));
+    }
+
+    #[test]
     fn test_diff_profiles_structured_sections_require_restart() {
         let base = UserProfile {
             id: "diff-test".into(),
@@ -4954,7 +5271,7 @@ mod tests {
                 assert!(fields.contains(&"deep_crawl".into()));
                 assert!(fields.contains(&"apps".into()));
             }
-            other => panic!("expected RestartRequired, got {:?}", other),
+            other => panic!("expected RestartRequired, got {other:?}"),
         }
     }
 
@@ -5514,7 +5831,7 @@ mod tests {
             ProfileChange::RestartRequired(fields) => {
                 assert!(fields.contains(&"parent_id".into()));
             }
-            other => panic!("expected RestartRequired, got {:?}", other),
+            other => panic!("expected RestartRequired, got {other:?}"),
         }
     }
 
@@ -5953,6 +6270,7 @@ mod tests {
             memory: Some(crate::config::MemoryConfig {
                 max_inject_tokens: Some(4242),
                 refresh: None,
+                recall_dimension: None,
             }),
             approval_policy: Some(crate::config::ApprovalPolicyConfig::default()),
             plugins: crate::config::PluginsConfig {
@@ -6035,6 +6353,7 @@ mod tests {
             memory: Some(crate::config::MemoryConfig {
                 max_inject_tokens: Some(1),
                 refresh: None,
+                recall_dimension: None,
             }),
             approval_policy: Some(crate::config::ApprovalPolicyConfig::default()),
             // Non-default sandbox: workspace_write=false differs from the
@@ -6053,6 +6372,7 @@ mod tests {
         profile.config.memory = Some(crate::config::MemoryConfig {
             max_inject_tokens: Some(999),
             refresh: None,
+            recall_dimension: None,
         });
         profile.config.approval_policy = None; // will inherit
         // The profile sets ONE sandbox field (allow_network) and turns signing
@@ -6223,6 +6543,39 @@ mod tests {
         assert!(
             !eff.sandbox.workspace_write,
             "omitted workspace_write must inherit the default read-only floor"
+        );
+        // fail_closed mirrors the same deny-wins floor: an operator defaults
+        // file that mandates refuse-over-unconfined is inherited by a profile
+        // that omits the field and cannot be loosened by one that sets false.
+        assert!(
+            merge_sandbox_defaults(
+                &octos_agent::SandboxConfig::default(),
+                &octos_agent::SandboxConfig {
+                    fail_closed: true,
+                    ..Default::default()
+                },
+            )
+            .fail_closed,
+            "defaults fail_closed=true must be inherited by an omitting profile"
+        );
+        assert!(
+            merge_sandbox_defaults(
+                &octos_agent::SandboxConfig {
+                    fail_closed: true,
+                    ..Default::default()
+                },
+                &octos_agent::SandboxConfig::default(),
+            )
+            .fail_closed,
+            "a profile may tighten fail_closed over permissive defaults"
+        );
+        assert!(
+            !merge_sandbox_defaults(
+                &octos_agent::SandboxConfig::default(),
+                &octos_agent::SandboxConfig::default(),
+            )
+            .fail_closed,
+            "fail_closed stays off when neither side sets it"
         );
         assert!(
             eff.sandbox.allow_network,

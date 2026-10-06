@@ -25,7 +25,7 @@ const TABS = [
 ]
 
 export default function MessagingPage() {
-  const { config, setConfig, save, saving, loading, status, profileId } = useProfile()
+  const { config, setConfig, save, saving, loading, status, profileId, isOwn } = useProfile()
   const [activeTab, setActiveTab] = useState('telegram')
 
   if (loading) {
@@ -54,7 +54,7 @@ export default function MessagingPage() {
           {activeTab === 'line' && <LineTab config={config} onChange={setConfig} profileId={profileId} />}
           {activeTab === 'wecom-bot' && <WeComBotTab config={config} onChange={setConfig} />}
           {activeTab === 'qq-bot' && <QQBotTab config={config} onChange={setConfig} />}
-          {activeTab === "wechat" && <WeChatTab config={config} onChange={setConfig} />}
+          {activeTab === "wechat" && <WeChatTab config={config} onChange={setConfig} profileId={isOwn ? undefined : profileId} />}
         </div>
         <SaveFooter onSave={save} saving={saving} />
       </div>

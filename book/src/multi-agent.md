@@ -29,7 +29,7 @@ An agent works with peers through five tools that cover the full lifecycle — *
 
 Promotes work out of the current conversation into a new sovereign peer.
 
-- **Arguments:** `brief` (required, ≤ 64 KB — the peer's entire context; it must be self-contained), `title` (optional, seeds the slug), `worktree` (optional bool — fence the peer in a git worktree on branch `peer/<slug>`).
+- **Arguments:** `name` and `brief` (required), `worktree` (optional), and `token_budget` (optional positive integer, only when the user requests a limit).
 - **Behavior:** stages the peer and returns immediately with a pointer to `peers/<slug>/result.md`. **Fire-and-forget** — you do *not* get the result back in this turn. Limited to **4 handoffs per turn**.
 
 ### `peer_send_input` — steer a running peer
@@ -64,8 +64,10 @@ Gracefully closes a running peer you created.
 
 Humans drive peers through two server methods, surfaced as `/peer` and `/gather` in octoscode:
 
-- **`peer/prepare`** — stage 1–8 peers as a fleet (all-or-nothing). Pure resource reservation; the client then opens each session and starts its first turn.
+- **`peer/prepare`** — stage 1–8 peers as a fleet (all-or-nothing). Set `token_budget` to give each staged peer the same cumulative token limit; omit it to leave peer-specific spend unrestricted. The response echoes the limit. The client then opens each session and starts its first turn.
 - **`peer/gather`** — the human-facing side of the blackboard; composes the peers' results into the caller's session.
+
+For example, `peer/prepare` accepts `{"brief":"Review the API change","cwd":"/workspace/octos","token_budget":250000}`. The limit is stored with the peer and survives OUP reconnects, even if the client opens it under a new session id. Completed, failed, and interrupted turns contribute to its usage; once the total reaches the limit, the next turn ends with `peer_token_budget_exceeded`. Enforcement is at turn boundaries, so one turn can exceed the limit. A goal-bound peer also charges the master's separate shared goal budget.
 
 ## Lifecycle
 

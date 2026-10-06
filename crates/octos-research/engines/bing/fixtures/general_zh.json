@@ -1,0 +1,51 @@
+{
+  "body_file": "general_zh.body",
+  "expect": [
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "nmc.cn",
+      "title": "中央气象台台风网",
+      "url": "http://typhoon.nmc.cn/web.html"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "zj.gov.cn",
+      "title": "实时台风路径",
+      "url": "https://typhoon.slt.zj.gov.cn/"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "baidu.com",
+      "title": "台风（气象学名词）_百度百科",
+      "url": "https://baike.baidu.com/item/%E5%8F%B0%E9%A3%8E/17003"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "stormatlasx.com",
+      "title": "台风实时路径图｜全球风暴实时追踪地图、卫星云图与路径 ...",
+      "url": "https://stormatlasx.com/zh"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "text/html"
+    },
+    "method": "GET",
+    "url": "https://www.bing.com/search?q=%E5%8F%B0%E9%A3%8E+%E6%9C%80%E6%96%B0&count=5&first=1&setlang=zh&cc=CN"
+  },
+  "recorded": "live, 2026-09-28",
+  "request": {
+    "category": "general",
+    "count": 5,
+    "langs": [
+      "zh-CN"
+    ],
+    "now": "2026-09-28T23:00:00Z",
+    "query": "台风 最新",
+    "since": null
+  }
+}

@@ -4,6 +4,7 @@ mod account;
 pub mod acp;
 mod admin;
 mod auth;
+mod cache;
 mod channels;
 pub mod chat;
 mod clean;
@@ -13,16 +14,34 @@ mod cron;
 mod docs;
 mod doctor;
 pub mod gateway;
+mod goal;
+
+mod inbox;
+
 mod init;
+mod ledger;
 pub mod mcp;
 pub mod mcp_serve;
 mod memory;
+pub(crate) mod obs_resolve;
 mod office;
+#[cfg(feature = "api")]
+pub(crate) mod oup_client;
+#[cfg(feature = "api")]
+pub(crate) mod oup_peers;
+#[cfg(feature = "api")]
+pub(crate) mod oup_session;
+#[cfg(feature = "api")]
+mod oup_text;
+#[cfg_attr(test, allow(unused_imports))]
+mod peer;
 mod profile;
 #[cfg(feature = "api")]
 mod serve;
+pub mod serve_console;
 pub mod skills;
 mod status;
+mod steer;
 mod update;
 
 use std::path::PathBuf;
@@ -31,15 +50,17 @@ use clap::{Parser, Subcommand};
 use eyre::Result;
 
 pub use account::AccountCommand;
-pub use acp::AcpCommand;
+pub use acp::{AcpCommand, NotifyIfBusy, NotifyRequest, NotifyResponse};
 // Test-support seam for the `octos acp` bridge: the end-to-end integration test
 // in `crates/octos-cli/tests/acp_integration.rs` drives the real ACP handler
 // wiring with a `MockLlm`-backed agent over an in-process transport. Hidden
 // from docs; not part of the stable surface.
 #[doc(hidden)]
+#[cfg(feature = "api")]
 pub use acp::{OctosAcpAgentTransport, TestAgentFactory};
 pub use admin::AdminCommand;
 pub use auth::AuthCommand;
+pub use cache::CacheCommand;
 pub use channels::ChannelsCommand;
 pub use chat::ChatCommand;
 pub use clean::CleanCommand;
@@ -49,16 +70,27 @@ pub use cron::CronCommand;
 pub use docs::DocsCommand;
 pub use doctor::DoctorCommand;
 pub use gateway::GatewayCommand;
+pub use goal::GoalCommand;
+
+pub use inbox::InboxCommand;
+
 pub use init::InitCommand;
+pub use ledger::LedgerCommand;
 pub use mcp::McpCommand;
 pub use mcp_serve::McpServeCommand;
 pub use memory::MemoryCommand;
+pub(crate) use obs_resolve as obs;
 pub use office::OfficeCommand;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub use peer::PeerCommand;
+#[cfg(test)]
+pub(crate) use peer::peer_list_for_test;
 pub use profile::ProfileCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
 pub use skills::SkillsCommand;
 pub use status::StatusCommand;
+pub use steer::SteerCommand;
 pub use update::UpdateCommand;
 
 /// octos: Rust-native coding agent orchestration.
@@ -107,6 +139,8 @@ pub enum Command {
     Channels(ChannelsCommand),
     /// Interactive multi-turn chat with an agent.
     Chat(ChatCommand),
+    /// Inspect and reclaim the build-cache pool (`status` / `gc` / `gate`).
+    Cache(CacheCommand),
     /// Inspect the saved startup config (`show` / `path`); read-only.
     Config(ConfigCommand),
     /// Manage scheduled cron jobs.
@@ -117,6 +151,8 @@ pub enum Command {
     Docs(DocsCommand),
     /// Initialize a new .octos configuration.
     Init(InitCommand),
+    /// Query inbox notes file paths (read-only; OLP observability).
+    Inbox(InboxCommand),
     /// Manage OAuth-authenticated MCP servers (`login`/`logout`).
     Mcp(McpCommand),
     /// Inspect and drive the memory-refresh pipeline.
@@ -132,28 +168,36 @@ pub enum Command {
     Skills(SkillsCommand),
     /// Show system status.
     Status(StatusCommand),
+    /// Queue an external-reviewer steer into a session (OLP control).
+    Steer(SteerCommand),
     /// Check for a newer octos release (`--check`); self-update is Stage 3.
     Update(UpdateCommand),
     /// Run as a persistent messaging gateway.
     Gateway(GatewayCommand),
+
+    /// Operator goal transitions (reopen a blocked/paused goal, archive a goal terminally).
+    Goal(GoalCommand),
+    /// Read-only goal-ledger tail (findings/escalations/decisions; OLP).
+    Ledger(LedgerCommand),
+
     /// Clean up stale state and cache files.
     Clean(CleanCommand),
     /// Generate shell completions.
     Completions(CompletionsCommand),
     /// Office file manipulation (extract, unpack, pack, clean, add-slide, validate).
     Office(OfficeCommand),
+    /// Read-only peer listing (direct peers/ dir read; OLP observability).
+    Peer(PeerCommand),
 }
 
-/// Whether `command` emits machine-readable output on stdout and therefore
-/// needs the tracing console layer routed to stderr so logs never corrupt that
-/// stream.
+/// Whether stdout is reserved for protocol or assistant output, so tracing
+/// must use stderr instead of interleaving log lines with that output.
 ///
 /// * `acp` speaks ACP JSON-RPC on stdout (one stray log line → a `-32700`
 ///   parse error at strict clients like Zed);
 /// * `mcp-serve --transport stdio` speaks MCP JSON-RPC on stdout;
 /// * `profile` emits payloads meant for `$(...)` capture / piping;
-/// * `chat --json` emits a single JSON result object on stdout (scripting /
-///   agent-to-agent);
+/// * `chat` streams assistant text (or one `--json` result) on stdout;
 /// * `doctor --json` emits the diagnostics support bundle on stdout — the
 ///   config-parse check loads the real config, whose tracing INFO lines
 ///   ("no config.json found, using defaults") would otherwise corrupt the
@@ -162,9 +206,15 @@ pub enum Command {
 /// Every other command keeps its historical stdout console routing untouched.
 pub fn reserve_stdout(command: &Command) -> bool {
     match command {
-        Command::Acp(_) | Command::Profile(_) | Command::McpServe(_) => true,
-        Command::Chat(cmd) => cmd.json,
+        Command::Acp(_) | Command::Profile(_) | Command::McpServe(_) | Command::Chat(_) => true,
+        // `inbox path` is a machine-readable single path.
+        Command::Inbox(_) => true,
         Command::Doctor(cmd) => cmd.json,
+        // `octos cache <sub> --json` emits a machine-readable object meant
+        // for scripting / the outer loop's gate check — same rule as
+        // `doctor --json`. Without `--json` the human table stays on the
+        // historical stdout routing.
+        Command::Cache(cmd) => cmd.emits_json(),
         _ => false,
     }
 }
@@ -184,6 +234,19 @@ pub fn resolve_data_dir(cli_override: Option<PathBuf>) -> eyre::Result<PathBuf> 
     let ctx = crate::config_context::resolve_config_context(cli_override.as_deref());
     std::fs::create_dir_all(&ctx.data_dir).ok();
     Ok(ctx.data_dir)
+}
+
+/// Build the `profile '<id>' not found` message, listing the ids that do
+/// exist so a typo doesn't dead-end the user (#2414).
+pub fn profile_not_found_message(profiles: &[crate::profiles::UserProfile], id: &str) -> String {
+    if profiles.is_empty() {
+        return format!("profile '{id}' not found. No profiles are configured.");
+    }
+    let ids: Vec<&str> = profiles.iter().map(|p| p.id.as_str()).collect();
+    format!(
+        "profile '{id}' not found. Existing profiles: {}",
+        ids.join(", ")
+    )
 }
 
 /// Resolve the canonical [`ConfigContext`](crate::config_context::ConfigContext)
@@ -222,6 +285,7 @@ pub(crate) fn load_prompt(name: &str, compiled_default: &str) -> String {
 /// opening the redb file fails — the caller falls back to the legacy
 /// single-credential flow in that case. Errors are logged but never
 /// fatal so a broken pool configuration cannot brick `octos serve`.
+#[cfg(feature = "api")]
 pub(crate) fn build_credential_pool(
     config: Option<&crate::config::CredentialPoolConfig>,
     data_dir: &std::path::Path,
@@ -355,11 +419,13 @@ impl Executable for Command {
             Self::Auth(cmd) => cmd.execute(),
             Self::Channels(cmd) => cmd.execute(),
             Self::Chat(cmd) => cmd.execute(),
+            Self::Cache(cmd) => cmd.execute(),
             Self::Config(cmd) => cmd.execute(),
             Self::Cron(cmd) => cmd.execute(),
             Self::Doctor(cmd) => cmd.execute(),
             Self::Docs(cmd) => cmd.execute(),
             Self::Init(cmd) => cmd.execute(),
+            Self::Inbox(cmd) => cmd.execute(),
             Self::Mcp(cmd) => cmd.execute(),
             Self::Profile(cmd) => cmd.execute(),
             Self::McpServe(cmd) => cmd.execute(),
@@ -367,12 +433,17 @@ impl Executable for Command {
             Self::Serve(cmd) => cmd.execute(),
             Self::Skills(cmd) => cmd.execute(),
             Self::Status(cmd) => cmd.execute(),
+            Self::Steer(cmd) => cmd.execute(),
             Self::Update(cmd) => cmd.execute(),
             Self::Gateway(cmd) => cmd.execute(),
+            Self::Goal(cmd) => cmd.execute(),
+            Self::Ledger(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),
             Self::Memory(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),
             Self::Office(cmd) => cmd.execute(),
+
+            Self::Peer(cmd) => cmd.execute(),
         }
     }
 }
@@ -392,11 +463,11 @@ mod reserve_stdout_tests {
     }
 
     #[test]
-    fn should_not_reserve_stdout_when_chat_lacks_json() {
-        // Plain `octos chat` keeps its historical stdout console routing.
+    fn should_reserve_stdout_for_plain_chat_streaming() {
+        // Shared OUP bootstrap/progress logs must not split assistant text.
         let args =
             Args::try_parse_from(["octos", "chat", "--message", "hi"]).expect("`chat` must parse");
-        assert!(!reserve_stdout(&args.command));
+        assert!(reserve_stdout(&args.command));
     }
 
     #[test]

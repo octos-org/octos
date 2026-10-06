@@ -51,7 +51,22 @@ const MINIMAX_API_TYPES: &[ApiTypeOption] = &[
     ApiTypeOption {
         value: Some("anthropic"),
         display: "Anthropic",
-        description: "Messages API",
+        description: "Messages API (required for sk-cp- Coding-plan keys)",
+        base_url: Some("https://api.minimaxi.com/anthropic"),
+    },
+];
+
+const MINIMAX_CN_API_TYPES: &[ApiTypeOption] = &[
+    ApiTypeOption {
+        value: None,
+        display: "OpenAI",
+        description: "Chat Completions API",
+        base_url: Some("https://api.minimaxi.com/v1"),
+    },
+    ApiTypeOption {
+        value: Some("anthropic"),
+        display: "Anthropic",
+        description: "Messages API (required for sk-cp- Coding-plan keys)",
         base_url: Some("https://api.minimaxi.com/anthropic"),
     },
 ];
@@ -113,13 +128,30 @@ const PROVIDERS: &[ProviderInfo] = &[
         api_type: None,
         api_types: MINIMAX_API_TYPES,
     },
+    // OpenAI-compatible root: the only Z.AI root that reports its implicit
+    // prompt cache. The Anthropic-compatible `/api/anthropic` root accepts
+    // `cache_control` and ignores it (cache_read 0 on every request), so an
+    // agent loop there re-bills its whole context each iteration.
     ProviderInfo {
         name: "zai",
         display: "Z.AI (GLM)",
         api_key_env: "ZAI_API_KEY",
-        base_url: Some("https://api.z.ai/api/anthropic"),
-        api_type: Some("anthropic"),
+        base_url: Some("https://api.z.ai/api/paas/v4"),
+        api_type: None,
         api_types: &[],
+    },
+    // Region variant of the `minimax` preset: MiniMax Token-plan keys are
+    // issued by the China platform and 401 against the international site
+    // (octos#2125). Appended last so every existing preset index keeps its
+    // number; only the trailing Custom entry (always `PROVIDERS.len() + 1`)
+    // moves.
+    ProviderInfo {
+        name: "minimax-cn",
+        display: "MiniMax China (Token Plan)",
+        api_key_env: "MINIMAX_CN_API_KEY",
+        base_url: Some("https://api.minimaxi.com/v1"),
+        api_type: None,
+        api_types: MINIMAX_CN_API_TYPES,
     },
 ];
 
@@ -211,6 +243,89 @@ fn validate_base_url(input: &str) -> Result<String> {
     match parsed.scheme() {
         "http" | "https" => Ok(trimmed),
         other => eyre::bail!("base_url scheme '{other}' is not supported; use http or https"),
+    }
+}
+
+/// True when `s` is a well-formed environment variable name: an ASCII
+/// identifier whose first char is a letter or underscore and whose
+/// remaining chars are letters, digits, or underscores (#1510).
+fn is_valid_env_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => (),
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Heuristic for the #1510 failure mode: the answer looks like a pasted
+/// API key VALUE (key-shaped `sk-...` prefix, or implausibly long for a
+/// variable name) rather than an environment variable name.
+fn looks_like_api_key(s: &str) -> bool {
+    s.starts_with("sk-") || s.len() > 40
+}
+
+/// Prompt for the NAME of the environment variable that holds the API key.
+///
+/// The original wording ("Environment variable containing the API Key")
+/// led users to paste the key VALUE itself, which was then stored as
+/// `api_key_env` and failed the runtime lookup (#1510). The prompt now
+/// says "NAME ... not the key value itself"; an empty answer keeps
+/// `default`, and an invalid name is explained and re-asked. The retry
+/// loop is bounded so piped/automated stdin cannot hang the wizard:
+/// after 3 invalid answers it **fails closed** and falls back to the
+/// default name — an invalid `api_key_env` can never work at runtime,
+/// and accepting one would reintroduce the #1510 failure mode through
+/// the automated path.
+fn prompt_api_key_env(default: &str) -> Result<String> {
+    const MAX_INVALID_ATTEMPTS: usize = 3;
+
+    let mut invalid_attempts = 0usize;
+    loop {
+        println!();
+        print!(
+            "Environment variable NAME that holds the API key (not the key value itself) [{default}]: "
+        );
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(default.to_string());
+        }
+        if is_valid_env_name(trimmed) {
+            return Ok(trimmed.to_string());
+        }
+
+        invalid_attempts += 1;
+        // Echo untrusted input escaped ({:?}) so ANSI escapes from a piped
+        // or typed line cannot redraw the prompt, and mask key-shaped input
+        // so a freshly pasted secret never lands in scrollback (#1510).
+        let echoed = if looks_like_api_key(trimmed) {
+            "«pasted value masked»".to_string()
+        } else {
+            format!("{trimmed:?}")
+        };
+        println!(
+            "{} {echoed} is not a valid environment variable name; \
+             enter the NAME (e.g. {default}), not the key value itself",
+            "Invalid environment variable name:".yellow()
+        );
+        if looks_like_api_key(trimmed) {
+            println!(
+                "  This looks like a pasted API key. Export it instead \
+                 (e.g. `export {default}=<your key>`) and enter only the \
+                 variable name here, or use `octos auth login`."
+            );
+        }
+        if invalid_attempts >= MAX_INVALID_ATTEMPTS {
+            println!(
+                "{} falling back to the default after {invalid_attempts} invalid attempts",
+                "Warning:".yellow()
+            );
+            return Ok(default.to_string());
+        }
     }
 }
 
@@ -328,16 +443,7 @@ fn prompt_custom_provider() -> Result<SelectedProvider> {
 
     let api_type = prompt_api_type()?;
 
-    println!();
-    print!("Environment variable containing the API Key [{CUSTOM_API_KEY_ENV}]: ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let api_key_env = if input.trim().is_empty() {
-        CUSTOM_API_KEY_ENV.to_string()
-    } else {
-        input.trim().to_string()
-    };
+    let api_key_env = prompt_api_key_env(CUSTOM_API_KEY_ENV)?;
 
     println!();
     print!(
@@ -485,10 +591,7 @@ fn offer_api_key_capture(provider: &str, api_key_env: &str, interactive: bool) {
 
     let captured = match store {
         Ok(mut s) if interactive && std::io::stdin().is_terminal() && !provider.is_empty() => {
-            println!(
-                "Paste your {} API key now to save it securely (Enter to skip):",
-                provider
-            );
+            println!("Paste your {provider} API key now to save it securely (Enter to skip):");
             print!("> ");
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
@@ -512,7 +615,7 @@ fn offer_api_key_capture(provider: &str, api_key_env: &str, interactive: bool) {
             println!();
             println!("Set it later with:");
             println!("  octos auth login --provider {provider}");
-            println!("  # or: export {}=your-api-key", api_key_env);
+            println!("  # or: export {api_key_env}=your-api-key");
             println!();
         }
     }
@@ -541,7 +644,7 @@ fn write_init_files(
     println!("{} {}", "Created:".green(), config_path.display());
     println!();
     println!("{}", "Config:".cyan());
-    println!("{}", config_str);
+    println!("{config_str}");
     println!();
 
     // Credential check. Resolution order at runtime is auth store first,
@@ -705,7 +808,9 @@ fn default_model_for(provider: &str, catalog: &BTreeMap<String, Vec<String>>) ->
 /// Load models from model_catalog.json, grouped by provider — from the
 /// usual disk locations first (repo/dev flows), else the embedded
 /// compile-time copy (installed binaries ship no catalog file).
-fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
+/// Shared with the completions candidates (#2413) so both surfaces read the
+/// one catalog.
+pub(crate) fn load_catalog_models() -> BTreeMap<String, Vec<String>> {
     let candidates = [
         std::env::current_exe()
             .ok()
@@ -963,11 +1068,11 @@ impl Executable for InitCommand {
                     println!("Available models for {} (from catalog):", info.display);
                     for (i, m) in models.iter().enumerate() {
                         let rec = if i == 0 { " (recommended)" } else { "" };
-                        println!("  - {}{}", m, rec);
+                        println!("  - {m}{rec}");
                     }
                     let default_model = models[0].clone();
                     println!();
-                    print!("Model [{}]: ", default_model);
+                    print!("Model [{default_model}]: ");
                     io::stdout().flush()?;
 
                     let mut input = String::new();
@@ -989,21 +1094,8 @@ impl Executable for InitCommand {
                 }
             };
 
-            // API key env var
-            println!();
-            print!(
-                "Environment variable containing the API Key [{}]: ",
-                info.api_key_env
-            );
-            io::stdout().flush()?;
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            let api_key_env = if input.trim().is_empty() {
-                info.api_key_env.to_string()
-            } else {
-                input.trim().to_string()
-            };
+            // API key env var (#1510: ask for the NAME, validate the answer)
+            let api_key_env = prompt_api_key_env(info.api_key_env)?;
 
             (idx, model, api_key_env, api_selection)
         };
@@ -1119,6 +1211,68 @@ mod tests {
     // embedded as a compile-time fallback, manual entry requires an explicit
     // model name, and --defaults errors instead of silently writing "auto".
 
+    // octos#2125: the MiniMax China preset is a first-class region variant —
+    // the Token-plan flow (preset -> protocol -> model -> config) must write
+    // the api.minimaxi.com endpoint with no manual base_url override.
+
+    #[test]
+    fn minimax_cn_preset_writes_the_china_endpoint() {
+        let info = provider("minimax-cn");
+        assert_eq!(info.api_key_env, "MINIMAX_CN_API_KEY");
+        assert_eq!(
+            default_api_type_selection(info).base_url,
+            Some("https://api.minimaxi.com/v1")
+        );
+        // Both protocols the China platform documents are offered, OpenAI
+        // first (the default).
+        assert_eq!(info.api_types.len(), 2);
+        let anthropic = select_api_type(info, "2");
+        assert_eq!(anthropic.api_type, Some("anthropic"));
+        assert_eq!(
+            anthropic.base_url,
+            Some("https://api.minimaxi.com/anthropic")
+        );
+
+        let config = build_config(
+            info,
+            "MiniMax-M3",
+            info.api_key_env,
+            default_api_type_selection(info),
+        );
+        assert_eq!(config["provider"], "minimax-cn");
+        assert_eq!(config["base_url"], "https://api.minimaxi.com/v1");
+        assert!(config.get("api_type").is_none());
+
+        // The catalog offers the Token-plan model for the family.
+        let catalog = embedded_catalog_models();
+        assert_eq!(
+            default_model_for("minimax-cn", &catalog).as_deref().ok(),
+            Some("MiniMax-M3")
+        );
+    }
+
+    #[test]
+    fn existing_preset_indices_do_not_shift() {
+        // Piped/scripted init flows select by number; only the trailing
+        // Custom entry (PROVIDERS.len() + 1) may move when a preset is added.
+        for (index, name) in [
+            "openai",
+            "anthropic",
+            "gemini",
+            "deepseek",
+            "moonshot",
+            "dashscope",
+            "minimax",
+            "zai",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(PROVIDERS[index].name, *name, "preset {index} shifted");
+        }
+        assert_eq!(PROVIDERS.last().unwrap().name, "minimax-cn");
+    }
+
     #[test]
     fn should_resolve_models_from_embedded_catalog_when_no_disk_file() {
         let models = embedded_catalog_models();
@@ -1231,11 +1385,13 @@ mod tests {
     }
 
     #[test]
-    fn zai_default_selection_preserves_anthropic_api_type_and_base_url() {
+    fn zai_default_selection_uses_the_openai_compatible_root() {
+        // The init preset must not hand new users the zero-cache
+        // Anthropic-compatible lane (see the preset comment).
         let selection = default_api_type_selection(provider("zai"));
 
-        assert_eq!(selection.api_type, Some("anthropic"));
-        assert_eq!(selection.base_url, Some("https://api.z.ai/api/anthropic"));
+        assert_eq!(selection.api_type, None);
+        assert_eq!(selection.base_url, Some("https://api.z.ai/api/paas/v4"));
     }
 
     #[test]
@@ -1386,5 +1542,43 @@ mod tests {
             parse_model_ids(&body),
             vec!["mistral-large".to_string(), "codestral".to_string()]
         );
+    }
+
+    // #1510: `octos init` asked for the "environment variable containing
+    // the API Key" in a way that made users paste the key VALUE itself;
+    // answers are now validated as environment variable names.
+
+    #[test]
+    fn should_accept_well_formed_env_var_names() {
+        assert!(is_valid_env_name("OPENAI_API_KEY"));
+        assert!(is_valid_env_name("CUSTOM_API_KEY"));
+        assert!(is_valid_env_name("_PRIVATE_TOKEN"));
+        assert!(is_valid_env_name("DEEPSEEK_API_KEY_2"));
+        assert!(is_valid_env_name("a"));
+    }
+
+    #[test]
+    fn should_reject_empty_or_non_identifier_answers() {
+        assert!(!is_valid_env_name(""));
+        assert!(!is_valid_env_name("1ST_VAR")); // must not start with a digit
+        assert!(!is_valid_env_name("MY-VAR")); // hyphens are not allowed
+        assert!(!is_valid_env_name("VAR.NAME"));
+        assert!(!is_valid_env_name("HAS SPACE"));
+    }
+
+    #[test]
+    fn should_reject_pasted_key_values_as_env_var_names() {
+        // The #1510 failure mode: the key value ends up in `api_key_env`.
+        assert!(!is_valid_env_name("sk-abc123"));
+        assert!(!is_valid_env_name("sk-proj-abc123def456ghi789jkl012"));
+    }
+
+    #[test]
+    fn should_flag_key_shaped_input_for_the_extra_hint() {
+        assert!(looks_like_api_key("sk-proj-abc123def456ghi789jkl012"));
+        assert!(looks_like_api_key("a".repeat(41).as_str()));
+        assert!(!looks_like_api_key("OPENAI_API_KEY"));
+        // A bare "sk" is a valid (if odd) variable name, not key-shaped.
+        assert!(!looks_like_api_key("sk"));
     }
 }

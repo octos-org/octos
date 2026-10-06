@@ -172,8 +172,7 @@ class WsAppUiClient {
     this.notifications = [];
     this.agentUpdated = [];
     this.taskUpdated = [];
-    this.turnCompleted = null;
-    this.turnErrored = null;
+    this.turnTerminals = new Map();
     this.closed = true;
     this.ws = null;
   }
@@ -206,10 +205,16 @@ class WsAppUiClient {
       this.agentUpdated.push(params);
     } else if (frame.method === 'task/updated') {
       this.taskUpdated.push(params);
-    } else if (frame.method === 'turn/completed') {
-      this.turnCompleted = params;
-    } else if (frame.method === 'turn/error') {
-      this.turnErrored = params;
+    } else if (frame.method === 'projection/envelope') {
+      // Canonical v2 lane: raw `turn/completed` / `turn/error` frames are
+      // suppressed for every connection since #2318, so the terminal arrives
+      // as a `projection/envelope` `turn_terminal` payload. Keyed by turn_id:
+      // the spawned child session's own terminal also rides this lane, and
+      // only the foreground turn's terminal gates this soak.
+      const payload = params.payload || {};
+      if (payload.type === 'turn_terminal') {
+        this.turnTerminals.set(params.turn_id, params);
+      }
     }
   }
 
@@ -316,6 +321,11 @@ async function startWsServer(port) {
     String(port),
     '--auth-token',
     authToken,
+    // #2486: profile/local/create is gated behind the local-solo opt-in, so
+    // the spawned server must enable it or the soak dies at capability
+    // negotiation. --solo is the danger-surface keystone: fine for this
+    // loopback-only child, but never copy it to a network-exposed serve.
+    '--solo',
     '--data-dir',
     dataDir,
     '--cwd',
@@ -400,7 +410,9 @@ async function ensureLocalProfile(client) {
   } catch (error) {
     if (error instanceof RpcFailure) {
       const kind = error.error?.data?.kind || error.error?.data?.code;
-      if (['profile_exists', 'already_exists', 'conflict'].includes(String(kind))) {
+      // profile_local_collision: same profile_id with different name/email
+      // (pinned-dir rerun after touching the constants above).
+      if (String(kind) === 'profile_local_collision') {
         return { reused: true, error: error.error };
       }
     }
@@ -508,8 +520,12 @@ async function main() {
       ],
     });
 
-    await waitFor(() => client.turnCompleted || client.turnErrored, 'turn terminal event');
-    assert(!client.turnErrored, `turn errored: ${JSON.stringify(client.turnErrored)}`);
+    await waitFor(() => client.turnTerminals.get(turnId), 'turn terminal event');
+    const terminalData = client.turnTerminals.get(turnId)?.payload?.data || {};
+    assert(
+      terminalData.outcome === 'completed',
+      `turn terminal outcome=${terminalData.outcome}: ${JSON.stringify(terminalData.error || {})}`,
+    );
     await waitFor(
       () => client.agentUpdated.some(mirroredAgent),
       'mirrored TaskSupervisor agent/updated notification',
@@ -532,7 +548,8 @@ async function main() {
     assert(terminalTaskUpdate, `missing terminal task/updated notification for ${taskId}`);
 
     const liveRead = await readMirroredState(client, agentId, taskId, terminalAgent);
-    const completedCursor = client.turnCompleted?.cursor || null;
+    const turnTerminal = client.turnTerminals.get(turnId);
+    const completedCursor = turnTerminal?.cursor || null;
 
     await client.reconnect();
     const reopened = await client.request('session/open', {
@@ -574,6 +591,13 @@ async function main() {
         state: params.state,
         runtimeDetail: params.runtime_detail,
       })),
+      turnTerminal: turnTerminal
+        ? {
+            turn_id: turnTerminal.turn_id,
+            cursor: turnTerminal.cursor || null,
+            outcome: turnTerminal.payload?.data?.outcome || null,
+          }
+        : null,
       listedAgent: {
         agentId: liveRead.listed.agent_id,
         backendKind: liveRead.listed.backend_kind,
@@ -616,8 +640,14 @@ async function main() {
       notifications: client?.notifications?.length || 0,
       agentUpdated: client?.agentUpdated?.length || 0,
       taskUpdated: client?.taskUpdated?.length || 0,
-      turnCompleted: client?.turnCompleted || null,
-      turnErrored: client?.turnErrored || null,
+      turnTerminals: client
+        ? Array.from(client.turnTerminals.values()).map((params) => ({
+            turn_id: params.turn_id,
+            cursor: params.cursor || null,
+            outcome: params.payload?.data?.outcome || null,
+            error: params.payload?.data?.error || null,
+          }))
+        : [],
       artifacts: {
         transcript: transcriptPath,
         serverLog,

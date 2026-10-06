@@ -8,7 +8,7 @@ This is the first protocol document for the M9 control-plane layer. It is intent
 
 Code sketch:
 
-- draft Rust types live in [crates/octos-core/src/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
+- draft Rust types live in [crates/octos-core/src/ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs)
 
 Related planning:
 
@@ -95,6 +95,35 @@ Stdio transport rules:
   then the server default profile. Clients should pass `profile_id` explicitly
   before `session/open`.
 
+Session-ingress transport rules:
+
+- `/v1/session_ingress/ws/{session_id}` is the second WebSocket route. It
+  speaks the same UI Protocol v1 JSON-RPC frames as `/api/ui-protocol/ws`,
+  but authenticates with a short-lived, session-scoped work secret instead
+  of the dashboard credential. The full walkthrough lives in
+  [OCTOS_WORK_SECRET_SESSION_INGRESS.md](../docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md).
+- Credentials: clients send `Authorization: Bearer {session_ingress_token}`.
+  WebSocket clients that cannot set headers may fall back to
+  `?token={session_ingress_token}`; the server logs that deprecated form
+  once the grant validates. The former `_token` and `session_ingress_token`
+  query aliases are removed; a request that presents only a removed alias
+  is rejected with a remediation message.
+- Grants: `octos auth issue-work-secret` writes a SHA-256 grant hash (the
+  token itself is never stored) and prints the encoded secret;
+  re-issuing for the same session replaces the earlier grant.
+  `octos auth revoke-work-secret` revokes one.
+- The server revalidates the grant before every client request and closes
+  the socket with close code `1008` whenever the grant no longer validates
+  (revoked, expired, or replaced).
+- The method surface is confined to the granted session: every
+  session-scoped method must carry the granted `session_id`, and
+  non-session global methods (for example `session/list`,
+  `system/status.get`, `content/*`, `memory/*`, `cron/*`) as well as raw
+  non-session-routed requests are refused with `invalid_request`.
+- The browser Origin gate that applies to `/api/ui-protocol/ws` upgrades
+  also applies to session-ingress upgrades; the work secret authenticates
+  and scopes the session independently and does not bypass that gate.
+
 ## 4. Versioning
 
 Protocol identifier:
@@ -155,7 +184,7 @@ Process:
 
 Executable contract gate:
 
-- [crates/octos-core/src/ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
+- [crates/octos-core/src/ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs)
   contains literal golden tests for the v1 protocol identifier, schema
   versions, JSON-RPC version, command method set, notification method set, and
   representative wire payloads.
@@ -316,6 +345,22 @@ Current M9 sandbox-parity decision:
   It lets clients observe manifest-declared background actions through generic
   projections of persisted supervised tasks. It does not introduce
   notebook-specific routes or a generic client-selected tool-call primitive.
+- The optional `client_commands` param of `session/open` (its per-open
+  lifecycle, release on disconnect, and server-side name filtering) is
+  governed by accepted
+  [UPCR-2026-037](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_037_CLIENT_COMMANDS.md).
+  The param is ungated and the request records the contract as shipped; it
+  changes no wire shape.
+- The additive `accepted_client_commands` field on `SessionOpened`, which
+  echoes the `client_commands` names the server accepted, is governed by
+  accepted
+  [UPCR-2026-038](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_038_ACCEPTED_CLIENT_COMMANDS.md).
+  The field is ungated.
+- The additive `tool_call_id`, `tool_name` and `tool_calls` fields on
+  `session/hydrate` message rows (and on `session/rollback`'s trimmed thread),
+  which name a tool row's call and tool, are governed by accepted
+  [UPCR-2026-039](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_039_HYDRATED_TOOL_CALL_IDENTITY.md).
+  The fields are ungated.
 
 ## 5. Identity Model
 
@@ -342,7 +387,7 @@ These ids need to be stable and client-visible:
 - `event_cursor`
   A resumable position in the ordered protocol event stream.
 
-Current draft Rust types for `turn_id`, `approval_id`, `preview_id`, `output_cursor`, and `event_cursor` live in [ui_protocol.rs](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1).
+Current draft Rust types for `turn_id`, `approval_id`, `preview_id`, `output_cursor`, and `event_cursor` live in [ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs).
 
 ### 5.1 M9-γ projection identity (UPCR-2026-014)
 
@@ -396,6 +441,14 @@ Session, turn, and approval core:
 - `session/compact/mode/set` (per-session LLM-vs-heuristic compaction mode; the `/context` menu)
 - `turn/start`
 - `turn/interrupt`
+- `voice/admit` (advertised by `voice.asr_admission.v1`; ASR-only preflight for uploaded
+  audio. Returns `status: speech` with a 120-second, session/turn/audio-scoped
+  single-use `admission_id`, or `status: no_speech`. It never starts an LLM
+  turn and sibling text/image inputs cannot override `no_speech`.)
+- `voice/commit_admission` (advertised by `voice.asr_admission.v1`; atomically consumes a
+  speech admission, optionally interrupts `supersedes_turn_id`, and starts the
+  admitted turn without repeating ASR. Same-turn retries are idempotent;
+  changing the session, turn id, or audio references is rejected.)
 - `turn/steer` (mid-turn prompt injection into the ACTIVE turn, codex
   app-server parity. Params `{session_id, expected_turn_id?, input}`,
   result `{turn_id, steered}`. With a live turn the text input items are
@@ -412,7 +465,8 @@ Session, turn, and approval core:
   returns `steered: false` + the NEW turn id. Raw server-handled method
   — session-ingress credentials cannot call it, and steering is NOT an
   interrupt: `turn/interrupt` stays the separate cancel op)
-- `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`)
+- `turn/state/get` (gate `state.turn_state_get.v1`, accepted `UPCR-2026-011`;
+  additive `running` certainty field `UPCR-2026-031`)
 - `thread/graph/get` (gate `state.thread_graph.v1`, accepted `UPCR-2026-010`)
 - `approval/respond`
 - `approval/scopes/list` (approval-scope discovery; first-server slice)
@@ -436,7 +490,8 @@ Supervised review and M15 agent/goal/loop autonomy (capability-gated, accepted
 - `review/start`
 - `agent/list`, `agent/status/read`, `agent/output/read`,
   `agent/artifact/list`, `agent/artifact/read`, `agent/interrupt`, `agent/close`
-- `session/goal/get`, `session/goal/set`, `session/goal/clear`
+- `session/goal/get`, `session/goal/set`, `session/goal/clear`,
+  `session/goal/operator_transition`
 - `loop/create`, `loop/list`, `loop/delete`, `loop/pause`, `loop/resume`,
   `loop/fire_now`
 - `monitor/create`, `monitor/list`, `monitor/pause`, `monitor/resume`,
@@ -454,6 +509,9 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
+- `memory/search`, `memory/load`, `memory/ingest` (Recall/Knowledge index —
+  `docs/adr/personal-memory-tiers.md`; auth-bound like `memory/overview`,
+  refused for session-ingress credentials)
 
 Launch (per-project session UX, gated `session.workspace_cwd.v1`):
 
@@ -473,6 +531,11 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `config/capabilities/list` (accepted `UPCR-2026-017`)
 - `client_hello` (accepted `UPCR-2026-016`)
 - `profile/local/create` (accepted `UPCR-2026-018`)
+- `server/shutdown` (accepted `UPCR-2026-032`; stops the serving process
+  through the same graceful path as SIGINT; advertised and callable only on a
+  local `--solo` HTTP serve, never to session-scoped connections, otherwise
+  typed `server_shutdown_unavailable`; never on `octos serve --host-managed`,
+  `UPCR-2026-036`)
 - `session/status/read` (accepted `UPCR-2026-017`)
 - `auth/status`, `auth/send_code`, `auth/verify`, `auth/me`, `auth/logout`
   (accepted `UPCR-2026-017`; `auth/me` and `auth/logout` are omitted from the
@@ -491,14 +554,164 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   brief under the profile data dir (`peers/<slug>/brief.md`) and optionally
   creates a fenced git worktree on branch `peer/<slug>`; returns
   `{slug, topic, brief_path, cwd, worktree_branch?, profile_id}`. Pure
-  resource staging — the client then opens the peer session and starts the
+  resource staging; a stored profile is sufficient even before its runtime
+  is bootstrapped. The client then opens the peer session and starts the
   kickoff turn through the ordinary `session/open` + `turn/start`; #1801 v2
   adds `n` (1..=8) for fleet staging — N suffixed slugs from ONE brief, the
-  scalar result fields mirror the first peer and `peers: [...]` carries all)
+  scalar result fields mirror the first peer and `peers: [...]` carries all;
+  optional positive `token_budget` sets a cumulative per-peer limit for every
+  staged member and is echoed in each result entry. The limit persists by peer
+  slug across session reconnects. Usage is charged after each turn, so one
+  turn can overshoot; later turns end with `peer_token_budget_exceeded`.)
+- `peer/prepare` host-owned app peers (accepted `UPCR-2026-034`, additive
+  fields; a server that lists `peer/context/open` honors them): optional
+  `model` names a configured `sub_provider` lane exactly like
+  `peer_handoff`'s `model` (unknown lane: `model_note`, primary model);
+  optional `memory_namespace` marks a host-owned app peer — requires
+  `session_id` (the owning system-agent session, persisted as originator),
+  exactly one name and no `worktree`; `cwd` is the app's host-owned
+  workspace, or, when omitted, a kernel-provisioned
+  `<data_dir>/app-workspaces/<namespace>` (for remote hosts); binds every session of the peer to that workspace and to
+  the namespace's memory stores (capture, retrieval, prompt injection;
+  never the profile's own memory); optional `resume: true` returns an
+  existing peer with the same originator, namespace and workspace
+  (`resumed: true`, requires `host_token`) instead of refusing the name.
+  Result entries add `model` (`{lane, provider?, model?}`, the effective
+  choice), `model_note`, `memory_namespace`, `resumed` and `host_token`
+  (minted once at creation; required for every later control call on the
+  peer). A binding whose namespace or workspace nests with another app
+  peer's is refused. A host-owned app peer's tool approvals are answered
+  only by the person through the host (`approval/respond`): the owning
+  system agent is not woken for them, `peer_list` does not offer them, and
+  `peer_respond` refuses them; it still answers the peer's questions.
+  Typed `data.kind`: `peer_originator_mismatch`,
+  `peer_host_token_mismatch`, `peer_binding_mismatch`,
+  `peer_binding_conflict`, `peer_closed`.
+- `peer/model/set` (accepted `UPCR-2026-034`: the peer's originator sets or
+  clears (`model: null`) its configured model lane; `{session_id, peer,
+  model}` → `{slug, profile_id, model, applies: "next_turn"}`; an unknown
+  lane is refused with `peer_model_unknown` and changes nothing; the profile
+  default is untouched)
+- `peer/context/open`, `peer/context/close` (accepted `UPCR-2026-034`: bound
+  request contexts of a host-owned app peer. `{session_id, peer,
+  context_id, cwd?}`; open returns the kernel-minted `session_id`
+  (`<originator base>#peerctx-<slug>.<context_id>`), `cwd` (inside the
+  peer's workspace, default `contexts/<context_id>`), the child
+  `memory_namespace` (`<peer ns>/ctx-<context_id>`), the peer's `model` and
+  `created`; idempotent while open. Optional `share_history {last_n?
+  (default 20, max 50), max_bytes? (default 16384, 1024..=65536)}`, from
+  the peer's host connection only (`share_history_host_only`), opens the
+  person's lane of the peer (amended 2026-09-29): it runs in parallel with
+  the peer's own session, each lane's turns are shown the other's recent
+  user/assistant text rows as a read-only prompt block that is never
+  persisted (including the other lane's running turn: its request, its
+  streamed text so far and a `[turn status]` line such as `waiting for
+  approval: <tool>`), its turns are labelled `person` by default, and each of its
+  turns publishes a round on the peer's blackboard (`origin:`, `context:`).
+  Fixed at creation (`peer_binding_mismatch` on a changed re-open). Close marks the binding closed and
+  interrupts the context's in-flight turn; a closed or never-opened
+  context session is refused at `session/open` and at every `turn/start`
+  (`session_binding_closed`), and its id is never reopened. Typed
+  `data.kind`: `peer_not_host_bound`, `peer_context_closed`,
+  `peer_context_not_found`, `peer_context_workspace_escape`)
+- `peer/tools/register` (accepted `UPCR-2026-035`: the host declares a
+  host-owned app peer's app tools and the generic kernel tools it may use;
+  without `peer`, the tools of the host SESSION `session_id` itself (e.g.
+  the system agent's conversation; credential: the host token of an app
+  peer that session prepared; only the registering connection's turns get
+  them, calls carry `caller.kind: "system"`, and the set lives as long as
+  that connection);
+  `{session_id, peer?, host_token, tools?, generic_tools?, if_version?,
+  call_timeout_ms?, approval_ttl_secs?, max_result_bytes?}` (`tools` are
+  the app bundle's `tools.json` entries: `name`, `description`,
+  `input_schema`, `output_schema?`, `risk`, `background?`, `outward?`,
+  `confirm?` `host`|`app`) →
+  `{slug, version, previous_version, tools, generic_tools, applies:
+  "next_turn"}`. Replaces the set atomically; from the next turn every
+  session of the peer and of its request contexts ADDS those app tools to
+  the peer's usual kernel tools (exactly `generic_tools` of them when the
+  host sets that list), but only for turns on the peer originator's base key
+  that are driven by the registering connection; any other turn on those
+  topics gets no tools (hosts must drive the peer's turns on that
+  connection). App tool calls are sent to the registering connection as the
+  server notification `peer/tool/call` `{peer, session_id, context_id,
+  turn_id, call_id, tool_call_id, args_digest, name, app, caller: {peer,
+  session_id, context_id}, args, risk, confirm_required, timeout_ms,
+  tools_version}` (`app` = the tool's owning app, which a cross-app tool
+  names in its declaration; `caller` = `{kind, peer, session_id,
+  context_id, turn_id}`, the calling peer, session and turn); `peer/tool/cancel`
+  `{call_id, reason}` stops one, after which the host must not execute it.
+  `generic_tools`, when given, is the peer's kernel tool set exactly (no
+  kernel-side exclusions; it never adds a tool the session lacks). Approvals of these calls, and `turn/steer` / `turn/interrupt` on
+  the peer's sessions, belong to the host connection: other connections do
+  not see those approvals and are refused (`peer_host_connection_only`). Kernel approvals of these calls are once-only: no
+  remembered scope answers them or is recorded from them. Destructive and outward tools need an `approval/requested` →
+  `approval/respond` on the calling session first (the host renders it),
+  except `confirm: app` tools, which the host hands to the owning app's own
+  sheet for callers of every kind (`confirm_required: true`). Typed `data.kind`:
+  `peer_not_host_bound`, `peer_tools_invalid`, `peer_tools_version_conflict`)
+- `peer/tool/result` (accepted `UPCR-2026-035`: the host answers one
+  `peer/tool/call`; `{session_id, peer?, host_token, call_id, ok?, data?,
+  error?, status?: "awaiting_confirmation"}` → `{call_id, accepted,
+  result_too_large?, awaiting_confirmation?}`; an acknowledgement extends a
+  gated call's wait to the approval TTL; an unanswered non-read call ends as
+  `outcome_unknown`; typed `data.kind` `peer_tool_call_not_found` for a
+  finished, timed-out or cancelled call, whose late result is audited)
+- `peer/purge` (accepted `UPCR-2026-034` amendment, #2604: the host erases
+  a host-owned app peer. `{session_id, peer, host_token, profile_id?}` →
+  `{session_id, profile_id, slug, name, purged, already_purged, purged_at,
+  was_open, contexts, contexts_closed, interrupted, host_calls_failed,
+  prompts_cancelled, erased, errors}`; closes an open peer first, fails its
+  in-flight host tool calls (`peer_purged`), stops its and its contexts'
+  running turns, then erases their transcripts, the memory namespace, the
+  blackboard and a kernel-provisioned workspace, and frees the (app,
+  account) binding; a failed erase entry finalizes nothing — the purge
+  fails `peer_purge_incomplete` with the entries in `data.errors`, the peer
+  stays closed and staged, and a retry runs the whole idempotent erase
+  again; a retry after completion answers `already_purged`;
+  host connection only; typed `data.kind` `peer_purge_not_owner`,
+  `peer_purge_busy`, `peer_purge_in_progress`, `peer_purge_incomplete`,
+  `peer_not_host_bound`)
+- `peer/input/reject` (accepted `UPCR-2026-035`, #2618: the host refuses a
+  `peer/input`; `{session_id, peer, host_token, input_id, reason:
+  "signed_out" | "no_consent" | "busy" | "other", message?}` → `{input_id,
+  rejected, reported_to: "call" | "system_session"}`; only from the connection
+  the input was sent to, once, before a `turn/start` with its `turn_id`; the
+  system agent's waiting `peer_send_input` fails with `peer_input_rejected:
+  <reason>`, or the refusal is reported on the system session's next turn;
+  the `turn_id` is released and a later `turn/start` with it is refused;
+  typed `data.kind` `peer_input_reject_invalid`, `peer_input_not_found`,
+  `peer_input_wrong_connection`, `peer_input_already_rejected`,
+  `peer_input_already_started`)
+- `session/tool_list/set` (accepted `UPCR-2026-035`, #2605: the host sets
+  the durable, exact kernel tool list of one of its own sessions;
+  `{session_id, host_token?, profile_id?, generic_tools: [string] | null,
+  if_version?}` → `{session_id, profile_id, version, previous_version,
+  generic_tools, applies: "next_turn"}`; `null` clears; it narrows every turn
+  on the session in the serve and gateway paths, survives reconnects and
+  restarts, never widens the profile policy, and an unreadable list keeps no
+  tools; never from an external client; the host's own connection (`serve --stdio`, or
+  a host-managed host-token connection), elsewhere the host token of an app peer the session prepared;
+  typed `data.kind` `session_tool_list_invalid`,
+  `session_tool_list_version_conflict`, `peer_host_token_mismatch`,
+  `external_method_denied`)
+- `session/tool_list/get` (accepted `UPCR-2026-035`, #2605: the host reads
+  that list back; `{session_id, host_token?, profile_id?}` → `{session_id,
+  profile_id, version, status: "none" | "set" | "cleared" | "unreadable",
+  generic_tools}`; same authorization)
+- `peer/tools/unregister` (accepted `UPCR-2026-035`: the host releases a
+  host-owned app peer it no longer serves while its connection stays open;
+  `{session_id, peer, host_token, profile_id?}` → `{slug, profile_id,
+  unregistered}`; drops the peer's route and ends its calls in flight
+  `host_gone`, so the system agent's later `peer_send_input` fails "not
+  connected"; idempotent; `peer/tools/register` restores the route; refused
+  to external clients)
 - `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
   latest `result.md` — written server-side on every peer-session turn
   terminal — with per-field truncation flags and `result_updated_unix`;
-  optional `slugs` filter)
+  optional `slugs` filter; reading a stored profile does not bootstrap a
+  runtime. Once bootstrapped, peer staging, results and parent continuation
+  use the same active profile runtime as `session/open` and `turn/start`.)
 - `profile/skills/list`, `profile/skills/registry/search`,
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
@@ -510,6 +723,28 @@ Runtime, auth, profile, and onboarding inspection (server-handled
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
 - `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
   local-solo only; #1057)
+- `onboarding/workspace_list`, `onboarding/workspace_create` (gate
+  `onboarding.workspace_browse.v1`, local-solo only;
+  WEB-WORKSPACE-BROWSER-CONTRACT-5000. Server-side folder browsing for the
+  workspace-creation form: `workspace_list` answers
+  `{canonical_path, parent_path, writable, entries[{name, path, writable}],
+  truncated, hidden_skipped}` for a resolved directory — directories only,
+  sorted case-insensitively, dot-directories counted in `hidden_skipped`,
+  at most 500 entries with `truncated` set when more existed, `parent_path`
+  null at the filesystem root or when the parent would be a banned system
+  path; `workspace_create` takes `{parent, name}` and answers
+  `{canonical_path, created}`, with `created: false` for an existing
+  directory of that name — an idempotent success, not an error. Typed
+  `data.kind` errors, same shape as the probe:
+  `workspace_list_invalid_path`, `workspace_list_not_found`,
+  `workspace_list_not_a_directory`, `workspace_list_permission_denied`,
+  `workspace_list_root_escape` (with `banned_root`),
+  `workspace_create_invalid_name`, `workspace_create_parent_not_found`,
+  `workspace_create_parent_not_a_directory`,
+  `workspace_create_permission_denied`, `workspace_create_root_escape`,
+  `workspace_create_exists_not_directory`, and `profile_local_unsupported`
+  on tenant/cloud. A client that does not see the feature keeps the
+  typed-path form and hides every browsing affordance — fail closed.)
 
 Notifications:
 
@@ -521,6 +756,15 @@ Session (server-pushed open-state echo for reconnect/replay):
 Turn, message, and tool lifecycle:
 
 - `turn/started`, `turn/completed`, `turn/error`
+- `turn/steer_dropped` (accepted `UPCR-2026-033`) — returned unconsumed steer
+  inputs, emitted at turn end after the turn can no longer accept steers and
+  BEFORE its terminal frame. `params` carry the `session_id`, `turn_id`,
+  optional `topic`, the still-pending steer `inputs` in buffer order, and a
+  `reason` (`interrupted` | `turn_ended`), so the client can re-queue them
+  deterministically. Delivery is unfiltered; the negotiated
+  `event.turn_steer_dropped.v1` feature licenses a client to treat a
+  terminal without a preceding `turn/steer_dropped` naming its steer as
+  consumed by the server.
 - `message/delta`
 - `message/reasoning_delta` (live LLM reasoning/thinking stream, sibling of
   `message/delta`; #1502)
@@ -599,12 +843,23 @@ M15 agent/goal/loop autonomy (accepted `UPCR-2026-021`):
 
 - `agent/updated`, `agent/output/delta`, `agent/artifact/updated`
 - `session/goal/updated`, `session/goal/cleared`
-- `loop/updated`, `loop/fired`, `loop/completed`
+- `loop/updated`, `loop/fired`
 - `monitor/updated`, `monitor/fired`, `monitor/expired`
 
 M16 context lifecycle (gate `context.lifecycle.v1`):
 
 - `context/compaction_completed`, `context/compaction_started`, `context/normalization_reported`
+- `context/state_reported` (additionally gated on `context.state.v1`: live token estimate mid-turn)
+
+Session orchestration status (whole-job indicator; ungated; accepted
+`UPCR-2026-033`):
+
+- `session/orchestration` — per-connection indicator snapshot for each open
+  session: `active:true` with `running_agents`, `pending_continuations`, and
+  an optional coarse `phase` while a turn, a non-terminal sub-agent, or a
+  queued master continuation is in flight, then one final `active:false`
+  when the session drops out. Emissions are deduped to changes, so a session
+  stays active across the sub-agent-complete → master-re-entry gap.
 
 Peer staging (#1801 v3, ungated):
 
@@ -622,6 +877,30 @@ Peer staging (#1801 v3, ungated):
   `peer-<slug>`). `params` carry the ORIGINATING `session_id` plus `topic`,
   `slug`, and `profile_id`. Durable: reconnect replay redelivers it, so
   clients dedup by the already-closed peer for the topic.
+
+Host-registered peer tools (UPCR-2026-035; sent only to the connection that
+registered a host-owned app peer's tools with `peer/tools/register`):
+
+- `peer/tool/call` — run one app tool: `{peer, session_id, context_id,
+  turn_id, call_id, tool_call_id, args_digest, name, app, caller, args,
+  risk, confirm_required, timeout_ms, tools_version}`. Approvals of these
+  calls carry `approval_kind: "host_tool"` and `typed_details.host_tool`
+  `{app, tool, args, risk, outward, calling_peer?, calling_session_id,
+  context_id?, tool_call_id?, outcome_unknown_before}` for the host's own
+  sheet. The host answers with `peer/tool/result`.
+  Ephemeral: never replayed; a host that is gone fails the call.
+- `peer/tool/cancel` — the kernel stopped waiting for `call_id`
+  (`reason`: `timeout` | `cancelled`).
+- `peer/input` — the system agent's `peer_send_input` to a host-owned peer:
+  `{peer, session_id, input_id, turn_id, text}`. The host starts the peer's
+  turn itself (`turn/start` on `session_id` with `turn_id` and the text, on
+  the same connection), or refuses it with `peer/input/reject`. Never run as
+  a kernel-internal turn; with no host connected `peer_send_input` fails and
+  nothing is queued. Ephemeral. The kernel labels that turn `system_agent`
+  (a different `turn/start` `origin` is refused). The person's own turns
+  run in parallel in a request context opened with `share_history`
+  (UPCR-2026-034, amended 2026-09-29), each lane shown the other's recent
+  turns read-only.
 
 Background activity — the human sink (#2019, gate `event.background_activity.v1`):
 
@@ -657,6 +936,17 @@ Minimum params:
   `session.workspace_cwd.v1`. The server must canonicalize and approve it
   against runtime filesystem roots before binding cwd-scoped tools.
 - optional `after`
+- optional `client_commands`
+  Slash commands the client handles itself, from accepted `UPCR-2026-037`
+  (leading `/` optional). The server lists the accepted names in the session's
+  system prompt. The declaration is per-open, not sticky: every `session/open`
+  replaces the session's previous one, omitting the field declares none, and
+  the server clears it when the declaring connection closes. Across concurrent
+  connections the last open wins. Names are filtered server-side: at most 32
+  characters of ASCII alphanumerics, `-` and `_`, deduplicated, first 64 kept,
+  and the gateway server-state commands (`/adaptive`, `/router`, `/queue`,
+  `/reset`) dropped. The names that survive are echoed in the result's
+  `accepted_client_commands`.
 
 Expected result:
 
@@ -711,6 +1001,15 @@ Optional result fields from the M16 `context.lifecycle.v1` contract:
   from the same canonical profile/session store used by `turn/start` and
   `session/hydrate`.
 
+Optional result fields from accepted `UPCR-2026-038`:
+
+- `accepted_client_commands`
+  The names the server accepted from this open's `client_commands`, each as
+  `/name`, in declaration order. Present whenever the request carried
+  `client_commands` and the server applied it, including as `[]` when every
+  name was dropped. Absent when the request omitted `client_commands`.
+  Ungated.
+
 ### `session/hydrate`
 
 Purpose:
@@ -739,6 +1038,21 @@ Optional result fields from the M16 `context.lifecycle.v1` contract:
   be read from the same canonical profile/session store used by `turn/start`,
   not reconstructed by the client from hydrated chat rows.
 
+Optional `messages` row fields from accepted `UPCR-2026-039` (ungated; the
+rows of `session/rollback`'s `thread` carry them too):
+
+- `tool_call_id`
+  On a tool-result row (`role: "tool"`), the id of the assistant tool call it
+  answers.
+- `tool_name`
+  On a tool-result row, the name of the tool that call ran (the `tool_name` of
+  `tool/started`), from the nearest earlier row whose `tool_calls` hold the
+  id, looked up in the whole transcript whatever `after` is. Absent when the
+  transcript lacks that call.
+- `tool_calls`
+  On an assistant row that called tools, `{tool_call_id, tool_name}` per call,
+  in call order, without the arguments. Omitted when the row made no call.
+
 ### `turn/state/get`
 
 Purpose:
@@ -746,6 +1060,10 @@ Purpose:
 - return deterministic lifecycle state for one turn using the active-turn
   registry plus the durable ledger projection
 - return `state = "unknown"` rather than an error for a missing turn
+- with `state = "unknown"`, return `running = false` when the server is certain
+  it is not executing the turn (no registry entry, no ledger record, no
+  admission in flight), so a client can stop holding for a turn lost across a
+  restart ([UPCR-2026-031](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_031_TURN_STATE_NOT_RUNNING.md))
 
 Gate:
 
@@ -777,11 +1095,28 @@ Minimum params:
 - `turn_id`
 - `input`
 
+Optional params (among others):
+
+- `origin` `{kind: "person" | "system_agent" | "app", label?}` — who speaks
+  in this turn of a host-owned app peer's shared conversation
+  (UPCR-2026-034, amended 2026-09-28). Only on the peer's own session
+  `<originator base>#peer-<slug>` or on a request context opened with
+  `share_history` (amended 2026-09-29: there `person` is the default and
+  only `person` or `app` are accepted), only from the peer's host
+  connection, and never `system_agent` (the kernel labels a turn started
+  from its `peer/input` itself). The kernel prefixes the prompt with a stable marker
+  (`[from the person]`, `[from the system agent: …]`) and records
+  `origin:` in the peer's `result.md`. Typed `data.kind`:
+  `turn_origin_not_allowed`, `turn_origin_host_only`,
+  `turn_origin_mismatch`.
+
 Behavior:
 
 - server emits `turn/started`
 - server may emit zero or more `message/delta`, `tool/*`, `task/updated`, `warning`
 - server finishes with `turn/completed` or `turn/error`
+- one turn per session: a start while a turn runs is refused with
+  `data.kind: "turn_in_progress"`; the kernel does not queue
 
 ### `review/start`
 
@@ -1172,7 +1507,7 @@ Clients must use that method list to enable or disable slash commands.
 `profile/local/create`:
 
 - local-only no-OTP solo onboarding command
-- request:
+- request (legacy shape, still fully supported):
 
   ```json
   {
@@ -1181,6 +1516,33 @@ Clients must use that method list to enable or disable slash commands.
     "email": "ada@example.com"
   }
   ```
+
+- request (additive shape, negotiated via two independent capability
+  features):
+
+  ```json
+  {
+    "name": "Ada Lovelace",
+    "requested_id": "glm",
+    "make_default": true
+  }
+  ```
+
+- field notes (matches implementation; audit 2026-08-21):
+  - `requested_id` (optional, gated by `profile.local_create.requested_id.v1`):
+    meaningful profile id typed during onboarding; normalized (lowercased,
+    non-`[a-z0-9-]` collapsed to `-`) and uniqueness-suffixed server-side
+    (`glm`, `glm-2`, …). Absent → server derives the id from `username`
+    (legacy shape) or generates one
+  - `make_default` (optional, gated by the separate
+    `profile.local_create.default.v1` feature): when `true`, the server
+    records this profile as the machine's global default — the profile a
+    bare launch resolves to in a folder with no sticky profile yet.
+    Omitted from the wire when unset so older servers receive an unchanged
+    shape
+  - `username` and `email` are optional in the current implementation: a solo
+    local profile does not require an owner username or email when
+    `requested_id` is supplied
 
 - result:
 
@@ -1224,6 +1586,12 @@ Clients must use that method list to enable or disable slash commands.
   backend can expose backend-owned context state for AppUI turns. Clients should
   render this state from `session/status/read` and must not infer it from chat
   rows or local transcript heuristics.
+- When `context.semantic_cache.v1` is also negotiated, `context_state` may
+  include `cache_epoch_id`, `last_cache_invalidation_reason`, `semantic_head_id`,
+  and `semantic_head_kind`. These are opaque, display-only diagnostics owned
+  by the backend; clients must not put them into model prompts or use them to
+  choose compaction boundaries. Missing fields do not establish a cache hit
+  or miss. See [UPCR-2026-029](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_029_SEMANTIC_CONTEXT_CACHE_DIAGNOSTICS.md).
 - `session/open`, `session/hydrate`, legacy REST-bridge
   `session/status.get`, and `turn/state/get` also include `context` and
   `context_state` when `context.lifecycle.v1` is available.
@@ -1578,10 +1946,23 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 
 - Gate: `auxiliary.rest_to_ws.v1`
 - Replaces: `GET /api/sessions`
-- Params type: `SessionListParams` (empty object).
+- Params type: `SessionListParams` — `{}` for the legacy per-profile/global
+  listing. With `session.workspace_cwd.v1` negotiated, an optional `cwd`
+  scopes the listing to that project's `<cwd>/.octos/<profile>` store, and
+  an optional `profile_id` names the profile whose store to read, under the
+  same scope rules as `session/open`: a user connection may only restate
+  its own profile (anything else is an `auth_scope_violation`), an
+  admin/token connection uses it to name the profile it opens sessions
+  under, and an unregistered profile is `cwd_runtime_unavailable`.
 - Result type: `SessionListResult` — `{ sessions: SessionInfo[] }`. The
   `sessions` field forwards the JSON body of the legacy REST handler
-  verbatim (one `SessionInfo` per entry).
+  verbatim (one `SessionInfo` per entry). When — and only when — the
+  server actually scoped the listing to a project store, the result also
+  carries `workspace_root` (the canonical root) and `profile_id` (whose
+  `<workspace_root>/.octos/<profile_id>` store was read). A `{cwd}` request
+  to a server with `appui.sessions_in_cwd` off, or one that predates it,
+  returns the legacy global listing without them; a client must not place
+  rows under a workspace unless the result attests that scope.
 - Errors: collection endpoint; an unexpected 404 surfaces as
   `resource_not_found` with `data.resource_type = "session"` rather than
   `unknown_session`.
@@ -1776,6 +2157,111 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `resource_not_found` with `data.resource_type = "memory_entity"` and
   `data.identifier = <name>` on REST 404.
 
+#### `memory/search`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: nothing — new surface (`docs/adr/personal-memory-tiers.md`,
+  phase 2). Stage one of the two-stage Recall/Knowledge retrieval: ranks
+  the caller's profile index (BM25 fused with vectors when the profile
+  has an embedder; BM25-only otherwise — never refused for lack of one)
+  and returns abstracts only. Bodies come from `memory/load`.
+- Params type: `MemorySearchParams` — `{ query: string, kinds?: string[],
+  sources?: string[], since?: string, until?: string, limit?: number }`.
+  `query` must be non-blank. `kinds` narrows to `"episode"` /
+  `"document"` / `"knowledge"` (empty = all; lenient aliases such as
+  `doc` are accepted). `sources` narrows to record sources (`mail`,
+  `calendar`, …; empty = all). `since` / `until` are RFC 3339 timestamps
+  (any offset, normalised to UTC) or bare `YYYY-MM-DD` dates — a bare
+  `since` is the start of that UTC day, a bare `until` its end (`until`
+  is inclusive). `limit` defaults to `MEMORY_SEARCH_DEFAULT_LIMIT` (10)
+  and is clamped to `1..=MEMORY_SEARCH_MAX_LIMIT` (50).
+- Result type: `MemorySearchResult` — `{ hits: Hit[] }` where each hit is
+  the JSON of `octos_memory::Hit`: `{ id: string, kind: "episode" |
+  "document" | "knowledge", source: string, title: string, abstract:
+  string, score: number, timestamp: RFC3339, trust: "trusted" |
+  "untrusted" }`, best first. App-sourced hits are `untrusted`: clients
+  and prompts must treat their text as data, never as instructions.
+- Errors: `auth_unavailable` (`-32120`) with WS close code
+  `1008 auth_expired` if the connection has no usable identity;
+  `invalid_params` for a blank query, an unknown kind, an unparseable
+  or inverted time bound; `runtime_unavailable` when the resolved
+  profile has no bootstrappable runtime (same message as session open).
+- Identity resolves to a profile exactly as `memory/overview` does
+  (`/api/my/*` host-scope rules); auth-bound — omitted from the stdio
+  capability set (see § stdio policy) and refused for session-ingress
+  credentials.
+
+#### `memory/load`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: nothing — new surface. Stage two: fetch one record by the
+  `id` a `memory/search` hit returned. Counts a visit on the record
+  (MemoryOS-style heat: hot records keep their vector and are nominated
+  for promotion into Knowledge).
+- Params type: `MemoryLoadParams` — `{ id: string }` (non-blank).
+- Result type: `MemoryLoadResult` — `{ record: Record, page?: string,
+  page_truncated: bool }`. `record` is the JSON of `octos_memory::Record`
+  (`id`, `kind`, `source`, `parent?`, `timestamp`, `title`, `abstract`,
+  `body?`, `trust`, `fingerprint?`, `visits`, `last_visit?`, `promoted`,
+  `updated_at`, `schema_version`). For Knowledge records (`id` starting
+  `bank:`) `page` carries the bank page markdown read from
+  `<data_dir>/memory/bank/entities/<slug>.md`, capped at the same
+  384 KiB JSON-ESCAPED budget as `memory/entity`; when capped it is a
+  clean UTF-8 prefix and `page_truncated` is `true`. `page` is absent
+  for Recall records (the owning app is the record of truth for bodies)
+  and for an indexed page whose file has since been removed.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `invalid_params` for a blank id; `resource_not_found` (`-32170`) with
+  `data.resource_type = "memory_record"` and `data.identifier = <id>`
+  when no record has that id; `runtime_unavailable` as for
+  `memory/search`.
+
+#### `memory/ingest`
+
+- Gate: `auxiliary.rest_to_ws.v1`
+- Replaces: nothing — new surface, and the ONLY memory write on the
+  protocol. Apps (Mail, Calendar, contacts, notes) push derived records
+  into the profile's Recall index; the apps remain the record of truth.
+  Runs on the same authenticated path as `memory/overview` (identity
+  required, `/api/my/*` profile resolution); session-ingress credentials
+  are refused by the scope guard.
+- Params type: `MemoryIngestParams` — `{ records: Record[], vectors?:
+  (number[] | null)[], embed?: bool }`. Each record is an
+  `octos_memory::Record` JSON: required `id`, `kind`, `source`,
+  `timestamp` (RFC 3339), `title`, `abstract`; optional `parent`,
+  `body`, `trust`, `fingerprint` (producer-side change detector —
+  records whose fingerprint and index text are unchanged are skipped
+  and their vectors kept). Server-owned fields (`visits`, `last_visit`,
+  `promoted`, `updated_at`) are ignored on input. Validation
+  (`invalid_params`, message names `records[i]`): 1 ≤ `records.len()`
+  ≤ `MEMORY_INGEST_MAX_RECORDS` (500; over-cap carries
+  `data.max_records` / `data.requested_records`); `vectors`, when
+  present, is parallel to `records`; `kind` parses; ids are non-blank
+  and namespaced by kind — documents `doc:<source>:<key>`, episodes
+  `episode:<key>`; Knowledge (`bank:`) records are refused with
+  "knowledge pages are written through save_memory / the memory bank,
+  not ingest"; no ingested record — document or episode — can claim
+  `trust: "trusted"` (`trust` is forced `untrusted` for every record).
+  Title/abstract/body are clamped to the index caps
+  (120 B / 300 B / 16 KiB). When `embed` (default `true`) is set, no
+  `vectors` were supplied and the profile has an embedder, the server
+  first asks the store which records need a vector (new id, changed
+  fingerprint or index text, or no usable stored vector) and embeds
+  only those records' index text (title + abstract + parent) in
+  batches of 16 — re-submitting an unchanged batch embeds nothing; an
+  embedding failure fails the call (retry with `embed: false` to store
+  BM25-only). Without an embedder records are stored BM25-only.
+- Result type: `MemoryIngestResult` — `{ inserted: number, updated:
+  number, unchanged: number, vectors_stored: number, embedded: number }`
+  (the `octos_memory::UpsertReport` counts plus how many vectors the
+  server actually embedded in this call — unchanged records that kept
+  their stored vector are not counted). The HNSW graph is persisted
+  before the result is sent.
+- Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
+  `invalid_params` per the validation above; `runtime_unavailable` as
+  for `memory/search`; `internal_error` when embedding or the index
+  write fails.
+
 #### `cron/list`
 
 - Gate: `auxiliary.rest_to_ws.v1`
@@ -1821,6 +2307,10 @@ from accepted `UPCR-2026-007` (see § 7).
 When `context.lifecycle.v1` is available for the connection, the notification
 payload may also include `context` and `context_state` with the same semantics
 as the `session/open` result.
+
+The payload carries `accepted_client_commands` (accepted `UPCR-2026-038`) with
+the value of the open that produced it. A replayed notification reports that
+earlier open's declaration, not the session's current one.
 
 Optional pane fields from accepted `UPCR-2026-002`:
 
@@ -1876,7 +2366,8 @@ Optional typed fields from accepted `UPCR-2026-001`:
 
 - `approval_kind`
   String registry with initial values `command`, `diff`, `filesystem`,
-  `network`, and `sandbox_escalation`.
+  `network`, and `sandbox_escalation`; `host_tool` (UPCR-2026-035) for a
+  host-routed app tool's call, with `typed_details.host_tool`.
 - `risk`
   Display/audit risk label.
 - `typed_details`
@@ -1956,6 +2447,13 @@ Capability feature:
 
 Carries task lifecycle and summary updates that are useful to clients even before the full unified ledger exists.
 
+Optional fields (#1595):
+
+- `started_at`
+  Server clock timestamp of task registration (ISO-8601 / RFC 3339, same wire form as the `task/list` projection field of the same name). Clients ranking rows that share one `tool_call_id` (pipeline families, relaunch chains) order by this server timestamp, not by client receipt time. Absent on synthetic / legacy emitters.
+- `relaunched_from`
+  First-class relaunch lineage: the predecessor task id when this task was created by `TaskSupervisor::relaunch`. Unlike the JSON stamped into `runtime_detail` on the spawn transition (dropped by the next runtime-state overwrite), this field rides every frame, so clients can resolve the chain explicitly. Absent when the task is not a relaunch successor. Carried on `task/updated` only — the `task/list` projection is unchanged, so clients that need lineage outside the live stream still parse the spawn-transition `runtime_detail` JSON there.
+
 ### `task/output/delta`
 
 Carries live chunks of task output for a task/output viewer.
@@ -1980,6 +2478,14 @@ Optional fields from accepted `UPCR-2026-014` (M9-α-9):
   `session_result` frame so a WS client can stamp authoritative seq
   onto an optimistic bubble without an extra REST roundtrip. Absent
   when the turn ended without a final assistant row.
+- `token_usage`
+  Exact measured usage for this turn as `EnvelopeTokenUsage` counters
+  (input, output, reasoning, cache-read, cache-write), the same shape
+  `turn/error` carries. Additive and optional: omitted when the producer
+  has no typed total, and never session-cumulative. The v2
+  `projection/envelope` `turn_terminal` with `outcome: "completed"` carries
+  these counters verbatim; without it the projection keeps deriving
+  input/output from `tokens_in` / `tokens_out`.
 
 ### `turn/started`
 
@@ -2059,6 +2565,29 @@ topic for client-side scoping.
 ### `turn/error`
 
 Marks the abnormal terminal event for a turn.
+
+Required fields are `session_id`, `turn_id`, `code`, and `message`; `topic` is
+optional. Provider output-limit termination uses `code: "output_truncated"`
+and remains a failure even when a real answer fragment was persisted.
+
+The additive optional fields from
+[UPCR-2026-030](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_030_INCOMPLETE_TURN_RESULTS.md)
+preserve evidence for failed turns:
+
+- `token_usage`: exact measured usage for this turn, using `EnvelopeTokenUsage`
+  counters. Unknown usage is omitted; this is never session-cumulative usage.
+- `partial_result.session_result`: a producer-authoritative `TurnSessionResult`
+  (`committed_seq`, `message_id`, optional `client_message_id`) for an actual
+  final fragment, or explicit null when there is no final answer. Absence of
+  `partial_result` means legacy/unknown identity and must not select the latest
+  pre-tool, prior-turn or background assistant row as a final fragment.
+
+The v2 `projection/envelope` representation is `turn_terminal` with
+`outcome: "errored"`, the existing `token_usage` field, and the partial marker
+at `error.data.partial_result`. Durable replay preserves the exact counters and
+object/null/absent identity distinction. The fields need no new capability;
+old errors without metadata retain their existing serialization. A second
+terminal cannot overwrite the first terminal's result or usage.
 
 ### `turn/spawn_complete`
 
@@ -2172,6 +2701,34 @@ Required fields: `session_id`, `context_state`, `trigger`,
 `threshold_tokens`. Documented by
 [UPCR-2026-026](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_026_COMPACTION_STARTED.md).
 
+### `context/state_reported`
+
+Gate: `context.lifecycle.v1` **and** `context.state.v1` (both requested by the
+client; never implied by a missing feature header, because legacy clients cannot
+decode this notification kind).
+
+Pushed by the in-loop prompt bridge as a turn's prompt grows between
+compactions, so a client's context gauge follows the real estimate instead of
+the value from `session/open` or the last compaction. Emitted at most once per
+agent-loop iteration and only when `token_estimate` moved by at least 2% of
+`threshold_tokens` (minimum 1024 tokens).
+
+```json
+{
+  "session_id": "local:abc",
+  "context_state": { "…": "UiContextState" },
+  "threshold_tokens": 800000,
+  "iteration": 57
+}
+```
+
+- `context_state` — the same `UiContextState` shape carried by the compaction
+  events; `token_estimate` is the live estimate.
+- `threshold_tokens` — the token count at which the server will compact this
+  session (context-window derived), the honest denominator for a fullness
+  fraction.
+- `iteration` — agent-loop iteration within the current turn (0 = turn start).
+
 ### `context/normalization_reported`
 
 Notification that a prompt-normalization pass ran ahead of an LLM call.
@@ -2273,6 +2830,97 @@ Rules:
   `data.kind = "profile_unresolved"`; it must not fabricate a runtime policy
   stamp for that profile or silently fall back to a default profile
 
+Numeric error codes are pinned in this section. `rpc_error_codes` in
+`crates/octos-core/src/ui_protocol.rs` mirrors them as Rust constants, and a
+parity test (`crates/octos-core/src/ui_protocol_tests.rs`) fails when either
+side gains a code the other lacks. The WS/stdio dispatcher applies them at
+its supported-table and capability gates in
+`crates/octos-cli/src/api/ui_protocol_transport.rs`.
+
+JSON-RPC reserved range:
+
+- `-32700` (`parse_error`) — JSON-RPC reserved: the frame is not valid JSON.
+  Raised by the frame codec before any method dispatch.
+- `-32600` (`invalid_request`) — JSON-RPC reserved: valid JSON that is not a
+  valid JSON-RPC 2.0 request envelope.
+- `-32601` (`method_not_found`) — JSON-RPC reserved. Emitted by the core
+  `UiCommand` parser when the method falls outside the protocol's method
+  table. The serve dispatcher answers unknown methods with `-32004`
+  instead (below), so this code is not observed on the AppUI wire today.
+- `-32602` (`invalid_params`) — JSON-RPC reserved: params failed schema
+  validation, including the per-method caps and validation rules listed
+  with each method.
+- `-32603` (`internal_error`) — JSON-RPC reserved: internal server error.
+
+Server-defined range:
+
+- `-32004` (`method_not_supported`) — legacy server slot for "this server
+  will not run the method": a method outside the supported-method table, or
+  a capability-gated method called without negotiating the feature (see the
+  M12 Phase D section). The message echoes the requested method name and
+  `data` carries a typed `UnsupportedCapabilityReport`, giving clients one
+  machine-readable signal that the server will not run the method on this
+  slice.
+- `-32011` (`approval_not_pending`) — `respond` against an approval that is
+  no longer pending; the already-recorded decision rides in `error.data`.
+- `-32100` (`unknown_session`) — `session_id` not known to the runtime;
+  `data` carries `session_id`.
+- `-32101` (`unknown_turn`) — `turn_id` not known for the addressed session.
+- `-32102` (`unknown_approval_id`) — `approval_id` not known to the runtime
+  (`unknown_approval` in the minimum categories above).
+- `-32103` (`unknown_preview_id`) — `preview_id` unknown (expired or never
+  issued).
+- `-32104` (`unknown_task_id`) — `task_id` not in the runtime task table.
+- `-32105` (`approval_cancelled`) — `respond` against an administratively
+  cancelled approval.
+- `-32106` (`user_question_unknown`) — `user_question/respond` against a
+  `question_id` not pending for the caller's session; mirrors
+  `unknown_approval_id` for the structured-question surface.
+- `-32107` (`user_question_stale`) — `user_question/respond` against a
+  question that was already answered or cancelled.
+- `-32108` (`user_question_invalid`) — `user_question/respond` carried
+  answers that do not match the stored request (wrong answer count, a
+  `selected_labels` value not in that question's options, more than one
+  label on a non-`multi_select` question, or free text where the question
+  disallows it). The server rejects the call without resolving the blocked
+  tool.
+- `-32110` (`cursor_out_of_range`) — stale or future cursor relative to the
+  session ledger; retry with a fresh cursor.
+- `-32111` (`cursor_invalid`) — cursor malformed or belonging to a different
+  stream; rehandshake instead of retrying.
+- `-32120` (`permission_denied`) — sandbox, approval-scope, or profile
+  policy refusal. The same numeric code carries `auth_unavailable` (with
+  `data.kind = "auth_unavailable"`) on content and auth methods called
+  without a usable identity; clients disambiguate by `data.kind`.
+- `-32130` (`unsupported_capability`) — typed slot for the
+  capability-unavailable condition. New emitters should prefer it over the
+  legacy `-32004` slot. Like `-32601`, it is not emitted on the AppUI wire
+  today; the dispatcher's capability gate still answers `-32004` (see the
+  migration status below).
+- `-32140` (`runtime_not_ready`) — transient runtime unavailability
+  (`runtime_unavailable` in the minimum categories above); autonomy loop
+  runtime failures answer with it.
+- `-32150` (`malformed_result`) — a server-side result failed its own
+  schema; the result-side counterpart to `invalid_params`.
+- `-32160` (`rate_limited`) — backpressure signal; `data` may carry an
+  optional `retry_after_ms` hint (the `RpcError::rate_limited` constructor),
+  which current emitters do not set.
+- `-32170` (`resource_not_found`) — not-found for non-session-scoped
+  resources (content catalog rows, profile records); `data` carries
+  `resource_type` and `identifier`. Distinct from `unknown_session`
+  (`-32100`), which is reserved for session-scoped 404s.
+
+`-32004` → `-32130` migration status:
+
+- Current: the dispatcher's capability gate answers with `-32004`;
+  `-32130` has no emitter on the AppUI wire today.
+- Target: `-32130` becomes the canonical answer for the
+  capability-unavailable condition.
+- Switch trigger: none scheduled. Repointing the gate is a client-visible
+  wire change and requires an accepted protocol change request (§4.1);
+  until then `-32004` is the only capability-gate answer a client can
+  observe.
+
 ## 11. Relationship to REST
 
 The original migration-era split below has been **superseded by M12 Phase D**
@@ -2340,9 +2988,12 @@ See [OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24.md](../docs/OCTOS_M8_FIX_FIRST_CHEC
 ## 14. M9-γ Envelope
 
 Status: **additive**, governed by accepted `UPCR-2026-014`. Capability-gated
-behind `projection.envelope.v1`. Legacy `message/delta`, `message/persisted`,
-`tool/*`, and `turn/completed` notifications continue to flow on connections
-that do not negotiate this feature, until `M9-γ-3` deletes them.
+behind `projection.envelope.v1`. Legacy `message/delta`, `tool/*`, and
+`turn/completed` notifications continue to flow on connections
+that do not negotiate this feature, until `M9-γ-3` deletes them. The
+`message/persisted` notification has since been **retired** (see the v2
+note at the end of this section): the ledger skips replaying its records
+and `projection/envelope` is its sole successor.
 
 ADR: [`docs/M9-GAMMA-SERVER-PROJECTION-ADR.md`](../docs/M9-GAMMA-SERVER-PROJECTION-ADR.md).
 
@@ -2391,6 +3042,28 @@ lacking `session_id`/`topic` defaults `session_id` to the empty key and
 `topic` to absent, and falls back to its ambient connection context for
 routing.
 
+**v2 form (audit 2026-08-21):** the same `projection/envelope` method name
+also carries an `EnvelopeV2`-shaped frame. An `EnvelopeV2` flattens
+`thread_id`, `seq`, `cursor?`, `turn_id`, `client_message_id?`, `payload`
+with the same routing keys (`session_id`, `topic?`). Key differences from
+v1: an explicit `turn_id` on every envelope (for background child streams
+this is the child stream identity and the payload carries `parent_turn_id`),
+and an optional `cursor` (`UiCursor`).
+
+Delivery semantics:
+
+- canonical v2 envelopes on the live stream are delivered **regardless of
+  negotiation** — the server never capability-filters canonical v2 frames
+- the `projection.envelope.v2` capability primarily controls projection of
+  **historical** (ledger-replayed) records into v2 form
+- a connection that negotiated v2 has the corresponding v1/source events
+  (`message/delta`, `tool/*`, `turn/completed`, legacy `message/persisted`)
+  **filtered out** on that connection — v2 clients do NOT decode both forms
+- `message/persisted` (UPCR-2026-012) is retired as a live notification:
+  the ledger explicitly skips replaying old `message/persisted` records, and
+  `projection/envelope` (v1 or v2 per connection negotiation) is its sole
+  successor
+
 > History: an earlier revision (UPCR-2026-014 + codex #1336 round-2
 > BLOCKER 4) stripped `session_id`/`topic` from the wire and kept them
 > only on the durable ledger's on-disk record. That left a multi-session
@@ -2422,9 +3095,9 @@ Field contract:
 - `topic` (`string`, optional) — Topic suffix for topic-scoped routing.
   Omitted when the envelope is not topic-scoped.
 
-Rust source: [`Envelope`](/Users/yuechen/home/octos/crates/octos-core/src/ui_protocol.rs:1)
+Rust source: [`Envelope`](../crates/octos-core/src/ui_protocol.rs)
 in `octos-core::ui_protocol`. TS source: `Envelope` in
-[`crates/octos-web/src/runtime/ui-protocol-types.ts`](/Users/yuechen/home/octos/crates/octos-web/src/runtime/ui-protocol-types.ts:1).
+[`crates/octos-web/src/runtime/ui-protocol-types.ts`](../crates/octos-web/src/runtime/ui-protocol-types.ts).
 
 ### 14.2 Payload (sealed tagged union)
 
@@ -2877,10 +3550,6 @@ Loop notifications:
 - `loop/fired`: params are `{ "session_id": SessionKey,
   "profile_id"?: string, "loop_id": string, "loop"?: Loop,
   "fire"?: LoopFire, "ok"?: boolean, "status"?: string }`.
-- `loop/completed`: params are `{ "session_id": SessionKey,
-  "profile_id"?: string, "loop_id": string, "loop"?: Loop,
-  "status"?: string, "completed_at_ms"?: number, "result"?: object,
-  "error"?: string }`.
 
 `Agent`, `Goal`, and `Loop` shapes match UPCR-2026-021. String status
 fields are open registries; clients must preserve unknown values. The

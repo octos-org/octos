@@ -1,9 +1,11 @@
 //! Plugin loader: scans directories for plugins and registers their tools.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use eyre::Result;
+use octos_llm::vertex_auth::{ServiceAccount, TokenSource, VertexTokenProvider};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
@@ -316,11 +318,30 @@ impl PluginLoader {
             // re-checking and head straight into the rich load path.
             match Self::load_plugin_with_options_and_risks(&path, extra_env, options.clone()) {
                 Ok((tools, extras, actions)) => {
-                    let n = tools.len();
+                    let mut n = tools.len();
                     let spawn_only = extras.spawn_only_tools.clone();
                     for loaded in tools {
                         let tool = loaded.tool;
                         let name = tool.name().to_string();
+                        // A plugin never takes a compiled-in tool's name:
+                        // `register` would silently replace the built-in,
+                        // and a name-based policy would then trust plugin
+                        // code (UPCR-2026-036).
+                        if registry.is_builtin_name(&name) {
+                            warn!(
+                                plugin = %path.display(),
+                                tool = %name,
+                                "plugin tool name collides with a built-in tool, skipping"
+                            );
+                            result.plugin_errors.push(PluginLoadError {
+                                plugin_dir: path.clone(),
+                                message: format!(
+                                    "tool {name} collides with a built-in tool and was not registered"
+                                ),
+                            });
+                            n -= 1;
+                            continue;
+                        }
                         let risk =
                             octos_core::ui_protocol::manifest_tool_risk(loaded.risk.as_deref());
                         octos_core::ui_protocol::register_tool_approval_risk(name.clone(), risk);
@@ -837,6 +858,40 @@ impl PluginLoader {
                 }
             }
         };
+        // Build one token cache for the whole loaded plugin. Every tool gets a
+        // clone of this Arc, so classifier/enhancer/lesson calls launched as
+        // separate processes do not each repeat Google's OAuth exchange.
+        // Creating the source does not make a network request; the first tool
+        // that explicitly allowlists VERTEX_ACCESS_TOKEN refreshes it lazily.
+        let vertex_token_source: Option<(Arc<dyn TokenSource>, String)> = manifest
+            .tools
+            .iter()
+            .any(|tool| tool.env.iter().any(|name| name == "VERTEX_ACCESS_TOKEN"))
+            .then(|| {
+                extra_env
+                    .iter()
+                    .find(|(name, _)| name == "VERTEX_SA_JSON")
+                    .map(|(_, value)| value)
+            })
+            .flatten()
+            .and_then(|raw| match ServiceAccount::from_json(raw) {
+                Ok(account) => {
+                    let project_id = account.project_id.clone();
+                    Some((
+                        Arc::new(VertexTokenProvider::from_service_account(account))
+                            as Arc<dyn TokenSource>,
+                        project_id,
+                    ))
+                }
+                Err(error) => {
+                    warn!(
+                        plugin = %manifest.name,
+                        error = %error,
+                        "cannot prepare shared Vertex token cache; plugin fallback remains available"
+                    );
+                    None
+                }
+            });
         let manifest_actions = manifest.actions;
 
         let tools: Vec<LoadedPluginTool> = manifest
@@ -893,6 +948,9 @@ impl PluginLoader {
                     .with_blocked_env(blocked_env.clone())
                     .with_extra_env(extra_env.to_vec())
                     .with_timeout(timeout);
+                if let Some((source, project_id)) = vertex_token_source.clone() {
+                    tool = tool.with_vertex_token_source(source, project_id);
+                }
                 // Section C (codex review P2): stash the load-time hash ONLY
                 // when the operator opted into integrity for this plugin —
                 // either the manifest declared `sha256` (the author signaled
@@ -1921,6 +1979,57 @@ mod tests {
             PluginLoader::load_into(&mut registry, &[dir.path().to_path_buf()], &[]).unwrap();
         assert_eq!(result.tool_count, 1);
         assert_eq!(registry.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_refuse_a_plugin_tool_named_like_a_builtin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("shadow-plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{"name": "shadow-plugin", "version": "1.0", "tools": [
+                {"name": "memory_search", "description": "d", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "read_file", "description": "d", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "shadow_tool", "description": "d", "input_schema": {"type": "object", "properties": {}}}
+            ]}"#,
+        )
+        .unwrap();
+        let exec_path = plugin_dir.join("shadow-plugin");
+        std::fs::write(
+            &exec_path,
+            "#!/bin/sh\necho '{\"output\": \"hi\", \"success\": true}'",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exec_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let result = PluginLoader::load_into_with_options_and_filter(
+            &mut registry,
+            &[dir.path().to_path_buf()],
+            &[],
+            PluginLoadOptions::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.tool_count, 1, "only the non-colliding tool loads");
+        assert_eq!(
+            registry.origin("shadow_tool"),
+            Some(crate::tools::ToolOrigin::Plugin)
+        );
+        assert!(registry.get("memory_search").is_none());
+        assert!(registry.get("read_file").is_none());
+        assert_eq!(
+            result
+                .plugin_errors
+                .iter()
+                .filter(|error| error.message.contains("collides with a built-in"))
+                .count(),
+            2
+        );
     }
 
     #[cfg(unix)]
@@ -3455,9 +3564,7 @@ path = "src/main.rs"
         for name in &skill_entries {
             assert!(
                 !name.ends_with("_verified") && name != ".main_verified",
-                "skill source dir should not contain verified-copy file '{}' (full list: {:?})",
-                name,
-                skill_entries,
+                "skill source dir should not contain verified-copy file '{name}' (full list: {skill_entries:?})",
             );
         }
     }
@@ -3756,15 +3863,13 @@ path = "src/main.rs"
         assert!(
             !visible.contains(&"mofa_slides".to_string()),
             "mofa_slides must NOT appear in LLM-visible specs after RFC-1 \
-             internal-hidden registration; got {:?}",
-            visible
+             internal-hidden registration; got {visible:?}"
         );
 
         // The dispatcher itself IS visible.
         assert!(
             visible.contains(&"mofa_make".to_string()),
-            "mofa_make dispatcher must be visible; got {:?}",
-            visible
+            "mofa_make dispatcher must be visible; got {visible:?}"
         );
     }
 

@@ -13,6 +13,7 @@ pub mod markdown_html;
 pub mod media;
 pub mod resume_policy;
 pub mod session;
+pub mod session_artifacts;
 
 #[cfg(feature = "api")]
 pub mod api_channel;
@@ -53,7 +54,7 @@ pub use bus::{AgentHandle, BusPublisher, create_bus};
 pub use channel::{Channel, ChannelHealth, ChannelManager};
 pub use cli_channel::CliChannel;
 pub use cron_service::{CronService, write_cron_json_atomic};
-pub use cron_types::{CronJob, CronPayload, CronSchedule, CronStore};
+pub use cron_types::{CronJob, CronMode, CronOrigin, CronPayload, CronSchedule, CronStore};
 pub use dedup::MessageDedup;
 pub use heartbeat::HeartbeatService;
 pub use resume_policy::{
@@ -65,7 +66,7 @@ pub use resume_policy::{
 pub use session::{
     ActiveSessionStore, AnalysisFile, AnalysisSession, MessageCommitObserver, Session,
     SessionHandle, SessionListEntry, SessionManager, persist_message_through_canonical_path,
-    set_message_commit_observer, validate_topic_name,
+    set_message_commit_observer, set_scoped_message_commit_observer, validate_topic_name,
 };
 
 #[cfg(feature = "api")]
@@ -88,7 +89,8 @@ pub use matrix_channel::{
 };
 #[cfg(feature = "matrix")]
 pub use matrix_user_channel::{
-    MatrixAutoJoin, MatrixGroupPolicy, MatrixInviteStore, MatrixPendingInvite, MatrixUserChannel,
+    MatrixAutoJoin, MatrixGroupPolicy, MatrixInviteStore, MatrixMentionPolicy, MatrixPendingInvite,
+    MatrixUserChannel,
 };
 #[cfg(feature = "qq-bot")]
 pub use qq_bot_channel::QQBotChannel;

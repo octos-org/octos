@@ -55,7 +55,7 @@ static SECRET_ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
 fn redact_credential(m: &regex::Match<'_>) -> String {
     let text = m.as_str();
     let prefix: String = text.chars().take(4).collect();
-    format!("{}...[credential-redacted]", prefix)
+    format!("{prefix}...[credential-redacted]")
 }
 
 /// Scrub known credential patterns from text.
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn test_strips_long_hex() {
         let hex = "a".repeat(64);
-        let input = format!("key: {} end", hex);
+        let input = format!("key: {hex} end");
         let result = sanitize_tool_output(&input);
         assert_eq!(result, "key: [hex-redacted] end");
     }
@@ -231,8 +231,7 @@ mod tests {
         assert_eq!(
             result.matches("[credential-redacted]").count(),
             2,
-            "should redact both credentials: {}",
-            result
+            "should redact both credentials: {result}"
         );
     }
 

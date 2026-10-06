@@ -29,6 +29,9 @@
 //! migrated the task-local becomes redundant and can be retired, but that
 //! clean-up is out of scope for M8.1.
 
+mod build_cache_usage;
+pub use build_cache_usage::{BuildCacheUsage, BuildCacheUseGuard};
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,10 +53,23 @@ use octos_core::{PathClassification, SessionScope};
 #[derive(Debug, Clone)]
 pub struct ToolInputError(String);
 
+/// Upper bound on a [`ToolInputError`]'s model-facing message. The message can
+/// embed caller-controlled content (unknown parameter names), so it is bounded
+/// at construction — well under every tool's output limit (`tool_output_limit`
+/// min is 20_000) — so an armed tool's `Err` can never exceed the cap and be
+/// mangled by the execution loop's blind head/tail cut (#2193 R4). Real
+/// validation messages are a few hundred bytes.
+pub(crate) const TOOL_INPUT_ERROR_MAX_BYTES: usize = 4096;
+
 impl ToolInputError {
-    /// Build an input-validation error from a model-facing message.
+    /// Build an input-validation error from a model-facing message, bounded to
+    /// [`TOOL_INPUT_ERROR_MAX_BYTES`] so caller-supplied content (e.g. a
+    /// pathological unknown-parameter name) cannot make the error exceed the
+    /// tool-output cap.
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        let mut message = message.into();
+        octos_core::truncate_utf8(&mut message, TOOL_INPUT_ERROR_MAX_BYTES, "…[truncated]");
+        Self(message)
     }
 }
 
@@ -333,6 +349,18 @@ pub struct ToolContext {
     /// can enforce the goal-binding check WITHOUT re-reading the originator
     /// file on every call. `None` for non-peer sessions.
     pub originator_session: Option<String>,
+    /// Build-cache pool slot this peer's CURRENT turn holds (outer-loop #4,
+    /// design docs/build-cache-pool.md §7.4). Populated from
+    /// `Agent::build_cache_slot` at tool dispatch, exactly like
+    /// `goal_id`/`task_id` above. Read by the shell tool to inject
+    /// `CARGO_TARGET_DIR=<slot>/target` + `CARGO_INCREMENTAL=0` PER TOOL
+    /// CALL — never via `std::env::set_var`, because on the serve path a
+    /// peer shares the process with the master and every other peer.
+    /// `None` for non-peer sessions and a peer turn that failed to acquire
+    /// a slot (it still runs, just with cargo's default target dir).
+    pub build_cache_slot: Option<std::path::PathBuf>,
+    /// Shared child lifetime accounting for this cache claim.
+    pub build_cache_usage: Option<BuildCacheUsage>,
     /// Post-edit formatting (issue #1774): when true, a successful
     /// `edit_file` / `write_file` / `diff_edit` runs the language formatter
     /// for the file (rustfmt / prettier / black / gofmt — see
@@ -390,6 +418,8 @@ impl ToolContext {
             goal_id: None,
             task_id: None,
             originator_session: None,
+            build_cache_slot: None,
+            build_cache_usage: None,
             format_after_edit: false,
         }
     }
@@ -409,6 +439,14 @@ pub struct ToolApprovalRequest {
     pub body: String,
     pub command: Option<String>,
     pub cwd: Option<String>,
+    /// This approval covers exactly this call: a remembered approval scope
+    /// (`approve_for_tool`, `approve_for_session`, …) must neither answer it
+    /// nor be recorded from it. Set by host-routed app tools (UPCR-2026-035),
+    /// whose approvals carry the exact arguments.
+    pub once_only: bool,
+    /// A host-routed app tool's call (UPCR-2026-035): the owning app, the
+    /// tool, the exact arguments and the caller, for the host's own sheet.
+    pub host_tool: Option<octos_core::ui_protocol::ApprovalHostToolDetails>,
 }
 
 /// Decision returned to a blocked tool after client approval handling.
@@ -572,6 +610,16 @@ pub struct ToolResult {
     /// Values are restricted to strings in v1; key shape must match
     /// `[a-z][a-z0-9_]*`. Absent (`None`) when the tool emits nothing.
     pub named_outputs: Option<std::collections::HashMap<String, String>>,
+    /// Images the tool wants the MODEL to look at, as local paths.
+    ///
+    /// Distinct from `files_to_send`, which goes to the human over the chat
+    /// channel and is never shown to the model. The agent loop turns these
+    /// into a user-role message carrying the image right after the batch's
+    /// tool results, so every provider renders them the way it renders a
+    /// user upload; the tool result itself stays text. `view_image` is the
+    /// first caller: without this, a model that can see could only learn a
+    /// screenshot's byte length.
+    pub model_media: Vec<PathBuf>,
 }
 
 /// Trait for implementing tools.
@@ -630,6 +678,43 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with typed execution context.
     ///
+    /// How the model can retrieve output the harness had to truncate.
+    ///
+    /// Returns the advice to append when this tool's result exceeded
+    /// [`octos_core::tool_output_limit`] and was cut. `None` (the default)
+    /// means the tool has no resume path, so no advice is offered rather than
+    /// inventing one.
+    ///
+    /// ## Why this lives on the tool
+    ///
+    /// Truncation happens in the execution loop, at the one point every tool's
+    /// output funnels through — which is also the point that knows the least.
+    /// By then the result is a plain `String`: the helper doing the cutting
+    /// (`truncate_head_tail_report(s, max_len, head_ratio)`) receives a string and a
+    /// number and cannot know which tool produced it, whether that tool paginates,
+    /// or what the parameter is called.
+    ///
+    /// So the loop knows it truncated but not how to resume; the tool knows how
+    /// to resume but not that it was truncated. This hook is the missing half.
+    ///
+    /// Without it the model is told only `... [47000 bytes omitted] ...` — a
+    /// dead end whose only recovery is re-running the call, which returns the
+    /// same output cut the same way and spends the tokens the cap was meant to
+    /// save.
+    ///
+    /// # Arguments
+    /// * `args` - the arguments this call was made with, so advice can name a
+    ///   concrete next call rather than a generic one.
+    /// * `omitted_bytes` - how much was dropped.
+    fn truncation_recovery(
+        &self,
+        args: &serde_json::Value,
+        omitted_bytes: usize,
+    ) -> Option<String> {
+        let _ = (args, omitted_bytes);
+        None
+    }
+
     /// The default implementation delegates to [`Tool::execute`], discarding
     /// the context. Tools that want to read [`ToolContext`] fields override
     /// this and ignore `execute`'s default path. See the module-level doc
@@ -725,11 +810,21 @@ pub trait Tool: Send + Sync {
     fn blocks_on_human_input(&self) -> bool {
         false
     }
+
+    /// Where the tool's code runs ([`ToolOrigin`]). The registry records it
+    /// at registration, so a filter can select by origin instead of by
+    /// name. Default: [`ToolOrigin::Builtin`].
+    fn origin(&self) -> ToolOrigin {
+        ToolOrigin::Builtin
+    }
 }
 
 // Tool registry (extracted to its own module)
+/// Observe-only probe for the read-paging decision (changes no behaviour).
+pub(crate) mod read_paging_probe;
+pub(crate) mod read_window;
 mod registry;
-pub use registry::ToolRegistry;
+pub use registry::{RESERVED_BUILTIN_TOOL_NAMES, ToolOrigin, ToolRegistry};
 
 // Tool policy
 pub mod policy;
@@ -768,16 +863,20 @@ pub mod http;
 pub mod list_dir;
 pub mod manage_skills;
 pub mod mcp_agent;
+pub mod memory_load;
 pub mod memory_note;
+pub mod memory_search;
 pub mod message;
 pub mod peer_close;
 pub mod peer_gather;
 pub mod peer_handoff;
+pub mod peer_host_tool;
 pub mod peer_list;
 pub mod peer_respond;
 pub mod peer_send_input;
 pub mod read_file;
 pub mod read_task_output;
+pub mod recall;
 pub mod recall_memory;
 pub mod record_memory_use;
 pub(crate) mod replacer;
@@ -836,20 +935,30 @@ pub use mcp_agent::{
     StdioMcpAgent, build_backend_from_config, build_dispatch_event_payload, dispatch_with_metrics,
     record_dispatch,
 };
+pub use memory_load::MemoryLoadTool;
 pub use memory_note::MemoryNoteTool;
+pub use memory_search::MemorySearchTool;
 pub use message::MessageTool;
 pub use peer_close::{PeerCloseCallback, PeerCloseTool};
 pub use peer_gather::{PeerGatherCallback, PeerGatherTool};
 pub use peer_handoff::{
     PeerHandoffCallback, PeerHandoffRequest, PeerHandoffStaged, PeerHandoffTool,
 };
+pub use peer_host_tool::{
+    HOST_TOOL_MAX_ARGS_BYTES, HostRoutedTool, HostToolAudit, HostToolCall, HostToolCallOutcome,
+    HostToolCaller, HostToolConfirm, HostToolDecl, HostToolRisk, HostToolRouter, OccurrenceClaim,
+};
 pub use peer_list::{PeerListCallback, PeerListTool};
 pub use peer_respond::{
     PeerRespondAnswer, PeerRespondCallback, PeerRespondRequest, PeerRespondTool,
 };
-pub use peer_send_input::{PeerSendInputCallback, PeerSendInputRequest, PeerSendInputTool};
+pub use peer_send_input::{
+    PeerSendInputAnswerCallback, PeerSendInputCallback, PeerSendInputDelivery,
+    PeerSendInputRefusal, PeerSendInputRequest, PeerSendInputTool,
+};
 pub use read_file::ReadFileTool;
 pub use read_task_output::ReadTaskOutputTool;
+pub use recall::{RecallTool, ToolOutputLedger};
 pub use recall_memory::RecallMemoryTool;
 pub use record_memory_use::RecordMemoryUseTool;
 pub use save_memory::SaveMemoryTool;
@@ -961,14 +1070,120 @@ pub fn resolve_path_with_scope(
     user_path: &str,
     filesystem_scope: FilesystemScope,
 ) -> Result<PathBuf> {
-    if filesystem_scope.is_host() {
+    let resolved = if filesystem_scope.is_host() {
         let candidate = PathBuf::from(user_path);
         if candidate.is_absolute() {
-            return Ok(normalize_lexical(&candidate));
+            normalize_lexical(&candidate)
+        } else {
+            normalize_lexical(&base_dir.join(user_path))
         }
-        return Ok(normalize_lexical(&base_dir.join(user_path)));
+    } else {
+        resolve_path(base_dir, user_path)?
+    };
+    if is_process_secret_path(&resolved) || is_process_secret_path(Path::new(user_path)) {
+        eyre::bail!("process environments and command lines are off limits: {user_path}");
     }
-    resolve_path(base_dir, user_path)
+    Ok(resolved)
+}
+
+/// Refuse any path that reaches into a git directory (`.git` as ANY path
+/// component). The kernel runs `git` over agent-writable trees (workspace
+/// snapshots, history tools, receipts), and a repository's `config`,
+/// `hooks/` and `info/attributes` decide which programs git executes — a
+/// model that could write `sites/x/.git/config` could make the kernel run a
+/// clean filter, fsmonitor or hook of its choosing. File tools therefore
+/// never create, modify, move or delete anything inside a `.git`.
+///
+/// Judged on the lexical path and, when an ancestor exists, on its canonical
+/// form (so a symlink pointing into a `.git` does not slip past). Matching is
+/// case-insensitive and ignores the trailing dots/spaces and `GIT~1` short
+/// name NTFS/APFS normalise away, the same spellings git itself refuses.
+pub fn refuse_git_internal_path(path: &Path) -> std::result::Result<(), String> {
+    fn is_git_dir_name(name: &std::ffi::OsStr) -> bool {
+        let lossy = name.to_string_lossy();
+        let head = lossy.split(':').next().unwrap_or("");
+        let trimmed = head.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+        trimmed == ".git" || trimmed == "git~1"
+    }
+    fn has_git_component(path: &Path) -> bool {
+        path.components()
+            .any(|c| matches!(c, Component::Normal(name) if is_git_dir_name(name)))
+    }
+    let refused = || {
+        Err(format!(
+            "writes into a .git directory are not permitted: {}",
+            octos_core::truncated_utf8(&path.display().to_string(), 200, "…")
+        ))
+    };
+    if has_git_component(path) || has_git_component(&normalize_lexical(path)) {
+        return refused();
+    }
+    // Canonical check: the deepest existing ancestor, resolved, plus the
+    // not-yet-existing tail.
+    let mut existing = path.to_path_buf();
+    let mut tail = Vec::new();
+    while !existing.as_os_str().is_empty() && std::fs::symlink_metadata(&existing).is_err() {
+        match (
+            existing.file_name().map(|n| n.to_owned()),
+            existing.parent(),
+        ) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                existing = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+    if let Ok(mut real) = std::fs::canonicalize(&existing) {
+        for name in tail.iter().rev() {
+            real.push(name);
+        }
+        if has_git_component(&real) {
+            return refused();
+        }
+    }
+    Ok(())
+}
+
+/// A process's private view: anything under `/proc/self`, `/proc/thread-self`
+/// or `/proc/<pid>` (environment, command line, `fd/`, `root/`, `cwd`,
+/// `mem`, …) and `/dev/fd`, `/dev/std*`. No file tool opens these in any
+/// filesystem scope, however the path is spelled: the raw spelling, its
+/// lexical normalization and (when it exists) its canonical target are all
+/// judged, so `..`, a leading `/../..` or a workspace symlink cannot slip
+/// past. System-wide `/proc` files such as `/proc/cpuinfo` stay readable.
+pub fn is_process_secret_path(path: &Path) -> bool {
+    fn private_view(path: &Path) -> bool {
+        let text = path.to_string_lossy();
+        let text = text.trim_end_matches('/');
+        let mut parts = text
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".");
+        let found = |parts: &mut dyn Iterator<Item = &str>| -> bool {
+            let mut previous = "";
+            for part in parts {
+                if previous == "proc"
+                    && (part == "self"
+                        || part == "thread-self"
+                        || part.chars().all(|c| c.is_ascii_digit()))
+                {
+                    return true;
+                }
+                if previous == "dev" && (part == "fd" || part.starts_with("std")) {
+                    return true;
+                }
+                if part == "environ" || part == "cmdline" {
+                    return text.contains("/proc/");
+                }
+                previous = part;
+            }
+            false
+        };
+        found(&mut parts)
+    }
+    private_view(path)
+        || private_view(&normalize_lexical(path))
+        || std::fs::canonicalize(path).is_ok_and(|real| private_view(&real))
 }
 
 /// Resolve and classify a user-supplied path against a [`SessionScope`]
@@ -1015,6 +1230,11 @@ fn resolve_for_scope(
     user_path: &str,
     for_write: bool,
 ) -> Result<PathBuf, &'static str> {
+    if is_process_secret_path(Path::new(user_path))
+        || is_process_secret_path(&normalize_lexical(Path::new(user_path)))
+    {
+        return Err("process environments and command lines are off limits");
+    }
     // Upload handles (`up/<base64>/<name>`) are opaque references to a file in
     // the authenticated upload tmpdir — NOT workspace-relative paths. Without
     // this short-circuit the join+classify logic below treats them as
@@ -1120,6 +1340,15 @@ fn resolve_for_scope(
         PathClassification::InSkillDir { .. } => {
             if for_write {
                 Err("Writes to plugin skill directories are not permitted")
+            } else {
+                Ok(lex_normalised)
+            }
+        }
+        // UPCR-2026-034 `read_parent`: a request context reads its peer's
+        // folder; it never writes there.
+        PathClassification::InReadOnlyView { .. } => {
+            if for_write {
+                Err("Writes outside this context's own folder are not permitted")
             } else {
                 Ok(lex_normalised)
             }
@@ -1307,10 +1536,105 @@ pub async fn read_no_follow(path: &Path) -> std::io::Result<String> {
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
+/// Open a file read-only, atomically rejecting symlinks (O_NOFOLLOW on Unix).
+///
+/// SECURITY: the flags here MUST match [`read_no_follow`]'s open exactly.
+#[cfg(unix)]
+fn open_no_follow_ro(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_no_follow_ro(path: &Path) -> std::io::Result<std::fs::File> {
+    if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "symlink rejected",
+        ));
+    }
+    std::fs::OpenOptions::new().read(true).open(path)
+}
+
+/// The descriptor-derived facts an armed windowed read needs beyond the bytes.
+pub(crate) struct ReadMeta {
+    /// [`crate::tools::read_window::ViewEpoch`] taken from the SAME descriptor
+    /// the bytes came from — not a separate path stat — so it describes the
+    /// exact inode whose bytes were shown (#2193 R4, read-side TOCTOU).
+    /// `None` only if the descriptor's metadata was unavailable, which never
+    /// authorizes a write.
+    pub epoch: Option<crate::tools::read_window::ViewEpoch>,
+    /// The returned content is a DECODE of the on-disk bytes (PDF text
+    /// extraction), not the bytes themselves — so a whole-file rewrite
+    /// reconstructed from it can never be faithful, and the view must never be
+    /// allowed to reach COMPLETE (#2193 R4, PDF false-COMPLETE).
+    pub transformed: bool,
+}
+
+/// Like [`read_no_follow`] but also returns the [`ReadMeta`] the armed
+/// windowed-read ledger needs. Kept as a distinct entry point so the many
+/// non-armed `read_no_follow` callers pay nothing for the extra `fstat`.
+pub(crate) async fn read_no_follow_with_meta(path: &Path) -> std::io::Result<(String, ReadMeta)> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = open_no_follow_ro(&path)?;
+        // fstat the DESCRIPTOR (not a re-resolution of the path): binds the
+        // epoch to the exact inode these bytes are read from.
+        let epoch = file
+            .metadata()
+            .ok()
+            .and_then(|m| crate::tools::read_window::ViewEpoch::from_metadata(&m));
+        // Same PDF handling as read_no_follow, reading the rest from the SAME
+        // O_NOFOLLOW descriptor (seek back to 0), never by re-opening the path.
+        let mut magic = [0u8; 5];
+        let n = file.read(&mut magic)?;
+        file.seek(SeekFrom::Start(0))?;
+        if n >= 5 && &magic == b"%PDF-" {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            match pdf_extract::extract_text_from_mem(&bytes) {
+                Ok(text) => Ok((
+                    text,
+                    ReadMeta {
+                        epoch,
+                        transformed: true,
+                    },
+                )),
+                Err(err) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("pdf extraction failed: {err}"),
+                )),
+            }
+        } else {
+            let mut content = String::with_capacity(n);
+            file.read_to_string(&mut content)?;
+            Ok((
+                content,
+                ReadMeta {
+                    epoch,
+                    transformed: false,
+                },
+            ))
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
 /// Write content to a file, atomically rejecting symlinks via O_NOFOLLOW on Unix.
 ///
 /// Eliminates the TOCTOU race between `reject_symlink` and `tokio::fs::write`.
 pub async fn write_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if let Err(reason) = refuse_git_internal_path(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            reason,
+        ));
+    }
     let path = path.to_owned();
     let content = content.to_owned();
     tokio::task::spawn_blocking(move || {
@@ -1334,6 +1658,84 @@ pub async fn write_no_follow(path: &Path, content: &[u8]) -> std::io::Result<()>
         let mut file = opts.open(&path)?;
         file.write_all(&content)?;
         Ok(())
+    })
+    .await
+    .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
+/// Outcome of an epoch-bound overwrite ([`write_no_follow_checked`]).
+#[derive(Debug)]
+pub(crate) enum CheckedWrite {
+    /// The opened descriptor matched the authorizing epoch and was truncated
+    /// and rewritten.
+    Written,
+    /// The opened descriptor's epoch (mtime/size/ctime/inode) no longer
+    /// matched what authorized the write — nothing was written.
+    EpochChanged {
+        /// The descriptor's actual epoch at open time.
+        found: crate::tools::read_window::ViewEpoch,
+    },
+}
+
+/// Overwrite an EXISTING file, but only if the descriptor we open still
+/// matches `expected` (#1638 R1 — TOCTOU).
+///
+/// The armed write guard authorizes an overwrite against a *stat of the path*.
+/// A plain `write_no_follow` then opens the path AGAIN and truncates whatever
+/// it resolves to — so an external replacement in that narrow authorize→open
+/// window is silently clobbered. This binds the authorization to the exact
+/// opened inode: it opens WITHOUT `O_TRUNC`, `fstat`s the descriptor, and only
+/// truncates + writes when that descriptor's `(mtime, size)` still equals the
+/// epoch that authorized the write. `O_NOFOLLOW` still rejects a symlink swap;
+/// operating on the validated descriptor (not a re-resolved path) closes the
+/// race even against a same-name inode swap after validation.
+pub(crate) async fn write_no_follow_checked(
+    path: &Path,
+    content: &[u8],
+    expected: crate::tools::read_window::ViewEpoch,
+) -> std::io::Result<CheckedWrite> {
+    if let Err(reason) = refuse_git_internal_path(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            reason,
+        ));
+    }
+    let path = path.to_owned();
+    let content = content.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        // No create, no truncate — we must inspect the descriptor before
+        // destroying its contents.
+        opts.write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        {
+            if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "symlink rejected",
+                ));
+            }
+        }
+        let mut file = opts.open(&path)?;
+        // fstat the DESCRIPTOR itself (not a re-resolution of the path). The
+        // epoch binds mtime/size/ctime/inode, so a same-size replacement that
+        // forged mtime is caught by the ctime (or inode) mismatch.
+        let meta = file.metadata()?;
+        let found = crate::tools::read_window::ViewEpoch::from_metadata(&meta)
+            .ok_or_else(|| std::io::Error::other("descriptor metadata unavailable"))?;
+        if found != expected {
+            return Ok(CheckedWrite::EpochChanged { found });
+        }
+        // The validated descriptor is the one we truncate and rewrite.
+        file.set_len(0)?;
+        file.write_all(&content)?;
+        Ok(CheckedWrite::Written)
     })
     .await
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
@@ -1370,6 +1772,50 @@ pub fn file_io_error(e: std::io::Error, display_path: &str) -> ToolResult {
 
 #[cfg(test)]
 mod nofollow_tests {
+
+    #[test]
+    fn should_flag_git_internal_paths_when_any_component_is_a_git_dir() {
+        for p in [
+            "/w/.git/config",
+            "/w/sites/demo/.git/hooks/pre-commit",
+            "/w/sites/demo/.GIT/config",
+            "/w/sites/demo/.git./config",
+            "/w/sites/demo/GIT~1/config",
+            "/w/.git",
+        ] {
+            assert!(refuse_git_internal_path(Path::new(p)).is_err(), "{p}");
+        }
+        for p in [
+            "/w/sites/demo/index.html",
+            "/w/.gitignore",
+            "/w/.github/x.yml",
+            "/w/a.git/x",
+        ] {
+            assert!(refuse_git_internal_path(Path::new(p)).is_ok(), "{p}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_flag_git_internal_paths_when_an_ancestor_symlink_points_into_git() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("sites/demo/.git")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("sites/demo/.git"), dir.path().join("link"))
+            .unwrap();
+        assert!(refuse_git_internal_path(&dir.path().join("link/config")).is_err());
+    }
+
+    #[tokio::test]
+    async fn should_refuse_write_no_follow_when_path_is_git_internal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        assert!(
+            write_no_follow(&dir.path().join(".git/config"), b"x")
+                .await
+                .is_err()
+        );
+        assert!(!dir.path().join(".git/config").exists());
+    }
     use super::*;
 
     #[tokio::test]
@@ -1380,6 +1826,120 @@ mod nofollow_tests {
 
         let content = read_no_follow(&file).await.unwrap();
         assert_eq!(content, "hello");
+    }
+
+    // R1 (#1638): the epoch-bound writer closes the TOCTOU between the write
+    // guard's authorizing stat and the truncating open. It fstat's the
+    // descriptor it is about to truncate and refuses if that inode's
+    // (mtime, size) no longer matches what authorized the write — so an
+    // external replacement in the narrow authorize→truncate window is caught
+    // on the exact opened object, not a re-resolved path.
+    // Unix-only: off-Unix the epoch has no ctime, so the documented weaker
+    // (mtime,size) fallback cannot detect a same-size/same-mtime swap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checked_write_refuses_a_same_size_same_mtime_content_swap() {
+        // #2193 R4 (codex H2): the (mtime,size)-only epoch authorized an
+        // overwrite of content the model never saw when a replacement kept the
+        // size and FORGED the mtime back. The epoch now also binds ctime, and
+        // forging mtime with `set_modified` is itself what bumps ctime — so the
+        // swap is caught. Under the old epoch this returned `Written` (RED).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, b"AAAAAAAAAA").unwrap(); // 10 bytes
+        let meta = std::fs::metadata(&path).unwrap();
+        let mtime = meta.modified().unwrap();
+        let authorized = crate::tools::read_window::ViewEpoch::from_metadata(&meta).unwrap();
+
+        std::fs::write(&path, b"BBBBBBBBBB").unwrap(); // same size, new content
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let now = std::fs::metadata(&path).unwrap();
+        assert_eq!(now.len(), authorized.size, "size still matches");
+        assert_eq!(now.modified().unwrap(), mtime, "mtime forged back to match");
+
+        let result = write_no_follow_checked(&path, b"CCCCCCCCCC", authorized)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, CheckedWrite::EpochChanged { .. }),
+            "same-size, same-mtime content swap must be refused (ctime binding)",
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"BBBBBBBBBB",
+            "the swapped-in bytes must be intact — never blind-clobbered",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_with_meta_reports_untransformed_epoch_from_the_read_fd() {
+        // #2193 R4 (codex H2b/H6): the armed ledger needs the epoch taken from
+        // the READ descriptor (not a separate path stat), and transformed=false
+        // for ordinary text.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        std::fs::write(&path, b"hello world\n").unwrap();
+        let (content, meta) = read_no_follow_with_meta(&path).await.unwrap();
+        assert_eq!(content, "hello world\n");
+        assert!(!meta.transformed, "plain text is not a transform");
+        let epoch = meta.epoch.expect("descriptor epoch");
+        assert_eq!(epoch.size, 12);
+        let independent =
+            crate::tools::read_window::ViewEpoch::from_metadata(&std::fs::metadata(&path).unwrap())
+                .unwrap();
+        assert_eq!(epoch, independent, "epoch describes the exact inode read");
+    }
+
+    #[tokio::test]
+    async fn write_no_follow_checked_writes_when_epoch_matches() {
+        use crate::tools::read_window::ViewEpoch;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "original").unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        let epoch = ViewEpoch::from_metadata(&meta).unwrap();
+
+        let outcome = write_no_follow_checked(&file, b"rebuilt", epoch)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CheckedWrite::Written),
+            "a matching epoch must write"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "rebuilt");
+    }
+
+    #[tokio::test]
+    async fn write_no_follow_checked_refuses_a_replaced_inode() {
+        use crate::tools::read_window::ViewEpoch;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "original small").unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        let authorized = ViewEpoch::from_metadata(&meta).unwrap();
+
+        // The file is replaced (new size ⇒ new epoch) in the window between
+        // the guard authorizing against `authorized` and this write opening
+        // the descriptor.
+        std::fs::write(&file, "REPLACED with different, important, longer content").unwrap();
+
+        let outcome = write_no_follow_checked(&file, b"model rebuild", authorized)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, CheckedWrite::EpochChanged { .. }),
+            "a replaced inode must be refused, not truncated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "REPLACED with different, important, longer content",
+            "the descriptor the guard did not authorize must be left intact"
+        );
     }
 
     /// Pins the PDF auto-extract path (mini5 invoice regression
@@ -2374,5 +2934,29 @@ mod tool_context_tests {
         let permissions = ToolPermissions::default();
         assert!(permissions.is_tool_allowed("anything"));
         assert!(permissions.is_tool_allowed("shell"));
+    }
+}
+
+#[cfg(test)]
+mod process_secret_path_tests {
+    use super::*;
+
+    #[test]
+    fn should_refuse_process_environments_in_every_scope() {
+        for path in [
+            "/proc/1/environ",
+            "/proc/self/cmdline",
+            "/proc/9/task/9/environ",
+            "/proc/1/../1/environ",
+        ] {
+            assert!(
+                resolve_path_with_scope(Path::new("/tmp"), path, FilesystemScope::Host).is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            resolve_path_with_scope(Path::new("/tmp"), "/proc/cpuinfo", FilesystemScope::Host)
+                .is_ok()
+        );
     }
 }

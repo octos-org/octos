@@ -42,7 +42,13 @@ pub struct PeerHandoffRequest {
     /// (case-insensitive) rather than auto-suffixing.
     pub name: String,
     /// Whether the host should fence the peer in its own git worktree.
-    pub worktree: bool,
+    /// `None` = the caller did NOT say (the tool argument was omitted) — the
+    /// host then decides from its collision predicate (#20a smart fencing:
+    /// multi-goal / branch-diverged / unfenced-in-flight ⇒ fence).
+    /// `Some(true)`/`Some(false)` are explicit and always respected (an
+    /// explicit `false` that contradicts the predicate is honored with a
+    /// warning in `PeerHandoffStaged.model_note`).
+    pub worktree: Option<bool>,
     /// Optional model LANE for this peer: the KEY of a `sub_provider`
     /// configured in the master's profile (e.g. `"cheap"`, `"strong"`).
     /// `None` (or an empty/whitespace value, normalized to `None` by
@@ -57,6 +63,9 @@ pub struct PeerHandoffRequest {
     /// Optional TASK ID within the goal. When set, the peer's work is tracked
     /// as part of this specific task.
     pub task_id: Option<String>,
+    /// Optional cumulative token limit for this peer's turns. Omit when the
+    /// user did not specify a budget.
+    pub token_budget: Option<u64>,
 }
 
 /// Staged-peer facts the host callback returns on success.
@@ -78,6 +87,8 @@ pub struct PeerHandoffStaged {
     /// peer falls back to the primary model). `None` when no lane was
     /// requested or the requested lane resolved cleanly.
     pub model_note: Option<String>,
+    /// Cumulative peer token limit written at staging, if requested.
+    pub token_budget: Option<u64>,
 }
 
 /// Host staging callback. Synchronous by design: the tool needs the staged
@@ -105,13 +116,15 @@ struct Input {
     brief: String,
     name: String,
     #[serde(default)]
-    worktree: bool,
+    worktree: Option<bool>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     goal_id: Option<String>,
     #[serde(default)]
     task_id: Option<String>,
+    #[serde(default)]
+    token_budget: Option<u64>,
 }
 
 fn failure(output: impl Into<String>) -> ToolResult {
@@ -176,11 +189,16 @@ impl Tool for PeerHandoffTool {
                 },
                 "worktree": {
                     "type": "boolean",
-                    "description": "Fence the peer in its own git worktree on branch peer/<slug> (default false). Use for code changes that must not collide with this session's working tree."
+                    "description": "Fence the peer in its own git worktree on branch peer/<slug>. Omit for the host's collision-aware default (auto-fences when the run could collide with another goal/peer). Pass true for code changes that must not collide with this session's working tree; pass false to force sharing (a warning is noted when that contradicts the collision check)."
                 },
                 "model": {
                     "type": "string",
                     "description": "Optional model lane for this peer — the KEY of a sub_provider configured in your profile (e.g. \"cheap\", \"strong\"). Omit to use the profile's primary model."
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional cumulative token budget for this peer. Set only when the user requested a token limit; the peer stops accepting new turns after the limit is reached."
                 }
             }
         })
@@ -221,6 +239,9 @@ impl Tool for PeerHandoffTool {
                  contract; keep the payload in the workspace and reference it by path."
             )));
         }
+        if input.token_budget == Some(0) {
+            return Ok(failure("token_budget must be a positive integer"));
+        }
         // Normalize the optional model lane: trim and drop an empty/whitespace
         // value to `None` so the host only ever sees a real lane key.
         let model = input
@@ -236,6 +257,7 @@ impl Tool for PeerHandoffTool {
             model,
             goal_id: input.goal_id,
             task_id: input.task_id,
+            token_budget: input.token_budget,
         };
         match (self.stage)(request) {
             Ok(staged) => {
@@ -243,7 +265,11 @@ impl Tool for PeerHandoffTool {
                     "Staged peer '{name}' (slug {slug}, brief at {brief_path}, cwd {cwd}). \
                      Address it later by name with peer_send_input / peer_close. The user's \
                      client opens it in the background; its result lands on the blackboard \
-                     at peers/{slug}/result.md. Do not wait for it — and do not \
+                     at peers/{slug}/result.md (#27f: when the peer session itself writes \
+                     the final result.md it must ALSO write a one-line sidecar file \
+                     `.result-owner` containing `peer` next to it — that claims \
+                     single-writer ownership and stops the runtime's turn-summary \
+                     copy from clobbering the peer's final version). Do not wait for it — and do not \
                      stop here: if you still have work of your own, continue it \
                      now in this same turn. Only finish if the peer took over \
                      everything that was left.",
@@ -256,6 +282,9 @@ impl Tool for PeerHandoffTool {
                 if let Some(note) = &staged.model_note {
                     output.push(' ');
                     output.push_str(note);
+                }
+                if let Some(limit) = staged.token_budget {
+                    output.push_str(&format!(" Peer token budget: {limit}."));
                 }
                 Ok(ToolResult {
                     output,
@@ -285,8 +314,12 @@ mod tests {
                 topic: "peer-ci-fix".to_owned(),
                 brief_path: "/data/peers/ci-fix/brief.md".to_owned(),
                 cwd: "/work/peers/ci-fix/wt".to_owned(),
-                worktree_branch: request.worktree.then(|| "peer/ci-fix".to_owned()),
+                worktree_branch: request
+                    .worktree
+                    .unwrap_or(false)
+                    .then(|| "peer/ci-fix".to_owned()),
                 model_note: None,
+                token_budget: request.token_budget,
             })
         }));
         (tool, seen)
@@ -431,6 +464,7 @@ mod tests {
                 "brief": "  Fix the flaky bus test; repro in crates/octos-bus.  ",
                 "name": "  CI Fix  ",
                 "worktree": true,
+                "token_budget": 12_345,
             }))
             .await
             .unwrap();
@@ -443,13 +477,15 @@ mod tests {
             PeerHandoffRequest {
                 brief: "Fix the flaky bus test; repro in crates/octos-bus.".to_owned(),
                 name: "CI Fix".to_owned(),
-                worktree: true,
+                worktree: Some(true),
                 model: None,
                 goal_id: None,
                 task_id: None,
+                token_budget: Some(12_345),
             },
             "brief/name are trimmed, worktree passes through"
         );
+        assert!(result.output.contains("Peer token budget: 12345"));
 
         // The result addresses the peer by NAME and teaches the fire-and-forget
         // contract (the recorder maps it to slug `ci-fix`).
@@ -508,7 +544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_default_worktree_when_omitted() {
+    async fn should_leave_worktree_unspecified_when_omitted() {
         let (tool, seen) = tool_with_recorder();
 
         let result = tool
@@ -523,10 +559,13 @@ mod tests {
             PeerHandoffRequest {
                 brief: "Just the brief.".to_owned(),
                 name: "Solo".to_owned(),
-                worktree: false,
+                // #20a — omitted stays UNSPECIFIED so the host applies its
+                // collision-aware default; the tool never invents a value.
+                worktree: None,
                 model: None,
                 goal_id: None,
                 task_id: None,
+                token_budget: None,
             }
         );
     }
@@ -590,6 +629,7 @@ mod tests {
                 cwd: "/work".to_owned(),
                 worktree_branch: None,
                 model_note: note,
+                token_budget: request.token_budget,
             })
         }));
 

@@ -89,6 +89,18 @@ export WECOM_BOT_SECRET="your_secret"
 
 ---
 
+## 会话历史问题
+
+### 崩溃后会话历史消失了
+
+在后台分段封存的半途崩溃或被杀，可能把一个会话的全部历史留在封存分段（`<name>.segments/`）里而没有活跃的 `<name>.jsonl` 文件。此时该会话在列表里看起来是空的——或者干脆不存在。
+
+该状态会自愈：打开会话时会从封存分段重建活跃文件；在网关上，`/new <name>` 也以同样方式恢复该会话——历史接续，而不是从头开始。恢复不删除任何东西——存在但无法读取的活跃文件会原样保留，留给人工修复。
+
+要有意地重新开始，用 `/clear`（或裸 `/new`），它会清空当前会话的历史。
+
+---
+
 ## 平台特定问题
 
 | 问题 | 解决方案 |
@@ -98,6 +110,7 @@ export WECOM_BOT_SECRET="your_secret"
 | 服务无法启动 | 查看日志：`tail -f ~/.octos/serve.log`（macOS）或 `journalctl --user -u octos-serve`（Linux） |
 | Windows: 找不到 `octos` | 确保 `%USERPROFILE%\.cargo\bin` 在 PATH 中 |
 | Windows: shell 命令失败 | 命令通过 `cmd /C` 执行；使用 Windows 兼容的语法 |
+| 升级后会话看起来变短了 | 历史现在按新到旧最多加载 `OCTOS_SESSION_LOAD_BUDGET_BYTES`（32 MiB）；更早的轮次存于 `<name>.segments/` 并按需加载——没有删除任何内容 |
 
 ---
 
@@ -129,3 +142,5 @@ export WECOM_BOT_SECRET="your_secret"
 | `EMAIL_PASSWORD` | 邮箱账户密码 |
 | `WECOM_CORP_ID` | 企业微信企业 ID |
 | `WECOM_AGENT_SECRET` | 企业微信应用密钥 |
+| `OCTOS_SESSION_SEGMENT_BYTES` | 活跃会话文件封存为分段的大小（默认 8 MiB） |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | 普通加载按新到旧读取的会话历史字节数（默认 32 MiB；`0` = 不限） |

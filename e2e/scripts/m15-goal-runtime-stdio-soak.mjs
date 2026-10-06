@@ -189,7 +189,11 @@ fs.writeFileSync(
 
 const child = spawn(
   octosBin,
-  ['serve', '--stdio', '--data-dir', dataDir, '--cwd', workspace],
+  // #2486: profile/local/create is gated behind the local-solo opt-in, so
+  // the spawned server must enable it or the soak dies before any turn.
+  // --solo is the danger-surface keystone: fine for this throwaway stdio
+  // child, but never copy it to a network-exposed serve.
+  ['serve', '--stdio', '--solo', '--data-dir', dataDir, '--cwd', workspace],
   {
     cwd: repoRoot,
     env: {
@@ -205,6 +209,7 @@ const notifications = [];
 // Notifications are partitioned by session_id so the two scenarios
 // can independently track recurrence.
 const turnCompletedBySession = new Map();
+const turnErroredBySession = new Map();
 const messageDeltasBySession = new Map();
 let stderrText = '';
 let nextSeq = 0;
@@ -216,6 +221,18 @@ function bucket(map, sessionId) {
     map.set(sessionId, entry);
   }
   return entry;
+}
+
+// Fail a wait immediately when the session's turn ended in a non-completed
+// outcome, instead of burning the whole deadline on a goal that can never
+// produce another continuation.
+function assertNoTerminalFailure(sessionId) {
+  const failure = bucket(turnErroredBySession, sessionId)[0];
+  if (failure) {
+    throw new Error(
+      `turn terminal outcome=${failure.outcome}: ${JSON.stringify(failure.error || {})}`,
+    );
+  }
 }
 
 child.stderr.on('data', (chunk) => {
@@ -252,13 +269,27 @@ rl.on('line', (line) => {
   notifications.push(frame);
   const params = frame.params || {};
   const sessionId = params.session_id || params.sessionId || params?.session?.session_id || '';
-  if (frame.method === 'message/delta') {
-    bucket(messageDeltasBySession, sessionId).push({
-      at: Date.now(),
-      text: typeof params.text === 'string' ? params.text : '',
-    });
-  } else if (frame.method === 'turn/completed') {
-    bucket(turnCompletedBySession, sessionId).push({ at: Date.now(), params });
+  // Canonical v2 lane: raw `message/delta` and `turn/*` frames are
+  // suppressed for every connection since #2318, so streamed content and
+  // the turn terminal arrive as projection/envelope payloads.
+  if (frame.method === 'projection/envelope') {
+    const payload = params.payload || {};
+    const data = payload.data || {};
+    if (payload.type === 'assistant_delta') {
+      if (typeof data.text === 'string') {
+        bucket(messageDeltasBySession, sessionId).push({ at: Date.now(), text: data.text });
+      }
+    } else if (payload.type === 'turn_terminal') {
+      if (data.outcome === 'completed') {
+        bucket(turnCompletedBySession, sessionId).push({ at: Date.now(), params });
+      } else {
+        bucket(turnErroredBySession, sessionId).push({
+          at: Date.now(),
+          outcome: data.outcome,
+          error: data.error || null,
+        });
+      }
+    }
   }
 });
 
@@ -368,7 +399,10 @@ async function runBudgetExhaustScenario() {
 
   // Initial continuation. `set_goal` enqueues immediately on active.
   await waitFor(
-    () => turnsBucket.length > beforeTurns,
+    () => {
+      assertNoTerminalFailure(sessionAId);
+      return turnsBucket.length > beforeTurns;
+    },
     'initial goal continuation',
     1000,
     180_000,
@@ -380,7 +414,10 @@ async function runBudgetExhaustScenario() {
   // scheduler is wired. The SessionActor's continuation tick is 2s,
   // so total worst-case ≈ 30s gate + 2s tick + LLM latency.
   await waitFor(
-    () => turnsBucket.length > afterInitialTurns,
+    () => {
+      assertNoTerminalFailure(sessionAId);
+      return turnsBucket.length > afterInitialTurns;
+    },
     'second goal continuation past GOAL_MIN_CONTINUATION_INTERVAL_MS',
     1500,
     goalMinContinuationIntervalMs + 180_000,
@@ -473,7 +510,10 @@ async function runSentinelCompleteScenario() {
   const goalId = setResult.goal.goal_id;
 
   await waitFor(
-    () => turnsBucket.length > beforeTurns,
+    () => {
+      assertNoTerminalFailure(sessionBId);
+      return turnsBucket.length > beforeTurns;
+    },
     'initial sentinel-scenario continuation',
     1000,
     180_000,
@@ -486,6 +526,7 @@ async function runSentinelCompleteScenario() {
   let sentinelObserved = false;
   await waitFor(
     async () => {
+      assertNoTerminalFailure(sessionBId);
       // Inline assistant-tail check so we do not poll the orchestrator
       // when the model hasn't yet emitted the sentinel.
       const tail = deltasBucket
@@ -518,7 +559,7 @@ async function runSentinelCompleteScenario() {
   // Confirm the goal stays complete and the orchestrator does not
   // queue further continuations. We wait one full
   // GOAL_MIN_CONTINUATION_INTERVAL_MS window past the sentinel turn
-  // and assert no new turn/completed frames arrived for this session.
+  // and assert no new turn terminals arrived for this session.
   const turnsAtCompletion = turnsBucket.length;
   await sleep(goalMinContinuationIntervalMs + 5_000);
   const noFurtherContinuation = turnsBucket.length === turnsAtCompletion;
@@ -589,6 +630,9 @@ async function main() {
     turnsBySession: Object.fromEntries(
       Array.from(turnCompletedBySession.entries()).map(([key, value]) => [key, value.length]),
     ),
+    turnErrorsBySession: Object.fromEntries(
+      Array.from(turnErroredBySession.entries()).map(([key, value]) => [key, value.length]),
+    ),
     goalMinContinuationIntervalMs,
     knownGaps: [
       'organic_token_exhaustion_not_wire_observable: session_actor wires tokens_consumed=0 today (see #1133); explicit set_goal(status="budget_limited") is the only wire-supported transition this soak can exercise.',
@@ -616,6 +660,9 @@ main()
       notifications: notifications.length,
       turnsBySession: Object.fromEntries(
         Array.from(turnCompletedBySession.entries()).map(([key, value]) => [key, value.length]),
+      ),
+      turnErrorsBySession: Object.fromEntries(
+        Array.from(turnErroredBySession.entries()).map(([key, value]) => [key, value.length]),
       ),
       secretScanClean: offenders.length === 0,
       secretScanOffenders: offenders,

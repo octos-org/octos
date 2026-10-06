@@ -41,6 +41,14 @@ const FIRST_PARTY_SKILL_ENV_VARS: &[&str] = &[
     "VERTEX_BASE_URL",
     "DASHSCOPE_API_KEY",
     "DASHSCOPE_BASE_URL",
+    "ARK_API_KEY",
+    "ARK_BASE_URL",
+    // Research tool operator settings (deep-search / deep-crawl):
+    // self-hosted SearXNG base URL, robots.txt (default off) and the
+    // search-results scrape opt-in (default off).
+    "SEARXNG_URL",
+    "OCTOS_RESPECT_ROBOTS",
+    "OCTOS_ALLOW_SERP_SCRAPE",
 ];
 
 /// Google / Vertex credential material: the raw service-account JSON, the
@@ -98,6 +106,9 @@ pub(crate) fn canonical_search_env(provider_id: &str) -> Option<&'static str> {
         "brave" => Some("BRAVE_API_KEY"),
         "you" => Some("YDC_API_KEY"),
         "serper" => Some("SERPER_API_KEY"),
+        // Not a secret: the base URL of a self-hosted SearXNG instance
+        // (profile `search.providers.searxng.api_key_env` names the variable).
+        "searxng" => Some("SEARXNG_URL"),
         _ => None,
     }
 }
@@ -135,6 +146,33 @@ fn push_env_once(env: &mut Vec<(String, String)>, key: impl Into<String>, value:
     env.push((key, value));
 }
 
+/// Export the immutable, resolved runtime route, replacing raw profile metadata.
+pub(crate) fn apply_resolved_profile_llm_env(
+    env: &mut Vec<(String, String)>,
+    config: &Config,
+    config_revision: &str,
+) {
+    let values = [
+        (
+            "OCTOS_PROFILE_LLM_PROVIDER",
+            crate::runtime::profile::configured_provider_name(config),
+        ),
+        ("OCTOS_PROFILE_LLM_MODEL", config.model.clone()),
+        ("OCTOS_PROFILE_LLM_BASE_URL", config.base_url.clone()),
+        ("OCTOS_PROFILE_LLM_API_TYPE", config.api_type.clone()),
+        (
+            "OCTOS_PROFILE_LLM_CONFIG_REVISION",
+            Some(config_revision.to_string()),
+        ),
+    ];
+    env.retain(|(name, _)| !values.iter().any(|(key, _)| name == key));
+    env.extend(values.into_iter().filter_map(|(name, value)| {
+        value
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| (name.to_string(), value))
+    }));
+}
+
 pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = profile_search_provider_keys(profile)
         .into_iter()
@@ -154,6 +192,30 @@ pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<
             .or_else(|| std::env::var(key).ok())
         {
             push_env_once(&mut env, *key, value);
+        }
+    }
+
+    // Give first-party skills the same non-secret model selection that the
+    // profile runtime uses. Skills still declare these names in their manifest
+    // before the strict environment gate will expose them, and an explicit
+    // skill-specific override remains free to take precedence inside the
+    // skill. Provider credentials continue through the existing, separately
+    // allowlisted secret path above.
+    if let Some(primary) = profile
+        .config
+        .llm
+        .as_ref()
+        .and_then(|llm| llm.primary.as_ref())
+    {
+        if let Some(provider) = primary
+            .family_id
+            .as_deref()
+            .or_else(|| primary.model_id.as_deref().and_then(detect_provider))
+        {
+            push_env_once(&mut env, "OCTOS_PROFILE_LLM_PROVIDER", provider.to_string());
+        }
+        if let Some(model) = primary.model_id.as_deref() {
+            push_env_once(&mut env, "OCTOS_PROFILE_LLM_MODEL", model.to_string());
         }
     }
 
@@ -205,27 +267,6 @@ pub(crate) fn profile_plugin_env(profile: &crate::profiles::UserProfile) -> Vec<
     }
 
     env
-}
-
-fn discover_ominix_url() -> Option<String> {
-    std::env::var("OMINIX_API_URL")
-        .ok()
-        .map(|s| s.trim().trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            let home = std::env::var_os("HOME")?;
-            for dir in [".ominix", ".OminiX"] {
-                let discovery = std::path::Path::new(&home).join(dir).join("api_url");
-                if let Some(url) = std::fs::read_to_string(discovery)
-                    .ok()
-                    .map(|s| s.trim().trim_end_matches('/').to_string())
-                    .filter(|s| !s.is_empty())
-                {
-                    return Some(url);
-                }
-            }
-            None
-        })
 }
 
 fn push_runtime_plugin_env(
@@ -280,6 +321,13 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
     let base_provider = create_provider(&provider_name, config, model, base_url)?;
     let mut adaptive_router_ref: Option<Arc<AdaptiveRouter>> = None;
 
+    // #2142: operator override of the primary's effective context window.
+    let base_provider = crate::qos_catalog::apply_context_window_override(
+        base_provider,
+        config.context_window,
+        "primary",
+    );
+
     let llm: Arc<dyn LlmProvider> = if no_retry {
         base_provider
     } else if config.fallback_models.is_empty() {
@@ -304,6 +352,12 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
                 fallback.api_type.as_deref(),
             ) {
                 Ok(provider) => {
+                    // #2142: per-fallback context-window override.
+                    let provider = crate::qos_catalog::apply_context_window_override(
+                        provider,
+                        fallback.context_window,
+                        "fallback",
+                    );
                     providers.push(Arc::new(RetryProvider::new(provider)));
                     costs.push(fallback.cost_per_m.unwrap_or(0.0));
                 }
@@ -594,6 +648,7 @@ pub(super) struct ProfileActorFactoryBuilder {
     pub(super) tool_config: Arc<octos_agent::ToolConfigStore>,
     pub(super) memory: Arc<EpisodeStore>,
     pub(super) memory_store: Arc<MemoryStore>,
+    pub(super) recall: Arc<octos_memory::RecallStore>,
     pub(super) agent_config: AgentConfig,
     pub(super) session_mgr: Arc<Mutex<SessionManager>>,
     pub(super) out_tx: mpsc::Sender<OutboundMessage>,
@@ -720,6 +775,22 @@ impl ProfileActorFactoryBuilder {
         // invariant and doubled keychain lookups).
         let profile_embedder =
             create_embedder(&profile_config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+        // The routed profile's OWN recall index (its personal records live
+        // under its data dir); the gateway's store is only right when both
+        // are the same directory.
+        let profile_recall: Arc<octos_memory::RecallStore> = if profile_data_dir
+            == self.effective_octos_home
+        {
+            self.recall.clone()
+        } else {
+            crate::runtime::profile::open_recall_store(
+                &profile_data_dir,
+                &profile_config,
+                profile_embedder.as_deref(),
+            )
+            .await
+            .wrap_err_with(|| format!("failed to open recall store for profile '{profile_id}'"))?
+        };
 
         // Child bots with admin_mode=true reuse the parent's tool registry snapshot
         // (which already has full tools + admin API). Child bots with admin_mode=false
@@ -768,7 +839,7 @@ impl ProfileActorFactoryBuilder {
                 &profile_data_dir,
                 &self.project_dir,
                 profile_id,
-                discover_ominix_url().as_deref(),
+                crate::skills_scope::discover_ominix_url().as_deref(),
             );
             let plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&profile_data_dir);
             if !plugin_dirs.is_empty() {
@@ -837,7 +908,16 @@ impl ProfileActorFactoryBuilder {
             tools.register(octos_agent::ManageSkillsTool::new(
                 profile_data_dir.join("skills"),
             ));
-            tools.register(octos_agent::RecallMemoryTool::new(
+            tools.register(
+                octos_agent::RecallMemoryTool::new(self.memory_store.clone())
+                    .with_recall(profile_recall.clone(), profile_embedder.clone()),
+            );
+            tools.register(octos_agent::MemorySearchTool::new(
+                profile_recall.clone(),
+                profile_embedder.clone(),
+            ));
+            tools.register(octos_agent::MemoryLoadTool::new(
+                profile_recall.clone(),
                 self.memory_store.clone(),
             ));
             tools.register(octos_agent::SaveMemoryTool::new(self.memory_store.clone()));
@@ -1086,6 +1166,7 @@ impl ProfileActorFactoryBuilder {
             // `profile.config.lane_routing`. None = built-in defaults.
             lane_routing: effective_profile.config.lane_routing.clone(),
             memory_store: Some(self.memory_store.clone()),
+            recall: Some(profile_recall.clone()),
             // Codex round-2 MAJOR 3 (PR #1327 review): expose the
             // profile_id so `ActorFactory::spawn` can build a per-
             // session SessionScope (multi-tenant) and attach the
@@ -1118,6 +1199,44 @@ mod tests {
         SearchProviderConfig, SlidesAppConfig, UserProfile,
     };
     use chrono::Utc;
+
+    #[test]
+    fn resolved_profile_llm_env_uses_runtime_config_and_replaces_stale_values() {
+        let mut config = Config {
+            provider: Some("google".into()),
+            model: Some("resolved-model".into()),
+            base_url: Some("https://example.invalid/v1beta".into()),
+            api_type: Some("gemini".into()),
+            ..Default::default()
+        };
+        let mut env = vec![
+            ("OCTOS_PROFILE_LLM_MODEL".into(), "stale".into()),
+            ("OCTOS_PROFILE_LLM_MODEL".into(), "duplicate".into()),
+            ("UNRELATED".into(), "retained".into()),
+        ];
+        apply_resolved_profile_llm_env(&mut env, &config, "revision-1");
+        let map: HashMap<_, _> = env.iter().cloned().collect();
+        assert_eq!(env.len(), map.len());
+        assert_eq!(map["OCTOS_PROFILE_LLM_PROVIDER"], "google");
+        assert_eq!(map["OCTOS_PROFILE_LLM_MODEL"], "resolved-model");
+        assert_eq!(
+            map["OCTOS_PROFILE_LLM_BASE_URL"],
+            "https://example.invalid/v1beta"
+        );
+        assert_eq!(map["OCTOS_PROFILE_LLM_API_TYPE"], "gemini");
+        assert_eq!(map["OCTOS_PROFILE_LLM_CONFIG_REVISION"], "revision-1");
+        assert_eq!(map["UNRELATED"], "retained");
+        config.provider = None;
+        config.model = Some("gemini-3.6-flash".into());
+        config.base_url = None;
+        config.api_type = None;
+        apply_resolved_profile_llm_env(&mut env, &config, "revision-2");
+        let map: HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(map["OCTOS_PROFILE_LLM_PROVIDER"], "gemini");
+        assert!(!map.contains_key("OCTOS_PROFILE_LLM_BASE_URL"));
+        assert!(!map.contains_key("OCTOS_PROFILE_LLM_API_TYPE"));
+        assert_eq!(map["OCTOS_PROFILE_LLM_CONFIG_REVISION"], "revision-2");
+    }
 
     #[test]
     fn profile_plugin_env_forwards_canonical_skill_env_without_arbitrary_secrets() {
@@ -1174,6 +1293,42 @@ mod tests {
         assert!(env.contains(&("PPT_TEMPLATE_DIR".to_string(), "/templates".to_string())));
         assert!(env.contains(&("PPT_DEFAULT_THEME".to_string(), "nb-pro".to_string())));
         assert!(!env.iter().any(|(key, _)| key == "CUSTOM_SECRET_KEY"));
+    }
+
+    #[test]
+    fn profile_plugin_env_forwards_primary_llm_selection_to_declaring_skills() {
+        let profile = UserProfile {
+            id: "skill-llm".to_string(),
+            name: "Skill LLM".to_string(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: ProfileConfig {
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("google".to_string()),
+                        model_id: Some("gemini-3.6-flash".to_string()),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let env = profile_plugin_env(&profile);
+
+        assert!(env.contains(&(
+            "OCTOS_PROFILE_LLM_PROVIDER".to_string(),
+            "google".to_string()
+        )));
+        assert!(env.contains(&(
+            "OCTOS_PROFILE_LLM_MODEL".to_string(),
+            "gemini-3.6-flash".to_string()
+        )));
     }
 
     #[test]
@@ -1520,6 +1675,13 @@ mod tests {
         );
         let memory = Arc::new(EpisodeStore::open(&effective_octos_home).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&effective_octos_home).await.unwrap());
+        let recall = Arc::new(
+            octos_memory::RecallStore::open(
+                &effective_octos_home,
+                octos_memory::RecallConfig::default(),
+            )
+            .unwrap(),
+        );
         let session_mgr = Arc::new(Mutex::new(
             SessionManager::open(&effective_octos_home).unwrap(),
         ));
@@ -1543,6 +1705,7 @@ mod tests {
             tool_config,
             memory,
             memory_store,
+            recall,
             agent_config: AgentConfig::default(),
             session_mgr,
             out_tx,

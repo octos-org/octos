@@ -9,6 +9,7 @@ use eyre::Result;
 use octos_llm::ToolSpec;
 
 use crate::policy::EffectivePermissions;
+use crate::policy::FilesystemScope;
 use crate::task_supervisor::TaskSupervisor;
 
 #[cfg(feature = "ast")]
@@ -123,10 +124,76 @@ fn estimate_json_size(value: &serde_json::Value) -> usize {
     }
 }
 
+/// Where a registered tool came from.
+///
+/// Compiled-in tools are [`ToolOrigin::Builtin`]; tools a plugin binary or an
+/// MCP server provides are not, whatever their names. A caller that trusts
+/// only compiled-in behaviour (for example the external-client turns of
+/// `octos serve --host-managed`) filters on [`ToolRegistry::origin`], never on
+/// a name alone: a name says nothing about who implements it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolOrigin {
+    /// Compiled into this binary.
+    Builtin,
+    /// Provided by a plugin binary (see [`ToolRegistry::mark_as_plugin`]).
+    Plugin,
+    /// Provided by an MCP server.
+    Mcp,
+    /// An app tool a host registered for a host-owned app peer; every call
+    /// is routed to the host connection (UPCR-2026-035). A tool says so
+    /// itself ([`Tool::origin`]), so it is recorded whichever `register*`
+    /// call adds it.
+    HostRouted,
+}
+
+/// Names of compiled-in tools that no plugin may register (and no MCP server
+/// may shadow, see `McpClient::PROTECTED_NAMES`): the core file, shell, web,
+/// memory, messaging and delegation tools, and every tool an external client
+/// of `octos serve --host-managed` keeps.
+pub const RESERVED_BUILTIN_TOOL_NAMES: &[&str] = &[
+    "shell",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "diff_edit",
+    "apply_patch",
+    "glob",
+    "grep",
+    "list_dir",
+    "code_structure",
+    "check_workspace_contract",
+    "web_search",
+    "web_fetch",
+    "browser",
+    "git",
+    "message",
+    "send_file",
+    "spawn",
+    "spawn_agent",
+    "delegate",
+    "ask_user_question",
+    "save_memory",
+    "recall",
+    "recall_memory",
+    "record_memory_use",
+    "memory_search",
+    "memory_load",
+    "view_image",
+    "view_video",
+    "tool_search",
+    "configure_tool",
+];
+
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     workspace_root: Option<PathBuf>,
+    /// The filesystem reach the cwd-bound tools were registered with. The
+    /// request build reads this (#2480) so media paths are only re-walked
+    /// against the workspace root when the tool-time validation also walked
+    /// them — a Host-scope read never got the ancestor walk and must not be
+    /// held to it at render.
+    filesystem_scope: FilesystemScope,
     /// Provider-specific policy that filters specs() output without removing tools.
     provider_policy: Option<ToolPolicy>,
     /// Context-based tag filter: only tools with matching tags appear in specs().
@@ -139,6 +206,10 @@ pub struct ToolRegistry {
     cached_specs: std::sync::Mutex<Option<Vec<ToolSpec>>>,
     /// Tool names that came from plugin binaries (for auto-send hook filtering).
     plugin_tools: HashSet<String>,
+    /// Origin of every registered tool that is NOT [`ToolOrigin::Builtin`].
+    /// Absent means built in. A name marked as a plugin stays non-built-in
+    /// even when something registers over it (fail closed).
+    non_builtin_origins: HashMap<String, ToolOrigin>,
     /// Live MCP transport handles, owned for the registry's whole lifetime.
     ///
     /// `McpService` is an `Arc<RunningService<..>>` and every `McpTool` holds a
@@ -215,6 +286,14 @@ pub struct ToolRegistry {
     /// path — and on any host without a real backend — command validators
     /// run the argv directly and behavior is unchanged.
     sandbox: Arc<dyn Sandbox>,
+    /// #2605: the host's exact kernel tool list for the session this
+    /// registry serves (`None`: no list). Set through `&self` because a
+    /// long-lived registry (the gateway's session actor shares one
+    /// `Arc<ToolRegistry>` across turns) must follow the host's durable
+    /// list from turn to turn. Unlisted tools are hidden from `specs()`,
+    /// visibility checks and discovery, and refused by `execute_with_context`.
+    /// It only ever narrows: it never adds a tool the registry lacks.
+    host_tool_allowlist: std::sync::RwLock<Option<Arc<HashSet<String>>>>,
 }
 
 /// Default per-tool execution-timeout backstop (seconds) for the registry
@@ -242,6 +321,7 @@ impl ToolRegistry {
             active_context: None,
             cached_specs: std::sync::Mutex::new(None),
             plugin_tools: HashSet::new(),
+            non_builtin_origins: HashMap::new(),
             mcp_services: Vec::new(),
             spawn_only: HashSet::new(),
             spawn_only_messages: HashMap::new(),
@@ -253,10 +333,12 @@ impl ToolRegistry {
             output_dir_hint: None,
             tool_timeout_secs: DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS,
             internal_hidden: HashSet::new(),
+            filesystem_scope: FilesystemScope::Workspace,
             // #1607: default to a no-op sandbox. Constructors that receive a
             // real sandbox (`with_builtins_and_permissions`,
             // `rebind_cwd_with_permissions`) overwrite this below.
             sandbox: Arc::new(NoSandbox),
+            host_tool_allowlist: std::sync::RwLock::new(None),
         }
     }
 
@@ -447,6 +529,13 @@ impl ToolRegistry {
         self.workspace_root.as_deref()
     }
 
+    /// The filesystem reach the cwd-bound tools were registered with. The
+    /// request build consults this (#2480): media paths are re-walked only
+    /// when the tool-time validation walked them too.
+    pub fn filesystem_scope(&self) -> FilesystemScope {
+        self.filesystem_scope
+    }
+
     /// Record a workspace cwd on this registry without re-creating the
     /// cwd-bound tools. Used by the AppUi `session_tool_registry` Tier-2
     /// fallback so an operator-configured default folder shows up in
@@ -532,10 +621,41 @@ impl ToolRegistry {
         self.plugin_tools.contains(name)
     }
 
-    /// Register a tool.
+    /// Register a compiled-in tool ([`ToolOrigin::Builtin`], unless the name
+    /// was marked as a plugin's with [`Self::mark_as_plugin`]).
     pub fn register(&mut self, tool: impl Tool + 'static) {
+        self.register_arc_as(Arc::new(tool), ToolOrigin::Builtin);
+    }
+
+    /// Register a tool from an existing Arc (for keeping a separate reference).
+    /// Origin as for [`Self::register`].
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
+        self.register_arc_as(tool, ToolOrigin::Builtin);
+    }
+
+    /// Register a tool with an explicit origin. The origin does not touch
+    /// [`Self::is_plugin`] (which only [`Self::mark_as_plugin`] sets), and a
+    /// name marked as a plugin's stays [`ToolOrigin::Plugin`].
+    pub fn register_with_origin(&mut self, tool: impl Tool + 'static, origin: ToolOrigin) {
+        self.register_arc_as(Arc::new(tool), origin);
+    }
+
+    /// [`Self::register_with_origin`] for an existing Arc.
+    pub fn register_arc_with_origin(&mut self, tool: Arc<dyn Tool>, origin: ToolOrigin) {
+        self.register_arc_as(tool, origin);
+    }
+
+    fn register_arc_as(&mut self, tool: Arc<dyn Tool>, origin: ToolOrigin) {
         let name = tool.name().to_string();
-        let tool: Arc<dyn Tool> = Arc::new(tool);
+        let origin = if self.plugin_tools.contains(&name) {
+            ToolOrigin::Plugin
+        } else if origin == ToolOrigin::Builtin {
+            // A tool that declares a non-built-in origin keeps it.
+            tool.origin()
+        } else {
+            origin
+        };
+        self.set_origin(&name, origin);
         self.tools.insert(name.clone(), tool.clone());
         if name == "spawn" {
             let spawn_agent: Arc<dyn Tool> = Arc::new(SpawnAgentTool::with_delegate(tool));
@@ -550,26 +670,52 @@ impl ToolRegistry {
                     spawn_agent,
                 )),
             );
+            // The aliases wrap `spawn`: they share its origin.
+            self.set_origin("spawn_agent", origin);
+            self.set_origin("delegate", origin);
         }
         self.invalidate_cache();
     }
 
-    /// Register a tool from an existing Arc (for keeping a separate reference).
-    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
-        let name = tool.name().to_string();
-        self.tools.insert(name.clone(), tool.clone());
-        if name == "spawn" {
-            let spawn_agent: Arc<dyn Tool> = Arc::new(SpawnAgentTool::with_delegate(tool));
-            self.tools
-                .insert("spawn_agent".to_string(), spawn_agent.clone());
-            self.tools.insert(
-                "delegate".to_string(),
-                Arc::new(super::coding_tools::DelegateAliasTool::with_spawn_agent(
-                    spawn_agent,
-                )),
-            );
+    fn set_origin(&mut self, name: &str, origin: ToolOrigin) {
+        if origin == ToolOrigin::Builtin {
+            self.non_builtin_origins.remove(name);
+        } else {
+            self.non_builtin_origins.insert(name.to_string(), origin);
         }
-        self.invalidate_cache();
+    }
+
+    /// Where the registered tool `name` came from; `None` when no such tool
+    /// is registered.
+    pub fn origin(&self, name: &str) -> Option<ToolOrigin> {
+        self.tools.contains_key(name).then(|| {
+            self.non_builtin_origins
+                .get(name)
+                .copied()
+                .unwrap_or(ToolOrigin::Builtin)
+        })
+    }
+
+    /// Whether `name` belongs to a compiled-in tool: a reserved built-in name
+    /// ([`RESERVED_BUILTIN_TOOL_NAMES`]) or a built-in already registered
+    /// here. A plugin must not register such a name.
+    pub fn is_builtin_name(&self, name: &str) -> bool {
+        RESERVED_BUILTIN_TOOL_NAMES.contains(&name)
+            || self.origin(name) == Some(ToolOrigin::Builtin)
+    }
+
+    /// Keep only compiled-in tools ([`ToolOrigin::Builtin`]) for which `keep`
+    /// holds. A plugin or MCP tool never survives, whatever its name.
+    pub fn retain_builtin(&mut self, keep: impl Fn(&str) -> bool) {
+        let kept: HashSet<String> = self
+            .tools
+            .keys()
+            .filter(|name| {
+                keep(name.as_str()) && self.origin(name.as_str()) == Some(ToolOrigin::Builtin)
+            })
+            .cloned()
+            .collect();
+        self.retain(|name| kept.contains(name));
     }
 
     /// Return the names of every registered tool.
@@ -670,6 +816,9 @@ impl ToolRegistry {
         if self.internal_hidden.contains(name) {
             return false;
         }
+        if !self.host_tool_allowlist_permits(name) {
+            return false;
+        }
         if let Some(ref policy) = self.provider_policy {
             if !provider_policy_allows_equivalent_with_tags(policy, name, tool.tags()) {
                 return false;
@@ -702,6 +851,7 @@ impl ToolRegistry {
         if let Some(ref specs) = *cache {
             return specs.clone();
         }
+        let allowlist = self.host_tool_allowlist_snapshot();
 
         // RFC-0 (#1289): every enabled tool is emitted every turn. The only
         // exclusions remaining are internal-hidden tools (mofa_make
@@ -715,6 +865,7 @@ impl ToolRegistry {
             // the LLM-visible spec set. They remain callable via `get()`
             // for internal forwarders (e.g. `mofa_make`).
             .filter(|t| !self.internal_hidden.contains(t.name()))
+            .filter(|t| allowlist.as_ref().is_none_or(|a| a.contains(t.name())))
             .filter(|t| {
                 self.provider_policy.as_ref().is_none_or(|p| {
                     provider_policy_allows_equivalent_with_tags(p, t.name(), t.tags())
@@ -798,6 +949,8 @@ impl ToolRegistry {
 
     pub fn retain(&mut self, f: impl Fn(&str) -> bool) {
         self.tools.retain(|name, _| f(name));
+        self.non_builtin_origins
+            .retain(|name, _| self.tools.contains_key(name));
         self.spawn_only.retain(|name| self.tools.contains_key(name));
         self.spawn_only_messages
             .retain(|name, _| self.tools.contains_key(name));
@@ -1022,11 +1175,13 @@ impl ToolRegistry {
             // the original registry drops. Cheap — one Arc per server.
             mcp_services: self.mcp_services.clone(),
             workspace_root: self.workspace_root.clone(),
+            filesystem_scope: self.filesystem_scope,
             provider_policy: self.provider_policy.clone(),
             context_filter: self.context_filter.clone(),
             active_context: self.active_context.clone(),
             cached_specs: std::sync::Mutex::new(None),
             plugin_tools: self.plugin_tools.clone(),
+            non_builtin_origins: self.non_builtin_origins.clone(),
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
             background_result_sender: None,
@@ -1053,6 +1208,9 @@ impl ToolRegistry {
             // plain `snapshot_excluding` caller still observes the same
             // confinement as the parent.
             sandbox: self.sandbox.clone(),
+            // #2605: a snapshot (a per-turn registry, a spawned child's
+            // parent roster) keeps the host's list: it must never widen.
+            host_tool_allowlist: std::sync::RwLock::new(self.host_tool_allowlist_snapshot()),
         };
         // #1148 codex P2: the cloned `tool_search` / `tool_suggest`
         // Arcs still point to the PARENT's catalog cell. Re-register
@@ -1078,6 +1236,54 @@ impl ToolRegistry {
             .inherit_registration_observers(&self.supervisor);
         snapshot.refresh_live_catalog();
         snapshot
+    }
+
+    // -- Host session tool list (#2605) --------------------------------------
+
+    /// Set (`Some`) or clear (`None`) the host's exact kernel tool list for
+    /// the session this registry serves. Takes `&self` so a registry shared
+    /// behind an `Arc` across turns can follow the host's durable list; the
+    /// caller sets it at each turn start. Only narrows: a listed name the
+    /// registry lacks stays absent.
+    pub fn set_host_tool_allowlist(&self, allowed: Option<&[String]>) {
+        let next: Option<Arc<HashSet<String>>> =
+            allowed.map(|names| Arc::new(names.iter().cloned().collect()));
+        {
+            let mut guard = self
+                .host_tool_allowlist
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            if *guard == next {
+                return;
+            }
+            *guard = next;
+        }
+        *self.cached_specs.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.refresh_live_catalog();
+    }
+
+    /// The host's current list for this registry, if any.
+    pub fn host_tool_allowlist(&self) -> Option<Vec<String>> {
+        self.host_tool_allowlist_snapshot().map(|set| {
+            let mut names: Vec<String> = set.iter().cloned().collect();
+            names.sort();
+            names
+        })
+    }
+
+    fn host_tool_allowlist_snapshot(&self) -> Option<Arc<HashSet<String>>> {
+        self.host_tool_allowlist
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn host_tool_allowlist_permits(&self, name: &str) -> bool {
+        self.host_tool_allowlist
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_none_or(|set| set.contains(name))
     }
 
     // -- Cache management ---------------------------------------------------
@@ -1121,6 +1327,9 @@ impl ToolRegistry {
         name: &str,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
+        if !self.host_tool_allowlist_permits(name) {
+            eyre::bail!("tool '{}' is not in this session's tool list", name);
+        }
         if let Some(ref policy) = self.provider_policy {
             if let policy::PolicyDecision::Deny { reason } =
                 evaluate_provider_policy_equivalent(policy, name)
@@ -1265,6 +1474,7 @@ impl ToolRegistry {
         // `Self::sandbox`). Kept in lockstep with the shell/exec/bash tools
         // registered just below.
         registry.sandbox = sandbox.clone();
+        registry.filesystem_scope = permissions.filesystem_scope;
         registry.register(
             ShellTool::new(cwd)
                 .with_shared_sandbox(sandbox.clone())
@@ -1275,7 +1485,8 @@ impl ToolRegistry {
             ExecCommandTool::new(cwd, sandbox.clone())
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_policy(permissions.shell_command_policy())
-                .with_approval_policy(permissions.approval_policy),
+                .with_approval_policy(permissions.approval_policy)
+                .with_bash_file_writes(permissions.bash_file_writes),
         );
         // #1172: Codex-compatible `bash` alias. Shares command policy /
         // approval policy / sandbox with `shell` and `exec_command`, so a
@@ -1284,7 +1495,8 @@ impl ToolRegistry {
             super::coding_tools::BashTool::new(cwd, sandbox)
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_policy(permissions.shell_command_policy())
-                .with_approval_policy(permissions.approval_policy),
+                .with_approval_policy(permissions.approval_policy)
+                .with_bash_file_writes(permissions.bash_file_writes),
         );
         registry.register(WriteStdinTool);
         registry.register(UpdatePlanTool);
@@ -1354,6 +1566,11 @@ impl ToolRegistry {
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_file_access(permissions.file_access),
         );
+        // `view_video`: the same scope rules, for the models that take video.
+        registry.register(
+            super::coding_tools::ViewVideoTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope),
+        );
         // #1148 codex P2: pass the LIVE shared catalog cell instead
         // of a frozen Vec snapshot. The registry refreshes the cell
         // on every mutation via `refresh_live_catalog` (called from
@@ -1388,6 +1605,7 @@ impl ToolRegistry {
             // tool_search / tool_suggest discovery too — the LLM cannot
             // call them directly, advertising them would be misleading.
             .filter(|tool| !self.internal_hidden.contains(tool.name()))
+            .filter(|tool| self.host_tool_allowlist_permits(tool.name()))
             .filter(|tool| {
                 self.provider_policy.as_ref().is_none_or(|policy| {
                     provider_policy_allows_equivalent_with_tags(policy, tool.name(), tool.tags())
@@ -1460,6 +1678,7 @@ impl ToolRegistry {
         // must follow `rebind_cwd` so a session targeting a new project root
         // does not leak previously bound paths.
         "view_image",
+        "view_video",
         #[cfg(feature = "git")]
         "git",
         #[cfg(feature = "ast")]
@@ -1494,6 +1713,7 @@ impl ToolRegistry {
         // validator path confines command validators to the same sandbox as
         // the shell/exec/bash tools re-registered just below.
         registry.sandbox = sandbox.clone();
+        registry.filesystem_scope = permissions.filesystem_scope;
         // Re-register cwd-bound tools with the new workspace
         registry.register(
             ShellTool::new(cwd)
@@ -1505,14 +1725,16 @@ impl ToolRegistry {
             ExecCommandTool::new(cwd, sandbox.clone())
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_policy(permissions.shell_command_policy())
-                .with_approval_policy(permissions.approval_policy),
+                .with_approval_policy(permissions.approval_policy)
+                .with_bash_file_writes(permissions.bash_file_writes),
         );
         // #1172: re-register the `bash` alias against the new cwd.
         registry.register(
             super::coding_tools::BashTool::new(cwd, sandbox)
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_policy(permissions.shell_command_policy())
-                .with_approval_policy(permissions.approval_policy),
+                .with_approval_policy(permissions.approval_policy)
+                .with_bash_file_writes(permissions.bash_file_writes),
         );
         registry
             .register(ReadFileTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope));
@@ -1560,6 +1782,11 @@ impl ToolRegistry {
             ViewImageTool::new(cwd)
                 .with_filesystem_scope(permissions.filesystem_scope)
                 .with_file_access(permissions.file_access),
+        );
+        // `view_video`: the same scope rules, for the models that take video.
+        registry.register(
+            super::coding_tools::ViewVideoTool::new(cwd)
+                .with_filesystem_scope(permissions.filesystem_scope),
         );
         // #1148 codex P2: live shared catalog cell — see `with_builtins`.
         let catalog_cell = registry.live_catalog_handle();
@@ -2960,13 +3187,11 @@ mod profile_filter_tests {
         let visible: Vec<String> = reg.specs().into_iter().map(|s| s.name).collect();
         assert!(
             !visible.contains(&"mofa_slides".to_string()),
-            "internal-hidden mofa_slides must NOT appear in specs; got {:?}",
-            visible
+            "internal-hidden mofa_slides must NOT appear in specs; got {visible:?}"
         );
         assert!(
             visible.contains(&"mofa_cards".to_string()),
-            "non-hidden mofa_cards must remain visible in specs; got {:?}",
-            visible
+            "non-hidden mofa_cards must remain visible in specs; got {visible:?}"
         );
         // Still reachable via get() for internal dispatcher forwarding.
         assert!(
@@ -3060,8 +3285,7 @@ mod profile_filter_tests {
         assert_eq!(
             post.len(),
             1,
-            "catalog must be pruned to surviving targets; got {:?}",
-            post
+            "catalog must be pruned to surviving targets; got {post:?}"
         );
         assert_eq!(post[0].content_type, "slides");
 
@@ -3165,8 +3389,7 @@ mod profile_filter_tests {
         assert_eq!(
             session_post.len(),
             1,
-            "slides session catalog must be pruned; got {:?}",
-            session_post
+            "slides session catalog must be pruned; got {session_post:?}"
         );
         assert_eq!(session_post[0].content_type, "slides");
 
@@ -3193,8 +3416,7 @@ mod profile_filter_tests {
         for required in ["slides", "cards", "comic", "site"] {
             assert!(
                 base_types.contains(required),
-                "base catalog lost {required:?} after slides session retain; got {:?}",
-                base_types
+                "base catalog lost {required:?} after slides session retain; got {base_types:?}"
             );
         }
 
@@ -3290,8 +3512,7 @@ mod profile_filter_tests {
         for required in ["slides", "cards", "comic"] {
             assert!(
                 b_types.contains(required),
-                "session B lost {required:?}; got {:?}",
-                b_types
+                "session B lost {required:?}; got {b_types:?}"
             );
         }
     }
@@ -3364,8 +3585,7 @@ mod profile_filter_tests {
             assert_eq!(
                 session_entries,
                 vec!["slides".to_string()],
-                "every session must end with only slides; got {:?}",
-                session_entries
+                "every session must end with only slides; got {session_entries:?}"
             );
         }
 
@@ -3491,6 +3711,57 @@ mod spec_order_tests {
         registry
     }
 
+    #[tokio::test]
+    async fn should_hide_and_refuse_unlisted_tools_when_a_host_tool_allowlist_is_set() {
+        let registry = registry_with(&["read_file", "shell", "grep"]);
+        assert_eq!(registry.specs().len(), 3, "cache primed without a list");
+        registry.set_host_tool_allowlist(Some(&["grep".to_owned(), "absent".to_owned()]));
+        let names: Vec<String> = registry.specs().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, vec!["grep".to_owned()], "a list never adds a tool");
+        assert!(!registry.is_tool_visible("shell"));
+        assert!(registry.is_tool_visible("grep"));
+        let Err(refused) = registry.execute("shell", &serde_json::json!({})).await else {
+            panic!("an unlisted tool is refused at dispatch");
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains("not in this session's tool list")
+        );
+        assert!(
+            registry
+                .execute("grep", &serde_json::json!({}))
+                .await
+                .is_ok()
+        );
+        assert!(
+            registry
+                .catalog_snapshot()
+                .iter()
+                .all(|entry| entry.name == "grep"),
+            "discovery shows only listed tools"
+        );
+    }
+
+    #[test]
+    fn should_restore_the_roster_when_the_host_tool_allowlist_is_cleared() {
+        let registry = registry_with(&["read_file", "shell"]);
+        registry.set_host_tool_allowlist(Some(&[]));
+        assert!(registry.specs().is_empty(), "an empty list keeps nothing");
+        registry.set_host_tool_allowlist(None);
+        assert_eq!(registry.specs().len(), 2);
+        assert_eq!(registry.host_tool_allowlist(), None);
+    }
+
+    #[test]
+    fn should_keep_the_host_tool_allowlist_when_a_registry_is_snapshotted() {
+        let registry = registry_with(&["read_file", "shell"]);
+        registry.set_host_tool_allowlist(Some(&["read_file".to_owned()]));
+        let snapshot = registry.snapshot_excluding(&[]);
+        let names: Vec<String> = snapshot.specs().iter().map(|s| s.name.clone()).collect();
+        assert_eq!(names, vec!["read_file".to_owned()]);
+    }
+
     #[test]
     fn specs_are_sorted_by_name_and_deterministic_across_rebuilds() {
         let names = [
@@ -3580,5 +3851,80 @@ mod spec_order_tests {
         assert!(notebook_turn.is_tool_visible("notebook_only"));
         assert!(!ordinary_turn.is_tool_visible("notebook_only"));
         assert!(!base.is_tool_visible("notebook_only"));
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::super::{Tool, ToolResult};
+    use super::*;
+    use async_trait::async_trait;
+    use eyre::Result;
+
+    struct Named(&'static str);
+
+    #[async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "test-only"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+            Ok(ToolResult::default())
+        }
+    }
+
+    #[test]
+    fn should_record_where_each_tool_came_from() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Named("read_file"));
+        registry.register_with_origin(Named("mcp_memory"), ToolOrigin::Mcp);
+        registry.mark_as_plugin("plugin_tool");
+        registry.register(Named("plugin_tool"));
+        assert_eq!(registry.origin("read_file"), Some(ToolOrigin::Builtin));
+        assert_eq!(registry.origin("mcp_memory"), Some(ToolOrigin::Mcp));
+        assert_eq!(registry.origin("plugin_tool"), Some(ToolOrigin::Plugin));
+        assert_eq!(registry.origin("absent"), None);
+        // A plugin-marked name stays non-built-in whatever registers over it.
+        registry.register(Named("plugin_tool"));
+        assert_eq!(registry.origin("plugin_tool"), Some(ToolOrigin::Plugin));
+        // A snapshot keeps the origins.
+        let snapshot = registry.snapshot_excluding(&[]);
+        assert_eq!(snapshot.origin("mcp_memory"), Some(ToolOrigin::Mcp));
+    }
+
+    #[test]
+    fn should_keep_only_builtin_tools_whatever_their_names() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Named("read_file"));
+        registry.register(Named("shell"));
+        // A plugin and an MCP server each offer an allowlisted name.
+        registry.register_with_origin(Named("memory_search"), ToolOrigin::Mcp);
+        registry.mark_as_plugin("recall");
+        registry.register(Named("recall"));
+        let allow = ["read_file", "memory_search", "recall"];
+        registry.retain_builtin(|name| allow.contains(&name));
+        let mut names = registry.tool_names();
+        names.sort();
+        assert_eq!(names, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn should_treat_reserved_and_registered_builtins_as_builtin_names() {
+        let mut registry = ToolRegistry::new();
+        assert!(registry.is_builtin_name("memory_search"), "reserved");
+        assert!(!registry.is_builtin_name("weather_now"));
+        registry.register(Named("weather_now"));
+        assert!(
+            registry.is_builtin_name("weather_now"),
+            "registered built-in"
+        );
+        registry.register_with_origin(Named("mcp_only"), ToolOrigin::Mcp);
+        assert!(!registry.is_builtin_name("mcp_only"));
     }
 }

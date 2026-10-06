@@ -74,6 +74,10 @@ impl LlmProvider for SemaphoreThrottledProvider {
         }))
     }
 
+    async fn ensure_ready(&self) {
+        self.inner.ensure_ready().await;
+    }
+
     fn context_window(&self) -> u32 {
         self.inner.context_window()
     }
@@ -96,6 +100,14 @@ impl LlmProvider for SemaphoreThrottledProvider {
 
     fn provider_metadata_for_index(&self, provider_index: Option<usize>) -> ProviderMetadata {
         self.inner.provider_metadata_for_index(provider_index)
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        self.inner.api_style()
+    }
+
+    fn supports_semantic_checkpoint_hints(&self) -> bool {
+        self.inner.supports_semantic_checkpoint_hints()
     }
 
     fn export_metrics(&self) -> Option<serde_json::Value> {

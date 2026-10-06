@@ -33,9 +33,27 @@ use crate::skills_scope::{
     build_account_skills_loader, discover_ominix_url, push_runtime_plugin_env,
 };
 
+/// Create directories that background profile services expect to exist for
+/// the entire runtime lifetime.
+///
+/// Inbox producers also create this directory defensively before writing, but
+/// the serve-side steer sweep starts before the first producer may run. Eager
+/// creation keeps an unused inbox from looking like an I/O failure while
+/// preserving the sweep's warning for a directory that disappears later.
+fn ensure_profile_runtime_directories(data_dir: &Path) -> Result<()> {
+    let inbox_dir = data_dir.join("inbox");
+    std::fs::create_dir_all(&inbox_dir).wrap_err_with(|| {
+        format!(
+            "failed to create profile inbox directory {}",
+            inbox_dir.display()
+        )
+    })
+}
+
 /// Immutable inputs needed to rebuild only a profile's plugin-derived layer.
 /// Long-lived stores, providers, schedulers, and profile services are reused
 /// from the existing [`ProfileRuntime`].
+#[derive(Clone)]
 pub struct ProfilePluginReloadConfig {
     base_tools: Arc<ToolRegistry>,
     plugin_dirs: Vec<PathBuf>,
@@ -62,6 +80,69 @@ impl Drop for ProfileRuntimeLifecycle {
         if let Some(ref cron) = self.cron_service {
             cron.shutdown_signal();
         }
+    }
+}
+
+/// Long-lived profile resources a replacement runtime takes over from the
+/// runtime it replaces instead of reopening them. `episodes.redb` admits a
+/// single writer, so reopening it while an in-flight turn still holds the
+/// previous runtime fails; sharing the handles makes a configuration change
+/// (model, key, route) take effect immediately without that lock.
+#[derive(Clone)]
+pub(crate) struct SharedProfileResources {
+    memory: Arc<EpisodeStore>,
+    memory_store: Arc<MemoryStore>,
+    recall: Arc<octos_memory::RecallStore>,
+    embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+    tool_config: Arc<ToolConfigStore>,
+    cron_service: Option<Arc<CronService>>,
+    runtime_lifecycle: Option<Arc<ProfileRuntimeLifecycle>>,
+    /// Handed over, not shared: it is stopped so the replacement can restart
+    /// the sweep with its own provider.
+    memory_refresh: Option<Arc<crate::memory_refresh::MemoryRefreshService>>,
+}
+
+/// Whether stores opened under `previous` stay valid under `next`: the
+/// embedder and recall width they were opened with are unchanged.
+fn configs_share_storage(previous: &Config, next: &Config) -> bool {
+    let embedding = |config: &Config| serde_json::to_value(&config.embedding).ok();
+    let recall_dimension = |config: &Config| {
+        config
+            .memory
+            .as_ref()
+            .and_then(|memory| memory.recall_dimension)
+    };
+    if embedding(previous) != embedding(next)
+        || recall_dimension(previous) != recall_dimension(next)
+    {
+        return false;
+    }
+    // An embedder authenticated by a profile env var must not keep a
+    // credential the new configuration replaced.
+    next.embedding
+        .as_ref()
+        .and_then(|embedding| embedding.api_key_env.as_deref())
+        .is_none_or(|name| previous.env_vars.get(name) == next.env_vars.get(name))
+}
+
+/// The resources of a runtime a configuration commit removed, awaiting its
+/// replacement. See [`ProfileRuntime::retire`].
+pub(crate) struct RetiredProfileRuntime {
+    data_dir: PathBuf,
+    custom_session_root: bool,
+    // Boxed: callers hold the retiree across awaits, and `Config` is large.
+    config: Box<Config>,
+    resources: SharedProfileResources,
+}
+
+impl RetiredProfileRuntime {
+    /// Whether a runtime for `config` rooted at `data_dir` can take over these
+    /// stores: same storage location, and nothing that shapes how the stores
+    /// were opened (embedder, recall width) has changed.
+    pub(crate) fn can_share_with(&self, data_dir: &Path, config: &Config) -> bool {
+        self.data_dir == data_dir
+            && !self.custom_session_root
+            && configs_share_storage(&self.config, config)
     }
 }
 
@@ -162,6 +243,19 @@ pub const GOAL_VERIFIER_LANE_KEY: &str = "goal_verifier";
 /// session's own provider, which is the pre-#1935 behavior unchanged (the
 /// back-compat default) — when no `goal_verifier` lane is configured or the
 /// configured lane fails to build.
+/// The LLM provider family a resolved profile config selects: the explicit
+/// `provider` (populated from `llm.primary` by `config_from_profile`), else
+/// the family detected from the model id.
+pub(crate) fn configured_provider_name(config: &Config) -> Option<String> {
+    config.provider.clone().or_else(|| {
+        config
+            .model
+            .as_deref()
+            .and_then(crate::config::detect_provider)
+            .map(String::from)
+    })
+}
+
 pub fn build_goal_verifier_provider(config: &Config) -> Option<Arc<dyn LlmProvider>> {
     let sp = config
         .sub_providers
@@ -275,6 +369,12 @@ pub struct ProfileRuntime {
     /// session-scope bootstrap code don't have to re-derive it.
     pub data_dir: PathBuf,
 
+    /// Optional local-frontend transcript root. Ephemeral chat keeps profile
+    /// memory/tools rooted at `data_dir`, while session JSONL and context/task
+    /// sidecars use this temporary directory even with per-cwd storage enabled.
+    /// Ordinary Serve/Gateway/ACP runtimes leave this unset.
+    pub session_store_root: Option<PathBuf>,
+
     /// The profile's resolved [`crate::config::Config`] (as produced by
     /// `config_from_profile` at bootstrap, with host memory/plugins merged).
     /// Most runtime state is pre-extracted into the typed fields below; this
@@ -360,6 +460,12 @@ pub struct ProfileRuntime {
     /// honors the configured value instead of a hardcoded cap (which silently
     /// starved spawned sub-agents doing multi-step work).
     pub max_iterations: Option<u32>,
+
+    /// Local frontend overrides applied by the canonical session bootstrap.
+    /// OUP still owns per-turn intent, context, persistence and cancellation.
+    pub session_defaults: Option<octos_agent::AgentConfig>,
+    /// Optional operator-selected coding tool/agent profile (chat and ACP).
+    pub agent_profile: Option<Arc<octos_agent::profile::ProfileDefinition>>,
 
     /// Post-edit formatting opt-in (`config.format_after_edit`, issue
     /// #1774) that per-session agents inherit. When true, successful
@@ -453,6 +559,12 @@ pub struct ProfileRuntime {
     /// Long-lived [`MemoryStore`] (MEMORY.md + daily notes + recent
     /// memories window) for this profile.
     pub memory_store: Arc<MemoryStore>,
+
+    /// Long-lived Recall/Knowledge index (`<data_dir>/recall.redb` +
+    /// `recall-index/`) — app records, mirrored episodes and bank pages
+    /// behind `memory_search` / `memory_load` and `memory/ingest`
+    /// (docs/adr/personal-memory-tiers.md).
+    pub recall: Arc<octos_memory::RecallStore>,
 
     /// The profile's embedding provider (None when no `embedding`
     /// config and no resolvable key). Sessions hand this to
@@ -655,6 +767,43 @@ async fn build_profile_plugin_layer(
 }
 
 impl ProfileRuntime {
+    /// Bind project plugins at session scope. Local adapters may open multiple
+    /// cwds on one profile; none may inherit another project's executables.
+    pub(crate) async fn for_workspace(self: &Arc<Self>, workspace: &Path) -> Result<Arc<Self>> {
+        if self.session_defaults.is_none() {
+            return Ok(self.clone());
+        }
+        let Some(reload) = &self.plugin_reload else {
+            return Ok(self.clone());
+        };
+        let mut dirs = Config::plugin_dirs_from_project(&workspace.join(".octos"));
+        if dirs.is_empty() {
+            return Ok(self.clone());
+        }
+        for dir in &reload.plugin_dirs {
+            if !dirs.contains(dir) {
+                dirs.push(dir.clone());
+            }
+        }
+        let mut reload = (**reload).clone();
+        reload.plugin_dirs = dirs;
+        self.rebuild_plugin_layer_using(&Arc::new(reload)).await
+    }
+
+    /// Reapply the effective envelope after cwd rebinding or dynamic tool
+    /// registration. A cloned registry must never resurrect excluded tools.
+    pub(crate) fn apply_tool_envelope(&self, tools: &mut ToolRegistry) {
+        if let Some(policy) = &self.tool_policy {
+            tools.apply_policy(policy);
+        }
+        if let Some(profile) = &self.agent_profile {
+            tools.filter_by_profile(&profile.tools);
+            if !profile.tools.allows("run_pipeline") {
+                tools.retain(|name| name != "run_pipeline");
+            }
+        }
+    }
+
     /// Rebuild plugin-derived tools, trusted actions, prompt fragments, and
     /// hooks while sharing all long-lived profile resources with `self`.
     pub async fn rebuild_plugin_layer(self: &Arc<Self>) -> Result<Arc<Self>> {
@@ -664,10 +813,31 @@ impl ProfileRuntime {
                 self.profile_id
             )
         })?;
+        self.rebuild_plugin_layer_using(reload).await
+    }
+
+    async fn rebuild_plugin_layer_using(
+        self: &Arc<Self>,
+        reload: &Arc<ProfilePluginReloadConfig>,
+    ) -> Result<Arc<Self>> {
         let (mut tools, plugin_result) =
             build_profile_plugin_layer(&self.profile_id, reload, true).await?;
+        let pipeline_factory = self.pipeline_factory.as_ref().map(|factory| {
+            factory
+                .with_plugin_dirs(reload.plugin_dirs.clone())
+                .unwrap_or_else(|| factory.clone())
+        });
 
-        tools.register(octos_agent::RecallMemoryTool::new(
+        tools.register(
+            octos_agent::RecallMemoryTool::new(self.memory_store.clone())
+                .with_recall(self.recall.clone(), self.embedder.clone()),
+        );
+        tools.register(octos_agent::MemorySearchTool::new(
+            self.recall.clone(),
+            self.embedder.clone(),
+        ));
+        tools.register(octos_agent::MemoryLoadTool::new(
+            self.recall.clone(),
             self.memory_store.clone(),
         ));
         tools.register(octos_agent::SaveMemoryTool::new(self.memory_store.clone()));
@@ -677,7 +847,7 @@ impl ProfileRuntime {
         if self.memory_refresh_enabled {
             tools.register(octos_agent::MemoryNoteTool::new(self.memory_store.clone()));
         }
-        if let Some(ref factory) = self.pipeline_factory {
+        if let Some(ref factory) = pipeline_factory {
             tools.register_arc(factory.create(&self.default_sandbox));
             tools.mark_spawn_only(
                 "run_pipeline",
@@ -694,6 +864,7 @@ impl ProfileRuntime {
             tools.apply_policy(policy);
         }
 
+        self.apply_tool_envelope(&mut tools);
         let skills_loader = build_account_skills_loader(&self.data_dir)
             .with_skill_filter(reload.skill_filter.clone());
         let mut prompt_parts = build_system_prompt(
@@ -708,20 +879,59 @@ impl ProfileRuntime {
             prompt_parts.post_memory.push_str("\n\n");
             prompt_parts.post_memory.push_str(fragment);
         }
+        if let Some(profile) = &self.agent_profile
+            && let Some(template) = &profile.system_prompt_template
+            && let Some(template) =
+                crate::commands::load_profile_prompt_template(&profile.name, template)
+        {
+            prompt_parts.pre_memory = template;
+        }
         let system_prompt = prompt_parts.joined();
 
-        let mut all_hooks = reload.host_hooks.clone();
+        // #2129: the coding default hooks (cargo check / eslint / ruff after
+        // edits) merge at THIS shared assembly point so every host —
+        // bootstrap sessions, WS per-turn rebuilds, chat, gateway — gets
+        // them, not just one consumer. They are SELF-GATING: each declares a
+        // path_filter (fires only on matching source edits) and requires_bin
+        // (skips when the checker is absent), so a podcast workspace never
+        // runs cargo. Defaults first, operator hooks after, per the
+        // coding_default_hooks contract. The hook child's working directory
+        // comes from the per-turn payload cwd (the workspace root), not the
+        // executor, so one profile-level executor serves every session.
+        let mut all_hooks = octos_agent::workspace_policy::coding_default_hooks();
+        all_hooks.extend(reload.host_hooks.clone());
         all_hooks.extend(plugin_result.hooks.clone());
-        let hook_executor = if all_hooks.is_empty() {
-            None
-        } else {
-            Some(Arc::new(HookExecutor::new(all_hooks)))
-        };
+        // #2153 finding 2: coalesce a burst of edits so a whole-project
+        // `cargo check` (up to its 60s timeout) does not run once per edit.
+        // The window is measured from the previous check's completion, so
+        // several `edit_file` calls in one assistant turn collapse to a single
+        // check while a later edit (a new thinking step) still gets a fresh
+        // one. Breaker + debounce state are per session (see HookExecutor).
+        let hook_executor = Some(Arc::new(
+            HookExecutor::new(all_hooks)
+                .with_after_event_debounce(std::time::Duration::from_millis(2000)),
+        ));
         let skills_dir_candidate = self.data_dir.join("skills");
+
+        // #20b — install the main-tree sovereignty provider for the shell
+        // tool. The main tree is the process working directory (the tree the
+        // serve/master was launched from); the closure re-reads its branch and
+        // the caller goal's ledger per command, fail-open when solo/unowned.
+        // Process-global: the LAST profile to bootstrap wins the shared slot,
+        // which is correct for the single-profile serve/master loop this
+        // guards; multi-profile hosts re-install the same rule with their own
+        // data dir.
+        if let Ok(cwd) = std::env::current_dir() {
+            crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::install_main_tree_sovereignty(
+                self.data_dir.clone(),
+                cwd,
+            );
+        }
 
         Ok(Arc::new(Self {
             profile_id: self.profile_id.clone(),
             data_dir: self.data_dir.clone(),
+            session_store_root: self.session_store_root.clone(),
             config: self.config.clone(),
             llm: self.llm.clone(),
             goal_verifier_llm: self.goal_verifier_llm.clone(),
@@ -737,12 +947,14 @@ impl ProfileRuntime {
             tool_policy: self.tool_policy.clone(),
             default_sandbox: self.default_sandbox.clone(),
             max_iterations: self.max_iterations,
+            session_defaults: self.session_defaults.clone(),
+            agent_profile: self.agent_profile.clone(),
             format_after_edit: self.format_after_edit,
             snapshots: self.snapshots.clone(),
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             skill_actions: plugin_result.loaded_actions.clone(),
-            plugin_reload: self.plugin_reload.clone(),
+            plugin_reload: Some(reload.clone()),
             plugin_dirs: reload.plugin_dirs.clone(),
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
             plugin_hooks: plugin_result.hooks.clone(),
@@ -752,6 +964,7 @@ impl ProfileRuntime {
             prompt_parts,
             memory: self.memory.clone(),
             memory_store: self.memory_store.clone(),
+            recall: self.recall.clone(),
             embedder: self.embedder.clone(),
             memory_inject_tokens: self.memory_inject_tokens,
             memory_refresh_enabled: self.memory_refresh_enabled,
@@ -759,7 +972,7 @@ impl ProfileRuntime {
             tool_config: self.tool_config.clone(),
             cron_service: self.cron_service.clone(),
             runtime_lifecycle: self.runtime_lifecycle.clone(),
-            pipeline_factory: self.pipeline_factory.clone(),
+            pipeline_factory,
             hook_executor,
             lane_routing: self.lane_routing.clone(),
             voice: self.voice.clone(),
@@ -799,9 +1012,10 @@ impl ProfileRuntime {
     ///
     /// # Errors
     ///
-    /// Returns an error when the LLM provider construction fails
-    /// (typically a missing API key), when the redb episode store
-    /// cannot open, or when the tool config store cannot be opened.
+    /// Returns an error when runtime directories cannot be created, when the
+    /// LLM provider construction fails (typically a missing API key), when the
+    /// redb episode store cannot open, or when the tool config store cannot be
+    /// opened.
     /// Plugin / MCP loading failures are logged at `warn` and do not
     /// fail bootstrap (the profile still serves with builtins only).
     pub async fn bootstrap(
@@ -830,6 +1044,39 @@ impl ProfileRuntime {
         host_voice: Option<&crate::config::VoiceConfig>,
         host_memory: Option<&crate::config::MemoryConfig>,
     ) -> Result<Arc<Self>> {
+        Self::bootstrap_replacing(
+            profile,
+            data_dir,
+            octos_home,
+            role,
+            host_plugins,
+            host_voice,
+            host_memory,
+            &mut None,
+        )
+        .await
+    }
+
+    /// [`Self::bootstrap_with_host_plugins`] for a configuration change of a
+    /// profile whose previous stores may still be open (an in-flight turn's
+    /// agent holds them even after the runtime itself is gone). When the new
+    /// configuration keeps the same storage, the new runtime takes over the
+    /// retired stores and long-lived services; every configuration-derived
+    /// part is rebuilt exactly as a cold bootstrap would. When it does not,
+    /// `previous` is released (set to `None`) before the cold bootstrap so
+    /// this process no longer pins the stores; otherwise it is left for the
+    /// caller to keep on failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn bootstrap_replacing(
+        profile: &UserProfile,
+        data_dir: &Path,
+        octos_home: Option<&Path>,
+        role: BootstrapRole,
+        host_plugins: Option<&crate::config::PluginsConfig>,
+        host_voice: Option<&crate::config::VoiceConfig>,
+        host_memory: Option<&crate::config::MemoryConfig>,
+        previous: &mut Option<RetiredProfileRuntime>,
+    ) -> Result<Arc<Self>> {
         // Step 1: derive the per-profile Config. Apply the host plugin
         // policy on top of the profile-derived one before any downstream
         // step inspects `config.plugins.require_signed`.
@@ -845,35 +1092,114 @@ impl ProfileRuntime {
         // inherit the host budget.
         crate::config::merge_host_memory_into_profile(&mut config.memory, host_memory);
 
+        let shared = match previous {
+            Some(retired) if retired.can_share_with(data_dir, &config) => {
+                Some(retired.resources.clone())
+            }
+            _ => {
+                *previous = None;
+                None
+            }
+        };
+        Self::bootstrap_resolved_sharing(
+            profile, data_dir, octos_home, role, config, host_voice, false, None, shared,
+        )
+        .await
+    }
+
+    /// Keep this runtime's stores and long-lived services for its
+    /// replacement. Held strongly: an in-flight turn's agent can keep the
+    /// single-writer episode store open after every runtime handle is gone.
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) fn retire(&self) -> RetiredProfileRuntime {
+        RetiredProfileRuntime {
+            data_dir: self.data_dir.clone(),
+            custom_session_root: self.session_store_root.is_some(),
+            config: Box::new(self.config.clone()),
+            resources: SharedProfileResources {
+                memory: self.memory.clone(),
+                memory_store: self.memory_store.clone(),
+                recall: self.recall.clone(),
+                embedder: self.embedder.clone(),
+                tool_config: self.tool_config.clone(),
+                cron_service: self.cron_service.clone(),
+                runtime_lifecycle: self.runtime_lifecycle.clone(),
+                memory_refresh: self.memory_refresh.clone(),
+            },
+        }
+    }
+
+    /// Local OUP adapters use the same assembler with their already-resolved
+    /// CLI config. Do not round-trip this through ProfileConfig: doing so loses
+    /// custom endpoints, API styles and explicit CLI policy overrides.
+    /// A supplied provider is an embedding seam, not a second runtime path.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "api"), allow(dead_code))]
+    pub(crate) async fn bootstrap_resolved(
+        profile: &UserProfile,
+        data_dir: &Path,
+        octos_home: Option<&Path>,
+        role: BootstrapRole,
+        config: Config,
+        host_voice: Option<&crate::config::VoiceConfig>,
+        no_retry: bool,
+        provider_override: Option<Arc<dyn LlmProvider>>,
+    ) -> Result<Arc<Self>> {
+        Self::bootstrap_resolved_sharing(
+            profile,
+            data_dir,
+            octos_home,
+            role,
+            config,
+            host_voice,
+            no_retry,
+            provider_override,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bootstrap_resolved_sharing(
+        profile: &UserProfile,
+        data_dir: &Path,
+        octos_home: Option<&Path>,
+        role: BootstrapRole,
+        config: Config,
+        host_voice: Option<&crate::config::VoiceConfig>,
+        no_retry: bool,
+        provider_override: Option<Arc<dyn LlmProvider>>,
+        shared: Option<SharedProfileResources>,
+    ) -> Result<Arc<Self>> {
+        ensure_profile_runtime_directories(data_dir).wrap_err_with(|| {
+            format!(
+                "failed to initialize runtime directories for profile '{}'",
+                profile.id
+            )
+        })?;
+
         // Step 2: resolve the provider name. `config_from_profile`
         // populates `provider`/`model` from `llm.primary` when set,
         // else falls back to `detect_provider(model)`.
         let model = config.model.clone();
         let base_url = config.base_url.clone();
-        let provider_name = config
-            .provider
-            .clone()
-            .or_else(|| {
-                model
-                    .as_deref()
-                    .and_then(crate::config::detect_provider)
-                    .map(String::from)
-            })
-            .ok_or_else(|| {
-                eyre::eyre!("profile '{}' has no LLM provider configured", profile.id)
-            })?;
+        let provider_name = configured_provider_name(&config).ok_or_else(|| {
+            eyre::eyre!("profile '{}' has no LLM provider configured", profile.id)
+        })?;
 
         // Step 3: build the LLM provider chain.
-        let base_provider = chat::create_provider(&provider_name, &config, model, base_url)
-            .wrap_err_with(|| {
-                format!("failed to create LLM provider for profile '{}'", profile.id)
-            })?;
+        let base_provider = match provider_override {
+            Some(provider) => provider,
+            None => chat::create_provider(&provider_name, &config, model, base_url).wrap_err_with(
+                || format!("failed to create LLM provider for profile '{}'", profile.id),
+            )?,
+        };
         let primary_model_id = base_provider.model_id().to_string();
         let bundle = build_adaptive_provider_chain(
             base_provider,
             &config,
             data_dir,
-            false,
+            no_retry,
             ExporterMode::Spawn,
         );
         let llm = bundle.llm.clone();
@@ -893,34 +1219,53 @@ impl ProfileRuntime {
         // different length. Sizing it from the configured provider is what
         // makes a non-1536-d embedder (e.g. in-process EmbeddingGemma at 768)
         // actually reach the vector lane instead of degrading to BM25-only.
-        let embedder =
-            chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
-        let index_dimension = embedder
-            .as_ref()
-            .map_or(octos_memory::EPISODIC_INDEX_DIMENSION, |e| e.dimension());
-
-        let memory_open_result = match role {
-            BootstrapRole::Serve => {
-                EpisodeStore::open_with_dimension(data_dir, index_dimension).await
-            }
-            BootstrapRole::Gateway => {
-                EpisodeStore::open_or_degraded_with_dimension(data_dir, index_dimension).await
-            }
-        };
-        let memory = Arc::new(memory_open_result.wrap_err_with(|| {
-            format!("failed to open episode store for profile '{}'", profile.id)
-        })?);
-        let memory_store = Arc::new(MemoryStore::open(data_dir).await.wrap_err_with(|| {
-            format!("failed to open memory store for profile '{}'", profile.id)
-        })?);
-
-        // Step 5: tool config store.
-        let tool_config = Arc::new(ToolConfigStore::open(data_dir).await.wrap_err_with(|| {
-            format!(
-                "failed to open tool config store for profile '{}'",
-                profile.id
+        let (memory, memory_store, recall, embedder, tool_config) = if let Some(shared) =
+            shared.as_ref()
+        {
+            (
+                shared.memory.clone(),
+                shared.memory_store.clone(),
+                shared.recall.clone(),
+                shared.embedder.clone(),
+                shared.tool_config.clone(),
             )
-        })?);
+        } else {
+            let embedder =
+                chat::create_embedder(&config).map(|e| e as Arc<dyn octos_llm::EmbeddingProvider>);
+            let index_dimension = embedder
+                .as_ref()
+                .map_or(octos_memory::EPISODIC_INDEX_DIMENSION, |e| e.dimension());
+
+            let memory_open_result = match role {
+                BootstrapRole::Serve => {
+                    EpisodeStore::open_with_dimension(data_dir, index_dimension).await
+                }
+                BootstrapRole::Gateway => {
+                    EpisodeStore::open_or_degraded_with_dimension(data_dir, index_dimension).await
+                }
+            };
+            let memory = Arc::new(memory_open_result.wrap_err_with(|| {
+                format!("failed to open episode store for profile '{}'", profile.id)
+            })?);
+            let memory_store = Arc::new(MemoryStore::open(data_dir).await.wrap_err_with(|| {
+                format!("failed to open memory store for profile '{}'", profile.id)
+            })?);
+            let recall = open_recall_store(data_dir, &config, embedder.as_deref())
+                .await
+                .wrap_err_with(|| {
+                    format!("failed to open recall store for profile '{}'", profile.id)
+                })?;
+
+            // Step 5: tool config store.
+            let tool_config =
+                Arc::new(ToolConfigStore::open(data_dir).await.wrap_err_with(|| {
+                    format!(
+                        "failed to open tool config store for profile '{}'",
+                        profile.id
+                    )
+                })?);
+            (memory, memory_store, recall, embedder, tool_config)
+        };
 
         // Step 6: resolve credentials from the profile's declared env
         // vars (keychain-aware). Used by MCP, plugin spawns, and the
@@ -943,6 +1288,11 @@ impl ProfileRuntime {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| data_dir.to_path_buf());
         let mut plugin_env_template = profile_plugin_env(profile);
+        crate::commands::gateway::profile_factory::apply_resolved_profile_llm_env(
+            &mut plugin_env_template,
+            &config,
+            &profile.updated_at.to_rfc3339(),
+        );
         push_runtime_plugin_env(
             &mut plugin_env_template,
             data_dir,
@@ -1022,7 +1372,7 @@ impl ProfileRuntime {
         // one-shot migration warning on first detection.
         let plugin_work_dir = data_dir.join("skill-output");
         let _ = std::fs::create_dir_all(&plugin_work_dir);
-        let mut plugin_dirs: Vec<PathBuf> = Config::plugin_dirs_from_project(&effective_octos_home);
+        let mut plugin_dirs = Config::plugin_dirs_from_project(&effective_octos_home);
         let platform_dir = effective_octos_home.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
         if platform_dir.exists() && !plugin_dirs.contains(&platform_dir) {
             plugin_dirs.push(platform_dir);
@@ -1078,7 +1428,18 @@ impl ProfileRuntime {
 
         // Memory bank tools — registered profile-side so every
         // session inherits the same memory_store.
-        tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
+        tools.register(
+            octos_agent::RecallMemoryTool::new(memory_store.clone())
+                .with_recall(recall.clone(), embedder.clone()),
+        );
+        tools.register(octos_agent::MemorySearchTool::new(
+            recall.clone(),
+            embedder.clone(),
+        ));
+        tools.register(octos_agent::MemoryLoadTool::new(
+            recall.clone(),
+            memory_store.clone(),
+        ));
         tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
         tools.register(octos_agent::RecordMemoryUseTool::new(memory_store.clone()));
         if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
@@ -1148,6 +1509,7 @@ impl ProfileRuntime {
         let pipeline_factory: Option<
             Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>,
         > = {
+            #[derive(Clone)]
             struct AppUiPipelineToolFactory {
                 llm: Arc<dyn LlmProvider>,
                 memory: Arc<EpisodeStore>,
@@ -1170,6 +1532,16 @@ impl ProfileRuntime {
             }
 
             impl crate::session_actor::PipelineToolFactory for AppUiPipelineToolFactory {
+                fn with_plugin_dirs(
+                    &self,
+                    plugin_dirs: Vec<PathBuf>,
+                ) -> Option<Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>>
+                {
+                    let mut factory = self.clone();
+                    factory.plugin_dirs = plugin_dirs;
+                    Some(Arc::new(factory))
+                }
+
                 fn create(&self, sandbox: &SandboxConfig) -> Arc<dyn octos_agent::tools::Tool> {
                     let mut pt = octos_pipeline::RunPipelineTool::new(
                         self.llm.clone(),
@@ -1252,13 +1624,33 @@ impl ProfileRuntime {
         // on `ProfileRuntime::cron_service`; without that field the
         // tokio task `start()` spawned would be cancelled the moment
         // this function returned.
-        let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
-        let cron_service = Arc::new(CronService::new(data_dir.join("cron.json"), cron_tx));
-        cron_service.start();
+        // A replacement runtime keeps the running service and its shutdown
+        // owner: a second `start()` on the same `cron.json` would fire jobs
+        // twice, and dropping the previous lifecycle would stop the timer.
+        let (cron_service, runtime_lifecycle) = match shared.as_ref().and_then(|shared| {
+            Some((
+                shared.cron_service.clone()?,
+                shared.runtime_lifecycle.clone()?,
+            ))
+        }) {
+            Some((cron_service, lifecycle)) => (cron_service, Some(lifecycle)),
+            None => {
+                let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
+                let cron_service = Arc::new(CronService::new(data_dir.join("cron.json"), cron_tx));
+                cron_service.start();
+                let lifecycle = Arc::new(ProfileRuntimeLifecycle {
+                    cron_service: Some(cron_service.clone()),
+                });
+                (cron_service, Some(lifecycle))
+            }
+        };
         tools.register(CronTool::with_context(cron_service.clone(), "api", ""));
-        let runtime_lifecycle = Some(Arc::new(ProfileRuntimeLifecycle {
-            cron_service: Some(cron_service.clone()),
-        }));
+        // Hand the same service to the AppUI orchestrator so `loop/delete` can
+        // reap the cron jobs a loop created. Without this the orchestrator has
+        // no cron handle at all and the reap silently does nothing.
+        #[cfg(feature = "api")]
+        crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+            .set_cron_service(cron_service.clone());
         // #1935 — resolve the INDEPENDENT goal-completion verifier lane
         // (`sub_providers` key `goal_verifier`) once at profile build. It is
         // threaded into the `goal_update` tool below and stored on the
@@ -1403,13 +1795,29 @@ impl ProfileRuntime {
         // `Option<Arc<HookExecutor>>` preserves the pre-M11-F default
         // when neither source carries any hooks (the agent's
         // `hooks: None` field remains untouched).
-        let mut all_hooks = config.hooks.clone();
+        // #2129: the coding default hooks (cargo check / eslint / ruff after
+        // edits) merge at THIS shared assembly point so every host —
+        // bootstrap sessions, WS per-turn rebuilds, chat, gateway — gets
+        // them, not just one consumer. They are SELF-GATING: each declares a
+        // path_filter (fires only on matching source edits) and requires_bin
+        // (skips when the checker is absent), so a podcast workspace never
+        // runs cargo. Defaults first, operator hooks after, per the
+        // coding_default_hooks contract. The hook child's working directory
+        // comes from the per-turn payload cwd (the workspace root), not the
+        // executor, so one profile-level executor serves every session.
+        let mut all_hooks = octos_agent::workspace_policy::coding_default_hooks();
+        all_hooks.extend(config.hooks.clone());
         all_hooks.extend(plugin_result.hooks.clone());
-        let hook_executor = if all_hooks.is_empty() {
-            None
-        } else {
-            Some(Arc::new(HookExecutor::new(all_hooks)))
-        };
+        // #2153 finding 2: coalesce a burst of edits so a whole-project
+        // `cargo check` (up to its 60s timeout) does not run once per edit.
+        // The window is measured from the previous check's completion, so
+        // several `edit_file` calls in one assistant turn collapse to a single
+        // check while a later edit (a new thinking step) still gets a fresh
+        // one. Breaker + debounce state are per session (see HookExecutor).
+        let hook_executor = Some(Arc::new(
+            HookExecutor::new(all_hooks)
+                .with_after_event_debounce(std::time::Duration::from_millis(2000)),
+        ));
 
         info!(
             profile_id = %profile.id,
@@ -1433,9 +1841,30 @@ impl ProfileRuntime {
                 .wrap_err("invalid profile approval_policy")?;
         }
 
+        // Recall/Knowledge index upkeep (docs/adr/personal-memory-tiers.md):
+        // mirror bank pages, embed records that arrived without vectors,
+        // and apply the heat policy. Runs off the bootstrap path so a large
+        // bank never delays the first turn; errors only log.
+        // A replacement shares stores whose upkeep already ran.
+        if shared.is_none() {
+            spawn_recall_maintenance(
+                recall.clone(),
+                memory_store.clone(),
+                embedder.clone(),
+                profile.id.clone(),
+            );
+        }
+
         // Start the background memory-refresh sweep when enabled. The
         // flock decides ownership when serve and gateway share a profile
-        // dir; the loser just logs and skips.
+        // dir; the loser just logs and skips. A replacement first stops the
+        // sweep it takes over so the restarted one uses the new provider.
+        if let Some(previous) = shared
+            .as_ref()
+            .and_then(|shared| shared.memory_refresh.as_ref())
+        {
+            previous.shutdown().await;
+        }
         let memory_refresh = if memory_refresh_enabled {
             let refresh_cfg = config.memory.as_ref().and_then(|m| m.refresh.as_ref());
             crate::memory_refresh::MemoryRefreshService::try_start(
@@ -1461,6 +1890,7 @@ impl ProfileRuntime {
         Ok(Arc::new(Self {
             profile_id: profile.id.clone(),
             data_dir: data_dir.to_path_buf(),
+            session_store_root: None,
             // Retained whole for lazy per-lane provider resolution (e.g. a
             // peer running on a named `sub_provider` model lane); the typed
             // fields below carry the pre-extracted hot-path state.
@@ -1477,6 +1907,8 @@ impl ProfileRuntime {
             tool_policy: config.tool_policy.clone(),
             default_sandbox,
             max_iterations: config.max_iterations,
+            session_defaults: None,
+            agent_profile: None,
             format_after_edit: config.format_after_edit,
             snapshots: config.snapshots.clone(),
             tool_specs: Arc::new(tools),
@@ -1498,6 +1930,7 @@ impl ProfileRuntime {
             memory_refresh_enabled,
             memory,
             memory_store,
+            recall,
             embedder,
             memory_refresh,
             tool_config,
@@ -1547,6 +1980,151 @@ impl ProfileRuntime {
 /// is already dropped — but readers reasonably expect the runtime to
 /// own its background tasks). Codex flagged this on the M11-F serve
 /// regression bundle review.
+/// Open the profile's Recall/Knowledge index sized to the embedder.
+///
+/// Vectors are Matryoshka-truncated to `memory.recall_dimension` (default
+/// 256) and quantised, so the index never needs the embedder's full width;
+/// an embedder narrower than that lowers the width instead. Without an
+/// embedder the store still opens and answers keyword (BM25) queries.
+pub(crate) async fn open_recall_store(
+    data_dir: &Path,
+    config: &Config,
+    embedder: Option<&dyn octos_llm::EmbeddingProvider>,
+) -> Result<Arc<octos_memory::RecallStore>> {
+    // One handle per data dir per process: profiles routed by the gateway
+    // and the serve/gateway bootstrap share it instead of contending for
+    // the redb lock (a second open in the same process would only get the
+    // in-memory fallback).
+    static SHARED: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, Arc<octos_memory::RecallStore>>>,
+    > = std::sync::OnceLock::new();
+    let key = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    if let Some(existing) = SHARED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Ok(existing);
+    }
+    let recall_config = recall_config_for(config, embedder);
+    let dir = data_dir.to_path_buf();
+    let store = tokio::task::spawn_blocking(move || {
+        octos_memory::RecallStore::open_or_degraded(&dir, recall_config)
+    })
+    .await
+    .wrap_err("recall store open task failed")??;
+    let store = Arc::new(store);
+    SHARED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, store.clone());
+    Ok(store)
+}
+
+/// Strict opener for one-shot commands (`octos memory …`): refuses when a
+/// running serve/gateway owns the store instead of silently working on an
+/// in-memory copy, and resolves the SAME geometry as the runtime so vectors
+/// are never misread.
+pub(crate) async fn open_recall_store_strict(
+    data_dir: &Path,
+    config: &Config,
+    embedder: Option<&dyn octos_llm::EmbeddingProvider>,
+) -> Result<octos_memory::RecallStore> {
+    let recall_config = recall_config_for(config, embedder);
+    let dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || octos_memory::RecallStore::open(&dir, recall_config))
+        .await
+        .wrap_err("recall store open task failed")?
+}
+
+/// The Recall geometry the runtime uses for `config` + `embedder`.
+pub(crate) fn recall_config_for(
+    config: &Config,
+    embedder: Option<&dyn octos_llm::EmbeddingProvider>,
+) -> octos_memory::RecallConfig {
+    let mut recall_config = octos_memory::RecallConfig::default();
+    if let Some(dim) = config.memory.as_ref().and_then(|m| m.recall_dimension) {
+        recall_config.dimension = dim.max(8);
+    }
+    if let Some(e) = embedder {
+        recall_config.dimension = recall_config.dimension.min(e.dimension());
+    }
+    // The embedder id is only claimed when an embedder actually loaded: a
+    // non-empty id lets the store adopt a new geometry (purging foreign
+    // vectors), which must never happen because credentials or a model file
+    // were merely unavailable this run.
+    recall_config.embedder_id = match (embedder.is_some(), config.embedding.as_ref()) {
+        (false, _) => String::new(),
+        // No `embedding` section but an embedder loaded ⇒ the bundled default.
+        (true, None) => crate::embed_model::DEFAULT_MODEL_ID.to_string(),
+        (true, Some(e)) => {
+            let model = e.model.clone().or_else(|| e.model_path.clone());
+            match model {
+                // The bundled model, referenced by its default path or none.
+                None => crate::embed_model::DEFAULT_MODEL_ID.to_string(),
+                Some(m) => format!("{}/{}", e.provider, m),
+            }
+        }
+    };
+    recall_config
+}
+
+/// Background upkeep for the Recall/Knowledge index at profile bootstrap.
+pub(crate) fn spawn_recall_maintenance(
+    recall: Arc<octos_memory::RecallStore>,
+    memory_store: Arc<MemoryStore>,
+    embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
+    profile_id: String,
+) {
+    tokio::spawn(async move {
+        if let Err(e) =
+            octos_agent::memory_index::sync_bank(&memory_store, &recall, embedder.as_deref()).await
+        {
+            tracing::warn!(profile = %profile_id, error = %e, "recall: bank sync failed");
+        }
+        if let Some(e) = embedder.as_deref() {
+            // Drain the whole backlog in bounded batches (an embedder change
+            // on a large store) instead of stopping after the first batch.
+            let mut total = 0usize;
+            loop {
+                match octos_agent::memory_index::backfill_vectors(&recall, e, 512).await {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(err) => {
+                        tracing::warn!(profile = %profile_id, error = %err, "recall: vector backfill failed");
+                        break;
+                    }
+                }
+            }
+            if total > 0 {
+                tracing::info!(profile = %profile_id, vectors = total, "recall: backfilled vectors");
+            }
+        }
+        let aged = {
+            let recall = recall.clone();
+            tokio::task::spawn_blocking(move || {
+                let report = recall.age(chrono::Utc::now())?;
+                recall.persist_index()?;
+                Ok::<_, eyre::Report>(report)
+            })
+            .await
+        };
+        match aged {
+            Ok(Ok(report)) if report.records_deleted > 0 || report.vectors_evicted > 0 => {
+                tracing::info!(profile = %profile_id, ?report, "recall: aged index")
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(profile = %profile_id, error = %e, "recall: aging failed"),
+            Err(e) => {
+                tracing::warn!(profile = %profile_id, error = %e, "recall: aging task failed")
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1560,6 +2138,214 @@ mod tests {
     #[cfg(unix)]
     use octos_core::SessionKey;
     use std::collections::HashMap;
+
+    fn gemini_profile(id: &str, model: &str) -> UserProfile {
+        let mut env_vars = HashMap::new();
+        env_vars.insert("GEMINI_API_KEY".to_string(), format!("fixture-{id}"));
+        UserProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig {
+                gateway: GatewaySettings::default(),
+                env_vars,
+                llm: Some(LlmProfileConfig {
+                    primary: Some(LlmModelSelectionConfig {
+                        family_id: Some("google".to_string()),
+                        model_id: Some(model.to_string()),
+                        ..Default::default()
+                    }),
+                    fallbacks: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Configuration-derived state that a replacement must rebuild exactly as
+    /// a cold bootstrap would.
+    fn derived_snapshot(rt: &ProfileRuntime) -> serde_json::Value {
+        let mut env = rt.plugin_env_template.clone();
+        env.sort();
+        let mut tools = rt.tool_specs.tool_names();
+        tools.sort();
+        serde_json::json!({
+            "env": env,
+            "provider": rt.provider_name,
+            "model": rt.primary_model_id,
+            "tools": tools,
+            "system_prompt": rt.system_prompt,
+            "memory_refresh_enabled": rt.memory_refresh_enabled,
+        })
+    }
+
+    #[tokio::test]
+    async fn should_share_stores_and_match_cold_bootstrap_when_replacing_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("swap").join("data");
+        let first = gemini_profile("swap", "gemini-m1");
+        let mut second = gemini_profile("swap", "gemini-m2");
+        second.updated_at = first.updated_at + chrono::Duration::seconds(5);
+
+        // `old` stays alive like a runtime held by an in-flight turn: it
+        // keeps the single-writer episode store open.
+        let old = ProfileRuntime::bootstrap(&first, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("initial bootstrap");
+        let cold_while_held =
+            ProfileRuntime::bootstrap(&second, &data_dir, None, BootstrapRole::Serve).await;
+        assert!(
+            cold_while_held.is_err(),
+            "a cold bootstrap cannot reopen the store the old runtime holds"
+        );
+
+        // Retire, then keep only what an in-flight agent keeps: the episode
+        // store. Every runtime handle is gone, the redb lock is not.
+        let mut retired = Some(old.retire());
+        let held_by_agent = old.memory.clone();
+        let old_memory_store = old.memory_store.clone();
+        let old_recall = old.recall.clone();
+        let old_tool_config = old.tool_config.clone();
+        let old_cron = old.cron_service.clone().unwrap();
+        let old_lifecycle = old.runtime_lifecycle.clone().unwrap();
+        assert_eq!(old.primary_model_id, "gemini-m1");
+        drop(old);
+        let replacement = ProfileRuntime::bootstrap_replacing(
+            &second,
+            &data_dir,
+            None,
+            BootstrapRole::Serve,
+            None,
+            None,
+            None,
+            &mut retired,
+        )
+        .await
+        .expect("replacement shares the held stores");
+        assert!(
+            retired.is_some(),
+            "a shareable retiree stays with the caller"
+        );
+        drop(retired);
+        assert!(Arc::ptr_eq(&replacement.memory, &held_by_agent));
+        assert!(Arc::ptr_eq(&replacement.memory_store, &old_memory_store));
+        assert!(Arc::ptr_eq(&replacement.recall, &old_recall));
+        assert!(Arc::ptr_eq(&replacement.tool_config, &old_tool_config));
+        assert!(Arc::ptr_eq(
+            replacement.cron_service.as_ref().unwrap(),
+            &old_cron
+        ));
+        assert!(Arc::ptr_eq(
+            replacement.runtime_lifecycle.as_ref().unwrap(),
+            &old_lifecycle
+        ));
+        assert!(
+            old_cron.is_running(),
+            "the shared cron service keeps running"
+        );
+        assert_eq!(replacement.primary_model_id, "gemini-m2");
+        assert_eq!(
+            replacement.memory_refresh.is_some(),
+            replacement.memory_refresh_enabled,
+            "the replacement takes over the memory refresh sweep"
+        );
+        let derived = derived_snapshot(&replacement);
+
+        drop(replacement);
+        drop((held_by_agent, old_memory_store, old_recall, old_tool_config));
+        drop((old_cron, old_lifecycle));
+        let cold = ProfileRuntime::bootstrap(&second, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("cold bootstrap once the stores are released");
+        assert_eq!(derived, derived_snapshot(&cold));
+    }
+
+    #[tokio::test]
+    async fn should_refuse_sharing_when_storage_shape_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("shape").join("data");
+        let profile = gemini_profile("shape", "gemini-m1");
+        let old = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
+            .await
+            .expect("initial bootstrap");
+        let same = old.config.clone();
+        let retired = old.retire();
+        assert!(retired.can_share_with(&data_dir, &same));
+        assert!(!retired.can_share_with(&tmp.path().join("elsewhere"), &same));
+
+        let mut embedding = same.clone();
+        embedding.embedding = Some(crate::config::EmbeddingConfig {
+            provider: "openai".to_string(),
+            api_key_env: None,
+            base_url: None,
+            model: Some("text-embedding-3-small".to_string()),
+            dimensions: Some(256),
+            model_path: None,
+            auto_download: None,
+        });
+        assert!(!retired.can_share_with(&data_dir, &embedding));
+
+        let mut recall = same.clone();
+        recall
+            .memory
+            .get_or_insert_with(Default::default)
+            .recall_dimension = Some(64);
+        assert!(!retired.can_share_with(&data_dir, &recall));
+
+        // An unshareable retiree is released before the cold bootstrap, so
+        // the process does not pin the stores it can no longer use.
+        drop(old);
+        let mut unshareable = Some(retired);
+        let mut changed = profile.clone();
+        changed.config.memory = Some(crate::config::MemoryConfig {
+            recall_dimension: Some(64),
+            ..Default::default()
+        });
+        let rebuilt = ProfileRuntime::bootstrap_replacing(
+            &changed,
+            &data_dir,
+            None,
+            BootstrapRole::Serve,
+            None,
+            None,
+            None,
+            &mut unshareable,
+        )
+        .await;
+        assert!(unshareable.is_none());
+        assert!(
+            rebuilt.is_ok(),
+            "nothing else holds the stores: {:?}",
+            rebuilt.err()
+        );
+
+        let mut keyed = embedding.clone();
+        keyed.embedding.as_mut().unwrap().api_key_env = Some("EMBED_KEY".to_string());
+        let mut keyed_old = keyed.clone();
+        keyed
+            .env_vars
+            .insert("EMBED_KEY".to_string(), "new".to_string());
+        keyed_old
+            .env_vars
+            .insert("EMBED_KEY".to_string(), "old".to_string());
+        assert!(configs_share_storage(&keyed_old, &keyed_old.clone()));
+        assert!(!configs_share_storage(&keyed_old, &keyed));
+    }
+
+    #[test]
+    fn should_create_inbox_when_ensuring_profile_runtime_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("profiles").join("test").join("data");
+
+        ensure_profile_runtime_directories(&data_dir).unwrap();
+
+        assert!(data_dir.join("inbox").is_dir());
+    }
 
     /// Build a minimal `UserProfile` with no LLM contract. M11-D
     /// bootstrap must reject this with a clear error, not panic.
@@ -1933,6 +2719,15 @@ mod tests {
         assert!(
             msg.contains("Database already open") || msg.contains("Cannot acquire lock"),
             "error must surface the redb lock contention; got: {err:?}",
+        );
+
+        // Failing loudly is only half the contract: the API layer branches on
+        // this to render an actionable remedy, and it must be able to tell
+        // lock contention from corruption without string matching.
+        assert!(
+            octos_memory::is_episode_store_locked(&err),
+            "bootstrap must preserve the typed lock cause through its own \
+             wrap_err context; got: {err:?}",
         );
     }
 
@@ -2509,11 +3304,18 @@ mod tests {
             .await
             .expect("bootstrap should succeed");
 
-        // With no config-side hooks and no plugin-side hooks the field
-        // must be None so the agent's default `hooks: None` is kept.
-        assert!(
-            rt.hook_executor.is_none(),
-            "hook_executor must be None when neither config nor plugins supply hooks",
+        // #2129: the coding defaults (cargo check / eslint / ruff) merge at
+        // this shared assembly point unconditionally (they are self-gating
+        // via path_filter + requires_bin), so the executor is always Some —
+        // with EXACTLY the defaults when neither config nor plugins add any.
+        let executor = rt
+            .hook_executor
+            .as_ref()
+            .expect("hook_executor must carry the coding defaults");
+        assert_eq!(
+            executor.configs().len(),
+            octos_agent::workspace_policy::coding_default_hooks().len(),
+            "no config/plugin hooks: executor must hold exactly the coding defaults",
         );
     }
 

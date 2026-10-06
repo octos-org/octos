@@ -24,6 +24,7 @@ octos-diagnostics = { workspace = true, features = ["github"] }
 octos-agent = { workspace = true }
 octos-memory = { workspace = true }
 octos-llm = { workspace = true }
+octos-sandbox = { path = "../octos-sandbox" }
 octos-bus = { workspace = true }
 octos-workflows = { workspace = true }
 octos-store = { workspace = true }
@@ -38,8 +39,13 @@ octos-swarm = { workspace = true }
 octos-plugin = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
-clap_complete = { workspace = true }
+# unstable-dynamic: `CompleteEnv` in main answers COMPLETE=<shell> callbacks so
+# sourced scripts get live completions (#2413). No-op unless that env is set.
+clap_complete = { workspace = true, features = ["unstable-dynamic"] }
 dirs = { workspace = true }
+# Strip the `\\?\` prefix std::fs::canonicalize returns on Windows; the prefix
+# breaks downstream tools (git treats it as a URL). Same use as octos-agent.
+dunce = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 colored = { workspace = true }
@@ -56,6 +62,7 @@ rustyline = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 sha2 = { workspace = true }
+semver = { workspace = true }
 fs2 = { workspace = true }
 subtle = { workspace = true, optional = true }
 getrandom = "0.2"
@@ -122,6 +129,7 @@ octos-fleet-worker.workspace = true
 # `tokio::fs::read` followed symlinks between the canonical-descendant
 # check and the read, opening a TOCTOU window.
 libc = { workspace = true }
+rpassword = { workspace = true }
 # `rustix::fs::openat` for the component-by-component path walk in
 # `src/api/preview.rs::open_no_follow_walk`. Codex round-2 BLOCKING #1
 # (issue #996): the previous `symlink_metadata`-then-`open` ancestor
@@ -130,7 +138,15 @@ libc = { workspace = true }
 # safe `openat` wrapper (workspace-wide `deny(unsafe_code)` rules out
 # raw `libc::openat`) anchors each step to a parent fd so the
 # relationship survives mid-walk swaps.
-rustix = { version = "1.1", features = ["fs"] }
+# `fs` for the preview walk above; `process` adds
+# `rustix::process::test_kill_process` — the kill(pid, 0) liveness probe in
+# `src/build_cache/pool.rs` (review #3 D1). Unlike the `kill` binary, the
+# syscall returns a distinguishable errno (ESRCH vs EPERM), and unlike
+# `libc::kill` it is safe under the workspace-wide deny(unsafe_code).
+# `net` validates the listener `serve --host-managed --listen-fd` inherits
+# (socket type, listen) in `src/api/host_managed.rs`; `process` also sets its
+# Linux/Android parent-death signal.
+rustix = { version = "1.1", features = ["fs", "process", "net"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
@@ -140,7 +156,18 @@ keyring = { workspace = true, features = ["apple-native"] }
 keyring = { workspace = true, features = ["windows-native"] }
 
 [features]
-default = []
+# chat, ACP and serve use one OUP dispatcher. Minimal library builds can opt
+# out, but never silently fall back to independent chat/ACP agent loops.
+# `embed-llama` is on by default: the in-process EmbeddingGemma embedder
+# behind memory search (docs/adr/personal-memory-tiers.md). Building it needs
+# cmake + a C++ toolchain; `--no-default-features --features api` opts out.
+default = ["api", "embed-llama", "impersonate"]
+# Results-page engines that need a browser-like client (Google's page for
+# simple phones, as SearXNG does; octos-research `impersonate`, BoringSSL,
+# needs cmake). A choice of this binary, not a default of octos-agent: a
+# `--no-default-features` build (the Android kernel) cross-compiles no
+# BoringSSL and simply leaves those engines out.
+impersonate = ["octos-agent/impersonate"]
 # In-process llama.cpp GGUF embedding provider. Wires
 # `embedding.provider = "llamacpp"` in create_embedder. Cross-platform — no
 # target gate — and defaults to the CPU backend; add an accelerator explicitly.
@@ -180,6 +207,7 @@ audio_mp3 = ["octos-agent/audio_mp3"]
 workspace = true
 
 [dev-dependencies]
+tracing-core = "0.1.36"
 tokio-test = { workspace = true }
 tower = { workspace = true }
 axum = { workspace = true }
@@ -187,6 +215,10 @@ axum = { workspace = true }
 # failover-surfacing tests can call `publish_failover_for_subscribers`.
 # Production builds don't see this; only `cargo test -p octos-cli`.
 octos-llm = { workspace = true, features = ["test-utils"] }
+# #2353 — exposes octos-agent's test-only liveness probes (e.g.
+# `on_restore_slot_alive_probe_for_test`) to octos-cli's tests. Production
+# builds don't see this; only `cargo test -p octos-cli`.
+octos-agent = { workspace = true, features = ["test-utils"] }
 # Exposes `octos-store`'s test-only helpers (e.g. `read_audit_lines`, reached via
 # the `api::ui_protocol_audit` alias) to octos-cli's tests. Production builds
 # don't see it; only `cargo test -p octos-cli`.

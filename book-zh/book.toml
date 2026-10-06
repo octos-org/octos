@@ -1,6 +1,6 @@
 [book]
 title = "Octos 文档"
-authors = ["Yue Chen"]
+authors = ["octos contributors"]
 language = "zh"
 src = "src"
 

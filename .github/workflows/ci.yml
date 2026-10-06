@@ -5,20 +5,22 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: "0 10 * * *"
 
 # Cancel a PR's in-flight run when it is superseded by a new push. Without this
-# every amend queues another full matrix behind the old one, and the
-# self-hosted/large runners (ARM, RISC-V) are the ones that back up. Never
-# cancels `main`: those runs gate the release artifacts.
+# every amend queues another full matrix behind the old one. A newer run on the
+# same ref contains every earlier commit, so it supersedes the older run.
+# Release artifacts are built by release.yml, not this workflow.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.97.1"
   FEATURES: "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
   SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p smart-home -p skill-evolve"
 
@@ -173,6 +175,25 @@ jobs:
           if ($deployText -notmatch '\$nssmExe install') {
             throw 'deploy dry run did not include NSSM service registration'
           }
+          if ($deployText -match '--auth-token') {
+            throw 'deploy dry run must not pass the bearer token via service argv (#2380)'
+          }
+          if ($deployText -notmatch 'icacls \$tokenTmp /inheritance:r') {
+            throw 'deploy dry run did not restrict the serve-token file ACLs (#2496)'
+          }
+          if ($deployText -notmatch 'set /p OCTOS_AUTH_TOKEN=<') {
+            throw 'deploy dry run did not read the token from the serve-token file in the launcher (#2496)'
+          }
+          $envLines = $deployText -split "`r?`n" | Where-Object { $_ -match 'AppEnvironmentExtra' }
+          if (-not $envLines) {
+            throw 'deploy dry run lost the non-secret service environment'
+          }
+          if ($envLines -match 'OCTOS_AUTH_TOKEN=') {
+            throw 'deploy dry run still delivers the token via AppEnvironmentExtra (#2496)'
+          }
+          if ($deployText -match 'auth_token = \$authToken') {
+            throw 'deploy dry run still writes the token into config.json (#2496)'
+          }
           if ($deployText -notmatch 'C:\\octos-ci') {
             throw 'deploy dry run did not include the requested remote root'
           }
@@ -196,6 +217,23 @@ jobs:
             throw 'uninstall dry run did not include purge behavior'
           }
 
+      - name: Test serve-launcher token handoff
+        shell: pwsh
+        run: |
+          # Windows pwsh exits -Command with the last native command's exit
+          # code; the script's refusal arm leaves it at 1 on a green run
+          # (#2388). Dot-source, then make success explicit — a throw aborts
+          # the body before the exit, so failures stay red.
+          . ./scripts/tests/test-serve-launcher-token.ps1
+          exit 0
+
+      - name: Test installer bundle checksum verification
+        shell: pwsh
+        run: |
+          # Same dot-source discipline as above (#2388).
+          . ./scripts/tests/test-install-checksum.ps1
+          exit 0
+
   web-app-base-url-windows:
     runs-on: windows-latest
     steps:
@@ -208,6 +246,61 @@ jobs:
       - name: Test embedded web base URL
         shell: bash
         run: '"$BASH" scripts/tests/test-build-web-app-base-url.sh'
+
+  bundle-release-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Test bundle checksum sidecar
+        run: scripts/test-bundle-release.sh
+
+      - name: Test installer checksum verification
+        run: |
+          bash scripts/test-install-paths.sh
+          pwsh scripts/tests/test-install-checksum.ps1
+
+  # Classifies a PR's diff so the heavy suites can skip PRs that only touch
+  # the research crates. `octos-research` is a leaf library used by
+  # octos-agent's web_search / site_crawl / deep_search tools, and
+  # deep-search / deep-crawl are standalone skill binaries: `check` still
+  # runs fmt, clippy over the whole workspace and their tests, and
+  # test-octos-agent runs the tools that use them. Pushes to main always
+  # run everything, so anything this lets through is caught on merge.
+  #   research_only: every changed file is under a research path.
+  #   windows_neutral: research_only and no skill crate changed (the skills
+  #     have cfg(not(unix)) code that only check-windows compiles).
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      research_only: ${{ steps.scope.outputs.research_only }}
+      windows_neutral: ${{ steps.scope.outputs.windows_neutral }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: scope
+        run: |
+          set -euo pipefail
+          research_only=false
+          windows_neutral=false
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            FILES=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+            echo "Changed files:"
+            echo "$FILES"
+            # Here-strings, not pipes: under pipefail an early `grep -q` exit
+            # can SIGPIPE `echo`, and the negated failure would read as a match.
+            if [ -n "$FILES" ] && ! grep -qvE '^crates/(octos-research|app-skills/deep-search|app-skills/deep-crawl)/' <<<"$FILES"; then
+              research_only=true
+              if ! grep -qvE '^crates/octos-research/' <<<"$FILES"; then
+                windows_neutral=true
+              fi
+            fi
+          fi
+          echo "research_only=$research_only" | tee -a "$GITHUB_OUTPUT"
+          echo "windows_neutral=$windows_neutral" | tee -a "$GITHUB_OUTPUT"
 
   check:
     runs-on: ubuntu-latest
@@ -245,8 +338,24 @@ jobs:
           python3 scripts/lint-tool-descriptions.py --self-test
           python3 scripts/lint-tool-descriptions.py
 
+      - name: Docs source-reference lint
+        run: |
+          python3 scripts/lint-doc-references.py --self-test
+          python3 scripts/lint-doc-references.py
+
+      - name: Installer token-hygiene lint
+        run: |
+          python3 scripts/lint-installer-token-hygiene.py --self-test
+          python3 scripts/lint-installer-token-hygiene.py
+
+      - name: UI Protocol wire inventory lint
+        run: |
+          python3 scripts/lint-ui-protocol-inventory.py --self-test
+          python3 scripts/lint-ui-protocol-inventory.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
@@ -291,8 +400,17 @@ jobs:
       - name: Test octos-fleet
         run: cargo test -p octos-fleet
 
+      # Same #2055 failure mode one crate over: octos-fleet-worker was absent
+      # from this list, so its suite (worker attempt gates — including the
+      # sandbox fail-closed terminations — pool, escalation) never ran in CI.
+      - name: Test octos-fleet-worker
+        run: cargo test -p octos-fleet-worker
+
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
+
+      - name: Install Linux sandbox prerequisites
+        run: bash scripts/setup-host-managed-linux-ci.sh
 
       - name: Test octos-sandbox
         run: cargo test -p octos-sandbox
@@ -307,6 +425,21 @@ jobs:
 
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
+
+      - name: Test octos-services
+        run: cargo test -p octos-services
+
+      # Same #2055/#2558 failure mode: the research crates (octos-research,
+      # including the metasearch sandbox and per-engine fixture replays, and
+      # the deep-search / deep-crawl skills) were absent from this list, so
+      # their suites never ran in PR CI. No network: live engine tests are
+      # #[ignore]d and need `--features http`.
+      - name: Test research crates
+        run: |
+          cargo test -p octos-research
+          cargo test -p octos-research --no-default-features
+          cargo test -p deep-search
+          cargo test -p deep-crawl
 
       # Bundled harness starter skills (each has small lib + 1 smoke test)
       - name: Test harness starter skills
@@ -358,6 +491,7 @@ jobs:
         # 16GB allocation and neither inherits residual RAM from the
         # other's compile phase.
         test-mode: [lib, integration]
+    needs: scope
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "1"
@@ -370,17 +504,25 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: octos-agent-tests-${{ matrix.test-mode }}
 
       - name: Test octos-agent (lib)
-        if: matrix.test-mode == 'lib'
+        if: matrix.test-mode == 'lib' && needs.scope.outputs.research_only != 'true'
         run: cargo test -p octos-agent --lib
 
+      # Research-only PR: just the tools built on octos-research.
+      - name: Test octos-agent (lib, research tools)
+        if: matrix.test-mode == 'lib' && needs.scope.outputs.research_only == 'true'
+        run: cargo test -p octos-agent --lib -- tools::web_search tools::site_crawl tools::deep_search
+
       - name: Test octos-agent (integration)
-        if: matrix.test-mode == 'integration'
+        if: matrix.test-mode == 'integration' && needs.scope.outputs.research_only != 'true'
         env:
           # Keep a cache miss viable on the standard runner. This shard links
           # many test binaries, so omit debug info to reduce disk and peak RSS.
@@ -400,7 +542,28 @@ jobs:
         run: cargo test -p octos-agent --test '*' -- --test-threads=1
 
 
+  # Split four ways so the PR wait is the slowest part (integration, ~35 min on
+  # 2026-09-28), not the whole ~90 min serial run. Every step that ran before
+  # still runs, in exactly one part: `unit` (lib + the api-feature filter
+  # suites + smart-home), `integration` (integration tests + the serial serve
+  # process e2e), `oup` (the OUP runtime/C-Python ABI contracts and their
+  # evidence), `oup-minimal` (the no-default-features frontend contract and
+  # strict lint). Each part keeps its own warm cache.
   test-octos-cli:
+    name: test-octos-cli (${{ matrix.part }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # oup-minimal is its own leg (#2421): it rebuilds every target with a
+        # --no-default-features fingerprint, so sharing the oup runner paid a
+        # second serial full build (~22 min, main run 36430435982) on every
+        # PR. The new context is enforced transitively for now — a failure
+        # skips the required security job through the test-octos-cli
+        # needs-aggregate — so add `test-octos-cli (oup-minimal)` to the
+        # branch-protection ruleset's required contexts.
+        part: [unit, integration, oup, oup-minimal]
+    needs: scope
+    if: needs.scope.outputs.research_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "1"
@@ -412,36 +575,77 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: octos-cli-tests
+          shared-key: octos-cli-tests-${{ matrix.part }}
 
       - name: Test octos-cli (lib)
+        if: matrix.part == 'unit'
         run: cargo test -p octos-cli --lib
 
-      - name: Test octos-cli (integration)
-        run: cargo test -p octos-cli --tests
+      - name: Test octos-cli (integration, excluding serve process e2e)
+        if: matrix.part == 'integration'
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
 
-      # Co-located here so they reuse this job's warm octos-cli build cache.
+      - name: OUP runtime and C/Python contracts
+        if: matrix.part == 'oup'
+        run: ./scripts/milestone-ci.sh oup-runtime
+
+      # Real-octos-process BrokenPipe/SIGINT e2e (serve_broken_pipe),
+      # SIGTERM gateway-reap e2e (serve_sigterm), WS half-open
+      # liveness e2e (serve_ws_liveness), solo manual-start
+      # guard e2e (serve_solo_gateway_guard), and the host-managed ownership
+      # e2e (serve_host_managed: stdin EOF, host SIGKILL, inherited listener).
+      # These spawn real
+      # `octos serve` children that contend for model catalog / profile
+      # store resources with other test binaries; under the default
+      # thread-per-core parallelism the children starve and the 15s port
+      # barrier times out. Dedicated serial step per the #21 outer-loop
+      # ruling (2026-08-27): layer at the CI command level, never #[ignore].
+      - name: serve BrokenPipe/SIGTERM/WS-liveness/solo-guard/host-managed process e2e (serial)
+        if: matrix.part == 'integration'
+        run: cargo test -p octos-cli --features api --test serve_broken_pipe --test serve_sigterm --test serve_ws_liveness --test serve_solo_gateway_guard --test serve_host_managed -- --test-threads=1
+
+      # In the `unit` part, so they reuse its warm octos-cli build cache.
+      # All api-feature filter steps below go through ci-api-filter-test.sh:
+      # a bare `cargo test <filter>` reports `ok` when the filter matches
+      # nothing, so a renamed test would silently drop out of CI (#2029).
+      # The script fails the step when any filter selects zero tests.
       - name: API feature tests
-        run: cargo test -p octos-cli --features api api::auth_handlers
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh api::auth_handlers
 
       # The §6 catalog guard lives in the feature-gated `api` module, so the
       # unfeatured lib/integration runs above never compile it. Run it
       # explicitly so UI Protocol spec/impl drift actually fails CI.
       - name: UI Protocol §6 catalog guard (octos-cli)
-        run: cargo test -p octos-cli --features api spec_section6_catalog_lists_every_advertised_method -- --nocapture
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh spec_section6_catalog_lists_every_advertised_method -- --nocapture
 
       - name: gateway_runtime regression (octos-cli)
-        run: cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh gateway_runtime::tests -- --nocapture
 
       # Session-open context hydration lives in the `api`-gated ui_protocol
       # module (same reason as the §6 guard): the open-time snapshot must run
       # the pre-turn threshold compaction so a rebuilt ledger never publishes
       # an over-window gauge (`ctx 1.2M/1M` field report, 2026-08-07).
       - name: Session-open context compaction (octos-cli)
-        run: cargo test -p octos-cli --features api session_open_snapshot -- --nocapture
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh session_open_snapshot -- --nocapture
+
+      # The session usage-status mapping lives in the `api`-gated ui_protocol
+      # module, so the unfeatured runs above never compile it — same reason as
+      # the §6 guard. Its tests matched NONE of the filters on this list
+      # (#2029), so the `cached_input_tokens`/`cache_write_input_tokens`
+      # mapping had never executed in CI.
+      - name: Session usage status mapping (octos-cli)
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh usage
 
       # Peer staging/fencing lives in the `api`-gated ui_protocol module, so the
       # unfeatured runs above never compile it — same reason as the §6 guard.
@@ -449,16 +653,18 @@ jobs:
       # isolation guard (one peer's cleanup must not delete a SIBLING's
       # worktree, which a repo-global `git worktree prune` used to do).
       - name: Peer staging + worktree fencing (octos-cli)
-        run: cargo test -p octos-cli --features api peer
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh peer
 
       # `commands::serve::tests` matched NONE of the filters on this list, so
       # its guards had not executed in CI since #1728 — long enough for
       # `global_drain_spawns_before_the_stdio_early_return` to go red on main
       # unnoticed (its source-scan needle carried the pre-rename module path).
-      # A filter that matches nothing reports `ok`, so absent coverage is
-      # indistinguishable from passing coverage; see #2029 for the general fix.
+      # ci-api-filter-test.sh now fails any filter that selects zero tests,
+      # so absent coverage can no longer masquerade as passing coverage (#2029).
       - name: serve wiring guards (octos-cli)
-        run: cargo test -p octos-cli --features api commands::serve::tests
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh commands::serve::tests
 
       # The goal-completion verifier's ledger-evidence fold lives in the
       # `api`-gated goal_tool module, so the unfeatured runs above never compile
@@ -466,7 +672,8 @@ jobs:
       # goal must verify against the durable ledger findings, not the master's
       # reply alone, or the master loops until its token budget drains.
       - name: Goal completion verifier ledger evidence (octos-cli)
-        run: cargo test -p octos-cli --features api -- completion_evidence goal_update_folds_ledger --nocapture
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh completion_evidence goal_update_folds_ledger -- --nocapture
 
       # #2019 human sink: the `background/activity` capability gate and the
       # durable per-session replay both live in the `api`-gated ui_protocol
@@ -475,13 +682,25 @@ jobs:
       # non-gated `crate::autonomy` and DOES run in the unfeatured lib step;
       # this covers the two halves that cannot.
       - name: Background activity human sink (octos-cli)
-        run: cargo test -p octos-cli --features api background_activity -- --nocapture
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh background_activity -- --nocapture
+
+      # #2065 goal-frame substrate: per-scope generation identities for the
+      # #1959 send guard (one cwd scope's clear must not suppress a sibling
+      # scope's repaint on a shared wire session id), goal-frame capability
+      # gating, and live-forwarder lifecycle hardening. Lives in the
+      # `api`-gated ui_protocol module — invisible to the unfeatured runs
+      # above, same reason as the §6 guard.
+      - name: Goal-frame scoping + gating + forwarder (octos-cli)
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh goal_scope_guard session_open_goal -- --nocapture
 
       # The smart_home/* WS methods are `api`-gated too, so the unfeatured
       # integration run above compiles this file to zero tests. Run it
       # explicitly: it is the only end-to-end coverage of the WS dispatch →
       # bridge-config resolution → real HTTP bridge path.
       - name: Smart-home WS e2e (octos-cli)
+        if: matrix.part == 'unit'
         run: cargo test -p octos-cli --features api --test smart_home_ws_e2e
 
       # SKILL_CRATES only get `cargo build`ed by the bundle jobs — their
@@ -489,42 +708,92 @@ jobs:
       # suite (unit + binary-contract e2e against a mock bridge), so run
       # it here where the build cache is already warm.
       - name: Smart-home skill tests
+        if: matrix.part == 'unit'
         run: cargo test -p smart-home
+
+      - name: Minimal OUP frontend contract
+        if: matrix.part == 'oup-minimal'
+        run: ./scripts/milestone-ci.sh oup-minimal
+
+      - name: Retain OUP runtime evidence
+        if: always() && matrix.part == 'oup'
+        uses: actions/upload-artifact@v7
+        with:
+          name: oup-runtime-evidence
+          path: target/oup-functional/
+          retention-days: 14
+          if-no-files-found: error
+
+      # Same evidence dir as the runtime leg, distinct artifact name: two
+      # matrix legs may not upload under one name in the same run.
+      - name: Retain OUP minimal evidence
+        if: always() && matrix.part == 'oup-minimal'
+        uses: actions/upload-artifact@v7
+        with:
+          name: oup-minimal-evidence
+          path: target/oup-functional/
+          retention-days: 14
+          if-no-files-found: error
 
   # Lightweight check that exercises the `matrix` feature gate. The default
   # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
   # job lean, but the Dockerfile and several release configurations enable it.
   # Without this job, feature-gated compile errors (e.g. an identifier referenced
   # only inside `#[cfg(feature = "matrix")]`) slip past PR CI and only surface
-  # during docker builds. Keep this job intentionally tiny: no tests.
-  # It also carries the clippy gate for the feature-gated api/serve/ui_protocol
-  # modules: octos-cli has `default = []`, so the workspace clippy in `check`
-  # never lints them — and clippy subsumes `cargo check`.
+  # during docker builds. It also carries the clippy gate for the feature-gated
+  # channel modules: the non-api channels stay outside octos-cli's default
+  # features, so the workspace clippy in `check` never lints them — and clippy
+  # subsumes `cargo check`. And it runs the feature-gated octos-bus matrix
+  # test suite: with the feature off (as in `check`'s `cargo test -p
+  # octos-bus`) the whole suite is cfg'd out, and the workspace-wide runs that
+  # do execute it only exist in the nightly and self-hosted lanes.
   check-matrix:
+    needs: scope
+    if: needs.scope.outputs.research_only != 'true'
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: matrix-feature
 
+      # Workspace/all-target builds can unify the api or cfg(test) gates and
+      # hide missing symbols in FFI consumers of the minimal production lib.
+      - name: Clippy minimal octos-cli production library
+        run: cargo clippy -p octos-cli --lib --no-default-features -- -D warnings
+
       - name: Clippy octos-cli with matrix feature
         run: cargo clippy -p octos-cli --all-targets --no-default-features --features api,telegram,discord,dingtalk,slack,whatsapp,feishu,email,matrix,audio_mp3 -- -D warnings
+
+      # The suite itself: its only PR-time execution. Floor-check the listing
+      # first so the gate fails loudly if the suite silently drops to zero
+      # (the #2029 lesson).
+      - name: Test octos-bus with the matrix feature
+        run: |
+          count=$(cargo test -p octos-bus --features matrix -- --list matrix_ | grep -c ': test$')
+          if [ "$count" -lt 100 ]; then
+            echo "::error::only $count matrix-gated tests listed; expected the suite floor of 100"
+            exit 1
+          fi
+          cargo test -p octos-bus --features matrix
 
   check-arm:
     # Deliberately NOT on PRs, unlike check-windows: the workspace has ZERO
     # `cfg(target_arch)` sites, so there is no arch-specific code for this to
     # catch that the x86 jobs do not already compile — and it costs ~67 min.
-    # It stays on `main` (and the nightly schedule) to catch toolchain- or
-    # dependency-level ARM breakage, which is the real risk here.
-    if: github.event_name != 'pull_request'
+    # The full ARM lane moved to nightly.yml. Keep this manual escape hatch for
+    # focused diagnosis without putting every main push behind the scarce ARM
+    # runner or duplicating the nightly workload.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-arm
     env:
       CARGO_BUILD_JOBS: "2"  # Limit parallelism to avoid OOM on 16GB ARM runners
@@ -532,6 +801,9 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -560,51 +832,27 @@ jobs:
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
+      - name: Install Linux sandbox prerequisites
+        run: bash scripts/setup-host-managed-linux-ci.sh
       - name: Test octos-sandbox
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
         run: cargo test -p octos-swarm
-      # NOTE — these two steps are where check-arm dies, and it is NOT our code.
-      #
-      # check-arm fails on roughly half of `main` pushes, always the same way:
-      # GitHub kills the runner ("The hosted runner lost communication with the
-      # server ... starves it for CPU/Memory") partway through
-      # `Test octos-agent (lib)`, after steps 1-15 pass. A killed runner uploads
-      # no logs, so every failure destroys its own evidence.
-      #
-      # MEASURED on an aarch64 Ubuntu box matched to the runner (4 CPU, 15.7GB),
-      # running THIS ENTIRE JOB's step sequence in order — all-features build,
-      # test-binary build, all nine crate test steps, then these two:
-      #
-      #   step 16 `octos-agent --lib`   29.3s, 2462 passed, exit 0
-      #   step 17 `octos-agent --tests`  9 passed, exit 0
-      #   memory available               never dipped below ~14.7GB
-      #
-      # 29 seconds locally vs 46 minutes and a dead runner in CI, on the same
-      # architecture running the same sequence with memory to spare. So the
-      # workload is not the cause, and these were all tried and disproven:
-      #
-      #   - RUST_TEST_THREADS=1 (#1890): serialising changed the time-to-death by
-      #     0.7 min (46.0 -> 46.7). Contention is not it.
-      #   - timeout-minutes (#1891): never fired. Step timeouts are enforced BY
-      #     the runner agent, which is itself dying — so it cannot preserve logs.
-      #   - a hanging test: it completes in 29s.
-      #   - accumulated RAM from earlier steps: fully replicated above; memory
-      #     never moved. A lib/integration matrix split (what test-octos-agent
-      #     does for a "fresh 16GB allocation") therefore would NOT help either.
-      #
-      # Both mitigations are removed as unnecessary. If this job is still red and
-      # you are reaching for a workflow tweak: the evidence says the fix is a
-      # RUNNER change (self-hosted arm64, or retry-on-infra-failure), not config.
-      # Please do not re-litigate the four theories above without new data.
       - name: Test octos-agent (lib)
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
         run: cargo test -p octos-agent --tests
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
-      - name: Test octos-cli (integration)
-        run: cargo test -p octos-cli --tests
+      # Same serve-process exclusions as the test-octos-cli PR job: the
+      # serve_broken_pipe / serve_sigterm / serve_ws_liveness /
+      # serve_solo_gateway_guard e2e suites
+      # spawn real `octos serve` children that starve under default
+      # thread-per-core parallelism. They get their dedicated serial run in
+      # test-octos-cli; skipping here keeps this manual lane's coverage
+      # semantics identical to the PR lane's.
+      - name: Test octos-cli (integration, excluding serve process e2e)
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
@@ -627,18 +875,8 @@ jobs:
     # Note this is a QUEUE limit, so `timeout-minutes` does NOT bound it —
     # that only starts counting once a runner picks the job up.
     #
-    # While queued it holds the whole run in-progress, and `cancel-in-progress`
-    # is false for `push` and `schedule`, so that one run owns the
-    # `ci-CI-refs/heads/main` concurrency slot for a full day. Every push behind
-    # it is cancelled while still pending — 22 of the last 50 `main` runs were
-    # cancelled having dispatched zero jobs.
-    #
-    # `schedule` is deliberately excluded too: the nightly cron runs on `main`
-    # and lands in the SAME concurrency group, so a schedule-only riscv job
-    # would re-wedge the slot for 24 h once a day.
-    #
-    # Restore `github.event_name != 'pull_request'` once a riscv64 runner is
-    # actually registered for this repo.
+    # While queued it holds a manual run open for a full day. Move it into the
+    # nightly matrix only after a riscv64 runner is actually registered.
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-riscv
     env:
@@ -647,6 +885,9 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -675,6 +916,8 @@ jobs:
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
         run: cargo test -p octos-plugin
+      - name: Install Linux sandbox prerequisites
+        run: bash scripts/setup-host-managed-linux-ci.sh
       - name: Test octos-sandbox
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
@@ -685,8 +928,10 @@ jobs:
         run: cargo test -p octos-agent --tests
       - name: Test octos-cli (lib)
         run: cargo test -p octos-cli --lib
-      - name: Test octos-cli (integration)
-        run: cargo test -p octos-cli --tests
+      # Same serve-process exclusions as the test-octos-cli PR job (see the
+      # matching comment in check-arm).
+      - name: Test octos-cli (integration, excluding serve process e2e)
+        run: cargo test -p octos-cli --tests -- --skip serve_broken_pipe --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
       - name: Test harness starter skills
         run: |
           cargo test -p harness-starter-generic
@@ -697,6 +942,8 @@ jobs:
         run: cargo test --workspace --doc
 
   check-windows:
+    needs: scope
+    if: needs.scope.outputs.windows_neutral != 'true'
     # Runs on PRs, unlike its ARM/RISC-V siblings below. The workspace has 42
     # `cfg(windows)` sites that NEVER compile on the Linux runners every other
     # PR job uses, so a Windows-only break was invisible until after merge. At
@@ -724,10 +971,28 @@ jobs:
     # `#[cfg(unix)]` over re-muting the whole job — a check that cannot fail
     # tells you nothing.
     runs-on: windows-latest
+    env:
+      # Test threads run on whatever stack the harness hands out — on Windows
+      # that is too small for the deep agent poll chains in octos-cli's
+      # local-runtime tests, and a stack overflow does not fail one test: it
+      # aborts the whole test binary, losing every other test's result with it
+      # (the octos-cli lib step died this way on 6/6 consecutive main pushes,
+      # #2581). 8 MiB is what every production runtime hands the same futures.
+      RUST_MIN_STACK: "8388608"
+    # The full Windows suite runs ~82 min when it passes (octos-cli integration
+    # ~19 min and lib ~13 min, two builds ~20 min, doc tests ~6 min), so 90 left
+    # almost no headroom: once the stack-overflow abort that used to end the
+    # octos-cli lib step early was fixed, runner variance tipped main past the
+    # cap and the job was cancelled rather than failed. Splitting octos-cli into
+    # its own Windows job would cut the wall-clock; this only stops the kill.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -739,11 +1004,31 @@ jobs:
       # code of its LAST line and silently swallows every failure before it.
       # The Linux jobs above are safe (bash runs with `-eo pipefail`); these
       # two blocks were the only multi-command steps in this job.
-      - name: Build (workspace)
+      - name: Check workspace (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo check --workspace
+
+      - name: Check octos-cli + all features (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo check -p octos-cli --features ${{ env.FEATURES }}
+
+      - name: Build workspace (main/manual)
+        if: github.event_name != 'pull_request'
         run: cargo build --workspace
 
-      - name: Build (octos-cli + all features)
+      - name: Build octos-cli + all features (main/manual)
+        if: github.event_name != 'pull_request'
         run: cargo build -p octos-cli --features ${{ env.FEATURES }}
+
+      # #2239: default-feature tests never compile the API's test-only secret
+      # hooks. Exercise those callers on Windows too, using isolated fixtures.
+      - name: Test API auth and secret-store fixtures
+        if: ${{ !cancelled() }}
+        run: cargo test -p octos-cli --features api --lib auth
+
+      - name: Test API credential relocation fixtures
+        if: ${{ !cancelled() }}
+        run: cargo test -p octos-cli --features api --lib relocate
 
       # Sharded per-crate tests — same rationale as the `check` job.
       #
@@ -758,63 +1043,107 @@ jobs:
       # step still fails the job, so this weakens no gate — it only makes one
       # run report the whole truth.
       - name: Test octos-core
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-core
       - name: Test octos-memory
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-memory
       - name: Test octos-llm (lib)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-llm --lib
       - name: Test octos-llm (integration)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-llm --tests
       - name: Test octos-bus
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-bus
       - name: Test octos-pipeline
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-pipeline
       - name: Test octos-plugin
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-plugin
       - name: Test octos-sandbox
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-sandbox
       - name: Test octos-swarm
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-swarm
       - name: Test octos-agent (lib)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-agent --lib
       - name: Test octos-agent (integration)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-agent --tests
       - name: Test octos-cli (lib)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-cli --lib
       - name: Test octos-cli (integration)
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p octos-cli --tests
       - name: Test harness starter generic
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p harness-starter-generic
 
       - name: Test harness starter report
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p harness-starter-report
 
       - name: Test harness starter audio
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p harness-starter-audio
 
       - name: Test harness starter coding
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test -p harness-starter-coding
 
       - name: Doc tests
-        if: ${{ !cancelled() }}
+        if: ${{ github.event_name != 'pull_request' && !cancelled() }}
         run: cargo test --workspace --doc
+
+  check-darwin:
+    needs: scope
+    if: needs.scope.outputs.research_only != 'true'
+    # Runs on PRs, like check-windows: the workspace has 89
+    # `cfg(target_os = "macos")` sites that NEVER compile on the Linux runners
+    # every other PR job uses, so a macOS-only break was invisible until after
+    # merge — #2239 alone produced two such breaks (#2258's E0599 in the
+    # default build, #2263's E0425 in api-feature test code) while every
+    # required check stayed green. The existing macOS jobs do not close this:
+    # e2e-tool-regression builds octos-cli (api+telegram features) but fires
+    # only on e2e path changes, and the security suite compiles one
+    # octos-agent test binary only on security-path changes — so an ordinary
+    # PR gets no macOS compile signal at all.
+    #
+    # Compile-only, so the cost is one macos-14 runner for a cargo check, not
+    # a test run. Both steps pass --all-targets so cfg(test) code is compiled
+    # too — #2263's break lived in feature-gated test modules, which a
+    # lib-only check would never see.
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: darwin
+
+      - name: Check workspace (all targets)
+        run: cargo check --workspace --all-targets
+
+      - name: Check octos-cli + all features (all targets)
+        run: cargo check -p octos-cli --all-targets --features ${{ env.FEATURES }}
+
+      # The updater's signature-preservation behavior (#2559) lives in
+      # macOS-gated code, so the ubuntu `cargo test -p octos-services` lane
+      # never executes it — coverage that prints nothing and looks like
+      # passing coverage (#2055).
+      - name: Test octos-services (macOS behavior)
+        run: cargo test -p octos-services
 
   # ── Release artifact builds (main only) ──────────────────────────
   build-macos-arm:
@@ -824,6 +1153,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
@@ -862,6 +1193,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
@@ -894,12 +1227,14 @@ jobs:
           retention-days: 7
 
   build-linux-arm:
-    if: github.event_name == 'push'
+    if: github.event_name == 'workflow_dispatch'
     needs: check-arm
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: arm64-release
@@ -940,6 +1275,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-release
@@ -980,7 +1317,6 @@ jobs:
   # executed in any of the last 14 CI runs (#2015).
   e2e-changes:
     runs-on: ubuntu-latest
-    if: github.event_name != 'schedule'
     outputs:
       run: ${{ steps.changes.outputs.run }}
     steps:
@@ -1018,11 +1354,13 @@ jobs:
     # Run on pushes to main and on every PR whose diff touches the paths in
     # `e2e-changes`. PR-title keyword matching used to gate this job, so a PR
     # that changed tools without saying so in the title skipped e2e entirely.
-    if: github.event_name != 'schedule' && needs.e2e-changes.outputs.run == 'true'
+    if: needs.e2e-changes.outputs.run == 'true'
     steps:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -1136,8 +1474,8 @@ jobs:
       # reported SUCCESS by simply not running.
       #
       # Required checks stay deterministic. The model-dependent specs run in
-      # `e2e-live-nightly` below, where a flake costs a notification instead of
-      # a merge.
+      # Model-dependent coverage lives in nightly.yml, where it reports a
+      # regression without making model phrasing a merge gate.
       - name: Run e2e tool regression tests
         working-directory: e2e
         run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/tool-use-regression.spec.ts
@@ -1155,8 +1493,8 @@ jobs:
       # without a configured profile. The rest of the m9 tree (turn/start,
       # tool events, interrupt, most of fault-injection) needs a `_main`
       # profile with a provider and answers `-32602 profile '_main' is not
-      # configured` without one; those stay in `e2e-live-nightly` until CI
-      # grows a profile fixture.
+      # configured` without one; the deterministic profile fixture lives in
+      # nightly.yml.
       - name: Run m9 protocol conformance (model-independent)
         working-directory: e2e
         run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/m9-protocol-session-open.spec.ts tests/m9-protocol-diff-preview.spec.ts
@@ -1165,92 +1503,17 @@ jobs:
         if: always()
         run: pkill -f "octos serve" || true
 
-  # #1923 — the model-dependent half of the e2e tree, nightly and NON-BLOCKING.
-  #
-  # These specs ask a live model to produce particular words and then assert on
-  # them exactly (`toContain('OK')`, `toContain('ALPHA')`, CJK output, event
-  # counts). They catch real regressions, but they can also fail because a model
-  # phrased an answer differently or because no provider credential is present —
-  # neither of which is a reason to block a merge.
-  #
-  # `continue-on-error` keeps a red run visible without gating anything. If these
-  # are ever promoted back to required, the assertions need to be semantic rather
-  # than exact-match first.
-  e2e-live-nightly:
-    runs-on: macos-14
-    if: github.event_name == 'schedule'
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: e2e/package-lock.json
-
-      - name: Build dashboard bundle (embedded at compile time)
-        run: ./scripts/build-dashboard.sh
-
-      - name: Build octos with all features
-        run: cargo build --release -p octos-cli --features "$FEATURES"
-
-      - name: Install Homebrew ffmpeg (macOS)
-        run: brew install ffmpeg
-
-      # Same `allow_admin_shell` config as the required job (#2031) — this job
-      # runs the full tree, which includes the admin-shell specs.
-      - name: Write CI serve config (enables the admin shell endpoint)
-        run: |
-          echo '{"allow_admin_shell": true}' > /tmp/octos-ci-serve.json
-
-      - name: Start octos serve
-        run: |
-          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
-            --config /tmp/octos-ci-serve.json &
-          # `/api/status` is a 404; `/health` is the endpoint that answers 200.
-          # See the identical note in `e2e-tool-regression` above.
-          ready=""
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:3000/health > /dev/null 2>&1; then
-              echo "Server ready after ${i}s"
-              ready=1
-              break
-            fi
-            sleep 1
-          done
-          if [ -z "$ready" ]; then
-            echo "::error::octos serve never answered /health on port 3000 after 30s."
-            exit 1
-          fi
-
-      - name: Install e2e deps
-        working-directory: e2e
-        run: npm ci
-
-      - name: Install Playwright browsers
-        working-directory: e2e
-        run: npx playwright install chromium
-
-      - name: Run model-dependent e2e specs
-        working-directory: e2e
-        run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line
-
-      - name: Stop octos serve
-        if: always()
-        run: pkill -f "octos serve" || true
-
   security:
     runs-on: macos-14
     needs: [check, test-octos-agent, test-octos-cli]
+    # test-octos-cli is skipped on research-only PRs (see `scope`).
+    if: >-
+      !cancelled() && needs.check.result == 'success'
+      && needs.test-octos-agent.result == 'success'
+      && contains(fromJSON('["success", "skipped"]'), needs.test-octos-cli.result)
     # Run on pushes and on every PR — the file-level detection below is the
     # only filter (title keyword matching used to let security-relevant PRs
     # slip through when the title didn't say "security"/"sandbox").
-    if: github.event_name != 'schedule'
     steps:
       # fetch-depth: 0 is load-bearing: with the old depth-2 checkout the PR
       # base sha was absent, the masked git-diff failure produced FILES="",
@@ -1260,6 +1523,8 @@ jobs:
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -1287,3 +1552,65 @@ jobs:
         run: |
           echo "Running 24 security integration tests on macOS (sandbox-exec SBPL)"
           cargo test -p octos-agent --test security_sandbox -- --nocapture
+
+  # One stable status for branch protection. Individual jobs can be renamed or
+  # conditionally skipped without requiring a repository-ruleset edit, while a
+  # real failure or cancellation still makes this gate red.
+  ci-required:
+    name: CI required
+    if: always()
+    needs:
+      - scope
+      - dashboard
+      - swarm-app
+      - typos
+      - ux-gate-report
+      - windows-deploy-script
+      - web-app-base-url-windows
+      - check
+      - test-octos-agent
+      - test-octos-cli
+      - check-matrix
+      - check-windows
+      - check-darwin
+      - e2e-changes
+      - e2e-tool-regression
+      - security
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require every mandatory job and reject failed optional jobs
+        run: |
+          set -euo pipefail
+          echo "$RESULTS" | jq .
+
+          # Jobs `scope` skipped on a research-only PR may be "skipped".
+          research_only=$(echo "$RESULTS" | jq -r '.scope.outputs.research_only')
+          windows_neutral=$(echo "$RESULTS" | jq -r '.scope.outputs.windows_neutral')
+          for job in scope dashboard swarm-app typos ux-gate-report \
+            windows-deploy-script web-app-base-url-windows check \
+            test-octos-agent test-octos-cli check-matrix check-windows \
+            check-darwin e2e-changes security; do
+            result=$(echo "$RESULTS" | jq -r --arg job "$job" '.[$job].result')
+            skippable=false
+            case "$job" in
+              test-octos-cli|check-matrix|check-darwin) [ "$research_only" = true ] && skippable=true ;;
+              check-windows) [ "$windows_neutral" = true ] && skippable=true ;;
+            esac
+            if [ "$result" = skipped ] && [ "$skippable" = true ]; then
+              continue
+            fi
+            if [ "$result" != success ]; then
+              echo "::error::required job $job finished with $result"
+              exit 1
+            fi
+          done
+
+          optional=$(echo "$RESULTS" | jq -r \
+            '[."e2e-tool-regression".result] | map(select(. != "success" and . != "skipped")) | join(",")')
+          if [ -n "$optional" ]; then
+            echo "::error::conditional E2E job finished with $optional"
+            exit 1
+          fi

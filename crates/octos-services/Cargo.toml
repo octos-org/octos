@@ -20,6 +20,7 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
+sha2 = { workspace = true }
 dirs = { workspace = true }
 futures = { workspace = true }
 
@@ -30,6 +31,7 @@ futures = { workspace = true }
 test-util = []
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

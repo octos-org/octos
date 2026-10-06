@@ -1,0 +1,91 @@
+{
+  "body_file": "results_zh.body",
+  "expect": [
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "",
+      "title": "生成式人工智能服务管理暂行办法 - 中国网信网",
+      "url": "https://www.cac.gov.cn/2023-07/13/c_1690898327029107.htm"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "",
+      "title": "人工智能安全治理的国际经验和启示",
+      "url": "https://www.ndrc.gov.cn/wsdwhfz/202512/t20251203_1402185.html"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "",
+      "title": "[PDF] 欧盟寻求人工智能监管规则型领导地位： 认知与路径*",
+      "url": "https://www.ciis.org.cn/gjwtyj/dqqk/202505/P020250512583201774405.pdf"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "",
+      "title": "中国人工智能监管法规全景解析 - 安全内参",
+      "url": "https://www.secrss.com/articles/89612"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "",
+      "title": "关于银行业保险业人工智能安全开发应用的指导意见",
+      "url": "https://www.nfra.gov.cn/cn/view/pages/governmentDetail.html?docId=1261784&itemId=&generaltype=1"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "",
+      "title": "人工智能监管- 维基百科，自由的百科全书",
+      "url": "https://zh.wikipedia.org/zh-hans/%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD%E7%9B%91%E7%AE%A1"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "",
+      "title": "加强人工智能监管与治理 - 北京工业大学学报",
+      "url": "https://journal.bjut.edu.cn/bjgydxxbskb/article/doi/10.12120/bjutskxb202503019"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "",
+      "title": "2025年全球人工智能监管回顾 - 君合",
+      "url": "https://www.junhe.com/legal-updates/2948"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "",
+      "title": "精准把握人工智能监管治理的尺度-复旦美国研究中心",
+      "url": "https://cas.fudan.edu.cn/info/1039/32323.htm"
+    },
+    {
+      "lang": "zh-CN",
+      "published": null,
+      "source": "",
+      "title": "关于人工智能监管的看法 - 领英",
+      "url": "https://cn.linkedin.com/pulse/thoughts-ai-regulation-patricia-thaine-x2ubc?tl=zh"
+    }
+  ],
+  "http": {
+    "headers": {},
+    "method": "GET",
+    "url": "https://www.google.com/wml/search?q=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD+%E7%9B%91%E7%AE%A1&sca_esv=1&hl=zh-CN&lr=lang_zh-CN&cr=countryCN&ie=utf8&oe=utf8"
+  },
+  "recorded": "live, 2026-09-28: Google's page for simple phones in Chinese, fetched with the legacy_mobile client (not signed in); the location footer (derived from the IP address) is replaced with a neutral placeholder",
+  "request": {
+    "category": "general",
+    "count": 10,
+    "langs": [
+      "zh-CN"
+    ],
+    "now": "2026-09-28T23:30:00Z",
+    "query": "人工智能 监管",
+    "since": null
+  }
+}

@@ -1,0 +1,323 @@
+name: Nightly Regression
+
+# Broad, slower coverage lives here instead of extending every pull request.
+# A scheduled failure opens or refreshes one actionable issue; the next green
+# schedule closes it. Changes to this workflow validate themselves immediately.
+on:
+  schedule:
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/nightly.yml"
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  RUST_VERSION: "1.97.1"
+  FEATURES: "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
+
+jobs:
+  # ARM64 workspace tests — retry-policy note (2026-09-03): the hosted ARM
+  # runner death problem remains unsolved at the infra level. Approaches tried:
+  #   - RUST_TEST_THREADS=1 serialise (#1890): disproven (time-to-death unchanged)
+  #   - timeout-minutes (#1891): disproven (enforced by the dying runner itself)
+  #   - step-count discriminator (c03a0604, reverted): 5/5 historical deaths
+  #     left a failed step, so the heuristic never fired
+  #   - log-absence discriminator: disproven — 9/9 attempts in the sampled
+  #     corpus carried complete ~1.6MB logs (BH3GEI review)
+  #   - job-annotation matching ("lost communication with the server"): the
+  #     reliable signature per review, unimplemented — revisit if deaths recur
+  # Current state: the nightly ARM64 lane runs WITHOUT auto-retry; a red
+  # nightly opens/updates the self-healing regression issue, which is the
+  # signal. Re-add a retry only with the annotation-based signature.
+  check-arm:
+    name: ARM64 workspace tests
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+      # The former main-branch ARM job repeatedly exhausted the hosted disk.
+      # Remove large preinstalled SDKs before compiling the workspace.
+      - name: Free runner disk
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-arm64
+          save-if: false
+      - name: Check the all-feature CLI surface
+        run: cargo check -p octos-cli --features "$FEATURES" --locked
+      - name: Install Linux sandbox prerequisites
+        run: bash scripts/setup-host-managed-linux-ci.sh
+      # The serve_sigterm / serve_ws_liveness / serve_solo_gateway_guard e2e
+      # spawn real `octos serve` children that starve under default test
+      # parallelism; ci.yml runs them in a dedicated serial step (see the #21
+      # outer-loop ruling there).
+      - name: Test the workspace
+        run: cargo test --workspace --locked -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
+
+  check-windows:
+    name: Windows workspace tests
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-windows
+          save-if: false
+      - name: Check the all-feature CLI surface
+        run: cargo check -p octos-cli --features "${{ env.FEATURES }}" --locked
+      - name: Test the workspace
+        run: cargo test --workspace --locked
+
+  protocol-e2e:
+    name: AppUI protocol fixture E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-protocol-e2e
+          save-if: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - name: Build dashboard and server
+        run: |
+          ./scripts/build-dashboard.sh
+          cargo build --release -p octos-cli --features "$FEATURES" --locked
+      - name: Install browser test dependencies
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Start deterministic protocol fixture
+        run: |
+          set -euo pipefail
+          echo '{"allow_admin_shell": true}' > /tmp/octos-nightly-serve.json
+          OCTOS_M9_PROTOCOL_FIXTURES=1 \
+          OPENAI_API_KEY=fixture-key-not-a-secret \
+          OCTOS_AUTH_TOKEN=ci-test-token \
+            ./target/release/octos serve --port 3000 \
+              --config /tmp/octos-nightly-serve.json \
+              --provider openai --model gpt-4o --no-retry \
+              > server.log 2>&1 &
+          echo $! > server.pid
+          for attempt in $(seq 1 45); do
+            curl -sf http://localhost:3000/health >/dev/null && exit 0
+            echo "attempt $attempt/45: waiting for octos serve"
+            sleep 1
+          done
+          echo "::error::octos serve did not become healthy"
+          cat server.log
+          exit 1
+      - name: Run deterministic protocol suite
+        working-directory: e2e
+        env:
+          OCTOS_TEST_URL: http://localhost:3000
+          OCTOS_AUTH_TOKEN: ci-test-token
+          OCTOS_PROFILE: _main
+          # Tells the specs they are on the fixture lane (#2483): the
+          # web-client persistence spec gates its history-check half there
+          # because fixture turns do not persist session history and the
+          # aux session/messages_page backing is not wired on this serve.
+          OCTOS_M9_PROTOCOL_FIXTURES: "1"
+        run: >-
+          npx playwright test --reporter=line
+          tests/m9-protocol-*.spec.ts
+          tests/web-client.spec.ts
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then kill "$(cat server.pid)" 2>/dev/null || true; fi
+      - name: Upload protocol evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-protocol-evidence
+          path: |
+            server.log
+            e2e/test-results/
+            e2e/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # #1923 — cadence-independent canary for the required e2e-tool-regression
+  # lane. In ci.yml that job only fires when a diff trips the path filter, so
+  # a serve-boot or endpoint-gating regression on main stays invisible until
+  # some unrelated PR happens to touch a matching path (the exact condition
+  # that let the original breakage sit unnoticed). This job runs the same
+  # spec (tests/tool-use-regression.spec.ts) on the same platform (macos-14 —
+  # the PATH assertion is Homebrew-specific) with the same feature set,
+  # blocking: a failure feeds the regression-issue reconciler below. As in
+  # the required lane, the two chat-turn tests pass vacuously with no
+  # provider configured — the canary's teeth are the serve boot, the
+  # admin-shell endpoint, and the ffmpeg/PATH assertions. The m9
+  # model-independent specs already have nightly coverage via
+  # protocol-e2e's glob, so they are not duplicated here.
+  tool-regression-e2e:
+    name: Tool-use regression E2E (required-lane canary)
+    runs-on: macos-14
+    # 90 rather than the protocol-e2e 60: save-if: false means every run is a
+    # cold release build on a 3-vCPU runner (the required lane's warm-cache
+    # build alone takes 12-25 min), and a runner-cancelled job feeds the
+    # reconciler's `cancelled` branch as a false regression alarm.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-tool-regression
+          save-if: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      # MUST precede the cargo build: the admin SPA is embedded into the
+      # binary at compile time (see the same comment on the required lane in
+      # ci.yml). Without it /admin/login answers 503 and the setup-wizard
+      # readiness probe times out.
+      - name: Build dashboard and server (required-lane feature set)
+        run: |
+          ./scripts/build-dashboard.sh
+          cargo build --release -p octos-cli --features "octos-cli/api,octos-cli/telegram" --locked
+      - name: Install Homebrew ffmpeg (macOS)
+        run: brew install ffmpeg
+      # /api/admin/shell is registered only when allow_admin_shell is true
+      # (see the #2031 comment on the required lane). Enabled on an ephemeral
+      # runner, bound to loopback, behind an admin token — nowhere else.
+      - name: Start octos serve
+        run: |
+          set -euo pipefail
+          echo '{"allow_admin_shell": true}' > /tmp/octos-nightly-tool-regression.json
+          OCTOS_AUTH_TOKEN=ci-test-token ./target/release/octos serve --port 3000 \
+            --config /tmp/octos-nightly-tool-regression.json > server.log 2>&1 &
+          echo $! > server.pid
+          for attempt in $(seq 1 45); do
+            curl -sf http://localhost:3000/health >/dev/null && exit 0
+            echo "attempt $attempt/45: waiting for octos serve"
+            sleep 1
+          done
+          echo "::error::octos serve did not become healthy"
+          cat server.log
+          exit 1
+      # Fail loudly at the precondition rather than inside four assertions
+      # that each report it as `undefined` (same probe as the required lane).
+      - name: Verify the admin shell endpoint is live
+        run: |
+          set -euo pipefail
+          body=$(curl -s -w '\n%{http_code}' -X POST http://localhost:3000/api/admin/shell \
+            -H "Authorization: Bearer ci-test-token" \
+            -H 'Content-Type: application/json' \
+            -d '{"command":"command -v ffmpeg"}')
+          code=$(echo "$body" | tail -1)
+          echo "$body" | sed '$d'
+          if [ "$code" != "200" ]; then
+            echo "::error::/api/admin/shell answered HTTP $code — expected 200."
+            exit 1
+          fi
+      - name: Install browser test dependencies
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install chromium
+      - name: Run tool-use regression spec
+        working-directory: e2e
+        env:
+          OCTOS_TEST_URL: http://localhost:3000
+          OCTOS_AUTH_TOKEN: ci-test-token
+        run: npx playwright test --reporter=line tests/tool-use-regression.spec.ts
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f server.pid ]; then kill "$(cat server.pid)" 2>/dev/null || true; fi
+      - name: Upload tool-regression evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-tool-regression-evidence
+          path: |
+            server.log
+            e2e/test-results/
+            e2e/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  regression-issue:
+    name: Reconcile nightly regression issue
+    needs: [check-arm, check-windows, protocol-e2e, tool-regression-e2e]
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RESULTS: ${{ toJSON(needs) }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ISSUE_TITLE: "[nightly] Regression detected"
+    steps:
+      - name: Open, refresh, or close the regression issue
+        run: |
+          set -euo pipefail
+          failed=$(echo "$RESULTS" | jq -r \
+            'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | "- `\(.key)`: **\(.value.result)**"')
+          gh label create nightly-regression \
+            --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "Failure in the scheduled regression suite" --force
+          issue=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label nightly-regression --search '"[nightly] Regression detected" in:title' \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$failed" ]; then
+            body=$(printf 'Scheduled nightly regression failed.\n\n%s\n\n[Open the run](%s)\n\nReproduce with the commands shown in .github/workflows/nightly.yml.' "$failed" "$RUN_URL")
+            if [ -n "$issue" ]; then
+              gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$ISSUE_TITLE" \
+                --label nightly-regression --body "$body"
+            fi
+          elif [ -n "$issue" ]; then
+            gh issue close "$issue" --repo "$GITHUB_REPOSITORY" \
+              --comment "The scheduled nightly is green again: $RUN_URL"
+          else
+            echo "Nightly is green; no open regression issue."
+          fi

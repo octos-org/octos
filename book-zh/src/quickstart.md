@@ -21,6 +21,8 @@ octos init
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
+其他供应商同理——例如 `DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY`，或 Z.AI（GLM）的 `ZAI_API_KEY`；完整可选列表见[配置 → 环境变量](./configuration.md#llm-供应商)。
+
 将此行添加到 `~/.bashrc` 或 `~/.zshrc` 中以持久保存。你也可以使用 `octos auth login --provider openai` 进行 OAuth 登录。
 
 ## 3. 检查配置

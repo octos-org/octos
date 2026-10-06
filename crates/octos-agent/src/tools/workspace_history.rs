@@ -8,6 +8,7 @@
 //! - `workspace_diff`: diff between two commits for a file
 
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 
 use async_trait::async_trait;
@@ -20,14 +21,25 @@ use crate::workspace_git::detect_workspace_repo;
 /// Max output length for git commands (50KB).
 const MAX_OUTPUT: usize = 50_000;
 
-/// Run a git command in a directory and return stdout as a string.
+/// Run a read-only git command against the repo at `dir` and return stdout.
+///
+/// The repo lives in the agent's workspace, so its `.git/config` is
+/// agent-writable: the command runs through a kernel-owned private git dir
+/// (see [`crate::private_git`]) that never honours it, and diff-producing
+/// subcommands additionally refuse external diff and textconv drivers.
 fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
+    let git = crate::private_git::PrivateGitDir::open(dir)?;
+    let mut cmd = git.command();
+    if let Some((sub, rest)) = args.split_first() {
+        cmd.arg(sub);
+        if matches!(*sub, "log" | "show" | "diff") {
+            cmd.args(["--no-ext-diff", "--no-textconv"]);
+        }
+        cmd.args(rest);
+    }
+    let output = cmd
         .output()
-        .wrap_err_with(|| format!("failed to run git {:?}", args))?;
+        .wrap_err_with(|| format!("failed to run git {args:?}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -233,8 +245,15 @@ impl Tool for WorkspaceShowTool {
         let input: WorkspaceShowInput =
             serde_json::from_value(args.clone()).wrap_err("invalid workspace_show input")?;
 
-        // Reject commit hashes with path traversal
-        if input.commit.contains("..") || input.commit.contains('/') {
+        // Reject commit hashes with path traversal, and anything that
+        // looks like a git option: a value starting with `-` is parsed as
+        // a flag by `git show` (e.g. `--output=/etc/passwd` writes a
+        // file), not as a revision. The traversal checks alone admit
+        // slash-free option strings (CVE-2025-68144/68145 class).
+        if input.commit.starts_with('-')
+            || input.commit.contains("..")
+            || input.commit.contains('/')
+        {
             return Ok(ToolResult {
                 output: "invalid commit hash".to_string(),
                 success: false,
@@ -360,9 +379,12 @@ impl Tool for WorkspaceDiffTool {
         let input: WorkspaceDiffInput =
             serde_json::from_value(args.clone()).wrap_err("invalid workspace_diff input")?;
 
-        // Reject traversal in commit refs
+        // Reject traversal in commit refs, and anything option-like: a
+        // value starting with `-` is parsed as a flag by `git diff`
+        // (e.g. `--output=pwned..HEAD`), not as a revision. Slash-free
+        // option strings currently pass the traversal check.
         for ref_str in [&input.from_commit, &input.to_commit] {
-            if ref_str.contains('/') && !ref_str.starts_with("HEAD") {
+            if ref_str.starts_with('-') || (ref_str.contains('/') && !ref_str.starts_with("HEAD")) {
                 return Ok(ToolResult {
                     output: "invalid commit ref".to_string(),
                     success: false,
@@ -498,6 +520,148 @@ mod tests {
             .unwrap();
 
         temp
+    }
+
+    fn commit_hashes(project: &Path) -> Vec<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(["log", "--format=%H", "--reverse"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    // Unix-gated: the PoC uses `touch` (a POSIX tool) for its marker files.
+    // On Windows this test would silently do nothing once the generated
+    // config parses (#2662/#2668) — a hollow false-green for the security
+    // assertion. A Windows-equivalent marker (e.g. `cmd /c type nul >`) is
+    // tracked as a follow-up in #2662 (MED-2).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn should_not_run_repo_config_programs_when_reading_history() {
+        let temp = setup_test_repo();
+        let project = temp.path().join("slides/test-deck");
+        let markers = temp.path().join("markers");
+        std::fs::create_dir_all(&markers).unwrap();
+        let touch = |name: &str| format!("touch '{}'", markers.join(name).display());
+        let evil = format!(
+            "[diff]\n\texternal = \"{ext}\"\n[diff \"x\"]\n\ttextconv = \"{tc}; cat\"\n\
+             [log]\n\tshowSignature = true\n[gpg]\n\tprogram = \"{gpg}; false\"\n\
+             [core]\n\tfsmonitor = \"{fsm}\"\n[filter \"p\"]\n\tclean = \"{cl}; cat\"\n",
+            ext = touch("EXTERNAL"),
+            tc = touch("TEXTCONV"),
+            gpg = touch("GPG"),
+            fsm = touch("FSMONITOR"),
+            cl = touch("CLEAN"),
+        );
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(project.join(".git/config"))
+                .unwrap();
+            f.write_all(evil.as_bytes()).unwrap();
+        }
+        std::fs::write(project.join(".gitattributes"), "* diff=x filter=p\n").unwrap();
+        let hashes = commit_hashes(&project);
+
+        let log = WorkspaceLogTool::new(temp.path())
+            .execute(&serde_json::json!({"project": "slides/test-deck"}))
+            .await
+            .unwrap();
+        assert!(
+            log.success && log.output.contains("Edit slide 2"),
+            "{}",
+            log.output
+        );
+        let show = WorkspaceShowTool::new(temp.path())
+            .execute(&serde_json::json!({
+                "project": "slides/test-deck", "commit": hashes[0], "file": "script.js"
+            }))
+            .await
+            .unwrap();
+        assert!(
+            show.success && show.output.contains("// v1"),
+            "{}",
+            show.output
+        );
+        let diff = WorkspaceDiffTool::new(temp.path())
+            .execute(&serde_json::json!({
+                "project": "slides/test-deck", "from_commit": hashes[0], "to_commit": hashes[2]
+            }))
+            .await
+            .unwrap();
+        assert!(
+            diff.success && diff.output.contains("+// v3"),
+            "{}",
+            diff.output
+        );
+
+        let found: Vec<_> = std::fs::read_dir(&markers)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            found.is_empty(),
+            "agent-controlled git config executed: {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_refuse_option_like_revisions_when_reading_history() {
+        let temp = setup_test_repo();
+        let out = temp.path().join("written-by-git");
+        let option = format!("--output={}", out.display());
+
+        let show = WorkspaceShowTool::new(temp.path())
+            .execute(&serde_json::json!({
+                "project": "slides/test-deck", "commit": option, "file": "script.js"
+            }))
+            .await
+            .unwrap();
+        assert!(!show.success, "{}", show.output);
+        let diff = WorkspaceDiffTool::new(temp.path())
+            .execute(&serde_json::json!({
+                "project": "slides/test-deck", "from_commit": option, "to_commit": "HEAD"
+            }))
+            .await
+            .unwrap();
+        assert!(!diff.success, "{}", diff.output);
+        let diff_to = WorkspaceDiffTool::new(temp.path())
+            .execute(&serde_json::json!({
+                "project": "slides/test-deck", "from_commit": "HEAD", "to_commit": option
+            }))
+            .await
+            .unwrap();
+        assert!(!diff_to.success, "{}", diff_to.output);
+        assert!(!out.exists(), "git must not treat a revision as an option");
+
+        // The slash-free variant is the real regression pin: before the
+        // option-like refusal, the traversal checks only caught values
+        // that happened to contain a slash — `--output=pwned2` (relative,
+        // no slash) wrote a file into the working tree.
+        let bare = WorkspaceShowTool::new(temp.path())
+            .execute(&serde_json::json!({
+                "project": "slides/test-deck", "commit": "--output=pwned2", "file": "script.js"
+            }))
+            .await
+            .unwrap();
+        assert!(!bare.success, "{}", bare.output);
+        let bare_diff = WorkspaceDiffTool::new(temp.path())
+            .execute(&serde_json::json!({
+                "project": "slides/test-deck", "from_commit": "--output=pwned2", "to_commit": "HEAD"
+            }))
+            .await
+            .unwrap();
+        assert!(!bare_diff.success, "{}", bare_diff.output);
+        assert!(
+            !temp.path().join("slides/test-deck/pwned2").exists(),
+            "git must not write files from slash-free option-like revisions"
+        );
     }
 
     // ── workspace_log tests ────────────────────────────────────────

@@ -399,8 +399,15 @@ impl SessionRuntimeCache {
                 });
                 if let Some(entry) = guard.get_mut(&key) {
                     if Arc::ptr_eq(&entry.runtime.profile, profile) {
-                        entry.last_used = Instant::now();
-                        return Ok(Arc::clone(&entry.runtime));
+                        // UPCR-2026-035: a runtime cached before its session
+                        // was bound (or rebound) to an app is stale — it
+                        // carries the profile's memory, its workspace and its
+                        // permissions. Drop it and rebuild.
+                        if entry.runtime.app_binding_is_current() {
+                            entry.last_used = Instant::now();
+                            return Ok(Arc::clone(&entry.runtime));
+                        }
+                        guard.remove(&key);
                     }
                 }
             }
@@ -663,6 +670,30 @@ impl SessionRuntimeCache {
         guard.retain(|(_, key_session, _), _| key_session != session_key);
     }
 
+    /// Drop every cached runtime whose session has `topic`, under any base
+    /// key and profile, bumping each one's session generation. Used when a
+    /// topic becomes (or changes) an app binding (UPCR-2026-034/035): a
+    /// runtime built before the binding carries the profile's memory,
+    /// workspace and permissions.
+    pub async fn invalidate_sessions_with_topic(&self, topic: &str) {
+        let mut guard = self.inner.write().await;
+        let stale: Vec<SessionKey> = guard
+            .keys()
+            .filter(|(_, key, _)| key.topic() == Some(topic))
+            .map(|(_, key, _)| key.clone())
+            .collect();
+        {
+            let mut generations = self
+                .session_generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for key in &stale {
+                *generations.entry(key.clone()).or_insert(0) += 1;
+            }
+        }
+        guard.retain(|(_, key, _), _| key.topic() != Some(topic));
+    }
+
     pub(crate) fn session_generation(&self, session_key: &SessionKey) -> u64 {
         self.session_generations
             .lock()
@@ -670,6 +701,34 @@ impl SessionRuntimeCache {
             .get(session_key)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Mark every cached runtime for `session` as used right now, so the
+    /// idle sweep does not evict a Session a client is holding open.
+    ///
+    /// Rebuilding an evicted runtime is correct but slow — a long session
+    /// costs seconds to reload from disk, which a UI client pays on its next
+    /// `session/open` (and can hit its request timeout). A connection with
+    /// the Session open calls this periodically, well inside the idle TTL.
+    /// Returns how many cached entries were refreshed (0 when the Session is
+    /// not cached, which needs no keep-alive).
+    pub async fn keep_session_alive(&self, session: &SessionKey) -> usize {
+        let mut guard = self.inner.write().await;
+        let mut refreshed = 0usize;
+        for (_, entry) in guard.iter_mut().filter(|((_, key, _), _)| key == session) {
+            entry.last_used = Instant::now();
+            refreshed += 1;
+        }
+        refreshed
+    }
+
+    /// Release the `client_commands` declarations connection `owner` made on
+    /// any cached session, when that connection closes.
+    pub async fn release_client_commands(&self, owner: u64) {
+        let guard = self.inner.read().await;
+        for entry in guard.values() {
+            entry.runtime.release_client_commands(owner);
+        }
     }
 
     /// Drop every entry whose `last_used` is older than
@@ -760,6 +819,10 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let recall = Arc::new(
+            octos_memory::RecallStore::open(&data_dir, octos_memory::RecallConfig::default())
+                .unwrap(),
+        );
         let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
         let sandbox = SandboxConfig::default();
         let base_tools =
@@ -767,6 +830,7 @@ mod tests {
         Arc::new(ProfileRuntime {
             profile_id: "_main".to_string(),
             data_dir,
+            session_store_root: None,
             config: crate::config::Config::default(),
             llm: Arc::new(StubLlm),
             goal_verifier_llm: None,
@@ -780,6 +844,8 @@ mod tests {
             tool_policy: None,
             default_sandbox: sandbox,
             max_iterations: None,
+            session_defaults: None,
+            agent_profile: None,
             format_after_edit: false,
             snapshots: None,
             tool_specs: Arc::new(base_tools),
@@ -798,6 +864,7 @@ mod tests {
             },
             memory,
             memory_store,
+            recall,
             embedder: None,
             memory_inject_tokens: 2500,
             memory_refresh_enabled: false,
@@ -1075,6 +1142,37 @@ mod tests {
         assert!(
             cache.is_empty().await,
             "idle entry should have been evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_an_open_session_cached_past_its_idle_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let profile = make_profile(tmp.path().join("profile-data")).await;
+        let cache = SessionRuntimeCache::new(8, Duration::from_millis(100));
+        let held = SessionKey::new("api", "held-open");
+        let idle = SessionKey::new("api", "idle");
+        let _a = cache
+            .get_or_init(&profile, held.clone(), None)
+            .await
+            .expect("init");
+        let _b = cache
+            .get_or_init(&profile, idle.clone(), None)
+            .await
+            .expect("init");
+
+        // A client holding `held` open keeps renewing it; `idle` is untouched.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert_eq!(cache.keep_session_alive(&held).await, 1);
+            cache.invalidate_idle().await;
+        }
+
+        assert_eq!(cache.len().await, 1, "only the renewed Session survives");
+        assert_eq!(
+            cache.keep_session_alive(&idle).await,
+            0,
+            "an evicted Session reports nothing to renew"
         );
     }
 

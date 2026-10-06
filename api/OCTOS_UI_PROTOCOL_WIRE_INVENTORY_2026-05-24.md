@@ -1,7 +1,10 @@
 # Octos UI Protocol Wire Inventory
 
-Status: current inventory for Octos issue #716
-Date: 2026-05-24
+Status: current; the tables below are pinned to the code constants by
+`scripts/lint-ui-protocol-inventory.py` in the CI `check` job (a method added
+to or removed from the pinned constants without updating this file fails CI;
+wire-shaped constants outside the pinned lists are reported in the lint's
+output)
 Protocol: `octos-ui/v1alpha1`
 
 This inventory reconciles the shipped AppUI/UI Protocol wire surface with the
@@ -9,7 +12,7 @@ spec and UPCR documents. The authoritative source remains code:
 
 - commands: `crates/octos-core/src/ui_protocol.rs::UI_PROTOCOL_COMMAND_METHODS`,
   `UI_PROTOCOL_FIRST_SERVER_METHODS`, plus
-  `crates/octos-cli/src/api/ui_protocol.rs::APPUI_EXTRA_METHODS`
+  `crates/octos-cli/src/api/ui_protocol_transport.rs::APPUI_EXTRA_METHODS`
 - notifications:
   `crates/octos-core/src/ui_protocol.rs::UI_PROTOCOL_NOTIFICATION_METHODS`
 - executable route fixture:
@@ -24,7 +27,8 @@ spec and UPCR documents. The authoritative source remains code:
 | `client_hello` | shipped AppUI extra, stdio/websocket negotiation |
 | `config/capabilities/list` | shipped AppUI extra, UPCR-2026-017 |
 | `profile/local/create` | shipped, UPCR-2026-018 |
-| `session/open` | shipped base method |
+| `server/shutdown` | shipped local-solo AppUI extra, UPCR-2026-032; stops this `octos serve` exactly as Ctrl+C would |
+| `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038 |
 | `session/list` | shipped REST-to-WS method |
 | `session/snapshot` | shipped REST-to-WS method |
 | `session/messages_page` | shipped REST-to-WS method |
@@ -37,8 +41,8 @@ spec and UPCR documents. The authoritative source remains code:
 | `session/status/read` | shipped AppUI extra, UPCR-2026-017 |
 | `session/hydrate` | shipped, UPCR-2026-009 |
 | `thread/graph/get` | shipped, UPCR-2026-010 |
-| `turn/state/get` | shipped, UPCR-2026-011 |
-| `turn/start` | shipped base method |
+| `turn/state/get` | shipped, UPCR-2026-011; `running` field UPCR-2026-031 |
+| `turn/start` | shipped base method; optional `origin` on a host-owned app peer's session or sharing request context (UPCR-2026-034, shared peer conversation; parallel person context) |
 | `turn/interrupt` | shipped base method, UPCR-2026-008 typed fields |
 | `approval/respond` | shipped base method, UPCR-2026-001 optional fields |
 | `approval/scopes/list` | shipped, UPCR-2026-001 |
@@ -61,6 +65,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `session/goal/get` | shipped, UPCR-2026-021 |
 | `session/goal/set` | shipped, UPCR-2026-021 |
 | `session/goal/clear` | shipped, UPCR-2026-021 |
+| `session/goal/operator_transition` | shipped, UPCR-2026-021 |
 | `loop/create` | shipped, UPCR-2026-021 |
 | `loop/list` | shipped, UPCR-2026-021 |
 | `loop/delete` | shipped, UPCR-2026-021 |
@@ -96,48 +101,120 @@ spec and UPCR documents. The authoritative source remains code:
 | `skill/action/invoke` | shipped AppUI extra, UPCR-2026-026 |
 | `skill/action/job/list` | shipped AppUI extra, UPCR-2026-027 |
 | `skill/action/job/read` | shipped AppUI extra, UPCR-2026-027 |
+| `voice/admit` | shipped AppUI extra, gate `voice.asr_admission.v1`; ASR-only preflight for uploaded audio, never starts an LLM turn |
+| `voice/commit_admission` | shipped AppUI extra, gate `voice.asr_admission.v1`; consumes a speech admission and starts the admitted turn |
 | `onboarding/workspace_probe` | shipped local-solo AppUI extra |
+| `onboarding/workspace_list` | shipped local-solo AppUI extra, gate `onboarding.workspace_browse.v1` (WEB-WORKSPACE-BROWSER-CONTRACT-5000) |
+| `onboarding/workspace_create` | shipped local-solo AppUI extra, gate `onboarding.workspace_browse.v1` (WEB-WORKSPACE-BROWSER-CONTRACT-5000) |
+| `session/btw` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `user_question/respond` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `session/rollback` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `session/fork` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `monitor/create` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `monitor/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `monitor/pause` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `monitor/resume` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `monitor/delete` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `memory/overview` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `memory/entity` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `memory/search` | shipped; Recall/Knowledge index search (docs/adr/personal-memory-tiers.md, 2026-09-16) |
+| `memory/load` | shipped; Recall/Knowledge record load + bank page (docs/adr/personal-memory-tiers.md, 2026-09-16) |
+| `memory/ingest` | shipped; the only memory write — app records into the Recall index (docs/adr/personal-memory-tiers.md, 2026-09-16) |
+| `cron/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `cron/toggle` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `launch/resolve` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `smart_home/status.get` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `smart_home/device.list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `smart_home/device.command` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `smart_home/camera.stream_start` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `smart_home/camera.stream_stop` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `profile/sub_providers/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `profile/sub_providers/upsert` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `profile/sub_providers/remove` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `snapshot/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `snapshot/restore` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `peer/prepare` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `peer/gather` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `peer/model/set` | shipped; UPCR-2026-034 host-owned app peers |
+| `peer/context/open` | shipped; UPCR-2026-034 host-owned app peers; optional `share_history` (parallel person context with shared history, amended 2026-09-29) |
+| `peer/context/close` | shipped; UPCR-2026-034 host-owned app peers |
+| `peer/tools/register` | shipped; UPCR-2026-035 host-registered peer tools |
+| `peer/tool/result` | shipped; UPCR-2026-035 host-registered peer tools |
+| `peer/input/reject` | shipped; UPCR-2026-035 host-registered peer tools (#2618) |
+| `session/tool_list/set` | shipped; UPCR-2026-035 durable host session tool list (#2605) |
+| `session/tool_list/get` | shipped; UPCR-2026-035 durable host session tool list (#2605) |
+| `peer/purge` | shipped; UPCR-2026-034 host-owned app peers (#2604): erase a peer and free its binding |
+| `peer/tools/unregister` | shipped; UPCR-2026-035 host-registered peer tools (host releases a peer) |
+| `turn/steer` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `session/compact` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `session/compact/mode/set` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 
 ## Notifications
 
 | Method | Status |
 |---|---|
-| `session/open` | shipped open/resume notification |
+| `session/open` | shipped open/resume notification; carries `accepted_client_commands` (UPCR-2026-038) |
 | `turn/started` | shipped base notification |
 | `turn/completed` | shipped base notification |
 | `turn/error` | shipped base notification |
+| `turn/steer_dropped` | shipped steer return notification, UPCR-2026-033 |
+| `context/state_reported` | shipped live token-estimate notification (context.state.v1) |
 | `message/delta` | shipped base notification |
+| `message/reasoning_delta` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `tool/started` | shipped base notification |
-| `tool/progress` | shipped base notification |
-| `tool/completed` | shipped base notification |
+| `tool/progress` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `tool/completed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `approval/requested` | shipped base notification, UPCR-2026-001 |
 | `approval/auto_resolved` | shipped durable approval notification |
 | `approval/decided` | shipped durable approval notification |
 | `approval/cancelled` | shipped durable approval notification |
+| `user_question/requested` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `task/updated` | shipped, UPCR-2026-004 |
+| `plan/updated` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `task/output/delta` | shipped task output notification |
 | `progress/updated` | shipped typed progress notification |
 | `warning` | shipped base notification |
 | `protocol/replay_lossy` | shipped backpressure/replay notification |
-| `message/persisted` | shipped, UPCR-2026-012 |
 | `turn/spawn_complete` | shipped background completion notification |
 | `file/attached` | shipped, UPCR-2026-014 |
+| `visual/generating` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `visual/succeeded` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `visual/failed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `voice/exit` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `skill/action/job/updated` | shipped AppUI extra notification, UPCR-2026-027 |
+| `voice/audio_chunk` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `projection/envelope` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `session/event` | shipped, UPCR-2026-014 |
 | `router/status` | shipped adaptive-router notification |
 | `router/failover` | shipped adaptive-router notification |
 | `queue/state` | known client-emitted queue notification |
 | `agent/updated` | shipped, UPCR-2026-019 / UPCR-2026-021 |
+| `peer/tool/call` | shipped raw notification to the registering host connection, UPCR-2026-035 |
+| `peer/tool/cancel` | shipped raw notification to the registering host connection, UPCR-2026-035 |
+| `peer/input` | shipped raw notification to the registering host connection, UPCR-2026-035 |
 | `agent/output/delta` | shipped, UPCR-2026-019 / UPCR-2026-021 |
 | `agent/artifact/updated` | shipped, UPCR-2026-019 / UPCR-2026-021 |
-| `skill/action/job/updated` | shipped AppUI extra notification, UPCR-2026-027 |
 | `session/goal/updated` | shipped, UPCR-2026-021 |
 | `session/goal/cleared` | shipped, UPCR-2026-021 |
 | `loop/updated` | shipped, UPCR-2026-021 |
 | `loop/fired` | shipped, UPCR-2026-021 |
-| `loop/completed` | shipped, UPCR-2026-021 |
+| `monitor/fired` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `monitor/updated` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `monitor/expired` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `context/compaction_completed` | shipped M16 context lifecycle notification |
 | `context/compaction_started` | shipped M16 context lifecycle notification |
 | `context/normalization_reported` | shipped M16 context lifecycle notification |
+| `session/orchestration` | shipped whole-job orchestration indicator, UPCR-2026-033 |
+| `peer/staged` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `peer/closed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `background/activity` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+
+> **Audit note (2026-08-21):** commands were backfilled from the code constants of
+> truth (`UI_PROTOCOL_COMMAND_METHODS` in `crates/octos-core/src/ui_protocol.rs` plus
+> `APPUI_EXTRA_METHODS`). Notifications above are now the full
+> `UI_PROTOCOL_NOTIFICATION_METHODS` list. `message/persisted` (UPCR-2026-012) was
+> **retired**: the ledger explicitly skips it (`ui_protocol_ledger.rs:1001`) and tests
+> assert no new frame carries it; its successor is `projection/envelope`.
 
 ## Reconciliation Decisions
 
@@ -149,6 +226,12 @@ spec and UPCR documents. The authoritative source remains code:
   internal implementation details.
 - `onboarding/workspace_probe` is added to the executable route inventory
   because `APPUI_EXTRA_METHODS` advertises it for local-solo deployments.
+- `onboarding/workspace_list` and `onboarding/workspace_create` join it for
+  the same reason: `APPUI_EXTRA_METHODS` advertises both for local-solo
+  deployments, behind the `onboarding.workspace_browse.v1` feature advertised
+  next to `onboarding.workspace_probe.v1`. Tenant/cloud deployments advertise
+  neither the methods nor the feature, and refuse a direct call with
+  `profile_local_unsupported`.
 - `auth/logout` and all `content/*` methods are recorded as auth-bound
   unavailable over unauthenticated stdio, matching
   `APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS`.

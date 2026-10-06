@@ -107,7 +107,7 @@ fn is_harness_env_name(name: &str) -> bool {
 /// - AND either:
 ///   - it is in the manifest allowlist, OR
 ///   - it is in [`ALWAYS_RETAIN_ENV_NAMES`] (runtime essentials), OR
-///   - it is a harness-injected `OCTOS_*` var.
+///   - it is a non-secret harness-injected `OCTOS_*` var.
 ///
 /// Any other env var — secret OR non-secret — is dropped.
 pub(crate) fn should_forward_env_name_strict(name: &str, allowlist: &EnvAllowlist) -> bool {
@@ -119,6 +119,9 @@ pub(crate) fn should_forward_env_name_strict(name: &str, allowlist: &EnvAllowlis
     }
     if is_always_retain_env_name(name) {
         return true;
+    }
+    if is_secret_env_name(name) || is_registered_secret_env_name(name) {
+        return false;
     }
     if is_harness_env_name(name) {
         return true;
@@ -339,6 +342,44 @@ mod tests {
                 should_forward_env_name_strict(name, &allowlist),
                 "{name} should be retained"
             );
+        }
+    }
+
+    #[test]
+    fn strict_allowlist_rejects_undeclared_octos_secrets() {
+        let allowlist = EnvAllowlist::from_names(["MY_VAR"]);
+        for name in ["OCTOS_AUTH_TOKEN", "OCTOS_ADMIN_TOKEN"] {
+            assert!(!should_forward_env_name_strict(name, &allowlist), "{name}");
+            assert!(should_forward_env_name_strict(
+                name,
+                &EnvAllowlist::from_names([name])
+            ));
+        }
+        let registered = "OCTOS_TEST_REGISTERED_CREDS";
+        register_secret_env_names([registered]);
+        assert!(!should_forward_env_name_strict(registered, &allowlist));
+        assert!(should_forward_env_name_strict(
+            registered,
+            &EnvAllowlist::from_names([registered])
+        ));
+        for name in [
+            "OCTOS_PROFILE_ID",
+            "OCTOS_DATA_DIR",
+            "OCTOS_WORK_DIR",
+            "OCTOS_HOME",
+            "OCTOS_VOICE_DIR",
+            "OCTOS_SESSION_ID",
+            "OCTOS_TASK_ID",
+            "OCTOS_HARNESS_SESSION_ID",
+            "OCTOS_HARNESS_TASK_ID",
+            "OCTOS_EVENT_SINK",
+            "OCTOS_SESSION_WORKSPACE",
+            "OCTOS_PROFILE_LLM_MODEL",
+            "OCTOS_PROFILE_LLM_PROVIDER",
+            "OCTOS_ALLOW_SERP_SCRAPE",
+            "OCTOS_RESPECT_ROBOTS",
+        ] {
+            assert!(should_forward_env_name_strict(name, &allowlist), "{name}");
         }
     }
 

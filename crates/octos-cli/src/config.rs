@@ -36,6 +36,34 @@ pub struct Config {
     #[serde(default)]
     pub model: Option<String>,
 
+    /// Operator override for the primary provider's effective context window,
+    /// in tokens. When set it wraps the (probed) primary provider in
+    /// `ContextWindowOverride` as the OUTERMOST layer, so it beats both the
+    /// static catalog and the runtime probe (#2135). Projected from
+    /// `LlmModelSelectionConfig.context_window` by `config_from_profile`.
+    /// `None` = defer to probe/catalog. (#2142)
+    #[serde(default)]
+    pub context_window: Option<u32>,
+
+    /// #2166: the configured PRIMARY model's typed inference defaults,
+    /// flattened out of `LlmModelSelectionConfig` by `config_from_profile`
+    /// so session bootstrap can compose them AHEAD of the profile-gateway
+    /// knobs (`gateway.llm_temperature` / `gateway.reasoning_effort` /
+    /// `gateway.llm_sampling_params`). Ownership stays with the durable
+    /// model selection; these are read-only projections. `None` = inherit.
+    /// Range validation lives on the AppUI wire schema (#2166).
+    #[serde(default)]
+    pub model_temperature: Option<f32>,
+    /// #2166: primary model default `top_p`. At runtime it overrides a
+    /// same-named `top_p` key in `gateway.llm_sampling_params` (#2176);
+    /// every other sampler key in that map is untouched.
+    #[serde(default)]
+    pub model_top_p: Option<f32>,
+    /// #2166: primary model default reasoning effort. Precedence:
+    /// session/turn override → this → `gateway.reasoning_effort` → none.
+    #[serde(default)]
+    pub model_reasoning_effort: Option<octos_llm::ReasoningEffort>,
+
     /// Custom base URL for the API endpoint.
     #[serde(default)]
     pub base_url: Option<String>,
@@ -93,6 +121,15 @@ pub struct Config {
     /// feature off.
     #[serde(default)]
     pub snapshots: Option<octos_agent::SnapshotConfig>,
+
+    /// Build-cache pool configuration (outer-loop #1–#3; design
+    /// docs/build-cache-pool.md §2). Optional like `snapshots`: absent
+    /// means defaults (2 peer slots + 1 verify slot per repository, a
+    /// 50 GB free-space gate, 168 h stale window). Peers and outer-loop
+    /// verification draw cargo target dirs from this pool instead of each
+    /// growing an unbounded `target/`.
+    #[serde(default)]
+    pub build_cache: Option<crate::build_cache::BuildCacheConfig>,
 
     /// Tool access policy (allow/deny lists with group and wildcard support).
     #[serde(default)]
@@ -193,7 +230,8 @@ pub struct Config {
     #[serde(default)]
     pub base_domain: Option<String>,
 
-    /// frps server address for cloud/tenant mode (e.g. "163.192.33.32").
+    /// frps relay server address for cloud/tenant mode (e.g. "relay.example.com").
+    /// No default: tenant setup scripts are refused until this is set.
     /// Also read from FRPS_SERVER env var.
     #[serde(default)]
     pub frps_server: Option<String>,
@@ -455,6 +493,13 @@ pub struct FallbackModel {
     /// Defaults to true for backward compat — set false for weak/proxy providers.
     #[serde(default = "default_true")]
     pub strong: bool,
+    /// Operator override for THIS fallback's effective context window, in
+    /// tokens. Wraps this fallback provider in `ContextWindowOverride`
+    /// (outermost) so it beats the catalog and the probe (#2135). Projected
+    /// from the per-fallback `LlmModelSelectionConfig.context_window`.
+    /// `None` = defer to probe/catalog. (#2142)
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 pub fn default_true() -> bool {
@@ -643,11 +688,18 @@ pub struct EmbeddingConfig {
     pub dimensions: Option<u32>,
 
     /// Path to the local `.gguf` file for the in-process `llamacpp` provider
-    /// (feature `embed-llama`; add `embed-llama-metal` / `embed-llama-cuda` to
-    /// offload). Any GGUF embedding model works, e.g.
-    /// `ggml-org/embeddinggemma-300M-GGUF`. Ignored by remote providers.
+    /// (feature `embed-llama`, on by default; add `embed-llama-metal` /
+    /// `embed-llama-cuda` to offload). Any GGUF embedding model works. When
+    /// omitted, the bundled default (EmbeddingGemma-300M Q8_0 under
+    /// `<data_dir>/models/`) is used and fetched on first use. Ignored by
+    /// remote providers.
     #[serde(default)]
     pub model_path: Option<String>,
+
+    /// Allow octos to download the default embedding model when it is
+    /// missing (default true; `OCTOS_NO_MODEL_DOWNLOAD=1` also disables it).
+    #[serde(default)]
+    pub auto_download: Option<bool>,
 }
 
 fn default_embedding_provider() -> String {
@@ -668,6 +720,14 @@ pub struct MemoryConfig {
     /// Automatic memory refreshing (capture + consolidation pipeline).
     #[serde(default)]
     pub refresh: Option<MemoryRefreshConfig>,
+
+    /// Width of the vectors kept by the Recall/Knowledge index
+    /// (Matryoshka-truncated from the embedder's output, int8 at rest).
+    /// Defaults to [`octos_memory::DEFAULT_RECALL_DIMENSION`] (256); never
+    /// wider than the configured embedder. See
+    /// docs/adr/personal-memory-tiers.md.
+    #[serde(default)]
+    pub recall_dimension: Option<usize>,
 }
 
 /// Automatic memory-refresh settings. Default OFF: when disabled there is
@@ -1545,6 +1605,24 @@ pub struct GatewayConfig {
     /// and Grok get `reasoning_effort`), so non-thinking models silently ignore it.
     #[serde(default)]
     pub reasoning_effort: Option<octos_llm::ReasoningEffort>,
+
+    /// Sampling temperature override for chat LLM calls. When unset (the
+    /// default), the built-in `ChatConfig` default (`0.0`, greedy) is used and
+    /// the request is byte-for-byte unchanged — so cloud providers are
+    /// unaffected. Set a value (e.g. `0.7`) to override it; this is primarily
+    /// for **local / OpenAI-compatible** models, where forced greedy decoding
+    /// triggers repetition collapse (a small model re-emits the same tool call
+    /// until `max_tokens`). See issue #2172.
+    #[serde(default)]
+    pub llm_temperature: Option<f32>,
+
+    /// Extra sampler params for OpenAI-compatible servers, flattened verbatim
+    /// into the request body — e.g. `{"repeat_penalty": 1.1, "top_p": 0.95}`.
+    /// For params octos does not model. `None` → nothing added, so cloud
+    /// requests are unchanged. The robust fix for local-model repetition
+    /// collapse (temperature alone is only a partial mitigation). #2172.
+    #[serde(default)]
+    pub llm_sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl Default for GatewayConfig {
@@ -1567,6 +1645,8 @@ impl Default for GatewayConfig {
             session_timeout_secs: None,
             max_output_tokens: None,
             reasoning_effort: None,
+            llm_temperature: None,
+            llm_sampling_params: None,
         }
     }
 }
@@ -2051,8 +2131,7 @@ impl Config {
         if let (Some(provider), Some(model)) = (&self.provider, &self.model) {
             if !is_valid_model_for_provider(provider, model) {
                 warnings.push(format!(
-                    "Model '{}' may not be valid for provider '{}'. Check provider docs.",
-                    model, provider
+                    "Model '{model}' may not be valid for provider '{provider}'. Check provider docs."
                 ));
             }
         }
@@ -2060,7 +2139,7 @@ impl Config {
         // Check base_url format
         if let Some(ref url) = self.base_url {
             if !(url.starts_with("http://") || url.starts_with("https://")) || url.contains(' ') {
-                warnings.push(format!("base_url '{}' is not a valid URL", url));
+                warnings.push(format!("base_url '{url}' is not a valid URL"));
             }
         }
 
@@ -2098,6 +2177,15 @@ impl Config {
             }
         }
 
+        // Check build_cache section floors (peer/verify slot caps >= 1,
+        // stale window >= 1). Warnings, not errors: a bad value still gets
+        // a working (default-clamped) pool.
+        if let Some(ref bc) = self.build_cache {
+            for warning in bc.validate() {
+                warnings.push(warning);
+            }
+        }
+
         // Check API key is set
         let provider = match self.provider.as_deref() {
             Some(p) => p,
@@ -2116,7 +2204,7 @@ impl Config {
                     .map(String::from)
                     .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
             });
-            warnings.push(format!("{} environment variable not set", env_var));
+            warnings.push(format!("{env_var} environment variable not set"));
         }
 
         warnings
@@ -2156,7 +2244,7 @@ fn is_valid_model_for_provider(provider: &str, model: &str) -> bool {
         "zai" | "z.ai" => true, // Z.AI hosts multiple models (GLM, Claude, etc.)
         "minimax" => m.contains("minimax"),
         // These host many models, accept any
-        "groq" | "nvidia" | "nim" | "ollama" | "vllm" | "openrouter" => true,
+        "groq" | "nvidia" | "nim" | "ollama" | "vllm" | "local" | "openrouter" => true,
         _ => true,
     }
 }
@@ -2350,6 +2438,46 @@ mod tests {
         let json = r#"{"provider": "anthropic"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.gateway.is_none());
+    }
+
+    #[test]
+    fn test_gateway_llm_temperature_parses() {
+        let json = r#"{
+            "channels": [{"type": "cli"}],
+            "llm_temperature": 0.7
+        }"#;
+        let gw: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(gw.llm_temperature, Some(0.7));
+    }
+
+    #[test]
+    fn test_gateway_llm_temperature_absent_is_none() {
+        // Cloud-safety guarantee (#2172): a config without llm_temperature
+        // yields None, so chat_config() keeps the built-in 0.0 default and the
+        // request is unchanged. Old configs must still parse.
+        let json = r#"{"channels": [{"type": "cli"}]}"#;
+        let gw: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(gw.llm_temperature, None);
+    }
+
+    #[test]
+    fn test_gateway_llm_sampling_params_parses() {
+        let json = r#"{
+            "channels": [{"type": "cli"}],
+            "llm_sampling_params": {"repeat_penalty": 1.1, "top_p": 0.95}
+        }"#;
+        let gw: GatewayConfig = serde_json::from_str(json).unwrap();
+        let sp = gw.llm_sampling_params.expect("sampling params present");
+        assert_eq!(sp.get("repeat_penalty"), Some(&serde_json::json!(1.1)));
+        assert_eq!(sp.get("top_p"), Some(&serde_json::json!(0.95)));
+    }
+
+    #[test]
+    fn test_gateway_llm_sampling_params_absent_is_none() {
+        // Cloud-safety: absent → None → nothing flattened into the request.
+        let json = r#"{"channels": [{"type": "cli"}]}"#;
+        let gw: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(gw.llm_sampling_params, None);
     }
 
     #[test]

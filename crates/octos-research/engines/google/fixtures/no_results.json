@@ -1,0 +1,20 @@
+{
+  "body_file": "no_results.body",
+  "expect": [],
+  "http": {
+    "headers": {},
+    "method": "GET",
+    "url": "https://www.google.com/wml/search?q=omarchy+linux&sca_esv=1&hl=en&lr=lang_en&ie=utf8&oe=utf8"
+  },
+  "recorded": "derived from results_en.body: the results replaced by Google's \"did not match any documents\" notice (its wording for an empty search). A genuine empty answer, not an error",
+  "request": {
+    "category": "general",
+    "count": 10,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-28T23:30:00Z",
+    "query": "omarchy linux",
+    "since": null
+  }
+}

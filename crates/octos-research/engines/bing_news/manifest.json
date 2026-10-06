@@ -1,0 +1,17 @@
+{
+  "id": "bing_news",
+  "name": "Bing News",
+  "categories": ["news"],
+  "languages": ["*"],
+  "hosts": ["www.bing.com"],
+  "results_page": true,
+  "rate_limit": {
+    "min_interval_ms": 3000,
+    "source": "No published limit for the results page; kept to a person's pace (one search every few seconds)."
+  },
+  "docs_url": ["https://www.bing.com/news/search", "https://support.microsoft.com/topic/advanced-search-options-b92e25f1-0085-4271-bdf9-14aaea720930"],
+  "license_note": "Bing News results page, read for one person (ADR 0002 §6). Headlines, publisher, time and links only; a challenge page is reported, never worked around.",
+  "weight": 1.1,
+  "cache_ttl_secs": 600,
+  "timeout_secs": 10
+}

@@ -67,7 +67,7 @@ impl Tool for SaveMemoryTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Entity name slug (e.g. 'octos', 'yuechen')"
+                    "description": "Entity name slug (e.g. 'octos', 'alice')"
                 },
                 "content": {
                     "type": "string",
@@ -208,13 +208,13 @@ mod tests {
 
         let result = tool
             .execute(&serde_json::json!({
-                "name": "yuechen",
-                "content": "# Yuechen\nPrefers concise replies; works on octos."
+                "name": "alice",
+                "content": "# Alice\nPrefers concise replies; works on octos."
             }))
             .await
             .unwrap();
         assert!(result.success, "{}", result.output);
-        assert!(store.read_entity("yuechen").await.unwrap().is_some());
+        assert!(store.read_entity("alice").await.unwrap().is_some());
     }
 
     // --- to_slug ---

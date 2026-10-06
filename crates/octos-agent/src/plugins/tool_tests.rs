@@ -1448,7 +1448,7 @@ async fn execute_preserves_plugin_structured_metadata() {
         make_tool_def("metadata_tool", "returns structured metadata"),
         script_path,
     )
-    .with_timeout(Duration::from_secs(5));
+    .with_timeout(TEST_PLUGIN_TIMEOUT);
 
     let result = tool
         .execute(&json!({}))
@@ -1732,6 +1732,59 @@ async fn execute_fallback_skips_missing_generated_pptx() {
     assert!(result.success);
     assert_eq!(result.file_modified, None);
     assert!(result.files_to_send.is_empty());
+}
+
+/// procps-ng `kill` reads `kill -9 -12345` as `kill(-1, SIGKILL)` (only the
+/// first digit of a bare negative pid survives), which kills every process
+/// the user owns — on CI that was the GitHub runner agent itself. The group
+/// must come after `--`.
+#[test]
+#[cfg(unix)]
+fn should_put_the_group_after_double_dash_when_building_group_kill_args() {
+    for pgid in [1_u32, 7, 12_345, 4_194_303] {
+        let args = sigkill_process_group_args(pgid);
+        assert_eq!(args, ["-9", "--", &format!("-{pgid}")], "pgid {pgid}");
+    }
+}
+
+/// Every group kill in this crate goes through `kill(1)` with the group after
+/// `--`. A bare `kill -9 -<pgid>` passes review and most local runs, then
+/// kills the whole user session when the pgid happens to start with `1`, so
+/// scan the source rather than trust each call site.
+#[test]
+#[cfg(unix)]
+fn should_pass_double_dash_when_any_kill_targets_a_negative_pid() {
+    fn visit(dir: &std::path::Path, offenders: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                visit(&path, offenders);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = std::fs::read_to_string(&path).expect("read source");
+                for (index, line) in text.lines().enumerate() {
+                    let negative_pid_arg = line.contains(".args([")
+                        && (line.contains("format!(\"-{") || line.contains("&group"));
+                    if negative_pid_arg && !line.contains("\"--\"") {
+                        offenders.push(format!(
+                            "{}:{}: {}",
+                            path.display(),
+                            index + 1,
+                            line.trim()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    visit(&src, &mut offenders);
+    assert!(
+        offenders.is_empty(),
+        "negative-pid kill without `--` (procps kill turns `-12345` into `-1`, killing \
+         every process the user owns):\n{}",
+        offenders.join("\n")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2289,6 +2342,68 @@ async fn strict_env_allowlist_drops_non_listed_extra_env() {
         "non-listed extra env must be stripped under strict allowlist; got: {}",
         result.output
     );
+}
+
+struct FixedVertexTokenSource;
+
+#[async_trait]
+impl octos_llm::vertex_auth::TokenSource for FixedVertexTokenSource {
+    async fn token(&self) -> eyre::Result<String> {
+        Ok("cached-host-token".to_string())
+    }
+}
+
+/// A plugin receives the host-minted short-lived token only after explicitly
+/// declaring it in the manifest allowlist. This keeps the long-lived service
+/// account compatible while avoiding one OAuth exchange per plugin process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn vertex_access_token_is_injected_from_host_cache_when_allowlisted() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let script_path = dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        "#!/bin/sh\nread INPUT || true\nTOKEN=${VERTEX_ACCESS_TOKEN:-missing}\nPROJECT=${GOOGLE_CLOUD_PROJECT:-missing}\nSA=${VERTEX_SA_JSON:-missing}\necho '{\"output\":\"token='\"$TOKEN\"';project='\"$PROJECT\"';sa='\"$SA\"'\",\"success\":true}'\n",
+    );
+
+    let mut def = make_tool_def("vertex_tool", "prints the short-lived token");
+    def.env.push("VERTEX_ACCESS_TOKEN".into());
+    def.env.push("GOOGLE_CLOUD_PROJECT".into());
+    def.env.push("VERTEX_SA_JSON".into());
+    let tool = PluginTool::new("p".into(), def, script_path)
+        .with_extra_env(vec![(
+            "VERTEX_SA_JSON".into(),
+            "long-lived-service-account".into(),
+        )])
+        .with_vertex_token_source(Arc::new(FixedVertexTokenSource), "test-project".into())
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
+
+    let result = tool.execute(&json!({})).await.expect("should succeed");
+    assert!(result.success);
+    assert_eq!(
+        result.output,
+        "token=cached-host-token;project=test-project;sa=missing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn vertex_access_token_is_not_injected_without_manifest_permission() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let script_path = dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        "#!/bin/sh\nread INPUT || true\nVALUE=${VERTEX_ACCESS_TOKEN:-missing}\necho '{\"output\":\"'\"$VALUE\"'\",\"success\":true}'\n",
+    );
+
+    let def = make_tool_def("vertex_tool", "prints the short-lived token");
+    let tool = PluginTool::new("p".into(), def, script_path)
+        .with_vertex_token_source(Arc::new(FixedVertexTokenSource), "test-project".into())
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
+
+    let result = tool.execute(&json!({})).await.expect("should succeed");
+    assert!(result.success);
+    assert_eq!(result.output, "missing");
 }
 
 /// When the manifest declares an empty `env` list, legacy semantics
@@ -3086,6 +3201,78 @@ async fn plugin_uses_scope_workspace_when_present() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(unix)]
+async fn plugin_exposes_session_workspace_separately_from_skill_output_cwd() {
+    let data = tempfile::tempdir().expect("data dir");
+    let scope = multi_tenant_scope_at(data.path(), "dspfac", "web-session-workspace", vec![]);
+    let session_workspace = scope.workspace().to_path_buf();
+    let skill_output = session_workspace.join("skill-output");
+    std::fs::create_dir_all(&skill_output).expect("skill output dir");
+
+    let bin_dir = tempfile::tempdir().expect("bin dir");
+    let script_path = bin_dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        "#!/bin/sh\nprintf '{\"output\":\"%s|%s\",\"success\":true}' \"$OCTOS_WORK_DIR\" \"$OCTOS_SESSION_WORKSPACE\"\n",
+    );
+
+    let mut def = make_tool_def("workspace_env", "echo workspace env");
+    def.env.push("OCTOS_SESSION_WORKSPACE".into());
+    let tool = PluginTool::new("plug".into(), def, script_path)
+        .with_work_dir(skill_output.clone())
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
+
+    let ctx = ctx_with_scope(scope);
+    let result = crate::tools::TOOL_CTX
+        .scope(ctx, tool.execute(&json!({})))
+        .await
+        .expect("execute should succeed");
+
+    assert!(result.success, "workspace environment probe should succeed");
+    let (actual_work_dir, actual_session_workspace) = result
+        .output
+        .trim()
+        .split_once('|')
+        .expect("plugin should echo both workspace paths");
+    assert_eq!(
+        std::fs::canonicalize(actual_work_dir).expect("work dir should resolve"),
+        std::fs::canonicalize(skill_output).expect("skill output should resolve"),
+    );
+    assert_eq!(
+        std::fs::canonicalize(actual_session_workspace).expect("session workspace should resolve"),
+        std::fs::canonicalize(session_workspace).expect("workspace should resolve"),
+        "plugins must be able to read workspace-relative action inputs without treating skill-output as the workspace root",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn plugin_does_not_receive_session_workspace_without_manifest_permission() {
+    let data = tempfile::tempdir().expect("data dir");
+    let scope = multi_tenant_scope_at(data.path(), "dspfac", "web-session-workspace", vec![]);
+    let skill_output = scope.workspace().join("skill-output");
+    std::fs::create_dir_all(&skill_output).expect("skill output dir");
+
+    let bin_dir = tempfile::tempdir().expect("bin dir");
+    let script_path = bin_dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        "#!/bin/sh\nprintf '{\"output\":\"%s\",\"success\":true}' \"${OCTOS_SESSION_WORKSPACE:-missing}\"\n",
+    );
+
+    let def = make_tool_def("workspace_env", "echo workspace env");
+    let tool = PluginTool::new("plug".into(), def, script_path)
+        .with_work_dir(skill_output)
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
+    let result = crate::tools::TOOL_CTX
+        .scope(ctx_with_scope(scope), tool.execute(&json!({})))
+        .await
+        .expect("execute should succeed");
+
+    assert_eq!(result.output.trim(), "missing");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
 async fn high_risk_plugin_approval_cwd_reflects_scope_workspace() {
     // Codex P3 pin (Phase 2-B): the approval prompt's `cwd` field
     // must reflect the directory the plugin will ACTUALLY run in,
@@ -3247,7 +3434,7 @@ async fn plugin_refuses_absolute_escape_in_hinted_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn plugin_prefers_registry_rebound_work_dir_over_scope() {
     // Codex P1 pin (Phase 2-B): when `SessionRuntime::bootstrap`
     // honours a `workspace_hint`, it calls
@@ -3272,19 +3459,32 @@ async fn plugin_prefers_registry_rebound_work_dir_over_scope() {
     );
 
     // Registry-rebound work_dir mirrors the hinted-workspace path.
-    let hinted_work_dir = tempfile::tempdir().expect("hinted work dir");
-    let script_path = hinted_work_dir.path().join("script.sh");
+    let hinted_workspace = tempfile::tempdir().expect("hinted workspace");
+    let hinted_work_dir = hinted_workspace.path().join("skill-output");
+    #[cfg(unix)]
+    let script_path = hinted_workspace.path().join("script.sh");
+    #[cfg(unix)]
     write_test_script(
         &script_path,
-        "#!/bin/sh\nDIR=$(pwd)\nprintf '{\"output\":\"%s\",\"success\":true}' \"$DIR\"\n",
+        "#!/bin/sh\nprintf 'generated report' > report.md\nDIR=$(pwd)\nprintf '{\"output\":\"%s\",\"success\":true}' \"$DIR\"\n",
     );
+    #[cfg(windows)]
+    let script_path = hinted_workspace.path().join("script.cmd");
+    #[cfg(windows)]
+    std::fs::write(
+        &script_path,
+        "@echo off\r\necho generated report>report.md\r\necho {\"output\":\"%CD:\\=/%\",\"success\":true}\r\n",
+    )
+    .expect("write plugin script");
 
     let def = make_tool_def("hint_cwd", "echo CWD");
     let tool = PluginTool::new("plug".into(), def, script_path)
-        .with_work_dir(hinted_work_dir.path().to_path_buf())
+        .with_work_dir(hinted_work_dir.clone())
         .with_timeout(TEST_PLUGIN_TIMEOUT);
+    assert!(!hinted_work_dir.exists(), "binding must leave output lazy");
 
-    let ctx = ctx_with_scope(scope);
+    let mut ctx = ToolContext::zero();
+    ctx.session_scope = Some(Arc::new(scope));
     let result = crate::tools::TOOL_CTX
         .scope(ctx, tool.execute(&json!({})))
         .await
@@ -3293,11 +3493,17 @@ async fn plugin_prefers_registry_rebound_work_dir_over_scope() {
     assert!(result.success, "hinted execute should succeed");
     let actual =
         std::fs::canonicalize(result.output.trim()).expect("CWD echoed by plugin should resolve");
-    let expected =
-        std::fs::canonicalize(hinted_work_dir.path()).expect("hinted work_dir should resolve");
+    let expected = std::fs::canonicalize(&hinted_work_dir).expect("hinted work_dir should resolve");
     assert_eq!(
         actual, expected,
         "registry-rebound self.work_dir MUST win over scope.workspace()"
+    );
+    assert_eq!(
+        std::fs::read_to_string(hinted_work_dir.join("report.md"))
+            .unwrap()
+            .trim(),
+        "generated report",
+        "first plugin execution must create its output directory and artifact"
     );
     // Defence in depth: the scope workspace must STILL be absent
     // because Phase 2-B did NOT redirect the spawn there.
@@ -4269,4 +4475,33 @@ fn plugin_accepts_input_path_inside_real_skill_dir_under_canonical_classify() {
         path_in.starts_with(&*canonical_skill_dir.to_string_lossy()),
         "accepted path must remain inside the canonical skill_dir: {path_in}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(unix)]
+async fn strict_env_allowlist_rejects_octos_secret_extra_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let script_path = dir.path().join("script.sh");
+    write_test_script(
+        &script_path,
+        r#"#!/bin/sh
+read INPUT || true
+if [ -n "${OCTOS_AUTH_TOKEN:-}" ] || [ -n "${OCTOS_ADMIN_TOKEN:-}" ]; then
+  echo '{"output":"secret present","success":false}'
+else
+  echo '{"output":"secret absent","success":true}'
+fi
+"#,
+    );
+    let mut def = make_tool_def("strict_secret", "test env isolation");
+    def.env.push("OCTOS_PROFILE_ID".into());
+    let tool = PluginTool::new("p".into(), def, script_path)
+        .with_extra_env(vec![
+            ("OCTOS_AUTH_TOKEN".into(), "fixture".into()),
+            ("OCTOS_ADMIN_TOKEN".into(), "fixture".into()),
+        ])
+        .with_timeout(TEST_PLUGIN_TIMEOUT);
+    let result = tool.execute(&json!({})).await.unwrap();
+    assert!(result.success);
+    assert_eq!(result.output, "secret absent");
 }

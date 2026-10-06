@@ -1,0 +1,24 @@
+{
+  "recorded": "live, 2026-09-28: Google's answer to a plain client, a redirect to its \"unusual traffic\" page, as the legacy_mobile client reports it (the page the request ended on, empty body). The engine must report a challenge and be suspended, not work around it",
+  "request": {
+    "query": "omarchy linux",
+    "langs": [
+      "en"
+    ],
+    "since": null,
+    "category": "general",
+    "count": 10,
+    "now": "2026-09-28T23:30:00Z"
+  },
+  "http": {
+    "method": "GET",
+    "url": "https://www.google.com/wml/search?q=omarchy+linux&sca_esv=1&hl=en&lr=lang_en&ie=utf8&oe=utf8",
+    "headers": {}
+  },
+  "response_headers": {
+    "x-octos-final-url": "https://www.google.com/sorry/index?continue=https://www.google.com/search%3Fq%3Domarchy%2Blinux&hl=en&q=EgQ"
+  },
+  "body_file": "challenge.body",
+  "expect_status": "challenge",
+  "expect": []
+}

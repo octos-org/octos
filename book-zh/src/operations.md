@@ -27,9 +27,21 @@ sudo systemctl restart octos-serve
 
 ---
 
+## 会话存储容量
+
+会话以滚动 JSONL 分段存储，而不是单个无限增长的文件。当活跃文件达到 `OCTOS_SESSION_SEGMENT_BYTES`（默认 8 MiB）时，它会被封存为旁边的 `<name>.segments/NNNNNN.jsonl`，并新建一个活跃文件。普通加载会读取活跃文件，再按新到旧纳入尽可能多的封存分段，直到 `OCTOS_SESSION_LOAD_BUDGET_BYTES`（默认 32 MiB；`0` = 不限）——超出预算的历史仍留在磁盘上，可通过全量加载和 `/undo` 访问。
+
+**内存规划**：该预算限制单个驻留会话占用的文件字节；解析后的行开销约为文件大小的 1.5–3 倍，因此缓存 N 个长会话的进程最多需要约 `N × 32 MiB × 3`。内存受限的主机应调低预算（如 `OCTOS_SESSION_LOAD_BUDGET_BYTES=16777216`）或调小会话缓存（`gateway.max_sessions`）。
+
+**混布版本重叠**（例如共享数据目录上的 Kubernetes 滚动升级）：旧二进制看不到 `.segments/`，其 `*.jsonl` 扫描只会看到活跃文件，看起来像一个很短的会话。本版本写入的会话携带 schema 版本 2，旧版本构建会整体拒读——但仍绝不能让旧二进制**改写**（重命名、摘要）任何已滚动的会话：改写会用旧构建能读到的内容整个替换活跃文件。对更老的（schema 1）会话，旧版重写擦掉 `sealed_segments` 会让封存分段对加载不可见；在这个未点名的状态存续期间，改写会被拒绝、seal 也会拒绝替换未点名的分段——文件保留在磁盘上，但该会话在状态修复前不再滚动。
+
+**中断的封存**（在封存一个分段与新建活跃文件之间崩溃或被杀）会把封存分段留在磁盘上，而没有（或只有空的）活跃文件。该状态在读路径自愈：下次加载该会话时会从封存分段重建缺失或为空的活跃文件；在网关上，切换到该会话名的 `/new <name>` 也以同样方式恢复缺失的活跃文件——会话接续历史，而不是从空白开始。无法读取的活跃文件原样保留，留给人工处理。主动清空历史仍是 `/clear`（或裸 `/new`）。
+
+---
+
 ## 钥匙串集成
 
-Octos 支持将 API 密钥存储在 macOS 钥匙串中，而不是以明文形式存放在配置文件的 JSON 中。这在 Apple Silicon 上提供硬件级加密和操作系统级别的访问控制。
+Octos 支持将 API 密钥存储在操作系统的密钥存储中，而不是以明文形式存放在配置文件的 JSON 中：macOS 使用钥匙串（Apple Silicon 上提供硬件级加密和操作系统级别的访问控制），Linux 使用 `~/.octos/secrets` 下的 0600 文件，Windows 暂无密钥存储——请改用环境变量或明文 `env_vars`。下图展示的是 macOS 后端。
 
 ### 架构
 
@@ -150,7 +162,8 @@ macOS 钥匙串是为桌面交互使用设计的。在无头服务器上，它�
 | **开发者笔记本** | 钥匙串（`"keychain:"`） | GUI 会话保持钥匙串解锁；ACL 弹窗可以接受 |
 | **自动登录 + GUI 的 Mac** | 钥匙串（`"keychain:"`） | 如果通过屏幕共享批准过 ACL 对话框则可用 |
 | **无头 Mac（仅 SSH）** | `env_vars` 或 launchd plist 中的明文 | 最可靠；无解锁/ACL 依赖 |
-| **Linux 服务器** | 环境变量中的明文 | 没有 macOS 钥匙串 |
+| **Linux 服务器** | 密钥存储（`~/.octos/secrets` 下的 0600 文件） | 文件存储无需解锁或 D-Bus；明文环境变量亦可 |
+| **Windows** | `env_vars` 或环境变量中的明文 | 暂无密钥存储（#2234） |
 
 **为什么钥匙串在无头服务器上不可靠：**
 
@@ -181,6 +194,30 @@ macOS 钥匙串是为桌面交互使用设计的。在无头服务器上，它�
 chmod 600 ~/.octos/profiles/*.json
 sudo chmod 600 /Library/LaunchDaemons/io.octos.serve.plist
 ```
+
+---
+
+## 工作密钥（会话入口）
+
+外部 CLI 或脚本代理不应持有你的仪表盘 bearer 令牌。*工作密钥*（work secret）是一种短生命周期凭证，只授予一个代理对**单个会话**的访问权，走会话入口 WebSocket 路由（`/v1/session_ingress/ws/{session_id}`）。
+
+签发一条（运维提示走 stderr，编码后的密钥走 stdout）：
+
+```bash
+octos auth issue-work-secret \
+  --session "dspfac:local:tui#coding" \
+  --profile dspfac \
+  --ttl 1h \
+  --api-base-url http://127.0.0.1:50080
+```
+
+- `--ttl` 接受 `15m`、`1h`、`3600s` 这类值（默认 `1h`）。
+- 对同一会话重新签发会替换早先的授权；授权以 SHA-256 哈希形式持久化在 serve 数据目录（默认 `~/.octos/work_secrets.json`，令牌本身从不落盘）。
+- `octos auth list-work-secrets` 列出已记录的授权；`octos auth revoke-work-secret '<secret>'` 撤销一条。
+
+访客解码密钥后连到 `/v1/session_ingress/ws/<URL 编码后的会话 id>`，带 `Authorization: Bearer <token>`。无法设置请求头的 WebSocket 客户端可退回 `?token=<token>`；该形式已弃用且会被服务端记录。套接字使用普通 UI Protocol 帧，每个客户端请求前都会重验授权，授权被撤销、过期或被重签替换后以 1008 关闭。只接受限定在被授权会话内的方法。
+
+完整走查（含最小 Python 客户端）：`docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md`。
 
 ---
 
@@ -230,3 +267,11 @@ sudo systemctl enable octos-serve
 sudo systemctl status octos-serve
 sudo journalctl -u octos-serve -f
 ```
+
+### 通过 `server/shutdown` 停止（本地 solo）
+
+服务器有三种停止方式：前台运行 `octos serve` 的终端里按 Ctrl+C、平台服务管理器（上文的 launchd / systemd），以及此处介绍的 UI Protocol 方法 `server/shutdown`。
+
+UI Protocol 客户端可以通过已认证的 WebSocket（`/api/ui-protocol/ws`）调用 `server/shutdown` 方法停止服务器。它的效果与 Ctrl+C 完全一致：连接排空、网关停止、进程退出。该调用是幂等的，停止动作在请求被处理后约 250 ms 触发，确认通常仍能赶在排空前送达客户端（出站背压下客户端可能错过确认，但停止照常发生）。
+
+该方法只在**本地部署**（`config.mode = "local"`）且开启 solo 登录（`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`）时被接受，且仅限 HTTP serve（不带 `--stdio` 的 `octos serve`）。一次调用会停止整个进程，所有已连接客户端一起下线，其运行中的轮次一并取消。fleet/托管服务器与 `--stdio` serve 会以 `invalid_request`（-32600）携带 `data.kind: "server_shutdown_unavailable"` 拒绝该调用，什么都不停；session 级（session-ingress）连接则完全无法调用，只会收到不带 kind 的裸 `invalid_request`。注意本地 solo 的信任模型：solo serve 上，任何能打开 WebSocket 的本地进程——或白名单来源页面——都能停止服务器。

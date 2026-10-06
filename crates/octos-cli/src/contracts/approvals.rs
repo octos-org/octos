@@ -15,11 +15,26 @@ struct ApprovalEntry {
     request: Option<ApprovalRequestedEvent>,
     runtime_resumable: bool,
     response_tx: Option<tokio::sync::oneshot::Sender<ApprovalDecision>>,
+    /// The UI Protocol connection whose turn raised the approval (its
+    /// `ConnectionId`), when known. `octos serve --host-managed` lets an
+    /// external connection answer only approvals it owns (UPCR-2026-036).
+    owner_connection: Option<u64>,
+    /// Covers exactly one call: no remembered scope may be recorded from it
+    /// (UPCR-2026-035 host-routed app tools).
+    once_only: bool,
+    /// For a host-routed app tool's call (UPCR-2026-035): the peer's route
+    /// key (`crate::peers::host_tools::route_key`). Only the owning
+    /// connection or the peer's current host connection may answer it.
+    host_route: Option<String>,
+    /// Raised by an external client's turn (`serve --host-managed`,
+    /// UPCR-2026-036): only `owner_connection` sees or answers it. Kept on
+    /// the entry so the rule holds even if the transport's side table has
+    /// evicted the id.
+    external: bool,
 }
 
 #[derive(Debug)]
 enum ApprovalEntryState {
-    #[allow(dead_code)]
     Pending,
     Responded {
         decision: ApprovalDecision,
@@ -55,6 +70,8 @@ pub(crate) struct PendingApprovalStore {
 pub(crate) struct RespondedApprovalContext {
     pub(crate) tool_name: String,
     pub(crate) turn_id: TurnId,
+    /// The approval covers exactly one call; record no scope from it.
+    pub(crate) once_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +120,7 @@ impl PendingApprovalStore {
                     .map(|request| RespondedApprovalContext {
                         tool_name: request.tool_name.clone(),
                         turn_id: request.turn_id.clone(),
+                        once_only: entry.once_only,
                     });
                 Ok(RespondOutcome {
                     result: ApprovalRespondResult::accepted_with_runtime_resumed(
@@ -218,7 +236,7 @@ impl PendingApprovalStore {
         })
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn insert_pending(&self, session_id: SessionKey, approval_id: ApprovalId) {
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         entries.insert(
@@ -229,6 +247,10 @@ impl PendingApprovalStore {
                 request: None,
                 runtime_resumable: false,
                 response_tx: None,
+                owner_connection: None,
+                once_only: false,
+                host_route: None,
+                external: false,
             },
         );
     }
@@ -243,6 +265,10 @@ impl PendingApprovalStore {
                 request: Some(event.clone()),
                 runtime_resumable: false,
                 response_tx: None,
+                owner_connection: None,
+                once_only: false,
+                host_route: None,
+                external: false,
             },
         );
         event
@@ -251,6 +277,30 @@ impl PendingApprovalStore {
     pub(crate) fn request_runtime(
         &self,
         event: ApprovalRequestedEvent,
+    ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
+        self.request_runtime_owned(event, None)
+    }
+
+    /// [`Self::request_runtime`], recording the connection that owns the
+    /// approval (see [`Self::pending_owner`]).
+    pub(crate) fn request_runtime_owned(
+        &self,
+        event: ApprovalRequestedEvent,
+        owner_connection: Option<u64>,
+    ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
+        self.request_runtime_entry(event, owner_connection, false, None)
+    }
+
+    /// [`Self::request_runtime_owned`] with the UPCR-2026-035 flags: a
+    /// `once_only` approval never records a remembered scope, and a
+    /// `host_route` one (a host-routed app tool's call) is answered only by
+    /// its owning connection or the peer's current host connection.
+    pub(crate) fn request_runtime_entry(
+        &self,
+        event: ApprovalRequestedEvent,
+        owner_connection: Option<u64>,
+        once_only: bool,
+        host_route: Option<String>,
     ) -> tokio::sync::oneshot::Receiver<ApprovalDecision> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
@@ -262,9 +312,65 @@ impl PendingApprovalStore {
                 request: Some(event),
                 runtime_resumable: true,
                 response_tx: Some(tx),
+                owner_connection,
+                once_only,
+                host_route,
+                external: false,
             },
         );
         rx
+    }
+
+    /// The owning connection of a PENDING approval of `session_id`: `None`
+    /// when no such approval is pending, `Some(None)` when it has no recorded
+    /// owner.
+    pub(crate) fn pending_owner(
+        &self,
+        session_id: &SessionKey,
+        approval_id: &ApprovalId,
+    ) -> Option<Option<u64>> {
+        let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
+        entries
+            .get(approval_id)
+            .filter(|entry| {
+                entry.session_id == *session_id
+                    && matches!(&entry.state, ApprovalEntryState::Pending)
+            })
+            .map(|entry| entry.owner_connection)
+    }
+
+    /// Mark approval `approval_id` as raised by an external client's turn
+    /// (UPCR-2026-036): see [`Self::external_owner`].
+    pub(crate) fn mark_external(&self, approval_id: &ApprovalId) {
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = entries.get_mut(approval_id) {
+            entry.external = true;
+        }
+    }
+
+    /// For an approval raised by an external client's turn (in any state):
+    /// `Some(owning connection)`, which alone may see or answer it
+    /// (`Some(None)`: nobody may). `None` for every other approval.
+    pub(crate) fn external_owner(&self, approval_id: &ApprovalId) -> Option<Option<u64>> {
+        let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
+        entries
+            .get(approval_id)
+            .filter(|entry| entry.external)
+            .map(|entry| entry.owner_connection)
+    }
+
+    /// For a host-routed call's approval (in any state): its peer route and
+    /// owning connection. `None` for every other approval.
+    pub(crate) fn host_route_owner(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Option<(String, Option<u64>)> {
+        let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
+        let entry = entries.get(approval_id)?;
+        entry
+            .host_route
+            .clone()
+            .map(|route| (route, entry.owner_connection))
     }
 
     pub(crate) fn pending_for_session(
@@ -282,7 +388,7 @@ impl PendingApprovalStore {
             .collect()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn remove_pending(&self, session_id: &SessionKey, approval_id: &ApprovalId) -> bool {
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
         let should_remove = entries.get(approval_id).is_some_and(|entry| {

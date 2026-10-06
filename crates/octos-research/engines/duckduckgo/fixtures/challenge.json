@@ -1,0 +1,23 @@
+{
+  "recorded": "reconstructed, not captured: the challenge page from crates/octos-research/tests/fixtures/serp/ddg_anomaly.html (its public structure). The engine must report a challenge for the person, not parse it or work around it",
+  "request": {
+    "category": "general",
+    "count": 5,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-28T23:00:00Z",
+    "query": "omarchy linux",
+    "since": null
+  },
+  "http": {
+    "headers": {
+      "accept": "text/html"
+    },
+    "method": "GET",
+    "url": "https://html.duckduckgo.com/html/?q=omarchy+linux&kl=us-en"
+  },
+  "body_file": "challenge.body",
+  "expect_status": "challenge",
+  "expect": []
+}

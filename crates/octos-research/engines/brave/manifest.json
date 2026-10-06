@@ -1,0 +1,19 @@
+{
+  "id": "brave",
+  "name": "Brave Search API",
+  "categories": ["general", "news"],
+  "languages": ["*"],
+  "hosts": ["api.search.brave.com"],
+  "needs_key": true,
+  "auth": {"header": {"name": "X-Subscription-Token"}},
+  "key_env": "BRAVE_API_KEY",
+  "rate_limit": {
+    "min_interval_ms": 1100,
+    "source": "https://api-dashboard.search.brave.com/documentation/guides/rate-limiting (free plan: 1 request per second)"
+  },
+  "docs_url": ["https://api-dashboard.search.brave.com/app/documentation/web-search/query", "https://api-dashboard.search.brave.com/app/documentation/web-search/responses", "https://api-dashboard.search.brave.com/app/documentation/news-search/query"],
+  "license_note": "Brave Search API terms apply to the key holder; runs only when the host has a key, which the script never sees.",
+  "weight": 1.2,
+  "cache_ttl_secs": 600,
+  "timeout_secs": 10
+}

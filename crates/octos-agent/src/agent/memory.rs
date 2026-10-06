@@ -210,12 +210,20 @@ impl Agent {
         {
             return;
         }
+        let mirror = octos_memory::record_from_episode(&episode);
         if let Err(e) = self.memory.store(episode).await {
             warn!(error = %e, "failed to save conversation episode");
             // Allow a retry on the next compaction — the save didn't land.
             self.conversation_episode_saved
                 .store(false, std::sync::atomic::Ordering::Release);
             return;
+        }
+        // Mirror into the Recall index so `memory_search` can find this
+        // conversation later (docs/adr/personal-memory-tiers.md).
+        if let Some(recall) = &self.recall {
+            if let Err(e) = recall.upsert(vec![mirror], vec![None]) {
+                warn!(error = %e, "failed to mirror conversation episode into the recall index");
+            }
         }
         info!(
             episode_id = %ep_id,
@@ -229,10 +237,14 @@ impl Agent {
         if let Some(ref embedder) = self.embedder {
             let embedder = embedder.clone();
             let memory = self.memory.clone();
+            let recall = self.recall.clone();
             tokio::spawn(async move {
                 match embedder.embed(&[summary_truncated.as_str()]).await {
                     Ok(vecs) => {
                         if let Some(vec) = vecs.into_iter().next() {
+                            if let Some(recall) = &recall {
+                                let _ = recall.store_vector(&format!("episode:{ep_id}"), &vec);
+                            }
                             if let Err(e) = memory.store_embedding(&ep_id, vec).await {
                                 warn!(error = %e, "failed to store conversation-episode embedding");
                             }

@@ -17,6 +17,14 @@ cargo install --path crates/octos-cli \
                                           # Install CLI locally with the
                                           # canonical feature default
                                           # (matches scripts/milestone-ci.sh).
+                                          # Default features include
+                                          # `embed-llama` (the bundled
+                                          # llama.cpp embedder): building
+                                          # needs cmake + a C++ toolchain;
+                                          # add `embed-llama-metal` on Apple
+                                          # Silicon, or use
+                                          # `--no-default-features --features api`
+                                          # to skip it.
                                           # `api` is required for `octos serve`.
                                           # `audio_mp3` is required for the
                                           # `podcast_generate` workspace
@@ -65,9 +73,9 @@ All tools implement `Tool` trait (`spec() -> ToolSpec`, `execute(&Value) -> Tool
 
 **Tool Policies** (`tools/policy.rs`): Allow/deny lists with deny-wins semantics, wildcard matching (`exec*`), and named groups (`group:fs`, `group:runtime`, `group:search`, `group:web`, `group:sessions`). Provider-specific policies via `tools.byProvider` in config.
 
-### Sandbox (`octos-agent/src/sandbox.rs`)
+### Sandbox (`octos-agent/src/sandbox/`)
 
-Three sandbox backends: `Bwrap` (Linux), `Macos` (sandbox-exec), `Docker`. On Windows, falls back to `NoSandbox` (uses `cmd /C`) or Docker if available. Auto-detection in `SandboxMode::Auto`. Shared `BLOCKED_ENV_VARS` constant (18 env vars) across all backends and MCP server spawning. Docker supports mount modes (none/ro/rw), resource limits (CPU/memory/PIDs), network isolation. Path validation rejects injection characters (`:`, `\0`, `\n`, `\r` for Docker; control chars, `(`, `)`, `\`, `"` for macOS SBPL).
+Five sandbox backends: `Bwrap` (Linux), `Landlock` (Linux, octos-sandbox helper), `Macos` (sandbox-exec), `AppContainer` (Windows, octos-sandbox.exe helper), `Docker` (any OS). Resolution is a pure decision layer (`decide_sandbox` over `HostOs` + `HostBackendProbe` — every platform's matrix unit-tested from any host): an explicit mode that cannot be honored on this host FAILS CLOSED with a typed `SandboxUnavailable` refusal (`RefusingSandbox` — every command refuses with per-OS remediation; never a silent `NoSandbox`, never a blind ENOENT backend). `SandboxMode::Auto` picks the best available backend; with none it degrades to `NoSandbox` loudly (warned once per process, surfaced by `octos doctor`) unless `sandbox.fail_closed = true` (default false) turns the degradation into a refusal. `enabled = false` / `mode = "none"` remain the explicit unconfined opt-outs and beat `fail_closed`. Shared `BLOCKED_ENV_VARS` constant (18 env vars) across all backends and MCP server spawning. Docker supports mount modes (none/ro/rw), resource limits (CPU/memory/PIDs), network isolation. Path validation rejects injection characters (`:`, `\0`, `\n`, `\r` for Docker; control chars, `(`, `)`, `\`, `"` for macOS SBPL).
 
 ### MCP (`octos-agent/src/mcp.rs`)
 
@@ -79,7 +87,7 @@ Token-aware message compaction: estimates tokens, strips tool arguments, summari
 
 ### LLM Providers (`octos-llm/src/`)
 
-`LlmProvider` trait with `chat()` method. Four native providers: `AnthropicProvider`, `OpenAIProvider`, `GeminiProvider`, `OpenRouterProvider`. 8 OpenAI-compatible via `with_base_url()`. 3-layer failover: `RetryProvider` (exponential backoff on 429/5xx) → `ProviderChain` → `AdaptiveRouter` (hedge racing, lane scoring, circuit breakers).
+`LlmProvider` trait with `chat()` method. Four native providers: `AnthropicProvider`, `OpenAIProvider`, `GeminiProvider`, `OpenRouterProvider`. OpenAI-compatible families via `with_base_url()`, registered in `registry/` (one module per family + one line in `ALL`; `model_catalog.json` is the SSOT for model names/defaults and gates onboarding visibility). The unified `local` family (aliases: llamacpp/llama.cpp/llama-server/lmstudio/openai-compatible) covers any local OpenAI-compatible server — keyless, zero-config default `http://127.0.0.1:8080/v1`; `local_discovery.rs` holds candidate ports + `/v1/models` parsing, used by `octos doctor`. 3-layer failover: `RetryProvider` (exponential backoff on 429/5xx) → `ProviderChain` → `AdaptiveRouter` (hedge racing, lane scoring, circuit breakers).
 
 ### Plugin System (`octos-agent/src/plugins/`, `octos-plugin/`)
 
@@ -107,7 +115,7 @@ Splits long messages into channel-safe chunks (paragraph > newline > sentence > 
 
 ### Session Management (`octos-bus/src/session.rs`)
 
-JSONL persistence with LRU in-memory cache. Session forking (`/new` command) with parent_key tracking. Percent-encoded filenames with hash suffix on truncation (prevents collisions). File size limit: 10MB. Atomic write-then-rename for crash safety.
+JSONL persistence with LRU in-memory cache. Session forking (`/new` command) with parent_key tracking. Percent-encoded filenames with hash suffix on truncation (prevents collisions). Files roll into `<name>.segments/NNNNNN.jsonl` at `OCTOS_SESSION_SEGMENT_BYTES` (8 MiB); loads read the newest segments up to `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB, 0 = all). Atomic write-then-rename for crash safety.
 
 ### Hooks (`octos-agent/src/hooks.rs`)
 
@@ -122,7 +130,7 @@ SHA-256 hash-based change detection. Hot-reload for system prompt; restart-requi
 - `Task` (octos-core): UUID v7 ID, kind (Code/Plan/Review/Custom), status, context
 - `Message` (octos-core): role (System/User/Assistant/Tool), content, tool_call_id. `MessageRole` has `as_str()` and `Display` impl.
 - `ChatResponse` (octos-llm): content, tool_calls, stop_reason, token usage
-- `AgentConfig` (octos-agent): max_iterations (default 50), max_tokens, save_episodes
+- `AgentConfig` (octos-agent): max_iterations (default 0 = unlimited for interactive chat/ACP; unattended gateway/session actors fall back to `UNATTENDED_MAX_ITERATIONS_FALLBACK` = 50 when `gateway.max_iterations` is unset), max_tokens, save_episodes
 - `truncate_utf8`/`truncated_utf8` (octos-core): Shared UTF-8 safe string truncation (in-place and copying variants)
 
 ## TDD - Test Driven Development

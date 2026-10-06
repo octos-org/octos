@@ -1,0 +1,20 @@
+{
+  "id": "mastodon",
+  "name": "Mastodon hashtags",
+  "categories": ["social", "news"],
+  "languages": ["*"],
+  "hosts": [],
+  "rate_limit": {
+    "min_interval_ms": 1500,
+    "source": "https://docs.joinmastodon.org/api/rate-limits/ (300 requests per 5 minutes per IP)"
+  },
+  "docs_url": ["https://docs.joinmastodon.org/methods/timelines/#tag", "https://docs.joinmastodon.org/entities/Status/", "https://docs.joinmastodon.org/api/rate-limits/"],
+  "license_note": "Posts belong to their authors; link to the post. Uses the public hashtag timeline (no login); full-text search needs a user token and is not used.",
+  "kind": "post",
+  "weight": 0.5,
+  "cache_ttl_secs": 300,
+  "timeout_secs": 10,
+  "settings": {
+    "instance": {"description": "Mastodon instance host name", "default": "mastodon.social", "host": true}
+  }
+}

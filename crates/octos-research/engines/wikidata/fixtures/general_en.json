@@ -1,0 +1,58 @@
+{
+  "body_file": "general_en.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": null,
+      "source": "Wikidata",
+      "title": "Douglas Adams (Q42)",
+      "url": "https://www.wikidata.org/wiki/Q42"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "Wikidata",
+      "title": "Douglas Adams (Q28421831)",
+      "url": "https://www.wikidata.org/wiki/Q28421831"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "Wikidata",
+      "title": "Douglas Adams (Q117249850)",
+      "url": "https://www.wikidata.org/wiki/Q117249850"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "Wikidata",
+      "title": "Douglas H Adams (Q61853920)",
+      "url": "https://www.wikidata.org/wiki/Q61853920"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "Wikidata",
+      "title": "Douglas Jerrold Adams (Q75630160)",
+      "url": "https://www.wikidata.org/wiki/Q75630160"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "application/json"
+    },
+    "method": "GET",
+    "url": "https://www.wikidata.org/w/api.php?action=wbsearchentities&search=Douglas+Adams&language=en&uselang=en&type=item&limit=5&continue=0&format=json"
+  },
+  "recorded": "live, 2026-09-27",
+  "request": {
+    "category": "general",
+    "count": 5,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-27T22:00:00Z",
+    "query": "Douglas Adams",
+    "since": null
+  }
+}

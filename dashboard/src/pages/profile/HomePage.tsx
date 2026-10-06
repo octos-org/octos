@@ -7,7 +7,7 @@ import ConfirmDialog from '../../components/ConfirmDialog'
 import StatusBadge from '../../components/StatusBadge'
 import { CHANNEL_COLORS, CHANNEL_LABELS } from '../../types'
 import type { ProfileResponse, UsageAnalytics, UsageRollup } from '../../types'
-import { api, myApi, systemApi } from '../../api'
+import { api, myApi, ensureActionOk, systemApi } from '../../api'
 import { useToast } from '../../components/Toast'
 
 /// Backward-compatible default when the server hasn't sent back a
@@ -179,11 +179,8 @@ export default function HomePage() {
 
   const handleSubStart = async (id: string) => {
     try {
-      if (isAdmin) {
-        await api.startGateway(id)
-      } else {
-        await myApi.startSubGateway(id)
-      }
+      const res = isAdmin ? await api.startGateway(id) : await myApi.startSubGateway(id)
+      ensureActionOk(res, `Failed to start gateway '${id}'`)
       toast(`Gateway '${id}' started`)
       loadSubAccounts()
     } catch (e: any) {
@@ -193,11 +190,8 @@ export default function HomePage() {
 
   const handleSubStop = async (id: string) => {
     try {
-      if (isAdmin) {
-        await api.stopGateway(id)
-      } else {
-        await myApi.stopSubGateway(id)
-      }
+      const res = isAdmin ? await api.stopGateway(id) : await myApi.stopSubGateway(id)
+      ensureActionOk(res, `Failed to stop gateway '${id}'`)
       toast(`Gateway '${id}' stopped`)
       loadSubAccounts()
     } catch (e: any) {

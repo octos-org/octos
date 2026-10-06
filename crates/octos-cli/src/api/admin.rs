@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::router::AuthIdentity;
 use super::{AppState, ominix_runtime};
-use crate::profiles::{ProfileConfig, UserProfile, mask_secrets};
+use crate::profiles::{ProfileConfig, ProfileStore, UserProfile, mask_secrets};
 
 const DEFAULT_SERVE_LOG_TAIL_N: usize = 200;
 const MAX_SERVE_LOG_TAIL_N: usize = 5_000;
@@ -24,8 +24,10 @@ const SERVE_LOG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 static SERVE_LOG_BEARER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9_.+/=-]{12,}").unwrap());
-static SERVE_LOG_QUERY_TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)((?:[?&]|\b)(?:token|auth_token)=)[^&\s]+").unwrap());
+static SERVE_LOG_QUERY_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)((?:[?&]|\b)(?:session_ingress_token|auth_token|_token|token)=)[^&\s]+")
+        .unwrap()
+});
 static SERVE_LOG_API_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\b(?:sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]{12,}|AKIA[0-9A-Z]{16})\b",
@@ -88,8 +90,13 @@ pub struct UpdateProfileRequest {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub data_dir: Option<Option<String>>,
+    /// Parsed as opaque JSON on purpose: the typed round-trip happens in
+    /// `merge_profile_config_from_body` *after* the raw patch is merged over
+    /// the stored config (an invalid merged result is a 400), so a partial
+    /// nested-section patch (e.g. `{"email":{"smtp_host":…}}` without the
+    /// required `provider`) must still parse here (#1470).
     #[serde(default)]
-    pub config: Option<ProfileConfig>,
+    pub config: Option<serde_json::Value>,
     /// Set or update the email address for OTP login.
     #[serde(default)]
     pub email: Option<String>,
@@ -97,6 +104,8 @@ pub struct UpdateProfileRequest {
 
 #[derive(Serialize)]
 pub struct ProfileResponse {
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<super::ui_protocol_transport::ProfileRuntimeStatus>,
     #[serde(flatten)]
     pub profile: UserProfile,
     pub status: crate::process_manager::ProcessStatus,
@@ -111,7 +120,15 @@ impl ProfileResponse {
             profile,
             status,
             email: None,
+            runtime: None,
         }
+    }
+    pub(crate) fn with_runtime_transition(
+        mut self,
+        transition: Option<super::ui_protocol_transport::ProfileLlmRuntimeTransition>,
+    ) -> Self {
+        self.runtime = transition.map(|transition| transition.wire_status());
+        self
     }
     pub fn with_email_lookup(mut self, user_store: Option<&crate::user_store::UserStore>) -> Self {
         self.email = user_store
@@ -171,6 +188,7 @@ pub async fn overview(
             running += 1;
         }
         items.push(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&p),
             status,
@@ -224,6 +242,7 @@ pub async fn list_profiles(
     for p in page {
         let status = pm.status(&p.id).await;
         items.push(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&p),
             status,
@@ -254,6 +273,7 @@ pub async fn get_profile(
     let status = pm.status(&id).await;
     Ok(Json(
         ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&profile),
             status,
@@ -272,6 +292,13 @@ pub async fn get_profile(
 /// declared `VERTEX_SA_JSON` name — so a private key pasted under a custom env
 /// var (e.g. a dashboard "Custom" provider deriving `VERTEX_API_KEY`) can't slip
 /// past into plaintext config.
+///
+/// Relocation is per key and short-circuits on the first failure: keys
+/// already relocated stay in the keychain when a later key fails. Those
+/// entries are scoped per profile id, so they cannot leak across accounts,
+/// and a same-id retry (after the caller's profile rollback) overwrites
+/// them (#2316); the admin API deletion paths release what relocation left
+/// behind (the CLI sub-account deletions still don't — #2702).
 pub(crate) fn relocate_keychain_backed_secrets(
     env_vars: &mut std::collections::HashMap<String, String>,
     profile_id: &str,
@@ -286,7 +313,7 @@ pub(crate) fn relocate_keychain_backed_secrets(
             env_vars,
             &key,
             profile_id,
-            cfg!(target_os = "macos"),
+            crate::auth::keychain::is_available(),
             crate::auth::keychain::set_secret,
         )
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -351,6 +378,7 @@ pub async fn create_profile(
     tracing::info!(profile = %profile.id, name = %profile.name, "profile created");
     let status = pm.status(&profile.id).await;
     let response = ProfileResponse {
+        runtime: None,
         email: None,
         profile: mask_secrets(&profile),
         status,
@@ -420,7 +448,8 @@ pub async fn update_profile(
     if let Some(data_dir) = req.data_dir {
         profile.data_dir = data_dir;
     }
-    merge_profile_config_from_body(&mut profile.config, &body, false);
+    merge_profile_config_from_body(&mut profile.config, &body, false)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     // Relocate freshly-entered keychain-backed secrets (e.g. the Vertex SA
     // JSON) into the OS keychain before persisting, so an admin edit can't
     // write a private key into plaintext profile config.
@@ -472,6 +501,7 @@ pub async fn update_profile(
     tracing::info!(profile = %id, "profile updated");
     let status = pm.status(&id).await;
     let response = ProfileResponse {
+        runtime: None,
         email: None,
         profile: mask_secrets(&profile),
         status,
@@ -488,6 +518,70 @@ pub async fn update_profile(
     )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(response))
+}
+
+/// Keychain accounts safe to release once the `removed` profiles are gone:
+/// every marker account their configs hold, minus the accounts a surviving
+/// profile still references. Scoped accounts (`VAR::id`) are unique to their
+/// profile and always released; legacy bare accounts can be shared across
+/// profiles and survive until the last reference goes. This is a deliberate
+/// superset of `octos auth remove-key`'s shared-key preservation (#2261):
+/// the survivor check spans every env var name, not just the one being
+/// removed, so it never releases an account `remove-key` would keep. Like
+/// `remove-key`, it builds on `ProfileStore::list()`, so a profile the store
+/// skips (unparsable row) counts as non-referencing. Pure, so the
+/// shared-account decision is unit-testable without a keychain.
+fn releasable_keychain_accounts<'a>(
+    removed: impl IntoIterator<Item = &'a UserProfile>,
+    survivors: &[UserProfile],
+) -> Vec<String> {
+    let mut accounts: Vec<String> = removed
+        .into_iter()
+        .flat_map(|profile| profile.config.env_vars.iter())
+        .filter(|(_, value)| crate::auth::keychain::is_marker(value))
+        .map(|(name, value)| crate::auth::keychain::marker_account(value, name).to_string())
+        .collect();
+    accounts.sort();
+    accounts.dedup();
+    accounts
+        .into_iter()
+        .filter(|account| {
+            !survivors.iter().any(|profile| {
+                profile.config.env_vars.iter().any(|(name, value)| {
+                    crate::auth::keychain::is_marker(value)
+                        && crate::auth::keychain::marker_account(value, name) == account.as_str()
+                })
+            })
+        })
+        .collect()
+}
+
+/// Release the keychain items the just-deleted `removed` profiles' markers
+/// pointed at. Shared by every API deletion path (`delete_profile`, the
+/// tenant purge, and the user-admin delete cascade) so a deleted tenant's
+/// scoped service-account item never outlives its profile (#2315). Best
+/// effort on purpose: the profiles are already gone, so a failure here can
+/// only be logged — the warn names the account, which is the only recovery
+/// path. Without a secret-store backend there is nothing to release.
+pub(crate) fn release_deleted_profiles_keychain_items<'a>(
+    store: &ProfileStore,
+    removed: impl IntoIterator<Item = &'a UserProfile>,
+) {
+    if !crate::auth::keychain::is_available() {
+        return;
+    }
+    match store.list() {
+        Ok(survivors) => {
+            for account in releasable_keychain_accounts(removed, &survivors) {
+                if let Err(e) = crate::auth::keychain::delete_secret(&account) {
+                    tracing::warn!(account = %account, error = %e, "failed to release deleted profile keychain item");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot list profiles to tell which deleted keychain items are unreferenced; keeping them")
+        }
+    }
 }
 
 /// DELETE /api/admin/profiles/:id
@@ -514,18 +608,17 @@ pub async fn delete_profile(
     let _ = pm.stop(&id).await;
 
     // Cascade: stop and delete all sub-accounts
-    if let Ok(subs) = store.list_sub_accounts(&id) {
-        for sub in &subs {
-            let _ = pm.stop(&sub.id).await;
-            // Clean up sub-account data directory
-            let sub_data_dir = store.resolve_data_dir(sub);
-            if sub_data_dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&sub_data_dir) {
-                    tracing::warn!(profile = %sub.id, dir = %sub_data_dir.display(), error = %e, "failed to clean up sub-account data directory");
-                }
+    let subs = store.list_sub_accounts(&id).unwrap_or_default();
+    for sub in &subs {
+        let _ = pm.stop(&sub.id).await;
+        // Clean up sub-account data directory
+        let sub_data_dir = store.resolve_data_dir(sub);
+        if sub_data_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&sub_data_dir) {
+                tracing::warn!(profile = %sub.id, dir = %sub_data_dir.display(), error = %e, "failed to clean up sub-account data directory");
             }
-            let _ = store.delete(&sub.id);
         }
+        let _ = store.delete(&sub.id);
     }
 
     let deleted = store
@@ -535,6 +628,8 @@ pub async fn delete_profile(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, format!("profile '{id}' not found")));
     }
+
+    release_deleted_profiles_keychain_items(store, profile.iter().chain(subs.iter()));
 
     let before_summary = profile
         .as_ref()
@@ -1034,17 +1129,27 @@ pub async fn test_provider(
     use octos_llm::{ChatConfig, LlmProvider};
 
     // Resolve the API key: prefer raw api_key, fall back to reading from saved profile
-    let api_key = if let Some(ref key) = req.api_key {
+    let keyless = octos_llm::registry::is_keyless(&req.provider);
+    let resolved = if let Some(ref key) = req.api_key {
         if !key.is_empty() && !key.contains("***") {
-            key.clone()
+            Ok(key.clone())
         } else {
-            resolve_saved_key(&state, &identity, &req)?
+            resolve_saved_key(&state, &identity, &req)
         }
     } else {
-        resolve_saved_key(&state, &identity, &req)?
+        resolve_saved_key(&state, &identity, &req)
+    };
+    // Keyless local families (local/ollama/vllm) construct without a key —
+    // both an EMPTY key and an UNRESOLVABLE key (no api_key/api_key_env in
+    // the request at all) are fine for them. Dead-ending here blocked the
+    // keyless onboarding flow entirely (red-team pass + live test).
+    let api_key = match resolved {
+        Ok(key) => key,
+        Err(_) if keyless => String::new(),
+        Err(error) => return Err(error),
     };
 
-    if api_key.is_empty() {
+    if api_key.is_empty() && !keyless {
         return Ok(Json(TestProviderResponse {
             ok: false,
             message: String::new(),
@@ -1052,9 +1157,25 @@ pub async fn test_provider(
         }));
     }
 
+    // Link-local (cloud metadata) targets are never model servers — refuse
+    // before any outbound request (adversarial review, octos#2097).
+    if req
+        .base_url
+        .as_deref()
+        .is_some_and(base_url_targets_link_local)
+    {
+        return Ok(Json(TestProviderResponse {
+            ok: false,
+            message: String::new(),
+            error: Some("base_url targets a link-local/metadata address — refused".into()),
+        }));
+    }
+
     let provider: Arc<dyn LlmProvider> = {
         let params = octos_llm::registry::CreateParams {
-            api_key: Some(api_key.clone()),
+            // Empty means "keyless family" — let the factory apply its own
+            // fallback instead of sending an empty Bearer token.
+            api_key: (!api_key.is_empty()).then(|| api_key.clone()),
             model: Some(req.model.clone()),
             base_url: req.base_url.clone(),
             model_hints: None,
@@ -1093,7 +1214,15 @@ pub async fn test_provider(
     // Gemini 2.5+ "thinking" models consume tokens on internal reasoning,
     // so 16 tokens is too small — they return empty content.  Use 128 for
     // Gemini and keep 16 for everyone else (fast, cheap connectivity check).
-    let max_tokens = if req.provider == "gemini" || req.provider == "vertex" {
+    // Resolve aliases through the registry: the web settings UI historically
+    // sends `google`, which is the registered alias for `gemini`. Treating the
+    // alias as an unrelated provider left the connectivity probe with only 16
+    // output tokens and caused thinking-capable Gemini models to return a
+    // truncated/empty candidate that was then reported as a connection error.
+    let canonical_provider = octos_llm::registry::lookup(&req.provider)
+        .map(|entry| entry.name)
+        .unwrap_or(req.provider.as_str());
+    let max_tokens = if canonical_provider == "gemini" || canonical_provider == "vertex" {
         128
     } else {
         16
@@ -1143,64 +1272,103 @@ pub async fn provider_models(
     identity: Option<axum::Extension<super::router::AuthIdentity>>,
     Json(req): Json<TestProviderRequest>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let api_key = if let Some(ref key) = req.api_key {
+    let keyless = octos_llm::registry::is_keyless(&req.provider);
+    let resolved = if let Some(ref key) = req.api_key {
         if !key.is_empty() && !key.contains("***") {
-            key.clone()
+            Ok(key.clone())
         } else {
-            resolve_saved_key(&state, &identity, &req)?
+            resolve_saved_key(&state, &identity, &req)
         }
     } else {
-        resolve_saved_key(&state, &identity, &req)?
+        resolve_saved_key(&state, &identity, &req)
     };
-    if api_key.is_empty() {
+    // Keyless local families (local/ollama/vllm) list models without a key —
+    // their /v1/models answers unauthenticated (octos#2096 review round).
+    let api_key = match resolved {
+        Ok(key) => key,
+        Err(_) if keyless => String::new(),
+        Err(error) => return Err(error),
+    };
+    if api_key.is_empty() && !keyless {
         return Err((StatusCode::BAD_REQUEST, "No API key".into()));
     }
-    let models = fetch_provider_models(&req.provider, &api_key, req.base_url.as_deref())
-        .await
-        .unwrap_or_default();
-    Ok(Json(models))
+    // Link-local (cloud metadata) targets are never model servers — refuse
+    // before any outbound request (adversarial review, octos#2097).
+    if req
+        .base_url
+        .as_deref()
+        .is_some_and(base_url_targets_link_local)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "base_url targets a link-local/metadata address".into(),
+        ));
+    }
+    // Protocol-aware discovery shared with the AppUI `profile/llm/
+    // fetch_models` surface — the strategy resolves from the route (api_type
+    // override, then the family's declared protocol — per-model for families
+    // like r9s that pick the wire protocol by model name), never from the
+    // literal family id, so the two clients cannot drift.
+    let route = octos_llm::discovery::resolve_model_discovery(
+        Some(&req.provider),
+        req.api_type.as_deref(),
+        (!req.model.trim().is_empty()).then_some(req.model.trim()),
+        req.base_url.as_deref(),
+    );
+    let outcome = octos_llm::discovery::discover_models(
+        &route,
+        &api_key,
+        req.base_url.as_deref(),
+        Some(&req.provider),
+    )
+    .await;
+    match outcome {
+        // Success — including an empty catalog, which is data, not an error.
+        octos_llm::discovery::DiscoveryOutcome::Discovered(models) => Ok(Json(models)),
+        // Advisory: this family has no model-list endpoint. Not an error —
+        // manual model-id entry, Test, and Save stay fully available, and the
+        // dashboard treats an empty list as "nothing to suggest".
+        octos_llm::discovery::DiscoveryOutcome::Unsupported(_) => Ok(Json(Vec::new())),
+        other => Err((
+            if other.status_label() == "rate_limited" {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
+            format!(
+                "{}: {}",
+                other.status_label(),
+                other.message().unwrap_or_default()
+            ),
+        )),
+    }
 }
 
 /// Fetch available models from a provider's /v1/models endpoint.
-pub(crate) async fn fetch_provider_models(
-    provider: &str,
-    api_key: &str,
-    base_url: Option<&str>,
-) -> Option<Vec<String>> {
-    let base = base_url
-        .map(|u| u.trim_end_matches('/').to_string())
-        .or_else(|| {
-            octos_llm::registry::lookup(provider)
-                .and_then(|e| e.default_base_url.map(|u| u.to_string()))
-        })?;
-    let base_trimmed = base.trim_end_matches("/v1").trim_end_matches("/v1/");
-    let url = if provider == "anthropic" {
-        format!("{base}/v1/models")
-    } else {
-        format!("{base_trimmed}/v1/models")
+/// Whether a caller-supplied `base_url` targets a LINK-LOCAL address —
+/// 169.254/16 (cloud metadata endpoints like 169.254.169.254), fe80::/10, or
+/// their IPv4-mapped forms. These are never legitimate model-server addresses,
+/// while loopback and RFC1918 ARE (local/ollama/vllm servers), so this is
+/// deliberately narrower than the agent-side `tools/ssrf.rs` checker (which
+/// blocks loopback too and would break the local family). Literal-IP check
+/// only: a hostname passes (the probe endpoints require auth; this closes the
+/// sharpest credential-theft target, not every probe vector).
+fn base_url_targets_link_local(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
     };
-    let client = reqwest::Client::new();
-    let mut req = client.get(&url).timeout(std::time::Duration::from_secs(10));
-    if provider == "anthropic" {
-        req = req
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01");
-    } else {
-        req = req.header("Authorization", format!("Bearer {api_key}"));
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_link_local(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+        Err(_) => false,
     }
-    let resp = req.send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    body.get("data").and_then(|d| d.as_array()).map(|arr| {
-        let mut ids: Vec<String> = arr
-            .iter()
-            .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
-            .collect();
-        ids.sort();
-        ids
-    })
 }
 
 /// Merge a request body's `config` object into an existing profile config.
@@ -1226,23 +1394,35 @@ pub(crate) fn merge_profile_config_from_body(
     config: &mut ProfileConfig,
     body: &str,
     env_vars_authoritative: bool,
-) {
+) -> Result<(), String> {
     let raw: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
-    if let Some(config_patch) = raw.get("config") {
-        if config_patch.is_object() {
-            let mut existing = serde_json::to_value(&mut *config).unwrap_or(serde_json::json!({}));
-            json_merge(&mut existing, config_patch);
-            if env_vars_authoritative {
-                if let Some(env_vars) = config_patch.get("env_vars").filter(|v| v.is_object()) {
-                    if let Some(existing_obj) = existing.as_object_mut() {
-                        existing_obj.insert("env_vars".to_string(), env_vars.clone());
-                    }
-                }
-            }
-            if let Ok(merged) = serde_json::from_value(existing) {
-                *config = merged;
+    let Some(config_patch) = raw.get("config") else {
+        return Ok(());
+    };
+    if config_patch.is_null() {
+        return Ok(());
+    }
+    if !config_patch.is_object() {
+        return Err("config must be an object".into());
+    }
+    let mut existing = serde_json::to_value(&mut *config).unwrap_or(serde_json::json!({}));
+    json_merge(&mut existing, config_patch);
+    if env_vars_authoritative {
+        if let Some(env_vars) = config_patch.get("env_vars").filter(|v| v.is_object()) {
+            if let Some(existing_obj) = existing.as_object_mut() {
+                existing_obj.insert("env_vars".to_string(), env_vars.clone());
             }
         }
+    }
+    // The request body parses `config` as opaque JSON (see UpdateProfileRequest),
+    // so this typed round-trip is the only validation gate: an invalid merged
+    // result must surface as an error instead of silently dropping the patch.
+    match serde_json::from_value(existing) {
+        Ok(merged) => {
+            *config = merged;
+            Ok(())
+        }
+        Err(e) => Err(format!("invalid config: {e}")),
     }
 }
 
@@ -1326,6 +1506,10 @@ pub struct TestProviderRequest {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Route protocol override for model discovery (`"anthropic"` switches the
+    /// listing strategy); absent means the family's declared protocol.
+    #[serde(default)]
+    pub api_type: Option<String>,
     #[serde(default)]
     pub profile_id: Option<String>,
 }
@@ -1709,6 +1893,7 @@ pub async fn list_sub_accounts(
     for s in subs {
         let status = pm.status(&s.id).await;
         items.push(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&s),
             status,
@@ -1756,6 +1941,107 @@ pub(crate) fn validate_channel_credentials(
     Ok(())
 }
 
+/// The secret-relocation hook applied to a profile's env vars before they are
+/// persisted — the signature of [`relocate_keychain_backed_secrets`]. Carried
+/// as a parameter so tests can drive the failure path without writing to the
+/// developer's keychain.
+pub(crate) type RelocateSecretsHook =
+    fn(&mut std::collections::HashMap<String, String>, &str) -> Result<(), (StatusCode, String)>;
+
+/// Roll back a just-created sub-account profile after a post-persist
+/// creation step failed: the store saved the profile before these steps ran,
+/// so deleting its registry record keeps the id retryable instead of
+/// stranding it behind "already exists" when the same request is retried
+/// (#1472, #2316). A rollback failure is logged, never reported over the
+/// original error.
+pub(crate) fn rollback_sub_account(store: &ProfileStore, sub_id: &str) {
+    if let Err(rollback) = store.delete(sub_id) {
+        tracing::error!(
+            profile = %sub_id,
+            error = %rollback,
+            "failed to roll back sub-account after creation failure"
+        );
+    }
+}
+
+/// Apply freshly supplied sub-account env vars, relocating keychain-backed
+/// secrets (e.g. the Vertex SA JSON) into the OS keychain before the save so a
+/// sub-account never writes a private key to plaintext config. The store has
+/// already persisted the fresh profile by the time this runs, so a failure —
+/// relocation or the final save — rolls the profile back: otherwise the API
+/// would report "creation failed" while leaving a sub-account whose id can
+/// never be retried ("already exists", #1472, #2316).
+pub(crate) fn apply_sub_account_env_vars(
+    store: &ProfileStore,
+    sub: &mut UserProfile,
+    env_vars: std::collections::HashMap<String, String>,
+    relocate: RelocateSecretsHook,
+) -> Result<(), (StatusCode, String)> {
+    sub.config.env_vars = env_vars;
+    let sub_id = sub.id.clone();
+    if let Err(e) = relocate(&mut sub.config.env_vars, &sub_id) {
+        // Roll the just-created profile back: the sub-account was saved
+        // keychain-less moments ago and nothing else references it yet, so
+        // removing it restores the pre-request state instead of stranding a
+        // half-configured id behind "already exists".
+        rollback_sub_account(store, &sub.id);
+        return Err(e);
+    }
+    sub.updated_at = Utc::now();
+    if let Err(e) = store.save(sub) {
+        // Same stranded-id shape: the env-less profile is already on disk,
+        // so a failed save must not leave it behind either.
+        rollback_sub_account(store, &sub.id);
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
+    Ok(())
+}
+
+/// Create the User entry that lets a fresh sub-account log in via OTP. Runs
+/// after the profile store has persisted the sub-account, so every failure
+/// (invalid email, already-registered email, user-store save) rolls the
+/// profile back — otherwise the request reports an error while the
+/// sub-account id stays on disk, unretryable behind "already exists" (#2316).
+pub(crate) fn create_sub_account_user_entry(
+    state: &AppState,
+    store: &ProfileStore,
+    sub: &UserProfile,
+    email: &str,
+) -> Result<(), (StatusCode, String)> {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() {
+        return Ok(());
+    }
+    let outcome = (|| -> Result<(), (StatusCode, String)> {
+        validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        if let Some(user_store) = state.user_store.as_ref() {
+            // Check if email is already taken
+            if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("Email '{email}' is already registered to another account"),
+                ));
+            }
+            let user = crate::user_store::User {
+                id: sub.id.clone(),
+                email: email.clone(),
+                name: sub.name.clone(),
+                role: crate::user_store::UserRole::User,
+                created_at: Utc::now(),
+                last_login_at: None,
+            };
+            user_store
+                .save(&user)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        rollback_sub_account(store, &sub.id);
+    }
+    outcome
+}
+
 /// POST /api/admin/profiles/:id/accounts — Create a sub-account.
 pub async fn create_sub_account(
     State(state): State<Arc<AppState>>,
@@ -1789,49 +2075,24 @@ pub async fn create_sub_account(
 
     // Set channel-specific env vars if provided
     if !req.env_vars.is_empty() {
-        sub.config.env_vars = req.env_vars;
-        // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
-        // persisting so a sub-account never writes a private key to disk.
-        let sub_id = sub.id.clone();
-        relocate_keychain_backed_secrets(&mut sub.config.env_vars, &sub_id)?;
-        sub.updated_at = Utc::now();
-        store
-            .save(&sub)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        apply_sub_account_env_vars(
+            store,
+            &mut sub,
+            req.env_vars,
+            relocate_keychain_backed_secrets,
+        )?;
     }
 
     // Create a User entry so the sub-account can log in via OTP
     if let Some(email) = &req.email {
-        let email = email.trim().to_lowercase();
-        if !email.is_empty() {
-            validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-            if let Some(user_store) = state.user_store.as_ref() {
-                // Check if email is already taken
-                if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        format!("Email '{email}' is already registered to another account"),
-                    ));
-                }
-                let user = crate::user_store::User {
-                    id: sub.id.clone(),
-                    email,
-                    name: sub.name.clone(),
-                    role: crate::user_store::UserRole::User,
-                    created_at: Utc::now(),
-                    last_login_at: None,
-                };
-                user_store
-                    .save(&user)
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
-        }
+        create_sub_account_user_entry(&state, store, &sub, email)?;
     }
 
     let status = pm.status(&sub.id).await;
     Ok((
         StatusCode::CREATED,
         Json(ProfileResponse {
+            runtime: None,
             email: None,
             profile: mask_secrets(&sub),
             status,
@@ -2854,16 +3115,21 @@ pub async fn platform_service_logs(
         .unwrap_or(50)
         .min(200);
 
-    let home = std::env::var("HOME").unwrap_or_default();
-    // Try both common log file names
-    let log_path = {
-        let p1 = format!("{home}/.ominix/api.log");
-        let p2 = format!("{home}/.ominix/ominix-api.log");
-        if std::path::Path::new(&p1).exists() {
-            p1
-        } else {
-            p2
-        }
+    // Match the runtime's home resolution (api/ominix_runtime.rs): a custom
+    // OCTOS_OMINIX_HOME relocates the whole OMiniX home, logs included.
+    let home = std::env::var_os("OCTOS_OMINIX_HOME")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_default();
+    let (log_path, err_log_path) = platform_service_log_paths(&home);
+
+    // The launchd plist routes stderr (startup failures, panics) to a
+    // separate api.err.log; surface it alongside the main log or bind
+    // failures and early crashes never reach the dashboard.
+    let (err_total_lines, err_lines) = match tokio::fs::read_to_string(&err_log_path).await {
+        Ok(c) => (c.lines().count(), last_lines(&c, lines)),
+        Err(_) => (0, Vec::new()),
     };
 
     let content = match tokio::fs::read_to_string(&log_path).await {
@@ -2873,18 +3139,46 @@ pub async fn platform_service_logs(
                 "log_path": log_path,
                 "error": format!("Cannot read log file: {e}"),
                 "lines": [],
+                "err_log_path": err_log_path,
+                "err_total_lines": err_total_lines,
+                "err_lines": err_lines,
             })));
         }
     };
 
-    let log_lines: Vec<&str> = content.lines().rev().take(lines).collect();
-    let log_lines: Vec<&str> = log_lines.into_iter().rev().collect();
-
     Ok(Json(serde_json::json!({
         "log_path": log_path,
         "total_lines": content.lines().count(),
-        "lines": log_lines,
+        "lines": last_lines(&content, lines),
+        "err_log_path": err_log_path,
+        "err_total_lines": err_total_lines,
+        "err_lines": err_lines,
     })))
+}
+
+/// Main and stderr log paths under the OMiniX home. Prefers `api.log`,
+/// falling back to the legacy `ominix-api.log` name.
+fn platform_service_log_paths(home: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = home.join(".ominix");
+    let primary = dir.join("api.log");
+    let main = if primary.exists() {
+        primary
+    } else {
+        dir.join("ominix-api.log")
+    };
+    (main, dir.join("api.err.log"))
+}
+
+fn last_lines(content: &str, n: usize) -> Vec<String> {
+    content
+        .lines()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(str::to_string)
+        .collect()
 }
 
 // ── Model Management (proxy to ominix-api) ─────────────────────────
@@ -3354,10 +3648,10 @@ pub async fn system_version(
     };
 
     let current_semver = env!("CARGO_PKG_VERSION");
-    let update_available = latest
-        .get("version")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| v != current_semver);
+    let update_available = update_available_for(
+        current_semver,
+        latest.get("version").and_then(|v| v.as_str()),
+    );
 
     Ok(Json(serde_json::json!({
         "current": current,
@@ -3375,6 +3669,27 @@ pub struct UpdateRequest {
 }
 fn default_version() -> String {
     "latest".to_string()
+}
+
+/// Whether `latest` is strictly newer than the running `current` release,
+/// with full semver precedence: `2.0.3-rc.12 < 2.0.3-rc.13 < 2.0.3`. This is
+/// deliberately pre-release-aware — unlike `octos_diagnostics`' planner, whose
+/// `parse_version` strips pre-releases — because the admin channel installs
+/// pinned rc tags and must keep the rc train flowing forward while still
+/// refusing downgrades. Unparseable on either side means "can't tell" and
+/// counts as up to date — never push a spurious (or backwards) update off an
+/// unparseable version.
+fn update_available_for(current: &str, latest: Option<&str>) -> bool {
+    let Some(latest) = latest else {
+        return false;
+    };
+    let (Ok(current), Ok(latest)) = (
+        semver::Version::parse(current.trim().trim_start_matches('v')),
+        semver::Version::parse(latest.trim().trim_start_matches('v')),
+    ) else {
+        return false;
+    };
+    latest > current
 }
 
 /// POST /api/admin/system/update — download and apply an update
@@ -3397,6 +3712,17 @@ pub async fn system_update(
         updater.check_version(&tag).await
     }
     .map_err(|e| (StatusCode::BAD_REQUEST, format!("Release not found: {e}")))?;
+
+    // Refuse anything that is not strictly newer — an update channel that
+    // accepts equal or older releases is a downgrade vector.
+    let current = env!("CARGO_PKG_VERSION");
+    let new_version = &release.version;
+    if !update_available_for(current, Some(new_version)) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("refusing update: {new_version} is not newer than the running {current}"),
+        ));
+    }
 
     // Perform the update
     let result = updater.update(&release).await.map_err(|e| {
@@ -4338,6 +4664,21 @@ pub async fn delete_tenant(
     }))
 }
 
+/// The tunnel relay (frps) address this node hands out in setup scripts.
+/// There is no built-in default: it must be set as `frps_server` in the
+/// node config, otherwise tenant setup is refused with a clear error.
+fn required_frps_server(state: &AppState) -> Result<&str, (StatusCode, String)> {
+    state
+        .frps_server
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tunnel relay not configured: set `frps_server` in this node's config".into(),
+        ))
+}
+
 /// GET /api/admin/tenants/{id}/setup-script — returns a bash one-liner that
 /// installs octos + frpc on a fresh Mac Mini.
 pub async fn tenant_setup_script(
@@ -4354,7 +4695,7 @@ pub async fn tenant_setup_script(
         .ok_or((StatusCode::NOT_FOUND, format!("tenant '{id}' not found")))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_admin_tenant_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -4474,6 +4815,9 @@ pub async fn register_tenant(
         ));
     }
 
+    // Fail before creating the tenant if this node has no tunnel relay.
+    let server = required_frps_server(&state)?;
+
     let ssh_port = store
         .next_ssh_port()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -4502,7 +4846,6 @@ pub async fn register_tenant(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
     let dashboard_url = format!("https://{}.{}", tenant.subdomain, domain);
 
     let mut email_sent = false;
@@ -4611,7 +4954,7 @@ pub async fn register_setup_script(
     ))?;
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_register_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -4642,7 +4985,7 @@ pub async fn register_setup_script_public(
     }
 
     let domain = state.tunnel_domain.as_deref().unwrap_or("octos-cloud.org");
-    let server = state.frps_server.as_deref().unwrap_or("163.192.33.32");
+    let server = required_frps_server(&state)?;
     let script = build_register_setup_script(&tenant, domain, server);
 
     Ok(script)
@@ -4779,7 +5122,7 @@ mod register_setup_script_tests {
             updated_at: Utc::now(),
         };
 
-        let script = build_register_setup_script(&tenant, "octos-cloud.org", "163.192.33.32");
+        let script = build_register_setup_script(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert!(script.contains("managed tenant bootstrap"));
         assert!(script.contains("--tunnel"));
@@ -4788,7 +5131,7 @@ mod register_setup_script_tests {
         assert!(script.contains("--frps-token \"per-tenant-uuid\""));
         assert!(script.contains("--ssh-port 6001"));
         assert!(script.contains("--domain \"octos-cloud.org\""));
-        assert!(script.contains("--frps-server \"163.192.33.32\""));
+        assert!(script.contains("--frps-server \"relay.example.com\""));
         assert!(!script.contains("$FRPS_TOKEN"));
     }
 
@@ -4809,7 +5152,7 @@ mod register_setup_script_tests {
         };
 
         let (_subject, html) =
-            build_register_setup_email(&tenant, "octos-cloud.org", "163.192.33.32");
+            build_register_setup_email(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert!(html.contains("/api/register/setup-script/alice/"));
         assert!(html.contains("install.ps1"));
@@ -4837,7 +5180,7 @@ mod register_setup_script_tests {
 
         let unix_command = build_register_setup_command_unix(&tenant, "octos-cloud.org");
         let windows_command =
-            build_register_setup_command_windows(&tenant, "octos-cloud.org", "163.192.33.32");
+            build_register_setup_command_windows(&tenant, "octos-cloud.org", "relay.example.com");
 
         assert_eq!(
             unix_command,
@@ -4873,7 +5216,7 @@ mod register_tenant_email_tests {
             )),
             tunnel_domain: Some("octos-cloud.org".into()),
             base_domain: None,
-            frps_server: Some("163.192.33.32".into()),
+            frps_server: Some("relay.example.com".into()),
             frps_port: Some(7000),
             deployment_mode: DeploymentMode::Cloud,
             ..AppState::empty_for_tests()
@@ -5011,7 +5354,7 @@ mod register_flow_tests {
             )),
             tunnel_domain: Some("octos-cloud.org".into()),
             base_domain: None,
-            frps_server: Some("163.192.33.32".into()),
+            frps_server: Some("relay.example.com".into()),
             frps_port: Some(7000),
             deployment_mode: mode,
             ..AppState::empty_for_tests()
@@ -5296,7 +5639,7 @@ mod register_flow_tests {
 
         assert!(script.contains("--tenant-name \"macmini\""));
         assert!(script.contains("--domain \"octos-cloud.org\""));
-        assert!(script.contains("--frps-server \"163.192.33.32\""));
+        assert!(script.contains("--frps-server \"relay.example.com\""));
         assert!(script.contains("--ssh-port"));
         assert!(
             script.contains(&format!("--frps-token \"{saved_tunnel_token}\"")),
@@ -5426,14 +5769,79 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    /// Strictly-newer only, with full semver precedence: the rc train flows
+    /// forward (rc.12 → rc.13), an rc graduates to its stable, but the older
+    /// July stable never shows as an "update" over a newer rc build — which
+    /// the string `!=` used to advertise.
+    #[test]
+    fn should_only_advertise_strictly_newer_releases() {
+        assert!(update_available_for("2.0.3-rc.13", Some("2.0.4")));
+        assert!(update_available_for("2.0.2", Some("2.0.3")));
+        // The rc train: forward allowed, backward refused.
+        assert!(update_available_for("2.0.3-rc.12", Some("2.0.3-rc.13")));
+        assert!(update_available_for("2.0.3-rc.13", Some("2.0.3")));
+        assert!(!update_available_for("2.0.3-rc.13", Some("2.0.3-rc.12")));
+        // Stable beats the pre-release of the same core version…
+        assert!(!update_available_for("2.0.3", Some("2.0.3-rc.13")));
+        // …and plain downgrades, which `!=` used to count as updates.
+        assert!(!update_available_for("2.0.3-rc.13", Some("2.0.2")));
+        assert!(!update_available_for("2.0.3", Some("2.0.3")));
+        // Unparseable on either side → never claim an update.
+        assert!(!update_available_for("2.0.3", None));
+        assert!(!update_available_for("2.0.3", Some("garbage")));
+        assert!(!update_available_for("garbage", Some("2.0.4")));
+    }
+
+    /// The guard blocks exactly the link-local (metadata) ranges and nothing
+    /// a local model server legitimately uses (loopback, RFC1918, hostnames).
+    #[test]
+    fn should_block_only_link_local_base_urls() {
+        // Metadata endpoints — blocked.
+        assert!(base_url_targets_link_local("http://169.254.169.254/latest"));
+        assert!(base_url_targets_link_local("http://169.254.0.1:8080/v1"));
+        assert!(base_url_targets_link_local("http://[fe80::1]:8080/v1"));
+        assert!(base_url_targets_link_local(
+            "http://[::ffff:169.254.169.254]/v1"
+        ));
+        // Legitimate local model servers — allowed.
+        assert!(!base_url_targets_link_local("http://127.0.0.1:8080/v1"));
+        assert!(!base_url_targets_link_local("http://localhost:11434/v1"));
+        assert!(!base_url_targets_link_local("http://192.168.1.10:11434/v1"));
+        assert!(!base_url_targets_link_local("http://10.0.0.5:8000/v1"));
+        assert!(!base_url_targets_link_local("https://api.openai.com/v1"));
+        // Garbage never panics.
+        assert!(!base_url_targets_link_local("not a url"));
+    }
+
+    // Native macOS Keychain writes need an explicit integration fixture;
+    // ordinary unit tests must never write into the developer's login store.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn relocate_keychain_backed_secrets_never_persists_raw_vertex_json_off_macos() {
-        // The shared helper used by every profile/sub-account save path must
-        // refuse a raw SA JSON on a non-macOS host (where keychain storage
-        // isn't available) rather than let it fall through to plaintext config.
-        // On macOS it would relocate to the keychain instead, so only assert on
-        // the non-macOS path (the one CI runs and the plaintext risk lives on).
-        if cfg!(target_os = "macos") {
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
+        // #2234/45a — the availability predicate is now `keychain::is_available()`
+        // (true on Linux: the file backend exists), NOT `cfg!(macos)`. The
+        // never-plaintext contract holds where NO backend exists (unsupported
+        // platforms); on Linux the raw JSON is legitimately relocated into the
+        // file store and the env slot becomes a marker.
+        if crate::auth::keychain::is_available() {
+            // Store-backed host (macOS keychain / linux file): relocation
+            // succeeds and the plaintext is replaced by a marker.
+            let mut env = std::collections::HashMap::new();
+            env.insert(
+                "VERTEX_SA_JSON".to_string(),
+                r#"{"type":"service_account","private_key":"x","project_id":"p"}"#.to_string(),
+            );
+            relocate_keychain_backed_secrets(&mut env, "sub-account-1")
+                .expect("store-backed host relocates raw SA JSON");
+            let stored = env.get("VERTEX_SA_JSON").expect("slot present");
+            assert!(
+                !stored.contains("private_key"),
+                "raw JSON must not persist as plaintext; got: {stored}"
+            );
+            assert!(stored.contains("keychain"), "marker present: {stored}");
             return;
         }
         let mut env = std::collections::HashMap::new();
@@ -5444,31 +5852,590 @@ mod tests {
         let res = relocate_keychain_backed_secrets(&mut env, "sub-account-1");
         assert!(
             res.is_err(),
-            "raw VERTEX_SA_JSON must be rejected off macOS, never saved as plaintext"
+            "raw VERTEX_SA_JSON must be rejected on hosts with no secret store"
         );
         // The raw value is left untouched (the caller bails before saving).
         assert!(env.get("VERTEX_SA_JSON").unwrap().starts_with('{'));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn relocate_rejects_service_account_json_under_custom_env_name_off_macos() {
         // The dashboard "Custom" bypass: SA JSON pasted under VERTEX_API_KEY
-        // (not the whitelisted name) must still be caught by content detection
-        // and rejected off macOS — never written to plaintext config.
-        if cfg!(target_os = "macos") {
-            return;
-        }
+        // (not the whitelisted name) must still be caught by content
+        // detection — never written to plaintext config.
+        //
+        // #2234/45a contract (same shape as the twin at ~L5533): the
+        // availability predicate is `keychain::is_available()`, NOT
+        // `cfg!(macos)`. On a store-backed host (linux file backend with an
+        // INJECTED temp root) the JSON is legitimately relocated: Ok, the
+        // slot becomes a keychain marker, the raw value never remains.
+        // Hosts with NO backend keep the rejection.
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
         let mut env = std::collections::HashMap::new();
         env.insert(
             "VERTEX_API_KEY".to_string(),
             r#"{"type":"service_account","private_key":"x"}"#.to_string(),
         );
         let res = relocate_keychain_backed_secrets(&mut env, "tenant-1");
-        assert!(
-            res.is_err(),
-            "SA JSON under a custom env name must be rejected off macOS"
+        let slot = env.get("VERTEX_API_KEY").expect("slot present");
+        if crate::auth::keychain::is_available() {
+            assert!(
+                res.is_ok(),
+                "store-backed host relocates SA JSON under a custom name"
+            );
+            assert!(
+                crate::auth::keychain::is_marker(slot),
+                "slot must be a keychain marker, got: {slot}"
+            );
+            assert!(
+                !slot.contains("private_key"),
+                "the raw private key must never remain in the slot"
+            );
+        } else {
+            assert!(
+                res.is_err(),
+                "SA JSON under a custom env name must be rejected with no store"
+            );
+            assert!(slot.starts_with('{'), "raw value left untouched");
+        }
+    }
+
+    // #1472 test fixture: a persisted parent profile plus a fresh (already
+    // saved, env-less) sub-account, i.e. the state `create_sub_account`
+    // handlers have when they reach the env-var step.
+    fn parent_profile() -> UserProfile {
+        UserProfile {
+            id: "parent".into(),
+            name: "Parent".into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            public_subdomain: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn fresh_sub_account_with_parent(store: &ProfileStore) -> UserProfile {
+        store.save(&parent_profile()).unwrap();
+        store
+            .create_sub_account(
+                "parent",
+                "sub1",
+                "sub1",
+                "Sub",
+                vec![],
+                crate::profiles::GatewaySettings::default(),
+            )
+            .unwrap()
+    }
+
+    // #1472: the store has already persisted the fresh sub-account when a
+    // keychain-backed secret fails to relocate (raw Vertex SA JSON on a host
+    // with no secret store, or a keychain write error) — the failed creation
+    // must roll the profile back so retrying the same id doesn't hit
+    // "already exists".
+    #[test]
+    fn should_roll_back_fresh_sub_account_when_secret_relocation_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let mut sub = fresh_sub_account_with_parent(&store);
+        let sub_id = sub.id.clone();
+
+        let res = apply_sub_account_env_vars(
+            &store,
+            &mut sub,
+            std::collections::HashMap::from([(
+                "VERTEX_SA_JSON".to_string(),
+                r#"{"type":"service_account","private_key":"x"}"#.to_string(),
+            )]),
+            |_env_vars, _profile_id| {
+                Err((
+                    StatusCode::BAD_REQUEST,
+                    "VERTEX_SA_JSON: keychain-backed credential storage is unavailable".into(),
+                ))
+            },
         );
-        assert!(env.get("VERTEX_API_KEY").unwrap().starts_with('{'));
+
+        assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert!(
+            store.get(&sub_id).unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+        store
+            .create_sub_account(
+                "parent",
+                "sub1",
+                "sub1",
+                "Sub",
+                vec![],
+                crate::profiles::GatewaySettings::default(),
+            )
+            .expect("retrying the same id must succeed after the rollback");
+    }
+
+    // #2316: the final `store.save` failing AFTER a successful relocation is
+    // the same stranded-id shape — the env-less profile persisted by the
+    // caller must be rolled back so the id stays retryable. A directory at
+    // the temp file's path makes `fs::write` fail on every platform (Unix
+    // EISDIR / Windows ERROR_ACCESS_DENIED), while the rollback's delete of
+    // the registry JSON stays functional.
+    #[test]
+    fn should_roll_back_fresh_sub_account_when_final_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let mut sub = fresh_sub_account_with_parent(&store);
+        let sub_id = sub.id.clone();
+        let blocker = dir
+            .path()
+            .join("profiles")
+            .join(format!("{sub_id}.json.tmp"));
+        std::fs::create_dir(&blocker).unwrap();
+
+        let res = apply_sub_account_env_vars(
+            &store,
+            &mut sub,
+            std::collections::HashMap::from([("SOME_TOKEN".to_string(), "x".to_string())]),
+            |_env_vars, _profile_id| Ok(()),
+        );
+
+        assert_eq!(res.unwrap_err().0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            store.get(&sub_id).unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+        std::fs::remove_dir(&blocker).unwrap();
+        store
+            .create_sub_account(
+                "parent",
+                "sub1",
+                "sub1",
+                "Sub",
+                vec![],
+                crate::profiles::GatewaySettings::default(),
+            )
+            .expect("retrying the same id must succeed after the rollback");
+    }
+
+    // The happy path is unchanged: benign env vars (nothing needing
+    // relocation) pass through the production relocate hook untouched and are
+    // persisted on the sub-account.
+    #[test]
+    fn should_persist_env_vars_when_nothing_needs_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open_unified(dir.path()).unwrap();
+        let mut sub = fresh_sub_account_with_parent(&store);
+        let sub_id = sub.id.clone();
+
+        let res = apply_sub_account_env_vars(
+            &store,
+            &mut sub,
+            std::collections::HashMap::from([("DEPLOY_ENV".to_string(), "production".to_string())]),
+            relocate_keychain_backed_secrets,
+        );
+
+        assert!(res.is_ok());
+        let saved = store.get(&sub_id).unwrap().expect("sub-account persisted");
+        assert_eq!(
+            saved.config.env_vars.get("DEPLOY_ENV").map(String::as_str),
+            Some("production")
+        );
+    }
+
+    // #1472 wiring: the admin create path routes env vars through the shared
+    // helper — benign vars (nothing to relocate) still land on the saved
+    // sub-account.
+    #[tokio::test]
+    async fn should_create_sub_account_with_env_vars_via_admin_handler() {
+        use crate::api::AppState;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let state = AppState {
+            profile_store: Some(profile_store.clone()),
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..AppState::empty_for_tests()
+        };
+        profile_store.save(&parent_profile()).unwrap();
+
+        let (status, Json(resp)) = create_sub_account(
+            axum::extract::State(Arc::new(state)),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(CreateSubAccountRequest {
+                sub_account_id: "sub1".into(),
+                name: "Sub".into(),
+                public_subdomain: "sub1".into(),
+                email: None,
+                channels: vec![],
+                gateway: None,
+                env_vars: std::collections::HashMap::from([(
+                    "DEPLOY_ENV".to_string(),
+                    "production".to_string(),
+                )]),
+            }),
+        )
+        .await
+        .expect("creation succeeds");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.profile.id, "parent--sub1");
+        let saved = profile_store
+            .get("parent--sub1")
+            .unwrap()
+            .expect("sub-account persisted");
+        assert_eq!(
+            saved.config.env_vars.get("DEPLOY_ENV").map(String::as_str),
+            Some("production")
+        );
+    }
+
+    // #2316 test fixture: an AppState wired like the admin create handler
+    // needs it — profile store, process manager, and a user store.
+    fn sub_account_state(
+        dir: &tempfile::TempDir,
+    ) -> (
+        Arc<AppState>,
+        Arc<ProfileStore>,
+        Arc<crate::user_store::UserStore>,
+    ) {
+        use crate::api::AppState;
+        use std::sync::Arc;
+
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let user_store = Arc::new(crate::user_store::UserStore::open(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store.clone()),
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            user_store: Some(user_store.clone()),
+            ..AppState::empty_for_tests()
+        });
+        (state, profile_store, user_store)
+    }
+
+    fn sub_account_request(email: Option<&str>) -> CreateSubAccountRequest {
+        CreateSubAccountRequest {
+            sub_account_id: "sub1".into(),
+            name: "Sub".into(),
+            public_subdomain: "sub1".into(),
+            email: email.map(str::to_string),
+            channels: vec![],
+            gateway: None,
+            env_vars: std::collections::HashMap::new(),
+        }
+    }
+
+    // #2316: the email-conflict 409 fires after the profile store has
+    // persisted the fresh sub-account — the failed creation must roll the
+    // profile back so retrying the same id doesn't hit "already exists".
+    #[tokio::test]
+    async fn should_roll_back_fresh_sub_account_when_email_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, user_store) = sub_account_state(&dir);
+        profile_store.save(&parent_profile()).unwrap();
+        user_store
+            .save(&crate::user_store::User {
+                id: "other".into(),
+                email: "taken@example.com".into(),
+                name: "Other".into(),
+                role: crate::user_store::UserRole::User,
+                created_at: Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let err = create_sub_account(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("taken@example.com"))),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            profile_store.get("parent--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+
+        let (status, _) = create_sub_account(
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("fresh@example.com"))),
+        )
+        .await
+        .expect("retrying the same id must succeed after the rollback");
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            user_store.get("parent--sub1").unwrap().is_some(),
+            "the user entry lands on the successful retry"
+        );
+    }
+
+    // #2316: an invalid email (BAD_REQUEST) is a post-persist failure too —
+    // same rollback, same retryable id.
+    #[tokio::test]
+    async fn should_roll_back_fresh_sub_account_when_email_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, _user_store) = sub_account_state(&dir);
+        profile_store.save(&parent_profile()).unwrap();
+
+        let err = create_sub_account(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("not-an-email"))),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            profile_store.get("parent--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+
+        let (status, _) = create_sub_account(
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(None)),
+        )
+        .await
+        .expect("retrying the same id must succeed after the rollback");
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // #2316: a user-store save failure (500) is the third post-persist
+    // failure shape. Blocking the user file's path with a directory makes
+    // the atomic rename fail deterministically while the profile store
+    // stays writable, so the rollback can still delete the sub-account.
+    #[tokio::test]
+    async fn should_roll_back_fresh_sub_account_when_user_store_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, user_store) = sub_account_state(&dir);
+        profile_store.save(&parent_profile()).unwrap();
+        let blocker = dir.path().join("users").join("parent--sub1.json");
+        std::fs::create_dir(&blocker).unwrap();
+
+        let err = create_sub_account(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("new@example.com"))),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            profile_store.get("parent--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+
+        std::fs::remove_dir(&blocker).unwrap();
+        let (status, _) = create_sub_account(
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+            axum::extract::Json(sub_account_request(Some("new@example.com"))),
+        )
+        .await
+        .expect("retrying the same id must succeed after the rollback");
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(
+            user_store.get("parent--sub1").unwrap().is_some(),
+            "the user entry lands once the save blocker is gone"
+        );
+    }
+
+    // #2315: deleting a profile must release the keychain items its stored
+    // markers point at. A scoped account (`VAR::id`) is unique to the deleted
+    // profile and always released; a legacy bare account is kept while a
+    // surviving profile still references it (the remove-key shared-account
+    // contract, #2261).
+    #[tokio::test]
+    async fn should_release_deleted_profile_keychain_accounts_but_keep_shared_ones() {
+        use crate::auth::keychain;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, _user_store) = sub_account_state(&dir);
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
+
+        let mut parent = parent_profile();
+        parent.config.env_vars.insert(
+            "VERTEX_SA_JSON".into(),
+            keychain::marker_for(&keychain::scoped_account("VERTEX_SA_JSON", "parent")),
+        );
+        parent
+            .config
+            .env_vars
+            .insert("ZAI_API_KEY".into(), keychain::marker_for("ZAI_API_KEY"));
+        // A bare account nothing else references: it goes with the profile.
+        parent.config.env_vars.insert(
+            "OPENAI_API_KEY".into(),
+            keychain::marker_for("OPENAI_API_KEY"),
+        );
+        profile_store.save(&parent).unwrap();
+        let mut sibling = parent_profile();
+        sibling.id = "sibling".into();
+        sibling.name = "Sibling".into();
+        sibling
+            .config
+            .env_vars
+            .insert("ZAI_API_KEY".into(), keychain::marker_for("ZAI_API_KEY"));
+        profile_store.save(&sibling).unwrap();
+
+        keychain::set_secret(
+            &keychain::scoped_account("VERTEX_SA_JSON", "parent"),
+            "sa-json",
+        )
+        .unwrap();
+        keychain::set_secret("ZAI_API_KEY", "shared-key").unwrap();
+        keychain::set_secret("OPENAI_API_KEY", "solo-key").unwrap();
+
+        let Json(resp) = delete_profile(
+            None,
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+        )
+        .await
+        .expect("deletion succeeds");
+        assert!(resp.ok, "deletion reports success");
+        assert!(
+            profile_store.get("parent").unwrap().is_none(),
+            "the profile itself must be gone"
+        );
+
+        assert_eq!(
+            keychain::get_secret(&keychain::scoped_account("VERTEX_SA_JSON", "parent")).unwrap(),
+            None,
+            "the deleted profile's scoped keychain item must be released"
+        );
+        assert_eq!(
+            keychain::get_secret("ZAI_API_KEY").unwrap().as_deref(),
+            Some("shared-key"),
+            "a bare keychain account a surviving profile still references must be kept"
+        );
+        assert_eq!(
+            keychain::get_secret("OPENAI_API_KEY").unwrap(),
+            None,
+            "a bare keychain account with no surviving reference must be released"
+        );
+    }
+
+    // Pure-decision tests for the shared-account logic — the cases the
+    // handler-level fixtures can't reach cheaply.
+    fn profile_with_env_vars(id: &str, env_vars: &[(&str, &str)]) -> UserProfile {
+        let mut profile = parent_profile();
+        profile.id = id.to_string();
+        profile.config.env_vars = env_vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        profile
+    }
+
+    #[test]
+    fn releasable_accounts_follow_the_remove_key_shared_account_contract() {
+        use crate::auth::keychain;
+        let marker = keychain::marker_for;
+
+        // A survivor referencing a bare account under a DIFFERENT env var
+        // name still keeps it: the survivor scan spans every env var name,
+        // never just the removed one.
+        let removed = [profile_with_env_vars(
+            "gone",
+            &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON"))],
+        )];
+        let survivors = [profile_with_env_vars(
+            "kept",
+            &[("VERTEX_API_KEY", &marker("VERTEX_SA_JSON"))],
+        )];
+        assert!(releasable_keychain_accounts(removed.iter(), &survivors).is_empty());
+
+        // Markers shared between two REMOVED profiles are released once.
+        let removed = [
+            profile_with_env_vars(
+                "parent",
+                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
+            ),
+            profile_with_env_vars(
+                "sub",
+                &[("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::parent"))],
+            ),
+        ];
+        assert_eq!(
+            releasable_keychain_accounts(removed.iter(), &[]),
+            ["VERTEX_SA_JSON::parent".to_string()]
+        );
+
+        // Duplicate accounts within one removed profile dedup to one release.
+        let removed = [profile_with_env_vars(
+            "dup",
+            &[
+                ("VERTEX_SA_JSON", &marker("VERTEX_SA_JSON::dup")),
+                ("CUSTOM_KEY", &marker("VERTEX_SA_JSON::dup")),
+            ],
+        )];
+        assert_eq!(
+            releasable_keychain_accounts(removed.iter(), &[]),
+            ["VERTEX_SA_JSON::dup".to_string()]
+        );
+
+        // Plain values (no marker) never name a keychain account.
+        let removed = [profile_with_env_vars(
+            "plain",
+            &[("OPENAI_API_KEY", "sk-real")],
+        )];
+        assert!(releasable_keychain_accounts(removed.iter(), &[]).is_empty());
+    }
+
+    // The delete cascade removes sub-accounts too, so their per-profile
+    // keychain items must go with them.
+    #[tokio::test]
+    async fn should_release_cascaded_sub_account_keychain_accounts_when_deleting_the_parent() {
+        use crate::auth::keychain;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, profile_store, _user_store) = sub_account_state(&dir);
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
+
+        profile_store.save(&parent_profile()).unwrap();
+        let mut sub = fresh_sub_account_with_parent(&profile_store);
+        let sub_account = keychain::scoped_account("VERTEX_SA_JSON", &sub.id);
+        sub.config
+            .env_vars
+            .insert("VERTEX_SA_JSON".into(), keychain::marker_for(&sub_account));
+        profile_store.save(&sub).unwrap();
+        keychain::set_secret(&sub_account, "sa-json").unwrap();
+
+        let Json(resp) = delete_profile(
+            None,
+            axum::extract::State(state),
+            axum::extract::Path("parent".into()),
+        )
+        .await
+        .expect("deletion succeeds");
+        assert!(resp.ok, "deletion reports success");
+        assert!(
+            profile_store.get(&sub.id).unwrap().is_none(),
+            "the sub-account must be cascaded away"
+        );
+        assert_eq!(
+            keychain::get_secret(&sub_account).unwrap(),
+            None,
+            "the cascaded sub-account's keychain item must be released"
+        );
     }
 
     #[test]
@@ -5495,7 +6462,8 @@ mod tests {
             &mut config,
             r#"{"config":{"env_vars":{"SMTP_PASSWORD":"new"}}}"#,
             false,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             config.env_vars.get("SMTP_PASSWORD").map(String::as_str),
@@ -5516,17 +6484,47 @@ mod tests {
         config.env_vars.insert("A".into(), "a".into());
         config.env_vars.insert("B".into(), "b".into());
 
-        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{"A":"a2"}}}"#, true);
+        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{"A":"a2"}}}"#, true)
+            .unwrap();
         assert_eq!(config.env_vars.get("A").map(String::as_str), Some("a2"));
         assert!(
             !config.env_vars.contains_key("B"),
             "authoritative replace drops omitted keys"
         );
 
-        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{}}}"#, true);
+        merge_profile_config_from_body(&mut config, r#"{"config":{"env_vars":{}}}"#, true).unwrap();
         assert!(
             config.env_vars.is_empty(),
             "an explicit empty map clears all entries"
+        );
+    }
+
+    // The request struct parses `config` as opaque JSON, so the merged
+    // typed round-trip is the only validation gate: patches that produce an
+    // invalid config must error (the handlers map this to 400) instead of
+    // silently dropping the patch. A literal `null` config stays a no-op.
+    #[test]
+    fn merge_config_rejects_invalid_patches() {
+        let mut config = ProfileConfig::default();
+        assert!(merge_profile_config_from_body(&mut config, r#"{"config":null}"#, false).is_ok());
+
+        let err =
+            merge_profile_config_from_body(&mut config, r#"{"config":42}"#, false).unwrap_err();
+        assert_eq!(err, "config must be an object");
+
+        // Merges fine as JSON but the result fails ProfileConfig's typed
+        // deserialization (`smtp_port` must be a number).
+        let err = merge_profile_config_from_body(
+            &mut config,
+            r#"{"config":{"email":{"provider":"smtp","smtp_port":"abc"}}}"#,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("invalid config:"), "got: {err}");
+        assert_eq!(
+            config,
+            ProfileConfig::default(),
+            "failed merge must not mutate"
         );
     }
 
@@ -5605,6 +6603,25 @@ mod tests {
     }
 
     #[test]
+    fn serve_log_redaction_masks_removed_ingress_token_aliases() {
+        // #2370 removed the `_token` / `session_ingress_token` query aliases;
+        // URLs carrying them still exist in retained logs from stale clients,
+        // so the redaction layer must recognize those spellings too.
+        let redacted = redact_serve_log_line(
+            "GET /v1/session_ingress/ws/s?session_ingress_token=secret123&_token=secret456",
+        );
+
+        assert!(redacted.contains("?session_ingress_token=[credential-redacted]"));
+        assert!(redacted.contains("&_token=[credential-redacted]"));
+        assert!(!redacted.contains("secret123"));
+        assert!(!redacted.contains("secret456"));
+
+        // Unrelated keys whose names merely contain the aliases stay intact.
+        let untouched = redact_serve_log_line("GET /x?my_token=keepme&other=keepme2");
+        assert!(untouched.contains("my_token=keepme"));
+    }
+
+    #[test]
     fn serve_log_path_uses_utc_date_to_match_rolling_appender() {
         let dir = tempfile::tempdir().unwrap();
         // tracing_appender's DAILY rotation names files by the UTC date
@@ -5670,6 +6687,8 @@ mod tests {
         assert_eq!(state.pending, "partial");
     }
 
+    // admin_shell hardcodes `sh -c`; the happy-path tests need a Unix shell.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_echo_command() {
         let req = ShellRequest {
@@ -5705,6 +6724,7 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_captures_stderr() {
         let req = ShellRequest {
@@ -5717,6 +6737,7 @@ mod tests {
         assert_eq!(result.exit_code, 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_nonzero_exit_code() {
         let req = ShellRequest {
@@ -5728,6 +6749,7 @@ mod tests {
         assert_eq!(result.exit_code, 42);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shell_timeout() {
         let req = ShellRequest {
@@ -5949,6 +6971,157 @@ mod tests {
         assert!(input.output_files.is_empty());
         assert!(input.runtime_state.is_none());
     }
+
+    #[test]
+    fn platform_service_log_paths_prefer_api_log_and_point_at_err_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let ominix = dir.path().join(".ominix");
+        std::fs::create_dir_all(&ominix).unwrap();
+
+        // No api.log yet ⇒ legacy name.
+        let (main, err) = platform_service_log_paths(dir.path());
+        assert_eq!(main, ominix.join("ominix-api.log"));
+        assert_eq!(err, ominix.join("api.err.log"));
+
+        std::fs::write(ominix.join("api.log"), "out\n").unwrap();
+        let (main, err) = platform_service_log_paths(dir.path());
+        assert_eq!(main, ominix.join("api.log"));
+        assert_eq!(err, ominix.join("api.err.log"));
+    }
+
+    #[test]
+    fn last_lines_returns_the_tail_in_order_capped() {
+        let content = "one\ntwo\nthree\n";
+        assert_eq!(last_lines(content, 2), vec!["two", "three"]);
+        assert_eq!(last_lines(content, 50), vec!["one", "two", "three"]);
+        assert!(last_lines("", 5).is_empty());
+    }
+
+    /// With a custom `OCTOS_OMINIX_HOME`, the logs endpoint must read the
+    /// main log from the relocated home and surface the plist's stderr
+    /// log (`api.err.log`) alongside it.
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    // The env must stay pivoted for the duration of the handler call, so the
+    // serializing lock is intentionally held across the await (test-only).
+    #[allow(clippy::await_holding_lock)]
+    async fn platform_service_logs_reads_custom_home_and_surfaces_err_log() {
+        use crate::config_context::TEST_ENV_LOCK;
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let custom = tempfile::tempdir().unwrap();
+        let default_home = tempfile::tempdir().unwrap();
+        let ominix = custom.path().join(".ominix");
+        std::fs::create_dir_all(&ominix).unwrap();
+        std::fs::write(ominix.join("api.log"), "boot ok\nserving\n").unwrap();
+        std::fs::write(ominix.join("api.err.log"), "panic: bind failed\n").unwrap();
+
+        let keys = ["OCTOS_OMINIX_HOME", "HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("OCTOS_OMINIX_HOME", custom.path());
+            std::env::set_var("HOME", default_home.path());
+        }
+        let result =
+            platform_service_logs(axum::extract::Query(std::collections::HashMap::new())).await;
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+
+        let Json(body) = result.expect("logs handler responds");
+        assert_eq!(body["lines"], serde_json::json!(["boot ok", "serving"]));
+        assert_eq!(body["total_lines"], 2);
+        assert_eq!(body["err_lines"], serde_json::json!(["panic: bind failed"]));
+        assert_eq!(body["err_total_lines"], 1);
+        assert!(body.get("error").is_none());
+    }
+
+    /// The exact startup-failure scenario: the daemon never wrote its main
+    /// log, but the plist captured stderr. The endpoint must still surface
+    /// `api.err.log` from the error arm.
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    #[allow(clippy::await_holding_lock)] // see the happy-path test above
+    async fn platform_service_logs_surfaces_err_log_when_main_log_missing() {
+        use crate::config_context::TEST_ENV_LOCK;
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let custom = tempfile::tempdir().unwrap();
+        let default_home = tempfile::tempdir().unwrap();
+        let ominix = custom.path().join(".ominix");
+        std::fs::create_dir_all(&ominix).unwrap();
+        std::fs::write(ominix.join("api.err.log"), "panic: bind failed\n").unwrap();
+
+        let keys = ["OCTOS_OMINIX_HOME", "HOME"];
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serialized by TEST_ENV_LOCK; restored below.
+        unsafe {
+            std::env::set_var("OCTOS_OMINIX_HOME", custom.path());
+            std::env::set_var("HOME", default_home.path());
+        }
+        let result =
+            platform_service_logs(axum::extract::Query(std::collections::HashMap::new())).await;
+        for (k, v) in saved {
+            match v {
+                Some(v) => unsafe { std::env::set_var(k, v) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+
+        let Json(body) = result.expect("logs handler responds");
+        assert_eq!(body["lines"], serde_json::json!([]));
+        assert!(body.get("error").is_some());
+        assert_eq!(body["err_lines"], serde_json::json!(["panic: bind failed"]));
+        assert_eq!(body["err_total_lines"], 1);
+    }
+
+    // #1440: a WeChat QR flow started against a profile that does not exist
+    // must fail fast instead of reporting "confirmed" with the token dropped.
+    #[tokio::test]
+    async fn wechat_qr_start_rejects_unknown_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+
+        let status = match wechat_qr_start(State(state), Path("ghost".into())).await {
+            Err((status, _)) => status,
+            Ok(_) => panic!("unknown profile must be rejected"),
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn wechat_qr_poll_rejects_unknown_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_store = Arc::new(ProfileStore::open_unified(dir.path()).unwrap());
+        let state = Arc::new(AppState {
+            profile_store: Some(profile_store),
+            ..AppState::empty_for_tests()
+        });
+
+        let status = match wechat_qr_poll(
+            State(state),
+            Path("ghost".into()),
+            Json(WeChatQrPollRequest {
+                session_key: "sk-1".into(),
+            }),
+        )
+        .await
+        {
+            Err((status, _)) => status,
+            Ok(_) => panic!("unknown profile must be rejected"),
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5963,9 +7136,13 @@ pub struct WeChatQrStartResponse {
 
 /// GET /api/admin/profiles/{id}/wechat/qr-start
 pub async fn wechat_qr_start(
-    State(_state): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
 ) -> Result<Json<WeChatQrStartResponse>, (StatusCode, String)> {
+    // Fail fast before the user scans a QR bound for a profile that does not
+    // exist — the poll below would have nowhere to land the token.
+    require_admin_profile(&state, &id)?;
+
     let client = reqwest::Client::new();
     let url = "https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3";
     let resp = client
@@ -6006,12 +7183,31 @@ pub struct WeChatQrPollResponse {
     pub bot_id: Option<String>,
 }
 
+/// Load the named profile or fail the request: a QR flow for a profile that
+/// does not exist would report "confirmed" while the token lands nowhere.
+fn require_admin_profile(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Result<Arc<crate::profiles::ProfileStore>, (StatusCode, String)> {
+    let store = state.profile_store.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    store
+        .get(id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
+    Ok(store)
+}
+
 /// POST /api/admin/profiles/{id}/wechat/qr-poll
 pub async fn wechat_qr_poll(
     State(state): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     Json(req): Json<WeChatQrPollRequest>,
 ) -> Result<Json<WeChatQrPollResponse>, (StatusCode, String)> {
+    let store = require_admin_profile(&state, &id)?;
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(40))
         .build()
@@ -6058,27 +7254,8 @@ pub async fn wechat_qr_poll(
             .unwrap_or_default()
             .to_string();
 
-        // Save token to profile
-        if !bot_token.is_empty() {
-            if let Some(_pm) = state.process_manager.as_ref() {
-                // Write token with restrictive permissions from the start (no TOCTOU race)
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let _ = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open("/tmp/octos-wechat-token")
-                        .and_then(|mut f| std::io::Write::write_all(&mut f, bot_token.as_bytes()));
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
-                }
-            }
-        }
+        // Save token to the profile being edited
+        super::auth_handlers::persist_wechat_bot_token(&store, &id, &bot_token);
 
         // Don't expose bot_token to the client — it's already saved server-side
         return Ok(Json(WeChatQrPollResponse {

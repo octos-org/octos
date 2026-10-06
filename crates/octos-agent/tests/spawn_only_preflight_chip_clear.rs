@@ -262,8 +262,7 @@ async fn preflight_failure_emits_tool_completed_to_clear_chip() {
     assert!(
         leaked.is_empty(),
         "pre-flight failure leaked an activity chip (ToolStarted with no \
-         matching ToolCompleted) for tool_id(s): {:?}",
-        leaked
+         matching ToolCompleted) for tool_id(s): {leaked:?}"
     );
 
     // And the clearing event must mark the call as failed (success:false),
@@ -272,8 +271,7 @@ async fn preflight_failure_emits_tool_completed_to_clear_chip() {
     assert!(
         completed.iter().any(|(_, success)| !success),
         "pre-flight failure must emit ToolCompleted{{ success: false }}; \
-         saw: {:?}",
-        completed
+         saw: {completed:?}"
     );
 }
 
@@ -349,14 +347,12 @@ async fn policy_deny_emits_tool_completed_to_clear_chip() {
     assert!(
         leaked.is_empty(),
         "policy deny leaked an activity chip (ToolStarted with no matching \
-         ToolCompleted) for tool_id(s): {:?}",
-        leaked
+         ToolCompleted) for tool_id(s): {leaked:?}"
     );
 
     let completed = reporter.completed.lock().unwrap().clone();
     assert!(
         completed.iter().any(|(_, success)| !success),
-        "policy deny must emit ToolCompleted{{ success: false }}; saw: {:?}",
-        completed
+        "policy deny must emit ToolCompleted{{ success: false }}; saw: {completed:?}"
     );
 }

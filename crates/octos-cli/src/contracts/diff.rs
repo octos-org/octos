@@ -44,8 +44,7 @@
 //!   spawn a background sweep (diff previews are fewer per session than
 //!   ledger events, so this is acceptable). Filed as a v2 follow-up.
 //!
-//! Counters (emitted via `tracing::info!` from
-//! [`PendingDiffPreviewStore::log_metrics`]):
+//! Counters (snapshotted via [`PendingDiffPreviewStore::metrics`]):
 //!
 //! - `diff_preview.entries.active`
 //! - `diff_preview.bytes.in_memory`
@@ -83,9 +82,9 @@ pub(crate) struct PendingDiffEntry {
     /// Raw unified diff captured at proposal time. `None` when the
     /// runtime did not surface a diff at all (e.g. tool emitted no
     /// `diff` and `materialize_file_mutation_diff` could not produce one).
-    /// Used by tests today and by apply-time consistency checks once the
-    /// apply path is wired in.
-    #[allow(dead_code)]
+    /// Used by apply-time consistency checks once the apply path is wired
+    /// in; today it is persisted to disk and measured by
+    /// `approx_entry_bytes` on every insert.
     snapshot_at_proposal: Option<String>,
 }
 
@@ -558,7 +557,9 @@ impl PendingDiffPreviewStore {
         })
     }
 
-    #[allow(dead_code)]
+    /// Convenience wrapper for tests: inserts without a proposal-time snapshot.
+    /// Production call sites go through [`PendingDiffPreviewStore::insert_with_snapshot`].
+    #[cfg(test)]
     pub(crate) fn insert(&self, preview: DiffPreview) {
         self.insert_with_snapshot(preview, None);
     }
@@ -811,24 +812,6 @@ impl PendingDiffPreviewStore {
         }
     }
 
-    /// Emit a structured tracing line with the current metrics.
-    /// Intended for periodic operator-visibility, mirroring the
-    /// ledger's sweep-tick log.
-    #[allow(dead_code)]
-    pub(crate) fn log_metrics(&self) {
-        let m = self.metrics();
-        info!(
-            target = "octos::diff_preview",
-            diff_preview.entries.active = m.entries_active,
-            diff_preview.sessions.active = m.sessions_active,
-            diff_preview.eviction.dropped = m.entries_dropped,
-            diff_preview.recovery.entries_loaded = m.recovery_entries_loaded,
-            diff_preview.bytes.in_memory = m.bytes_in_memory,
-            diff_preview.bytes.on_disk = m.bytes_on_disk,
-            "diff preview metrics tick"
-        );
-    }
-
     #[cfg(test)]
     pub(crate) fn snapshot_for(&self, preview_id: &PreviewId) -> Option<String> {
         self.inner
@@ -914,7 +897,7 @@ fn list_log_files(session_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 fn encode_session_dir_name(session_id: &SessionKey) -> String {
     let mut out = String::with_capacity(session_id.0.len() * 2);
     for byte in session_id.0.as_bytes() {
-        out.push_str(&format!("{:02x}", byte));
+        out.push_str(&format!("{byte:02x}"));
     }
     out
 }

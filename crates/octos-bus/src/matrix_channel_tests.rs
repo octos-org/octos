@@ -452,6 +452,23 @@ async fn wait_for_request_count(requests: &Arc<Mutex<Vec<CapturedRequest>>>, min
     }
 }
 
+/// `Channel::start` binds the appservice listener only after a best-effort
+/// registration round-trip, so poll for the port to accept instead of
+/// gambling on a fixed sleep (slow runner lanes lose that race with
+/// ConnectionRefused, #2267).
+async fn wait_for_appservice_port(port: u16) {
+    for _ in 0..400 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("appservice listener on 127.0.0.1:{port} never accepted within 10s");
+}
+
 #[test]
 fn test_matrix_channel_name() {
     let ch = make_channel();
@@ -912,7 +929,7 @@ async fn test_handle_room_query_requires_token() {
         tokio::spawn(async move { channel.start(inbound_tx).await.unwrap() })
     };
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_appservice_port(appservice_port).await;
     let client = reqwest::Client::new();
     let resp = client
         .get(format!(
@@ -964,7 +981,7 @@ async fn test_handle_transaction_invite_joins_room() {
     });
 
     let client = reqwest::Client::new();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_appservice_port(appservice_port).await;
 
     let http_resp = client
             .put(format!(
@@ -3879,7 +3896,7 @@ async fn test_slash_command_createbot() {
 async fn test_slash_command_createbot_defaults_private() {
     let (tx, _rx) = mpsc::channel(1);
     let mut state = make_test_state(tx);
-    state.bot_manager = Some(Arc::new(RecordingBotManager::default()));
+    state.bot_manager = Some(Arc::new(RecordingBotManager));
 
     let result = handle_slash_command(
         &state,
@@ -3904,7 +3921,7 @@ async fn test_slash_command_createbot_defaults_private() {
 async fn test_slash_command_createbot_with_public_visibility() {
     let (tx, _rx) = mpsc::channel(1);
     let mut state = make_test_state(tx);
-    state.bot_manager = Some(Arc::new(RecordingBotManager::default()));
+    state.bot_manager = Some(Arc::new(RecordingBotManager));
 
     let result = handle_slash_command(
         &state,

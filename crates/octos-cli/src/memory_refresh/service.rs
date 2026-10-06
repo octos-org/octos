@@ -148,13 +148,20 @@ pub(crate) fn backoff_after(consecutive_failures: u32) -> Duration {
 /// releases the profile lock.
 pub struct MemoryRefreshService {
     shutdown: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
+    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Drop for MemoryRefreshService {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        self.task.abort();
+        if let Some(task) = self
+            .task
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
+        }
     }
 }
 
@@ -264,7 +271,26 @@ impl MemoryRefreshService {
                 }
             }
         });
-        Some(Self { shutdown, task })
+        Some(Self {
+            shutdown,
+            task: std::sync::Mutex::new(Some(task)),
+        })
+    }
+
+    /// Stop the sweep and wait until its task has released the profile lock,
+    /// so a replacement runtime that shares this profile's stores can take
+    /// ownership immediately. Idempotent.
+    pub async fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -376,6 +402,14 @@ pub(crate) async fn run_extraction_pass(
 
     let manager = SessionManager::open(data_dir).wrap_err("failed to open session manager")?;
     let now = SystemTime::now();
+    // UPCR-2026-034 — a host-owned app peer (or one of its request contexts)
+    // captures only into its own memory namespace: the profile-level sweep
+    // must never read its transcript into the profile's memory.
+    let peers_root = data_dir.join("peers");
+    let app_bound = |key: &octos_core::SessionKey| {
+        crate::peers::app_binding::resolve_session_app_binding(&peers_root, key)
+            .is_bound_or_refused()
+    };
 
     // Pre-upgrade cursor backfill — INDEPENDENT of extraction eligibility
     // (idle windows, age caps, budgets): a watermarked session without a
@@ -385,7 +419,7 @@ pub(crate) async fn run_extraction_pass(
     // files already changed since the old watermark accept a one-time
     // full re-read (we cannot know the consumed prefix).
     for session in manager.list_for_analysis() {
-        if session.internal || session.files.is_empty() {
+        if session.internal || session.files.is_empty() || app_bound(&session.key) {
             continue;
         }
         if state.extracted_counts.contains_key(&session.key.0) {
@@ -428,7 +462,7 @@ pub(crate) async fn run_extraction_pass(
 
     let mut candidates: Vec<(octos_bus::AnalysisSession, Vec<FileSnap>, SystemTime)> = Vec::new();
     for session in manager.list_for_analysis() {
-        if session.internal || session.files.is_empty() {
+        if session.internal || session.files.is_empty() || app_bound(&session.key) {
             continue;
         }
         if state
@@ -824,6 +858,12 @@ async fn extract_one_session(
     ];
     let config = ChatConfig {
         max_tokens: Some(2_000),
+        // #2194 review: one extraction call per session transcript — the
+        // prompt embeds that session's rendered transcript and is never
+        // replayed, so a cache write is pure premium. (The consolidation
+        // pass is different: its corrective re-ask APPENDS to the original
+        // messages, genuinely reusing the prefix, so it keeps caching.)
+        cache_retention: octos_llm::CacheRetention::None,
         ..Default::default()
     };
     let response = provider.chat(&messages, &[], &config).await?;
@@ -961,6 +1001,118 @@ mod tests {
         mgr.add_message(&key, msg).await.unwrap();
     }
 
+    struct RetentionProbeProvider {
+        response: String,
+        seen: std::sync::Mutex<Option<octos_llm::CacheRetention>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RetentionProbeProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            *self.seen.lock().unwrap() = Some(config.cache_retention);
+            Ok(ChatResponse {
+                content: Some(self.response.clone()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatStream> {
+            unimplemented!("probe does not stream")
+        }
+
+        fn model_id(&self) -> &str {
+            "retention-probe"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_opt_out_of_cache_writes_when_extracting_session_memory() {
+        // #2194 review: extraction sends one per-session transcript prompt,
+        // never replayed — it must not pay for cache writes.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        seed_session(dir.path(), "tg:200", "I prefer tabs over spaces").await;
+
+        let provider = RetentionProbeProvider {
+            response: r#"{"items":[{"kind":"fact","content":"prefers tabs","evidence":[0]}]}"#
+                .to_string(),
+            seen: std::sync::Mutex::new(None),
+        };
+        let knobs = knobs_for_test();
+        let report = run_extraction_pass(dir.path(), &store, &provider, &knobs)
+            .await
+            .unwrap();
+        assert_eq!(report.extracted, 1, "probe extraction must go through");
+        assert_eq!(
+            *provider.seen.lock().unwrap(),
+            Some(octos_llm::CacheRetention::None),
+            "one-shot memory extraction must not request cache writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_never_extract_an_app_bound_session_into_the_profile_memory() {
+        // UPCR-2026-034: a host-owned app peer and its request contexts
+        // capture only into their own namespace.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        let peer_dir = dir.path().join("peers/rinx");
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        crate::peers::app_binding::write_host_binding_in(
+            &peer_dir,
+            &crate::peers::app_binding::PeerHostBinding {
+                version: 1,
+                cwd: dir.path().join("apps/rinx"),
+                memory_namespace: "app/rinx/acct-1".into(),
+                token_sha256: String::new(),
+            },
+        )
+        .unwrap();
+        std::fs::write(peer_dir.join("brief.md"), "brief").unwrap();
+        seed_session(
+            dir.path(),
+            "dev:api:host#peer-rinx",
+            "my Matrix password hint is X",
+        )
+        .await;
+        seed_session(
+            dir.path(),
+            "dev:api:host#peerctx-rinx.mini-a",
+            "mini app secret",
+        )
+        .await;
+
+        let provider = ScriptedProvider {
+            response: r#"{"items":[{"kind":"fact","content":"leak","evidence":[0]}]}"#.to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let report = run_extraction_pass(dir.path(), &store, &provider, &knobs_for_test())
+            .await
+            .unwrap();
+        assert_eq!(report.candidates, 0, "bound sessions are not candidates");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.count_staging_extractions().await, 0);
+    }
+
     #[tokio::test]
     async fn should_write_extraction_and_advance_watermark_when_pass_runs() {
         let dir = tempfile::tempdir().unwrap();
@@ -1076,6 +1228,48 @@ mod tests {
             .unwrap();
         assert_eq!(report.candidates, 0);
         assert_eq!(provider.calls.load(Ordering::SeqCst), calls_before);
+    }
+
+    #[tokio::test]
+    async fn should_release_lock_after_shutdown_for_replacement_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path()).await.unwrap());
+        let provider = || -> Arc<dyn LlmProvider> {
+            Arc::new(ScriptedProvider {
+                response: "{}".to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                prompts: std::sync::Mutex::new(Vec::new()),
+            })
+        };
+        let first = MemoryRefreshService::try_start(
+            dir.path().to_path_buf(),
+            store.clone(),
+            provider(),
+            provider(),
+            knobs_for_test(),
+        )
+        .expect("first owner starts");
+        // Wait until the task has taken the lock fd into its own scope.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(acquire_refresh_lock(dir.path()).unwrap().is_none());
+        first.shutdown().await;
+        first.shutdown().await; // idempotent
+        let mut replacement = None;
+        for _ in 0..40 {
+            replacement = MemoryRefreshService::try_start(
+                dir.path().to_path_buf(),
+                store.clone(),
+                provider(),
+                provider(),
+                knobs_for_test(),
+            );
+            if replacement.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(replacement.is_some(), "replacement must own the sweep");
+        drop(first);
     }
 
     #[tokio::test]

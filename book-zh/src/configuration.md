@@ -81,7 +81,7 @@
   // 自适应路由
   "adaptive_routing": {
     "enabled": false,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -115,6 +115,13 @@
       "provider": "deepseek",
       "model": "deepseek-chat",
       "description": "Fast model for simple tasks"
+    },
+    // Z.AI GLM 车道 —— api_key_env 省略时默认使用 ZAI_API_KEY
+    {
+      "key": "zai",
+      "provider": "zai",
+      "model": "glm-5.2",
+      "description": "Z.AI GLM 5.2 lane (1M context)"
     }
   ],
 
@@ -296,6 +303,13 @@ Origin 应使用 HTTPS。浏览器认证 token 按 Origin 存储；URL 变化后
 | 变量 | 说明 |
 |------|------|
 | `OMINIX_API_URL` | OminiX ASR/TTS API 地址 |
+
+### 会话存储
+
+| 变量 | 说明 |
+|------|------|
+| `OCTOS_SESSION_SEGMENT_BYTES` | 活跃会话文件封存为分段的大小（默认 8 MiB） |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | 普通加载按新到旧读取的会话历史字节数（默认 32 MiB；`0` = 不限） |
 
 ### 系统
 

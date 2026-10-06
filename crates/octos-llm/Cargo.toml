@@ -15,6 +15,7 @@ default = []
 test-utils = []
 
 [dependencies]
+libc = { workspace = true }
 octos-core = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
@@ -30,6 +31,7 @@ chrono = { workspace = true }
 redb = { workspace = true }
 metrics = { workspace = true }
 jsonwebtoken = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true
@@ -38,3 +40,4 @@ workspace = true
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+tracing-subscriber = { workspace = true }

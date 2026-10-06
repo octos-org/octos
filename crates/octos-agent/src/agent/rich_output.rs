@@ -104,6 +104,11 @@ pub async fn author_html(llm: &dyn LlmProvider, ctx: &RichHtmlContext) -> eyre::
         temperature: Some(0.2),
         tool_choice: ToolChoice::None,
         reasoning_effort: Some(ReasoningEffort::Low),
+        // #2194 review: a single-shot authoring call per voice turn — the
+        // request is dominated by the per-turn dynamic user block (transcript
+        // + spoken reply + brief), and the breakpoint lands on that block, so
+        // a cache write is never read back.
+        cache_retention: octos_llm::CacheRetention::None,
         ..Default::default()
     };
     let resp = llm.chat(&messages, &[], &config).await?;
@@ -168,6 +173,72 @@ mod tests {
         fn provider_name(&self) -> &str {
             "stub"
         }
+    }
+
+    struct RetentionProbeProvider {
+        seen: Arc<std::sync::Mutex<Option<octos_llm::CacheRetention>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for RetentionProbeProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            *self.seen.lock().unwrap() = Some(config.cache_retention);
+            Ok(ChatResponse {
+                content: Some("<!doctype html><html><body>ok</body></html>".into()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+                provider_index: None,
+            })
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatStream> {
+            unimplemented!("probe does not stream")
+        }
+
+        fn model_id(&self) -> &str {
+            "retention-probe"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_opt_out_of_cache_writes_when_authoring_rich_output() {
+        // #2194 review: author_html is a single-shot authoring call — one
+        // request per voice turn, dominated by a per-turn dynamic user block
+        // (transcript + spoken reply + brief) that is never replayed. The
+        // request must not pay for cache writes.
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let ctx = RichHtmlContext {
+            transcript: "看看天气".into(),
+            spoken_reply: "今天晴".into(),
+            brief: "天气卡片".into(),
+            illustration: false,
+        };
+        let probe = RetentionProbeProvider {
+            seen: Arc::clone(&seen),
+        };
+        let html = author_html(&probe, &ctx).await.expect("probe returns html");
+        assert!(html.contains("<body>ok</body>"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(octos_llm::CacheRetention::None),
+            "one-shot rich-output authoring must not request cache writes"
+        );
     }
 
     #[test]

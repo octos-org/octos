@@ -59,7 +59,9 @@ At the start of each new task, the agent queries the episode store for up to **6
 }
 ```
 
-When configured, the agent embeds each episode summary in a fire-and-forget background task and stores the vector alongside the episode. At query time, the task instruction is embedded and used for vector search. When omitted, the system falls back to BM25-only keyword matching.
+When configured, the agent embeds each episode summary in a fire-and-forget background task and stores the vector alongside the episode. At query time, the task instruction is embedded and used for vector search.
+
+When the `embedding` section is omitted, the default build uses the bundled in-process embedder (llama.cpp, feature `embed-llama`, on by default) with **EmbeddingGemma-300M**: the 334 MB GGUF is downloaded once into `<data_dir>/models/` on first use (`octos memory embedder --fetch` does it ahead of time; `embedding.auto_download = false` or `OCTOS_NO_MODEL_DOWNLOAD=1` opts out). Without a model the system falls back to BM25-only keyword matching. Licence and controls: `docs/THIRD_PARTY_MODELS.md`.
 
 ### Layer 2: Long-Term Memory & Daily Notes (file-based)
 
@@ -151,7 +153,7 @@ The entity bank is a structured knowledge store at `.octos/memory/bank/entities/
 │   ├── 2025-02-10.md        # Daily note (manual or write_file)
 │   └── bank/
 │       └── entities/        # Entity bank (managed by save/recall tools)
-│           ├── yuechen.md   # Entity: "who is the user"
+│           ├── alice.md   # Entity: "who is the user"
 │           └── octos.md     # Entity: "what is this project"
 ├── skills/                  # Custom skills
 ├── episodes.redb            # Episodic memory DB (auto-populated)

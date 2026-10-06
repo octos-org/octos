@@ -1,0 +1,41 @@
+{
+  "exchanges": [
+    {
+      "body_file": "news_en_zh.3.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://feeds.npr.org/1001/rss.xml"
+    },
+    {
+      "body_file": "news_en_zh.5.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml"
+    },
+    {
+      "body_file": "news_en_zh.6.body",
+      "method": "GET",
+      "status": 200,
+      "url": "https://www.france24.com/en/rss"
+    }
+  ],
+  "expect": [],
+  "http": {
+    "headers": {
+      "accept": "application/rss+xml, application/atom+xml, application/xml"
+    },
+    "method": "GET",
+    "url": "https://feeds.npr.org/1001/rss.xml"
+  },
+  "recorded": "live, 2026-09-28 (the news_en_zh feeds)",
+  "request": {
+    "category": "news",
+    "count": 5,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-28T02:00:00Z",
+    "query": "EU AI Act",
+    "since": null
+  }
+}

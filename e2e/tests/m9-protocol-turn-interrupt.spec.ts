@@ -18,42 +18,13 @@ import {
   M9WsClient,
   expectRpcError,
   freshTurnId,
+  isTurnTerminal,
   liveServerEnv,
   uniqueSessionId,
+  waitForTurnTerminal,
 } from "../lib/m9-ws-client";
 
 const UNKNOWN_TURN_CODE = -32101;
-
-async function waitForTurnTerminal(
-  client: M9WsClient,
-  turnId: string,
-  timeoutMs = 45_000,
-) {
-  const existing = client
-    .notificationsLog()
-    .find(
-      (n) =>
-        (n.method === "turn/completed" || n.method === "turn/error") &&
-        n.params?.turn_id === turnId,
-    );
-  if (existing) return existing;
-
-  return new Promise<ReturnType<M9WsClient["notificationsLog"]>[number]>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`timed out waiting for terminal event for ${turnId}`)),
-      timeoutMs,
-    );
-    client.onNotification((n) => {
-      if (
-        (n.method === "turn/completed" || n.method === "turn/error") &&
-        n.params?.turn_id === turnId
-      ) {
-        clearTimeout(timer);
-        resolve(n);
-      }
-    });
-  });
-}
 
 test.describe("M9 protocol — turn/interrupt (happy paths)", () => {
   test.setTimeout(60_000);
@@ -95,7 +66,7 @@ test.describe("M9 protocol — turn/interrupt (happy paths)", () => {
       expect(accept.accepted).toBe(true);
 
       // Wait for terminal state, THEN interrupt — server should still ack
-      // without an error and without producing a second turn/completed.
+      // without an error and without producing a second terminal envelope.
       await waitForTurnTerminal(client, turnId, 45_000);
 
       const r = await client.interruptTurn({
@@ -143,14 +114,10 @@ test.describe("M9 protocol — turn/interrupt (happy paths)", () => {
       expect(second.interrupted).toBe(true);
 
       const terminal = await waitForTurnTerminal(client, turnId, 45_000);
-      expect(terminal.method).toBe("turn/error");
-      expect(terminal.params.code).toBe("interrupted");
+      expect(terminal.params.payload.type).toBe("turn_terminal");
+      expect(terminal.params.payload.data.outcome).toBe("interrupted");
 
-      const terminalEvents = client.notificationsLog().filter(
-        (n) =>
-          (n.method === "turn/completed" || n.method === "turn/error") &&
-          n.params?.turn_id === turnId,
-      );
+      const terminalEvents = client.notificationsLog().filter((n) => isTurnTerminal(n, turnId));
       expect(terminalEvents).toHaveLength(1);
     } finally {
       await client.close();

@@ -66,7 +66,7 @@ The result: every install goes through the same code path the runtime
 ```
 scripts/fleet-install-skills.sh [OPTIONS]
 
-  --host LIST          Comma/space hosts (default: 69.194.3.{128,129,203,66,19})
+  --host LIST          Comma/space hosts (required; or OCTOS_FLEET_HOSTS)
   --profile LIST       Comma-separated profile IDs (default: enumerate per host)
   --skill LIST         Comma-separated skill names (default: all mofa-* with
                        SKILL.md+manifest.json in MOFA_SKILLS_DIR)

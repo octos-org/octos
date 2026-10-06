@@ -239,7 +239,7 @@ fn cmd_list(skills_dirs: &[PathBuf]) {
     if output.is_empty() {
         print_result(true, "No pending evolution patches.");
     } else {
-        output.insert_str(0, &format!("Total: {} pending patches\n\n", total));
+        output.insert_str(0, &format!("Total: {total} pending patches\n\n"));
         print_result(true, &output);
     }
 }
@@ -294,7 +294,7 @@ fn cmd_apply(skills_dirs: &[PathBuf], skill: &str) {
     if !all_notes.is_empty() {
         new_content.push_str("\n\n## Learned Notes\n");
         for note in &all_notes {
-            new_content.push_str(&format!("- {}\n", note));
+            new_content.push_str(&format!("- {note}\n"));
         }
     }
 
@@ -460,7 +460,7 @@ Return at most 5 rules. If all notes are redundant with the original instruction
     let mut new_content = body.to_string();
     new_content.push_str("\n\n## Learned Notes\n");
     for note in &consolidated {
-        new_content.push_str(&format!("- {}\n", note));
+        new_content.push_str(&format!("- {note}\n"));
     }
 
     if fs::write(&skill_md_path, &new_content).is_err() {
@@ -904,7 +904,7 @@ mod tests {
         // Simulate a SKILL.md with existing notes + new patches that exceed MAX_APPLIED_NOTES.
         let mut existing = "# Skill\n\nBody.\n\n## Learned Notes\n".to_string();
         for i in 0..MAX_APPLIED_NOTES {
-            existing.push_str(&format!("- Old note {}\n", i));
+            existing.push_str(&format!("- Old note {i}\n"));
         }
         let (body, mut all_notes) = split_learned_notes(&existing);
         assert_eq!(all_notes.len(), MAX_APPLIED_NOTES);
@@ -927,7 +927,7 @@ mod tests {
         let mut new_content = body.to_string();
         new_content.push_str("\n\n## Learned Notes\n");
         for note in &all_notes {
-            new_content.push_str(&format!("- {}\n", note));
+            new_content.push_str(&format!("- {note}\n"));
         }
         assert!(new_content.contains("# Skill"));
         assert!(new_content.contains("New note C"));

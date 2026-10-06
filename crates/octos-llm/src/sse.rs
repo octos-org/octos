@@ -35,8 +35,7 @@ pub fn parse_sse_response(response: reqwest::Response) -> impl Stream<Item = Sse
                             let error = SseEvent {
                                 event: None,
                                 data: format!(
-                                    "{{\"error\":\"SSE buffer exceeded {} bytes\"}}",
-                                    MAX_BUFFER_SIZE
+                                    "{{\"error\":\"SSE buffer exceeded {MAX_BUFFER_SIZE} bytes\"}}"
                                 ),
                             };
                             buffer.clear();

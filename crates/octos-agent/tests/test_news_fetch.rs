@@ -368,10 +368,7 @@ async fn test_tech_news_discovery() {
                     htmd::convert(&cleaned).unwrap_or_else(|_| extract_text_fallback(&cleaned));
                 let orig_len = text.len();
                 text.truncate(2000);
-                println!(
-                    "  Status: {status}, converted: {} chars (showing first 2000)",
-                    orig_len
-                );
+                println!("  Status: {status}, converted: {orig_len} chars (showing first 2000)");
                 println!("  Preview:\n{text}\n");
             }
             Err(e) => println!("  FAILED: {e}\n"),

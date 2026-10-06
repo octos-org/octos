@@ -3,6 +3,10 @@
 Status: accepted (implemented)
 Date: 2026-05-15
 
+> Errata (2026-09, #2080): the `loop/completed` notification proposed below
+> never gained a producer and was removed from the wire protocol; the current
+> spec and wire inventory are authoritative.
+
 ## Summary
 
 Add AppUI inspection and user-control surfaces for three backend-owned coding

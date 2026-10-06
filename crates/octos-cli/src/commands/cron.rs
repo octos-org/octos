@@ -248,11 +248,15 @@ fn cmd_add(
             deliver,
             channel,
             chat_id: to,
+            mode: Default::default(),
         },
         state: Default::default(),
         created_at_ms: now_ms,
         delete_after_run,
         timezone: None,
+        // Made from the CLI by a person, so there is no loop to attribute it to
+        // and nothing should ever reap it automatically.
+        origin: Default::default(),
     };
     job.compute_next_run(now_ms);
 
@@ -274,7 +278,10 @@ fn cmd_remove(store_path: &std::path::Path, job_id: &str) -> Result<()> {
         println!("{} Removed job {}", "OK".green(), job_id.cyan());
         Ok(())
     } else {
-        eyre::bail!("Job {job_id} not found.");
+        eyre::bail!(
+            "No cron job with id '{job_id}'. Run 'octos cron list' for active ids \
+             ('--all' includes disabled ones)."
+        );
     }
 }
 
@@ -302,7 +309,10 @@ fn cmd_enable(store_path: &std::path::Path, job_id: &str, enabled: bool) -> Resu
         );
         Ok(())
     } else {
-        eyre::bail!("Job {job_id} not found.");
+        eyre::bail!(
+            "No cron job with id '{job_id}'. Run 'octos cron list' for active ids \
+             ('--all' includes disabled ones)."
+        );
     }
 }
 
@@ -381,5 +391,25 @@ mod tests {
         let store = dir.path().join("cron.json");
         assert!(cmd_remove(&store, "nope").is_err());
         assert!(cmd_enable(&store, "nope", true).is_err());
+    }
+
+    #[test]
+    fn unknown_job_error_points_at_cron_list() {
+        // #2414 — the bare "Job {id} not found." dead-ends; it must say where
+        // the active ids live.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("cron.json");
+
+        let error = cmd_remove(&store, "nope").unwrap_err();
+        assert!(
+            error.to_string().contains("Run 'octos cron list'"),
+            "remove error must point at 'octos cron list': {error}"
+        );
+
+        let error = cmd_enable(&store, "nope", true).unwrap_err();
+        assert!(
+            error.to_string().contains("Run 'octos cron list'"),
+            "enable error must point at 'octos cron list': {error}"
+        );
     }
 }

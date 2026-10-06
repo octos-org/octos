@@ -1,0 +1,35 @@
+{
+  "recorded": "synthetic body, shaped after Google's Programmable Search Element documentation (needs the person's engine ID and a browser; not yet run live)",
+  "request": {
+    "query": "omarchy linux",
+    "langs": [
+      "en"
+    ],
+    "since": null,
+    "category": "general",
+    "count": 5,
+    "now": "2026-09-28T20:00:00Z"
+  },
+  "http": {
+    "method": "GET",
+    "url": "https://cse.google.com/cse?q=omarchy+linux&hl=en&cx=fixture-key",
+    "headers": {}
+  },
+  "body_file": "general_synthetic.body",
+  "expect": [
+    {
+      "url": "https://omarchy.org/",
+      "title": "Omarchy - Beautiful, fun & agentic Linux by DHH",
+      "source": "omarchy.org",
+      "lang": "en",
+      "published": null
+    },
+    {
+      "url": "https://github.com/omacom/omarchy",
+      "title": "GitHub - omacom/omarchy",
+      "source": "github.com",
+      "lang": "en",
+      "published": null
+    }
+  ]
+}

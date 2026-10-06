@@ -170,6 +170,16 @@ impl Tool for EditFileTool {
             },
         };
 
+        // Never let a file tool touch a `.git` directory: its config/hooks
+        // decide what the kernel's own git invocations execute.
+        if let Err(reason) = super::refuse_git_internal_path(&path) {
+            return Ok(ToolResult {
+                output: reason,
+                success: false,
+                ..Default::default()
+            });
+        }
+
         // #1976 — per-path write fence, BEFORE any file I/O. SECURITY ROUND
         // (codex): a fenced edit must read AND write through ONE confined
         // handle so an ancestor swapped between the read and the write cannot
@@ -391,6 +401,28 @@ impl Tool for EditFileTool {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn should_refuse_edit_when_path_enters_a_git_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sites/demo/.git")).unwrap();
+        std::fs::write(dir.path().join("sites/demo/.git/config"), "[core]\n").unwrap();
+        let tool = EditFileTool::new(dir.path());
+        let result = tool
+            .execute(&serde_json::json!({
+                "path": "sites/demo/.git/config",
+                "old_string": "[core]",
+                "new_string": "[core]\n\tfsmonitor = touch PWNED",
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success, "{}", result.output);
+        assert!(result.output.contains(".git"), "{}", result.output);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("sites/demo/.git/config")).unwrap(),
+            "[core]\n"
+        );
+    }
     use super::*;
 
     #[test]

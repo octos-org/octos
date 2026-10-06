@@ -430,6 +430,11 @@ async fn delete_profile_record(
         .delete(&profile.id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    crate::api::admin::release_deleted_profiles_keychain_items(
+        profile_store,
+        std::iter::once(profile),
+    );
+
     Ok(())
 }
 

@@ -143,6 +143,459 @@ struct StaticResultTool {
     calls: Arc<AtomicUsize>,
 }
 
+/// Unlike the default mock stream adapter, preserve the reasoning channel.
+struct TerminalScript(ScriptedProvider);
+
+#[async_trait]
+impl LlmProvider for TerminalScript {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[octos_llm::ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        self.0.chat(messages, tools, config).await
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[octos_llm::ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<octos_llm::ChatStream> {
+        use octos_llm::StreamEvent;
+        let response = self.chat(messages, tools, config).await?;
+        let events = vec![
+            StreamEvent::ReasoningDelta(response.reasoning_content.unwrap_or_default()),
+            StreamEvent::TextDelta(response.content.unwrap_or_default()),
+            StreamEvent::Usage(response.usage),
+            StreamEvent::Done(response.stop_reason),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+    fn model_id(&self) -> &str {
+        "terminal-test"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn terminal_integrity_reasoning_only_recovers_to_actual_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reasoning = end_turn("", 10, 20);
+    reasoning.reasoning_content = Some("Need to inspect the image.".into());
+    let provider = Arc::new(TerminalScript(ScriptedProvider::new(vec![
+        reasoning,
+        end_turn("Actual final answer", 30, 40),
+    ])));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("terminal-recovery"),
+        provider.clone(),
+        ToolRegistry::new(),
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    });
+    let result = agent
+        .process_message("Inspect the image", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "Actual final answer");
+    assert!(provider.0.responses.lock().unwrap().is_empty());
+    assert_eq!(result.token_usage.input_tokens, 40);
+    assert_eq!(result.token_usage.output_tokens, 60);
+}
+
+#[tokio::test]
+async fn terminal_integrity_reasoning_only_fail_fast_is_error() {
+    for stop_reason in [StopReason::EndTurn, StopReason::MaxTokens] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reasoning = end_turn("", 10, 20);
+        reasoning.reasoning_content = Some("Need to inspect the image.".into());
+        reasoning.stop_reason = stop_reason;
+        let provider = Arc::new(TerminalScript(ScriptedProvider::new(vec![reasoning])));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("terminal-no-answer"),
+            provider,
+            ToolRegistry::new(),
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        });
+        let result = octos_llm::with_llm_call_policy(
+            octos_llm::LlmCallPolicy::FailFast,
+            agent.process_message("Inspect the image", &[], vec![]),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "reasoning-only output cannot complete: {result:?}"
+        );
+        let error = result.unwrap_err();
+        let usage = &error
+            .downcast_ref::<crate::PartialTurnUsage>()
+            .unwrap()
+            .total;
+        assert_eq!((usage.input_tokens, usage.output_tokens), (10, 20));
+    }
+}
+
+#[tokio::test]
+async fn terminal_integrity_exhausted_reasoning_retries_retain_all_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reasoning = end_turn("", 10, 20);
+    reasoning.reasoning_content = Some("Need to inspect the image.".into());
+    let provider = Arc::new(TerminalScript(ScriptedProvider::new(vec![reasoning; 5])));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("empty-usage"),
+        provider,
+        ToolRegistry::new(),
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    });
+    let error = agent
+        .process_message("Inspect the image", &[], vec![])
+        .await
+        .unwrap_err();
+    let usage = &error
+        .downcast_ref::<crate::PartialTurnUsage>()
+        .unwrap()
+        .total;
+    assert_eq!((usage.input_tokens, usage.output_tokens), (50, 100));
+}
+
+#[tokio::test]
+async fn terminal_integrity_fallback_counts_last_failed_stream_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reasoning = end_turn("", 10, 20);
+    reasoning.reasoning_content = Some("Need to inspect the image.".into());
+    let mut responses = vec![reasoning; 4];
+    responses.push(end_turn("Fallback final answer", 30, 40));
+    let provider = Arc::new(TerminalScript(ScriptedProvider::new(responses)));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("fallback-usage"),
+        provider,
+        ToolRegistry::new(),
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    });
+    let response = agent
+        .process_message("Inspect the image", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(response.content, "Fallback final answer");
+    assert_eq!(
+        (
+            response.token_usage.input_tokens,
+            response.token_usage.output_tokens
+        ),
+        (70, 120)
+    );
+}
+
+#[tokio::test]
+async fn terminal_integrity_truncated_answer_is_error_with_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut truncated = end_turn("First I need to inspect the image and then I will", 12, 7);
+    truncated.stop_reason = StopReason::MaxTokens;
+    let provider = Arc::new(ScriptedProvider::new(vec![truncated]));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("terminal-truncated"),
+        provider,
+        ToolRegistry::new(),
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    });
+    let error = agent
+        .process_message("Inspect the image", &[], vec![])
+        .await
+        .expect_err("a truncated response is not a completed answer");
+    assert!(error.to_string().contains("max_tokens"), "{error:?}");
+    let usage = error.downcast_ref::<crate::PartialTurnUsage>().unwrap();
+    assert_eq!(usage.total.input_tokens, 12);
+    assert_eq!(usage.total.output_tokens, 7);
+}
+
+/// Mix complete-but-rejected responses with transport/provider errors. The
+/// response-only fixture above cannot reach the error arm's fallback exits.
+struct MixedTerminalScript(StdMutex<VecDeque<Result<ChatResponse>>>);
+
+#[async_trait]
+impl LlmProvider for MixedTerminalScript {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("mixed terminal script exhausted")
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[octos_llm::ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<octos_llm::ChatStream> {
+        use octos_llm::StreamEvent;
+        let response = self.chat(messages, tools, config).await?;
+        Ok(Box::pin(futures::stream::iter(vec![
+            StreamEvent::ReasoningDelta(response.reasoning_content.unwrap_or_default()),
+            StreamEvent::TextDelta(response.content.unwrap_or_default()),
+            StreamEvent::Usage(response.usage),
+            StreamEvent::Done(response.stop_reason),
+        ])))
+    }
+
+    fn model_id(&self) -> &str {
+        // Known pricing makes the test check attributed spend as well as all
+        // four token counters; no actual provider is contacted.
+        "claude-sonnet-4"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+fn mixed_terminal_response(content: &str, input: u32, output: u32) -> ChatResponse {
+    let mut response = end_turn(content, input, output);
+    response.reasoning_content = Some("Still inspecting the image.".into());
+    response.usage.cache_read_tokens = 3;
+    response.usage.cache_write_tokens = 4;
+    response.usage.reasoning_tokens = 5;
+    response
+}
+
+fn mixed_terminal_transport_error() -> Result<ChatResponse> {
+    Err(octos_llm::StreamError::Transport {
+        detail: "fixture transport failure".into(),
+    }
+    .into())
+}
+
+async fn assert_mixed_terminal_usage(
+    attempts: Vec<Result<ChatResponse>>,
+    expected: (u32, u32, u32, u32),
+    succeeds: bool,
+) {
+    let expected_reasoning: u32 = attempts
+        .iter()
+        .filter_map(|attempt| attempt.as_ref().ok())
+        .map(|response| response.usage.reasoning_tokens)
+        .sum();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(MixedTerminalScript(StdMutex::new(attempts.into())));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("mixed-terminal-usage"),
+        provider.clone(),
+        ToolRegistry::new(),
+        memory,
+    );
+    let mut turn = LoopTurnState::new(Instant::now());
+    // Existing usage must remain intact, and must not be included again when
+    // a recovered response is returned for the caller to record.
+    turn.record_usage(
+        &TokenUsage {
+            input_tokens: 100,
+            output_tokens: 200,
+            cache_read_tokens: 300,
+            cache_write_tokens: 400,
+            ..Default::default()
+        },
+        None,
+        Some(0.5),
+    );
+    let previous = turn.total_usage().clone();
+    let result = agent
+        .call_llm_with_hooks(
+            &[Message::user("Inspect the image")],
+            &[],
+            &ChatConfig::default(),
+            1,
+            &previous,
+            &mut turn,
+        )
+        .await;
+    assert_eq!(result.is_ok(), succeeds, "{result:?}");
+    assert!(provider.0.lock().unwrap().is_empty());
+    if let Err(error) = &result {
+        assert!(
+            error.downcast_ref::<LlmError>().is_some()
+                || error.downcast_ref::<octos_llm::StreamError>().is_some(),
+            "usage settlement must preserve the typed error: {error:?}",
+        );
+    }
+    if let Ok((response, _, cost)) = result {
+        assert_eq!(turn.total_usage().input_tokens, 100);
+        assert_eq!(turn.priced_spend(), Some(0.5));
+        turn.record_llm_usage(&response.usage, None, cost);
+    }
+    let total = turn.total_usage();
+    assert_eq!(
+        total.reasoning_tokens, expected_reasoning,
+        "rejected, recovered, and fallback responses retain reasoning exactly once"
+    );
+    assert_eq!(
+        (
+            total.input_tokens,
+            total.output_tokens,
+            total.cache_read_tokens,
+            total.cache_write_tokens,
+        ),
+        (
+            100 + expected.0,
+            200 + expected.1,
+            300 + expected.2,
+            400 + expected.3
+        ),
+    );
+    let pricing = octos_llm::pricing::model_pricing("claude-sonnet-4").unwrap();
+    // The fixture is a residual-protocol mock, not an Anthropic provider.
+    // All disjoint cache traffic must remain priced (read 1x, write 1.25x).
+    let expected_cost = pricing.cost(expected.0, expected.1)
+        + (f64::from(expected.2) + 1.25 * f64::from(expected.3)) * pricing.input_per_million
+            / 1_000_000.0;
+    assert!((turn.priced_spend().unwrap() - (0.5 + expected_cost)).abs() < 1e-12);
+}
+
+#[tokio::test]
+async fn terminal_integrity_mixed_rejected_then_nonretryable_error_retains_usage() {
+    assert_mixed_terminal_usage(
+        vec![
+            Ok(mixed_terminal_response("", 10, 20)),
+            Err(LlmError::auth("fixture invalid key").into()),
+        ],
+        (10, 20, 3, 4),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminal_integrity_mixed_stream_errors_and_empty_fallback_retain_usage() {
+    assert_mixed_terminal_usage(
+        vec![
+            Ok(mixed_terminal_response("", 10, 20)),
+            mixed_terminal_transport_error(),
+            mixed_terminal_transport_error(),
+            mixed_terminal_transport_error(),
+            Ok(mixed_terminal_response("", 30, 40)),
+        ],
+        (40, 60, 6, 8),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminal_integrity_mixed_stream_errors_and_failed_fallback_retain_usage() {
+    assert_mixed_terminal_usage(
+        vec![
+            Ok(mixed_terminal_response("", 10, 20)),
+            mixed_terminal_transport_error(),
+            mixed_terminal_transport_error(),
+            mixed_terminal_transport_error(),
+            Err(LlmError::auth("fixture fallback invalid key").into()),
+        ],
+        (10, 20, 3, 4),
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminal_integrity_mixed_stream_recovery_charges_exactly_once() {
+    assert_mixed_terminal_usage(
+        vec![
+            Ok(mixed_terminal_response("", 10, 20)),
+            mixed_terminal_transport_error(),
+            Ok(mixed_terminal_response("Recovered answer", 30, 40)),
+        ],
+        (40, 60, 6, 8),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminal_integrity_mixed_stream_fallback_recovery_charges_exactly_once() {
+    assert_mixed_terminal_usage(
+        vec![
+            Ok(mixed_terminal_response("", 10, 20)),
+            mixed_terminal_transport_error(),
+            mixed_terminal_transport_error(),
+            mixed_terminal_transport_error(),
+            Ok(mixed_terminal_response("Fallback answer", 30, 40)),
+        ],
+        (40, 60, 6, 8),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminal_integrity_mixed_adaptive_recovery_keeps_settled_usage_once() {
+    let dir = tempfile::tempdir().unwrap();
+    // Four rejected streaming attempts and a rejected fallback settle on the
+    // first call's Err. The outer agent then retries adaptively and succeeds.
+    let mut responses = vec![mixed_terminal_response("", 10, 20); 5];
+    responses.push(mixed_terminal_response("Adaptive final answer", 30, 40));
+    let provider = Arc::new(TerminalScript(ScriptedProvider::new(responses)));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("mixed-adaptive-usage"),
+        provider.clone(),
+        ToolRegistry::new(),
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    });
+    let response = agent
+        .process_message("Inspect the image", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(response.content, "Adaptive final answer");
+    assert_eq!(response.token_usage.reasoning_tokens, 30);
+    assert!(provider.0.responses.lock().unwrap().is_empty());
+    assert_eq!(
+        (
+            response.token_usage.input_tokens,
+            response.token_usage.output_tokens,
+            response.token_usage.cache_read_tokens,
+            response.token_usage.cache_write_tokens,
+        ),
+        (80, 140, 18, 24),
+    );
+}
+
 impl StaticResultTool {
     fn new(
         name: &'static str,
@@ -157,6 +610,1272 @@ impl StaticResultTool {
             calls,
         }
     }
+}
+
+#[tokio::test]
+async fn should_preserve_tool_carrier_text_in_durable_log_when_final_answer_repeats_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let answer = "这次我完整读了论文原文。\n\n先纠错。\n\n论文解决了三个问题。";
+    let final_content = format!("curl 被拒绝，改用 fetch 工具读取正文：\n\n{answer}");
+    let mut tool_response = tool_use(
+        vec![ToolCall {
+            id: "call_fetch".into(),
+            name: "fetch_paper".into(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        }],
+        10,
+        20,
+    );
+    tool_response.content = Some(answer.into());
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response,
+        end_turn(&final_content, 30, 40),
+    ]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body",
+        true,
+        calls.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent =
+        Agent::new(AgentId::new("dedupe-test"), provider, tools, memory).with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        });
+
+    let response = agent
+        .process_message("请读这篇论文", &[], vec![])
+        .await
+        .expect("turn should complete");
+
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(response.content, final_content);
+    assert_eq!(response.assistant_segments.message_iterations, vec![(1, 1)]);
+    assert_eq!(
+        response.assistant_segments.final_iteration, 2,
+        "final reply carries its own producer iteration, not the earlier tool carrier"
+    );
+    assert_eq!(
+        response.clone().assistant_segments.message_iterations,
+        vec![(1, 1)]
+    );
+    assert_eq!(response.messages.len(), 3);
+    assert_eq!(response.messages[0].role, MessageRole::User);
+    assert_eq!(response.messages[1].role, MessageRole::Assistant);
+    assert_eq!(response.messages[1].content, answer);
+    assert!(
+        response.messages[1]
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| tool_calls.len() == 1)
+    );
+    assert_eq!(response.messages[2].role, MessageRole::Tool);
+    assert_eq!(
+        response.messages[2].tool_call_id.as_deref(),
+        Some("call_fetch")
+    );
+}
+
+#[tokio::test]
+async fn should_preserve_tool_carrier_text_in_durable_log_when_turn_ends_on_max_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let answer = "A complete answer emitted before the source check.";
+    let final_content = format!("The source check started but output was truncated.\n\n{answer}");
+    let mut tool_response = tool_use(
+        vec![ToolCall {
+            id: "call_fetch".into(),
+            name: "fetch_paper".into(),
+            arguments: serde_json::json!({}),
+            metadata: None,
+        }],
+        10,
+        20,
+    );
+    tool_response.content = Some(answer.into());
+    let max_tokens_response = ChatResponse {
+        content: Some(final_content.clone()),
+        reasoning_content: None,
+        tool_calls: vec![],
+        stop_reason: StopReason::MaxTokens,
+        usage: LlmTokenUsage::default(),
+        provider_index: None,
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_response,
+        max_tokens_response,
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body",
+        true,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("max-token-dedupe"), provider, tools, memory).with_config(
+        AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+
+    let error = agent
+        .process_message("请读这篇论文", &[], vec![])
+        .await
+        .expect_err("max-token turn must retain partial output without claiming completion");
+    let response = &error
+        .downcast_ref::<crate::IncompleteResponseError>()
+        .unwrap()
+        .partial;
+
+    assert_eq!(response.assistant_segments.message_iterations, vec![(1, 1)]);
+    assert_eq!(
+        response.assistant_segments.final_iteration, 2,
+        "typed partial carries the exact final model iteration through host recovery"
+    );
+    assert_eq!(
+        response.clone().assistant_segments.message_iterations,
+        vec![(1, 1)]
+    );
+
+    assert_eq!(response.content, final_content);
+    assert_eq!(response.messages[1].role, MessageRole::Assistant);
+    assert_eq!(response.messages[1].content, answer);
+    assert!(
+        response.messages[1]
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| tool_calls.len() == 1)
+    );
+    assert_eq!(response.messages[2].role, MessageRole::Tool);
+}
+
+/// Scripted provider that records the exact `(messages, tools)` of every
+/// request so a test can assert on the prompt SHAPE the loop sent (roles,
+/// positions, tool slices), not merely on message text.
+struct RequestRecordingProvider {
+    responses: StdMutex<Vec<ChatResponse>>,
+    requests: RecordedRequests,
+}
+
+/// `(messages, tools)` of every provider request, in call order.
+type RecordedRequests = Arc<StdMutex<Vec<(Vec<Message>, Vec<octos_llm::ToolSpec>)>>>;
+
+impl RequestRecordingProvider {
+    fn new(responses: Vec<ChatResponse>, requests: RecordedRequests) -> Self {
+        Self {
+            responses: StdMutex::new(responses.into_iter().rev().collect()),
+            requests,
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RequestRecordingProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push((messages.to_vec(), tools.to_vec()));
+        self.responses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop()
+            .ok_or_else(|| eyre::eyre!("scripted provider exhausted"))
+    }
+
+    fn model_id(&self) -> &str {
+        "planner-test"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+const CHECKPOINT_ENVELOPE_OPEN: &str = "<context_event kind=\"convergence_checkpoint\"";
+
+/// `(messages, tools, config)` of every provider request, in call order.
+type RecordedConfigRequests =
+    Arc<StdMutex<Vec<(Vec<Message>, Vec<octos_llm::ToolSpec>, ChatConfig)>>>;
+
+/// Like [`RequestRecordingProvider`] but also keeps the `ChatConfig` of each
+/// call, so a test can compare the cache-relevant request controls of the
+/// checkpoint reflection with those of the action call it shadows.
+struct ConfigRecordingProvider {
+    responses: StdMutex<Vec<ChatResponse>>,
+    requests: RecordedConfigRequests,
+}
+
+impl ConfigRecordingProvider {
+    fn new(responses: Vec<ChatResponse>, requests: RecordedConfigRequests) -> Self {
+        Self {
+            responses: StdMutex::new(responses.into_iter().rev().collect()),
+            requests,
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ConfigRecordingProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[octos_llm::ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push((messages.to_vec(), tools.to_vec(), config.clone()));
+        self.responses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop()
+            .ok_or_else(|| eyre::eyre!("scripted provider exhausted"))
+    }
+
+    fn model_id(&self) -> &str {
+        "planner-test"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+async fn run_peer_polling_regression(
+    tool_name: &'static str,
+    outputs: Vec<String>,
+    reflection_after: &[usize],
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses = Vec::new();
+    for index in 0..outputs.len() {
+        responses.push(tool_use(
+            vec![ToolCall {
+                id: format!("poll_{index}"),
+                name: tool_name.into(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }],
+            10,
+            5,
+        ));
+        if reflection_after.contains(&(index + 1)) {
+            responses.push(end_turn(
+                "PRIVATE-POLL-REFLECTION: await new evidence",
+                10,
+                5,
+            ));
+        }
+    }
+    responses.push(end_turn("GENUINE-MODEL-FINAL", 10, 5));
+    let expected_calls = responses.len();
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let calls = executions.clone();
+    let count = outputs.len();
+    let mut tools = ToolRegistry::new();
+    if tool_name == "peer_gather" {
+        tools.register(crate::tools::PeerGatherTool::new(Arc::new(move |_| {
+            let index = calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(outputs[index.min(outputs.len() - 1)].clone())
+        })));
+    } else {
+        tools.register(crate::tools::PeerListTool::new(Arc::new(move || {
+            let index = calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(outputs[index.min(outputs.len() - 1)].clone())
+        })));
+    }
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("peer-polling"), provider, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 30,
+            ..Default::default()
+        })
+        .with_convergence_intervals(100, 100_000_000, std::time::Duration::from_secs(86_400));
+    let result = agent
+        .process_message("gather the peer result", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        result.content, "GENUINE-MODEL-FINAL",
+        "{tool_name}: never substitute a controller stop for a model answer"
+    );
+    assert_eq!(executions.load(AtomicOrdering::SeqCst), count);
+    assert!(!agent.is_loop_detected_recently());
+    assert!(
+        result
+            .messages
+            .iter()
+            .all(|row| !row.content.contains("PRIVATE-POLL-REFLECTION")),
+        "reflection is transient working memory, not a persisted assistant answer"
+    );
+    assert_eq!(result.token_usage.input_tokens, expected_calls as u32 * 10);
+    assert_eq!(result.token_usage.output_tokens, expected_calls as u32 * 5);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), expected_calls);
+    let reflection_requests: Vec<_> = requests
+        .iter()
+        .filter(|(_, _, config)| matches!(config.tool_choice, ToolChoice::None))
+        .collect();
+    assert_eq!(reflection_requests.len(), reflection_after.len());
+    for (messages, _, _) in reflection_requests {
+        let prompt = &messages.last().unwrap().content;
+        assert!(
+            prompt.contains("peer") && prompt.contains("asynchronous"),
+            "waiting-aware checkpoint: {prompt}"
+        );
+        assert!(
+            prompt.contains("busy-wait"),
+            "checkpoint must discourage repeated polling: {prompt}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn peer_polling_should_allow_changed_result_on_third_identical_request() {
+    for tool in ["peer_gather", "peer_list"] {
+        run_peer_polling_regression(
+            tool,
+            vec![
+                "still running".into(),
+                "still running".into(),
+                "done: actual result".into(),
+            ],
+            &[],
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn peer_polling_should_reflect_after_unchanged_results_and_resume_for_genuine_final() {
+    for tool in ["peer_gather", "peer_list"] {
+        run_peer_polling_regression(
+            tool,
+            vec![
+                "still running".into(),
+                "still running".into(),
+                "still running".into(),
+                "done: actual result".into(),
+            ],
+            &[3],
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn peer_polling_should_reset_no_progress_threshold_when_output_changes() {
+    for tool in ["peer_gather", "peer_list"] {
+        run_peer_polling_regression(
+            tool,
+            vec![
+                "running: 1".into(),
+                "running: 1".into(),
+                "running: 2".into(),
+                "running: 2".into(),
+                "done: result".into(),
+            ],
+            &[],
+        )
+        .await;
+    }
+}
+
+/// The checkpoint request must be the action request plus appended rows:
+/// same `context_management`, same reasoning effort (Anthropic derives the
+/// `thinking` budget from `max_tokens`, so the output cap must not change it
+/// when an effort is configured), and `tool_choice = none` on the wire.
+#[tokio::test]
+async fn should_send_checkpoint_with_identical_cache_relevant_config_and_tool_choice_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(ConfigRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_1".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 1 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_2".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 2 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            end_turn("REFLECTION: keep going", 5, 5),
+            end_turn("final answer", 10, 10),
+        ],
+        requests.clone(),
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body",
+        true,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("convergence-config"), provider, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_tokens: Some(8_192),
+            reasoning_effort: Some(octos_llm::ReasoningEffort::High),
+            ..Default::default()
+        })
+        .with_convergence_intervals(2, 100_000_000, std::time::Duration::from_secs(86_400));
+
+    let response = agent
+        .process_message("read the paper", &[], vec![])
+        .await
+        .expect("turn should complete");
+    assert_eq!(response.content, "final answer");
+
+    let requests = requests.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(requests.len(), 4);
+    let (_, _, action) = &requests[1];
+    let (_, _, checkpoint) = &requests[2];
+    let (_, _, next_action) = &requests[3];
+    assert!(matches!(action.tool_choice, octos_llm::ToolChoice::Auto));
+    assert!(
+        matches!(checkpoint.tool_choice, octos_llm::ToolChoice::None),
+        "the reflection must forbid tool use on the wire"
+    );
+    assert!(matches!(
+        next_action.tool_choice,
+        octos_llm::ToolChoice::Auto
+    ));
+    assert_eq!(checkpoint.reasoning_effort, action.reasoning_effort);
+    assert_eq!(
+        checkpoint.max_tokens, action.max_tokens,
+        "with a reasoning effort configured the output cap must not change the thinking budget"
+    );
+    assert_eq!(checkpoint.context_management, action.context_management);
+    assert_eq!(checkpoint.prompt_cache_context, action.prompt_cache_context);
+}
+
+/// The single budget-grace call (#1691) belongs to the model's deliverable.
+/// When the grace iteration coincides with a due convergence checkpoint, the
+/// reflection must not consume it and end the turn without an action call.
+#[tokio::test]
+async fn should_not_spend_budget_grace_call_on_convergence_reflection() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_1".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 1 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_2".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 2 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            end_turn("deliverable", 10, 10),
+        ],
+        requests.clone(),
+    ));
+    let mut tools = ToolRegistry::new();
+    // Budget grace is granted only after a PRODUCTIVE tool call (a
+    // substantive result body, see `is_productive_tool_message`).
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body: the abstract, the method section and the evaluation, long enough to be a substantive tool result rather than a short diagnostic string.",
+        true,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("convergence-grace"), provider, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            // Two action bodies, then the budget stop is converted into ONE
+            // grace call — the same body where a call-interval-2 checkpoint
+            // becomes due.
+            max_iterations: 2,
+            ..Default::default()
+        })
+        .with_convergence_intervals(2, 100_000_000, std::time::Duration::from_secs(86_400));
+
+    let response = agent
+        .process_message("read the paper", &[], vec![])
+        .await
+        .expect("turn should complete");
+    assert_eq!(
+        response.content, "deliverable",
+        "the grace call must reach the model as an action call"
+    );
+
+    let requests = requests.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        requests.len(),
+        3,
+        "two action calls plus the grace action call"
+    );
+    let (grace_messages, _) = &requests[2];
+    assert!(
+        grace_messages
+            .iter()
+            .any(|message| message.content.contains("[budget notice]")),
+        "the grace request must carry the FINAL-iteration notice"
+    );
+    assert!(
+        grace_messages
+            .iter()
+            .all(|message| !message.content.contains("CONVERGENCE CHECKPOINT")),
+        "a reflection must not spend the grace call"
+    );
+}
+
+/// #2359: the budget-grace call is the turn's terminal response, so it runs
+/// tools-disabled — a tool result there could never be summarized (the budget
+/// is exhausted; the next response would be the canned budget-stop message).
+/// The model's text is what the user walks away with.
+#[tokio::test]
+async fn should_run_the_budget_grace_call_tools_disabled_and_return_its_synthesis() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_1".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 1 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_2".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 2 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            end_turn(
+                "FINAL: fetched both pages, method and evaluation summarized; nothing remains.",
+                10,
+                30,
+            ),
+        ],
+        requests.clone(),
+    ));
+    let mut tools = ToolRegistry::new();
+    // Budget grace is granted only after a PRODUCTIVE tool call (a
+    // substantive result body, see `is_productive_tool_message`).
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body: the abstract, the method section and the evaluation, long enough to be a substantive tool result rather than a short diagnostic string.",
+        true,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("grace-tools-disabled"),
+        provider,
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        // Two action bodies, then the budget stop is converted into ONE
+        // tools-disabled grace call whose text ends the turn.
+        max_iterations: 2,
+        ..Default::default()
+    });
+
+    let response = agent
+        .process_message("read the paper", &[], vec![])
+        .await
+        .expect("turn should complete");
+    assert_eq!(
+        response.content,
+        "FINAL: fetched both pages, method and evaluation summarized; nothing remains.",
+        "the synthesis must replace the canned budget-stop message"
+    );
+
+    let requests = requests.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        requests.len(),
+        3,
+        "two action calls plus the grace call, nothing after it"
+    );
+    assert!(
+        requests.iter().take(2).all(|(_, tools)| !tools.is_empty()),
+        "the action iterations still carry the full tool slice"
+    );
+    let (grace_messages, grace_tools) = &requests[2];
+    assert!(
+        grace_tools.is_empty(),
+        "the grace call must reach the model tools-disabled"
+    );
+    assert!(
+        grace_messages.iter().any(|message| message
+            .content
+            .contains("tools are disabled in this response")),
+        "the grace request must carry the FINAL-iteration notice"
+    );
+}
+
+/// #2359: a provider that ignores the empty tool slice and emits a tool call
+/// anyway must not buy a canned budget-stop message either — the calls are
+/// dropped (executing them could not be followed by a summary) and the text
+/// it produced ends the turn.
+#[tokio::test]
+async fn should_finish_with_the_grace_text_when_a_provider_ignores_the_tool_slice() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let tool_executions = Arc::new(AtomicUsize::new(0));
+    let mut grace_response = tool_use(
+        vec![ToolCall {
+            id: "call_fetch_3".into(),
+            name: "fetch_paper".into(),
+            arguments: serde_json::json!({ "page": 3 }),
+            metadata: None,
+        }],
+        10,
+        30,
+    );
+    grace_response.content = Some("wrap-up: both pages summarized; nothing remains.".into());
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_1".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 1 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_2".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 2 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            grace_response,
+        ],
+        requests.clone(),
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body: the abstract, the method section and the evaluation, long enough to be a substantive tool result rather than a short diagnostic string.",
+        true,
+        tool_executions.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("grace-call-dropped"), provider, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 2,
+            ..Default::default()
+        });
+
+    let response = agent
+        .process_message("read the paper", &[], vec![])
+        .await
+        .expect("turn should complete");
+    assert_eq!(
+        response.content, "wrap-up: both pages summarized; nothing remains.",
+        "the grace text is the final answer even under a non-compliant provider"
+    );
+    assert_eq!(
+        tool_executions.load(AtomicOrdering::SeqCst),
+        2,
+        "the tool call on the tools-disabled grace iteration must not execute"
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len(),
+        3,
+        "the turn must end on the grace call, not loop into the exhausted budget"
+    );
+}
+
+/// #2359: the verifier's ready gate must not veto the grace synthesis — a
+/// veto would convert it into the canned budget-stop message with no budget
+/// left to act on the verdict (the convergence checkpoint is already exempt
+/// for the same reason).
+#[tokio::test]
+async fn should_not_let_the_verifier_veto_the_grace_synthesis() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fail".into(),
+                    name: "fail_tool".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 1 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            end_turn(
+                "GRACE WRAP-UP: recovered from the failure; nothing remains.",
+                10,
+                30,
+            ),
+        ],
+        requests.clone(),
+    ));
+    let verifier = Arc::new(GateVerifier {
+        calls: AtomicUsize::new(0),
+    });
+    let mut tools = ToolRegistry::new();
+    // The failed call activates the verifier's ready gate, the productive
+    // one earns the grace call.
+    tools.register(StaticResultTool::new(
+        "fail_tool",
+        "[VALIDATION FAILED] style TOML is malformed",
+        false,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body: the abstract, the method section and the evaluation, long enough to be a substantive tool result rather than a short diagnostic string.",
+        true,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("grace-verifier-exempt"),
+        provider,
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        max_iterations: 2,
+        ..Default::default()
+    })
+    .with_verifier_config(AgentVerifierConfig::with_provider(
+        verifier.clone(),
+        "haiku-test",
+    ));
+
+    let response = agent
+        .process_message("read the paper", &[], vec![])
+        .await
+        .expect("turn should complete");
+    assert_eq!(
+        response.content, "GRACE WRAP-UP: recovered from the failure; nothing remains.",
+        "the verifier must not convert the grace synthesis into the canned message"
+    );
+    assert_eq!(
+        verifier.calls.load(AtomicOrdering::SeqCst),
+        1,
+        "only the failure classification may consult the verifier, never the grace turn"
+    );
+}
+
+/// #2359: a grace call that yields no text at all must not end the turn as
+/// an empty answer — the canned budget-stop message is the honest fallback.
+/// The no-text path is reached through an inline-invoke-only response:
+/// `normalize_inline_invokes` strips the markup into a (dropped) tool call,
+/// leaving no text, and the empty-content retry ladder never sees it.
+#[tokio::test]
+async fn should_fall_back_to_the_budget_stop_message_when_the_grace_call_returns_no_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_1".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 1 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_2".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 2 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            end_turn(
+                "<invoke name=\"fetch_paper\"><parameter name=\"page\">3</parameter></invoke>",
+                10,
+                30,
+            ),
+        ],
+        requests.clone(),
+    ));
+    let tool_executions = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body: the abstract, the method section and the evaluation, long enough to be a substantive tool result rather than a short diagnostic string.",
+        true,
+        tool_executions.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("grace-empty-fallback"),
+        provider,
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        max_iterations: 2,
+        ..Default::default()
+    });
+
+    let response = agent
+        .process_message("read the paper", &[], vec![])
+        .await
+        .expect("turn should complete");
+    assert!(
+        response
+            .content
+            .contains("did not complete within 2 iterations"),
+        "an empty grace answer must fall back to the canned budget-stop message, got: {:?}",
+        response.content
+    );
+    assert_eq!(
+        tool_executions.load(AtomicOrdering::SeqCst),
+        2,
+        "the inline-invoked tool on the tools-disabled grace iteration must not execute"
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len(),
+        3,
+        "the turn must end on the grace call"
+    );
+}
+
+#[tokio::test]
+async fn should_send_checkpoint_as_typed_user_tail_with_main_loop_tools_when_convergence_is_due() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let reflection_text =
+        "REFLECTION: the goal is the paper summary; next action is one bounded fetch.";
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_1".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 1 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_2".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 2 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            end_turn(reflection_text, 5, 5),
+            end_turn("final answer", 10, 10),
+        ],
+        requests.clone(),
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body",
+        true,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("convergence-shape"), provider, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        })
+        // Only the call axis can fire: a checkpoint is due once two action
+        // calls have COMPLETED, i.e. before the third action call.
+        .with_convergence_intervals(2, 100_000_000, std::time::Duration::from_secs(86_400));
+
+    let response = agent
+        .process_message("read the paper", &[], vec![])
+        .await
+        .expect("turn should complete");
+    assert_eq!(response.content, "final answer");
+
+    let requests = requests.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        requests.len(),
+        4,
+        "two action calls, checkpoint reflection call, action call"
+    );
+
+    // Stable-prefix contract: no System row may appear after the leading
+    // System run in ANY request of the turn (Anthropic hoists every System
+    // row into the `system` field, so a tail System row rewrites the prefix).
+    for (index, (messages, _)) in requests.iter().enumerate() {
+        let leading = messages
+            .iter()
+            .take_while(|message| message.role == MessageRole::System)
+            .count();
+        assert!(
+            messages[leading..]
+                .iter()
+                .all(|message| message.role != MessageRole::System),
+            "request {index} carries a System row outside the leading run"
+        );
+    }
+
+    // The checkpoint request is the action request plus appended rows, ends
+    // with the checkpoint instruction as a User row, and carries the SAME
+    // tool slice as the action call so its serialized prefix can hit the
+    // provider cache.
+    let (action_messages, action_tools) = &requests[1];
+    let (checkpoint_messages, checkpoint_tools) = &requests[2];
+    let shape = |messages: &[Message]| {
+        messages
+            .iter()
+            .map(|message| (message.role, message.content.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        shape(checkpoint_messages).starts_with(&shape(action_messages)),
+        "the checkpoint request must extend the action request, not rewrite it"
+    );
+    let instruction = checkpoint_messages
+        .last()
+        .expect("checkpoint request has rows");
+    assert_eq!(instruction.role, MessageRole::User);
+    assert!(instruction.content.contains("CONVERGENCE CHECKPOINT"));
+    let tool_names = |tools: &[octos_llm::ToolSpec]| {
+        tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(!action_tools.is_empty());
+    assert_eq!(tool_names(checkpoint_tools), tool_names(action_tools));
+
+    // The reflection reaches the next action call as a typed User tail.
+    let (next_messages, _) = &requests[3];
+    let tail = next_messages.last().expect("next action request has rows");
+    assert_eq!(tail.role, MessageRole::User);
+    assert!(
+        tail.content.starts_with(CHECKPOINT_ENVELOPE_OPEN),
+        "reflection must be a typed context_event envelope, got: {}",
+        tail.content
+    );
+    assert!(tail.content.contains(reflection_text));
+    assert!(tail.content.trim_end().ends_with("</context_event>"));
+
+    // Transient working memory never enters the durable turn log.
+    assert!(response.messages.iter().all(|message| {
+        !message.content.contains(CHECKPOINT_ENVELOPE_OPEN)
+            && !message.content.contains("CONVERGENCE CHECKPOINT")
+    }));
+}
+
+fn message_shape(messages: &[Message]) -> Vec<(MessageRole, String)> {
+    messages
+        .iter()
+        .map(|message| (message.role, message.content.clone()))
+        .collect()
+}
+
+/// Message shape without the transient reflection envelope, which the loop
+/// strips and re-appends after the new durable rows on every iteration.
+fn durable_shape(messages: &[Message]) -> Vec<(MessageRole, String)> {
+    message_shape(messages)
+        .into_iter()
+        .filter(|(_, content)| !content.starts_with(CHECKPOINT_ENVELOPE_OPEN))
+        .collect()
+}
+
+fn tool_names(tools: &[octos_llm::ToolSpec]) -> Vec<String> {
+    tools.iter().map(|tool| tool.name.clone()).collect()
+}
+
+#[tokio::test]
+async fn should_fire_call_checkpoints_after_exactly_n_completed_action_calls_when_tools_keep_running()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
+    let action = |page: u64| {
+        tool_use(
+            vec![ToolCall {
+                id: format!("call_{page}"),
+                name: "fetch_paper".into(),
+                // Distinct arguments per call keep the doom-loop and cycle
+                // detectors quiet; only the checkpoint cadence is under test.
+                arguments: serde_json::json!({ "page": page }),
+                metadata: None,
+            }],
+            10,
+            20,
+        )
+    };
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            action(1),
+            action(2),
+            action(3),
+            end_turn("REFLECTION ONE: keep fetching, one page at a time.", 5, 5),
+            action(4),
+            action(5),
+            action(6),
+            end_turn("REFLECTION TWO: three more pages; converging.", 5, 5),
+            end_turn("final answer", 10, 10),
+        ],
+        requests.clone(),
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body",
+        true,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("convergence-cadence"), provider, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        })
+        .with_convergence_intervals(3, 100_000_000, std::time::Duration::from_secs(86_400));
+
+    let response = agent
+        .process_message("read the whole paper", &[], vec![])
+        .await
+        .expect("turn should complete");
+    assert_eq!(response.content, "final answer");
+
+    let requests = requests.lock().unwrap_or_else(|error| error.into_inner());
+    let is_checkpoint = |messages: &[Message]| {
+        messages.last().is_some_and(|message| {
+            message.role == MessageRole::User && message.content.contains("CONVERGENCE CHECKPOINT")
+        })
+    };
+    let checkpoint_indices = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, (messages, _))| is_checkpoint(messages))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    // 3 actions, checkpoint, 3 actions, checkpoint, final action: nine
+    // requests, with the checkpoints as the 4th and 8th (0-based 3 and 7).
+    assert_eq!(
+        requests.len(),
+        9,
+        "expected 7 action requests and 2 checkpoint requests"
+    );
+    assert_eq!(
+        checkpoint_indices,
+        vec![3, 7],
+        "a call-based checkpoint fires after exactly 3 COMPLETED action calls, \
+         and the reflection call must not count toward the next one"
+    );
+    for index in checkpoint_indices {
+        let (messages, tools) = &requests[index];
+        let instruction = messages.last().expect("checkpoint request has rows");
+        assert!(
+            instruction.content.contains("3 LLM action calls"),
+            "checkpoint {index} must report the completed action calls, got: {}",
+            instruction.content
+        );
+        assert_eq!(tool_names(tools), tool_names(&requests[0].1));
+        // The transient reflection envelope is stripped and re-appended after
+        // the new durable rows each iteration, so compare durable rows only.
+        assert!(
+            durable_shape(messages).starts_with(&durable_shape(&requests[index - 1].0)),
+            "checkpoint {index} must extend the preceding action request's durable rows"
+        );
+    }
+    // Each reflection reaches the following action call as the typed tail.
+    let tail = |index: usize| {
+        requests[index]
+            .0
+            .last()
+            .expect("request has rows")
+            .content
+            .clone()
+    };
+    assert!(tail(4).starts_with(CHECKPOINT_ENVELOPE_OPEN) && tail(4).contains("REFLECTION ONE"));
+    assert!(tail(8).starts_with(CHECKPOINT_ENVELOPE_OPEN) && tail(8).contains("REFLECTION TWO"));
+}
+
+/// Simulates an `AdaptiveRouter` whose per-call slot selection flaps:
+/// `provider_name()`/`model_id()` alternate on every request. Records the
+/// `(affinity_key, epoch_id)` each request carried on its `ChatConfig`.
+struct FlappingRouteProvider {
+    calls: AtomicUsize,
+    responses: StdMutex<Vec<ChatResponse>>,
+    observed_cache_identity: Arc<StdMutex<Vec<(String, String)>>>,
+}
+
+#[async_trait]
+impl LlmProvider for FlappingRouteProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        let context = config
+            .prompt_cache_context
+            .as_ref()
+            .expect("agent attaches a prompt cache context to every call");
+        self.observed_cache_identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push((context.affinity_key.clone(), context.epoch_id.clone()));
+        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        self.responses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop()
+            .ok_or_else(|| eyre::eyre!("scripted provider exhausted"))
+    }
+
+    fn model_id(&self) -> &str {
+        if self.calls.load(AtomicOrdering::SeqCst) % 2 == 0 {
+            "gpt-5"
+        } else {
+            "claude-fallback"
+        }
+    }
+
+    fn provider_name(&self) -> &str {
+        if self.calls.load(AtomicOrdering::SeqCst) % 2 == 0 {
+            "openai"
+        } else {
+            "anthropic"
+        }
+    }
+}
+
+#[tokio::test]
+async fn should_keep_prompt_cache_affinity_stable_when_router_selection_flaps_mid_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(FlappingRouteProvider {
+        calls: AtomicUsize::new(0),
+        // Popped from the back: tool round first, then the final answer.
+        responses: StdMutex::new(vec![
+            end_turn("final answer", 3, 3),
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+        ]),
+        observed_cache_identity: observed.clone(),
+    });
+    let mut tools = ToolRegistry::new();
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body",
+        true,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("route-flap"), provider, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        })
+        .with_parent_session_key("api:private-route-flap-session");
+
+    agent
+        .process_message("read the paper", &[], vec![])
+        .await
+        .expect("turn should complete");
+
+    let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(observed.len(), 2, "one call per routed slot");
+    let (first_affinity, first_epoch) = &observed[0];
+    let (second_affinity, second_epoch) = &observed[1];
+    assert_eq!(
+        first_affinity, second_affinity,
+        "prompt_cache_key must not follow the router's per-call slot selection"
+    );
+    assert_eq!(
+        first_epoch, second_epoch,
+        "the non-OUP fallback epoch must not rotate on a route flap"
+    );
+    assert!(first_affinity.len() <= 64);
+    assert!(!first_affinity.contains("private-route-flap-session"));
 }
 
 #[async_trait]
@@ -885,6 +2604,81 @@ impl Tool for CountingEchoTool {
     }
 }
 
+struct TerminalFailureTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for TerminalFailureTool {
+    fn name(&self) -> &str {
+        "lesson_generate"
+    }
+
+    fn description(&self) -> &str {
+        "Generate one complete lesson"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "tutor_context": { "type": "string" } }
+        })
+    }
+
+    async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(ToolResult {
+            output: "lesson generation exhausted its internal attempts".to_string(),
+            success: false,
+            structured_metadata: Some(serde_json::json!({
+                "retryable": false,
+                "do_not_retry_same_turn": true
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+struct TerminalLessonRetryProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for TerminalLessonRetryProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let suffix = if call == 0 { "first" } else { "rewritten" };
+        Ok(ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: format!("call_lesson_{call}"),
+                name: "lesson_generate".to_string(),
+                // The actual incident changed context strings on every retry.
+                // The guard must key on terminal tool identity, not exact args.
+                arguments: serde_json::json!({ "tutor_context": suffix }),
+                metadata: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
 struct PodcastGenerateTwiceProvider {
     calls: AtomicUsize,
 }
@@ -1113,6 +2907,207 @@ part two"
     );
 }
 
+/// #2359 in the task loop: the grace call `run_task` grants past the budget
+/// is tools-disabled, and its synthesis — not the canned budget-stop
+/// message — is the TaskResult output.
+#[tokio::test]
+async fn run_task_grace_call_is_tools_disabled_and_returns_the_synthesis() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_1".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 1 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_2".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 2 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            end_turn(
+                "FINAL: fetched both pages, method and evaluation summarized; nothing remains.",
+                10,
+                30,
+            ),
+        ],
+        requests.clone(),
+    ));
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body: the abstract, the method section and the evaluation, long enough to be a substantive tool result rather than a short diagnostic string.",
+        true,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("task-grace-tools-disabled"),
+        provider,
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        // Two action bodies, then the budget stop is converted into ONE
+        // tools-disabled grace call whose text ends the task.
+        max_iterations: 2,
+        ..Default::default()
+    });
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "read the paper".to_string(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        },
+    );
+
+    let result = agent.run_task(&task).await.unwrap();
+
+    assert!(
+        result.success,
+        "the grace synthesis ends the task successfully"
+    );
+    assert_eq!(
+        result.output,
+        "FINAL: fetched both pages, method and evaluation summarized; nothing remains.",
+        "the synthesis must replace the canned budget-stop output"
+    );
+
+    let requests = requests.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        requests.len(),
+        3,
+        "two action calls plus the grace call, nothing after it"
+    );
+    assert!(
+        requests.iter().take(2).all(|(_, tools)| !tools.is_empty()),
+        "the action iterations still carry the full tool slice"
+    );
+    let (grace_messages, grace_tools) = &requests[2];
+    assert!(
+        grace_tools.is_empty(),
+        "the grace call must reach the model tools-disabled"
+    );
+    assert!(
+        grace_messages.iter().any(|message| message
+            .content
+            .contains("tools are disabled in this response")),
+        "the grace request must carry the FINAL-iteration notice"
+    );
+}
+
+/// #2359: a provider truncating the grace answer (MaxTokens stop) must not
+/// be silently upgraded to a complete success — the forced-terminal grace
+/// re-applies the partial-output marker and keeps `success: false`.
+#[tokio::test]
+async fn run_task_grace_truncation_stays_marked_as_partial_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut truncated = end_turn(
+        "The evaluation section compares the three approaches and finds",
+        10,
+        30,
+    );
+    truncated.stop_reason = StopReason::MaxTokens;
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_1".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 1 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            tool_use(
+                vec![ToolCall {
+                    id: "call_fetch_2".into(),
+                    name: "fetch_paper".into(),
+                    arguments: serde_json::json!({ "page": 2 }),
+                    metadata: None,
+                }],
+                10,
+                20,
+            ),
+            truncated,
+        ],
+        requests.clone(),
+    ));
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(StaticResultTool::new(
+        "fetch_paper",
+        "paper body: the abstract, the method section and the evaluation, long enough to be a substantive tool result rather than a short diagnostic string.",
+        true,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("task-grace-truncated"),
+        provider,
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        max_iterations: 2,
+        ..Default::default()
+    });
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "read the paper".to_string(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        },
+    );
+
+    let result = agent.run_task(&task).await.unwrap();
+
+    assert!(
+        !result.success,
+        "a truncated grace answer is not a complete deliverable"
+    );
+    assert!(
+        result
+            .output
+            .starts_with("[partial output: max_output_tokens reached before a final answer]"),
+        "the partial-output marker must survive the forced-terminal grace: {:?}",
+        result.output
+    );
+    assert!(
+        result.output.contains("The evaluation section compares"),
+        "the truncated text itself must still be reported: {:?}",
+        result.output
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len(),
+        3,
+        "the task must end on the grace call, not loop into the exhausted budget"
+    );
+}
+
 #[tokio::test]
 async fn process_message_preserves_tool_pair_order_across_iterations() {
     let dir = tempfile::tempdir().unwrap();
@@ -1252,6 +3247,42 @@ async fn process_message_blocks_second_podcast_generate_when_session_limit_is_on
             && content.contains("podcast_generate")
             && content.contains("max 1")
     }));
+}
+
+#[tokio::test]
+async fn terminal_tool_failure_blocks_a_rewritten_retry_in_the_same_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(TerminalFailureTool {
+        calls: Arc::clone(&calls),
+    });
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(TerminalLessonRetryProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
+
+    let result = agent
+        .process_message("teach me", &[], vec![])
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        result.content,
+        terminal_tool_retry_message("lesson_generate"),
+    );
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .count(),
+        1,
+        "the rewritten second call must be stopped before it creates another tool result",
+    );
 }
 
 #[tokio::test]
@@ -4023,8 +6054,7 @@ fn should_return_none_when_all_managed_repos_are_ready() {
     let failures = inspect_workspace_contract_failures(tmp.path());
     assert!(
         failures.is_none(),
-        "ready workspace should not produce contract failure summary: {:?}",
-        failures
+        "ready workspace should not produce contract failure summary: {failures:?}"
     );
 }
 
@@ -4038,13 +6068,11 @@ fn should_return_failure_summary_when_managed_repo_is_not_ready() {
         .expect("broken workspace must produce contract failure summary");
     assert!(
         failures.contains("slides/broken"),
-        "summary should name the failing repo:\n{}",
-        failures
+        "summary should name the failing repo:\n{failures}"
     );
     assert!(
         failures.contains("completion failed") || failures.contains("artifact missing"),
-        "summary should describe what failed:\n{}",
-        failures
+        "summary should describe what failed:\n{failures}"
     );
 }
 
@@ -4062,8 +6090,7 @@ fn should_return_failure_summary_with_mixed_repos() {
     // ready-deck is not in the failing set.
     assert!(
         !failures.contains("ready-deck") || failures.contains("broken-deck"),
-        "ready-deck should not appear as a failure:\n{}",
-        failures
+        "ready-deck should not appear as a failure:\n{failures}"
     );
 }
 
@@ -5476,6 +7503,57 @@ async fn should_not_emit_turn_failure_when_hook_denies_llm_call_under_failfast()
     );
 }
 
+/// #2249 — a `before_llm_call` deny is expected policy behaviour, not a
+/// harness bug: the classified error event must carry `variant="policy"
+/// recovery="expected"` so operator dashboards stop paging on it.
+#[tokio::test]
+#[cfg(unix)]
+async fn should_classify_hook_deny_as_policy_not_internal_bug() {
+    use crate::hooks::{HookConfig, HookEvent, HookExecutor};
+
+    let dir = tempfile::tempdir().unwrap();
+    let chat_calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn LlmProvider> = Arc::new(AlwaysErrorProvider {
+        chat_calls: chat_calls.clone(),
+    });
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let hooks = Arc::new(HookExecutor::new(vec![HookConfig {
+        event: HookEvent::BeforeLlmCall,
+        command: vec!["false".into()],
+        timeout_ms: 5000,
+        tool_filter: vec![],
+        path_filter: vec![],
+        requires_bin: None,
+    }]));
+    let sink_path = dir.path().join("harness-events.jsonl");
+    let agent = Agent::new(AgentId::new("hookdeny-policy"), provider, tools, memory)
+        .with_hooks(hooks)
+        .with_harness_event_sink(sink_path.to_string_lossy().into_owned());
+
+    let result = agent.run_task(&task_for("hi", dir.path())).await;
+
+    assert!(result.is_err(), "hook-deny must still bail with Err");
+    assert_eq!(
+        chat_calls.load(AtomicOrdering::SeqCst),
+        0,
+        "hook denied the call before the provider was reached"
+    );
+    let sink = std::fs::read_to_string(&sink_path).expect("error event written to sink");
+    let error_events: Vec<_> = sink
+        .lines()
+        .filter_map(|line| crate::harness_events::HarnessEvent::from_json_line(line).ok())
+        .filter_map(|event| match event.payload {
+            crate::harness_events::HarnessEventPayload::Error { data } => Some(data),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(error_events.len(), 1, "exactly one classified error event");
+    assert_eq!(error_events[0].variant, "policy");
+    assert_eq!(error_events[0].recovery, "expected");
+    assert!(error_events[0].message.contains("denied by hook"));
+}
+
 /// Records the message contents of every LLM call and returns EndTurn
 /// immediately. Used to assert what the model actually saw and that it was
 /// (or was not) called at all.
@@ -5825,6 +7903,19 @@ async fn should_run_extra_round_when_steer_lands_after_final_answer() {
 
     // The steer forced a second round and the turn ends on ITS answer.
     assert_eq!(result.content, "second answer");
+    let first_index = result
+        .messages
+        .iter()
+        .position(|message| {
+            message.role == MessageRole::Assistant && message.content == "first answer"
+        })
+        .unwrap();
+    assert_eq!(
+        result.assistant_segments.message_iterations,
+        vec![(first_index, 1)],
+        "the tool-free pre-steer answer has its own producer identity"
+    );
+    assert_eq!(result.assistant_segments.final_iteration, 2);
     let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
     assert_eq!(
         observed.len(),
@@ -5896,12 +7987,14 @@ async fn should_preserve_fifo_order_when_multiple_steers_accumulate() {
     );
 }
 
-/// With a drained-callback registered, the HOST owns steer-row persistence:
-/// the callback sees the drained batch (before the next LLM call) and the
-/// rows stay OUT of the turn output log so end-of-turn persistence cannot
-/// double-write them. The prompt still carries them.
+/// The drained-callback is a live hook (the host may echo the steer to a
+/// client); it never owns persistence. The steer stays in the chronological
+/// turn output log at its model-visible position — after the answer it
+/// followed — so the end-of-turn persist writes durable rows in the order
+/// the model saw them and a context ledger rebuilt from that history keeps
+/// the chronology. The prompt carries it too.
 #[tokio::test]
-async fn should_hand_drained_steers_to_callback_and_skip_output_log() {
+async fn should_hand_drained_steers_to_callback_and_keep_them_in_output_log_order() {
     let dir = tempfile::tempdir().unwrap();
     let tools = ToolRegistry::with_builtins(dir.path());
     let buffer: crate::steering::SharedSteerBuffer =
@@ -5939,15 +8032,28 @@ async fn should_hand_drained_steers_to_callback_and_skip_output_log() {
         batches.as_slice(),
         [vec!["persist me host-side".to_string()]]
     );
-    // Host owns persistence → the row must NOT ride the output log.
+    // The durable log carries the steer exactly once, AFTER the first answer
+    // it was injected behind (chronological persistence is what lets a
+    // rebuild from session history reproduce the model-visible order).
+    let steer_rows = result
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == MessageRole::User && m.content == "persist me host-side")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(steer_rows.len(), 1, "log: {:?}", result.messages);
+    let first_answer = result
+        .messages
+        .iter()
+        .position(|m| m.role == MessageRole::Assistant)
+        .expect("first answer in the durable log");
     assert!(
-        !result
-            .messages
-            .iter()
-            .any(|m| m.role == MessageRole::User && m.content == "persist me host-side"),
-        "steer rows must stay out of the turn output log when the host persists them"
+        steer_rows[0] > first_answer,
+        "the steer must follow the answer it was injected behind: {:?}",
+        result.messages
     );
-    // ...but the model did see it.
+    // ...and the model did see it.
     let observed = observed.lock().unwrap_or_else(|error| error.into_inner());
     assert!(
         observed[1]
@@ -6078,4 +8184,899 @@ fn repeated_identical_failing_command_still_trips_the_retry_limit() {
     let recovery =
         recover_shell_retry(&messages, 4).expect("the same command failing repeatedly is a spiral");
     assert!(matches!(recovery.kind, ShellRetryRecoveryKind::RetryLimit));
+}
+
+/// Append-only measurement, end to end through the real loop.
+///
+/// The point of the audit is to answer one question with evidence rather than
+/// argument: does octos already rewrite request history in place? This drives
+/// two real turns on one agent — the second carrying the first's oversized
+/// tool result as history — which is the shape `truncate_old_tool_results`
+/// acts on, and asserts the audit both RAN and reported it.
+///
+/// The `RAN` half matters as much as the finding. An earlier version of this
+/// measurement reported nothing, and the nothing meant only that octos-agent's
+/// lib tests install no `tracing` subscriber, so every `warn!` went nowhere.
+/// A measurement whose silence cannot be distinguished from absence is not a
+/// measurement, so findings are recorded out-of-band and asserted here.
+#[tokio::test]
+async fn append_only_audit_observes_the_in_place_truncation_across_turns() {
+    crate::agent::append_only_audit::arm_for_test();
+    let _ = crate::agent::append_only_audit::drain_findings();
+    let before = crate::agent::append_only_audit::finding_count();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    // Comfortably past the 800-char collapse threshold.
+    tools.register(NamedEchoTool {
+        name: "alpha",
+        output: BIG_TOOL_OUTPUT,
+    });
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(MultiToolThenEndProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("append-only-audit"), provider, tools, memory);
+
+    let first = agent.process_message("do work", &[], vec![]).await.unwrap();
+    // Second turn carries the first turn's tool results as history, which is
+    // what puts them BEFORE the newest user message.
+    let _second = agent
+        .process_message("and now the next thing", &first.messages, vec![])
+        .await
+        .unwrap();
+
+    let after = crate::agent::append_only_audit::finding_count();
+    let findings = crate::agent::append_only_audit::drain_findings();
+    crate::agent::append_only_audit::disarm_for_test();
+
+    assert!(
+        after > before,
+        "the audit must have RUN; a silent result here means the wiring is dead, \
+         not that octos is append-only (findings: {findings:?})"
+    );
+    assert!(
+        findings.iter().any(|f| f.contains("rewritten in place")),
+        "expected an in-place rewrite across turns; got {findings:?}"
+    );
+}
+
+/// Large enough that `truncate_old_tool_results` collapses it.
+const BIG_TOOL_OUTPUT: &str = concat!(
+    "BEGIN-LARGE-TOOL-RESULT ",
+    include_str!("append_only_audit.rs"),
+);
+
+/// A tool whose output overflows the cap and which knows how to resume.
+struct OverflowingPagedTool;
+
+#[async_trait]
+impl Tool for OverflowingPagedTool {
+    fn name(&self) -> &str {
+        "overflowing_paged"
+    }
+
+    fn description(&self) -> &str {
+        "Return more output than the per-tool cap allows"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+
+    async fn execute(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        Ok(ToolResult {
+            // Comfortably past the 50_000-byte default cap.
+            output: "y".repeat(120_000),
+            success: true,
+            ..Default::default()
+        })
+    }
+
+    fn truncation_recovery(
+        &self,
+        args: &serde_json::Value,
+        omitted_bytes: usize,
+    ) -> Option<String> {
+        let page = args
+            .get("page")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        Some(format!(
+            "[{omitted_bytes} bytes omitted] Continue with page: {}.",
+            page + 1
+        ))
+    }
+}
+
+struct CallsOverflowingToolThenEnds {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for CallsOverflowingToolThenEnds {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(if call == 0 {
+            ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_overflow".to_string(),
+                    name: "overflowing_paged".to_string(),
+                    arguments: serde_json::json!({ "page": 0 }),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        } else {
+            ChatResponse {
+                content: Some("done".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+
+    fn provider_name(&self) -> &str {
+        "test-provider"
+    }
+}
+
+/// The wiring test: a truncated tool result must reach the model carrying its
+/// recovery advice.
+///
+/// The unit tests prove `truncation_recovery` returns good text. They prove
+/// nothing about whether the execution loop ever CALLS it — and an unwired
+/// hook that returns perfect advice into the void is the failure mode this
+/// whole change exists to remove. So this drives the real loop and inspects
+/// the tool message the model actually received.
+#[tokio::test]
+async fn truncated_tool_output_reaches_the_model_with_its_recovery_advice() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(OverflowingPagedTool);
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(CallsOverflowingToolThenEnds {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("truncation-recovery"), provider, tools, memory);
+
+    let result = agent.process_message("go", &[], vec![]).await.unwrap();
+
+    let tool_message = result
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .expect("the turn must contain the tool result");
+
+    assert!(
+        tool_message.content.len() < 120_000,
+        "the cap must still apply: got {} bytes",
+        tool_message.content.len()
+    );
+    assert!(
+        tool_message.content.contains("Continue with page: 1."),
+        "the truncated result must carry the tool's recovery advice, otherwise the model is \
+         left at a dead end and can only re-run the same call; tail was: {:?}",
+        &tool_message.content[tool_message.content.len().saturating_sub(200)..]
+    );
+}
+
+/// #2197 mock: two identical unbounded `read_file` calls, then EndTurn.
+struct ReadsSameFileTwiceThenEnds {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmProvider for ReadsSameFileTwiceThenEnds {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(if call < 2 {
+            ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("call_read_{call}"),
+                    name: "read_file".to_string(),
+                    arguments: serde_json::json!({ "path": "many_tiny.txt" }),
+                    metadata: None,
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        } else {
+            ChatResponse {
+                content: Some("done".to_string()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: StopReason::EndTurn,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            }
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+
+    fn provider_name(&self) -> &str {
+        "test-provider"
+    }
+}
+
+/// #2197 end-to-end through the real loop: an unbounded read whose formatted
+/// output crosses the tool's internal output cut must not poison the
+/// file-state cache as a "complete" view. The unit tests prove the tool
+/// records the emitted range; this drives the real loop (registry builtins,
+/// real `FileStateCache`, the loop's head/tail backstop) and inspects what
+/// the model actually receives for the SECOND identical read — real content
+/// with the advising footer, never `[FILE_UNCHANGED] (full file cached)`.
+#[tokio::test]
+async fn repeated_read_of_a_cut_file_reaches_the_model_as_content_not_a_stub() {
+    let dir = tempfile::tempdir().unwrap();
+    // 32,000 raw bytes — under the #2131 unbounded-read refusal budget —
+    // whose formatted form (11 bytes/line) exceeds the unarmed cut budget.
+    std::fs::write(dir.path().join("many_tiny.txt"), "x\n".repeat(16_000)).unwrap();
+
+    let tools = ToolRegistry::with_builtins(dir.path());
+    let provider: Arc<dyn LlmProvider> = Arc::new(ReadsSameFileTwiceThenEnds {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("read-cut-cache"), provider, tools, memory)
+        .with_file_state_cache(Arc::new(crate::file_state_cache::FileStateCache::new()));
+
+    let result = agent.process_message("go", &[], vec![]).await.unwrap();
+
+    let tool_messages: Vec<&Message> = result
+        .messages
+        .iter()
+        .filter(|m| m.role == MessageRole::Tool)
+        .collect();
+    assert_eq!(
+        tool_messages.len(),
+        2,
+        "two read_file calls, two tool messages: {:?}",
+        result.messages.iter().map(|m| m.role).collect::<Vec<_>>()
+    );
+    let second = &tool_messages[1].content;
+    assert!(
+        !second.contains("[FILE_UNCHANGED]"),
+        "a truncated first view must never be served back as unchanged-complete: {second}"
+    );
+    assert!(
+        second.contains("Continue with offset:"),
+        "the honest answer is the advised first page again: {second}"
+    );
+    assert!(
+        !second.contains("bytes omitted"),
+        "the in-tool advising cut is sized under the loop cap, so the blind \
+         head/tail backstop must never middle-elide a read_file page: {second}"
+    );
+    assert_eq!(
+        tool_messages[0].content, *second,
+        "an uncacheable partial view is re-served byte-identically, not stubbed"
+    );
+}
+
+/// Every `<digits> bytes omitted` count in `content`, in order of appearance.
+fn omitted_byte_counts(content: &str) -> Vec<u64> {
+    let mut counts = Vec::new();
+    for (idx, _) in content.match_indices(" bytes omitted") {
+        let digits: Vec<char> = content[..idx]
+            .chars()
+            .rev()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let digits: String = digits.into_iter().rev().collect();
+        if !digits.is_empty() {
+            counts.push(digits.parse().expect("ascii digits"));
+        }
+    }
+    counts
+}
+
+/// The backstop's inline marker (`... [N bytes omitted] ...`) and the
+/// recovery advice the tool composes (`[N bytes omitted] Continue...`) are
+/// two tellings of the SAME cut and must carry the same byte count.
+///
+/// The legacy loop recomputed the recovery count as
+/// `untruncated_len - content.len()`, which undercounts by the length of the
+/// elision marker itself — the model was shown two numbers that never agreed.
+/// The structured `truncate_head_tail_report` hands both consumers the one
+/// `omitted_bytes` the split actually measured.
+#[tokio::test]
+async fn should_agree_on_omitted_bytes_between_marker_and_recovery_when_backstop_truncates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(OverflowingPagedTool);
+
+    let provider: Arc<dyn LlmProvider> = Arc::new(CallsOverflowingToolThenEnds {
+        calls: AtomicUsize::new(0),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("truncation-agree"), provider, tools, memory);
+
+    let result = agent.process_message("go", &[], vec![]).await.unwrap();
+    let tool_message = result
+        .messages
+        .iter()
+        .find(|m| m.role == MessageRole::Tool)
+        .expect("the turn must contain the tool result");
+
+    let counts = omitted_byte_counts(&tool_message.content);
+    assert_eq!(
+        counts.len(),
+        2,
+        "expected the elision marker and the recovery advice to each name a count; tail: {:?}",
+        &tool_message.content[tool_message.content.len().saturating_sub(300)..]
+    );
+    assert_eq!(
+        counts[0], counts[1],
+        "marker and recovery advice must agree on how much was omitted"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #27d (R4) — malformed tool-call feedback buffer
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A provider whose first N `chat` calls fail with
+/// `StreamError::MalformedArgs` and whose subsequent calls succeed with the
+/// scripted response — models "the model emitted broken tool-call JSON, then
+/// self-corrected after seeing the diagnostic".
+struct MalformedThenOkProvider {
+    malformed_first: StdMutex<usize>,
+    ok_response: ChatResponse,
+}
+
+#[async_trait]
+impl LlmProvider for MalformedThenOkProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        let mut guard = self
+            .malformed_first
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *guard > 0 {
+            *guard -= 1;
+            return Err(eyre::Report::new(octos_llm::StreamError::MalformedArgs {
+                tool_id: "call_bad".to_string(),
+                tool_name: "shell".to_string(),
+                error: "expected `,` or `}` at line 1 column 4123".to_string(),
+            }));
+        }
+        Ok(self.ok_response.clone())
+    }
+
+    fn model_id(&self) -> &str {
+        "malformed-then-ok"
+    }
+
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+fn plain_text_response(content: &str) -> ChatResponse {
+    ChatResponse {
+        content: Some(content.to_owned()),
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+        stop_reason: octos_llm::StopReason::EndTurn,
+        usage: octos_llm::TokenUsage {
+            input_tokens: 5,
+            output_tokens: 5,
+            ..Default::default()
+        },
+        provider_index: None,
+    }
+}
+
+/// #27d — a MalformedArgs failure is fed back as a diagnostic message; the
+/// model self-corrects on the next call and the TURN SURVIVES (pre-#27d the
+/// same stream error terminated the turn instantly).
+#[tokio::test]
+async fn malformed_toolcall_feedback_lets_model_self_correct_and_survive() {
+    let provider: Arc<dyn LlmProvider> = Arc::new(MalformedThenOkProvider {
+        malformed_first: StdMutex::new(1),
+        ok_response: plain_text_response("recovered: valid tool call emitted"),
+    });
+    let tools = ToolRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("malformed-feedback"), provider, tools, memory);
+    let response = agent
+        .process_message("do the thing with a tool", &[], vec![])
+        .await
+        .expect("turn survives the malformed tool call after feedback");
+    assert_eq!(
+        response.content, "recovered: valid tool call emitted",
+        "the model's post-correction reply is the turn's answer"
+    );
+}
+
+/// #27d — after MALFORMED_TOOLCALL_FEEDBACK_LIMIT (3) fed-back diagnostics
+/// the buffer is exhausted and the turn terminates with the error (the
+/// pinned pre-#27d behavior).
+#[tokio::test]
+async fn malformed_toolcall_feedback_exhausts_and_terminates() {
+    let provider: Arc<dyn LlmProvider> = Arc::new(MalformedThenOkProvider {
+        malformed_first: StdMutex::new(10), // never self-corrects
+        ok_response: plain_text_response("unreachable"),
+    });
+    let tools = ToolRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("malformed-exhaust"), provider, tools, memory);
+    let result = agent
+        .process_message("never produces valid JSON", &[], vec![])
+        .await;
+    let err = result.expect_err("exhausted malformed budget terminates the turn");
+    assert!(
+        err.to_string().contains("MalformedArgs")
+            || err.to_string().contains("malformed")
+            || err.to_string().contains("arguments"),
+        "the terminal error names the malformed-args failure: {err}"
+    );
+}
+
+// --- build_chat_config: temperature/max_tokens override semantics (#2172) ---
+
+#[test]
+fn build_chat_config_keeps_default_temperature_when_unset() {
+    // Cloud-safety invariant: with no chat_temperature override, the chat
+    // temperature must remain the built-in ChatConfig default (0.0), so cloud
+    // requests are byte-for-byte unchanged.
+    let cfg = AgentConfig {
+        chat_temperature: None,
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg, false);
+    assert_eq!(chat.temperature, ChatConfig::default().temperature);
+    assert_eq!(chat.temperature, Some(0.0));
+}
+
+#[test]
+fn build_chat_config_applies_temperature_override() {
+    let cfg = AgentConfig {
+        chat_temperature: Some(0.7),
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg, false);
+    assert_eq!(chat.temperature, Some(0.7));
+}
+
+#[test]
+fn build_chat_config_threads_sampling_params() {
+    // #2172: chat_sampling_params flows into ChatConfig.sampling_params; unset
+    // → None (cloud unchanged).
+    let mut sp = serde_json::Map::new();
+    sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+    let cfg = AgentConfig {
+        chat_sampling_params: Some(sp),
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg, false);
+    assert_eq!(
+        chat.sampling_params
+            .as_ref()
+            .and_then(|m| m.get("repeat_penalty")),
+        Some(&serde_json::json!(1.1))
+    );
+    assert_eq!(
+        build_chat_config(&AgentConfig::default(), false).sampling_params,
+        None
+    );
+}
+
+// --- chat_config: render-time media scope root wiring (#2480) ---
+
+#[tokio::test]
+async fn chat_config_carries_the_registry_workspace_root_for_render_time_media_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    // `with_builtins` records the cwd as the registry's workspace root — the
+    // same root the file tools validate media paths against at tool time.
+    let agent = Agent::new(
+        AgentId::new("media-scope-root"),
+        Arc::new(TerminalScript(ScriptedProvider::new(vec![]))),
+        ToolRegistry::with_builtins(dir.path()),
+        memory.clone(),
+    );
+    assert_eq!(
+        agent.chat_config().media_scope_root.as_deref(),
+        Some(dir.path()),
+        "providers re-walk media ancestors against this root at request build"
+    );
+
+    // A registry with no workspace root keeps the leaf-only guard.
+    let agent = Agent::new(
+        AgentId::new("media-scope-none"),
+        Arc::new(TerminalScript(ScriptedProvider::new(vec![]))),
+        ToolRegistry::new(),
+        memory.clone(),
+    );
+    assert_eq!(agent.chat_config().media_scope_root, None);
+
+    // A host-scope registry never walked media ancestors at tool time
+    // (coding_tools passes no stop for `FilesystemScope::Host`); the request
+    // build must not start holding its paths to that walk.
+    let agent = Agent::new(
+        AgentId::new("media-scope-host"),
+        Arc::new(TerminalScript(ScriptedProvider::new(vec![]))),
+        ToolRegistry::with_builtins_and_permissions(
+            dir.path(),
+            Box::new(crate::sandbox::NoSandbox),
+            crate::policy::EffectivePermissions::danger_full_access(),
+        ),
+        memory,
+    );
+    assert_eq!(agent.chat_config().media_scope_root, None);
+}
+
+#[test]
+fn build_chat_config_applies_max_tokens_override_independently() {
+    // Overrides compose without clobbering each other.
+    let cfg = AgentConfig {
+        chat_max_tokens: Some(4096),
+        chat_temperature: Some(0.5),
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg, false);
+    assert_eq!(chat.max_tokens, Some(4096));
+    assert_eq!(chat.temperature, Some(0.5));
+}
+
+#[test]
+fn build_chat_config_local_provider_unsets_temperature() {
+    // #2229: on a local provider with no explicit chat_temperature, temperature
+    // is left UNSET (None) so the server samples — the request omits it — rather
+    // than forcing greedy 0.0 (which degenerates local reasoning models).
+    let cfg = AgentConfig {
+        chat_temperature: None,
+        ..AgentConfig::default()
+    };
+    let chat = build_chat_config(&cfg, true);
+    assert_eq!(chat.temperature, None);
+    // Cloud path is unchanged: still the built-in 0.0.
+    assert_eq!(build_chat_config(&cfg, false).temperature, Some(0.0));
+}
+
+#[test]
+fn build_chat_config_local_provider_respects_explicit_temperature() {
+    // An explicit override always wins, even on local.
+    let cfg = AgentConfig {
+        chat_temperature: Some(0.6),
+        ..AgentConfig::default()
+    };
+    assert_eq!(build_chat_config(&cfg, true).temperature, Some(0.6));
+}
+
+// --- #2174: conversation-loop recovery from a degenerate empty MaxTokens ---
+
+fn empty_max_tokens_response() -> ChatResponse {
+    // Models the REAL degenerate case: the whole output budget was spent on
+    // reasoning, so `content` is empty and there are no tool calls. Private
+    // reasoning is not an answer: terminal-integrity retries treat this as
+    // empty and eventually return an explicit error if no answer arrives.
+    ChatResponse {
+        content: None,
+        reasoning_content: Some("(long internal reasoning, no final answer)".to_string()),
+        tool_calls: vec![],
+        stop_reason: StopReason::MaxTokens,
+        usage: LlmTokenUsage {
+            input_tokens: 5,
+            output_tokens: 128,
+            ..Default::default()
+        },
+        provider_index: None,
+    }
+}
+
+async fn run_conversation_response(responses: Vec<ChatResponse>) -> Result<ConversationResponse> {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let tools = ToolRegistry::new();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("empty-maxtokens"), provider, tools, memory).with_config(
+        AgentConfig {
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    agent.process_message("go", &[], vec![]).await
+}
+
+#[tokio::test]
+async fn empty_max_tokens_recovers_when_retry_succeeds() {
+    // A degenerate empty MaxTokens (no content, no tool call) must trigger a
+    // nudge-and-retry instead of returning empty; the retry succeeds and its
+    // content is returned — not a silent empty exit.
+    let response = run_conversation_response(vec![
+        empty_max_tokens_response(),
+        end_turn("recovered answer", 4, 6),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(response.content, "recovered answer");
+}
+
+/// Always returns the degenerate empty-MaxTokens response, so the loop's
+/// behavior is bounded solely by the recovery cap (not by a fixed script).
+struct AlwaysEmptyMaxTokensProvider(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait]
+impl LlmProvider for AlwaysEmptyMaxTokensProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(empty_max_tokens_response())
+    }
+    fn model_id(&self) -> &str {
+        "always-empty"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn empty_max_tokens_surfaces_error_after_recovery_exhausted() {
+    // A model that keeps returning a degenerate empty MaxTokens: the loop does
+    // two bounded recoveries then surfaces a clear terminal error rather than a
+    // silent empty return. If the recovery counter did NOT persist across
+    // iterations this would instead loop until max_iterations — so this also
+    // pins the bound.
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider = Arc::new(AlwaysEmptyMaxTokensProvider(calls.clone()));
+    let tools = ToolRegistry::new();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("empty-maxtokens"), provider, tools, memory).with_config(
+        AgentConfig {
+            max_iterations: 10,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    // Uses the default (non-FailFast) call policy — the path `octos chat`
+    // takes, where an empty-but-reasoning MaxTokens reaches the conversation
+    // loop rather than being failed fast. (Under FailFast the empty response is
+    // terminal earlier, a different — also non-silent — outcome.)
+    let error = agent.process_message("go", &[], vec![]).await.unwrap_err();
+    assert!(
+        error.to_string().contains("empty response after"),
+        "{error:#}"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        10,
+        "two call-level recovery rounds must stay bounded"
+    );
+}
+
+#[tokio::test]
+async fn non_empty_max_tokens_preserves_partial_content_without_claiming_success() {
+    // Real partial text is retained without retrying or relabeling truncation
+    // as a successfully completed turn.
+    let error = run_conversation_response(vec![ChatResponse {
+        content: Some("partial but real".to_string()),
+        reasoning_content: None,
+        tool_calls: vec![],
+        stop_reason: StopReason::MaxTokens,
+        usage: LlmTokenUsage {
+            input_tokens: 5,
+            output_tokens: 128,
+            ..Default::default()
+        },
+        provider_index: None,
+    }])
+    .await
+    .unwrap_err();
+    let incomplete = error
+        .downcast_ref::<crate::agent::IncompleteResponseError>()
+        .expect("truncation keeps its typed partial response");
+    assert_eq!(incomplete.partial.content, "partial but real");
+    assert_eq!(incomplete.partial.token_usage.input_tokens, 5);
+    assert_eq!(incomplete.partial.token_usage.output_tokens, 128);
+}
+
+// --- PersistentRetryStateGuard shared-handle write-back (#1655) ---
+
+#[test]
+fn should_not_write_back_when_turn_left_retry_state_unmodified() {
+    // A turn that observed no errors must not touch the shared handle at
+    // all: a concurrent turn's increments landed after this guard loaded,
+    // and an unconditional write-back would silently discard them.
+    let handle = Arc::new(StdMutex::new(LoopRetryState::default()));
+    let guard = PersistentRetryStateGuard::new(Some(handle.clone()));
+
+    // Concurrent turn observes two rate-limits while `guard` is alive.
+    {
+        let mut shared = handle.lock().unwrap();
+        shared.counters.rate_limited = 2;
+    }
+
+    drop(guard);
+    assert_eq!(
+        handle.lock().unwrap().counters.rate_limited,
+        2,
+        "clean turn must not clobber concurrent increments"
+    );
+}
+
+#[test]
+fn should_preserve_both_turns_increments_when_turns_overlap() {
+    // Two turns sharing one handle, each observing different errors from
+    // the same base: the merged state must reflect BOTH turns' increments,
+    // so a bucket that crossed its limit cannot be rolled back to a
+    // pre-exhaustion count by the later drop.
+    let handle = Arc::new(StdMutex::new(LoopRetryState::default()));
+    let mut turn_a = PersistentRetryStateGuard::new(Some(handle.clone()));
+    let mut turn_b = PersistentRetryStateGuard::new(Some(handle.clone()));
+
+    turn_a.counters.rate_limited += 2;
+    turn_b.counters.rate_limited += 1;
+    turn_b.counters.network += 3;
+
+    drop(turn_a);
+    drop(turn_b);
+
+    let shared = handle.lock().unwrap();
+    assert_eq!(shared.counters.rate_limited, 3);
+    assert_eq!(shared.counters.network, 3);
+}
+
+#[test]
+fn should_preserve_both_turns_increments_when_dropped_in_reverse_order() {
+    // Reverse-order twin of
+    // `should_preserve_both_turns_increments_when_turns_overlap` (#2221):
+    // dropping turn B first exercises the same delta merge from the other
+    // side — `rate_limited`, the bucket BOTH turns incremented, must still
+    // accumulate 2 + 1 regardless of which drop runs the merge first.
+    let handle = Arc::new(StdMutex::new(LoopRetryState::default()));
+    let mut turn_a = PersistentRetryStateGuard::new(Some(handle.clone()));
+    let mut turn_b = PersistentRetryStateGuard::new(Some(handle.clone()));
+
+    turn_a.counters.rate_limited += 2;
+    turn_b.counters.rate_limited += 1;
+    turn_b.counters.network += 3;
+
+    drop(turn_b);
+    drop(turn_a);
+
+    let shared = handle.lock().unwrap();
+    assert_eq!(shared.counters.rate_limited, 3);
+    assert_eq!(shared.counters.network, 3);
+}
+
+#[test]
+fn should_write_back_exact_state_when_no_concurrent_writer() {
+    // Single-agent regression: with no concurrent writer the drop must
+    // reproduce today's byte-for-byte write-back, including the grace-call
+    // reset of `productive_tool_calls_since_last_grace` (a non-monotonic
+    // field, so a naive max-merge would corrupt it).
+    let handle = Arc::new(StdMutex::new(LoopRetryState {
+        productive_tool_calls_since_last_grace: 3,
+        ..Default::default()
+    }));
+    {
+        let mut guard = PersistentRetryStateGuard::new(Some(handle.clone()));
+        guard.observe_budget_exhaustion(); // fires the grace call, resets the counter
+        guard.counters.timeout += 1;
+    }
+
+    let shared = handle.lock().unwrap();
+    assert_eq!(shared.productive_tool_calls_since_last_grace, 0);
+    assert_eq!(shared.grace_calls_fired, 1);
+    assert_eq!(shared.counters.timeout, 1);
+}
+
+#[test]
+fn should_recover_state_from_poisoned_retry_state_mutex() {
+    // A panic while holding the lock poisons the mutex; the guard must
+    // still recover the inner state (with a warning) rather than panic or
+    // discard it.
+    let handle = Arc::new(StdMutex::new(LoopRetryState {
+        grace_calls_fired: 7,
+        ..Default::default()
+    }));
+    let poisoned = handle.clone();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = poisoned.lock().unwrap();
+        panic!("simulated panic while holding the retry-state lock");
+    }));
+    assert!(handle.is_poisoned());
+
+    let guard = PersistentRetryStateGuard::new(Some(handle.clone()));
+    assert_eq!(guard.grace_calls_fired, 7);
+    drop(guard);
+    assert_eq!(
+        handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .grace_calls_fired,
+        7
+    );
+
+    // A DIRTY guard must also recover on drop: the write-back path takes
+    // the same poisoned lock and must merge, not panic.
+    {
+        let mut dirty = PersistentRetryStateGuard::new(Some(handle.clone()));
+        dirty.counters.timeout += 1;
+    }
+    let shared = handle.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(shared.grace_calls_fired, 7);
+    assert_eq!(shared.counters.timeout, 1);
+}
+
+#[test]
+fn should_write_nowhere_when_no_handle_attached() {
+    // Legacy reset-per-turn behaviour: without a handle the guard owns a
+    // fresh state and its drop touches nothing.
+    let mut guard = PersistentRetryStateGuard::new(None);
+    guard.counters.internal += 1;
+    drop(guard); // must not panic
+}
+
+/// #48b — the exhausted error text STARTS WITH the stable marker and carries
+/// the limit/observed payload (the CLI terminal path keys on this prefix to
+/// emit `malformed_exhausted` instead of a generic turn_error row).
+#[tokio::test]
+async fn malformed_exhaustion_error_carries_marker() {
+    let provider: Arc<dyn LlmProvider> = Arc::new(MalformedThenOkProvider {
+        malformed_first: StdMutex::new(10), // never self-corrects → exhausted
+        ok_response: plain_text_response("unreachable"),
+    });
+    let tools = ToolRegistry::new();
+    let dir = tempfile::tempdir().unwrap();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("malformed-marker"), provider, tools, memory);
+    let err = agent
+        .process_message("never produces valid JSON", &[], vec![])
+        .await
+        .expect_err("exhausted malformed budget terminates the turn");
+    let text = err.to_string();
+    assert!(
+        text.starts_with(crate::MALFORMED_TOOLCALL_EXHAUSTED_MARKER),
+        "must START with the marker: {text}"
+    );
+    assert!(
+        text.contains("feedback_limit=3 observed_malformed=4"),
+        "carries the limit/observed payload: {text}"
+    );
 }

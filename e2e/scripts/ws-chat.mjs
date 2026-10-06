@@ -6,10 +6,13 @@
  *
  * Wire contract:
  *   session/open + turn/start with one text input item, then collect
- *   notifications until `turn/completed`, `turn/error`, or the deadline
- *   elapses. Mirrors the inner loop in e2e/lib/m9-ws-client.ts::chatWS
- *   but with zero TypeScript / Playwright deps so it can run from a
- *   plain shell harness.
+ *   notifications until the canonical `turn_terminal` projection
+ *   envelope (payload outcome `completed` or otherwise), or the deadline
+ *   elapses. Content accumulates from `assistant_delta` payloads — the
+ *   raw `message/delta` / `turn/completed` / `turn/error` frames have
+ *   been suppressed for every connection since #2318. Same inner loop
+ *   shape as e2e/lib/m9-ws-client.ts::chatWS but with zero TypeScript /
+ *   Playwright deps so it can run from a plain shell harness.
  *
  * Usage:
  *   node ws-chat.mjs \
@@ -21,10 +24,11 @@
  *     [--max-wait-ms 90000]
  *
  * Exit code:
- *   0  turn/completed received
+ *   0  turn_terminal envelope with outcome `completed` received
  *   2  bad usage
- *   3  WS connection or RPC error
- *   4  deadline elapsed without turn/completed
+ *   3  WS connection or RPC error, or a turn_terminal envelope whose
+ *      outcome is not `completed` (errored / interrupted / rate_limited)
+ *   4  deadline elapsed without a turn terminal
  *
  * Output (stdout, single line):
  *   {"status":"completed","content":"…","events":[…]}  (on success)
@@ -137,15 +141,24 @@ ws.on('message', (data) => {
     if (params.turn_id !== undefined && params.turn_id !== turnId) return;
     events.push({ method: frame.method, params });
     switch (frame.method) {
-      case 'message/delta':
-        if (typeof params.text === 'string') content += params.text;
+      case 'projection/envelope': {
+        // Canonical v2 lane: since #2318 the raw `message/delta` /
+        // `turn/completed` / `turn/error` frames are suppressed for every
+        // connection, so streamed content and the terminal arrive as
+        // `projection/envelope` payloads.
+        const payload = params.payload || {};
+        const data = payload.data || {};
+        if (payload.type === 'assistant_delta') {
+          if (typeof data.text === 'string') content += data.text;
+        } else if (payload.type === 'turn_terminal') {
+          if (data.outcome === 'completed') finish({ status: 'completed', content, events }, 0);
+          else {
+            const message = data.error?.message || data.error?.code || `turn ${data.outcome || 'terminal'}`;
+            finish({ status: 'error', message, events }, 3);
+          }
+        }
         break;
-      case 'turn/completed':
-        finish({ status: 'completed', content, events }, 0);
-        break;
-      case 'turn/error':
-        finish({ status: 'error', message: params.message || params.code || 'turn/error', events }, 3);
-        break;
+      }
     }
   }
 });

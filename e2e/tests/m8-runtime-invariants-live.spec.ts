@@ -10,13 +10,13 @@
  *   M8.7 — SubAgentOutputRouter writes spawn_only output to disk
  *   M8.9 — Spawn failure surfaces an actionable message back to the user
  *
- * Run from /Users/yuechen/home/octos/e2e:
+ * Run from ~/home/octos/e2e:
  *
  *   OCTOS_TEST_URL=https://dspfac.ocean.ominix.io OCTOS_PROFILE=dspfac \
  *   OCTOS_TEST_EMAIL=dspfac@gmail.com \
  *     npx playwright test tests/m8-runtime-invariants-live.spec.ts --workers=1
  *
- * Mini5 SSH: cloud@69.194.3.19 (key auth assumed).
+ * Mini5 SSH: set OCTOS_FLEET_SSH_MAP or OCTOS_TEST_SSH_HOST (key auth assumed).
  *   Profile data dir: ~/.octos/profiles/dspfac/data
  *   Workspace dirs:   <data>/users/<percent-encoded session key>/workspace
  *   Subagent outputs: <data>/subagent-outputs/<session_id>/<task_id>.out
@@ -40,13 +40,18 @@ test.setTimeout(180_000);
 //
 // Map known production domains to SSH targets. Override via env var
 // OCTOS_TEST_SSH_HOST when running against an unmapped target.
-const HOST_MAP: Record<string, string> = {
-  'dspfac.crew.ominix.io': 'cloud@69.194.3.128',
-  'dspfac.bot.ominix.io': 'cloud@69.194.3.129',
-  'dspfac.octos.ominix.io': 'cloud@69.194.3.203',
-  'dspfac.river.ominix.io': 'cloud@69.194.3.66',
-  'dspfac.ocean.ominix.io': 'cloud@69.194.3.19',
-};
+// SSH targets per fleet host come from the environment so no host
+// addresses live in the repo, e.g.
+//   OCTOS_FLEET_SSH_MAP='dspfac.crew.ominix.io=cloud@<host>,dspfac.bot.ominix.io=cloud@<host>'
+const HOST_MAP: Record<string, string> = Object.fromEntries(
+  (process.env.OCTOS_FLEET_SSH_MAP || '')
+    .split(',')
+    .map((pair): [string, string] => {
+      const [k = '', v = ''] = pair.trim().split('=');
+      return [k, v];
+    })
+    .filter(([k, v]) => k !== '' && v !== ''),
+);
 const SSH_HOST =
   process.env.OCTOS_TEST_SSH_HOST ||
   (() => {

@@ -60,6 +60,8 @@ use octos_bus::SessionManager;
 use octos_core::SessionKey;
 use tokio::sync::Mutex;
 
+use crate::commands::gateway::prompt::{CLIENT_HANDLED_COMMANDS, SERVER_STATE_COMMANDS};
+
 /// References to the per-turn state the WS slash dispatcher needs.
 ///
 /// Holds shared (`Arc<Mutex<…>>`) handles rather than owned values so
@@ -146,11 +148,15 @@ pub async fn try_dispatch_slash_command(
         // mutate (queue mode, adaptive router, etc.); the WS turn
         // path doesn't. Intercept so they don't leak into LLM
         // context.
-        "/queue" | "/adaptive" | "/router" | "/status" | "/reset" | "/thinking" => Some(format!(
-            "`{cmd}` is not yet wired on the web chat transport \
-             (gateway-only for now). Issue #1013 follow-up will surface \
-             the matching control in the SPA."
-        )),
+        _ if cmd.strip_prefix('/').is_some_and(|name| {
+            SERVER_STATE_COMMANDS.contains(&name) || CLIENT_HANDLED_COMMANDS.contains(&name)
+        }) =>
+        {
+            Some(format!(
+                "`{cmd}` is not available on the web chat transport \
+                 (gateway-only)."
+            ))
+        }
         _ => Some(unknown_command_help()),
     }
 }
@@ -415,5 +421,26 @@ mod tests {
                 "{cmd} must be intercepted"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn intercepts_every_classified_gateway_command_as_unavailable() {
+        let (ctx, _tmp, _key) = setup().await;
+        for name in SERVER_STATE_COMMANDS.iter().chain(CLIENT_HANDLED_COMMANDS) {
+            let reply = try_dispatch_slash_command(&format!("/{name}"), &ctx)
+                .await
+                .unwrap();
+            assert!(reply.contains("gateway-only"), "/{name}: {reply}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_gateway_command_reply_promises_no_tracked_follow_up() {
+        let (ctx, _tmp, _key) = setup().await;
+        let reply = try_dispatch_slash_command("/router", &ctx).await.unwrap();
+        assert!(
+            !reply.contains('#') && !reply.contains("follow-up"),
+            "the reply must not point users at an issue: {reply}"
+        );
     }
 }

@@ -253,7 +253,7 @@ pub struct CreateParams {
 
 | Provider | Aliases | Base URL | Default Model | API Key Env |
 |----------|---------|----------|---------------|-------------|
-| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5-turbo | ZAI_API_KEY |
+| Z.AI | zai, z.ai | api.z.ai/api/paas/v4 | glm-5-turbo | ZAI_API_KEY |
 
 ### ModelHints (OpenAI provider)
 
@@ -411,7 +411,7 @@ Two implementations:
 
 ### Transcription
 
-**GroqTranscriber**: Whisper `whisper-large-v3` via `https://api.groq.com/openai/v1/audio/transcriptions`. Multipart form. 60s timeout. MIME detection: ogg/opus→audio/ogg, mp3→audio/mpeg, m4a→audio/mp4, wav→audio/wav.
+**Voice platform skill** — audio is transcribed at the gateway layer, not in `octos-llm`. The gateway spawns the installed `voice` platform-skill binary (`platform-skills/voice/main` under the gateway home: `--octos-home`, else `<cwd>/.octos`) with the `voice_transcribe` subcommand, `{"audio_path", "language"?}` JSON on stdin and `{"success", "output"}` JSON on stdout; 120s timeout. Transcript text merges into the inbound message content (`voice_transcript` metadata), audio-only messages whose transcripts are all rejected skip agent dispatch, and the per-profile ASR language override is re-resolved per message (`octos-cli/src/commands/gateway/message_preprocessing.rs:515`, wiring at `octos-cli/src/commands/gateway/gateway_runtime.rs:613`).
 
 ### Vision
 
@@ -973,10 +973,10 @@ pub struct ConsoleReporter {
 
 **Duration formatting**: >1s → `{:.1}s`, ≤1s → `{N}ms`.
 
-**SseBroadcaster** (REST API, feature: `api`) — converts events to JSON and broadcasts via `tokio::sync::broadcast` channel:
+**EventBroadcaster** (feature: `api`, `octos-cli/src/api/events.rs:32`) — process-wide broadcaster that converts progress events to JSON and publishes them on a `tokio::sync::broadcast` channel. No SSE wire path remains in the chat transport; the JSON frames feed the harness/admin `/api/events/harness` endpoint, the swarm event publishers, and the UI Protocol v1 WS bridge:
 
 ```rust
-pub struct SseBroadcaster {
+pub struct EventBroadcaster {
     tx: broadcast::Sender<String>,  // JSON-serialized events
 }
 ```
@@ -990,9 +990,8 @@ pub struct SseBroadcaster {
 | CostUpdate | `"cost_update"` | `input_tokens`, `output_tokens`, `session_cost` |
 | Thinking | `"thinking"` | `iteration` |
 | Response | `"response"` | `iteration` |
-| (other) | `"other"` | — (logged at debug level) |
 
-Subscribers receive events via `SseBroadcaster::subscribe() -> broadcast::Receiver<String>`. Send errors (no subscribers) are silently ignored.
+Subscribers receive events via `EventBroadcaster::subscribe() -> broadcast::Receiver<String>`. Send errors (no subscribers) are silently ignored.
 
 ### Execution Environments (`exec_env.rs`)
 
@@ -1004,7 +1003,7 @@ Subscribers receive events via `SseBroadcaster::subscribe() -> broadcast::Receiv
 
 ### Typed Turns (`turn.rs`)
 
-`Turn` wraps `Message` with `TurnKind` (UserInput, AgentReply, ToolCall, ToolResult, System) and iteration number. `turns_to_messages()` converts back to `Vec<Message>` for LLM calls. Enables semantic analysis of conversation history.
+`Turn` wraps `Message` with `TurnKind` (UserInput, AssistantResponse, ToolResult, SteeringFollowUp, SystemReminder, RetrievedContext) and iteration number. `turns_to_messages()` converts back to `Vec<Message>` for LLM calls. Enables semantic analysis of conversation history.
 
 ### Event Bus (`event_bus.rs`)
 
@@ -1032,11 +1031,14 @@ Detects repetitive agent behavior (e.g., calling the same tool with same args). 
 
 ### Message Bus
 
-`create_bus() -> (AgentHandle, BusPublisher)` linked by mpsc channels (capacity 256). AgentHandle receives InboundMessages; BusPublisher dispatches OutboundMessages.
+`create_bus() -> (AgentHandle, BusPublisher)` linked by mpsc channels (capacity 256). AgentHandle receives InboundMessage; BusPublisher dispatches OutboundMessage.
 
 **Queue Modes** (configured via `gateway.queue_mode`):
-- `Followup` (default): FIFO — process queued messages one at a time
-- `Collect`: Merge queued messages by session, concatenating content before processing
+- `Followup`: FIFO — process queued messages one at a time
+- `Collect` (default): Merge queued messages by session, concatenating content before processing
+- `Latest`: Keep only the latest queued message, discarding older ones (renamed from `Steer`; the `steer` serde alias keeps old configs parsing)
+- `Interrupt`: Cancel the in-flight turn and start a new one
+- `Speculative`: Run a parallel speculative turn while the in-flight one finishes
 
 ### Channel Trait
 
@@ -1074,7 +1076,7 @@ pub trait Channel: Send + Sync {
 
 **Media**: `download_media()` helper downloads photos/voice/audio/documents to `.octos/media/`.
 
-**Transcription**: Voice/audio auto-transcribed via GroqTranscriber before agent processing.
+**Transcription**: Voice/audio auto-transcribed by the voice platform skill before agent processing (see Transcription).
 
 ### Message Coalescing
 
@@ -1096,7 +1098,7 @@ JSONL persistence at `.octos/sessions/{key}.jsonl`.
 
 - **In-memory cache**: LRU with disk sync on write
 - **Filenames**: Percent-encoded SessionKey, truncated to 183 chars with `_{hash:016X}` suffix on truncation to prevent collisions
-- **File size limit**: 10MB max (`MAX_SESSION_FILE_SIZE`); oversized files skipped on load
+- **Rolling segments**: Files roll into `<name>.segments/NNNNNN.jsonl` at `OCTOS_SESSION_SEGMENT_BYTES` (8 MiB); loads read the newest segments up to `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB, 0 = all)
 - **Crash safety**: Atomic write-then-rename
 - **Forking**: `fork()` creates child session with `parent_key` tracking, copies last N messages
 
@@ -1246,7 +1248,7 @@ User Input → readline → Agent.process_message(input, history)
 ### Gateway Mode
 
 ```
-Channel → InboundMessage → MessageBus → [transcribe audio] → [load session]
+Channel → InboundMessage → AgentHandle → [transcribe audio] → [load session]
                                               │
                                     Agent.process_message()
                                               │
@@ -1367,7 +1369,7 @@ crates/
 - Tool policies: allow/deny with deny-wins semantics, 8 named groups (`group:fs`, `group:runtime`, `group:web`, `group:search`, `group:sessions`, etc.), wildcard matching, provider-specific filtering via `tools.byProvider`
 - Tool argument size limit: 1MB per invocation (non-allocating `estimate_json_size` with escape char accounting)
 - Symlink-safe file I/O via `O_NOFOLLOW` on Unix (atomic kernel-level check, eliminates TOCTOU races); metadata-based symlink check fallback on Windows
-- SSRF protection in shared `ssrf.rs` module: DNS resolution with fail-closed behavior (blocks on DNS failure), private IP blocking (10/8, 172.16/12, 192.168/16, 169.254/16), IPv6 coverage (ULA `fc00::/7`, link-local `fe80::/10`, site-local `fec0::/10`, IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`), loopback blocking. Used by web_fetch and browser.
+- SSRF protection via `octos_research::net::check_url` — the one shared implementation, adapted for the agent tools by `octos-agent/src/tools/ssrf.rs`: DNS resolution with fail-closed behavior (blocks on DNS failure), private IP blocking (10/8, 172.16/12, 192.168/16, 169.254/16), IPv6 coverage (ULA `fc00::/7`, link-local `fe80::/10`, site-local `fec0::/10`, IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`), loopback blocking. Used by web_fetch and browser.
 - Browser: URL scheme allowlist (http/https only), 10s JS execution timeout, zombie process reaping, secure tempfiles for screenshots
 - MCP: input schema validation (max depth 10, max size 64KB) prevents malicious tool definitions
 - Prompt injection guard (`prompt_guard.rs`): 5 threat categories (SystemOverride, RoleConfusion, ToolCallInjection, SecretExtraction, InstructionInjection), 10 detection patterns. Sanitizes threats by wrapping in `[injection-blocked:...]`.
@@ -1376,7 +1378,7 @@ crates/
 - Tool output sanitization (`sanitize.rs`): strips base64 data URIs, long hex strings (64+ chars), and **credential redaction** with 7 regex patterns covering OpenAI (`sk-...`), Anthropic (`sk-ant-...`), AWS (`AKIA...`), GitHub (`ghp_/gho_/ghs_/ghr_/github_pat_...`), GitLab (`glpat-...`), Bearer tokens, and generic `password`/`api_key` assignments
 - UTF-8 safe truncation via `truncate_utf8()` across all tool outputs and email bodies
 - Session file collision prevention via percent-encoded filenames with hash suffix on truncation
-- Session file size limit: 10MB max prevents OOM on corrupted files
+- Session files roll into 8 MiB segments and loads stop at `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB), preventing OOM on oversized histories
 - Atomic write-then-rename for session persistence (crash safety)
 - API server binds to 127.0.0.1 by default (not 0.0.0.0)
 - Channel access control via `allowed_senders` lists
@@ -1482,10 +1484,10 @@ Each profile has its own LLM provider, API keys, channels, data directory, and `
 - **Unit**: type serde round-trips, tool arg parsing, config validation, provider detection, tool policies, compaction, coalescing, BM25 scoring, L2 normalization, SSE parsing
 - **Adaptive routing**: Off/Hedge/Lane modes, circuit breaker, failover, scoring, metrics, provider racing (19 tests)
 - **Responsiveness**: baseline learning, degradation detection, recovery, threshold boundaries (8 tests)
-- **Queue modes**: Followup, Collect, Steer, Speculative overflow, auto-escalation/deescalation (9 tests)
+- **Queue modes**: Followup, Collect, Latest, Interrupt, Speculative overflow, auto-escalation/deescalation (9 tests)
 - **Session persistence**: JSONL storage, LRU eviction, fork, rewrite, timestamp sort, concurrent access (28 tests)
 - **Integration**: CLI commands, file tools, cron jobs, session forking, plugin loading
-- **Security**: sandbox path injection, env sanitization, SSRF blocking, symlink rejection (O_NOFOLLOW), private IP detection, dedup overflow, tool argument size limits, session file size limits, circuit breaker threshold edge cases, MCP schema validation
+- **Security**: sandbox path injection, env sanitization, SSRF blocking, symlink rejection (O_NOFOLLOW), private IP detection, dedup overflow, tool argument size limits, session segment rolling and load budget, circuit breaker threshold edge cases, MCP schema validation
 - **Channel**: allowed_senders, message parsing, dedup logic, email address extraction
 
 Local CI: `./scripts/ci.sh` (mirrors GitHub Actions + focused subsystem tests). See [TESTING.md](./TESTING.md).

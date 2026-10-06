@@ -1,4 +1,36 @@
 use super::*;
+
+#[tokio::test]
+async fn scoped_commit_observers_follow_storage_roots_for_managers_and_handles() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let a = Arc::new(AtomicUsize::new(0));
+    let b = Arc::new(AtomicUsize::new(0));
+    let count_a = a.clone();
+    let count_b = b.clone();
+    let observer_a: MessageCommitObserver = Arc::new(move |_, _, _| {
+        count_a.fetch_add(1, Ordering::SeqCst);
+    });
+    let observer_b: MessageCommitObserver = Arc::new(move |_, _, _| {
+        count_b.fetch_add(1, Ordering::SeqCst);
+    });
+    set_scoped_message_commit_observer(first.path(), &observer_a);
+    set_scoped_message_commit_observer(second.path(), &observer_b);
+    let key = SessionKey::new("acp", "same-wire-key");
+    let mut manager = SessionManager::open(first.path()).unwrap();
+    manager
+        .add_message(&key, Message::user("first"))
+        .await
+        .unwrap();
+    let mut handle = SessionHandle::open(second.path(), &key);
+    handle.add_message(Message::user("second")).await.unwrap();
+    assert_eq!(a.load(Ordering::SeqCst), 1);
+    assert_eq!(b.load(Ordering::SeqCst), 1);
+}
 use octos_core::MessageRole;
 use tempfile::TempDir;
 
@@ -1049,27 +1081,789 @@ async fn test_session_handle_fork_from_parent_if_missing_links_existing_child_hi
     assert_eq!(child_session.messages[0].content, "existing-child-msg");
 }
 
+/// A row big enough that the active file passes the segment size, so the
+/// NEXT append seals it. Rolling is decided per append from the file's size,
+/// which keeps these tests free of process-global knobs.
+fn oversize_row() -> Message {
+    make_message(
+        MessageRole::Assistant,
+        &"x".repeat(SESSION_SEGMENT_BYTES_DEFAULT as usize + 1024),
+    )
+}
+
+/// Drive `mgr`'s session past the segment size: seed, one oversize row, then
+/// one small row that lands in a fresh active file. Returns the committed
+/// seqs in order.
+async fn roll_once(mgr: &mut SessionManager, key: &SessionKey) -> Vec<usize> {
+    let mut seqs = Vec::new();
+    for message in [
+        make_message(MessageRole::User, "seed"),
+        oversize_row(),
+        make_message(MessageRole::User, "after the roll"),
+    ] {
+        seqs.push(mgr.add_message_with_seq(key, message).await.unwrap());
+    }
+    seqs
+}
+
 #[tokio::test]
-async fn test_load_rejects_oversized_file() {
+async fn should_load_a_session_larger_than_the_old_ten_megabyte_cap() {
+    // The cap made a >10 MB session load as empty (and refuse appends). A
+    // large file is now simply read, line by line.
     let tmp = TempDir::new().unwrap();
     let mut mgr = SessionManager::open(tmp.path()).unwrap();
     let key = SessionKey::new("cli", "huge");
-
-    // Write a normal message so the file exists
+    let big = "y".repeat(11 * 1024 * 1024);
     mgr.add_message(&key, make_message(MessageRole::User, "seed"))
         .await
         .unwrap();
-
-    // Evict from cache so next access must load from disk
+    mgr.add_message(&key, make_message(MessageRole::Assistant, &big))
+        .await
+        .unwrap();
     mgr.cache.pop(&key.0);
 
-    // Overwrite the file with junk exceeding the size limit
-    let path = mgr.session_path(&key);
-    let junk = "x".repeat((MAX_SESSION_FILE_SIZE as usize) + 1);
-    std::fs::write(&path, junk).unwrap();
+    let loaded = mgr
+        .load_from_disk(&key)
+        .await
+        .expect("a large session still loads");
+    assert_eq!(loaded.messages.len(), 2);
+    assert_eq!(loaded.messages[1].content.len(), big.len());
+    assert!(!loaded.is_partial());
+}
 
-    // load_from_disk should return None for oversized file
-    assert!(mgr.load_from_disk(&key).await.is_none());
+#[tokio::test]
+async fn should_seal_the_active_file_into_a_segment_at_the_segment_size() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "big");
+
+    let seqs = roll_once(&mut mgr, &key).await;
+    assert_eq!(seqs, vec![0, 1, 2], "seqs stay global across the roll");
+
+    let active = mgr.session_path(&key);
+    let sealed = segment_path(&segments_dir(&active), 1);
+    assert!(
+        sealed.is_file(),
+        "the oversize file was sealed as segment 1"
+    );
+    assert!(
+        std::fs::metadata(&active).unwrap().len() < 4096,
+        "the fresh active file holds only the meta line and the last row"
+    );
+    let meta = read_session_meta(&active).unwrap();
+    assert_eq!(meta.sealed_segments, 1);
+    assert_eq!(meta.base_seq, 2, "the active file's first row is seq 2");
+
+    // A reload reproduces the whole history in order.
+    mgr.cache.pop(&key.0);
+    let loaded = mgr.load_from_disk(&key).await.unwrap();
+    assert_eq!(
+        loaded
+            .messages
+            .iter()
+            .map(|m| m.content.len())
+            .collect::<Vec<_>>(),
+        vec![
+            "seed".len(),
+            oversize_row().content.len(),
+            "after the roll".len()
+        ]
+    );
+    assert!(
+        !loaded.is_partial(),
+        "within the load budget every segment loads"
+    );
+    assert_eq!(loaded.next_seq(), 3);
+    // Listing count contract: 1 meta line + rows, now spanning segments.
+    assert_eq!(
+        mgr.list_sessions()
+            .into_iter()
+            .find(|(k, _)| k == &key.0)
+            .unwrap()
+            .1,
+        4
+    );
+}
+
+#[tokio::test]
+async fn should_load_only_the_newest_segments_within_the_budget() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "windowed");
+    roll_once(&mut mgr, &key).await;
+    mgr.cache.pop(&key.0);
+
+    // A budget smaller than the sealed segment: only the active file loads.
+    let window = mgr
+        .load_from_disk_with_budget(&key, 64 * 1024)
+        .await
+        .unwrap();
+    assert!(window.is_partial());
+    assert_eq!(
+        window.base_seq, 2,
+        "two visible rows live in the unloaded segment"
+    );
+    assert_eq!(window.messages.len(), 1);
+    assert_eq!(window.messages[0].content, "after the roll");
+    assert_eq!(window.next_seq(), 3);
+
+    // Appending through a partial window keeps seqs global.
+    mgr.cache.put(key.0.clone(), window);
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "fourth"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 3);
+
+    // A rewrite from the partial window touches only the active file: the
+    // sealed segment, and the history in it, survive.
+    mgr.rewrite(&key).await.unwrap();
+    mgr.cache.pop(&key.0);
+    let full = mgr.load_full(&key).await.unwrap();
+    assert_eq!(full.messages.len(), 4);
+    assert_eq!(full.messages[0].content, "seed");
+    assert_eq!(full.messages[3].content, "fourth");
+    assert!(!full.is_partial());
+}
+
+#[tokio::test]
+async fn should_rewrite_a_fully_loaded_rolled_session_back_into_one_file() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "collapse");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    assert!(segment_path(&segments_dir(&active), 1).is_file());
+
+    // The cached session merged the sealed segment, so a rewrite folds it
+    // back into the active file and drops the now-redundant segment file.
+    mgr.rewrite(&key).await.unwrap();
+    assert!(!segment_path(&segments_dir(&active), 1).exists());
+    assert_eq!(read_session_meta(&active).unwrap().sealed_segments, 0);
+    mgr.cache.pop(&key.0);
+    assert_eq!(mgr.load_from_disk(&key).await.unwrap().messages.len(), 3);
+}
+
+#[tokio::test]
+async fn should_roll_back_turns_that_live_in_a_sealed_segment() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "undo-across");
+    // Three user turns; the middle one is oversize, so the third lands in a
+    // fresh active file and the first two are sealed.
+    for content in [
+        "seed".to_owned(),
+        "u".repeat(SESSION_SEGMENT_BYTES_DEFAULT as usize + 1024),
+        "after the roll".to_owned(),
+    ] {
+        mgr.add_message(&key, make_message(MessageRole::User, &content))
+            .await
+            .unwrap();
+    }
+    assert!(segments_dir(&mgr.session_path(&key)).is_dir());
+    mgr.cache.pop(&key.0);
+    // Resident as a partial window, as a long-lived process would hold it.
+    let window = mgr
+        .load_from_disk_with_budget(&key, 64 * 1024)
+        .await
+        .unwrap();
+    assert!(window.is_partial());
+    assert_eq!(window.messages.len(), 1);
+    mgr.cache.put(key.0.clone(), window);
+
+    // Two turns back reaches into the sealed segment; the window alone holds
+    // one, so the manager must widen to the full history first.
+    let dropped = mgr.rollback_last_n_user_turns(&key, 2).await.unwrap();
+    assert_eq!(dropped, 2);
+    mgr.cache.pop(&key.0);
+    let reloaded = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        reloaded
+            .messages
+            .iter()
+            .map(|m| m.content.len())
+            .collect::<Vec<_>>(),
+        vec!["seed".len()],
+        "the marker replays across segments and trims the sealed turn"
+    );
+}
+
+#[tokio::test]
+async fn should_remove_sealed_segments_when_a_session_is_cleared() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "cleared");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    assert!(segments_dir(&active).is_dir());
+    mgr.clear(&key).await.unwrap();
+    assert!(!active.exists());
+    assert!(!segments_dir(&active).exists());
+}
+
+fn contents(session: &Session) -> Vec<String> {
+    session
+        .messages
+        .iter()
+        .map(|m| {
+            if m.content.len() > 32 {
+                format!("<{} bytes>", m.content.len())
+            } else {
+                m.content.clone()
+            }
+        })
+        .collect()
+}
+
+/// F1: a rewrite folds merged segments into the active file and then deletes
+/// them; if the deletion is interrupted, the leftover segment must not load a
+/// second time, and the next seal must replace it rather than chain after it.
+#[tokio::test]
+async fn should_not_read_a_merged_segment_twice_when_a_rewrite_left_it_behind() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "residue");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    let sealed = segment_path(&segments_dir(&active), 1);
+    let kept = std::fs::read(&sealed).unwrap();
+
+    mgr.rewrite(&key).await.unwrap();
+    assert!(!sealed.exists());
+    // The crash: the rewritten active file is in place, the merged segment
+    // is still on disk.
+    std::fs::write(&sealed, &kept).unwrap();
+
+    mgr.cache.pop(&key.0);
+    let loaded = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        contents(&loaded),
+        vec!["seed", "<8389632 bytes>", "after the roll"],
+        "the active meta owns zero segments, so the residue is ignored"
+    );
+    assert_eq!(loaded.sealed_segments, 0);
+    assert_eq!(loaded.next_seq(), 3);
+
+    // The rewritten active file is itself past the segment size, so the
+    // next append seals it — as 000001 again, REPLACING the residue rather
+    // than chaining after it as 000002 (which would have baked it in). The
+    // oversize row then seals once more as 000002.
+    mgr.cache.put(key.0.clone(), loaded);
+    mgr.add_message(&key, oversize_row()).await.unwrap();
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "later"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 4);
+    let first = read_segment(&segment_path(&segments_dir(&active), 1), &key).unwrap();
+    assert_eq!(
+        first.timeline.len(),
+        3,
+        "000001 holds the rewritten rows, not the residue"
+    );
+    assert!(segment_path(&segments_dir(&active), 2).is_file());
+    assert!(!segment_path(&segments_dir(&active), 3).exists());
+    mgr.cache.pop(&key.0);
+    let reloaded = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        contents(&reloaded),
+        vec![
+            "seed",
+            "<8389632 bytes>",
+            "after the roll",
+            "<8389632 bytes>",
+            "later"
+        ]
+    );
+}
+
+/// #2481: a build that predates segments rewrites the active file with the
+/// meta IT knows — no `sealed_segments` key — so the count reads as zero
+/// while real segment files still sit in the segments directory. The next
+/// seal then computed `owned + 1 = 1`, found 000001 occupied by that real
+/// history, and removed it. The seal must refuse to replace a segment the
+/// active meta never named and keep the row in the active file instead.
+#[tokio::test]
+async fn should_not_replace_sealed_history_after_a_legacy_rewrite_erases_the_count() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "legacy");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    let sealed = segment_path(&segments_dir(&active), 1);
+    let real_history = std::fs::read(&sealed).unwrap();
+
+    // The legacy rewrite: same rows, but a meta line of the pre-segments
+    // shape, which carries no `sealed_segments`.
+    let rows = std::fs::read_to_string(&active).unwrap();
+    let body = rows.split_once('\n').unwrap().1.to_owned();
+    let legacy_meta = format!(
+        "{{\"schema_version\":1,\"session_key\":\"{}\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}}",
+        key.0
+    );
+    std::fs::write(&active, format!("{legacy_meta}\n{body}")).unwrap();
+
+    // The erased count hides the sealed history from loads, too — that much
+    // is legacy behavior — but the files must stay on disk.
+    mgr.cache.pop(&key.0);
+    let loaded = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        contents(&loaded),
+        vec!["after the roll"],
+        "the legacy meta owns zero segments, so the sealed rows are orphaned"
+    );
+
+    // The next seal lands on `owned + 1 = 1` — occupied by real history.
+    mgr.cache.put(key.0.clone(), loaded);
+    mgr.add_message(&key, oversize_row()).await.unwrap();
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "later"))
+        .await
+        .unwrap();
+    assert_eq!(
+        seq, 2,
+        "appends continue from the orphaned view's next_seq; the refused seal does not reset the chain"
+    );
+
+    assert!(
+        std::fs::read(&sealed).unwrap() == real_history,
+        "the sealed segment survives the refused seal byte for byte"
+    );
+    assert!(
+        !segment_path(&segments_dir(&active), 2).is_file(),
+        "the refused seal does not chain a segment behind the history it would have destroyed"
+    );
+    let active_rows = std::fs::read_to_string(&active).unwrap();
+    assert!(
+        active_rows.contains("\"later\""),
+        "the refused roll keeps the row in the active file"
+    );
+
+    // The orphaned history stays orphaned — refusal preserves it on disk
+    // but does not adopt it; reconciling that is an operator action.
+    mgr.cache.pop(&key.0);
+    let still = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        contents(&still),
+        vec!["after the roll", "<8389632 bytes>", "later"],
+        "loads keep reading the active file the refused seal appended to"
+    );
+}
+
+/// #2481: the schema bump is what keeps pre-segments builds from re-erasing
+/// the count — every reader refuses a newer version, so a version-2 file is
+/// skipped whole by them. A version-1 file must keep loading here, and the
+/// next meta this build stamps must carry the new version.
+#[tokio::test]
+async fn a_schema_one_session_still_loads_and_the_next_meta_is_stamped_two() {
+    let tmp = TempDir::new().unwrap();
+    let active = tmp.path().join("sessions").join("cli%3Aold.jsonl");
+    std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+    std::fs::write(
+        &active,
+        concat!(
+            "{\"schema_version\":1,\"session_key\":\"cli:old\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+            "{\"role\":\"user\",\"content\":\"seed\",\"timestamp\":\"2026-01-01T00:00:01Z\"}\n"
+        ),
+    )
+    .unwrap();
+
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "old");
+    let loaded = mgr.load_from_disk(&key).await.unwrap();
+    assert_eq!(contents(&loaded), vec!["seed"]);
+    mgr.cache.put(key.0.clone(), loaded);
+    mgr.add_message(&key, oversize_row()).await.unwrap();
+    mgr.add_message(&key, make_message(MessageRole::User, "next"))
+        .await
+        .unwrap();
+
+    // The oversize row triggered a roll; the fresh active meta is stamped
+    // with the new version and the sealed segment kept its original one.
+    let meta = read_session_meta(&active).unwrap();
+    assert_eq!(meta.sealed_segments, 1);
+    let sealed_meta = read_session_meta(&segment_path(&segments_dir(&active), 1)).unwrap();
+    assert_eq!(
+        sealed_meta.schema_version, 1,
+        "the sealed rows keep loading"
+    );
+    mgr.cache.pop(&key.0);
+    let full = mgr.load_full(&key).await.unwrap();
+    assert_eq!(contents(&full), vec!["seed", "<8389632 bytes>", "next"]);
+}
+
+/// A rewrite must not launder a meta that does not name its count. Stamping a
+/// trusted-looking `sealed_segments: 0` over the unnamed state would re-arm
+/// the very seal replacement the guard refuses, and the next roll would
+/// destroy the orphaned history (#2481).
+#[tokio::test]
+async fn a_rewrite_does_not_launder_an_unnamed_sealed_count() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "launder");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    let sealed = segment_path(&segments_dir(&active), 1);
+    let real_history = std::fs::read(&sealed).unwrap();
+
+    // The legacy rewrite erases the count; the segments become orphans.
+    let rows = std::fs::read_to_string(&active).unwrap();
+    let body = rows.split_once('\n').unwrap().1.to_owned();
+    let legacy_meta = format!(
+        "{{\"schema_version\":1,\"session_key\":\"{}\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}}",
+        key.0
+    );
+    std::fs::write(&active, format!("{legacy_meta}\n{body}")).unwrap();
+    mgr.cache.pop(&key.0);
+    let loaded = mgr.load_full(&key).await.unwrap();
+    mgr.cache.put(key.0.clone(), loaded);
+
+    // The rewrite refuses instead of stamping a trusted count over the
+    // unnamed state, and the meta line on disk stays unnamed.
+    assert!(
+        mgr.rewrite(&key).await.is_err(),
+        "rewriting an unnamed count with segments on disk is refused"
+    );
+    let meta_line = std::fs::read_to_string(&active).unwrap();
+    assert!(
+        meta_line.contains("\"schema_version\":1"),
+        "the refused rewrite left the legacy meta line untouched: {meta_line}"
+    );
+
+    // With the laundering path closed, the seal guard still holds.
+    mgr.cache
+        .put(key.0.clone(), mgr.load_full(&key).await.unwrap());
+    mgr.add_message(&key, oversize_row()).await.unwrap();
+    mgr.add_message(&key, make_message(MessageRole::User, "later"))
+        .await
+        .unwrap();
+    assert!(
+        std::fs::read(&sealed).unwrap() == real_history,
+        "the orphaned history survives the refused seal"
+    );
+}
+
+/// A pre-segments single file — a meta without the key and no segments on
+/// disk — rewrites normally. That is the upgrade path, and the rewritten
+/// meta is the first one that names its (empty) count.
+#[tokio::test]
+async fn a_legacy_single_file_session_still_rewrites() {
+    let tmp = TempDir::new().unwrap();
+    let active = tmp.path().join("sessions").join("cli%3Anc.jsonl");
+    std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+    std::fs::write(
+        &active,
+        concat!(
+            "{\"schema_version\":1,\"session_key\":\"cli:nc\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n",
+            "{\"role\":\"user\",\"content\":\"seed\",\"timestamp\":\"2026-01-01T00:00:01Z\"}\n"
+        ),
+    )
+    .unwrap();
+
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "nc");
+    let loaded = mgr.load_from_disk(&key).await.unwrap();
+    assert_eq!(contents(&loaded), vec!["seed"]);
+    mgr.cache.put(key.0.clone(), loaded);
+
+    mgr.rewrite(&key).await.unwrap();
+    let meta_line = std::fs::read_to_string(&active).unwrap();
+    assert!(
+        meta_line.starts_with("{\"schema_version\":2"),
+        "the rewritten meta is stamped with the current version: {meta_line}"
+    );
+    assert!(
+        meta_line.contains("\"sealed_segments\":0"),
+        "the rewritten meta names its count: {meta_line}"
+    );
+    mgr.cache.pop(&key.0);
+    assert_eq!(mgr.load_full(&key).await.unwrap().messages.len(), 1);
+}
+
+#[test]
+fn meta_line_naming_checks() {
+    let dir = TempDir::new().unwrap();
+    let write_first_line = |line: &str| {
+        let path = dir.path().join("probe.jsonl");
+        std::fs::write(&path, format!("{line}\n{{\"role\":\"user\"}}")).unwrap();
+        path
+    };
+
+    let named = write_first_line("{\"schema_version\":2,\"sealed_segments\":0}");
+    assert!(active_meta_records_sealed_segments(&named));
+    let unnamed = write_first_line("{\"schema_version\":1}");
+    assert!(!active_meta_records_sealed_segments(&unnamed));
+    let null_count = write_first_line("{\"schema_version\":2,\"sealed_segments\":null}");
+    assert!(!active_meta_records_sealed_segments(&null_count));
+    let corrupt = write_first_line("not json at all");
+    assert!(!active_meta_records_sealed_segments(&corrupt));
+    let empty = dir.path().join("empty.jsonl");
+    std::fs::write(&empty, "").unwrap();
+    assert!(!active_meta_records_sealed_segments(&empty));
+    assert!(!active_meta_records_sealed_segments(
+        &dir.path().join("missing.jsonl")
+    ));
+}
+
+/// F2: a crash after the seal's rename but before the fresh meta line is
+/// durable leaves sealed segments and no usable active file. The session must
+/// not vanish, and the seq chain must continue from the sealed rows.
+#[tokio::test]
+async fn should_rebuild_the_active_file_when_a_seal_was_interrupted() {
+    for empty_rather_than_missing in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::new("cli", "torn-seal");
+        roll_once(&mut mgr, &key).await;
+        let active = mgr.session_path(&key);
+        if empty_rather_than_missing {
+            std::fs::write(&active, b"").unwrap();
+        } else {
+            std::fs::remove_file(&active).unwrap();
+        }
+        mgr.cache.pop(&key.0);
+
+        let recovered = mgr.load_from_disk(&key).await.unwrap();
+        assert_eq!(recovered.sealed_segments, 1);
+        assert_eq!(
+            recovered.next_seq(),
+            2,
+            "two visible rows are sealed; the row lost with the active file is gone"
+        );
+        assert_eq!(recovered.title.as_deref(), Some("seed"));
+        assert!(active.is_file(), "the active file is written back");
+        assert_eq!(read_session_meta(&active).unwrap().base_seq, 2);
+        assert!(
+            mgr.list_sessions().iter().any(|(k, _)| k == &key.0),
+            "the session is listed again"
+        );
+
+        mgr.cache.put(key.0.clone(), recovered);
+        let seq = mgr
+            .add_message_with_seq(&key, make_message(MessageRole::User, "resumed"))
+            .await
+            .unwrap();
+        assert_eq!(seq, 2);
+        mgr.cache.pop(&key.0);
+        let full = mgr.load_full(&key).await.unwrap();
+        assert_eq!(contents(&full), vec!["seed", "<8389632 bytes>", "resumed"]);
+    }
+}
+
+/// Two sealed segments: `roll_once` seals [seed, big] as 000001, then a
+/// second oversize row makes the next append seal [after the roll, big] as
+/// 000002, leaving `third` in the active file.
+async fn roll_twice(mgr: &mut SessionManager, key: &SessionKey) {
+    roll_once(mgr, key).await;
+    mgr.add_message(key, oversize_row()).await.unwrap();
+    mgr.add_message(key, make_message(MessageRole::User, "third"))
+        .await
+        .unwrap();
+}
+
+/// Overwrite a file's first line (the meta) with garbage, keeping the rows.
+fn corrupt_meta_line(path: &std::path::Path) {
+    let content = std::fs::read_to_string(path).unwrap();
+    let rows = content.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+    std::fs::write(path, format!("{{\"schema_version\":1,\"broken\n{rows}")).unwrap();
+}
+
+/// #2468: an unreadable meta line on a sealed segment hides only that line,
+/// not the rows behind it — neither on a plain load nor during recovery.
+#[tokio::test]
+async fn should_keep_reading_a_sealed_segment_whose_meta_line_is_unreadable() {
+    for bad_index in [1u32, 2] {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::new("cli", "torn-meta");
+        roll_twice(&mut mgr, &key).await;
+        let active = mgr.session_path(&key);
+        corrupt_meta_line(&segment_path(&segments_dir(&active), bad_index));
+        mgr.cache.pop(&key.0);
+
+        let full = mgr.load_full(&key).await.unwrap();
+        assert_eq!(
+            contents(&full),
+            vec![
+                "seed",
+                "<8389632 bytes>",
+                "after the roll",
+                "<8389632 bytes>",
+                "third"
+            ],
+            "segment {bad_index} with a bad meta line still contributes its rows"
+        );
+        assert_eq!(full.base_seq, 0);
+        assert_eq!(full.next_seq(), 5);
+    }
+}
+
+#[tokio::test]
+async fn should_rebuild_after_a_seal_when_the_newest_segment_meta_is_unreadable() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "double-crash");
+    roll_twice(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    // Crash one: the fresh active file never made it. Crash two: the newest
+    // sealed segment lost its first line.
+    std::fs::remove_file(&active).unwrap();
+    corrupt_meta_line(&segment_path(&segments_dir(&active), 2));
+    mgr.cache.pop(&key.0);
+
+    let recovered = mgr.load_full(&key).await.unwrap();
+    assert_eq!(recovered.sealed_segments, 2);
+    assert_eq!(
+        recovered.next_seq(),
+        4,
+        "rows behind the bad line are counted; the chain does not restart at 0"
+    );
+    assert_eq!(
+        recovered.title.as_deref(),
+        Some("seed"),
+        "identity from 000001"
+    );
+    assert_eq!(read_session_meta(&active).unwrap().base_seq, 4);
+    assert_eq!(
+        contents(&recovered),
+        vec![
+            "seed",
+            "<8389632 bytes>",
+            "after the roll",
+            "<8389632 bytes>"
+        ]
+    );
+
+    mgr.cache.put(key.0.clone(), recovered);
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "resumed"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 4);
+}
+
+#[tokio::test]
+async fn should_rebuild_from_rows_alone_when_no_segment_meta_is_readable() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "no-meta-left");
+    roll_once(&mut mgr, &key).await;
+    let active = mgr.session_path(&key);
+    std::fs::remove_file(&active).unwrap();
+    corrupt_meta_line(&segment_path(&segments_dir(&active), 1));
+    mgr.cache.pop(&key.0);
+
+    let recovered = mgr.load_full(&key).await.unwrap();
+    assert_eq!(
+        recovered.next_seq(),
+        2,
+        "seed and the big row are still counted"
+    );
+    assert_eq!(
+        recovered.title, None,
+        "no line on disk names the session any more"
+    );
+    assert_eq!(contents(&recovered), vec!["seed", "<8389632 bytes>"]);
+    let meta = read_session_meta(&active).unwrap();
+    assert_eq!((meta.sealed_segments, meta.base_seq), (1, 2));
+    assert_eq!(meta.session_key, key.0);
+}
+
+/// F3: after a rollback that reaches into a sealed segment, the seq a handle
+/// reads back from disk must reflect the rows the marker removed there.
+#[tokio::test]
+async fn should_read_back_the_right_seq_after_a_rollback_into_a_sealed_segment() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "undo-seq");
+    for content in [
+        "seed".to_owned(),
+        "u".repeat(SESSION_SEGMENT_BYTES_DEFAULT as usize + 1024),
+        "after the roll".to_owned(),
+    ] {
+        mgr.add_message(&key, make_message(MessageRole::User, &content))
+            .await
+            .unwrap();
+    }
+    assert_eq!(mgr.rollback_last_n_user_turns(&key, 2).await.unwrap(), 2);
+    let seq = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "again"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 1, "manager: seed is 0, the two dropped turns are gone");
+
+    // A handle's read-back folds the active file, where the marker sits;
+    // the marker's debt spills into the sealed segment, so the active file
+    // alone would over-count by the sealed row it removed.
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    assert_eq!(handle.session().next_seq(), 2);
+    let seq = handle
+        .add_message_with_seq(make_message(MessageRole::User, "handle"))
+        .await
+        .unwrap();
+    assert_eq!(seq, 2);
+    mgr.cache.pop(&key.0);
+    let full = mgr.load_full(&key).await.unwrap();
+    assert_eq!(contents(&full), vec!["seed", "again", "handle"]);
+    assert_eq!(full.next_seq(), 3);
+}
+
+/// F5: the listing previews the last prompt from the file's tail, and falls
+/// back to the whole file only when the tail has no user row.
+#[test]
+fn should_preview_the_last_prompt_from_the_file_tail() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("s.jsonl");
+    let meta = serde_json::json!({
+        "schema_version": 1, "session_key": "cli:x",
+        "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+    });
+    let row = |role: &str, content: &str| {
+        serde_json::json!({"role": role, "content": content, "timestamp": "2026-01-01T00:00:00Z"})
+            .to_string()
+    };
+    let blob = "b".repeat(600 * 1024);
+
+    // Prompt at the end of a big file: found in the tail.
+    let lines = [
+        meta.to_string(),
+        row("user", "first question"),
+        row("assistant", &blob),
+        row("user", "last question"),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    assert_eq!(
+        last_user_prompt_from_file(&path).as_deref(),
+        Some("last question")
+    );
+
+    // Prompt buried before a big blob: the tail has no user row, so the
+    // whole file is read.
+    let lines = [
+        meta.to_string(),
+        row("user", "buried question"),
+        row("assistant", &blob),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    assert_eq!(
+        last_user_prompt_from_file(&path).as_deref(),
+        Some("buried question")
+    );
+
+    // A rollback in the tail that drops the tail's only user row: the
+    // fold over the tail yields nothing, and the full read honours it.
+    let lines = [
+        meta.to_string(),
+        row("user", "kept question"),
+        row("assistant", &blob),
+        row("user", "undone question"),
+        rollback_marker_line(1).unwrap(),
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    assert_eq!(
+        last_user_prompt_from_file(&path).as_deref(),
+        Some("kept question")
+    );
 }
 
 #[test]
@@ -1651,6 +2445,108 @@ fn test_active_session_store_persistence() {
     assert_eq!(store.get_active_topic("telegram:12345"), "research");
 }
 
+/// #2013 — a corrupt `active_sessions.json` must NEVER be silently swallowed
+/// into an empty store that the next `switch_to` then overwrites.
+///
+/// Old behaviour: `serde_json::from_str(..).unwrap_or_default()` turned a
+/// truncated file into an empty store with no error and no log line; the next
+/// topic switch persisted over `active_sessions.json` and every chat's active
+/// topic and `/back` target was gone for good. The load-side property that
+/// prevents that is: the original bytes must still exist on disk afterwards.
+#[test]
+fn corrupt_active_session_store_is_quarantined_not_silently_discarded() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("active_sessions.json");
+    // Truncated mid-token, as an unfsynced write + power loss leaves it. The
+    // cut-off word is deliberately NOT a prefix of a real English word: the
+    // `typos` CI gate reads a truncated word as a misspelling and fails the
+    // build, which is ironic for a fixture whose whole job is to BE
+    // truncated — but not a battle worth having with a spell-checker.
+    let corrupt = r#"{"active":{"telegram:12345":"topic-zzq"#;
+    std::fs::write(&path, corrupt).unwrap();
+
+    let mut store = ActiveSessionStore::open(tmp.path()).unwrap();
+    assert_eq!(
+        store.get_active_topic("telegram:12345"),
+        "",
+        "the store still opens (topics reset is recoverable; losing the mappings is not)",
+    );
+
+    // THE load-bearing assertion: the operator can still get the mappings back.
+    let preserved: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("corrupt-"))
+        })
+        .collect();
+    assert_eq!(
+        preserved.len(),
+        1,
+        "the corrupt store must be quarantined aside, not discarded (got {preserved:?})",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&preserved[0]).unwrap(),
+        corrupt,
+        "the quarantined copy must be byte-identical so mappings can be recovered",
+    );
+    assert!(
+        !path.exists(),
+        "the corrupt file is moved aside, so a later save cannot overwrite it in place",
+    );
+
+    // The next topic switch persists the near-empty store — and must leave
+    // the quarantined evidence untouched.
+    store.switch_to("telegram:12345", "fresh").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&preserved[0]).unwrap(),
+        corrupt,
+        "a post-quarantine save must not clobber the preserved store",
+    );
+}
+
+/// A MISSING store is the normal first run — it must stay silent and must
+/// NOT create a quarantine file.
+#[test]
+fn missing_active_session_store_is_not_treated_as_corruption() {
+    let tmp = TempDir::new().unwrap();
+    let store = ActiveSessionStore::open(tmp.path()).unwrap();
+    assert_eq!(store.get_active_topic("telegram:12345"), "");
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        0,
+        "first run must not leave a quarantine artifact behind",
+    );
+}
+
+/// #2013 — the save path's temp files must be unique and must never linger:
+/// two stores on one data dir saving alternately (the two-processes shape)
+/// leave exactly the store file behind, no `*.tmp` orphans.
+#[test]
+fn active_session_store_saves_leave_no_tmp_orphans() {
+    let tmp = TempDir::new().unwrap();
+    let mut a = ActiveSessionStore::open(tmp.path()).unwrap();
+    let mut b = ActiveSessionStore::open(tmp.path()).unwrap();
+
+    a.switch_to("telegram:1", "from-a").unwrap();
+    b.switch_to("telegram:2", "from-b").unwrap();
+    a.switch_to("telegram:1", "from-a-again").unwrap();
+
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "active_sessions.json")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "saves must clean up their unique temp files, got {leftovers:?}",
+    );
+}
+
 #[test]
 fn test_validate_topic_name() {
     assert!(validate_topic_name("research").is_ok());
@@ -1671,29 +2567,19 @@ fn test_validate_topic_name() {
 }
 
 #[tokio::test]
-async fn test_append_respects_file_size_limit() {
+async fn should_keep_appending_past_the_old_cap_by_rolling() {
+    // The old test pinned that an append at 10 MB was refused. It now rolls.
     let tmp = TempDir::new().unwrap();
     let mut mgr = SessionManager::open(tmp.path()).unwrap();
     let key = SessionKey::new("cli", "big");
-
-    // Write a seed message
-    mgr.add_message(&key, make_message(MessageRole::User, "seed"))
+    let seqs = roll_once(&mut mgr, &key).await;
+    assert_eq!(seqs.last(), Some(&2));
+    let more = mgr
+        .add_message_with_seq(&key, make_message(MessageRole::User, "and again"))
         .await
         .unwrap();
-
-    // Manually inflate the file to just under the limit
-    let path = mgr.session_path(&key);
-    let padding = "x".repeat((MAX_SESSION_FILE_SIZE as usize) - 10);
-    std::fs::write(&path, padding).unwrap();
-
-    // Append should silently skip (file is at limit)
-    mgr.add_message(&key, make_message(MessageRole::User, "should not append"))
-        .await
-        .unwrap();
-
-    // File should not have grown significantly
-    let size = std::fs::metadata(&path).unwrap().len();
-    assert!(size < MAX_SESSION_FILE_SIZE + 1000);
+    assert_eq!(more, 3);
+    assert!(segments_dir(&mgr.session_path(&key)).is_dir());
 }
 
 #[tokio::test]
@@ -2085,6 +2971,73 @@ fn should_sanitize_loaded_messages_in_place() {
     // Handle was mutated in place.
     assert_eq!(handle.session.messages.len(), 1);
     assert_eq!(handle.session.messages[0].content, "hi");
+}
+
+/// #2204 regression (real disk round-trip): a session whose persisted
+/// transcript ends in an interrupted thinking-only assistant turn must, on a
+/// COLD reload from disk, have that turn FAILED (dropped) — not resurrected
+/// and resumed. Exercises the exact production path the session actor uses at
+/// bootstrap: persist → `SessionHandle::open` (loads from disk) →
+/// `sanitize_loaded_messages(None, ..)`.
+#[tokio::test]
+async fn cold_reload_fails_interrupted_thinking_only_tail() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "coding");
+
+    // Persist a completed user turn, then an interrupted thinking-only
+    // assistant turn (empty content, non-empty reasoning, no tool calls) — the
+    // killed reasoning spiral that used to be resurrected on the next launch.
+    {
+        let mut writer = SessionHandle::open(tmp.path(), &key);
+        writer
+            .add_message(make_message(MessageRole::User, "hi"))
+            .await
+            .unwrap();
+        let spiral = Message {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: Some(
+                "... geometry topology manifold spacetime quantum mechanics ...".into(),
+            ),
+            client_message_id: None,
+            thread_id: Some("01a05fda-turn".into()),
+            timestamp: chrono::Utc::now(),
+        };
+        writer.add_message(spiral).await.unwrap();
+    }
+
+    // Cold reload: a fresh handle loads the transcript from disk, exactly as
+    // the session actor does at bootstrap (retry_state = None).
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    assert_eq!(
+        handle.session.messages.len(),
+        2,
+        "both persisted turns must load from disk"
+    );
+
+    let (report, _refs) = handle
+        .sanitize_loaded_messages(None, None)
+        .expect("clean outcome — no workspace root");
+
+    assert_eq!(
+        report.orphan_thinking_dropped, 1,
+        "the interrupted thinking-only tail must be failed on cold reload"
+    );
+    assert_eq!(handle.session.messages.len(), 1);
+    assert_eq!(handle.session.messages[0].content, "hi");
+    assert!(
+        handle
+            .session
+            .messages
+            .last()
+            .unwrap()
+            .reasoning_content
+            .is_none(),
+        "no thinking-only turn survives to be resumed"
+    );
 }
 
 /// M8.6: a missing worktree surfaces as `Err` and DOES NOT mutate the
@@ -2831,36 +3784,82 @@ fn session_threads_skips_system_messages() {
     assert_eq!(threads[0].responses.len(), 0);
 }
 
-/// Regression for codex retro-review BLOCKING #1: SessionHandle::append_to_disk
-/// must return Err on size-cap rejection (was returning Ok(()), letting the
-/// caller push to memory and fire message/persisted observer for a row that
-/// never committed to disk — UPCR-2026-012 contract violation).
+/// The handle path rolls too, and its seq read-back — which reads only the
+/// active file — still reports the global seq after a roll.
 #[tokio::test]
-async fn session_handle_append_returns_err_when_at_size_cap() {
+async fn session_handle_append_rolls_and_keeps_global_seqs() {
     let tmp = TempDir::new().unwrap();
-    let key = SessionKey::new("api", "web-cap-test");
+    let key = SessionKey::new("api", "web-roll-test");
     let mut handle = SessionHandle::open(tmp.path(), &key);
-
-    // Pre-fill the JSONL above MAX_SESSION_FILE_SIZE so the next
-    // append must refuse.
-    let path = handle.session_path();
-    std::fs::create_dir_all(path.parent().unwrap()).ok();
-    let oversize = vec![b'a'; (MAX_SESSION_FILE_SIZE + 1) as usize];
-    std::fs::write(&path, oversize).expect("pre-fill oversize jsonl");
-
-    let msg = make_message(MessageRole::User, "after-cap");
-    let result = handle.add_message_with_seq(msg).await;
-
-    assert!(
-        result.is_err(),
-        "add_message_with_seq must return Err when file at size cap; got {:?}",
-        result
-    );
-    // In-memory state must NOT advance on a refused append.
     assert_eq!(
-        handle.get_history(10).len(),
-        0,
-        "no message should be in memory when disk append refused"
+        handle
+            .add_message_with_seq(make_message(MessageRole::User, "seed"))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        handle.add_message_with_seq(oversize_row()).await.unwrap(),
+        1
+    );
+    let after = handle
+        .add_message_with_seq(make_message(MessageRole::User, "after the roll"))
+        .await
+        .unwrap();
+    assert_eq!(after, 2);
+    let active = handle.session_path();
+    assert!(segment_path(&segments_dir(&active), 1).is_file());
+    assert_eq!(read_session_meta(&active).unwrap().base_seq, 2);
+
+    // A fresh handle sees the whole history; a tiny budget sees the window.
+    let reopened = SessionHandle::open(tmp.path(), &key);
+    assert_eq!(reopened.get_history(10).len(), 3);
+    let windowed = SessionHandle::open_with_budget(tmp.path(), &key, 64 * 1024);
+    assert_eq!(windowed.get_history(10).len(), 1);
+    assert!(windowed.session().is_partial());
+    assert_eq!(windowed.session().next_seq(), 3);
+}
+
+/// A system note written before the file rolled must still count as present.
+#[tokio::test]
+async fn system_note_once_finds_a_note_that_lives_in_a_sealed_segment() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "web-note-roll");
+    let first = persist_system_note_once_through_canonical_path(
+        tmp.path(),
+        &key,
+        Message::system("remember this"),
+        "note-1",
+    )
+    .await
+    .unwrap();
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    handle.add_message_with_seq(oversize_row()).await.unwrap();
+    handle
+        .add_message_with_seq(make_message(MessageRole::User, "after the roll"))
+        .await
+        .unwrap();
+    assert!(segments_dir(&handle.session_path()).is_dir());
+
+    let again = persist_system_note_once_through_canonical_path(
+        tmp.path(),
+        &key,
+        Message::system("remember this"),
+        "note-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        again.timestamp, first.timestamp,
+        "the sealed note is returned, not re-added"
+    );
+    let full = SessionHandle::open_full(tmp.path(), &key);
+    assert_eq!(
+        full.get_history(10)
+            .iter()
+            .filter(|m| m.client_message_id.as_deref() == Some("note-1"))
+            .count(),
+        1
     );
 }
 
@@ -3018,5 +4017,578 @@ async fn should_not_migrate_legacy_file_when_exporting_transcript() {
     assert!(
         !dir.path().join("users").exists(),
         "export must not create the per-user tree"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// evening 2026-09-10: persist_system_note_once_through_canonical_path —
+// idempotency, concurrency, strict-read fail-closed, and durable-row
+// identity (original timestamp/content preserved).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Same id twice → exactly one durable row; the second call returns the
+/// ORIGINAL row (same timestamp and content).
+#[tokio::test]
+async fn system_note_once_same_id_returns_original_row_without_duplicate() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:same-id".to_owned());
+
+    let first = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note A"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await
+    .expect("first append");
+    let first_ts = first.timestamp;
+
+    // Different content, SAME id → the durable original wins.
+    let second = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note A-prime"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await
+    .expect("second call resolves");
+    assert_eq!(second.content, "note A", "first-writer-wins content");
+    assert_eq!(second.timestamp, first_ts, "original timestamp preserved");
+
+    let durable = SessionHandle::open(dir.path(), &key);
+    let count = durable
+        .session()
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == octos_core::MessageRole::System
+                && m.client_message_id.as_deref() == Some("goal-verifier-note:v1:g1:d1")
+        })
+        .count();
+    assert_eq!(count, 1, "exactly one durable row for the id");
+}
+
+/// Different ids → independent rows.
+#[tokio::test]
+async fn system_note_once_distinct_ids_append_independently() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:distinct-ids".to_owned());
+    for id in ["g1:d1", "g1:d2", "g2:d1"] {
+        let note_id = format!("goal-verifier-note:v1:{id}");
+        persist_system_note_once_through_canonical_path(
+            dir.path(),
+            &key,
+            octos_core::Message::system(format!("note {id}")),
+            &note_id,
+        )
+        .await
+        .expect("append");
+    }
+    let durable = SessionHandle::open(dir.path(), &key);
+    assert_eq!(
+        durable.session().messages.len(),
+        3,
+        "three independent notes"
+    );
+}
+
+/// Concurrent same-id calls → exactly one durable row (the shared per-key
+/// persist lock serializes check+append).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn system_note_once_concurrent_same_id_single_durable_row() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:concurrent".to_owned());
+    let data_dir = dir.path().to_path_buf();
+    let mut joins = Vec::new();
+    for i in 0..8 {
+        let data_dir = data_dir.clone();
+        let key = key.clone();
+        joins.push(tokio::spawn(async move {
+            persist_system_note_once_through_canonical_path(
+                &data_dir,
+                &key,
+                octos_core::Message::system(format!("concurrent {i}")),
+                "goal-verifier-note:v1:g1:d1",
+            )
+            .await
+        }));
+    }
+    for j in joins {
+        j.await.expect("join").expect("call ok");
+    }
+    let durable = SessionHandle::open(dir.path(), &key);
+    let count = durable
+        .session()
+        .messages
+        .iter()
+        .filter(|m| {
+            m.role == octos_core::MessageRole::System
+                && m.client_message_id.as_deref() == Some("goal-verifier-note:v1:g1:d1")
+        })
+        .count();
+    assert_eq!(count, 1, "concurrency commits exactly one row");
+}
+
+/// Strict read: a corrupt meta header means Err and the file is left
+/// byte-identical (no append past a broken head).
+#[tokio::test]
+async fn system_note_once_bad_header_fails_closed_file_untouched() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:bad-header".to_owned());
+    // Seed a valid session, then corrupt the meta line.
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    let original = std::fs::read(&canonical).expect("read");
+    let body_start = original
+        .iter()
+        .position(|b| *b == b'\n')
+        .expect("meta newline")
+        + 1;
+    let mut corrupted = b"{not json\n".to_vec();
+    corrupted.extend_from_slice(&original[body_start..]);
+    assert_eq!(corrupted.last(), Some(&b'\n'), "isolate header corruption");
+    std::fs::write(&canonical, &corrupted).expect("corrupt");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(result.is_err(), "bad header must fail closed");
+    let after = std::fs::read(&canonical).expect("read after");
+    assert_eq!(after, corrupted, "failed call must preserve every byte");
+}
+
+/// Strict read: a body line that parses as neither Message nor control
+/// record means Err (never treat a corrupt tail as absence).
+#[tokio::test]
+async fn system_note_once_bad_body_line_fails_closed() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:bad-body".to_owned());
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    let text = std::fs::read_to_string(&canonical).expect("read");
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.push("!!!not a message or control record!!!");
+    std::fs::write(&canonical, lines.join("\n") + "\n").expect("append bad line");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(result.is_err(), "bad body line must fail closed");
+}
+
+/// Strict read: a non-empty final line WITHOUT a trailing newline means Err
+/// (an append would concatenate onto it).
+#[tokio::test]
+async fn system_note_once_missing_trailing_newline_fails_closed() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:no-newline".to_owned());
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    let text = std::fs::read_to_string(&canonical).expect("read");
+    std::fs::write(&canonical, text.trim_end()).expect("strip trailing newline");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(result.is_err(), "missing trailing newline must fail closed");
+}
+
+/// Test util: first .jsonl under the users/ tree (single-session tempdir).
+fn find_first_jsonl(users_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    fn visit(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = visit(&path) {
+                    return Some(found);
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    visit(users_dir)
+}
+
+/// Meta-only file WITHOUT a trailing newline: fail closed; the file bytes
+/// are unchanged (an append would glue the note JSON onto the meta line).
+#[tokio::test]
+async fn system_note_once_meta_only_no_newline_fails_closed_bytes_unchanged() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:meta-nonl".to_owned());
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    // Keep ONLY the meta line, no trailing newline.
+    let text = std::fs::read_to_string(&canonical).expect("read");
+    let meta_only = text.lines().next().expect("meta line").to_owned();
+    std::fs::write(&canonical, &meta_only).expect("meta-only, no newline");
+    let before = std::fs::read(&canonical).expect("bytes before");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "meta-only file without newline must fail closed"
+    );
+    let after = std::fs::read(&canonical).expect("bytes after");
+    assert_eq!(before, after, "file bytes unchanged by the failed call");
+}
+
+/// Invalid UTF-8 in the transcript: fail closed; bytes unchanged.
+#[tokio::test]
+async fn system_note_once_invalid_utf8_fails_closed_bytes_unchanged() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:bad-utf8".to_owned());
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    let mut bytes = std::fs::read(&canonical).expect("read");
+    // Corrupt INSIDE a valid JSON string: lossy UTF-8 decoding would still
+    // produce a valid Message, so only strict decoding rejects this case.
+    let offset = bytes
+        .windows(4)
+        .rposition(|part| part == b"seed")
+        .expect("seed content");
+    bytes[offset] = 0xFF;
+    let lossy = String::from_utf8_lossy(&bytes);
+    let body = lossy.lines().nth(1).expect("message line");
+    assert!(serde_json::from_str::<octos_core::Message>(body).is_ok());
+    std::fs::write(&canonical, &bytes).expect("invalid utf8 body");
+    let before = std::fs::read(&canonical).expect("bytes before");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(result.is_err(), "invalid UTF-8 must fail closed");
+    let after = std::fs::read(&canonical).expect("bytes after");
+    assert_eq!(before, after, "file bytes unchanged by the failed call");
+}
+
+/// The canonical path is a DIRECTORY: fail closed; the directory's bytes
+/// (its listing) are unchanged — nothing is written through it.
+#[tokio::test]
+async fn system_note_once_target_is_directory_fails_closed() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:target-dir".to_owned());
+    persist_message_through_canonical_path(dir.path(), &key, octos_core::Message::user("seed"))
+        .await
+        .expect("seed");
+    let users_dir = dir.path().join("users");
+    let canonical = find_first_jsonl(&users_dir).expect("canonical file");
+    let backup = canonical.with_extension("jsonl.backup");
+    std::fs::rename(&canonical, &backup).expect("rename aside");
+    std::fs::create_dir(&canonical).expect("dir at target");
+
+    let result = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("note"),
+        "goal-verifier-note:v1:g1:d1",
+    )
+    .await;
+    assert!(result.is_err(), "a directory target must fail closed");
+    assert!(
+        canonical.is_dir(),
+        "the directory is untouched (still a directory, empty)"
+    );
+    let entries: Vec<_> = std::fs::read_dir(&canonical).expect("read dir").collect();
+    assert!(entries.is_empty(), "nothing written through the directory");
+
+    // Restore for cleanup.
+    std::fs::remove_dir(&canonical).expect("remove dir");
+    std::fs::rename(&backup, &canonical).expect("restore");
+}
+
+/// Recovery after file creation succeeds but the initial metadata write fails.
+#[tokio::test]
+async fn system_note_once_zero_byte_file_recovers_and_stays_idempotent() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let key = octos_core::SessionKey("noteonce-prof:api:empty-file".to_owned());
+    let canonical = SessionHandle::open(dir.path(), &key).session_path();
+    std::fs::create_dir_all(canonical.parent().unwrap()).expect("parent");
+    std::fs::write(&canonical, []).expect("real empty canonical file");
+    assert_eq!(std::fs::metadata(&canonical).unwrap().len(), 0);
+    let id = "goal-verifier-note:v1:g1:d1";
+    let first = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("recovered note"),
+        id,
+    )
+    .await
+    .expect("recover empty file");
+    let second = persist_system_note_once_through_canonical_path(
+        dir.path(),
+        &key,
+        octos_core::Message::system("must not replace"),
+        id,
+    )
+    .await
+    .expect("idempotent replay");
+    assert_eq!(second.content, first.content);
+    assert_eq!(second.timestamp, first.timestamp);
+    let reopened = SessionHandle::open(dir.path(), &key);
+    assert_eq!(reopened.session().messages.len(), 1);
+    assert_eq!(
+        reopened.session().messages[0].client_message_id.as_deref(),
+        Some(id)
+    );
+    assert_eq!(reopened.session().messages[0].content, "recovered note");
+}
+
+/// Issue #2006: a torn tail (crash mid-write leaves a partial final line
+/// without a newline) must not fuse with the NEXT appended row — the fused
+/// line is unparseable and silently takes the complete row down with it.
+/// The append path seals the torn tail with the missing terminator first,
+/// so only the torn bytes are lost, never the row written after them.
+#[tokio::test]
+async fn torn_tail_does_not_eat_next_appended_message() {
+    use std::io::Write;
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "torn-tail-append");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.add_message(&key, make_message(MessageRole::User, "before torn"))
+        .await
+        .unwrap();
+
+    // Simulate a crash mid-write: partial JSON row, no trailing newline.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(mgr.session_path(&key))
+        .unwrap()
+        .write_all(b"{\"role\":\"user\",\"content\":\"torn")
+        .unwrap();
+
+    mgr.add_message(&key, make_message(MessageRole::User, "after torn"))
+        .await
+        .unwrap();
+
+    // A fresh manager reloads from disk: the torn row is skipped, but the
+    // complete row appended after it must survive.
+    let mut reload = SessionManager::open(tmp.path()).unwrap();
+    let session = reload.get_or_create(&key).await;
+    let contents: Vec<&str> = session
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        ["before torn", "after torn"],
+        "torn tail must not eat the next appended message"
+    );
+}
+
+/// Issue #2006: the same seal must protect the rollback control line —
+/// otherwise the marker fuses with a torn tail, is dropped on reload, and
+/// `/undo` un-does itself (the rolled-back turn resurrects).
+#[tokio::test]
+async fn torn_tail_does_not_eat_rollback_marker() {
+    use std::io::Write;
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "torn-tail-rollback");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    for n in 1..=2 {
+        let tid = format!("t{n}");
+        let mut user = make_message(MessageRole::User, &format!("turn {n}"));
+        user.client_message_id = Some(tid.clone());
+        user.thread_id = Some(tid.clone());
+        mgr.add_message(&key, user).await.unwrap();
+        let mut asst = make_message(MessageRole::Assistant, &format!("reply {n}"));
+        asst.thread_id = Some(tid.clone());
+        mgr.add_message(&key, asst).await.unwrap();
+    }
+
+    // Crash mid-write leaves a torn tail right before the rollback marker.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(mgr.session_path(&key))
+        .unwrap()
+        .write_all(b"{\"role\":\"user\",\"content\":\"torn")
+        .unwrap();
+
+    let dropped = mgr.rollback_last_n_user_turns(&key, 1).await.unwrap();
+    assert_eq!(dropped, 1);
+
+    // Fresh reload replays the marker: turn 2 must stay rolled back.
+    let mut reload = SessionManager::open(tmp.path()).unwrap();
+    let session = reload.get_or_create(&key).await;
+    let contents: Vec<&str> = session
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        ["turn 1", "reply 1"],
+        "rollback marker fused with a torn tail resurrects the rolled-back turn"
+    );
+}
+
+/// Issue #2006: the SessionHandle append path seals the same way.
+#[tokio::test]
+async fn torn_tail_does_not_eat_handle_appended_message() {
+    use std::io::Write;
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "torn-tail-handle");
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    handle
+        .add_message(Message::user("before torn"))
+        .await
+        .unwrap();
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(handle.session_path())
+        .unwrap()
+        .write_all(b"{\"role\":\"user\",\"content\":\"torn")
+        .unwrap();
+
+    handle
+        .add_message(Message::user("after torn"))
+        .await
+        .unwrap();
+
+    let reloaded = SessionHandle::open(tmp.path(), &key);
+    let contents: Vec<&str> = reloaded
+        .session()
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        ["before torn", "after torn"],
+        "torn tail must not eat the next handle-appended message"
+    );
+}
+
+/// Issue #2006: torn bytes that are actually a COMPLETE row missing only
+/// their terminator are preserved, never truncated — once sealed, the read
+/// path recovers the row (mirrors the supervisor store's
+/// `append_seals_a_complete_row_missing_its_trailing_newline`).
+#[tokio::test]
+async fn torn_tail_complete_row_is_recovered() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "torn-tail-complete-row");
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    mgr.add_message(&key, make_message(MessageRole::User, "complete row"))
+        .await
+        .unwrap();
+
+    // Simulate the exact crash point: the row's bytes landed but its
+    // terminator did not — drop the trailing newline.
+    let path = mgr.session_path(&key);
+    let len = std::fs::metadata(&path).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(len - 1)
+        .unwrap();
+
+    mgr.add_message(&key, make_message(MessageRole::User, "after torn"))
+        .await
+        .unwrap();
+
+    let mut reload = SessionManager::open(tmp.path()).unwrap();
+    let session = reload.get_or_create(&key).await;
+    let contents: Vec<&str> = session
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        ["complete row", "after torn"],
+        "a complete row that lost only its terminator must be recovered"
+    );
+}
+
+/// Issue #2006: when the per-user layout exists the rollback marker lands
+/// THERE (the production-canonical layout) — the seal must protect the
+/// marker on that file too.
+#[tokio::test]
+async fn torn_tail_does_not_eat_rollback_marker_in_per_user_layout() {
+    use std::io::Write;
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("cli", "torn-tail-rollback-per-user");
+
+    // Seed via SessionHandle so the transcript lives in the per-user layout.
+    let mut handle = SessionHandle::open(tmp.path(), &key);
+    for n in 1..=2 {
+        let tid = format!("t{n}");
+        let mut user = make_message(MessageRole::User, &format!("turn {n}"));
+        user.client_message_id = Some(tid.clone());
+        user.thread_id = Some(tid.clone());
+        handle.add_message(user).await.unwrap();
+        let mut asst = make_message(MessageRole::Assistant, &format!("reply {n}"));
+        asst.thread_id = Some(tid.clone());
+        handle.add_message(asst).await.unwrap();
+    }
+
+    // Crash mid-write leaves a torn tail on the per-user file.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(handle.session_path())
+        .unwrap()
+        .write_all(b"{\"role\":\"user\",\"content\":\"torn")
+        .unwrap();
+    drop(handle);
+
+    // Roll back through a manager over the same dir: the marker targets the
+    // per-user file (the only layout present) and must survive the torn tail.
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let dropped = mgr.rollback_last_n_user_turns(&key, 1).await.unwrap();
+    assert_eq!(dropped, 1);
+
+    let mut reload = SessionManager::open(tmp.path()).unwrap();
+    let session = reload.get_or_create(&key).await;
+    let contents: Vec<&str> = session
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect();
+    assert_eq!(
+        contents,
+        ["turn 1", "reply 1"],
+        "rollback marker on the per-user file must survive a torn tail"
     );
 }

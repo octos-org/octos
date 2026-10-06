@@ -1,6 +1,6 @@
 # LLM Providers & Routing
 
-Octos supports 16 LLM providers out of the box. Each provider needs an API key stored in an environment variable (except local providers like Ollama and Vertex AI, which uses a service-account JSON).
+Octos supports 17 LLM providers out of the box. Each provider needs an API key stored in an environment variable (except local providers like Ollama and Vertex AI, which uses a service-account JSON).
 
 ## Supported Providers
 
@@ -15,15 +15,18 @@ Octos supports 16 LLM providers out of the box. Each provider needs an API key s
 | `groq` | `GROQ_API_KEY` | llama-3.3-70b-versatile | OpenAI-compatible | -- |
 | `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI-compatible | `kimi` |
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI-compatible | `qwen` |
-| `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible | -- |
+| `minimax` | `MINIMAX_API_KEY` | MiniMax-M3 | OpenAI-compatible | -- |
+| `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI-compatible | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | OpenAI-compatible | `z.ai` |
 | `r9s` | `R9S_API_KEY` | claude-sonnet-4-6 | Auto (Anthropic/OpenAI) | `r9s.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | -- |
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | -- |
 
 **`vertex`** authenticates with a Google service-account JSON (resolved via `VERTEX_SA_JSON` — keychain marker, config value, or env) instead of an API key; the GCP project is read from the JSON and the region is fixed to `global`. It must be selected explicitly (`provider: "vertex"`) — bare `gemini-*` model names still resolve to the AI Studio `gemini` provider. **`r9s`** is a multi-protocol proxy that auto-detects the Anthropic Messages API for `claude-*` models and OpenAI Chat Completions otherwise.
+
+**`minimax-cn`** is the China region of MiniMax (`https://api.minimaxi.com/v1` instead of the international `https://api.minimax.io/v1`). MiniMax Token-plan subscription keys are issued by the China platform (platform.minimaxi.com) and are region-bound, so they only work against `minimax-cn`; international keys stay on `minimax`. MiniMax Coding-plan keys (`sk-cp-…`) additionally require the Anthropic protocol: choose protocol **Anthropic** during `octos init`, or set `api_type: "anthropic"` with `base_url: "https://api.minimaxi.com/anthropic"` — over the default OpenAI protocol they 401 (see octos#2115).
 
 Any other OpenAI- or Anthropic-compatible endpoint (e.g. `wisemodel`, Together, Fireworks, Azure) is reachable by setting `base_url` on a provider — see [Custom Endpoints](#custom-endpoints).
 
@@ -55,12 +58,11 @@ octos chat --provider deepseek --model deepseek-chat
 octos chat --model gpt-4o
 
 # Custom endpoint — name the real vendor, pick the wire protocol explicitly
-octos chat --provider zai --api-type anthropic \
-  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+octos chat --provider zai --api-type openai \
+  --base-url https://api.z.ai/api/paas/v4 --model glm-5.2
 
 # Full autonomy (bypass approvals + sandbox) alongside model selection
-octos chat --yolo --provider zai --api-type anthropic \
-  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+octos chat --yolo --provider zai --model glm-5.2
 ```
 
 | Flag | Meaning |
@@ -108,8 +110,7 @@ There is **no `--api-key` flag** — the key is resolved, in order:
 ```bash
 # Quickest — export the provider's env var, then run
 export ZAI_API_KEY=<your-key>
-octos chat --provider zai --api-type anthropic \
-  --base-url https://api.z.ai/api/anthropic --model glm-5.2
+octos chat --provider zai --model glm-5.2
 
 # Or log in once (no env var afterward)
 octos auth login --provider zai      # prompts: "Paste your API key:"
@@ -123,8 +124,8 @@ Or bake it into `config.json` so nothing is needed at runtime:
 {
   "provider": "zai",
   "model": "glm-5.2",
-  "base_url": "https://api.z.ai/api/anthropic",
-  "api_type": "anthropic",
+  "base_url": "https://api.z.ai/api/paas/v4",
+  "api_type": "openai",
   "env_vars": { "ZAI_API_KEY": "<your-key>" }
 }
 ```
@@ -203,8 +204,8 @@ octos chat --provider zai --api-type anthropic \
   --base-url https://api.z.ai/api/anthropic --model glm-5.2
 ```
 
-- `"openai"` -- OpenAI Chat Completions format (default for most providers)
-- `"anthropic"` -- Anthropic Messages format (for Anthropic-compatible proxies, e.g. z.ai/GLM)
+- `"openai"` -- OpenAI Chat Completions format (default for most providers, including `zai` / `zai-coding`)
+- `"anthropic"` -- Anthropic Messages format (for Anthropic-compatible proxies). A `zai` / `zai-coding` route with `api_type: "anthropic"` and no `base_url` targets Z.AI's Anthropic-compatible root (`https://api.z.ai/api/anthropic`); that root reports no prompt-cache hits, so the default OpenAI-compatible lane is cheaper for long sessions
 - `"responses"` -- OpenAI Responses API format
 
 ## Fallback Chains
@@ -247,7 +248,7 @@ When multiple fallback models are configured, adaptive routing dynamically selec
   "adaptive_routing": {
     "mode": "hedge",
     "qos_ranking": true,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -291,7 +292,7 @@ Each provider is scored on 4 factors (lower score = better). All weights are con
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `latency_threshold_ms` | 30000 | Providers with average latency above this are penalized |
+| `latency_threshold_ms` | 10000 | Providers with average latency above this are penalized |
 | `error_rate_threshold` | 0.3 | Providers with error rates above 30% are deprioritized |
 | `probe_probability` | 0.1 | Fraction of requests sent to non-primary providers as health probes |
 | `probe_interval_secs` | 60 | Minimum seconds between probes to the same provider |

@@ -57,8 +57,7 @@ pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> Result<Pa
     if !memory_path.exists() {
         let today = chrono::Utc::now().format("%Y-%m-%d");
         let memory = format!(
-            "# {} -- Slides Project\n\n## Style decisions\n\n## User preferences\n\n## Current state\n- Created: {}\n- Slides: 0\n",
-            project_name, today
+            "# {project_name} -- Slides Project\n\n## Style decisions\n\n## User preferences\n\n## Current state\n- Created: {today}\n- Slides: 0\n"
         );
         std::fs::write(&memory_path, &memory)
             .map_err(|e| format!("write slides memory.md failed: {e}"))?;
@@ -78,7 +77,7 @@ pub fn scaffold_slides_project(data_dir: &Path, project_name: &str) -> Result<Pa
 // updated_at: {}
 // change_summary: Initial scaffold created by /new slides
 // EMPTY: The agent must write slide content here before generating.
-// Use mofa_slides with input pointing to this file after writing content.
+// Use mofa_make with content_type "slides" and args.input pointing here after writing content.
 //
 // Example format:
 // module.exports = [
@@ -280,7 +279,7 @@ fn site_preset_from_topic(session_topic: &str) -> Option<SitePreset> {
             site_name: "Physics Learning Studio",
             description: "Lesson-driven math and physics site with chapter pages, diagrams, and explanatory notes.",
             accent: "#2563eb",
-            reference: "/Users/yuechen/home/sophie/3b1b-calculus",
+            reference: "3b1b-calculus",
             reference_label: "3b1b-calculus",
         },
         "astro" | "docs" | "documentation" | "guide" => SitePreset {
@@ -290,7 +289,7 @@ fn site_preset_from_topic(session_topic: &str) -> Option<SitePreset> {
             site_name: "Signal Atlas",
             description: "Structured content site for guides, onboarding, changelogs, and reference pages.",
             accent: "#d97706",
-            reference: "/Users/yuechen/home/origin2025",
+            reference: "origin2025",
             reference_label: "origin2025",
         },
         "next" | "nextjs" | "app" | "product" | "event" => SitePreset {
@@ -300,7 +299,7 @@ fn site_preset_from_topic(session_topic: &str) -> Option<SitePreset> {
             site_name: "Vision Forum",
             description: "App-like landing shell for events, products, and structured call-to-action flows.",
             accent: "#0f766e",
-            reference: "/Users/yuechen/home/ai-vision-forum-paris-2026",
+            reference: "ai-vision-forum-paris-2026",
             reference_label: "ai-vision-forum-paris-2026",
         },
         "react" | "vite" | "prototype" | "tool" => SitePreset {
@@ -310,7 +309,7 @@ fn site_preset_from_topic(session_topic: &str) -> Option<SitePreset> {
             site_name: "React Lab",
             description: "Lean React/Vite shell for prototypes, interface experiments, and lightweight tools.",
             accent: "#be123c",
-            reference: "/Users/yuechen/home/adora-website",
+            reference: "adora-website",
             reference_label: "adora-website",
         },
         _ => SitePreset {
@@ -320,7 +319,7 @@ fn site_preset_from_topic(session_topic: &str) -> Option<SitePreset> {
             site_name: "Physics Learning Studio",
             description: "Lesson-driven math and physics site with chapter pages, diagrams, and explanatory notes.",
             accent: "#2563eb",
-            reference: "/Users/yuechen/home/sophie/3b1b-calculus",
+            reference: "3b1b-calculus",
             reference_label: "3b1b-calculus",
         },
     };
@@ -1213,13 +1212,23 @@ mod tests {
     }
 
     #[test]
+    fn review_slides_prompt_uses_visible_content_dispatcher() {
+        let prompt = slides_system_prompt("Deck");
+        assert!(prompt.contains("mofa_describe_content_type({content_type: \"slides\"})"));
+        assert!(prompt.contains("mofa_make({content_type: \"slides\", args:"));
+        assert!(prompt.contains("intentionally hidden from the model"));
+        assert!(!prompt.contains("Call it directly"));
+        assert!(!prompt.contains("only mini1 had"));
+    }
+
+    #[test]
     fn slides_prompt_uses_task_and_workspace_state_for_status_checks() {
         let prompt = slides_system_prompt("Deck");
         assert!(prompt.contains("check_background_tasks"));
         assert!(prompt.contains("check_workspace_contract"));
         assert!(prompt.contains("task state tells you what happened in execution"));
         assert!(prompt.contains("workspace state tells you what is true about the deliverable"));
-        assert!(prompt.contains("If `mofa_slides` is not available"));
+        assert!(prompt.contains("If `mofa_make` is unavailable"));
         assert!(prompt.contains("Runtime owns workspace contract enforcement"));
         assert!(prompt.contains("PROMPT-OWNED GUIDANCE"));
         assert!(prompt.contains("runtime auto-delivers"));

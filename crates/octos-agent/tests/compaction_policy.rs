@@ -252,8 +252,7 @@ fn should_preserve_declared_artifacts_through_compaction() {
         .expect("preservation check");
     assert!(
         ledger.all_preserved(),
-        "declared artifact path should survive compaction ({:?})",
-        ledger
+        "declared artifact path should survive compaction ({ledger:?})"
     );
     assert!(outcome.performed || outcome.messages_dropped == 0);
 }
@@ -474,6 +473,8 @@ fn tool_result_placeholder_roundtrips_through_json() {
         turn_id: Some(3),
         original_byte_len: Some(4096),
         reason: "pruned_after_turns".into(),
+        target: None,
+        hint: None,
     };
     let json = placeholder.to_placeholder_content();
     let parsed = ToolResultPlaceholder::from_placeholder_content(&json).expect("roundtrip");

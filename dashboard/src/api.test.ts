@@ -1,50 +1,23 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { api } from './api'
+// Tests for the ActionResponse ok-flag contract shared by the gateway
+// action callers (ProfileContext, HomePage sub-account list).
+//
+// The self-service gateway routes report failures as HTTP 200 +
+// `{ ok: false, message }` — only the admin ones use error statuses.
 
-beforeEach(() => {
-  localStorage.clear()
-})
+import { describe, it, expect } from 'vitest'
+import { ensureActionOk } from './api'
 
-afterEach(() => {
-  vi.unstubAllGlobals()
-})
-
-describe('dashboard api errors', () => {
-  it('throws structured ApiError details for JSON error bodies', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            code: 'registered_email_exists',
-            message: "email 'alice@example.com' is already registered",
-          }),
-          {
-            status: 409,
-            headers: { 'Content-Type': 'application/json' },
-          },
-        ),
-      ),
-    )
-
-    await expect(api.addAllowedEmail({ email: 'alice@example.com' })).rejects.toMatchObject({
-      name: 'ApiError',
-      status: 409,
-      code: 'registered_email_exists',
-      message: "email 'alice@example.com' is already registered",
-    })
+describe('ensureActionOk', () => {
+  it('passes an ok: true response through untouched', () => {
+    expect(() => ensureActionOk({ ok: true }, 'Failed')).not.toThrow()
   })
 
-  it('keeps legacy text errors readable', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue(new Response('HTTP 409', { status: 409 })),
-    )
+  it('throws the backend message on ok: false', () => {
+    expect(() => ensureActionOk({ ok: false, message: 'refused: reason' }, 'Failed')).toThrow('refused: reason')
+  })
 
-    await expect(api.addAllowedEmail({ email: 'alice@example.com' })).rejects.toMatchObject({
-      name: 'ApiError',
-      status: 409,
-      message: 'HTTP 409',
-    })
+  it('falls back to the caller message when the refusal carries none', () => {
+    expect(() => ensureActionOk({ ok: false }, 'Failed to start gateway')).toThrow('Failed to start gateway')
+    expect(() => ensureActionOk({ ok: false, message: '' }, 'Failed to start gateway')).toThrow('Failed to start gateway')
   })
 })

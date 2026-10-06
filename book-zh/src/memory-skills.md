@@ -151,7 +151,7 @@ octos memory forget --id ^m4k2abq   # 硬删除某条精确的 MEMORY.md 条目
 │   ├── 2025-02-10.md        # 每日笔记（手动或 write_file）
 │   └── bank/
 │       └── entities/        # 实体知识库（由 save/recall 工具管理）
-│           ├── yuechen.md   # 实体：「用户是谁」
+│           ├── alice.md   # 实体：「用户是谁」
 │           └── octos.md     # 实体：「这个项目是什么」
 ├── skills/                  # 自定义技能
 ├── episodes.redb            # 情景记忆数据库（自动填充）

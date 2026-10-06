@@ -1,19 +1,25 @@
-//! macOS Keychain integration for secure API key storage.
+//! Platform-neutral secret store for API keys (#2234).
 //!
-//! Uses the macOS `security` CLI to store secrets in the login keychain.
-//! This bypasses application-level ACL prompts that would block on headless
-//! servers (the `keyring` crate's native API requires GUI confirmation for
-//! new applications).
-//!
-//! ## SSH access
-//!
-//! SSH sessions cannot access a locked keychain.  Call [`unlock`] with the
-//! login password first, or enable auto-login so the keychain is unlocked
-//! at boot.
+//! Backends, selected at compile time:
+//! * **macOS** — the login keychain via the `security` CLI. This bypasses
+//!   application-level ACL prompts that would block on headless servers (the
+//!   `keyring` crate's native API requires GUI confirmation for new
+//!   applications). SSH sessions may need [`unlock`] with the login password
+//!   first (see the macOS notes below).
+//! * **Linux** — a file-backed store under `<octos home>/secrets` (directory
+//!   0700, one file per key 0600): the lowest-dependency option that works in
+//!   headless sessions with no D-Bus / Secret Service. [`unlock`] is a no-op.
+//! * **Other platforms** — [`set_secret`] / [`get_secret`] / [`delete_secret`]
+//!   return an explicit "secret store unsupported" error. There is never a
+//!   silent fallback to plaintext profile config.
 
 use std::collections::HashMap;
 
-use eyre::{Result, WrapErr};
+use eyre::Result;
+// #2258 — `wrap_err` is only used by the macOS-gated helpers below; keep the
+// trait import gated too so Linux clippy (unused_imports) and macOS rustc agree.
+#[cfg(target_os = "macos")]
+use eyre::WrapErr;
 
 /// Sentinel prefix stored in profile `env_vars` to indicate that the real
 /// secret lives in the macOS Keychain.
@@ -78,13 +84,436 @@ pub fn marker_account<'a>(value: &'a str, fallback_name: &'a str) -> &'a str {
         .unwrap_or(fallback_name)
 }
 
-/// The service name used for all octos keychain entries.
+/// The service name used for all octos keychain entries (macOS backend).
+#[cfg(target_os = "macos")]
 const SERVICE: &str = "octos";
+
+/// Human-readable name of the active secret-store backend.
+pub fn backend_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "macos-keychain"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "linux-file"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "unsupported"
+    }
+}
+
+/// Whether a secret-store backend exists on this platform.
+pub fn is_available() -> bool {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_file::is_available()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// Explicit error for platforms with no secret-store backend (#2234).
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn unsupported_store_error(op: &str) -> eyre::Report {
+    // TODO(#2234): implement a native Windows secret store (keyring/windows-native).
+    // The workarounds are real today (#2415) for plain API keys: non-marker
+    // `env_vars` values pass through unresolved, and `api_key_env` reads the
+    // process environment. (Service-account JSON is different: the dashboard
+    // refuses a plaintext SA value when no store exists.)
+    eyre::eyre!(
+        "secret store unsupported on {} ({op} failed); store plain API keys \
+         in the process environment or the profile's `env_vars` instead \
+         (both are read without the secret store; see `octos auth keys`)",
+        std::env::consts::OS
+    )
+}
+
+/// Unlock the login keychain so subsequent operations succeed from SSH.
+///
+/// No-op on Linux (the file store has no lock); unsupported elsewhere.
+pub fn unlock(password: &str) -> Result<()> {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_unlock(password)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // The file-backed store is always usable when the home dir resolves;
+        // there is no keychain lock to open.
+        let _ = password;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = password;
+        Err(unsupported_store_error("unlock"))
+    }
+}
+
+/// Store a secret in the platform secret store.
+pub fn set_secret(name: &str, secret: &str) -> Result<()> {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return test_store::set_secret(name, secret);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_set_secret(name, secret)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_file::set_secret(name, secret)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (name, secret);
+        Err(unsupported_store_error("set_secret"))
+    }
+}
+
+/// Retrieve a secret from the platform secret store.
+///
+/// Returns `Ok(Some(secret))` on success, `Ok(None)` if not found,
+/// or `Err` on unexpected failures (keychain locked, etc.).
+pub fn get_secret(name: &str) -> Result<Option<String>> {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return test_store::get_secret(name);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_get_secret(name)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_file::get_secret(name)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = name;
+        Err(unsupported_store_error("get_secret"))
+    }
+}
+
+/// Delete a secret from the platform secret store.
+///
+/// Returns `Ok(true)` if deleted, `Ok(false)` if not found.
+pub fn delete_secret(name: &str) -> Result<bool> {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return test_store::delete_secret(name);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_delete_secret(name)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_file::delete_secret(name)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = name;
+        Err(unsupported_store_error("delete_secret"))
+    }
+}
+
+/// Check if the secret store is accessible (unlocked / usable).
+pub fn is_accessible() -> bool {
+    #[cfg(test)]
+    if test_store::root().is_some() {
+        return test_store::is_accessible();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_is_accessible()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_file::is_accessible()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+// ── Linux file-backed store ────────────────────────────────────────────────
+//
+// `<octos home>/secrets/<account>` — one file per secret, 0600, directory
+// 0700. The root mirrors the `ProfileStore::octos_home_dir()` the CLI auth
+// commands use (`~/.octos`): same resolver, `secrets/` sibling of `profiles/`.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+pub(crate) mod linux_file {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::OwnedFd;
+    use std::path::PathBuf;
+
+    use eyre::{Result, WrapErr};
+    use rustix::fs::{
+        AtFlags, Mode, OFlags, fchmod, fsync, mkdirat, open, openat, renameat, unlinkat,
+    };
+
+    const DIR_MODE: Mode = Mode::RWXU;
+    const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
+
+    /// The secrets root: `<octos home>/secrets`, with the octos home resolved
+    /// exactly as `ProfileStore::octos_home_dir()` does for the CLI auth
+    /// commands (`~/.octos`).
+    fn secrets_root() -> Result<PathBuf> {
+        #[cfg(test)]
+        if let Some(dir) = super::test_store::root() {
+            return Ok(dir);
+        }
+        let home = dirs::home_dir()
+            .ok_or_else(|| eyre::eyre!("cannot determine home directory for the secret store"))?;
+        Ok(home.join(".octos").join("secrets"))
+    }
+
+    /// Account names are env-var names or `<ENV>::<profile_id>`; reject
+    /// anything that could escape the secrets directory.
+    fn validate_name(name: &str) -> Result<()> {
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+            eyre::bail!("invalid secret account name: {name:?}");
+        }
+        Ok(())
+    }
+
+    fn open_root(create: bool) -> Result<Option<OwnedFd>> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let root = secrets_root()?;
+        let parent = root
+            .parent()
+            .ok_or_else(|| eyre::eyre!("secret root has no parent"))?;
+        let leaf = root
+            .file_name()
+            .ok_or_else(|| eyre::eyre!("secret root has no name"))?;
+        if create {
+            // The production parent is ~/.octos. Refuse a symlink at that
+            // boundary below, rather than following it while chmod'ing secrets.
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .wrap_err_with(|| {
+                    format!("failed to create secret-store parent: {}", parent.display())
+                })?;
+        }
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let parent = match open(parent, flags, Mode::empty()) {
+            Ok(parent) => parent,
+            Err(error) if !create && error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(error) => {
+                return Err(error).wrap_err_with(|| {
+                    format!("failed to open secret-store parent for {}", root.display())
+                });
+            }
+        };
+        if create {
+            match mkdirat(&parent, leaf, DIR_MODE) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!("failed to create secrets dir: {}", root.display())
+                    });
+                }
+            }
+        }
+        let dir = match openat(&parent, leaf, flags, Mode::empty()) {
+            Ok(dir) => dir,
+            Err(error) if !create && error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .wrap_err_with(|| format!("failed to open secrets dir: {}", root.display()));
+            }
+        };
+        if create {
+            // Restrict the opened inode, never a path that could be swapped.
+            fchmod(&dir, DIR_MODE).wrap_err("failed to restrict secrets directory")?;
+        }
+        Ok(Some(dir))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn is_available() -> bool {
+        secrets_root().is_ok()
+    }
+
+    pub fn is_accessible() -> bool {
+        open_root(true).is_ok()
+    }
+
+    pub fn set_secret(name: &str, secret: &str) -> Result<()> {
+        validate_name(name)?;
+        let dir = open_root(true)?.expect("create opens a directory or returns an error");
+        let temporary = format!(".secret-{}.tmp", uuid::Uuid::new_v4());
+        let fd = openat(
+            &dir,
+            temporary.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            FILE_MODE,
+        )
+        .wrap_err("failed to create private temporary secret file")?;
+        let mut file = std::fs::File::from(fd);
+        let written = (|| -> Result<()> {
+            // Creation can only be MORE restrictive under umask. Restore the
+            // owner's read/write bits on this opened inode before writing.
+            fchmod(&file, FILE_MODE).wrap_err("failed to restrict secret file")?;
+            file.write_all(secret.as_bytes())
+                .wrap_err("failed to write secret file")?;
+            file.sync_all().wrap_err("failed to sync secret file")?;
+            // All operations use the SAME directory fd, even if its path is
+            // concurrently renamed. Rename replaces a symlink/hardlink itself;
+            // it never truncates another inode or exposes a partially written key.
+            renameat(&dir, temporary.as_str(), &dir, name)
+                .wrap_err("failed to replace secret file")?;
+            fsync(&dir).wrap_err("failed to sync secret directory")?;
+            Ok(())
+        })();
+        if written.is_err() {
+            let _ = unlinkat(&dir, temporary.as_str(), AtFlags::empty());
+        }
+        written?;
+        Ok(())
+    }
+
+    pub fn get_secret(name: &str) -> Result<Option<String>> {
+        validate_name(name)?;
+        let Some(dir) = open_root(false)? else {
+            return Ok(None);
+        };
+        let fd = match openat(
+            &dir,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+            Err(error) => return Err(error).wrap_err("failed to open secret file"),
+        };
+        let mut file = std::fs::File::from(fd);
+        if !file.metadata()?.is_file() {
+            eyre::bail!("secret account is not a regular file");
+        }
+        let mut value = String::new();
+        file.read_to_string(&mut value)
+            .wrap_err("failed to read UTF-8 secret file")?;
+        Ok(Some(value))
+    }
+
+    pub fn delete_secret(name: &str) -> Result<bool> {
+        validate_name(name)?;
+        let Some(dir) = open_root(false)? else {
+            return Ok(false);
+        };
+        match unlinkat(&dir, name, AtFlags::empty()) {
+            Ok(()) => Ok(true),
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(false),
+            Err(error) => Err(error).wrap_err("failed to delete secret file"),
+        }
+    }
+}
+
+/// Explicit, thread-local test backend on EVERY host; never a no-op that falls
+/// through to the login Keychain. Keep the tempdir alive until the guard drops.
+#[cfg(test)]
+pub(crate) use test_store::override_root as test_override_secrets_root;
+
+#[cfg(test)]
+mod test_store {
+    use std::path::PathBuf;
+
+    thread_local! {
+        static ROOT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn root() -> Option<PathBuf> {
+        ROOT.with(|slot| slot.borrow().clone())
+    }
+
+    pub(crate) fn override_root(dir: PathBuf) -> RootGuard {
+        RootGuard {
+            previous: ROOT.with(|slot| slot.replace(Some(dir))),
+            // Restoring a thread-local override on another thread is invalid.
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) struct RootGuard {
+        previous: Option<PathBuf>,
+        _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for RootGuard {
+        fn drop(&mut self) {
+            ROOT.with(|slot| *slot.borrow_mut() = self.previous.take());
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) use super::linux_file::{delete_secret, get_secret, is_accessible, set_secret};
+
+    // Unsupported production hosts still need an explicitly isolated fixture
+    // backend. Encode account names (scoped names contain ':' on Windows).
+    #[cfg(not(unix))]
+    fn path(name: &str) -> eyre::Result<PathBuf> {
+        let root = root().expect("test backend requires an explicit override");
+        std::fs::create_dir_all(&root)?;
+        let leaf: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
+        Ok(root.join(format!("fixture-{leaf}")))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn set_secret(name: &str, value: &str) -> eyre::Result<()> {
+        Ok(std::fs::write(path(name)?, value)?)
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn get_secret(name: &str) -> eyre::Result<Option<String>> {
+        match std::fs::read_to_string(path(name)?) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn delete_secret(name: &str) -> eyre::Result<bool> {
+        match std::fs::remove_file(path(name)?) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn is_accessible() -> bool {
+        root().is_some_and(|root| std::fs::create_dir_all(root).is_ok())
+    }
+}
 
 /// Unlock the login keychain so subsequent operations succeed from SSH.
 ///
 /// Also disables auto-lock so the keychain stays unlocked until reboot.
-pub fn unlock(password: &str) -> Result<()> {
+#[cfg(target_os = "macos")]
+fn macos_unlock(password: &str) -> Result<()> {
     let home = std::env::var("HOME").unwrap_or_default();
     let keychain_path = format!("{home}/Library/Keychains/login.keychain-db");
 
@@ -110,7 +539,8 @@ pub fn unlock(password: &str) -> Result<()> {
 ///
 /// Uses `security add-generic-password` which works without GUI prompts.
 /// Handles updates by deleting existing entries first.
-pub fn set_secret(name: &str, secret: &str) -> Result<()> {
+#[cfg(target_os = "macos")]
+fn macos_set_secret(name: &str, secret: &str) -> Result<()> {
     // Delete all existing entries for this name
     loop {
         let out = std::process::Command::new("security")
@@ -154,6 +584,7 @@ pub fn set_secret(name: &str, secret: &str) -> Result<()> {
 /// a single-line secret that happens to be valid even-length ASCII hex (e.g.
 /// `41424344`) was returned as-is and must NOT be decoded — doing so would
 /// silently corrupt it into `ABCD`. Requiring a newline removes that ambiguity.
+#[cfg(target_os = "macos")]
 fn decode_security_hex(s: &str) -> Option<String> {
     let s = s.trim();
     if s.len() < 2 || s.len() % 2 != 0 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -175,7 +606,8 @@ fn decode_security_hex(s: &str) -> Option<String> {
 /// or `Err` on unexpected failures (keychain locked, etc.).
 ///
 /// Uses a 3-second timeout to prevent hanging on headless servers.
-pub fn get_secret(name: &str) -> Result<Option<String>> {
+#[cfg(target_os = "macos")]
+fn macos_get_secret(name: &str) -> Result<Option<String>> {
     let name_owned = name.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -220,7 +652,8 @@ pub fn get_secret(name: &str) -> Result<Option<String>> {
 /// Delete a secret from the macOS Keychain.
 ///
 /// Returns `Ok(true)` if deleted, `Ok(false)` if not found.
-pub fn delete_secret(name: &str) -> Result<bool> {
+#[cfg(target_os = "macos")]
+fn macos_delete_secret(name: &str) -> Result<bool> {
     let mut deleted = false;
     loop {
         let out = std::process::Command::new("security")
@@ -238,7 +671,8 @@ pub fn delete_secret(name: &str) -> Result<bool> {
 }
 
 /// Check if the keychain is accessible (unlocked).
-pub fn is_accessible() -> bool {
+#[cfg(target_os = "macos")]
+fn macos_is_accessible() -> bool {
     // Try to add and immediately delete a test entry
     let out = std::process::Command::new("security")
         .args([
@@ -328,6 +762,286 @@ mod tests {
     use super::*;
 
     #[test]
+    fn backend_name_matches_platform() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(backend_name(), "macos-keychain");
+        #[cfg(target_os = "linux")]
+        assert_eq!(backend_name(), "linux-file");
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        assert_eq!(backend_name(), "unsupported");
+    }
+
+    /// #2415 — the unsupported-store error must hand users a working
+    /// alternative instead of a dead end. Windows-only by nature: PR CI
+    /// compile-checks it, main's Windows test shard runs it.
+    #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn unsupported_store_error_names_alternatives() {
+        let err = unsupported_store_error("set_secret").to_string();
+        assert!(err.contains("unsupported on windows"), "{err}");
+        assert!(err.contains("process environment"), "{err}");
+        assert!(err.contains("env_vars"), "{err}");
+    }
+
+    #[test]
+    fn availability_matches_backend_presence() {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(is_available());
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        assert!(!is_available());
+    }
+
+    #[test]
+    fn should_isolate_and_restore_nested_test_stores_on_every_host() {
+        let outer = tempfile::tempdir().unwrap();
+        let _outer = test_override_secrets_root(outer.path().to_path_buf());
+        assert!(is_available());
+        assert!(is_accessible());
+        set_secret("FIXTURE::profile", "outer-fixture").unwrap();
+        {
+            let inner = tempfile::tempdir().unwrap();
+            let _inner = test_override_secrets_root(inner.path().to_path_buf());
+            assert_eq!(get_secret("FIXTURE::profile").unwrap(), None);
+            set_secret("FIXTURE::profile", "inner-fixture").unwrap();
+            assert_eq!(
+                get_secret("FIXTURE::profile").unwrap().as_deref(),
+                Some("inner-fixture")
+            );
+        }
+        assert_eq!(
+            get_secret("FIXTURE::profile").unwrap().as_deref(),
+            Some("outer-fixture")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_reject_read_through_account_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("secrets");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "outside-fixture").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("KEY")).unwrap();
+        let _root = test_override_secrets_root(root);
+        assert!(get_secret("KEY").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_replace_account_symlink_without_touching_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("secrets");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "outside-fixture").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("KEY")).unwrap();
+        let _root = test_override_secrets_root(root.clone());
+        set_secret("KEY", "new-fixture").unwrap();
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside-fixture");
+        assert!(
+            std::fs::symlink_metadata(root.join("KEY"))
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(get_secret("KEY").unwrap().as_deref(), Some("new-fixture"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_refuse_symlinked_secret_directory_without_chmod_or_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = tmp.path().join("secrets");
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        let _root = test_override_secrets_root(root);
+        assert!(set_secret("KEY", "fixture").is_err());
+        assert!(get_secret("KEY").is_err());
+        assert!(delete_secret("KEY").is_err());
+        assert!(!is_accessible());
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_replace_hardlinked_account_without_changing_other_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("secrets");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "outside-fixture").unwrap();
+        std::fs::hard_link(&outside, root.join("KEY")).unwrap();
+        let _root = test_override_secrets_root(root);
+        set_secret("KEY", "new-fixture").unwrap();
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside-fixture");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_leave_no_temporary_secret_when_atomic_replace_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("KEY")).unwrap();
+        let _root = test_override_secrets_root(tmp.path().to_path_buf());
+        assert!(set_secret("KEY", "fixture").is_err());
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("KEY")]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_reject_fifo_account_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(tmp.path().join("KEY"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _root = test_override_secrets_root(tmp.path().to_path_buf());
+        assert!(get_secret("KEY").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_not_create_missing_store_during_read_or_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("missing");
+        let _root = test_override_secrets_root(root.clone());
+        assert_eq!(get_secret("KEY").unwrap(), None);
+        assert!(!delete_secret("KEY").unwrap());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_keep_owner_read_write_permissions_under_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD_ROOT: &str = "OCTOS_TEST_SECRET_UMASK_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = std::path::PathBuf::from(root);
+            let _root = test_override_secrets_root(root.clone());
+            set_secret("KEY", "fixture").unwrap();
+            assert_eq!(
+                std::fs::metadata(root.join("KEY"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(get_secret("KEY").unwrap().as_deref(), Some("fixture"));
+            return;
+        }
+        // umask is process-global: change it ONLY in a dedicated child, never
+        // in the parallel test runner. The existing root is owned by this test.
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("sh")
+            .args(["-c", "umask 777; exec \"$@\"", "secret-fixture"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "should_keep_owner_read_write_permissions_under_restrictive_umask",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, root.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn should_refuse_symlinked_store_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let parent = tmp.path().join("octos-home");
+        std::os::unix::fs::symlink(&outside, &parent).unwrap();
+        let _root = test_override_secrets_root(parent.join("secrets"));
+        assert!(set_secret("KEY", "fixture").is_err());
+        assert!(get_secret("KEY").is_err());
+        assert!(delete_secret("KEY").is_err());
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn linux_file_backend_roundtrip_with_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = test_override_secrets_root(tmp.path().to_path_buf());
+
+        // Full CRUD against the injected root — the `security` binary does
+        // not exist on Linux, so success proves no macOS CLI path runs.
+        set_secret("ZAI_API_KEY", "sk-test-123").unwrap();
+        assert_eq!(
+            get_secret("ZAI_API_KEY").unwrap().as_deref(),
+            Some("sk-test-123")
+        );
+
+        // Directory 0700, per-key file 0600.
+        let dir_mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let file_mode = std::fs::metadata(tmp.path().join("ZAI_API_KEY"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600);
+
+        // Overwrite updates in place (still 0600); scoped accounts map to
+        // their own file; multiline SA JSON round-trips byte-exact.
+        set_secret("ZAI_API_KEY", "sk-second").unwrap();
+        assert_eq!(
+            get_secret("ZAI_API_KEY").unwrap().as_deref(),
+            Some("sk-second")
+        );
+        let sa = "{\n  \"type\": \"service_account\",\n  \"private_key\": \"x\"\n}";
+        let acct = scoped_account("VERTEX_SA_JSON", "alice");
+        set_secret(&acct, sa).unwrap();
+        assert_eq!(get_secret(&acct).unwrap().as_deref(), Some(sa));
+
+        // Delete: true once, then false (not found); read back None.
+        assert!(delete_secret("ZAI_API_KEY").unwrap());
+        assert!(!delete_secret("ZAI_API_KEY").unwrap());
+        assert_eq!(get_secret("ZAI_API_KEY").unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn linux_file_backend_rejects_path_escaping_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = test_override_secrets_root(tmp.path().to_path_buf());
+        assert!(set_secret("../evil", "x").is_err());
+        assert!(set_secret("a/b", "x").is_err());
+        assert!(set_secret("", "x").is_err());
+        // Nothing was written outside the root.
+        assert!(
+            std::fs::read_dir(tmp.path().parent().unwrap())
+                .unwrap()
+                .all(|e| e.unwrap().path() != tmp.path().with_file_name("evil"))
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_unlock_is_noop() {
+        assert!(unlock("any-password").is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn decodes_hex_password_emitted_by_security_for_multiline_secret() {
         // `security -w` hex-encodes a value containing newlines (e.g. SA JSON).
         let json = "{\n  \"type\": \"service_account\",\n  \"project_id\": \"p\"\n}";
@@ -336,24 +1050,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn leaves_ordinary_api_key_untouched() {
         // Contains non-hex characters → not decoded.
         assert!(decode_security_hex("sk-proj-abc123XYZ").is_none());
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn leaves_odd_length_or_non_hex_untouched() {
         assert!(decode_security_hex("abc").is_none()); // odd length
         assert!(decode_security_hex("zzzz").is_none()); // non-hex chars
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn leaves_binary_hex_untouched_when_not_utf8() {
         // Pure hex that decodes to non-UTF-8 bytes is left as-is.
         assert!(decode_security_hex("deadbeef").is_none());
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn leaves_single_line_ascii_hex_secret_untouched() {
         // A real secret that is even-length ASCII hex and valid UTF-8 but
         // single-line (e.g. "41424344") was returned verbatim by `security`,

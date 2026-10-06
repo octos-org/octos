@@ -83,7 +83,6 @@ cargo test -p octos-llm test_qos_ranking_changes_lane_selection -- --nocapture
 cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores -- --nocapture
 cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score -- --nocapture
 cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
-cargo test -p octos-agent --test activate_tools_regression -- --nocapture
 
 # 3. Focused M9 Rust tests.
 cargo test -p octos-core ui_protocol -- --nocapture
@@ -499,8 +498,8 @@ Tests JSONL-backed session storage with LRU caching.
 
 | Test | What It Verifies |
 |------|-----------------|
-| `test_load_rejects_oversized_file` | Files over 10 MB refused |
-| `test_append_respects_file_size_limit` | Append skips when file at 10 MB limit |
+| `should_seal_the_active_file_into_a_segment_at_the_segment_size` | Active file seals into a segment at `OCTOS_SESSION_SEGMENT_BYTES` (8 MiB) |
+| `should_load_only_the_newest_segments_within_the_budget` | A plain load reads the active file plus as many newest-first sealed segments as fit within `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB) |
 | `test_load_rejects_future_schema_version` | Rejects unknown schema versions |
 | `test_purge_stale_sessions` | Deletes sessions older than N days |
 

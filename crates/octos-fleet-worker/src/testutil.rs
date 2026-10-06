@@ -339,17 +339,20 @@ pub fn restricted_sandbox_factory() -> crate::SandboxFactory {
 /// triggers the clean filter and HANGS. Used to prove codex fix #4 (the bounded
 /// sandboxed commit kills a hung filter at the deadline). Populate already ran
 /// (clean tree) before this plants the filter, so only the later `git add`
-/// hangs, not the populate.
+/// hangs, not the populate. Unix-only: the planted filter is a POSIX `sleep`.
+#[cfg(unix)]
 pub struct HangCleanFilterProvider {
     calls: AtomicUsize,
 }
 
+#[cfg(unix)]
 impl Default for HangCleanFilterProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(unix)]
 impl HangCleanFilterProvider {
     pub fn new() -> Self {
         Self {
@@ -359,6 +362,7 @@ impl HangCleanFilterProvider {
 }
 
 #[async_trait]
+#[cfg(unix)]
 impl LlmProvider for HangCleanFilterProvider {
     async fn chat(&self, _m: &[Message], _t: &[ToolSpec], _c: &ChatConfig) -> Result<ChatResponse> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {

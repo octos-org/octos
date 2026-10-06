@@ -19,6 +19,11 @@ scraper = "0.22"
 ego-tree = "0.10"
 regex = "1"
 url = "2"
+chrono = "0.4"
+# `impersonate`: results-page engines that need a browser-like client
+# (Google, as SearXNG does). `browser`: engines that render load in the
+# octos browser profile when OCTOS_BROWSER is set.
+octos-research = { path = "../../octos-research", features = ["http", "browser", "impersonate"] }
 
 [package.metadata.release]
 release = false

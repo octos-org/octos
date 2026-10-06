@@ -348,12 +348,12 @@ mod tests {
         };
         let config = render_frpc_config(
             &tenant,
-            "163.192.33.32",
+            "relay.example.com",
             7000,
             "octos-cloud.org",
             "shared-frps-token-123",
         );
-        assert!(config.contains("serverAddr = \"163.192.33.32\""));
+        assert!(config.contains("serverAddr = \"relay.example.com\""));
         assert!(config.contains("serverPort = 7000"));
         assert!(
             config.contains("auth.token = \"\""),

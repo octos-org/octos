@@ -73,7 +73,9 @@ const PROXY_HEADERS: &[&str] = &[
     "forwarded",
 ];
 
-fn is_proxied(headers: &HeaderMap) -> bool {
+/// `pub(crate)` so the pairing endpoints (WEB-PAIRING-CONTRACT-5100)
+/// reuse the SAME anti-laundering rule rather than restating it.
+pub(crate) fn is_proxied(headers: &HeaderMap) -> bool {
     PROXY_HEADERS.iter().any(|h| headers.contains_key(*h))
 }
 

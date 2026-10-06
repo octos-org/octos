@@ -735,7 +735,7 @@ mod tests {
                     seq,
                     "path-a",
                     "component-x",
-                    &format!("claim-{}", seq),
+                    &format!("claim-{seq}"),
                     FindingStatus::Confirmed,
                     vec![],
                 )
@@ -799,7 +799,7 @@ mod tests {
                     seq,
                     "path-a",
                     "component-x",
-                    &format!("claim-{}", seq),
+                    &format!("claim-{seq}"),
                     FindingStatus::Confirmed,
                     vec![],
                 );

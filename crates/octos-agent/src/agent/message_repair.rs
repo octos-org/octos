@@ -478,7 +478,7 @@ pub(crate) fn synthesize_missing_tool_results(messages: &mut Vec<Message>) -> bo
                 insert_pos + inserted,
                 Message {
                     role: MessageRole::Tool,
-                    content: format!("[Tool '{}' result was lost — no output available]", name),
+                    content: format!("[Tool '{name}' result was lost — no output available]"),
                     media: vec![],
                     tool_calls: None,
                     tool_call_id: Some(id.clone()),

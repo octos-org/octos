@@ -134,7 +134,7 @@ Stable:
 
 Experimental:
 
-- `llm_status`, `stream_chunk`, `stream_done`, `stream_retry`,
+- `agent_progress`, `llm_status`, `stream_chunk`, `stream_done`, `stream_retry`,
   `tool_progress` — currently in flight with M4.1 and may pick up
   additional fields within v1.
 

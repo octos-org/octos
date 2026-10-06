@@ -1,6 +1,7 @@
 //! Spawn tool for background subagent execution.
 
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -165,9 +166,7 @@ impl Drop for WorkerWorktreeGuard {
 fn prune_worker_worktree(repo_root: &Path, worktree: &WorkerWorktree) {
     // `--force` clears the untracked `.octos/worker-worktree.json` status
     // marker; the checkout is otherwise fresh.
-    match Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    match octos_core::agent_repo_git::agent_repo_git(repo_root)
         .args(["worktree", "remove", "--force"])
         .arg(&worktree.path)
         .output()
@@ -204,9 +203,7 @@ fn prune_worker_worktree(repo_root: &Path, worktree: &WorkerWorktree) {
             );
         }
     }
-    match Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    match octos_core::agent_repo_git::agent_repo_git(repo_root)
         .args(["branch", "-D"])
         .arg(&worktree.branch)
         .output()
@@ -252,9 +249,7 @@ fn validate_worker_worktree_slug(slug: &str) -> Result<(), String> {
 }
 
 fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let output = octos_core::agent_repo_git::agent_repo_git(repo)
         .args(args)
         .output()
         .wrap_err_with(|| format!("failed to run git {}", args.join(" ")))?;
@@ -269,9 +264,7 @@ fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_ref_exists(repo: &Path, refname: &str) -> Result<bool> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let status = octos_core::agent_repo_git::agent_repo_git(repo)
         .args(["show-ref", "--verify", "--quiet", refname])
         .status()
         .wrap_err("failed to run git show-ref")?;
@@ -304,9 +297,7 @@ fn git_ref_exists(repo: &Path, refname: &str) -> Result<bool> {
 /// message covers "not a git repository" as the actionable remedy, and a truly
 /// missing git surfaces its own error on the subsequent `git worktree add`.
 fn is_inside_git_work_tree(dir: &Path) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    octos_core::agent_repo_git::agent_repo_git(dir)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
         .map(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
@@ -435,9 +426,7 @@ fn allocate_worker_worktree(
         // session-scope checks above already ran against the un-simplified
         // path, so containment guarantees are unaffected.
         let git_path = dunce::simplified(&path).to_path_buf();
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&repo_root)
+        let output = octos_core::agent_repo_git::agent_repo_git(&repo_root)
             .args(["worktree", "add", "-b"])
             .arg(&branch)
             .arg(&git_path)
@@ -968,6 +957,11 @@ async fn emit_lifecycle_hook(hooks: Option<&Arc<HookExecutor>>, payload: HookPay
         // Context injection is a `user_prompt_submit`-only outcome; a spawn
         // lifecycle event never produces it, but the match must be exhaustive.
         HookResult::Context(_) => {}
+        // Feedback is an AfterToolCall-only outcome; spawn lifecycle events
+        // have no tool result to append it to — log and continue.
+        HookResult::Feedback(entries) => {
+            warn!(event = ?event, count = entries.len(), "lifecycle hook produced feedback; ignored");
+        }
         HookResult::Deny(reason) => {
             warn!(
                 event = ?event,
@@ -1030,6 +1024,8 @@ async fn run_before_spawn_verify_hook(
         // `before_spawn_verify` never yields context injection (that is a
         // `user_prompt_submit`-only outcome); treat it like a plain allow.
         HookResult::Context(_) => Ok(default_files),
+        // Feedback is an AfterToolCall-only outcome; never arises here.
+        HookResult::Feedback(_) => Ok(default_files),
         HookResult::Deny(reason) => Err(reason),
         HookResult::Error(error) => {
             warn!(
@@ -1808,28 +1804,23 @@ impl SpawnTool {
 }
 
 /// Upper bound for a spawn's `max_iterations` override. A repo-scale review or
-/// deep research legitimately needs well over the interactive default 50
-/// one-tool-call-at-a-time steps, but an unbounded value is a runaway-loop /
-/// cost footgun, so the caller-supplied value is clamped to this ceiling.
+/// deep research legitimately needs many one-tool-call-at-a-time steps, but an
+/// unattended worker still needs a finite runaway backstop, so the
+/// caller-supplied value is clamped to this ceiling.
 const MAX_SPAWN_MAX_ITERATIONS: u32 = 300;
 
 /// Default iteration budget for a spawned sub-agent when the caller does not set
-/// `max_iterations`. The bare `AgentConfig` default (50) is tuned for a snappy
+/// `max_iterations`. The bare `AgentConfig` default (`0`) is unlimited for a
 /// *interactive* turn; a background sub-agent does bounded-but-substantive work
 /// (a from-scratch repo review runs ~100–150 one-tool-call-at-a-time steps), so
-/// blindly inheriting 50 starved real work (agents capped on their first
-/// exploration pass, producing nothing). The token budget and loop detection
-/// remain the real runaway guards; the iteration cap is a secondary backstop, so
-/// a more generous spawn default trades a little worst-case runaway headroom for
-/// first-try success on the common substantive-task case. Callers can still
-/// raise it up to [`MAX_SPAWN_MAX_ITERATIONS`] or lower it explicitly.
-const DEFAULT_SPAWN_MAX_ITERATIONS: u32 = 150;
+/// the historical 50-call default starved real work (agents capped on their
+/// first exploration pass, producing nothing). The token budget and loop
+/// detection remain the primary runaway guards; this cap is a secondary
+/// backstop. Callers can raise it up to [`MAX_SPAWN_MAX_ITERATIONS`] or lower it
+/// explicitly.
+pub(crate) const DEFAULT_SPAWN_MAX_ITERATIONS: u32 = 150;
 
-/// The whole point of the constant above is that it exceeds the interactive
-/// default of 50 (`AgentConfig::max_iterations`). Asserted at compile time:
-/// both sides are consts, so a runtime `assert!` in a test is really a
-/// `clippy::assertions_on_constants` — and this way an edit that breaks the
-/// invariant fails the build instead of a test run.
+/// Keep enough headroom for repo-scale review while remaining finite.
 const _: () = assert!(DEFAULT_SPAWN_MAX_ITERATIONS > 50);
 
 /// Resolve the effective iteration budget for a spawn: a caller-supplied value
@@ -2310,15 +2301,13 @@ async fn run_task_with_m8_9_recovery(
 fn build_spawn_recovery_prompt(task_desc: &str, error_message: &str) -> String {
     format!(
         "[system-internal] Your previous attempt at the task below failed.\n\
-         Original task: {task}\n\
-         Failure: {err}\n\n\
+         Original task: {task_desc}\n\
+         Failure: {error_message}\n\n\
          Re-attempt the task. Diagnose the root cause from the failure text, \
          pick a different strategy if appropriate (different tool, different inputs, \
          a smaller scope), and either complete the task or end with a clear \
          explanation of why the task cannot be completed. Do not repeat the same \
          failing step verbatim.",
-        task = task_desc,
-        err = error_message,
     )
 }
 
@@ -5263,8 +5252,7 @@ impl Tool for SpawnTool {
                         r.output
                     ),
                     Err(e) => format!(
-                        "[Subagent {} failed]\nTask: {}\nError: {e}\n\nPlease inform the user about this failure.",
-                        wid, task_desc
+                        "[Subagent {wid} failed]\nTask: {task_desc}\nError: {e}\n\nPlease inform the user about this failure."
                     ),
                 };
 

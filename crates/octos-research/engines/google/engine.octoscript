@@ -1,0 +1,107 @@
+// Google's results page for simple phones (www.google.com/wml/search): plain
+// HTML, no JavaScript. The host fetches it with its `legacy_mobile` client
+// (manifest `client`), the browser-like client the page answers, as SearXNG
+// does; the request shape was observed black-box from SearXNG's network
+// traffic. Written from the pages themselves (each result is a block
+// holding a /url?q= link, its title and a snippet) and Google's
+// search-operators help page (docs_url): `q` query, `hl` interface
+// language, `lr` result language, `cr` country, `start` offset. An
+// "unusual traffic" answer (a redirect to /sorry/) is a challenge: the
+// engine is suspended, nothing is solved or worked around.
+use mod.markup
+use mod.net
+use mod.std.array
+use mod.std.object
+use mod.std.text
+
+fn lang_code(opts) {
+    if opts.lang == nil {
+        return nil
+    }
+    if opts.lang.primary == "zh" {
+        if opts.lang.region == "TW" || opts.lang.region == "HK" {
+            return "zh-TW"
+        }
+        return "zh-CN"
+    }
+    return opts.lang.primary
+}
+
+fn build_request(query, opts) {
+    let q = query
+    if opts.since != nil {
+        q = q + " after:" + opts.since.date
+    }
+    let params = [["q", q], ["sca_esv", "1"]]
+    let code = lang_code(opts)
+    if code != nil {
+        array.push(params, ["hl", code])
+        array.push(params, ["lr", "lang_" + code])
+    }
+    let gl = if opts.region != nil {
+        opts.region
+    } elif opts.lang != nil {
+        opts.lang.region
+    } else {
+        nil
+    }
+    if gl != nil {
+        array.push(params, ["cr", "country" + text.upper(gl)])
+    }
+    if opts.page > 1 {
+        array.push(params, ["start", (opts.page - 1) * 10])
+    }
+    array.push(params, ["ie", "utf8"])
+    array.push(params, ["oe", "utf8"])
+    let u = net.url({base: "https://www.google.com/wml/search", query: params})
+    return net.request({url: u.url})
+}
+
+// Google's own pages (links out of a results page are to other sites).
+fn is_google(url) {
+    for prefix in ["https://www.google.", "http://www.google.", "https://google.", "https://support.google.", "https://accounts.google.", "https://maps.google.", "https://policies.google."] {
+        if text.starts_with(url, prefix) {
+            return true
+        }
+    }
+    return false
+}
+
+fn parse_response(response, opts) {
+    let body = response.body
+    let final_url = object.get(response.headers, "x_octos_final_url", "")
+    if text.contains(final_url, "google.com/sorry/") {
+        return {challenge: "Google reported unusual traffic"}
+    }
+    // Result blocks by their current class names; if those change, every
+    // result link that carries a title (<span>) still counts, without a
+    // snippet.
+    let found = markup.select({item: "div.zMzFAb", fields: {url: "a[href^=\"/url?q=\"]@href", title: "a[href^=\"/url?q=\"] span", snippet: "div.taTFJ"}})
+    if array.len(found.items) == 0 {
+        found = markup.select({item: "a[href^=\"/url?q=\"]", fields: {url: "@href", title: "span"}})
+    }
+    let out = []
+    let seen = []
+    for r in found.items {
+        if r.url == nil || r.title == nil || r.title == "" {
+            continue
+        }
+        let url = markup.unwrap({url: r.url, base: "https://www.google.com/"}).url
+        if !text.starts_with(url, "http") || is_google(url) || array.contains(seen, url) {
+            continue
+        }
+        array.push(seen, url)
+        array.push(out, {url: url, title: r.title, snippet: object.get(r, "snippet", nil)})
+    }
+    if array.len(out) == 0 {
+        if text.contains(body, "unusual traffic") || text.contains(body, "g-recaptcha") {
+            return {challenge: "Google reported unusual traffic"}
+        }
+        // Page 1 with no results is Google saying so, or the page changed
+        // under the parser: an error (and backoff), never a healthy empty.
+        if opts.page == 1 && !text.contains(body, "did not match any documents") {
+            return {error: "Google's page had no results the parser recognises (page changed?)"}
+        }
+    }
+    return out
+}

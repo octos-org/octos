@@ -12,6 +12,9 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::vision;
 
+use crate::cache_manifest::{
+    PromptCacheInputManifest, prompt_cache_features_enabled, without_cache_markers,
+};
 use crate::config::ChatConfig;
 use crate::provider::{LlmProvider, endpoint_label_from_base_url};
 use crate::sse::SseEvent;
@@ -38,6 +41,13 @@ pub struct ModelHints {
     #[serde(default)]
     pub lacks_vision: bool,
 
+    /// Model takes images but not video (`video_url` parts stripped, the
+    /// file named in a note instead). Not inferred from the model name, for
+    /// the same reason as `lacks_vision`: the graceful fallback learns it
+    /// from the endpoint's refusal. Config-overridable to skip that attempt.
+    #[serde(default)]
+    pub lacks_video: bool,
+
     /// Merge consecutive system messages into one (some providers reject multiples).
     #[serde(default = "default_true")]
     pub merge_system_messages: bool,
@@ -60,6 +70,7 @@ impl Default for ModelHints {
             uses_completion_tokens: false,
             fixed_temperature: false,
             lacks_vision: false,
+            lacks_video: false,
             merge_system_messages: true,
             reasoning_style: ReasoningStyle::None,
         }
@@ -170,6 +181,7 @@ impl ModelHints {
             uses_completion_tokens,
             fixed_temperature,
             lacks_vision,
+            lacks_video: false,
             merge_system_messages: true,
             reasoning_style,
         }
@@ -240,6 +252,10 @@ fn tool_call_arguments_to_wire(arguments: &serde_json::Value) -> String {
 /// OpenAI GPT provider.
 pub struct OpenAIProvider {
     client: Client,
+    /// Separate client for streaming requests, built without a total request
+    /// timeout so a healthy long generation is never cut off mid-stream. See
+    /// [`crate::provider::build_streaming_http_client`].
+    stream_client: Client,
     api_key: SecretString,
     model: String,
     base_url: String,
@@ -248,6 +264,26 @@ pub struct OpenAIProvider {
     /// registry entries (e.g. `"moonshot"`, `"deepseek"`) so providers are
     /// distinguishable in failover chains.
     provider_label: String,
+    /// OpenAI-only request affinity. Defaults to official-endpoint-only so
+    /// Kimi/DeepSeek/vLLM never see a reserved field they may reject; the
+    /// operator kill-switch (`OCTOS_PROMPT_CACHING`) is evaluated per request.
+    prompt_cache_affinity: bool,
+    /// Whether a builder call explicitly selected the affinity mode. An
+    /// explicit opt-in/out must survive either builder-call order (mirrors
+    /// `AnthropicProvider::prompt_caching_override`).
+    prompt_cache_affinity_override: Option<bool>,
+}
+
+const OFFICIAL_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Official-endpoint check tolerant of a trailing slash, surrounding
+/// whitespace, and case, so `https://api.openai.com/v1/` keeps affinity and
+/// is not tagged as a custom host.
+fn is_official_openai_base_url(base_url: &str) -> bool {
+    base_url
+        .trim()
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(OFFICIAL_OPENAI_BASE_URL)
 }
 
 impl OpenAIProvider {
@@ -260,11 +296,16 @@ impl OpenAIProvider {
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
             ),
+            stream_client: crate::provider::build_streaming_http_client(
+                crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
+            ),
             api_key: SecretString::from(api_key.into()),
             hints,
             model,
-            base_url: "https://api.openai.com/v1".to_string(),
+            base_url: OFFICIAL_OPENAI_BASE_URL.to_string(),
             provider_label: "openai".to_string(),
+            prompt_cache_affinity: true,
+            prompt_cache_affinity_override: None,
         }
     }
 
@@ -278,26 +319,31 @@ impl OpenAIProvider {
     /// Set a custom base URL (for Azure, local proxies, etc.).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         let url = base_url.into();
+        let official = is_official_openai_base_url(&url);
+        // Affinity is official-endpoint-only by default; an explicit builder
+        // choice survives either call order.
+        if self.prompt_cache_affinity_override.is_none() {
+            self.prompt_cache_affinity = official;
+        }
         // If using a non-default base URL, tag the provider_label to distinguish
         // it in the adaptive router (e.g., "moonshot@autodl" vs "moonshot").
-        if url != "https://api.openai.com/v1" {
-            if let Some(domain) = url
+        if !official
+            && let Some(domain) = url
                 .trim_start_matches("https://")
                 .trim_start_matches("http://")
                 .split('/')
                 .next()
-            {
-                // Use the domain name (minus TLD) as the tag.
-                // "www.autodl.art" → "autodl", "api.moonshot.ai" → "api"
-                let parts: Vec<&str> = domain.split('.').collect();
-                let short = if parts.len() >= 2 && parts[0] == "www" {
-                    parts[1] // skip "www", use "autodl"
-                } else {
-                    parts[0] // use "api" from "api.moonshot.ai"
-                };
-                if !self.provider_label.contains('@') {
-                    self.provider_label = format!("{}@{}", self.provider_label, short);
-                }
+        {
+            // Use the domain name (minus TLD) as the tag.
+            // "www.autodl.art" → "autodl", "api.moonshot.ai" → "api"
+            let parts: Vec<&str> = domain.split('.').collect();
+            let short = if parts.len() >= 2 && parts[0] == "www" {
+                parts[1] // skip "www", use "autodl"
+            } else {
+                parts[0] // use "api" from "api.moonshot.ai"
+            };
+            if !self.provider_label.contains('@') {
+                self.provider_label = format!("{}@{}", self.provider_label, short);
             }
         }
         // The DeepSeek `thinking` toggle is specific to DeepSeek's official API.
@@ -314,6 +360,34 @@ impl OpenAIProvider {
         self
     }
 
+    /// Explicit override for an endpoint known to implement OpenAI's
+    /// `prompt_cache_key` contract. Custom endpoints remain opt-out by
+    /// default; this explicit choice survives either builder-call order. The
+    /// operator kill-switch (`OCTOS_PROMPT_CACHING`) still applies per request.
+    pub fn with_prompt_cache_affinity(mut self, enabled: bool) -> Self {
+        self.prompt_cache_affinity = enabled;
+        self.prompt_cache_affinity_override = Some(enabled);
+        self
+    }
+
+    /// Affinity key for this request, if any. `features_enabled` is the
+    /// operator kill-switch (`OCTOS_PROMPT_CACHING`), passed in so the
+    /// decision is made per request — like the Responses provider — and stays
+    /// unit-testable without mutating process env.
+    fn prompt_cache_key_for<'a>(
+        &self,
+        config: &'a ChatConfig,
+        features_enabled: bool,
+    ) -> Option<&'a str> {
+        if !(self.prompt_cache_affinity && features_enabled) {
+            return None;
+        }
+        config
+            .prompt_cache_context
+            .as_ref()
+            .map(|context| context.affinity_key.as_str())
+    }
+
     /// Override the auto-detected model hints.
     pub fn with_hints(mut self, hints: ModelHints) -> Self {
         self.hints = hints;
@@ -321,8 +395,14 @@ impl OpenAIProvider {
     }
 
     /// Replace the HTTP client with one using custom timeouts (in seconds).
+    ///
+    /// `timeout_secs` is the **total** request timeout for non-streaming
+    /// requests. The streaming client is rebuilt only with the connect timeout —
+    /// it never takes a total timeout, so a long streamed generation is not
+    /// capped regardless of this value.
     pub fn with_http_timeout(mut self, timeout_secs: u64, connect_timeout_secs: u64) -> Self {
         self.client = crate::provider::build_http_client(timeout_secs, connect_timeout_secs);
+        self.stream_client = crate::provider::build_streaming_http_client(connect_timeout_secs);
         self
     }
 
@@ -351,23 +431,36 @@ impl OpenAIProvider {
             .json(request)
             .send()
             .await
-            .wrap_err("failed to send request to OpenAI")
+            .wrap_err_with(|| {
+                crate::provider::transport_error_message(
+                    false,
+                    &self.provider_label,
+                    &self.model,
+                    crate::provider::ApiStyle::OpenAiChatCompletions,
+                )
+            })
     }
 
     /// POST a streaming chat request (adds `stream` + `stream_options`).
     /// Factored for the same image-modality fallback as [`Self::post_chat`].
     async fn post_chat_stream(&self, request: &OpenAIRequest<'_>) -> Result<reqwest::Response> {
-        let mut body =
-            serde_json::to_value(request).wrap_err("failed to serialize OpenAI request")?;
-        let obj = body
-            .as_object_mut()
-            .ok_or_else(|| eyre::eyre!("failed to build OpenAI request body"))?;
+        let mut body = serde_json::to_value(request).wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::SerializeRequest)
+        })?;
+        let obj = body.as_object_mut().ok_or_else(|| {
+            eyre::Report::msg(
+                self.operational_message(crate::provider::OperationalStage::BuildRequestBody),
+            )
+        })?;
         obj.insert("stream".into(), true.into());
         obj.insert(
             "stream_options".into(),
             serde_json::json!({"include_usage": true}),
         );
-        self.client
+        // Stream client: no total timeout, so a long healthy generation is not
+        // cut off. Stalls are bounded by the client's per-read timeout and the
+        // agent's stream-timeout guards (see build_streaming_http_client).
+        self.stream_client
             .post(format!("{}/chat/completions", self.base_url))
             .header(
                 "Authorization",
@@ -377,7 +470,25 @@ impl OpenAIProvider {
             .json(&body)
             .send()
             .await
-            .wrap_err("failed to send streaming request to OpenAI")
+            .wrap_err_with(|| {
+                crate::provider::transport_error_message(
+                    true,
+                    &self.provider_label,
+                    &self.model,
+                    crate::provider::ApiStyle::OpenAiChatCompletions,
+                )
+            })
+    }
+
+    /// Lane-attributed wording for operational failures (see
+    /// [`crate::provider::operational_error_message`]).
+    fn operational_message(&self, stage: crate::provider::OperationalStage) -> String {
+        crate::provider::operational_error_message(
+            stage,
+            &self.provider_label,
+            &self.model,
+            crate::provider::ApiStyle::OpenAiChatCompletions,
+        )
     }
 
     /// Build the shared request struct used by both chat() and chat_stream().
@@ -391,86 +502,165 @@ impl OpenAIProvider {
         &'a self,
         messages: &'a [Message],
         tools: &'a [ToolSpec],
-        config: &ChatConfig,
+        config: &'a ChatConfig,
         force_text_only: bool,
     ) -> OpenAIRequest<'a> {
-        // Effective content hints: honour the configured `lacks_vision`, and
-        // additionally strip images on the text-only retry leg.
+        self.build_request_stripping(messages, tools, config, force_text_only, false)
+    }
+
+    /// `build_request` with the retry legs spelled out: `force_text_only`
+    /// strips images (and video), `force_no_video` strips only the video
+    /// parts — the leg for an endpoint that takes images but answered a
+    /// `video_url` part with a refusal.
+    fn build_request_stripping<'a>(
+        &'a self,
+        messages: &'a [Message],
+        tools: &'a [ToolSpec],
+        config: &'a ChatConfig,
+        force_text_only: bool,
+        force_no_video: bool,
+    ) -> OpenAIRequest<'a> {
+        // Effective content hints: honour the configured `lacks_vision` /
+        // `lacks_video`, and additionally strip on the retry legs.
         let mut content_hints = self.hints.clone();
         content_hints.lacks_vision = content_hints.lacks_vision || force_text_only;
-        let openai_messages: Vec<OpenAIMessage> = messages
-            .iter()
-            .filter(|m| {
-                // Drop empty assistant messages (no content, no tool_calls) —
-                // these can appear in session history and cause 400 errors.
-                !(m.role == MessageRole::Assistant
-                    && m.content.is_empty()
-                    && m.tool_calls.as_ref().is_none_or(|tc| tc.is_empty()))
-            })
-            .map(|m| {
-                let role = m.role.as_str();
-                // Convert tool_calls from octos_core format to OpenAI format
-                let tool_calls = m.tool_calls.as_ref().map(|tcs| {
-                    tcs.iter()
-                        .map(|tc| OpenAIToolCall {
-                            id: tc.id.clone(),
-                            call_type: "function".to_string(),
-                            function: FunctionCall {
-                                name: tc.name.clone(),
-                                arguments: tool_call_arguments_to_wire(&tc.arguments),
-                            },
-                        })
-                        .collect()
-                });
-                // We do NOT re-send prior assistant reasoning_content for ordinary
-                // openai-compat models. Reasoning models re-derive their chain of
-                // thought each turn, so round-tripping the full verbose reasoning is
-                // pure context bloat (and grows unboundedly across a tool loop) —
-                // OpenAI's own API and codex both drop it.
-                //
-                // kimi-k2/k3 are the exception. With thinking enabled kimi-k2 (a)
-                // returns 400 "reasoning_content is missing in assistant tool call
-                // message" if the field is absent, AND (b) per kimi's docs preserves
-                // historical assistant reasoning for multi-step tool-use continuity
-                // (K3's quickstart likewise mandates "add the complete assistant
-                // message returned by the API to the next request. Do not keep only
-                // `content`"). So for kimi-k2/k3 we keep the REAL reasoning when
-                // present, and fall back to a minimal "." stub only to satisfy the
-                // presence check when it's absent.
-                //
-                // kimi-k2/k3 are detected via fixed_temperature + model name
-                // containing "kimi-k2"/"kimi-k3". Other models (e.g. deepseek-v4,
-                // verified live to return 200 without the field, and non-official
-                // nvidia/vllm endpoints that don't expect it) get no
-                // reasoning_content at all.
-                let model_lower = self.model.to_lowercase();
-                let needs_reasoning_stub = self.hints.fixed_temperature
-                    && (model_lower.contains("kimi-k2")
-                        || model_lower.contains("kimi-k3")
-                        // Kimi Code API ids: bare `k3`/`k3-256k` and the
-                        // K2.7 Code alias — thinking is always on for them,
-                        // so assistant tool-call messages need the stub too.
-                        || model_lower == "k3"
-                        || model_lower.starts_with("k3-")
-                        || model_lower.starts_with("kimi-for-coding"));
-                let reasoning = if role == "assistant" && needs_reasoning_stub {
-                    match m.reasoning_content.as_deref() {
-                        Some(r) if !r.is_empty() => Some(r),
-                        _ => Some("."),
-                    }
-                } else {
-                    None
-                };
-
-                OpenAIMessage {
-                    role,
-                    content: build_openai_content(m, &content_hints),
-                    reasoning_content: reasoning,
-                    tool_call_id: m.tool_call_id.as_deref(),
-                    tool_calls,
+        content_hints.lacks_video = content_hints.lacks_video || force_text_only || force_no_video;
+        // #2480: re-run the tool's symlink-ancestor walk at request build for
+        // media paths inside the validated workspace.
+        let scope_root = config.media_scope_root.as_deref();
+        let mut openai_messages: Vec<OpenAIMessage> = Vec::with_capacity(messages.len() + 1);
+        // Media a tool in the current batch handed the model. The chat
+        // completions protocol takes no media in a tool message, so it goes
+        // out as ONE user turn after the batch's tool outputs — built here,
+        // on the wire only, never persisted — naming the calls it answers.
+        let mut pending_media: Vec<OpenAIContentPart> = Vec::new();
+        let mut pending_notes: Vec<String> = Vec::new();
+        for (index, m) in messages.iter().enumerate() {
+            // Drop empty assistant messages (no content, no tool_calls) —
+            // these can appear in session history and cause 400 errors.
+            if m.role == MessageRole::Assistant
+                && m.content.is_empty()
+                && m.tool_calls.as_ref().is_none_or(|tc| tc.is_empty())
+            {
+                continue;
+            }
+            if m.role != MessageRole::Tool && !pending_media.is_empty() {
+                openai_messages.push(media_turn(&mut pending_media, &mut pending_notes));
+            }
+            let role = m.role.as_str();
+            // Convert tool_calls from octos_core format to OpenAI format
+            let tool_calls = m.tool_calls.as_ref().map(|tcs| {
+                tcs.iter()
+                    .map(|tc| OpenAIToolCall {
+                        id: tc.id.clone(),
+                        call_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: tc.name.clone(),
+                            arguments: tool_call_arguments_to_wire(&tc.arguments),
+                        },
+                    })
+                    .collect()
+            });
+            // We do NOT re-send prior assistant reasoning_content for ordinary
+            // openai-compat models. Reasoning models re-derive their chain of
+            // thought each turn, so round-tripping the full verbose reasoning is
+            // pure context bloat (and grows unboundedly across a tool loop) —
+            // OpenAI's own API and codex both drop it.
+            //
+            // kimi-k2/k3 are the exception. With thinking enabled kimi-k2 (a)
+            // returns 400 "reasoning_content is missing in assistant tool call
+            // message" if the field is absent, AND (b) per kimi's docs preserves
+            // historical assistant reasoning for multi-step tool-use continuity
+            // (K3's quickstart likewise mandates "add the complete assistant
+            // message returned by the API to the next request. Do not keep only
+            // `content`"). So for kimi-k2/k3 we keep the REAL reasoning when
+            // present, and fall back to a minimal "." stub only to satisfy the
+            // presence check when it's absent.
+            //
+            // kimi-k2/k3 are detected via fixed_temperature + model name
+            // containing "kimi-k2"/"kimi-k3". Other models (e.g. deepseek-v4,
+            // verified live to return 200 without the field, and non-official
+            // nvidia/vllm endpoints that don't expect it) get no
+            // reasoning_content at all.
+            let model_lower = self.model.to_lowercase();
+            let needs_reasoning_stub = self.hints.fixed_temperature
+                && (model_lower.contains("kimi-k2")
+                    || model_lower.contains("kimi-k3")
+                    // Kimi Code API ids: bare `k3`/`k3-256k` and the
+                    // K2.7 Code alias — thinking is always on for them,
+                    // so assistant tool-call messages need the stub too.
+                    || model_lower == "k3"
+                    || model_lower.starts_with("k3-")
+                    || model_lower.starts_with("kimi-for-coding"));
+            let reasoning = if role == "assistant" && needs_reasoning_stub {
+                match m.reasoning_content.as_deref() {
+                    Some(r) if !r.is_empty() => Some(r),
+                    _ => Some("."),
                 }
-            })
-            .collect();
+            } else {
+                None
+            };
+
+            let mut content = build_openai_content(m, &content_hints, scope_root);
+            if m.role == MessageRole::Tool {
+                let shown = crate::tool_media::for_tool_row(
+                    messages,
+                    index,
+                    content_hints.lacks_vision,
+                    content_hints.lacks_video,
+                );
+                if let Some(note) = shown.note.as_deref() {
+                    content = append_note(content, note);
+                }
+                let call = m.tool_call_id.as_deref().unwrap_or("unknown");
+                let mut rendered = Vec::new();
+                for path in &shown.images {
+                    match vision::encode_image(path, scope_root) {
+                        Ok((mime, data)) => {
+                            pending_media.push(OpenAIContentPart::ImageUrl {
+                                image_url: OpenAIImageUrl {
+                                    url: format!("data:{mime};base64,{data}"),
+                                },
+                            });
+                            rendered.push(path.clone());
+                        }
+                        Err(_) => {
+                            content =
+                                append_note(content, &crate::tool_media::unreadable_note(path))
+                        }
+                    }
+                }
+                for path in &shown.videos {
+                    match vision::encode_video(path, scope_root) {
+                        Ok((mime, data)) => {
+                            pending_media.push(OpenAIContentPart::VideoUrl {
+                                video_url: OpenAIVideoUrl {
+                                    url: format!("data:{mime};base64,{data}"),
+                                },
+                            });
+                            rendered.push(path.clone());
+                        }
+                        Err(_) => {
+                            content =
+                                append_note(content, &crate::tool_media::unreadable_note(path))
+                        }
+                    }
+                }
+                if !rendered.is_empty() {
+                    pending_notes.push(crate::tool_media::shown_note(call, &rendered));
+                }
+            }
+            openai_messages.push(OpenAIMessage {
+                role,
+                content,
+                reasoning_content: reasoning,
+                tool_call_id: m.tool_call_id.as_deref(),
+                tool_calls,
+            });
+        }
+        if !pending_media.is_empty() {
+            openai_messages.push(media_turn(&mut pending_media, &mut pending_notes));
+        }
 
         let openai_messages = if self.hints.merge_system_messages {
             merge_system_messages(openai_messages)
@@ -616,9 +806,111 @@ impl OpenAIProvider {
             response_format,
             reasoning_effort,
             thinking,
+            // Flatten operator-supplied sampler params (e.g. repeat_penalty) into
+            // the request. Empty unless configured → no wire change for cloud.
+            extra_sampling: {
+                let mut extra = config.sampling_params.clone().unwrap_or_default();
+                // Defense-in-depth (#2172): drop keys octos already models with
+                // dedicated fields, so a misconfigured sampler param can't emit
+                // duplicate/divergent keys across the streaming (to_value,
+                // last-wins) and non-streaming (to_vec, duplicate) send paths.
+                // The strip must not be silent (#2177): an operator who puts
+                // e.g. `temperature` in sampling_params would otherwise see a
+                // configured-but-unchanged request with no signal at any level.
+                let mut dropped = Vec::new();
+                for reserved in RESERVED_SAMPLING_KEYS {
+                    if extra.remove(*reserved).is_some() {
+                        dropped.push(*reserved);
+                    }
+                }
+                if !dropped.is_empty() {
+                    tracing::warn!(
+                        provider = %self.provider_label,
+                        model = %self.model,
+                        dropped = ?dropped,
+                        "sampling_params keys collide with reserved request fields and are dropped; set them via the dedicated ChatConfig field where one exists (e.g. temperature, max_tokens) — keys without one must not be sent"
+                    );
+                }
+                extra
+            },
+            prompt_cache_key: self.prompt_cache_key_for(config, prompt_cache_features_enabled()),
+            tool_choice: config.tool_choice.openai_chat_wire(!tools.is_empty()),
+        }
+    }
+
+    fn prompt_cache_input_manifest(
+        &self,
+        request: &OpenAIRequest<'_>,
+        config: &ChatConfig,
+    ) -> PromptCacheInputManifest {
+        let normalized = without_cache_markers(
+            serde_json::to_value(request).unwrap_or_else(|_| serde_json::json!({})),
+        );
+        let mut stable = Vec::new();
+        let mut conversation = Vec::new();
+        if let Some(messages) = normalized
+            .get("messages")
+            .and_then(|value| value.as_array())
+        {
+            for (index, message) in messages.iter().enumerate() {
+                let role = message
+                    .get("role")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let segment = (format!("message:{index}:{role}"), message.clone());
+                if role == "system" || role == "developer" {
+                    stable.push(segment);
+                } else {
+                    conversation.push(segment);
+                }
+            }
+        }
+        if let Some(tools) = normalized.get("tools").and_then(|value| value.as_array()) {
+            stable.extend(
+                tools
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tool)| (format!("tool:{index}"), tool.clone())),
+            );
+        }
+        let metadata = self.provider_metadata();
+        PromptCacheInputManifest::from_normalized_segments(
+            metadata.provider,
+            metadata.model,
+            config
+                .prompt_cache_context
+                .as_ref()
+                .map(|context| context.epoch_id.as_str()),
+            stable,
+            conversation,
+        )
+    }
+
+    fn trace_prompt_cache_input(&self, request: &OpenAIRequest<'_>, config: &ChatConfig) {
+        if tracing::enabled!(target: "octos.prompt_cache", tracing::Level::TRACE) {
+            self.prompt_cache_input_manifest(request, config).trace();
         }
     }
 }
+
+/// Request keys octos sets via dedicated `OpenAIRequest` fields; if an operator
+/// puts one of these in `sampling_params` it is dropped (the dedicated field /
+/// knob wins) rather than emitted twice. See [`OpenAIProvider::build_request`].
+const RESERVED_SAMPLING_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "tools",
+    "response_format",
+    "reasoning_effort",
+    "thinking",
+    "stream",
+    "stream_options",
+    "prompt_cache_key",
+    "tool_choice",
+];
 
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
@@ -629,6 +921,7 @@ impl LlmProvider for OpenAIProvider {
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
         let request = self.build_request(messages, tools, config, false);
+        self.trace_prompt_cache_input(&request, config);
         let mut response = self.post_chat(&request).await?;
 
         // Graceful image-modality fallback: a vision-capable model behind a
@@ -637,26 +930,53 @@ impl LlmProvider for OpenAIProvider {
         // so the turn proceeds instead of erroring — the agent can still
         // `read_file` the attachment via the media note. See
         // `is_image_modality_error` / `ModelHints::detect`.
-        if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
+        // The same for video: an image-capable endpoint that does not take
+        // `video_url` (DeepSeek answers 422 naming the part) gets the request
+        // again with the video parts replaced by a note, so the turn proceeds
+        // and the model is told what it did not get to see.
+        let status = response.status().as_u16();
+        if (status == 400 || status == 422) && request_has_user_media(messages, &self.hints) {
             let body = response.text().await.unwrap_or_default();
-            if is_image_modality_error(&body)
-                && crate::current_llm_call_policy() != crate::LlmCallPolicy::FailFast
+            let fail_fast = crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+            let retry = if !fail_fast
+                && request_has_user_videos(messages, &self.hints)
+                && is_video_modality_error(&body)
+            {
+                tracing::warn!(
+                    provider = %self.provider_label,
+                    model = %self.model,
+                    status,
+                    "endpoint rejected video content; retrying without video"
+                );
+                Some(self.build_request_stripping(messages, tools, config, false, true))
+            } else if !fail_fast
+                && request_has_user_images(messages, &self.hints)
+                && is_image_modality_error(&body)
             {
                 tracing::warn!(
                     provider = %self.provider_label,
                     model = %self.model,
                     "endpoint rejected image content (400); retrying text-only"
                 );
-                let retry = self.build_request(messages, tools, config, true);
-                response = self.post_chat(&retry).await?;
+                Some(self.build_request(messages, tools, config, true))
             } else {
-                let body = crate::provider::truncate_error_body(&body);
-                return Err(crate::error::LlmError::from_status_with_label(
-                    400,
-                    &body,
-                    format!("{}/{}", self.provider_label, self.model),
-                )
-                .into());
+                None
+            };
+            match retry {
+                Some(retry) => {
+                    self.trace_prompt_cache_input(&retry, config);
+                    response = self.post_chat(&retry).await?;
+                }
+                None => {
+                    let body = crate::provider::truncate_error_body(&body);
+                    return Err(crate::error::LlmError::from_status_with_label(
+                        status,
+                        &body,
+                        format!("{}/{}", self.provider_label, self.model),
+                    )
+                    .with_api_style(crate::provider::ApiStyle::OpenAiChatCompletions)
+                    .into());
+                }
             }
         }
 
@@ -682,19 +1002,19 @@ impl LlmProvider for OpenAIProvider {
                 &body,
                 format!("{}/{}", self.provider_label, self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::OpenAiChatCompletions)
             .into());
         }
 
-        let api_response: OpenAIResponse = response
-            .json()
-            .await
-            .wrap_err("failed to parse OpenAI response")?;
+        let api_response: OpenAIResponse = response.json().await.wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::ParseResponse)
+        })?;
 
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| eyre::eyre!("no choices in OpenAI response"))?;
+        let choice = api_response.choices.into_iter().next().ok_or_else(|| {
+            eyre::Report::msg(
+                self.operational_message(crate::provider::OperationalStage::NoChoices),
+            )
+        })?;
 
         let tool_calls = choice
             .message
@@ -750,10 +1070,27 @@ impl LlmProvider for OpenAIProvider {
                     .as_ref()
                     .map(|d| d.cached_tokens)
                     .unwrap_or(0);
+                let cache_write = api_response
+                    .usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map(|d| d.cache_write_tokens)
+                    .unwrap_or(0);
                 TokenUsage {
-                    input_tokens: api_response.usage.prompt_tokens.saturating_sub(cached),
+                    input_tokens: api_response
+                        .usage
+                        .prompt_tokens
+                        .saturating_sub(cached)
+                        .saturating_sub(cache_write),
                     output_tokens: api_response.usage.completion_tokens,
+                    reasoning_tokens: api_response
+                        .usage
+                        .completion_tokens_details
+                        .as_ref()
+                        .map(|details| details.reasoning_tokens)
+                        .unwrap_or(0),
                     cache_read_tokens: cached,
+                    cache_write_tokens: cache_write,
                     ..Default::default()
                 }
             },
@@ -768,21 +1105,41 @@ impl LlmProvider for OpenAIProvider {
         config: &ChatConfig,
     ) -> Result<ChatStream> {
         let request = self.build_request(messages, tools, config, false);
+        self.trace_prompt_cache_input(&request, config);
         let mut response = self.post_chat_stream(&request).await?;
 
         // Graceful image-modality fallback (see `chat()`): retry once
         // text-only if the endpoint rejected the image content parts.
-        if response.status().as_u16() == 400 && request_has_user_images(messages, &self.hints) {
+        let status = response.status().as_u16();
+        if (status == 400 || status == 422) && request_has_user_media(messages, &self.hints) {
             let text = response.text().await.unwrap_or_default();
-            if is_image_modality_error(&text)
-                && crate::current_llm_call_policy() != crate::LlmCallPolicy::FailFast
+            let fail_fast = crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
+            let retry = if !fail_fast
+                && request_has_user_videos(messages, &self.hints)
+                && is_video_modality_error(&text)
+            {
+                tracing::warn!(
+                    provider = %self.provider_label,
+                    model = %self.model,
+                    status,
+                    "endpoint rejected video content; retrying without video (stream)"
+                );
+                Some(self.build_request_stripping(messages, tools, config, false, true))
+            } else if !fail_fast
+                && request_has_user_images(messages, &self.hints)
+                && is_image_modality_error(&text)
             {
                 tracing::warn!(
                     provider = %self.provider_label,
                     model = %self.model,
                     "endpoint rejected image content (400); retrying text-only (stream)"
                 );
-                let retry = self.build_request(messages, tools, config, true);
+                Some(self.build_request(messages, tools, config, true))
+            } else {
+                None
+            };
+            if let Some(retry) = retry {
+                self.trace_prompt_cache_input(&retry, config);
                 response = self.post_chat_stream(&retry).await?;
             } else {
                 let body = crate::provider::truncate_error_body(&text);
@@ -791,6 +1148,7 @@ impl LlmProvider for OpenAIProvider {
                     &body,
                     format!("{}/{}", self.provider_label, self.model),
                 )
+                .with_api_style(crate::provider::ApiStyle::OpenAiChatCompletions)
                 .into());
             }
         }
@@ -806,6 +1164,7 @@ impl LlmProvider for OpenAIProvider {
                 &body,
                 format!("{}/{}", self.provider_label, self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::OpenAiChatCompletions)
             .into());
         }
 
@@ -822,6 +1181,10 @@ impl LlmProvider for OpenAIProvider {
 
     fn provider_name(&self) -> &str {
         &self.provider_label
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        Some(crate::provider::ApiStyle::OpenAiChatCompletions)
     }
 
     fn provider_metadata(&self) -> ProviderMetadata {
@@ -859,6 +1222,21 @@ struct OpenAIRequest<'a> {
     /// DeepSeek V4 thinking toggle (`{"type": "enabled"}`); other styles omit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<serde_json::Value>,
+    /// Operator-supplied extra sampler params flattened into the request body
+    /// (`repeat_penalty`, `top_p`, `top_k`, `min_p`, `frequency_penalty`, …) for
+    /// OpenAI-compatible servers (llama.cpp / vLLM / SGLang) — params octos does
+    /// not model. Empty by default, so it flattens to nothing and cloud requests
+    /// are unchanged. See `ChatConfig::sampling_params` / issue #2172.
+    #[serde(flatten)]
+    extra_sampling: serde_json::Map<String, serde_json::Value>,
+    /// Official OpenAI affinity key. Omitted for every compatible/custom
+    /// endpoint unless the provider capability is explicitly enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
+    /// `ChatConfig.tool_choice` on the wire; absent for the default `auto`
+    /// so ordinary requests keep their exact prior shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -889,10 +1267,21 @@ enum OpenAIContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: OpenAIImageUrl },
+    /// A video as a data URL. The part the multimodal OpenAI-compatible
+    /// endpoints take (GLM's coding endpoint, Kimi); a text-or-image-only
+    /// endpoint rejects the request naming `video_url`, and the retry in
+    /// `chat()` / `chat_stream()` then resends without it.
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: OpenAIVideoUrl },
 }
 
 #[derive(Serialize)]
 struct OpenAIImageUrl {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct OpenAIVideoUrl {
     url: String,
 }
 
@@ -950,13 +1339,43 @@ fn is_image_modality_error(body: &str) -> bool {
 /// inlined (i.e. images are not already stripped by the configured
 /// `lacks_vision`). Decides whether a 400 is worth retrying text-only.
 fn request_has_user_images(messages: &[Message], hints: &ModelHints) -> bool {
-    !hints.lacks_vision
-        && messages
-            .iter()
-            .any(|m| m.role == MessageRole::User && m.media.iter().any(|p| vision::is_image(p)))
+    !hints.lacks_vision && request_has_media(messages, vision::is_image)
 }
 
-fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIContent> {
+/// A user row's media, or a current-batch tool row's: both go out inline.
+fn request_has_media(messages: &[Message], kind: fn(&str) -> bool) -> bool {
+    messages.iter().enumerate().any(|(i, m)| {
+        m.media.iter().any(|p| kind(p))
+            && (m.role == MessageRole::User
+                || (m.role == MessageRole::Tool && crate::tool_media::is_current(messages, i)))
+    })
+}
+
+/// Whether the request carries a user-row video we would have sent as a
+/// `video_url` part. Decides whether a refusal is worth retrying without it.
+fn request_has_user_videos(messages: &[Message], hints: &ModelHints) -> bool {
+    !hints.lacks_video && !hints.lacks_vision && request_has_media(messages, vision::is_video)
+}
+
+fn request_has_user_media(messages: &[Message], hints: &ModelHints) -> bool {
+    request_has_user_images(messages, hints) || request_has_user_videos(messages, hints)
+}
+
+/// A refusal of the `video_url` part specifically. DeepSeek: 422 `unknown
+/// variant `video_url`, expected one of `text`, `image_url`, `file``; other
+/// endpoints say the modality or the part is not supported.
+fn is_video_modality_error(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    b.contains("video_url")
+        || (b.contains("video")
+            && (b.contains("not support") || b.contains("modal") || b.contains("unsupported")))
+}
+
+fn build_openai_content(
+    msg: &Message,
+    hints: &ModelHints,
+    scope_root: Option<&std::path::Path>,
+) -> Option<OpenAIContent> {
     // Only inline images on USER messages. Tool outputs (Assistant/Tool
     // role with `media`) are previous-turn artifacts the agent emitted —
     // e.g. `send_file(skill-output/slides/<slug>/output/slide-NN.png)` —
@@ -969,19 +1388,39 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
     //
     // The `read_file` text path still works: the assistant can read the
     // image's bytes if it really needs to inspect them, but the file is
-    // not pushed unsolicited into vision content.
+    // not pushed unsolicited into vision content. A tool that wants the
+    // model to look at something hands it over as `model_media`, which the
+    // agent loop turns into a user row (see `execute_tools`).
     let images: Vec<_> = if hints.lacks_vision || msg.role != MessageRole::User {
         vec![]
     } else {
         msg.media.iter().filter(|p| vision::is_image(p)).collect()
     };
+    // Video rides on the same user rows as a `video_url` part, for the
+    // endpoints that take one (GLM's coding endpoint, Kimi). An endpoint
+    // that does not answers with a refusal naming the part and the retry
+    // leg rebuilds with `lacks_video`, which lands here as a note.
+    let videos: Vec<_> = if hints.lacks_vision || hints.lacks_video || msg.role != MessageRole::User
+    {
+        vec![]
+    } else {
+        msg.media.iter().filter(|p| vision::is_video(p)).collect()
+    };
 
-    if images.is_empty() {
+    if images.is_empty() && videos.is_empty() {
         // Build a note for any media the LLM won't see inline:
         // - Non-image files (CSV, PDF, etc.) → include full path so agent can read_file
         // - Images stripped because model lacks vision → include filename
-        let non_image_files: Vec<_> = msg.media.iter().filter(|p| !vision::is_image(p)).collect();
+        // - Videos stripped because the model takes no video → include filename
+        let non_image_files: Vec<_> = msg
+            .media
+            .iter()
+            .filter(|p| !vision::is_image(p) && !vision::is_video(p))
+            .collect();
         let stripped_images = hints.lacks_vision && msg.media.iter().any(|p| vision::is_image(p));
+        let stripped_videos = msg.role == MessageRole::User
+            && (hints.lacks_vision || hints.lacks_video)
+            && msg.media.iter().any(|p| vision::is_video(p));
 
         let media_note = if !non_image_files.is_empty() || stripped_images {
             let mut parts = Vec::new();
@@ -1012,6 +1451,31 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
         } else {
             None
         };
+        // A video the model cannot view is named, not silently dropped: the
+        // model should say it could not watch it rather than guess.
+        let video_note = if stripped_videos {
+            let names: Vec<String> = msg
+                .media
+                .iter()
+                .filter(|p| vision::is_video(p))
+                .map(|p| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| p.clone())
+                })
+                .collect();
+            Some(format!(
+                "[video attachments this model cannot view: {}. Say so if asked about them; do not guess their contents.]",
+                names.join(", ")
+            ))
+        } else {
+            None
+        };
+        let media_note = match (media_note, video_note) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (a, b) => a.or(b),
+        };
 
         if msg.content.is_empty() && media_note.is_none() {
             // Tool messages require a content string (OpenAI spec).
@@ -1035,9 +1499,18 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
 
     let mut parts = Vec::new();
     for path in images {
-        if let Ok((mime, data)) = vision::encode_image(path) {
+        if let Ok((mime, data)) = vision::encode_image(path, scope_root) {
             parts.push(OpenAIContentPart::ImageUrl {
                 image_url: OpenAIImageUrl {
+                    url: format!("data:{mime};base64,{data}"),
+                },
+            });
+        }
+    }
+    for path in videos {
+        if let Ok((mime, data)) = vision::encode_video(path, scope_root) {
+            parts.push(OpenAIContentPart::VideoUrl {
+                video_url: OpenAIVideoUrl {
                     url: format!("data:{mime};base64,{data}"),
                 },
             });
@@ -1049,6 +1522,40 @@ fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIConte
         });
     }
     Some(OpenAIContent::Parts(parts))
+}
+
+/// Append a note line to a message's content, whatever shape it has.
+fn append_note(content: Option<OpenAIContent>, note: &str) -> Option<OpenAIContent> {
+    Some(match content {
+        Some(OpenAIContent::Parts(mut parts)) => {
+            parts.push(OpenAIContentPart::Text {
+                text: note.to_string(),
+            });
+            OpenAIContent::Parts(parts)
+        }
+        Some(OpenAIContent::Text(text)) => {
+            OpenAIContent::Text(crate::tool_media::with_note(&text, Some(note)))
+        }
+        None => OpenAIContent::Text(note.to_string()),
+    })
+}
+
+/// The user turn that carries a tool batch's media (see `build_request`).
+fn media_turn<'a>(
+    media: &mut Vec<OpenAIContentPart>,
+    notes: &mut Vec<String>,
+) -> OpenAIMessage<'a> {
+    let mut parts = std::mem::take(media);
+    parts.push(OpenAIContentPart::Text {
+        text: std::mem::take(notes).join("\n"),
+    });
+    OpenAIMessage {
+        role: "user",
+        content: Some(OpenAIContent::Parts(parts)),
+        reasoning_content: None,
+        tool_call_id: None,
+        tool_calls: None,
+    }
 }
 
 #[derive(Serialize)]
@@ -1111,12 +1618,24 @@ struct Usage {
     /// providers that omit the object parse as `None`.
     #[serde(default)]
     prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Reasoning is already included in completion_tokens; retain this
+    /// diagnostic breakdown without adding it to the billed output total.
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Deserialize, Default)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u32,
 }
 
 #[derive(Deserialize, Default)]
 struct PromptTokensDetails {
     #[serde(default)]
     cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
 }
 
 // --- Streaming SSE helpers (shared with OpenRouter) ---
@@ -1209,10 +1728,17 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
         let cached = usage["prompt_tokens_details"]["cached_tokens"]
             .as_u64()
             .unwrap_or(0) as u32;
+        let cache_write = usage["prompt_tokens_details"]["cache_write_tokens"]
+            .as_u64()
+            .unwrap_or(0) as u32;
         events.push(StreamEvent::Usage(TokenUsage {
-            input_tokens: prompt.saturating_sub(cached),
+            input_tokens: prompt.saturating_sub(cached).saturating_sub(cache_write),
             output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            reasoning_tokens: usage["completion_tokens_details"]["reasoning_tokens"]
+                .as_u64()
+                .unwrap_or(0) as u32,
             cache_read_tokens: cached,
+            cache_write_tokens: cache_write,
             ..Default::default()
         }));
     }
@@ -1226,6 +1752,107 @@ mod tests {
     use crate::config::ChatConfig;
     use crate::provider::LlmProvider;
     use octos_core::{Message, MessageRole};
+
+    #[test]
+    fn provider_normalized_manifest_proves_same_epoch_append_only_prefix() {
+        let provider = OpenAIProvider::new("test-key", "gpt-5.4");
+        let config = ChatConfig {
+            prompt_cache_context: Some(crate::PromptCacheContext {
+                affinity_key: "octos-affinity".to_owned(),
+                epoch_id: "epoch-one".to_owned(),
+                stable_prefix_hash: "agent-stable".to_owned(),
+                semantic_boundaries: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let tools = vec![ToolSpec {
+            name: "read".to_owned(),
+            description: "read a file".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let first_messages = vec![
+            Message::system("TOPSECRET_SYSTEM_3892"),
+            Message::user("TOPSECRET_USER_1047"),
+        ];
+        let mut next_messages = first_messages.clone();
+        next_messages.push(Message::assistant("answer"));
+        next_messages.push(Message::user("next"));
+
+        let first_request = provider.build_request(&first_messages, &tools, &config, false);
+        let next_request = provider.build_request(&next_messages, &tools, &config, false);
+        let first = provider.prompt_cache_input_manifest(&first_request, &config);
+        let next = provider.prompt_cache_input_manifest(&next_request, &config);
+        let comparison = first.compare_prefix(&next);
+
+        assert_eq!(first.epoch_id.as_deref(), Some("epoch-one"));
+        assert_eq!(first.stable_prefix_hash, next.stable_prefix_hash);
+        assert_eq!(comparison.conversation_prefix_segments, 1);
+        assert_eq!(comparison.invalidation_reason, None);
+        assert!(comparison.reusable_normalized_bytes > 0);
+        let redacted = serde_json::to_string(&first).unwrap();
+        assert!(!redacted.contains("TOPSECRET_SYSTEM_3892"));
+        assert!(!redacted.contains("TOPSECRET_USER_1047"));
+    }
+
+    /// A custom base URL tags the router label (`moonshot-coding@api`), but
+    /// `provider_metadata()` reports the untagged lane. The manifest must use
+    /// the metadata label, otherwise usage rows (attributed through
+    /// `provider_metadata_for_index`) never match their manifest and the OUP
+    /// epoch reads a route change on every call.
+    #[test]
+    fn should_build_manifest_with_the_same_provider_label_as_provider_metadata_for_tagged_lane() {
+        let provider = OpenAIProvider::new("test-key", "k3")
+            .with_provider_label("moonshot-coding")
+            .with_base_url("https://api.kimi.com/coding/v1");
+        assert_eq!(provider.provider_name(), "moonshot-coding@api");
+        let config = ChatConfig::default();
+        let messages = vec![Message::system("stable"), Message::user("hello")];
+        let request = provider.build_request(&messages, &[], &config, false);
+        let manifest = provider.prompt_cache_input_manifest(&request, &config);
+
+        let metadata = provider.provider_metadata();
+        assert_eq!(metadata.provider, "moonshot-coding");
+        assert_eq!(manifest.provider, metadata.provider);
+        assert_eq!(manifest.model, metadata.model);
+        assert_eq!(
+            manifest.provider,
+            provider.provider_metadata_for_index(None).provider
+        );
+    }
+
+    /// `ChatConfig.tool_choice` used to be inert: no adapter serialized it,
+    /// so a "tools-disabled" round (the convergence reflection) still let
+    /// the model call tools. `none` must reach the wire, while the default
+    /// `auto` and tool-less requests keep their exact prior body.
+    #[test]
+    fn should_serialize_tool_choice_on_the_wire_only_when_explicit() {
+        let provider = OpenAIProvider::new("test-key", "gpt-5.4");
+        let tools = vec![ToolSpec {
+            name: "read".to_owned(),
+            description: "read a file".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let messages = vec![Message::user("hello")];
+        let auto = serde_json::to_value(provider.build_request(
+            &messages,
+            &tools,
+            &ChatConfig::default(),
+            false,
+        ))
+        .unwrap();
+        assert!(auto.get("tool_choice").is_none(), "{auto}");
+
+        let none = ChatConfig {
+            tool_choice: crate::ToolChoice::None,
+            ..Default::default()
+        };
+        let request =
+            serde_json::to_value(provider.build_request(&messages, &tools, &none, false)).unwrap();
+        assert_eq!(request["tool_choice"], "none");
+        let tool_less =
+            serde_json::to_value(provider.build_request(&messages, &[], &none, false)).unwrap();
+        assert!(tool_less.get("tool_choice").is_none(), "{tool_less}");
+    }
 
     #[test]
     fn tool_call_arguments_wire_passes_objects_through() {
@@ -1431,6 +2058,7 @@ mod tests {
             uses_completion_tokens: true,
             fixed_temperature: false,
             lacks_vision: true,
+            lacks_video: false,
             merge_system_messages: false,
             reasoning_style: ReasoningStyle::EffortAndThinkingToggle,
         };
@@ -1544,6 +2172,36 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_key_is_capability_gated_to_official_openai_endpoint() {
+        let config = ChatConfig {
+            prompt_cache_context: Some(crate::PromptCacheContext {
+                affinity_key: "octos-stable-affinity".to_owned(),
+                epoch_id: "epoch".to_owned(),
+                stable_prefix_hash: "sha256:stable".to_owned(),
+                semantic_boundaries: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let messages = [msg("hello")];
+        let official = OpenAIProvider::new("key", "gpt-5").with_prompt_cache_affinity(true);
+        let official_body =
+            serde_json::to_value(official.build_request(&messages, &[], &config, false)).unwrap();
+        assert_eq!(official_body["prompt_cache_key"], "octos-stable-affinity");
+
+        for custom in [
+            OpenAIProvider::new("key", "kimi-k3").with_base_url("https://api.moonshot.ai/v1"),
+            OpenAIProvider::new("key", "deepseek-v4").with_base_url("https://api.deepseek.com/v1"),
+        ] {
+            let body =
+                serde_json::to_value(custom.build_request(&messages, &[], &config, false)).unwrap();
+            assert!(
+                body.get("prompt_cache_key").is_none(),
+                "compatible endpoints must not receive reserved OpenAI fields: {body}"
+            );
+        }
+    }
+
+    #[test]
     fn build_request_emits_effort_and_thinking_for_deepseek_v4() {
         let p = OpenAIProvider::new("key", "deepseek-v4-pro");
         let cfg = ChatConfig {
@@ -1554,6 +2212,138 @@ mod tests {
         let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
         assert_eq!(v["reasoning_effort"], "high");
         assert_eq!(v["thinking"], serde_json::json!({ "type": "enabled" }));
+    }
+
+    #[test]
+    fn build_request_flattens_sampling_params() {
+        // Operator-supplied sampler params (#2172) appear as top-level fields in
+        // the request body, so an OpenAI-compatible server receives e.g.
+        // repeat_penalty even though octos does not model it.
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let mut sp = serde_json::Map::new();
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        sp.insert("top_p".to_string(), serde_json::json!(0.95));
+        let cfg = ChatConfig {
+            sampling_params: Some(sp),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v["repeat_penalty"], serde_json::json!(1.1));
+        assert_eq!(v["top_p"], serde_json::json!(0.95));
+    }
+
+    #[test]
+    fn build_request_drops_reserved_keys_from_sampling_params() {
+        // Defense-in-depth (#2172): a modeled key put in sampling_params is
+        // dropped so it can't duplicate/override the dedicated field. The
+        // dedicated `temperature` (0.5, exactly representable) wins; the stray
+        // one (1.9) is gone. `repeat_penalty` (unmodeled) passes through.
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let mut sp = serde_json::Map::new();
+        sp.insert("temperature".to_string(), serde_json::json!(1.9));
+        sp.insert(
+            "prompt_cache_key".to_string(),
+            serde_json::json!("injected"),
+        );
+        sp.insert("tool_choice".to_string(), serde_json::json!("required"));
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        let cfg = ChatConfig {
+            temperature: Some(0.5),
+            sampling_params: Some(sp),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert_eq!(v["temperature"], serde_json::json!(0.5));
+        assert!(v.get("prompt_cache_key").is_none(), "{v}");
+        assert!(v.get("tool_choice").is_none(), "{v}");
+        assert_eq!(v["repeat_penalty"], serde_json::json!(1.1));
+    }
+
+    /// In-memory log capture so a test can assert a `tracing::warn!` fired
+    /// (same shape as octos-cli's turn_trace tests).
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_logs(run: impl FnOnce()) -> String {
+        let captured = CapturedLogs::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn should_warn_when_sampling_params_contain_reserved_keys() {
+        // #2177: stripping reserved keys from sampling_params must not be
+        // silent — an operator who puts `temperature` there otherwise gets a
+        // configured-but-unchanged request with zero signal.
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let mut sp = serde_json::Map::new();
+        sp.insert("temperature".to_string(), serde_json::json!(1.9));
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        let cfg = ChatConfig {
+            sampling_params: Some(sp),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let logs = capture_logs(|| {
+            p.build_request(&msgs, &[], &cfg, false);
+        });
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("temperature"), "{logs}");
+        assert!(
+            !logs.contains("repeat_penalty"),
+            "non-reserved keys pass through and are not named in the warning: {logs}"
+        );
+    }
+
+    #[test]
+    fn should_not_warn_when_sampling_params_have_no_reserved_keys() {
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let mut sp = serde_json::Map::new();
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        let cfg = ChatConfig {
+            sampling_params: Some(sp),
+            ..Default::default()
+        };
+        let msgs = [msg("hi")];
+        let logs = capture_logs(|| {
+            p.build_request(&msgs, &[], &cfg, false);
+        });
+        assert!(
+            !logs.contains("WARN"),
+            "no reserved keys → no warning, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn build_request_omits_sampling_params_when_unset() {
+        // Cloud-safety: with no sampling_params, no extra keys are added — the
+        // request body is unchanged.
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let msgs = [msg("hi")];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        assert!(v.get("repeat_penalty").is_none());
+        assert!(v.get("top_p").is_none());
     }
 
     #[test]
@@ -1977,6 +2767,7 @@ mod tests {
             uses_completion_tokens: true,
             fixed_temperature: true,
             lacks_vision: true,
+            lacks_video: false,
             merge_system_messages: false,
             reasoning_style: ReasoningStyle::None,
         });
@@ -2002,7 +2793,7 @@ mod tests {
         let mut assistant = msg("I delivered the deck.");
         assistant.role = MessageRole::Assistant;
         assistant.media = vec!["skill-output/slides/deck/output/slide-01.png".to_string()];
-        let content = build_openai_content(&assistant, &hints)
+        let content = build_openai_content(&assistant, &hints, None)
             .expect("assistant content should still be built");
         match content {
             OpenAIContent::Text(text) => {
@@ -2044,6 +2835,357 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    fn msg_with_user_video(dir: &std::path::Path) -> Message {
+        let clip = dir.join("clip.mp4");
+        std::fs::write(&clip, b"\x00\x00\x00\x18ftypisom").unwrap();
+        Message {
+            role: MessageRole::User,
+            content: "what happens in this clip".to_string(),
+            media: vec![clip.to_string_lossy().into_owned()],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn should_send_a_user_video_as_a_video_url_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = OpenAIProvider::new("key", "glm-5.3-flash");
+        let msgs = [msg_with_user_video(dir.path())];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let parts = v["messages"][0]["content"]
+            .as_array()
+            .expect("multipart user content");
+        assert_eq!(parts[0]["type"], "video_url");
+        assert!(
+            parts[0]["video_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:video/mp4;base64,"),
+            "{}",
+            parts[0]
+        );
+        assert_eq!(parts[1]["type"], "text");
+    }
+
+    #[test]
+    fn should_replace_the_video_with_a_note_when_the_model_lacks_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = OpenAIProvider::new("key", "deepseek-v4-flash").with_hints(ModelHints {
+            lacks_video: true,
+            ..ModelHints::default()
+        });
+        let msgs = [msg_with_user_video(dir.path())];
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let content = v["messages"][0]["content"]
+            .as_str()
+            .expect("text content, no parts");
+        assert!(
+            content.starts_with("what happens in this clip"),
+            "{content}"
+        );
+        assert!(
+            content.contains("video attachments this model cannot view: clip.mp4"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("read_file"),
+            "a video is not for read_file: {content}"
+        );
+    }
+
+    /// DeepSeek's actual refusal of a `video_url` part.
+    const VIDEO_PART_422_BODY: &str = r#"{"error":{"message":"Failed to deserialize the JSON body into the target type: messages[0]: unknown variant `video_url`, expected one of `text`, `image_url`, `file` at line 1 column 6377","type":"invalid_request_error"}}"#;
+
+    #[tokio::test]
+    async fn should_retry_without_video_when_the_endpoint_refuses_the_video_part() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        // The first request carries the video part and is refused; the
+        // retry, without it, is answered.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("video_url"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_string(VIDEO_PART_422_BODY)
+                    .append_header("Content-Type", "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "I could not watch it."}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAIProvider::new("test-key", "deepseek-v4-flash").with_base_url(server.uri());
+        let messages = vec![msg_with_user_video(dir.path())];
+        let response = provider
+            .chat(&messages, &[], &ChatConfig::default())
+            .await
+            .expect("the retry without video succeeds");
+        assert_eq!(response.content.as_deref(), Some("I could not watch it."));
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let second = String::from_utf8_lossy(&requests[1].body);
+        assert!(
+            !second.contains("video_url"),
+            "retry must carry no video part"
+        );
+        assert!(
+            second.contains("video attachments this model cannot view"),
+            "retry names the video it dropped: {second}"
+        );
+    }
+
+    /// A tool loop whose tool handed the model an image: user, assistant
+    /// tool call, tool row with the PNG on its media.
+    fn media_loop(dir: &std::path::Path) -> (Vec<Message>, String) {
+        let png = dir.join("grab.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
+        let path = png.to_string_lossy().into_owned();
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_1".into(),
+            name: "view_image".into(),
+            arguments: serde_json::json!({"path": "grab.png"}),
+            metadata: None,
+        }]);
+        let mut tool = mk(MessageRole::Tool, "{\"format\":\"png\"}");
+        tool.tool_call_id = Some("call_1".into());
+        tool.media = vec![path.clone()];
+        (
+            vec![mk(MessageRole::User, "look at grab.png"), assistant, tool],
+            path,
+        )
+    }
+
+    /// The same loop continued: the model answered, the user asked again,
+    /// and a second call ran — the first row's image is now an old batch.
+    fn media_loop_continued(dir: &std::path::Path) -> Vec<Message> {
+        let (mut msgs, _) = media_loop(dir);
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        msgs.push(mk(MessageRole::Assistant, "a red circle"));
+        msgs.push(mk(MessageRole::User, "and the size?"));
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_2".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"cmd": "file grab.png"}),
+            metadata: None,
+        }]);
+        msgs.push(assistant);
+        let mut tool = mk(MessageRole::Tool, "PNG 480x320");
+        tool.tool_call_id = Some("call_2".into());
+        msgs.push(tool);
+        msgs
+    }
+
+    /// #2480 end to end: a tool validated `project/img.png` inside the
+    /// workspace, then a background writer swapped `project` for a symlink
+    /// to elsewhere before the request was built. The request body is the
+    /// last stop before the bytes leave the machine — it must carry the
+    /// validated image on the untouched layout and never the swapped one.
+    #[cfg(unix)]
+    #[test]
+    fn build_request_never_ships_bytes_behind_a_swapped_symlink_ancestor() {
+        let ws = tempfile::tempdir().unwrap();
+        let secret = tempfile::tempdir().unwrap();
+        let project = ws.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let legit_path = project.join("img.png");
+        let legit_bytes: Vec<u8> =
+            [b"\x89PNG\r\n\x1a\n".as_slice(), b"the-real-screenshot"].concat();
+        std::fs::write(&legit_path, &legit_bytes).unwrap();
+        let payload_path = secret.path().join("img.png");
+        let payload_bytes: Vec<u8> =
+            [b"\x89PNG\r\n\x1a\n".as_slice(), b"swapped-private-bytes"].concat();
+        std::fs::write(&payload_path, &payload_bytes).unwrap();
+
+        let b64 = |bytes: &[u8]| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
+
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_1".into(),
+            name: "view_image".into(),
+            arguments: serde_json::json!({"path": "img.png"}),
+            metadata: None,
+        }]);
+        let mut tool = mk(MessageRole::Tool, "{\"format\":\"png\"}");
+        tool.tool_call_id = Some("call_1".into());
+        tool.media = vec![legit_path.to_string_lossy().into_owned()];
+        let msgs = vec![mk(MessageRole::User, "look"), assistant, tool];
+
+        let p = OpenAIProvider::new("key", "gpt-4o");
+        let cfg = ChatConfig {
+            media_scope_root: Some(ws.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        // Untouched layout: the validated image ships.
+        let body = serde_json::to_string(&p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert!(
+            body.contains(&b64(&legit_bytes)),
+            "validated image ships: {body}"
+        );
+
+        // The swap: `project` now points at the secret directory.
+        std::fs::remove_dir_all(&project).unwrap();
+        std::os::unix::fs::symlink(secret.path(), &project).unwrap();
+        let body = serde_json::to_string(&p.build_request(&msgs, &[], &cfg, false)).unwrap();
+        assert!(
+            !body.contains(&b64(&payload_bytes)),
+            "swapped bytes must never leave the machine: {body}"
+        );
+        assert!(
+            body.contains("could not be read"),
+            "the model is told the media went away: {body}"
+        );
+    }
+
+    #[test]
+    fn should_render_tool_media_as_one_user_turn_after_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (msgs, _) = media_loop(dir.path());
+        let p = OpenAIProvider::new("key", "deepseek-v4-flash");
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let out = v["messages"].as_array().unwrap();
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "user"], "{v}");
+        assert_eq!(
+            out[2]["content"], "{\"format\":\"png\"}",
+            "tool output stays text"
+        );
+        let parts = out[3]["content"]
+            .as_array()
+            .expect("media turn is multipart");
+        assert_eq!(parts[0]["type"], "image_url");
+        assert!(
+            parts[0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        assert!(
+            parts[1]["text"].as_str().unwrap().contains("call_1"),
+            "{}",
+            parts[1]
+        );
+    }
+
+    #[test]
+    fn should_send_tool_media_once_and_name_it_afterwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = media_loop_continued(dir.path());
+        let p = OpenAIProvider::new("key", "deepseek-v4-flash");
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let out = v["messages"].as_array().unwrap();
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        // No media turn after the FIRST tool row any more; the second batch
+        // has no media, so none after it either.
+        assert_eq!(
+            roles,
+            vec![
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "user",
+                "assistant",
+                "tool"
+            ],
+            "{v}"
+        );
+        let first_tool = out[2]["content"].as_str().unwrap();
+        assert!(
+            first_tool.contains("shown to you when it ran") && first_tool.contains("grab.png"),
+            "{first_tool}"
+        );
+        assert!(
+            !v.to_string().contains("data:image/png"),
+            "the old image is not re-sent"
+        );
+    }
+
+    #[test]
+    fn a_tool_video_is_stripped_and_named_when_the_model_lacks_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut msgs, _) = media_loop(dir.path());
+        let clip = dir.path().join("clip.mp4");
+        std::fs::write(&clip, b"\x00\x00\x00\x18ftypisom").unwrap();
+        msgs[2].media = vec![clip.to_string_lossy().into_owned()];
+        let p = OpenAIProvider::new("key", "deepseek-v4-flash").with_hints(ModelHints {
+            lacks_video: true,
+            ..ModelHints::default()
+        });
+        let v = serde_json::to_value(p.build_request(&msgs, &[], &ChatConfig::default(), false))
+            .unwrap();
+        let out = v["messages"].as_array().unwrap();
+        assert_eq!(out.len(), 3, "no media turn: {v}");
+        assert!(
+            out[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be viewed by this model: clip.mp4"),
+            "{v}"
+        );
     }
 
     /// The body string that `is_image_modality_error` recognises as an image-
@@ -2220,6 +3362,87 @@ mod cache_usage_tests {
     use crate::config::ChatConfig;
     use octos_core::{Message, MessageRole};
 
+    fn reasoning_usage_cases() -> Vec<(serde_json::Value, u32)> {
+        use serde_json::json;
+        [
+            (Some(json!({"reasoning_tokens": 6})), 6),
+            (Some(json!({"reasoning_tokens": 0})), 0),
+            (None, 0),
+            (Some(serde_json::Value::Null), 0),
+            (Some(json!({})), 0),
+        ]
+        .into_iter()
+        .map(|(details, expected)| {
+            let mut usage = json!({
+                "prompt_tokens": 17,
+                "completion_tokens": 8,
+                "prompt_tokens_details": {"cached_tokens": 7}
+            });
+            if let Some(details) = details {
+                usage["completion_tokens_details"] = details;
+            }
+            (usage, expected)
+        })
+        .collect()
+    }
+
+    fn assert_reasoning_usage(usage: &TokenUsage, expected: u32) {
+        assert_eq!(usage.reasoning_tokens, expected);
+        // Reasoning is a component of completion_tokens, not extra output.
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cache_read_tokens, 7);
+        assert_eq!(usage.cache_write_tokens, 0);
+    }
+
+    #[test]
+    fn should_preserve_reasoning_usage_from_sse_without_adding_to_output() {
+        for (usage, expected) in reasoning_usage_cases() {
+            let event = SseEvent {
+                event: None,
+                data: serde_json::json!({"choices": [], "usage": usage}).to_string(),
+            };
+            let events = parse_openai_sse_events(&event);
+            let usage = events
+                .iter()
+                .find_map(|event| match event {
+                    StreamEvent::Usage(usage) => Some(usage),
+                    _ => None,
+                })
+                .expect("usage event");
+            assert_reasoning_usage(usage, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn should_preserve_reasoning_usage_from_chat_without_adding_to_output() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (usage, expected) in reasoning_usage_cases() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"},
+                                 "finish_reason": "stop"}],
+                    "usage": usage
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let provider = OpenAIProvider::new("fixture-fake-only", "fixture-model")
+                .with_base_url(server.uri());
+            let response = provider
+                .chat(&[], &[], &ChatConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(response.content.as_deref(), Some("ok"));
+            assert_eq!(response.stop_reason, StopReason::EndTurn);
+            assert_reasoning_usage(&response.usage, expected);
+        }
+    }
+
     #[test]
     fn should_parse_cached_tokens_from_sse_usage() {
         let event = SseEvent {
@@ -2255,6 +3478,25 @@ mod cache_usage_tests {
             })
             .expect("usage event");
         assert_eq!(usage.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn should_parse_cache_write_tokens_from_sse_usage_disjointly() {
+        let event = SseEvent {
+            event: None,
+            data: r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":20,"cache_write_tokens":30}}}"#.into(),
+        };
+        let events = parse_openai_sse_events(&event);
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.cache_read_tokens, 20);
+        assert_eq!(usage.cache_write_tokens, 30);
     }
 
     #[tokio::test]
@@ -2295,5 +3537,174 @@ mod cache_usage_tests {
         // cached_tokens, TokenUsage does not — total = input + cache_read.
         assert_eq!(response.usage.input_tokens, 25);
         assert_eq!(response.usage.cache_read_tokens, 75);
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_affinity_tests {
+    use super::*;
+
+    fn affinity_config() -> ChatConfig {
+        ChatConfig {
+            prompt_cache_context: Some(crate::PromptCacheContext {
+                affinity_key: "octos-stable-affinity".to_owned(),
+                epoch_id: "epoch".to_owned(),
+                stable_prefix_hash: "sha256:stable".to_owned(),
+                semantic_boundaries: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn body(provider: &OpenAIProvider, config: &ChatConfig) -> serde_json::Value {
+        serde_json::to_value(provider.build_request(&[Message::user("hello")], &[], config, false))
+            .unwrap()
+    }
+
+    #[test]
+    fn should_keep_explicit_affinity_opt_in_when_base_url_is_set_in_either_order() {
+        let config = affinity_config();
+        let opt_in_then_custom = OpenAIProvider::new("key", "kimi-k3")
+            .with_prompt_cache_affinity(true)
+            .with_base_url("https://api.moonshot.ai/v1");
+        let custom_then_opt_in = OpenAIProvider::new("key", "kimi-k3")
+            .with_base_url("https://api.moonshot.ai/v1")
+            .with_prompt_cache_affinity(true);
+        for provider in [opt_in_then_custom, custom_then_opt_in] {
+            let body = body(&provider, &config);
+            assert_eq!(
+                body["prompt_cache_key"], "octos-stable-affinity",
+                "an explicit opt-in must survive builder call ordering: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_keep_explicit_affinity_opt_out_when_official_base_url_is_set_afterwards() {
+        let config = affinity_config();
+        let provider = OpenAIProvider::new("key", "gpt-5")
+            .with_prompt_cache_affinity(false)
+            .with_base_url("https://api.openai.com/v1");
+        let body = body(&provider, &config);
+        assert!(body.get("prompt_cache_key").is_none(), "{body}");
+    }
+
+    #[test]
+    fn should_honor_kill_switch_at_request_time_when_flipped_after_construction() {
+        let config = affinity_config();
+        // Same constructed provider, kill-switch flipped between requests:
+        // the decision must be made per request (as the Responses provider
+        // does), not baked in at construction.
+        let provider = OpenAIProvider::new("key", "gpt-5");
+        assert_eq!(
+            provider.prompt_cache_key_for(&config, true),
+            Some("octos-stable-affinity")
+        );
+        assert_eq!(
+            provider.prompt_cache_key_for(&config, false),
+            None,
+            "the operator kill-switch must be honored on the next request"
+        );
+        // An explicit opt-in is still subject to the operator kill-switch.
+        let opted_in = OpenAIProvider::new("key", "kimi-k3")
+            .with_base_url("https://api.moonshot.ai/v1")
+            .with_prompt_cache_affinity(true);
+        assert_eq!(
+            opted_in.prompt_cache_key_for(&config, true),
+            Some("octos-stable-affinity")
+        );
+        assert_eq!(opted_in.prompt_cache_key_for(&config, false), None);
+    }
+
+    #[test]
+    fn should_treat_trailing_slash_official_base_url_as_official() {
+        let config = affinity_config();
+        let provider =
+            OpenAIProvider::new("key", "gpt-5").with_base_url("https://api.openai.com/v1/");
+        let body = body(&provider, &config);
+        assert_eq!(
+            body["prompt_cache_key"], "octos-stable-affinity",
+            "a trailing slash must not disable official affinity: {body}"
+        );
+        assert_eq!(
+            provider.provider_name(),
+            "openai",
+            "the official endpoint must not be tagged as a custom host"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lane_attributed_operational_errors {
+    use octos_core::Message;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::OpenAIProvider;
+    use crate::config::ChatConfig;
+    use crate::error::{LlmError, LlmErrorKind};
+    use crate::provider::LlmProvider;
+    use crate::provider::test_lanes::assert_error_names_lane;
+    use crate::retry::RetryProvider;
+
+    const LANE: &str = "moonshot-coding@api/k3";
+    const STYLE: &str = "api_style=openai_chat_completions";
+    const FORBIDDEN: &[&str] = &["OpenAI response", "OpenAI request"];
+
+    async fn k3_lane_returning(status: u16, body: &str) -> (MockServer, OpenAIProvider) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body.to_owned()))
+            .mount(&server)
+            .await;
+        let provider = OpenAIProvider::new("key", "k3")
+            .with_base_url(server.uri())
+            .with_provider_label("moonshot-coding@api");
+        (server, provider)
+    }
+
+    #[tokio::test]
+    async fn should_name_k3_lane_when_response_body_is_malformed() {
+        let (_server, provider) = k3_lane_returning(200, "not json{").await;
+        let err = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_error_names_lane(&err, LANE, STYLE, FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn should_name_k3_lane_when_choices_are_empty() {
+        let (_server, provider) = k3_lane_returning(
+            200,
+            r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0}}"#,
+        )
+        .await;
+        let err = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_error_names_lane(&err, LANE, STYLE, FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn should_name_k3_lane_with_api_style_when_status_error_is_mapped() {
+        let (_server, provider) = k3_lane_returning(503, "upstream exploded").await;
+        let err = provider
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await
+            .unwrap_err();
+        assert_error_names_lane(&err, LANE, STYLE, FORBIDDEN);
+        let llm = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<LlmError>())
+            .expect("status errors stay typed");
+        assert_eq!(llm.kind, LlmErrorKind::ServerError { status: 503 });
+        assert_eq!(
+            llm.provider, LANE,
+            "the HarnessError lane label is unchanged"
+        );
+        assert!(RetryProvider::should_failover(&err));
+        assert!(RetryProvider::is_retryable_error(&err));
     }
 }

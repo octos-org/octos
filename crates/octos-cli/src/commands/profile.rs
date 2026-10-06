@@ -332,6 +332,7 @@ mod tests {
             model: Some("text-embedding-v4".into()),
             dimensions: None,
             model_path: None,
+            auto_download: None,
         });
         config
             .env_vars

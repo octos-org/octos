@@ -1421,33 +1421,26 @@ impl Tool for GoalUpdateTool {
                 .map(|dd| orchestrator.model_goal_ledger_findings(dd, &snapshot.goal_id))
                 .unwrap_or_default();
             let evidence = completion_evidence_with_ledger(reason, &ledger_findings);
-            let (verdict, usage) =
-                crate::autonomy::agent_orchestrator::run_goal_completion_verifier_with_usage(
+            // evo-goal-verifier — the SINGLE shared recovery entry: digest
+            // gate → single call → per-attempt charge → budget gate →
+            // bounded retry (≤2 calls) → ledger append. The wrapper owns
+            // the charge; this call site no longer charges directly.
+            let outcome = orchestrator
+                .verify_goal_completion_bounded(
+                    &session_id,
+                    &self.profile_id,
+                    &snapshot,
                     verifier_provider,
-                    &snapshot.objective,
                     &evidence,
+                    self.data_dir.as_deref(),
                 )
                 .await;
-            // #1935 round 5 — exactly-once direct charge, while the goal is
-            // still active/budget_limited (a `complete` goal cannot be
-            // charged). Covers Done AND NotDone outcomes.
-            let _ = orchestrator.charge_goal_verifier_usage(
-                &session_id,
-                &self.profile_id,
-                Some(&snapshot.goal_id),
-                &usage,
-            );
-            if !verdict.is_done() {
+            if !outcome.is_done() {
+                // M5: single canonical formatting source — the Display impl
+                // on GoalVerifierOutcome. All four call sites render the
+                // same `verifier {kind} (attempt n/2): reason` line.
                 return Ok(ToolResult {
-                    output: format!(
-                        "goal_update: completion NOT verified — independent verifier returned: {}",
-                        match verdict {
-                            crate::autonomy::goal_loop_runtime::GoalCompletionVerdict::NotDone {
-                                reason,
-                            } => reason,
-                            _ => "unknown".to_string(),
-                        }
-                    ),
+                    output: format!("goal_update: completion NOT verified — {outcome}"),
                     success: false,
                     ..Default::default()
                 });
@@ -1526,8 +1519,8 @@ impl Tool for GoalCreateTool {
         "Create a persistent goal for this session — ONLY when the user or system/developer \
          instructions explicitly ask for a goal; do NOT infer one from an ordinary task. Starts \
          a new active goal when none exists, or replaces the current goal only when it is \
-         already complete. Fails if an unfinished goal exists (complete or clear it first). Set \
-         token_budget only when an explicit token budget is requested."
+         terminal (already complete or archived). Fails if an unfinished goal exists (complete \
+         or clear it first). Set token_budget only when an explicit token budget is requested."
     }
 
     fn input_schema(&self) -> Value {
@@ -1986,6 +1979,115 @@ impl Tool for MonitorDeleteTool {
 mod tests {
     use super::*;
 
+    /// #24 — REAL-machine capture of the goal-completion verifier call against
+    /// the LIVE main provider (k3 / moonshot-coding), to locate the true layer
+    /// of the "empty verifier return" (#23 symptom). Prints verdict + usage +
+    /// whether the call errored. Run with the main credential in env:
+    ///   KIMI_API_KEY=… cargo test -p octos-cli --lib --features api -- \
+    ///     --ignored --exact goal_tool::tests::capture_live_verifier_call
+    #[tokio::test]
+    #[ignore = "real k3 network call; run explicitly with KIMI_API_KEY in env"]
+    async fn capture_live_verifier_call() {
+        let key = std::env::var("KIMI_API_KEY").expect("KIMI_API_KEY required");
+        // Build the LIVE main-lane provider exactly as the profile does.
+        let mut config = crate::config::Config {
+            provider: Some("moonshot-coding".to_owned()),
+            api_key_env: Some("KIMI_API_KEY".to_owned()),
+            ..Default::default()
+        };
+        config.env_vars.insert("KIMI_API_KEY".to_owned(), key);
+        let provider = crate::commands::chat::create_provider_with_api_type(
+            "moonshot-coding",
+            &config,
+            Some("k3".to_owned()),
+            Some("https://api.kimi.com/coding/v1".to_owned()),
+            Some("openai"),
+        )
+        .expect("build live k3 provider");
+
+        let call = crate::autonomy::agent_orchestrator::run_goal_completion_verifier_with_usage(
+            provider,
+            "Write the number 42 to a file.",
+            "I wrote 42 to /tmp/answer.txt and verified it with cat.",
+        )
+        .await;
+        let verdict = call.verdict;
+        let usage = call.usage;
+        let is_done = verdict.is_done();
+        let reason = match &verdict {
+            crate::autonomy::goal_loop_runtime::GoalCompletionVerdict::NotDone { reason } => {
+                reason.clone()
+            }
+            _ => "<done>".to_owned(),
+        };
+        eprintln!(
+            "VERIFIER-LIVE is_done={is_done} reason={reason:?} usage_in={} usage_out={}",
+            usage.input_tokens, usage.output_tokens
+        );
+        // The live verifier returns a NON-EMPTY verdict — this proves the
+        // verifier layer is healthy and the k3 main lane answers the judge
+        // prompt with real content + billed usage. (Whether DONE or NOT_DONE
+        // is the model's judgment; the #23 "empty return" bug is an EMPTY
+        // reason, which a healthy call never produces.)
+        assert!(
+            !reason.is_empty(),
+            "a healthy verifier call must produce a non-empty verdict reason"
+        );
+        assert!(usage.output_tokens > 0, "verifier must bill output tokens");
+    }
+
+    /// #24 — reproduce the EXACT #23 empty-return: a long, ledger-folded
+    /// evidence blob like the real goal_update sends. Captures whether the
+    /// verdict reason comes back EMPTY (the actual symptom).
+    #[tokio::test]
+    #[ignore = "real k3 network call; run explicitly with KIMI_API_KEY in env"]
+    async fn capture_live_verifier_call_long_evidence() {
+        let key = std::env::var("KIMI_API_KEY").expect("KIMI_API_KEY required");
+        let mut config = crate::config::Config {
+            provider: Some("moonshot-coding".to_owned()),
+            api_key_env: Some("KIMI_API_KEY".to_owned()),
+            ..Default::default()
+        };
+        config.env_vars.insert("KIMI_API_KEY".to_owned(), key);
+        let provider = crate::commands::chat::create_provider_with_api_type(
+            "moonshot-coding",
+            &config,
+            Some("k3".to_owned()),
+            Some("https://api.kimi.com/coding/v1".to_owned()),
+            Some("openai"),
+        )
+        .expect("build live k3 provider");
+
+        // A long, realistic evidence blob mimicking a real goal_update reason.
+        let long_evidence = format!(
+            "#19 已由外环(claude)隔离终验采认收官。{}\n\n{}",
+            "四切片实证齐全。".repeat(40),
+            "1. [peer:s2] (finding) zai lane done\n2. [peer:s4] (finding) docs done\n".repeat(20)
+        );
+        let call = crate::autonomy::agent_orchestrator::run_goal_completion_verifier_with_usage(
+            provider,
+            "#19 goal peer 多模型能力 + zai GLM 5.2 接入。切片 S1-S4。",
+            &long_evidence,
+        )
+        .await;
+        let verdict = call.verdict;
+        let usage = call.usage;
+        let reason = match &verdict {
+            crate::autonomy::goal_loop_runtime::GoalCompletionVerdict::NotDone { reason } => {
+                reason.clone()
+            }
+            _ => "<done>".to_owned(),
+        };
+        eprintln!(
+            "VERIFIER-LONG is_done={} reason_len={} reason={reason:?} usage_in={} usage_out={}",
+            verdict.is_done(),
+            reason.len(),
+            usage.input_tokens,
+            usage.output_tokens
+        );
+        eprintln!("VERIFIER-LONG-EMPTY-REASON={}", reason.is_empty());
+    }
+
     /// #1935 — a call-counting scripted provider for verifier-lane routing
     /// assertions: replies with a fixed verdict line and fixed token usage.
     struct CountingVerifierProvider {
@@ -2017,6 +2119,43 @@ mod tests {
         }
         fn provider_name(&self) -> &str {
             "counting-verifier"
+        }
+    }
+
+    /// evo-goal-verifier M4: always fails with a RETRYABLE server error so
+    /// the bounded wrapper burns both attempts (attempt 2/2) before
+    /// refusing with kind=call_failed.
+    struct FailingVerifierProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Default for FailingVerifierProvider {
+        fn default() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl octos_llm::LlmProvider for FailingVerifierProvider {
+        async fn chat(
+            &self,
+            _messages: &[octos_core::Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(eyre::eyre!(octos_llm::LlmError::new(
+                octos_llm::LlmErrorKind::ServerError { status: 503 },
+                "always failing",
+            )))
+        }
+        fn model_id(&self) -> &str {
+            "failing-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "failing-verifier"
         }
     }
 
@@ -2470,6 +2609,19 @@ mod tests {
             .expect("goal_update runs");
         assert!(!result.success, "NotDone verdict refuses the transition");
         assert!(result.tokens_used.is_none(), "no stamp on refusal either");
+        // M4 (cross/GAP hardening): the refusal output must carry the
+        // STRUCTURED kind + attempt + reason via the canonical Display line.
+        assert!(
+            result
+                .output
+                .contains("verifier insufficient_evidence (attempt 1/2)"),
+            "structured kind+attempts in refusal output, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("evidence missing"),
+            "missing-evidence reason surfaced"
+        );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let (tokens_used, _, _) = orchestrator
             .goal_counters_for_test(&session)
@@ -2537,6 +2689,43 @@ mod tests {
     /// when a goal-scoped peer parks (`model_goal_record_peer_escalation`) but
     /// until this fold no production read existed, so the master model could
     /// never see them. Same data_dir gate as `ledger_findings`.
+    //
+    /// evo-goal-verifier M4 (spec Filter: goal_update_reports_structured_
+    /// verifier_failure, CallFailed variant): two transient call failures
+    /// cap at attempt 2/2 and the refusal output names call_failed.
+    #[tokio::test]
+    async fn goal_update_reports_call_failed_verifier_failure() {
+        use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+        let orchestrator = default_agent_orchestrator();
+        let session = SessionKey("verifier-callfailed-prof:api:goal-update-callfailed".to_owned());
+        orchestrator
+            .set_goal(GoalSetRequest {
+                session_id: session.clone(),
+                profile_id: "verifier-callfailed-prof".to_owned(),
+                objective: "surface call failure".to_owned(),
+                status: Some("active".to_owned()),
+                token_budget: Some(10_000),
+                transition_actor: None,
+            })
+            .expect("set goal");
+
+        let verifier = std::sync::Arc::new(FailingVerifierProvider::default());
+        let tool = GoalUpdateTool::new("verifier-callfailed-prof").with_verifier_provider(verifier);
+        let mut ctx = ToolContext::zero();
+        ctx.parent_session_key = Some(session.0.clone());
+
+        let result = tool
+            .execute_with_context(&ctx, &json!({"status": "complete", "reason": "attempt"}))
+            .await
+            .expect("goal_update runs");
+        assert!(!result.success, "call failure refuses the transition");
+        assert!(
+            result.output.contains("verifier call_failed (attempt 2/2)"),
+            "call_failed kind + capped attempts in output, got: {}",
+            result.output
+        );
+    }
+
     #[tokio::test]
     async fn goal_get_includes_open_escalations_when_data_dir_set() {
         use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};

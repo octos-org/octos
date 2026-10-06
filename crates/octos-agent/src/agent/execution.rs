@@ -396,7 +396,12 @@ struct ApprovedToolAutoApprover;
 
 #[async_trait::async_trait]
 impl ToolApprovalRequester for ApprovedToolAutoApprover {
-    async fn request_approval(&self, _request: ToolApprovalRequest) -> ToolApprovalDecision {
+    async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        // A once-only approval (a host-routed app tool, UPCR-2026-035) is the
+        // person's answer to one exact call; a replay path never grants it.
+        if request.once_only {
+            return ToolApprovalDecision::Deny;
+        }
         ToolApprovalDecision::Approve
     }
 }
@@ -441,6 +446,8 @@ impl Agent {
                         Err("tool arguments changed since approval request was created".to_string())
                     }
                 }
+                // Feedback is an after-event-only outcome; never arises here.
+                HookResult::Feedback(_) => Ok(()),
                 // Context injection is a `user_prompt_submit`-only outcome and
                 // never arises for a before-tool re-validation; allow the call.
                 HookResult::Context(_) => Ok(()),
@@ -507,6 +514,11 @@ impl Agent {
             // boot so goal-aware tools can enforce binding without re-reading
             // the mutable originator file on every call.
             originator_session: self.originator_session.clone(),
+            // Outer-loop #4: forward the build-cache slot this peer's turn
+            // holds so the shell tool injects CARGO_TARGET_DIR per call
+            // (§7.4) — never a process env var (peers share the process).
+            build_cache_slot: self.build_cache_slot.clone(),
+            build_cache_usage: self.build_cache_usage.clone(),
             // #1774: approval-gated edits still honor the post-edit
             // formatting opt-in.
             format_after_edit: self.config.format_after_edit,
@@ -526,7 +538,7 @@ impl Agent {
         // default delegation), so every field above was reaching only
         // task-local (`TOOL_CTX`) readers. TOOL_CTX stays scoped for plugin
         // tools that read the task-local.
-        let result = TOOL_APPROVAL_CTX
+        let mut result = TOOL_APPROVAL_CTX
             .scope(
                 approver,
                 TOOL_CTX.scope(
@@ -547,9 +559,28 @@ impl Agent {
                 octos_core::truncated_utf8(&result.output, 500, "..."),
                 result.success,
                 tool_start.elapsed().as_millis() as u64,
+                Some(&pending.tool_args),
+                self.tools.workspace_root(),
                 self.hook_ctx().as_ref(),
             );
-            let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
+            // Feedback (a checker reporting diagnostics) reaches the model;
+            // infra errors (missing binary, timeout) stay log-only — see
+            // HookResult::Feedback. Sanitized like every other model-facing
+            // tool output: checkers quote source lines, and source lines
+            // carry secrets.
+            if let HookResult::Feedback(entries) =
+                hooks.run(HookEvent::AfterToolCall, &payload).await
+            {
+                let feedback = crate::sanitize::sanitize_tool_output(&entries.join("\n\n"));
+                // #2129 review round 2, finding 4: truncate the tool output
+                // to its limit FIRST, then append feedback — mirrors the
+                // spawned dispatch site so a downstream cap cannot cut the
+                // checker feedback appended last.
+                let limit = octos_core::tool_output_limit(&pending.request.tool_name);
+                result.output = octos_core::truncate_head_tail(&result.output, limit, 0.7);
+                result.output.push_str("\n\n[hook] ");
+                result.output.push_str(&feedback);
+            }
         }
 
         Ok(result)
@@ -590,6 +621,8 @@ impl Agent {
         let ctx_goal_id = self.goal_id.clone();
         let ctx_task_id = self.task_id.clone();
         let ctx_originator_session = self.originator_session.clone();
+        let ctx_build_cache_slot = self.build_cache_slot.clone();
+        let ctx_build_cache_usage = self.build_cache_usage.clone();
         let reporter = self.reporter();
         let hooks = self.hooks.clone();
         let hook_ctx = self.hook_ctx();
@@ -701,13 +734,11 @@ impl Agent {
                         );
                         let deny_msg = if reason.is_empty() {
                             format!(
-                                "[HOOK DENIED] Tool '{}' was blocked by a lifecycle hook. Do not retry.",
-                                tc_name
+                                "[HOOK DENIED] Tool '{tc_name}' was blocked by a lifecycle hook. Do not retry."
                             )
                         } else {
                             format!(
-                                "[HOOK DENIED] Tool '{}' was blocked: {}. Do not retry.",
-                                tc_name, reason
+                                "[HOOK DENIED] Tool '{tc_name}' was blocked: {reason}. Do not retry."
                             )
                         };
                         // Clear the activity chip: this early-return skips the
@@ -776,8 +807,7 @@ impl Agent {
                             "provider policy denied spawn_only tool at intercept"
                         );
                         let deny_msg = format!(
-                            "[POLICY DENIED] Tool '{}' is blocked by provider policy ({}). Do not retry.",
-                            tc_name, reason
+                            "[POLICY DENIED] Tool '{tc_name}' is blocked by provider policy ({reason}). Do not retry."
                         );
                         // Clear the activity chip: this early-return skips the
                         // normal completion paths, so emit the matching
@@ -1008,7 +1038,7 @@ impl Agent {
                 // the pre-spawn local — `self` cannot cross into the 'static
                 // task.
                 let bg_format_after_edit = format_after_edit;
-                let bg_session_id_for_watcher = format!("agent:{}", tc_id);
+                let bg_session_id_for_watcher = format!("agent:{tc_id}");
                 // M10 Phase 4: keep a copy of the task_id so the synthesized
                 // tool-result message returned to the LLM (built after this
                 // `tokio::spawn` moves `task_id` into the closure) can carry
@@ -1458,8 +1488,7 @@ impl Agent {
                                         }
                                     } else {
                                         let err_msg = format!(
-                                            "verified outputs for {} but failed to persist background result",
-                                            bg_name
+                                            "verified outputs for {bg_name} but failed to persist background result"
                                         );
                                         tracing::warn!(
                                             tool = %bg_name,
@@ -1479,10 +1508,10 @@ impl Agent {
                                     if let Some(ref sender) = bg_sender {
                                         let content = match notify_user {
                                             Some(message) => {
-                                                format!("✗ {}: {}", message, error)
+                                                format!("✗ {message}: {error}")
                                             }
                                             None => {
-                                                format!("✗ {} failed: {}", bg_name, error)
+                                                format!("✗ {bg_name} failed: {error}")
                                             }
                                         };
                                         let _ = sender(BackgroundResultPayload {
@@ -1509,18 +1538,14 @@ impl Agent {
                                     if required {
                                         let err_msg = reason.unwrap_or_else(|| {
                                             format!(
-                                                "workspace contract is required for {} but not configured",
-                                                bg_name
+                                                "workspace contract is required for {bg_name} but not configured"
                                             )
                                         });
                                         bg_supervisor.mark_failed(&task_id, err_msg.clone());
                                         if let Some(ref sender) = bg_sender {
                                             let _ = sender(BackgroundResultPayload {
                                                 task_label: bg_name.clone(),
-                                                content: format!(
-                                                    "✗ {} failed: {}",
-                                                    bg_name, err_msg
-                                                ),
+                                                content: format!("✗ {bg_name} failed: {err_msg}"),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
                                                 envelope_media: vec![],
@@ -1623,8 +1648,7 @@ impl Agent {
                                             let _ = sender(BackgroundResultPayload {
                                                 task_label: bg_name.clone(),
                                                 content: format!(
-                                                    "✗ {} failed: no output files produced",
-                                                    bg_name
+                                                    "✗ {bg_name} failed: no output files produced"
                                                 ),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
@@ -1659,7 +1683,7 @@ impl Agent {
                                     bg_supervisor.mark_runtime_state(
                                         &task_id,
                                         TaskRuntimeState::DeliveringOutputs,
-                                        Some(format!("deliver outputs for {}", bg_name)),
+                                        Some(format!("deliver outputs for {bg_name}")),
                                     );
                                     let mut sent_files = Vec::new();
                                     let mut delivery_failed = false;
@@ -1757,10 +1781,7 @@ impl Agent {
                                         if let Some(ref sender) = bg_sender {
                                             let _ = sender(BackgroundResultPayload {
                                                 task_label: bg_name.clone(),
-                                                content: format!(
-                                                    "✗ {} failed: {}",
-                                                    bg_name, err_msg
-                                                ),
+                                                content: format!("✗ {bg_name} failed: {err_msg}"),
                                                 kind: BackgroundResultKind::Notification,
                                                 media: vec![],
                                                 envelope_media: vec![],
@@ -1846,7 +1867,7 @@ impl Agent {
                                                 // containing just "\n" instead
                                                 // of the "✓ completed" notice.
                                                 let bubble_content = if r.output.trim().is_empty() {
-                                                    format!("✓ {} completed{}", bg_name, file_info)
+                                                    format!("✓ {bg_name} completed{file_info}")
                                                 } else {
                                                     r.output.clone()
                                                 };
@@ -1995,7 +2016,7 @@ impl Agent {
                             if let Some(ref sender) = bg_sender {
                                 let _ = sender(BackgroundResultPayload {
                                     task_label: bg_name.clone(),
-                                    content: format!("✗ {} error: {}", bg_name, e),
+                                    content: format!("✗ {bg_name} error: {e}"),
                                     kind: BackgroundResultKind::Notification,
                                     media: vec![],
                                     envelope_media: vec![],
@@ -2034,7 +2055,8 @@ impl Agent {
                     name: tc_name.clone(),
                     tool_id: tc_id.clone(),
                     success: true,
-                    output_preview: "Running in background — audio will be sent when ready.".into(),
+                    output_preview: "Running in background — results will be delivered when ready."
+                        .into(),
                     duration: tool_start.elapsed(),
                 });
                 // M10 Phase 4 — agent context isolation: hand the LLM a
@@ -2140,6 +2162,11 @@ impl Agent {
                 goal_id: ctx_goal_id.clone(),
                 task_id: ctx_task_id.clone(),
                 originator_session: ctx_originator_session.clone(),
+                // Outer-loop #4: the foreground tool ctx carries the peer's
+                // held build-cache slot for per-call CARGO_TARGET_DIR
+                // injection in the shell tool (docs/build-cache-pool.md §7.4).
+                build_cache_slot: ctx_build_cache_slot.clone(),
+                build_cache_usage: ctx_build_cache_usage.clone(),
                 ..ToolContext::zero()
             };
             // Thread the typed context into execute_with_context. Legacy tools
@@ -2198,6 +2225,7 @@ impl Agent {
                 content,
                 tool_files_modified,
                 tool_files_to_send,
+                tool_model_media,
                 tool_tokens,
                 tool_success,
                 tool_structured_metadata,
@@ -2263,6 +2291,14 @@ impl Agent {
                         tool_files_modified.push(file);
                     }
                     let tool_files_to_send = tool_result.files_to_send.clone();
+                    // Media the tool wants the model to see rides on the
+                    // tool message's `media`; each provider renders it in
+                    // its own shape for the current batch (octos_llm::tool_media).
+                    let tool_model_media: Vec<String> = tool_result
+                        .model_media
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
 
                     let output_preview =
                         octos_core::truncated_utf8(&tool_result.output, 200, "...");
@@ -2280,6 +2316,7 @@ impl Agent {
                         tool_result.output,
                         tool_files_modified,
                         tool_files_to_send,
+                        tool_model_media,
                         tool_result.tokens_used,
                         success,
                         tool_result.structured_metadata,
@@ -2337,6 +2374,7 @@ impl Agent {
                         format!("Error: {e}"),
                         Vec::new(),
                         Vec::new(),
+                        Vec::new(),
                         None,
                         false,
                         None,
@@ -2345,7 +2383,12 @@ impl Agent {
                 }
             };
 
-            // After-tool hook (fire-and-forget)
+            // After-tool hooks. Hook FEEDBACK (a checker reporting
+            // diagnostics — see HookResult::Feedback) reaches the model:
+            // appended to the tool message below AFTER truncation so it
+            // survives the output cap, and sanitized because checkers quote
+            // source lines. Infra errors stay log-only.
+            let mut hook_feedback: Option<String> = None;
             if let Some(ref hooks) = hooks {
                 let payload = HookPayload::after_tool(
                     &tc_name,
@@ -2353,15 +2396,56 @@ impl Agent {
                     octos_core::truncated_utf8(&content, 500, "..."),
                     tool_success,
                     duration.as_millis() as u64,
+                    Some(&effective_args),
+                    tools.workspace_root(),
                     hook_ctx.as_ref(),
                 );
-                let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
+                if let HookResult::Feedback(entries) =
+                    hooks.run(HookEvent::AfterToolCall, &payload).await
+                {
+                    hook_feedback =
+                        Some(crate::sanitize::sanitize_tool_output(&entries.join("\n\n")));
+                }
             }
 
-            // Per-tool output truncation with head/tail split
+            // Per-tool output truncation with head/tail split.
+            //
+            // The cut is a BACKSTOP: it is the one point every tool's output
+            // funnels through, which is also the point that knows the least —
+            // `truncate_head_tail_report` receives a string and a number. On
+            // its own it leaves the model with `... [N bytes omitted] ...` and
+            // no way to reach what it lost, so the only recovery is re-running
+            // the call, which returns the same output cut the same way and
+            // spends the tokens the cap was meant to save.
+            //
+            // `Tool::truncation_recovery` is the missing half: the tool still
+            // knows its own arguments and whether it paginates, so it can name a
+            // concrete next call. Tools with no resume path return None and get
+            // no invented advice.
+            //
+            // The hook is handed `omitted_bytes` from the structured report —
+            // the same N the inline marker prints — instead of the legacy
+            // `untruncated_len - content.len()` re-derivation, which
+            // undercounted by the marker's own length and told the model two
+            // disagreeing numbers about one cut.
             let limit = octos_core::tool_output_limit(&tc_name);
-            let content = octos_core::truncate_head_tail(&content, limit, 0.7);
-            let content = crate::sanitize::sanitize_tool_output(&content);
+            let report = octos_core::truncate_head_tail_report(&content, limit, 0.7);
+            let mut content = report.content;
+            if report.truncated {
+                if let Some(recovery) = tools.get(&tc_name).and_then(|tool| {
+                    tool.truncation_recovery(&effective_args, report.omitted_bytes)
+                }) {
+                    content.push('\n');
+                    content.push_str(&recovery);
+                }
+            }
+            let content = content;
+            let mut content = crate::sanitize::sanitize_tool_output(&content);
+            if let Some(feedback) = hook_feedback {
+                content.push_str("\n\n[hook] ");
+                content.push_str(&feedback);
+            }
+            let content = content;
 
             // Pair the structured side-channel with the originating tool's
             // call id so the session actor (which keys cost rows by
@@ -2372,7 +2456,7 @@ impl Agent {
                 Message {
                     role: MessageRole::Tool,
                     content,
-                    media: vec![],
+                    media: tool_model_media,
                     tool_calls: None,
                     tool_call_id: Some(tc_id),
                     reasoning_content: None,
@@ -2638,7 +2722,6 @@ impl Agent {
                 structured_metadata.push(meta);
             }
         }
-
         Ok((
             messages,
             files_modified,
@@ -3029,6 +3112,30 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn should_never_auto_approve_a_once_only_request() {
+        use crate::tools::{ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequester};
+        let request = |once_only| ToolApprovalRequest {
+            tool_id: "c1".into(),
+            tool_name: "mail_send".into(),
+            title: "Approve".into(),
+            body: "exact args".into(),
+            command: None,
+            cwd: None,
+            once_only,
+            host_tool: None,
+        };
+        let approver = super::ApprovedToolAutoApprover;
+        assert_eq!(
+            approver.request_approval(request(true)).await,
+            ToolApprovalDecision::Deny
+        );
+        assert_eq!(
+            approver.request_approval(request(false)).await,
+            ToolApprovalDecision::Approve
+        );
+    }
+
     use super::{
         build_spawn_only_produced_files_message, relativize_workspace_path,
         satisfied_completion_content, satisfied_delivery_is_failure, should_auto_send_tool_files,
@@ -3225,7 +3332,7 @@ mod tests {
     fn spawn_only_failure_arm_bubble_format_pins_pipeline_timeout_text() {
         let bg_name = "run_pipeline";
         let pipeline_output = "pipeline timed out after 1200s";
-        let bubble = format!("✗ {} failed: {}", bg_name, pipeline_output);
+        let bubble = format!("✗ {bg_name} failed: {pipeline_output}");
         assert_eq!(
             bubble, "✗ run_pipeline failed: pipeline timed out after 1200s",
             "the bubble surface text the WS client renders on a \
@@ -3541,6 +3648,83 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    /// Returns an image for the model to look at (`model_media`), the way
+    /// `view_image` does.
+    struct SeeingTool {
+        image: std::path::PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for SeeingTool {
+        fn name(&self) -> &str {
+            "seeing_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool that hands the model an image"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "SEEING_TOOL_OUTPUT".to_string(),
+                success: true,
+                model_media: vec![self.image.clone()],
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn should_carry_model_media_on_the_tool_row_and_add_no_other_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("grab.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mut tools = ToolRegistry::new();
+        tools.register(SeeingTool {
+            image: image.clone(),
+        });
+        tools.register(InstantTool);
+        let provider: Arc<dyn LlmProvider> = Arc::new(NoChatProvider);
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent =
+            Agent::new(AgentId::new("seeing"), provider, tools, memory).with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            });
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![
+                tool_call("call_see", "seeing_tool"),
+                tool_call("call_fast", "fast_tool"),
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+
+        let (messages, ..) = agent.execute_tools(&response).await.unwrap();
+
+        // Exactly the two tool results: the media is on its row, and the
+        // providers render it from there. No synthetic user row — one
+        // would break role alternation on Anthropic and root a stray
+        // thread in the transcript.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, octos_core::MessageRole::Tool);
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_see"));
+        assert_eq!(messages[0].content, "SEEING_TOOL_OUTPUT");
+        assert_eq!(
+            messages[0].media,
+            vec![image.to_string_lossy().into_owned()]
+        );
+        assert_eq!(messages[1].role, octos_core::MessageRole::Tool);
+        assert!(messages[1].media.is_empty());
     }
 
     /// Sleeps far past the batch ceiling so the batch timeout always fires

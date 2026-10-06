@@ -125,7 +125,7 @@ Primary surfaces:
 - `crates/octos-agent/src/workspace_policy.rs`
 - `crates/octos-agent/src/behaviour.rs`
 - `e2e/*`
-- `/Users/yuechen/home/octos-web/tests/*`
+- `~/home/octos-web/tests/*`
 
 Must produce:
 - broader artifact truth for multi-file and mixed-media outputs

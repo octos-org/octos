@@ -555,7 +555,7 @@ fn cmd_search(query: Option<&str>, registry_url: Option<&str>) -> Result<()> {
 
     if filtered.is_empty() {
         if let Some(q) = query {
-            println!("  No packages matching '{}'", q);
+            println!("  No packages matching '{q}'");
         } else {
             println!("  Registry is empty.");
         }
@@ -676,13 +676,18 @@ fn repo_name_from_git_url(input: &str) -> Result<String> {
         .split(['#', '?'])
         .next()
         .unwrap_or_default();
-    let tail = trimmed
-        .rsplit(['/', ':'])
-        .next()
-        .ok_or_else(|| eyre::eyre!("Invalid Git URL: '{input}'"))?;
+    let tail = trimmed.rsplit(['/', ':']).next().ok_or_else(|| {
+        eyre::eyre!(
+            "Invalid Git URL: '{input}'. Accepted forms: \
+                                   https://host/owner/repo, owner/repo, or a local path"
+        )
+    })?;
     let repo_name = tail.strip_suffix(".git").unwrap_or(tail).trim();
     if repo_name.is_empty() {
-        eyre::bail!("Invalid Git URL: '{input}'");
+        eyre::bail!(
+            "Invalid Git URL: '{input}'. Accepted forms: https://host/owner/repo, \
+             owner/repo, or a local path"
+        );
     }
     Ok(repo_name.to_string())
 }
@@ -917,7 +922,7 @@ fn cmd_install_all(skills_dir: &Path, force: bool, branch: &str) -> Result<()> {
             total_failed.len()
         );
         for (name, err) in &total_failed {
-            println!("    - {}: {}", name, err);
+            println!("    - {name}: {err}");
         }
     }
     if total_installed.is_empty() && total_skipped.is_empty() && total_failed.is_empty() {
@@ -2357,5 +2362,20 @@ fi
         .expect("clean manifest must install");
         assert_eq!(result.installed, vec!["good-skill".to_string()]);
         assert!(skills_dir.join("good-skill").join("manifest.json").exists());
+    }
+
+    #[test]
+    fn install_source_nameless_git_url_names_accepted_forms() {
+        // #2414 — through the real entry point: a git URL whose repo-name
+        // extraction yields nothing must say what IS accepted instead of
+        // dead-ending on "Invalid Git URL: '...'".
+        let error = match resolve_install_source("https://host/.git") {
+            Ok(_) => panic!("nameless git URL must not resolve to an install source"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("Accepted forms"),
+            "error must list accepted forms: {error}"
+        );
     }
 }

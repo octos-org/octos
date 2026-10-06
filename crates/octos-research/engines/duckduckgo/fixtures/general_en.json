@@ -1,0 +1,51 @@
+{
+  "body_file": "general_en.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "Omarchy - Beautiful, fun & agentic Linux by DHH",
+      "url": "https://omarchy.org/"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "Omarchy - Wikipedia",
+      "url": "https://en.wikipedia.org/wiki/Omarchy"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "Omarchy — Beautiful, Fun & Opinionated Linux by DHH",
+      "url": "https://omarchy-official.org/"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "The Manual - Omarchy",
+      "url": "https://omarchy.org/manual"
+    }
+  ],
+  "http": {
+    "headers": {
+      "accept": "text/html"
+    },
+    "method": "GET",
+    "url": "https://html.duckduckgo.com/html/?q=omarchy+linux&kl=us-en"
+  },
+  "recorded": "live, 2026-09-28",
+  "request": {
+    "category": "general",
+    "count": 5,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-28T23:00:00Z",
+    "query": "omarchy linux",
+    "since": null
+  }
+}

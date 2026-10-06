@@ -7,8 +7,9 @@
   "tools": [
     {
       "name": "deep_crawl",
-      "description": "Recursively crawl an existing website using a headless browser (CDP). Renders JavaScript, follows same-origin links via BFS, extracts text from each page, and saves results to disk. Ideal for ingesting JS-rendered SPAs and documentation sites. NOT for site generation or publishing - use `mofa_site` for site creation and `mofa_publish` for site deployment.",
+      "description": "Recursively crawl an existing website using a headless browser (CDP). Renders JavaScript, follows same-origin links via BFS (robots.txt optional, off by default), extracts text from each page, and saves results to disk. Ideal for ingesting JS-rendered SPAs and documentation sites. NOT for site generation or publishing - use `mofa_site` for site creation and `mofa_publish` for site deployment.",
       "concurrency_class": "exclusive",
+      "env": ["OCTOS_RESPECT_ROBOTS"],
       "input_schema": {
         "type": "object",
         "properties": {
@@ -18,7 +19,7 @@
           },
           "max_depth": {
             "type": "integer",
-            "description": "Maximum link-following depth (range: 1-10, default: 3)",
+            "description": "Maximum link-following depth (range: 0-10, 0 = only the start page, default: 3)",
             "default": 3
           },
           "max_pages": {
@@ -29,6 +30,11 @@
           "path_prefix": {
             "type": "string",
             "description": "Only follow links under this path prefix (e.g. /docs/)"
+          },
+          "include_html": {
+            "type": "boolean",
+            "description": "Also return each crawled page's rendered HTML and final URL in a `pages` array (default: false)",
+            "default": false
           }
         },
         "required": ["url"]

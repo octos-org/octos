@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use octos_core::{PathClassification, SessionScope};
+use octos_llm::vertex_auth::TokenSource;
 
 use crate::harness_errors::HarnessError;
 use crate::harness_events::{
@@ -88,6 +89,15 @@ pub struct PluginTool {
     /// Extra environment variables to inject into the plugin's environment.
     /// Secret-like names require the tool manifest's explicit env allowlist.
     extra_env: Vec<(String, String)>,
+    /// Host-owned, cached Vertex token source shared by plugin tools. The
+    /// short-lived token is injected only when the manifest explicitly
+    /// allowlists `VERTEX_ACCESS_TOKEN`; the service-account JSON remains the
+    /// backwards-compatible fallback inside the plugin.
+    vertex_token_source: Option<Arc<dyn TokenSource>>,
+    /// Project paired with `vertex_token_source`; injected alongside the
+    /// short-lived token so the plugin does not need the service-account JSON
+    /// merely to discover its Vertex project.
+    vertex_project_id: Option<String>,
     /// Working directory for plugin execution (created on first use).
     work_dir: Option<PathBuf>,
     /// Execution timeout.
@@ -147,6 +157,8 @@ impl PluginTool {
             executable,
             blocked_env: vec![],
             extra_env: vec![],
+            vertex_token_source: None,
+            vertex_project_id: None,
             work_dir: None,
             timeout: Self::DEFAULT_TIMEOUT,
             synthesis_config: None,
@@ -216,6 +228,19 @@ impl PluginTool {
     /// Set extra environment variables to inject into plugin execution.
     pub fn with_extra_env(mut self, env: Vec<(String, String)>) -> Self {
         self.extra_env = env;
+        self
+    }
+
+    /// Attach a host-owned Vertex token source. Multiple tools should receive
+    /// clones of the same `Arc` so separate plugin processes reuse one OAuth
+    /// token instead of exchanging the service-account key on every call.
+    pub fn with_vertex_token_source(
+        mut self,
+        source: Arc<dyn TokenSource>,
+        project_id: String,
+    ) -> Self {
+        self.vertex_token_source = Some(source);
+        self.vertex_project_id = Some(project_id);
         self
     }
 
@@ -392,6 +417,8 @@ impl PluginTool {
             executable: self.executable.clone(),
             blocked_env: self.blocked_env.clone(),
             extra_env: self.extra_env.clone(),
+            vertex_token_source: self.vertex_token_source.clone(),
+            vertex_project_id: self.vertex_project_id.clone(),
             work_dir: Some(work_dir),
             timeout: self.timeout,
             synthesis_config: self.synthesis_config.clone(),
@@ -421,6 +448,8 @@ impl PluginTool {
             executable: self.executable.clone(),
             blocked_env: self.blocked_env.clone(),
             extra_env: self.extra_env.clone(),
+            vertex_token_source: self.vertex_token_source.clone(),
+            vertex_project_id: self.vertex_project_id.clone(),
             work_dir: self.work_dir.clone(),
             timeout: self.timeout,
             synthesis_config: self.synthesis_config.clone(),
@@ -1512,6 +1541,15 @@ fn accept_for_intent(
             "path '{raw_path}' rejected: plugin skill dir '{}' is read-only — writes refused per SessionScope policy",
             skill_dir.display()
         )),
+        // A request context's read-only view of its peer's folder
+        // (UPCR-2026-034 `read_parent`): reads allowed, writes refused.
+        (PathClassification::InReadOnlyView { .. }, PathIntent::Read) => {
+            Ok(absolute.to_string_lossy().into_owned())
+        }
+        (PathClassification::InReadOnlyView { root }, PathIntent::Write) => Err(eyre::eyre!(
+            "path '{raw_path}' rejected: '{}' is a read-only view — writes refused per SessionScope policy",
+            root.display()
+        )),
         // Out of scope: refuse for both intents. Echo the raw path so
         // the LLM sees what was refused (matches the round-3/4
         // bespoke-validator error contract).
@@ -1622,6 +1660,7 @@ fn rescue_workspace_input_existence(
         PathClassification::InGrantedDir { .. }
         | PathClassification::InSharedZone { .. }
         | PathClassification::InSkillDir { .. }
+        | PathClassification::InReadOnlyView { .. }
         | PathClassification::OutOfScope => lexical_absolute.to_string(),
     }
 }
@@ -2329,11 +2368,26 @@ impl Drop for ProcessGroupKillGuard {
             return;
         }
         let _ = std::process::Command::new("kill")
-            .args(["-9", "--", &format!("-{}", self.pid)])
+            .args(sigkill_process_group_args(self.pid))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// `kill(1)` arguments that SIGKILL the process group `pgid`.
+///
+/// The `--` is load-bearing. procps-ng `kill` (4.0.x, e.g. Ubuntu 24.04) does
+/// not read a bare negative pid after the signal as a pid: `kill -9 -12345`
+/// becomes `kill(-1, SIGKILL)` — only the first digit survives — which
+/// signals EVERY process the user can reach. On a GitHub runner that kills the
+/// runner agent itself ("The hosted runner lost communication with the
+/// server"); on a workstation it kills the user's whole session. Whether it
+/// fires depends on the pid's leading digit, which is why it looked like a
+/// flaky hang. `kill -9 -- -12345` is parsed correctly everywhere.
+#[cfg(unix)]
+fn sigkill_process_group_args(pgid: u32) -> [String; 3] {
+    ["-9".to_string(), "--".to_string(), format!("-{pgid}")]
 }
 
 #[async_trait]
@@ -2584,6 +2638,8 @@ impl Tool for PluginTool {
                     cwd: effective_work_dir
                         .as_ref()
                         .map(|p| p.to_string_lossy().into_owned()),
+                    once_only: false,
+                    host_tool: None,
                 })
                 .await;
             if matches!(decision, ToolApprovalDecision::Deny) {
@@ -2668,8 +2724,48 @@ impl Tool for PluginTool {
         // also keeps approval-prompt cwd and runtime cwd in lockstep.
         let ctx = ctx_snapshot;
 
+        // Prepare the short-lived token before forwarding static env. If this
+        // succeeds, suppress the long-lived service-account JSON and provide
+        // only the token plus project. If it fails, keep the old JSON path as
+        // a backwards-compatible fallback.
+        let prepared_vertex_token = if let (Some(source), Some(project_id)) =
+            (&self.vertex_token_source, &self.vertex_project_id)
+        {
+            let token_permitted = if strict_env_gate {
+                should_forward_env_name_strict("VERTEX_ACCESS_TOKEN", &env_allowlist)
+            } else {
+                should_forward_env_name("VERTEX_ACCESS_TOKEN", &env_allowlist)
+            };
+            let project_permitted = if strict_env_gate {
+                should_forward_env_name_strict("GOOGLE_CLOUD_PROJECT", &env_allowlist)
+            } else {
+                should_forward_env_name("GOOGLE_CLOUD_PROJECT", &env_allowlist)
+            };
+            if token_permitted && project_permitted {
+                match source.token().await {
+                    Ok(token) => Some((token, project_id.clone())),
+                    Err(error) => {
+                        tracing::warn!(
+                            plugin = %self.plugin_name,
+                            tool = %self.tool_def.name,
+                            error = %error,
+                            "failed to prepare cached Vertex token; plugin fallback remains available"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Inject extra environment variables (e.g. provider base URLs, API keys)
         for (key, val) in &self.extra_env {
+            if key == "VERTEX_SA_JSON" && prepared_vertex_token.is_some() {
+                continue;
+            }
             let permitted = if strict_env_gate {
                 should_forward_env_name_strict(key, &env_allowlist)
             } else {
@@ -2685,6 +2781,11 @@ impl Tool for PluginTool {
                 "skipping non-allowlisted environment variable for plugin tool"
                 );
             }
+        }
+
+        if let Some((token, project_id)) = prepared_vertex_token {
+            cmd.env("VERTEX_ACCESS_TOKEN", token);
+            cmd.env("GOOGLE_CLOUD_PROJECT", project_id);
         }
 
         if let Some(sink) = ctx
@@ -2728,6 +2829,24 @@ impl Tool for PluginTool {
             }
             cmd.current_dir(dir);
             cmd.env("OCTOS_WORK_DIR", dir);
+        }
+
+        // A plugin's output CWD is commonly `<session workspace>/skill-output`,
+        // while file_each skill actions materialize their inputs under
+        // `<session workspace>/uploads`. Keep those two roots explicit: a
+        // plugin must not have to infer the session root from its output CWD,
+        // and it must never treat a caller-supplied path as that root.
+        if self
+            .tool_def
+            .env
+            .iter()
+            .any(|name| name == "OCTOS_SESSION_WORKSPACE")
+        {
+            if let Some(session_workspace) = self.workspace_root_for_host_injection(
+                ctx.as_ref().and_then(|ctx| ctx.session_scope.as_deref()),
+            ) {
+                cmd.env("OCTOS_SESSION_WORKSPACE", session_workspace);
+            }
         }
 
         // Codex round-3 BLOCKER fix (PR #1186 review): when
@@ -2843,7 +2962,7 @@ impl Tool for PluginTool {
                     #[cfg(unix)]
                     if child_pid > 0 {
                         let _ = std::process::Command::new("kill")
-                            .args(["-9", &format!("-{child_pid}")])
+                            .args(sigkill_process_group_args(child_pid))
                             .status();
                         let _ = std::process::Command::new("kill")
                             .args(["-9", &child_pid.to_string()])
@@ -2961,7 +3080,7 @@ impl Tool for PluginTool {
                     #[cfg(unix)]
                     if child_pid > 0 {
                         let _ = std::process::Command::new("kill")
-                            .args(["-9", &format!("-{child_pid}")])
+                            .args(sigkill_process_group_args(child_pid))
                             .status();
                         let _ = std::process::Command::new("kill")
                             .args(["-9", &child_pid.to_string()])

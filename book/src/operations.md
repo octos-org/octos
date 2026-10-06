@@ -27,9 +27,21 @@ sudo systemctl restart octos-serve
 
 ---
 
+## Session Storage Capacity
+
+Sessions are stored as rolling JSONL segments, not one ever-growing file. When the active file reaches `OCTOS_SESSION_SEGMENT_BYTES` (default 8 MiB), it is sealed into a sibling `<name>.segments/NNNNNN.jsonl` and a fresh active file starts. A plain load reads the active file plus as many sealed segments, newest first, as fit within `OCTOS_SESSION_LOAD_BUDGET_BYTES` (default 32 MiB; `0` = unlimited) — history beyond the budget stays on disk and remains reachable through full-history loads and `/undo`.
+
+**Memory planning**: the budget bounds the file bytes one resident session holds; parsed rows cost roughly 1.5–3× their file size, so a process caching N long sessions needs up to about `N × 32 MiB × 3`. Memory-limited hosts should lower the budget (e.g. `OCTOS_SESSION_LOAD_BUDGET_BYTES=16777216`) or the session cache size (`gateway.max_sessions`).
+
+**Mixed-version overlap** (e.g. a Kubernetes rolling upgrade on a shared data directory): an old binary does not see `.segments/`; its `*.jsonl` walks show only the active file, which looks like a short session. Sessions this build has written carry schema version 2, which older builds refuse to load — but never let an old binary *rewrite* (rename, summary) any rolled session: a rewrite replaces the active file with whatever the old build could read. For an older (schema 1) session, a legacy rewrite that erases `sealed_segments` makes the sealed segments invisible to loads; while that unnamed state stands, rewrites refuse and the seal refuses to replace the unnamed segments, so the files stay on disk but the session stops rolling until the state is reconciled.
+
+**Interrupted seals** (a crash or kill between sealing a segment and starting the fresh active file) leave the sealed segments on disk with no (or an empty) active file. The state self-heals on the read path: the next load of the session rebuilds a missing or empty active file from the sealed segments, and on a gateway `/new <name>` recovers a missing active file the same way, so the session resumes its history instead of starting empty. An unreadable active file is left untouched for manual recovery. Deliberately erasing history remains `/clear` (or bare `/new`).
+
+---
+
 ## Keychain Integration
 
-Octos supports storing API keys in the macOS Keychain instead of plaintext in profile JSON files. This provides hardware-backed encryption on Apple Silicon and OS-level access control.
+Octos supports storing API keys in the OS secret store instead of plaintext in profile JSON files: the macOS Keychain on macOS (hardware-backed, per-user access control), a 0600 file under `~/.octos/secrets` on Linux, and no store on Windows yet — use the process environment or plain `env_vars` there. The diagram below shows the macOS backend.
 
 ### Architecture
 
@@ -150,7 +162,8 @@ The macOS Keychain was designed for interactive desktop use. On headless servers
 | **Developer laptop** | Keychain (`"keychain:"`) | GUI session keeps keychain unlocked; ACL prompts are fine |
 | **Mac with auto-login + GUI** | Keychain (`"keychain:"`) | Works if ACL dialogs were approved once via screen sharing |
 | **Headless Mac (SSH only)** | Plain text in `env_vars` or launchd plist | Most reliable; no unlock/ACL dependencies |
-| **Linux server** | Plain text in env vars | No macOS Keychain available |
+| **Linux server** | Secret store (0600 files under `~/.octos/secrets`) | File store needs no unlock or D-Bus; plain env vars also work |
+| **Windows** | Plain text in `env_vars` or env vars | No secret store yet (#2234) |
 
 **Why Keychain is unreliable on headless servers:**
 
@@ -181,6 +194,30 @@ Protect the files with filesystem permissions:
 chmod 600 ~/.octos/profiles/*.json
 sudo chmod 600 /Library/LaunchDaemons/io.octos.serve.plist
 ```
+
+---
+
+## Work Secrets (Session Ingress)
+
+An external CLI or scripted agent should not hold your dashboard bearer token. A *work secret* is a short-lived credential that grants one agent access to exactly one session, over the session-ingress WebSocket route (`/v1/session_ingress/ws/{session_id}`).
+
+Issue one (operator notes go to stderr, the encoded secret to stdout):
+
+```bash
+octos auth issue-work-secret \
+  --session "dspfac:local:tui#coding" \
+  --profile dspfac \
+  --ttl 1h \
+  --api-base-url http://127.0.0.1:50080
+```
+
+- `--ttl` accepts values like `15m`, `1h`, or `3600s` (default `1h`).
+- Re-issuing for the same session replaces the earlier grant; grants are persisted as SHA-256 hashes in the serve data directory (`~/.octos/work_secrets.json` by default — the token itself is never stored).
+- `octos auth list-work-secrets` lists recorded grants; `octos auth revoke-work-secret '<secret>'` revokes one.
+
+The guest decodes the secret and connects to `/v1/session_ingress/ws/<url-encoded session id>` with `Authorization: Bearer <token>`. WebSocket clients that cannot set headers may fall back to `?token=<token>`; that form is deprecated and logged by the server. The socket speaks normal UI Protocol frames, the grant is revalidated before every client request, and the socket closes with code 1008 once the grant no longer validates (revoked, expired, or replaced). Only methods scoped to the granted session are accepted.
+
+Full walkthrough (including a minimal Python client): `docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md`.
 
 ---
 
@@ -230,3 +267,11 @@ sudo systemctl enable octos-serve
 sudo systemctl status octos-serve
 sudo journalctl -u octos-serve -f
 ```
+
+### Stopping via `server/shutdown` (Local Solo)
+
+The server stops three ways: Ctrl+C in the terminal running the foreground `octos serve`, the platform service manager (`launchctl` / `systemctl`, above), and the `server/shutdown` UI Protocol method described here.
+
+A UI Protocol client connected over the authenticated WebSocket (`/api/ui-protocol/ws`) can stop the server with the `server/shutdown` method. It stops the process exactly like Ctrl+C: connections drain, gateways stop, the process exits. The call is idempotent, and the stop fires ~250 ms after the request is handled so the acknowledgement still gets a chance to reach the client (under outbound backpressure the client may miss it; the stop still happens).
+
+The method is only accepted on a local deployment (`config.mode = "local"`) with solo login opted in (`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`) and only by an HTTP serve (`octos serve` without `--stdio`). One call stops the process for every connected client and cancels their running turns. Fleet/hosted servers and `--stdio` serve reject the call with `invalid_request` (-32600) and `data.kind: "server_shutdown_unavailable"` and stop nothing; session-scoped (session-ingress) connections can never call it and are refused with a plain `invalid_request`. Note the local-solo trust model: on a solo serve, any local process -- or any page on an allowed origin -- that can open the WebSocket can stop the server.

@@ -1,8 +1,14 @@
 //! Agent implementation.
 
 mod activity;
+mod append_only_audit;
 mod budget;
+
+/// #27h-r1 — shared result.md ownership judgment (see `budget::result_md_owner_content_is_peer`);
+/// re-exported at the crate surface for the cli-side peer-result writer.
+pub use budget::result_md_owner_content_is_peer;
 mod compaction;
+mod convergence;
 mod detection;
 mod execution;
 mod llm_call;
@@ -11,6 +17,7 @@ mod loop_runner;
 pub mod loop_state;
 pub mod memory;
 mod message_repair;
+mod prompt_cache;
 pub mod prompt_segments;
 pub mod realtime;
 pub mod rich_output;
@@ -55,7 +62,9 @@ pub const DEFAULT_WORKER_PROMPT: &str = include_str!("../prompts/worker.txt");
 /// Configuration for agent execution.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// Maximum number of iterations before stopping.
+    /// Maximum number of LLM-loop iterations before stopping. `0` means
+    /// unlimited, which is the default for an interactive Codex-style turn.
+    /// Unattended entry points (spawn, MCP, pipelines) set an explicit cap.
     pub max_iterations: u32,
     /// Maximum total tokens (input + output) before stopping. None = unlimited.
     pub max_tokens: Option<u32>,
@@ -84,6 +93,16 @@ pub struct AgentConfig {
     /// Per-call max output tokens override. When set, overrides `ChatConfig::default()`.
     /// Useful for pipeline nodes that produce long outputs (e.g. synthesize).
     pub chat_max_tokens: Option<u32>,
+    /// Sampling temperature override. When set, overrides `ChatConfig::default()`
+    /// (which is `0.0`/greedy). When `None`, the default is used unchanged — so
+    /// cloud requests are byte-for-byte identical. Primarily for local /
+    /// OpenAI-compatible models, where forced greedy decoding causes repetition
+    /// collapse. See issue #2172.
+    pub chat_temperature: Option<f32>,
+    /// Extra sampler params (e.g. `repeat_penalty`) flattened into the request
+    /// for OpenAI-compatible servers. `None` → nothing added (cloud unchanged).
+    /// The robust fix for local-model repetition collapse. See issue #2172.
+    pub chat_sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
     /// Reasoning effort for thinking models. Flows into `ChatConfig::reasoning_effort`;
     /// providers translate it per model (no-op for models without a reasoning style).
     pub reasoning_effort: Option<octos_llm::ReasoningEffort>,
@@ -144,17 +163,37 @@ pub const VOICE_STREAM_TTFT_SECS: u64 = 10;
 /// Tightened inter-chunk idle timeout for voice fail-fast turns (10s).
 pub const VOICE_STREAM_IDLE_SECS: u64 = 10;
 
+/// Pure clamp behind the `env_secs_*` readers: apply `[min, 86_400]` to a
+/// parsed value, or fall back to `default_secs` when the var was absent or
+/// unparseable. Extracted so the clamp is unit-testable without touching the
+/// process environment.
+fn clamp_env_secs(parsed: Option<u64>, default_secs: u64, min: u64) -> u64 {
+    parsed.map(|v| v.clamp(min, 86_400)).unwrap_or(default_secs)
+}
+
 /// Read an env-overridable seconds value, mirroring the convention in
 /// `octos-cli/src/session_actor.rs` (`std::env::var(...).parse()` with a clamp
 /// so a misconfigured value cannot disable the guard entirely). A parsed `0`
-/// is clamped up to `1` so the timeout is always live.
+/// is clamped up to `1` so the timeout is always live. Use
+/// [`env_secs_allow_zero_or`] for knobs whose contract makes `0` mean
+/// "disabled".
 fn env_secs_or(var: &str, default_secs: u64) -> std::time::Duration {
-    let secs = std::env::var(var)
+    let parsed = std::env::var(var)
         .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .map(|v| v.clamp(1, 86_400))
-        .unwrap_or(default_secs);
-    std::time::Duration::from_secs(secs)
+        .and_then(|raw| raw.parse::<u64>().ok());
+    std::time::Duration::from_secs(clamp_env_secs(parsed, default_secs, 1))
+}
+
+/// Like [`env_secs_or`] but honors `0` as a disable sentinel (floor is `0`,
+/// not `1`). Used for `OCTOS_LLM_CALL_MAX_SECS`, whose `0` value disables the
+/// overall wall-clock backstop (see `streaming.rs`; the idle/TTFT guards stay
+/// live). Clamping `0` up to `1` here would instead abort every stream after
+/// 1s (#2228).
+fn env_secs_allow_zero_or(var: &str, default_secs: u64) -> std::time::Duration {
+    let parsed = std::env::var(var)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok());
+    std::time::Duration::from_secs(clamp_env_secs(parsed, default_secs, 0))
 }
 
 /// Like [`env_secs_or`] but returns a raw `u64` seconds value clamped to
@@ -186,7 +225,7 @@ pub const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 1800;
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 50,
+            max_iterations: 0,
             max_tokens: None,
             max_timeout: Some(std::time::Duration::from_secs(1800)),
             save_episodes: true,
@@ -197,6 +236,8 @@ impl Default for AgentConfig {
                 DEFAULT_INTERACTIVE_TOOL_TIMEOUT_SECS,
             ),
             chat_max_tokens: None,
+            chat_temperature: None,
+            chat_sampling_params: None,
             reasoning_effort: None,
             suppress_auto_send_files: false,
             llm_first_token_grace: env_secs_or(
@@ -207,7 +248,10 @@ impl Default for AgentConfig {
                 "OCTOS_LLM_STREAM_IDLE_SECS",
                 DEFAULT_LLM_STREAM_IDLE_SECS,
             ),
-            llm_call_max: env_secs_or("OCTOS_LLM_CALL_MAX_SECS", DEFAULT_LLM_CALL_MAX_SECS),
+            llm_call_max: env_secs_allow_zero_or(
+                "OCTOS_LLM_CALL_MAX_SECS",
+                DEFAULT_LLM_CALL_MAX_SECS,
+            ),
             human_approval_rules: None,
             voice_overall_deadline: env_secs_or(
                 "OCTOS_VOICE_LLM_DEADLINE_SECS",
@@ -216,6 +260,15 @@ impl Default for AgentConfig {
             format_after_edit: false,
         }
     }
+}
+
+/// Producer-authored identity of assistant rows in the append-only turn log.
+/// Indices name `ConversationResponse::messages`, never the mutable prompt.
+/// Iterations may have gaps (e.g. hidden reflection) and are not UI ordinals.
+#[derive(Debug, Clone, Default)]
+pub struct AssistantSegmentProvenance {
+    pub message_iterations: Vec<(usize, u32)>,
+    pub final_iteration: u32,
 }
 
 /// Response from conversation mode (process_message).
@@ -242,6 +295,7 @@ pub struct ConversationResponse {
     /// tool results). Includes the user message at the front. Callers should
     /// persist these to session history so subsequent calls see the full context.
     pub messages: Vec<Message>,
+    pub assistant_segments: AssistantSegmentProvenance,
     /// Structured side-channel metadata surfaced by tools that ran during
     /// this conversation, keyed by `tool_call_id`. Used today for per-node
     /// cost rows from `run_pipeline` (`{"node_costs": [...]}`); the session
@@ -266,6 +320,22 @@ pub struct ConversationResponse {
     /// that case. `None` for every ordinary turn.
     pub pending_approval: Option<crate::approval::PendingApprovalDraft>,
 }
+
+/// An incomplete provider response, not a successful conversation completion.
+/// Hosts may persist/render the actual partial output, but must emit an error
+/// terminal rather than treating this carrier as a final answer.
+#[derive(Debug, Clone)]
+pub struct IncompleteResponseError {
+    pub partial: ConversationResponse,
+}
+
+impl std::fmt::Display for IncompleteResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Model output was truncated (max_tokens); the response is incomplete")
+    }
+}
+
+impl std::error::Error for IncompleteResponseError {}
 
 /// Shared atomic counters for real-time token tracking (used by status indicators).
 pub struct TokenTracker {
@@ -300,6 +370,9 @@ pub struct Agent {
     pub(super) memory: Arc<EpisodeStore>,
     /// Embedding provider for hybrid memory search.
     pub(super) embedder: Option<Arc<dyn EmbeddingProvider>>,
+    /// Recall/Knowledge index; saved episodes are mirrored into it so
+    /// `memory_search` sees them (docs/adr/personal-memory-tiers.md).
+    pub(super) recall: Option<Arc<octos_memory::RecallStore>>,
     /// Whether THIS conversation has already saved its episode (#1587
     /// write side). Set on the first compaction; subsequent compactions
     /// skip. One conversation episode per session — bounded regardless of
@@ -377,6 +450,13 @@ pub struct Agent {
     /// [`crate::compaction::CompactionRunner`] wrapped as a
     /// [`crate::compaction_tiered::FullCompactor`].
     pub(super) tiered_compaction: Option<Arc<crate::compaction_tiered::TieredCompactionRunner>>,
+    /// Measurement only (`OCTOS_APPEND_ONLY_AUDIT=1`). Held here rather than
+    /// on the per-turn state because the rewrite path we know about —
+    /// `truncate_old_tool_results` — only collapses tool results BEFORE the
+    /// last user message, so it fires ACROSS turns and a per-turn auditor
+    /// would never observe it.
+    pub(super) append_only_audit:
+        std::sync::Mutex<crate::agent::append_only_audit::AppendOnlyAudit>,
     /// M8.7 sub-agent output router. When configured, the spawn_only
     /// background branch in `execution.rs` calls
     /// [`crate::SubAgentOutputRouter::mark_terminal`] when a task ends so
@@ -407,6 +487,13 @@ pub struct Agent {
     /// `ToolContext.parent_session_key` so spawn children / pipeline
     /// workers can register tasks against the owning session.
     pub(super) parent_session_key: Option<String>,
+    /// OUP-owned semantic prompt-cache epoch. Non-OUP callers leave this
+    /// unset and derive an epoch from the stable provider input instead.
+    pub(super) prompt_cache_epoch_id: Option<String>,
+    /// Test seam: explicit convergence-checkpoint thresholds
+    /// `(llm_call_interval, active_token_interval, elapsed_interval)`.
+    /// `None` reads the `OCTOS_CONVERGENCE_*` environment defaults.
+    pub(super) convergence_intervals: Option<(u32, u64, std::time::Duration)>,
     /// Guard C (issue #607): nesting depth this agent's tool calls
     /// inherit via `ToolContext.spawn_depth`. The session-actor's
     /// top-level agent leaves this at 0; sub-agents created by the
@@ -460,6 +547,15 @@ pub struct Agent {
     /// vulnerable) originator file on every call. `None` for non-peer
     /// sessions.
     pub(super) originator_session: Option<String>,
+    /// Build-cache pool slot held by this peer's CURRENT turn (outer-loop
+    /// #4, docs/build-cache-pool.md §4). The slot lifecycle is ONE TURN, not
+    /// the peer session: the serve boot adopts/acquires it and the turn
+    /// terminal releases it. Threaded into `ToolContext.build_cache_slot`
+    /// for per-tool-call `CARGO_TARGET_DIR` injection (§7.4) — the serve
+    /// path shares one process across peers and the master, so this MUST
+    /// ride the tool context, never the process environment.
+    pub(super) build_cache_slot: Option<std::path::PathBuf>,
+    pub(super) build_cache_usage: Option<crate::tools::BuildCacheUsage>,
     /// Optional inference-time verifier plus structured TurnLedger. Absent
     /// by default so legacy agent loops do not spend verifier calls or write
     /// verifier sidecars unless a caller opts in explicitly.
@@ -486,12 +582,12 @@ pub struct Agent {
     /// (`needs_follow_up = model_wants_more || buffer_nonempty`). `None`
     /// (the default) keeps the loop byte-identical to pre-steer behaviour.
     pub(super) steer_buffer: Option<crate::steering::SharedSteerBuffer>,
-    /// Host callback observing each drained steer batch (codex
-    /// `record_user_prompt_and_emit_turn_item` parity): the host persists
-    /// the injected user message + emits its standard persisted
-    /// user-message event. Called inline at the drain point, before the
-    /// next LLM call. When set, drained steer rows stay OUT of the turn
-    /// output log so end-of-turn persistence cannot double-write them.
+    /// Host callback observing each drained steer batch, called inline at
+    /// the drain point before the next LLM call. Observation only: the
+    /// drained rows always stay in the chronological turn output log and are
+    /// persisted by the end-of-turn pass in model-visible order, so a host
+    /// must not persist them itself (doing so at drain time gave the steer a
+    /// lower durable sequence than the turn's own rows).
     pub(super) steer_drained_callback: Option<crate::steering::SteerDrainedCallback>,
 }
 
@@ -536,6 +632,7 @@ impl Agent {
             tools,
             memory,
             embedder: None,
+            recall: None,
             conversation_episode_saved: std::sync::atomic::AtomicBool::new(false),
             system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
             segment_providers: RwLock::new(Vec::new()),
@@ -556,11 +653,14 @@ impl Agent {
             file_state_cache: None,
             profile: None,
             tiered_compaction: None,
+            append_only_audit: Default::default(),
             subagent_output_router: None,
             subagent_summary_generator: None,
             cost_accountant: None,
             session_usage_base: None,
             parent_session_key: None,
+            prompt_cache_epoch_id: None,
+            convergence_intervals: None,
             spawn_depth: 0,
             sandbox_config: None,
             prompt_context_manager: None,
@@ -568,6 +668,8 @@ impl Agent {
             goal_id: None,
             task_id: None,
             originator_session: None,
+            build_cache_slot: None,
+            build_cache_usage: None,
             verifier_config: None,
             voice_failure_sink: None,
             snapshot_manager: None,
@@ -617,6 +719,7 @@ impl Agent {
             tools,
             memory,
             embedder: None,
+            recall: None,
             conversation_episode_saved: std::sync::atomic::AtomicBool::new(false),
             system_prompt: RwLock::new(prompt_segments::PromptSegments::from_base(system_prompt)),
             segment_providers: RwLock::new(Vec::new()),
@@ -637,11 +740,14 @@ impl Agent {
             file_state_cache: None,
             profile: None,
             tiered_compaction: None,
+            append_only_audit: Default::default(),
             subagent_output_router: None,
             subagent_summary_generator: None,
             cost_accountant: None,
             session_usage_base: None,
             parent_session_key: None,
+            prompt_cache_epoch_id: None,
+            convergence_intervals: None,
             spawn_depth: 0,
             sandbox_config: None,
             prompt_context_manager: None,
@@ -649,6 +755,8 @@ impl Agent {
             goal_id: None,
             task_id: None,
             originator_session: None,
+            build_cache_slot: None,
+            build_cache_usage: None,
             verifier_config: None,
             voice_failure_sink: None,
             snapshot_manager: None,
@@ -691,6 +799,12 @@ impl Agent {
     /// (legacy pre-M8.3 mode).
     pub fn profile(&self) -> Option<Arc<crate::profile::ProfileDefinition>> {
         self.profile.clone()
+    }
+
+    /// Operator-loaded agent definitions retained when a transport rebuilds
+    /// the request agent from its session runtime.
+    pub fn agent_definitions(&self) -> Arc<crate::agents::AgentDefinitions> {
+        self.agent_definitions.clone()
     }
 
     /// RFC-1 (issue #1290): wire the `mofa_make` dispatcher + companion
@@ -812,6 +926,11 @@ impl Agent {
         self
     }
 
+    /// Cancellation handle for embedders using the canonical session agent.
+    pub fn shutdown_signal(&self) -> Arc<AtomicBool> {
+        self.shutdown.clone()
+    }
+
     /// Attach the voice-turn failure projection sink (Task 8). When set and the
     /// loop runs under [`octos_llm::LlmCallPolicy::FailFast`], a single
     /// [`crate::TurnFailure`] is emitted on terminal foreground-LLM failure
@@ -839,11 +958,9 @@ impl Agent {
 
     /// Register the host callback observing each drained steer batch.
     /// Called inline from the drain point (after the drained texts joined
-    /// the prompt, before the next LLM call) so the host can persist the
-    /// injected user message and emit its standard persisted user-message
-    /// event. When set, the loop keeps drained steer rows OUT of
-    /// `ConversationResponse.messages` — the host owns their persistence,
-    /// and the end-of-turn persist pass must not write them again.
+    /// the prompt, before the next LLM call). This is an observation hook;
+    /// drained rows remain in `ConversationResponse.messages` and are
+    /// persisted by the normal end-of-turn path in model-visible order.
     pub fn with_steer_drained_callback(
         mut self,
         callback: crate::steering::SteerDrainedCallback,
@@ -944,6 +1061,27 @@ impl Agent {
         self
     }
 
+    /// Bind provider calls from this Agent to the durable OUP cache epoch.
+    pub fn with_prompt_cache_epoch_id(mut self, epoch_id: impl Into<String>) -> Self {
+        self.prompt_cache_epoch_id = Some(epoch_id.into());
+        self
+    }
+
+    /// Test seam: pin the convergence-checkpoint thresholds instead of reading
+    /// the `OCTOS_CONVERGENCE_*` environment (process-global, so tests must
+    /// not set it). Values are used as given; the env path clamps its own.
+    #[cfg(test)]
+    pub(crate) fn with_convergence_intervals(
+        mut self,
+        llm_call_interval: u32,
+        active_token_interval: u64,
+        elapsed_interval: std::time::Duration,
+    ) -> Self {
+        self.convergence_intervals =
+            Some((llm_call_interval, active_token_interval, elapsed_interval));
+        self
+    }
+
     /// Access the recorded parent session key, if any.
     pub fn parent_session_key(&self) -> Option<&str> {
         self.parent_session_key.as_deref()
@@ -1010,6 +1148,28 @@ impl Agent {
         self.originator_session.as_deref()
     }
 
+    /// Builder: set the build-cache pool slot this peer's current turn holds
+    /// (outer-loop #4, docs/build-cache-pool.md §4/§7.4). Called by the peer
+    /// turn boot — serve adopts the staging slot on the first turn and
+    /// acquires fresh on later ones. The solo chat path does not allocate pool slots.
+    /// Threaded into `ToolContext.build_cache_slot` so the shell tool can
+    /// inject `CARGO_TARGET_DIR` per tool call (never a process env var).
+    pub fn with_build_cache_slot(mut self, slot: std::path::PathBuf) -> Self {
+        self.build_cache_slot = Some(slot);
+        self
+    }
+
+    /// Share the registry claim's child lifetime tracker with tool execution.
+    pub fn with_build_cache_usage(mut self, usage: crate::tools::BuildCacheUsage) -> Self {
+        self.build_cache_usage = Some(usage);
+        self
+    }
+
+    /// The build-cache slot held by this peer's current turn, if any.
+    pub fn build_cache_slot(&self) -> Option<&std::path::Path> {
+        self.build_cache_slot.as_deref()
+    }
+
     /// Guard C (issue #607): record this agent's spawn nesting depth so
     /// every tool call it dispatches inherits the value via
     /// `ToolContext.spawn_depth`. The spawn tool consults this when
@@ -1031,6 +1191,13 @@ impl Agent {
         self
     }
 
+    /// Attach the Recall/Knowledge index so saved episodes are mirrored
+    /// into it (and memory prompt segments can rank bank pages).
+    pub fn with_recall(mut self, recall: Arc<octos_memory::RecallStore>) -> Self {
+        self.recall = Some(recall);
+        self
+    }
+
     /// Set lifecycle hooks executor.
     pub fn with_hooks(mut self, hooks: Arc<HookExecutor>) -> Self {
         self.hooks = Some(hooks);
@@ -1043,6 +1210,13 @@ impl Agent {
     /// (`ws_standalone_agent`, ui_protocol per-turn).
     pub fn hooks(&self) -> Option<Arc<HookExecutor>> {
         self.hooks.clone()
+    }
+
+    /// Returns the session-level context injected into hook payloads, if
+    /// any. Counterpart to [`Self::hooks`] — the runtime layer uses it to
+    /// assert the context survives session construction (#2246).
+    pub fn hook_context(&self) -> Option<HookContext> {
+        self.hook_ctx()
     }
 
     /// Set session-level context for hook payloads.
@@ -1288,6 +1462,13 @@ impl Agent {
     /// providers are registered, and providers keep the unchanged path
     /// cheap (typically one stat).
     pub async fn refresh_prompt_segments(&self) {
+        self.refresh_prompt_segments_for(None).await
+    }
+
+    /// Like [`Self::refresh_prompt_segments`] but tells providers what the
+    /// upcoming turn is about, so relevance-selected segments (the memory
+    /// bank rows) can re-rank for it.
+    pub async fn refresh_prompt_segments_for(&self, query: Option<&str>) {
         let providers: Vec<Arc<dyn PromptSegmentProvider>> = self
             .segment_providers
             .read()
@@ -1298,7 +1479,7 @@ impl Agent {
         }
         let mut updates = Vec::new();
         for provider in providers {
-            if let Some(content) = provider.refresh().await {
+            if let Some(content) = provider.refresh_for(query).await {
                 updates.push((provider.segment_name().to_string(), content));
             }
         }
@@ -1419,6 +1600,29 @@ impl Agent {
             .render()
     }
 
+    /// Render the System prompt with one named segment replaced in the
+    /// snapshot only. This lets transports move volatile segment data to a
+    /// lower-authority tail message without mutating the shared Agent.
+    pub fn system_prompt_snapshot_replacing_segment(
+        &self,
+        name: &str,
+        replacement: &str,
+    ) -> String {
+        self.system_prompt
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .render_replacing_named(name, replacement)
+    }
+
+    /// Return one named segment's current content without rendering adjacent
+    /// prompt segments.
+    pub fn prompt_segment_snapshot(&self, name: &str) -> Option<String> {
+        self.system_prompt
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .named_content(name)
+    }
+
     /// Whether the loop-detector warning has fired since the last reset.
     /// Exposed for tests so they can verify single-fire-per-burst semantics.
     pub fn is_loop_detected_recently(&self) -> bool {
@@ -1448,6 +1652,25 @@ mod profile_integration_tests {
     use octos_core::AgentId;
     use octos_llm::{ChatResponse, LlmProvider, ToolSpec};
     use octos_memory::EpisodeStore;
+
+    #[test]
+    fn clamp_env_secs_floor_one_keeps_guard_live() {
+        // env_secs_or semantics: 0 floors to 1 so the guard is always live.
+        assert_eq!(clamp_env_secs(Some(0), 90, 1), 1);
+        assert_eq!(clamp_env_secs(Some(45), 90, 1), 45);
+        assert_eq!(clamp_env_secs(Some(99_999), 90, 1), 86_400);
+        assert_eq!(clamp_env_secs(None, 90, 1), 90);
+    }
+
+    #[test]
+    fn clamp_env_secs_floor_zero_allows_disable() {
+        // env_secs_allow_zero_or semantics (#2228): 0 passes through so the
+        // wall-clock cap can actually be disabled.
+        assert_eq!(clamp_env_secs(Some(0), 1200, 0), 0);
+        assert_eq!(clamp_env_secs(Some(1200), 1200, 0), 1200);
+        assert_eq!(clamp_env_secs(Some(99_999), 1200, 0), 86_400);
+        assert_eq!(clamp_env_secs(None, 1200, 0), 1200);
+    }
 
     struct NoopProvider;
 
@@ -1529,7 +1752,15 @@ mod profile_integration_tests {
             lean_names.iter().all(|n| base_names.contains(n)),
             "lean set must be a subset of the default set",
         );
-        for kept in ["read_file", "shell", "edit_file", "grep"] {
+        for kept in [
+            "read_file",
+            "shell",
+            "bash",
+            "edit_file",
+            "grep",
+            "check",
+            "update_plan",
+        ] {
             assert!(
                 lean_names.contains(&kept.to_string()),
                 "core-loop tool {kept} missing from lean set: {lean_names:?}",

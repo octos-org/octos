@@ -150,7 +150,7 @@ fn issue_649_fixture_violates_invariant_until_fixed() {
         violations.len()
     );
     for v in &violations {
-        eprintln!("  {:?}", v);
+        eprintln!("  {v:?}");
     }
 
     // Three known production violations the fixture mirrors:
@@ -192,7 +192,6 @@ fn correct_three_user_overflow_passes() {
     let violations = check_jsonl(&path);
     assert!(
         violations.is_empty(),
-        "Correct fixture should have zero thread_id binding violations, got: {:?}",
-        violations
+        "Correct fixture should have zero thread_id binding violations, got: {violations:?}"
     );
 }

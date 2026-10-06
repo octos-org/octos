@@ -5,14 +5,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
-use reqwest::Client;
-use reqwest::redirect::Policy;
+use html5ever::tendril::TendrilSink;
+use markup5ever_rcdom::{NodeData, RcDom};
 use serde::Deserialize;
 
 use super::{Tool, ToolResult};
-
-/// Maximum number of redirects to follow (with SSRF validation per hop).
-const MAX_REDIRECTS: usize = 10;
 
 pub struct WebFetchTool {
     config: Option<Arc<super::tool_config::ToolConfigStore>>,
@@ -71,7 +68,15 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL and extract its content as markdown or plain text."
+        static DESCRIPTION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            format!(
+                "Fetch a URL and extract its content as markdown or plain text. Output beyond \
+                 {} bytes is truncated with a '[N bytes omitted]' middle marker, regardless of \
+                 max_chars.",
+                octos_core::tool_output_limit("web_fetch")
+            )
+        });
+        &DESCRIPTION
     }
 
     fn tags(&self) -> &[&str] {
@@ -163,7 +168,7 @@ impl Tool for WebFetchTool {
         if let Some(len) = response.content_length() {
             if len > MAX_BODY_BYTES as u64 {
                 return Ok(ToolResult {
-                    output: format!("Response too large ({} bytes, max {})", len, MAX_BODY_BYTES),
+                    output: format!("Response too large ({len} bytes, max {MAX_BODY_BYTES})"),
                     success: false,
                     ..Default::default()
                 });
@@ -215,90 +220,117 @@ impl Tool for WebFetchTool {
 /// Validate a URL against SSRF rules, build a pinned client, and fetch.
 /// Redirects are followed manually with SSRF validation on each hop.
 /// DNS failures are treated as blocked (fail-closed).
+///
+/// The hop loop itself is `octos_research::net::pinned_get` — the one
+/// pinned-fetch loop in the workspace, shared with the research readers.
+/// This wrapper adds the PR A fleet grant's host allowlist, checked BEFORE
+/// any DNS or socket on every hop, and the tool's own User-Agent.
 async fn ssrf_safe_fetch(
     initial_url: &str,
     host_allowlist: Option<&[String]>,
 ) -> Result<reqwest::Response, String> {
-    let mut current_url = initial_url.to_string();
-
-    for _ in 0..MAX_REDIRECTS {
-        let parsed = reqwest::Url::parse(&current_url).map_err(|_| "Invalid URL".to_string())?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| "URL has no host".to_string())?
-            .to_string();
-
-        // PR A — enforce the fleet grant's host allowlist BEFORE any DNS or
-        // socket, so a refused host never touches the network (and the
-        // deterministic "not in the granted network allowlist" error is
-        // returned, not a DNS/connection error). Empty allowlist = unrestricted.
-        super::ssrf::check_host_allowlist(&host, host_allowlist)?;
-
-        // Validate the URL and resolve DNS (fail-closed on DNS error).
-        let check = super::ssrf::check_ssrf_with_addrs(&current_url).await?;
-
-        // Build a per-request client with redirects disabled and DNS pinned.
-        let mut builder = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent("octos/0.1 (web-fetch-tool)")
-            .redirect(Policy::none());
-        // Pin ALL validated addresses at once. `resolve()` called in a loop
-        // overwrites the per-host entry each time, leaving only the last address
-        // pinned — so a host whose last DNS answer is unreachable would fail even
-        // when another validated address works. `resolve_to_addrs` keeps them all.
-        if !check.resolved_addrs.is_empty() {
-            builder = builder.resolve_to_addrs(&host, &check.resolved_addrs);
-        }
-        let client = builder
-            .build()
-            .map_err(|e| format!("HTTP client error: {e}"))?;
-
-        let response = client
-            .get(&current_url)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch URL: {e}"))?;
-
-        if !response.status().is_redirection() {
-            return Ok(response);
-        }
-
-        let location = response
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| "Redirect with no Location header".to_string())?;
-        // Resolve relative redirects against the current URL.
-        current_url = parsed
-            .join(location)
-            .map_err(|_| format!("Invalid redirect URL: {location}"))?
-            .to_string();
-    }
-
-    Err(format!("Too many redirects (max {MAX_REDIRECTS})"))
+    let check_allowlist = move |host: &str| super::ssrf::check_host_allowlist(host, host_allowlist);
+    octos_research::net::pinned_get(
+        initial_url,
+        octos_research::net::PinnedFetch {
+            timeout: Duration::from_secs(30),
+            user_agent: "octos/0.1 (web-fetch-tool)",
+            pre_check: Some(&check_allowlist),
+        },
+    )
+    .await
 }
 
 fn extract_markdown(html: &str) -> String {
-    htmd::convert(html).unwrap_or_else(|_| extract_text(html))
+    htmd::HtmlToMarkdown::builder()
+        .skip_tags(vec!["script", "style", "template", "noscript"])
+        .build()
+        .convert(html)
+        .unwrap_or_else(|_| extract_text(html))
 }
 
 fn extract_text(html: &str) -> String {
+    // Use the same HTML parser as Markdown extraction. Stripping brackets
+    // leaves script/style bodies in the result and mistakes quoted `>` for
+    // the end of a tag, consuming the output budget before page evidence.
+    let dom = html5ever::parse_document(RcDom::default(), Default::default()).one(html);
     let mut result = String::with_capacity(html.len());
-    let mut in_tag = false;
-
-    for c in html.chars() {
-        if c == '<' {
-            in_tag = true;
-            continue;
-        }
-        if c == '>' {
-            in_tag = false;
+    // Iterative traversal avoids an extra recursive walk for deeply nested
+    // remote documents. Exit markers separate blocks without splitting words
+    // around inline markup such as inter<b>national</b>.
+    let mut pending = vec![(dom.document.clone(), false)];
+    while let Some((node, exiting_block)) = pending.pop() {
+        if exiting_block {
             result.push(' ');
             continue;
         }
-        if !in_tag {
-            result.push(c);
+        match &node.data {
+            NodeData::Text { contents } => result.push_str(&contents.borrow()),
+            NodeData::Element { name, attrs, .. } => {
+                let tag = name.local.as_ref();
+                if matches!(tag, "head" | "script" | "style" | "template" | "noscript")
+                    || attrs
+                        .borrow()
+                        .iter()
+                        .any(|attr| attr.name.local.as_ref() == "hidden")
+                {
+                    continue;
+                }
+                if matches!(
+                    tag,
+                    "address"
+                        | "article"
+                        | "aside"
+                        | "blockquote"
+                        | "br"
+                        | "caption"
+                        | "dd"
+                        | "details"
+                        | "dialog"
+                        | "div"
+                        | "dl"
+                        | "dt"
+                        | "fieldset"
+                        | "figcaption"
+                        | "figure"
+                        | "footer"
+                        | "form"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "header"
+                        | "hr"
+                        | "li"
+                        | "main"
+                        | "nav"
+                        | "ol"
+                        | "p"
+                        | "pre"
+                        | "section"
+                        | "summary"
+                        | "table"
+                        | "td"
+                        | "th"
+                        | "tr"
+                        | "ul"
+                ) {
+                    result.push(' ');
+                    pending.push((node.clone(), true));
+                }
+            }
+            NodeData::Document => {}
+            _ => continue,
         }
+        pending.extend(
+            node.children
+                .borrow()
+                .iter()
+                .rev()
+                .map(|child| (child.clone(), false)),
+        );
     }
 
     result.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -329,6 +361,52 @@ mod tests {
         let html = "<div>\n  <p>  spaced  </p>\n</div>";
         let text = extract_text(html);
         assert_eq!(text, "spaced");
+    }
+
+    #[test]
+    fn text_extraction_keeps_body_evidence_within_the_output_budget() {
+        let html = format!(
+            "<head><style>{}</style><script>{}</script></head>\
+             <body><h1>Shanghai forecast</h1><p>Published 2026-09-11: light rain.</p>\
+             <script>var injected = 'not a forecast';</script></body>",
+            ".weather {{ color: red; }}".repeat(1000),
+            "var pagetype = 'weather';".repeat(1000),
+        );
+        let mut text = extract_text(&html);
+        octos_core::truncate_utf8(&mut text, 120, "[truncated]");
+        assert_eq!(text, "Shanghai forecast Published 2026-09-11: light rain.");
+    }
+
+    #[test]
+    fn text_extraction_handles_entities_and_quoted_attribute_delimiters() {
+        assert_eq!(
+            extract_text("<p title='a > b'>北京 &amp; 上海: 28&#176;C &lt; 30&#176;C</p>"),
+            "北京 & 上海: 28°C < 30°C"
+        );
+    }
+
+    #[test]
+    fn text_extraction_omits_non_content_subtrees_and_comments() {
+        assert_eq!(
+            extract_text(
+                "<STYLE>.secret { color: red }</STYLE><!--not evidence-->\
+                <p>Visible</p><div hidden><p>hidden forecast</p></div>\
+                <template><p>template forecast</p></template>\
+                <noscript>Enable JavaScript</noscript><p>content</p>"
+            ),
+            "Visible content"
+        );
+    }
+
+    #[test]
+    fn text_extraction_preserves_inline_words_and_separates_blocks() {
+        assert_eq!(
+            extract_text(
+                "<p>Inter<b>national</b> weather</p><div>Next<br>line</div>\
+                <table><tr><td>Beijing</td><td>28°C</td></tr></table>"
+            ),
+            "International weather Next line Beijing 28°C"
+        );
     }
 
     #[tokio::test]
@@ -370,6 +448,20 @@ mod tests {
         assert!(md.contains("Paragraph"));
     }
 
+    #[test]
+    fn markdown_extraction_omits_scripts_and_styles_but_keeps_source_links() {
+        let md = extract_markdown(
+            "<body><style>.forecast { color: red; }</style>\
+             <script>var forecast = 'not evidence';</script>\
+             <template>not published</template><noscript>enable scripts</noscript>\
+             <p>Published forecast: <a href='https://example.com/weather'>source</a>.</p></body>",
+        );
+        assert_eq!(
+            md,
+            "Published forecast: [source](https://example.com/weather)."
+        );
+    }
+
     #[tokio::test]
     async fn test_ssrf_redirect_to_private_ip_blocked() {
         // A redirect to a private IP must be blocked.
@@ -393,6 +485,26 @@ mod tests {
             err.contains("DNS resolution failed") || err.contains("fail closed"),
             "error should indicate DNS failure: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn should_block_a_host_managed_servers_own_port_and_loopback_spellings() {
+        // `octos serve --host-managed` (UPCR-2026-036) keeps web_fetch in an
+        // external client's turns: it must never reach the server itself or
+        // anything else on loopback, link-local or metadata addresses.
+        for url in [
+            "http://127.0.0.1:50080/api/admin/overview",
+            "http://127.0.0.1:50080/pair/info",
+            "http://localhost:50080/",
+            "http://[::1]:50080/",
+            "http://2130706433/",
+            "http://0x7f.0.0.1/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://0.0.0.0:50080/",
+        ] {
+            assert!(ssrf_safe_fetch(url, None).await.is_err(), "{url}");
+        }
     }
 
     #[tokio::test]
@@ -468,6 +580,19 @@ mod tests {
             result.output.contains("allowlist"),
             "refusal must be the allowlist (no network hit): {}",
             result.output,
+        );
+    }
+
+    /// pi-style truncation contract: the model is warned about the output cap
+    /// UP FRONT, in the tool description, using the real limit.
+    #[test]
+    fn should_state_truncation_contract_in_description_when_web_fetch() {
+        let tool = WebFetchTool::new();
+        let desc = tool.description();
+        let limit = octos_core::tool_output_limit("web_fetch");
+        assert!(
+            desc.contains(&limit.to_string()),
+            "description must carry the real output cap ({limit}): {desc}"
         );
     }
 }

@@ -12,6 +12,55 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+/// Structured ASR result. `rejected` is authoritative even when an upstream
+/// service accidentally includes non-empty text alongside the rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsrTranscription {
+    pub text: String,
+    pub rejected: bool,
+    pub reject_reason: Option<String>,
+}
+
+fn parse_transcription_response(json: &serde_json::Value) -> Result<AsrTranscription> {
+    let rejected = match json.get("rejected") {
+        None => None,
+        Some(serde_json::Value::Bool(value)) => Some(*value),
+        Some(_) => eyre::bail!("invalid rejected field in transcription response"),
+    };
+
+    if rejected == Some(true) {
+        let reject_reason = json
+            .get("reject_reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("upstream_rejected")
+            .to_owned();
+        return Ok(AsrTranscription {
+            text: String::new(),
+            rejected: true,
+            reject_reason: Some(reject_reason),
+        });
+    }
+
+    let text = json
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| eyre::eyre!("no text field in transcription response"))?
+        .trim();
+    if text.is_empty() {
+        return Ok(AsrTranscription {
+            text: String::new(),
+            rejected: true,
+            reject_reason: Some("no_speech".to_owned()),
+        });
+    }
+
+    Ok(AsrTranscription {
+        text: text.to_owned(),
+        rejected: false,
+        reject_reason: None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Platform model allowlist — ~/.octos/platform-models.json
 // ---------------------------------------------------------------------------
@@ -341,14 +390,22 @@ impl VoicesRegistry {
     /// Like [`resolve`](Self::resolve), but only matches voices whose
     /// `ref_audio` path satisfies `is_visible`, so a tenant can't select a
     /// voice cloned by (and owned by) another profile.
+    ///
+    /// An exact canonical-id match wins over another voice's alias: with
+    /// `doubao.aliases = ["vivian"]` plus a separate `vivian` entry, the name
+    /// `vivian` resolves to the `vivian` entry, not to `doubao` (which sorts
+    /// earlier in the BTreeMap). An exact id whose ref is unusable falls
+    /// through to the alias pass.
     pub fn resolve_visible(&self, name: &str, is_visible: impl Fn(&str) -> bool) -> Option<String> {
+        let usable = |e: &VoiceEntry| self.ref_exists(e) && is_visible(&e.ref_audio);
+        if let Some(e) = self.voices.get(name) {
+            if usable(e) {
+                return Some(name.to_string());
+            }
+        }
         self.voices
             .iter()
-            .find(|(id, e)| {
-                (id.as_str() == name || e.aliases.iter().any(|a| a == name))
-                    && self.ref_exists(e)
-                    && is_visible(&e.ref_audio)
-            })
+            .find(|(_, e)| e.aliases.iter().any(|a| a == name) && usable(e))
             .map(|(id, _)| id.clone())
     }
 }
@@ -425,8 +482,9 @@ impl OminixClient {
         Ok(filtered)
     }
 
-    /// Transcribe an audio file to text.
-    pub async fn transcribe(&self, audio_path: &Path) -> Result<String> {
+    /// Transcribe an audio file while preserving the upstream no-speech
+    /// contract instead of collapsing it into an empty string.
+    pub async fn transcribe(&self, audio_path: &Path) -> Result<AsrTranscription> {
         let meta = tokio::fs::metadata(audio_path)
             .await
             .wrap_err_with(|| format!("failed to stat audio: {}", audio_path.display()))?;
@@ -470,13 +528,14 @@ impl OminixClient {
             .await
             .wrap_err("invalid transcription response")?;
 
-        let text = json
-            .get("text")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| eyre::eyre!("no text field in transcription response"))?;
+        let result = parse_transcription_response(&json)?;
 
-        debug!(chars = text.len(), "audio transcribed via ASR service");
-        Ok(text.to_string())
+        debug!(
+            chars = result.text.len(),
+            rejected = result.rejected,
+            "audio transcribed via ASR service"
+        );
+        Ok(result)
     }
 
     /// Synthesize text to speech, returning raw WAV bytes.
@@ -557,7 +616,8 @@ impl OminixClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{OminixClient, tts_endpoint};
+    use super::{OminixClient, parse_transcription_response, tts_endpoint};
+    use serde_json::json;
 
     #[test]
     fn sovits_is_the_default_endpoint() {
@@ -572,6 +632,74 @@ mod tests {
     #[test]
     fn unknown_engine_falls_back_to_sovits() {
         assert_eq!(tts_endpoint("nonsense"), "/v1/audio/tts/sovits");
+    }
+
+    #[test]
+    fn should_reject_when_upstream_explicitly_rejects_nonempty_text() {
+        let result = parse_transcription_response(&json!({
+            "text": "hallucinated words",
+            "rejected": true,
+            "reject_reason": "no_speech"
+        }))
+        .expect("explicit rejection is a valid ASR response");
+
+        assert!(result.rejected);
+        assert_eq!(result.text, "");
+        assert_eq!(result.reject_reason.as_deref(), Some("no_speech"));
+    }
+
+    #[test]
+    fn should_reject_when_upstream_rejects_without_text() {
+        let result = parse_transcription_response(&json!({
+            "rejected": true
+        }))
+        .expect("explicit rejection does not require text");
+
+        assert!(result.rejected);
+        assert_eq!(result.text, "");
+        assert_eq!(result.reject_reason.as_deref(), Some("upstream_rejected"));
+    }
+
+    #[test]
+    fn should_reject_blank_text_from_legacy_asr() {
+        let result = parse_transcription_response(&json!({ "text": "  \n" }))
+            .expect("legacy blank response is valid no-speech");
+
+        assert!(result.rejected);
+        assert_eq!(result.text, "");
+        assert_eq!(result.reject_reason.as_deref(), Some("no_speech"));
+    }
+
+    #[test]
+    fn should_accept_nonempty_text_when_not_rejected() {
+        let result = parse_transcription_response(&json!({
+            "text": " 正常中文 ",
+            "rejected": false
+        }))
+        .expect("valid speech response");
+
+        assert!(!result.rejected);
+        assert_eq!(result.text, "正常中文");
+        assert_eq!(result.reject_reason, None);
+    }
+
+    #[test]
+    fn should_fail_when_rejected_has_wrong_type() {
+        let error = parse_transcription_response(&json!({
+            "text": "不可信文本",
+            "rejected": "true"
+        }))
+        .expect_err("invalid rejected type must fail closed");
+
+        assert!(error.to_string().contains("rejected"));
+    }
+
+    #[test]
+    fn should_fail_when_non_rejected_response_has_no_text() {
+        let error = parse_transcription_response(&json!({ "rejected": false }))
+            .expect_err("accepted response requires text");
+
+        assert!(error.to_string().contains("text"));
     }
 
     #[tokio::test]
@@ -657,6 +785,48 @@ mod voices_tests {
         assert_eq!(reg.resolve("vivian").as_deref(), Some("doubao")); // alias → id
         assert_eq!(reg.resolve("ghost"), None); // ref missing
         assert_eq!(reg.resolve("nope"), None); // unknown
+    }
+
+    #[test]
+    fn resolve_prefers_exact_id_over_another_voice_alias() {
+        // doubao sorts before vivian in the BTreeMap and aliases ["vivian"];
+        // a separate canonical "vivian" entry must still win its own name.
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["doubao_ref.wav", "vivian_ref.wav"] {
+            let p = dir.path().join("ref_audios").join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"fake").unwrap();
+        }
+        let json = format!(
+            r#"{{
+              "default_voice": "doubao",
+              "models_base_path": {base:?},
+              "voices": {{
+                "doubao": {{ "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] }},
+                "vivian": {{ "ref_audio": "ref_audios/vivian_ref.wav", "ref_text": "z", "aliases": [] }}
+              }}
+            }}"#,
+            base = dir.path().to_string_lossy()
+        );
+        let reg = VoicesRegistry::parse(&json).unwrap();
+        assert_eq!(reg.resolve("vivian").as_deref(), Some("vivian"));
+        // An unusable exact id (ref missing) still falls through to aliases.
+        let dir2 = tempfile::tempdir().unwrap();
+        let json2 = format!(
+            r#"{{
+              "default_voice": "doubao",
+              "models_base_path": {base:?},
+              "voices": {{
+                "doubao": {{ "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] }},
+                "vivian": {{ "ref_audio": "ref_audios/vivian_ref.wav", "ref_text": "z", "aliases": [] }}
+              }}
+            }}"#,
+            base = dir2.path().to_string_lossy()
+        );
+        std::fs::create_dir_all(dir2.path().join("ref_audios")).unwrap();
+        std::fs::write(dir2.path().join("ref_audios/doubao_ref.wav"), b"fake").unwrap();
+        let reg2 = VoicesRegistry::parse(&json2).unwrap();
+        assert_eq!(reg2.resolve("vivian").as_deref(), Some("doubao"));
     }
 
     #[test]

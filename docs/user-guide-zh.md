@@ -44,6 +44,12 @@ Octos 是一个 Rust 原生的 AI 智能体平台，支持三种运行模式：
 - **`octos gateway`** — 单个 gateway 实例，服务于各消息通道（Telegram、Discord、Slack、WhatsApp、Matrix、飞书、邮件、微信、企业微信、企业微信群机器人、QQ 机器人、Twilio）。
 - **`octos chat`** — 交互式 CLI 聊天，用于开发和测试。
 
+chat 和 `octos acp` 通过进程内连接使用与 OctosCode 相同的 OUP 会话 runtime，
+共享历史、压缩、权限和取消逻辑，不再各自执行另一套 Agent 循环。
+两者需要默认启用的 `api` feature，无需额外启动服务进程或网络监听。
+ACP 支持 `session/load` 回放和工具权限请求；OUP 结构化用户提问仍由
+终端 chat／OctosCode 提供交互。
+
 ### 架构
 
 ```
@@ -55,7 +61,7 @@ octos serve（控制面板 + 仪表盘，约 140 个 REST 端点）
        │
        ├── LLM 提供商（15 家，AdaptiveRouter → ProviderChain → RetryProvider）
        ├── 工具注册表（约 50 个内置 + 插件 + 9 个用户级 app-skill）
-       │      LRU 延迟加载保留约 15 个活跃；spawn_only 自动转后台
+       │      每轮发送全部已启用工具；spawn_only 自动转后台
        ├── 沙箱（bwrap / sandbox-exec / Docker / Windows AppContainer）
        ├── Pipeline 引擎（DOT 图，逐节点模型，限流扇出）
        ├── Swarm 调度器（/api/swarm/dispatch — 扇出到 N 个子 Agent）
@@ -174,11 +180,36 @@ export SMTP_PASSWORD="your-app-password"
 
 源码：`crates/octos-cli/src/api/admin_setup.rs`、`dashboard/src/pages/wizard/`。
 
+### 2.5 给外部代理授予会话访问（工作密钥）
+
+外部 CLI 或脚本代理不应持有你的仪表盘 bearer 令牌。*工作密钥*（work secret）是一种短生命周期凭证，只授予一个代理对单个会话的访问权，走会话入口 WebSocket 路由（`/v1/session_ingress/ws/{session_id}`）：
+
+```bash
+# 运维提示走 stderr，编码后的密钥走 stdout
+octos auth issue-work-secret \
+  --session "dspfac:local:tui#coding" \
+  --profile dspfac \
+  --ttl 1h \
+  --api-base-url http://127.0.0.1:50080
+
+# 列出已记录的授权（只有 SHA-256 哈希前缀；令牌从不落盘）
+octos auth list-work-secrets
+
+# 在过期前撤销
+octos auth revoke-work-secret '<secret>'
+```
+
+- `--ttl` 接受 `15m`、`1h`、`3600s` 这类值（默认 `1h`）；对同一会话重新签发会替换早先的授权。
+- 访客解码密钥后带 `Authorization: Bearer <token>` 连接。无法设置请求头的 WebSocket 客户端仍可用 `?token=` 查询参数，但该形式已弃用且会被服务端记录。
+- 每个客户端请求前都会重验授权；授权被撤销、过期或被重签替换后，存活套接字以 1008 关闭。只接受限定在被授权会话内的方法。
+
+完整走查（含最小 Python 客户端）：`docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md`。
+
 ---
 
 ## 3. 配置 LLM 提供商
 
-Octos 开箱即用支持 15 个 LLM 提供商。每个提供商需要设置对应的环境变量 API 密钥。
+Octos 开箱即用支持 17 个 LLM 提供商家族。云端提供商需要设置对应的环境变量 API 密钥；本地服务器（见 [3.6](#36-本地模型llamacppollamavllmlm-studio)）无需密钥。
 
 ### 3.1 支持的提供商
 
@@ -194,11 +225,13 @@ Octos 开箱即用支持 15 个 LLM 提供商。每个提供商需要设置对�
 | `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI 兼容 | `kimi` |
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI 兼容 | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI 兼容 | — |
+| `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI 兼容 | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI 兼容 | `glm` |
 | `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic 兼容 | `z.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI 兼容 | `nim` |
 | `ollama` | *（无需）* | llama3.2 | OpenAI 兼容 | — |
 | `vllm` | `VLLM_API_KEY` | *（必须指定）* | OpenAI 兼容 | — |
+| `local` | *（无需）* | local-default | OpenAI 兼容 | `llamacpp`、`llama.cpp`、`llama-server`、`lmstudio`、`openai-compatible` |
 
 #### 如何获取 API 密钥
 
@@ -246,12 +279,12 @@ Octos 开箱即用支持 15 个 LLM 提供商。每个提供商需要设置对�
 5. 设置环境变量：`export ANTHROPIC_API_KEY="your-key"`
 
 **MiniMax（稀宇科技）：**
-1. 访问 [MiniMax 开放平台](https://platform.minimaxi.com/)
+1. 按密钥所属区域访问对应平台：[国际站](https://platform.minimax.io/)，或[国内站](https://platform.minimaxi.com/)——Token 套餐订阅密钥由国内站签发且有区域绑定（在国际端点会 401，需改用 `minimax-cn` 家族）
 2. 注册或登录
 3. 在控制台中进入 **API Keys** 管理页面
 4. 点击"创建 API Key"
 5. 复制密钥
-6. 设置环境变量：`export MINIMAX_API_KEY="your-key"`
+6. 设置环境变量：`export MINIMAX_API_KEY="your-key"`（国际站）或 `export MINIMAX_CN_API_KEY="your-key"`（国内站）
 
 **Z.AI：**
 1. 访问 [Z.AI 平台](https://z.ai/)
@@ -375,6 +408,35 @@ octos auth logout --provider openai
 
 凭据存储在 `~/.octos/auth.json`（文件权限 0600）。解析 API 密钥时，认证存储**优先于**环境变量。
 
+### 3.6 本地模型（llama.cpp、Ollama、vLLM、LM Studio）
+
+主流本地模型服务器都提供 OpenAI 兼容 API，因此 Octos 将它们统一为**一个提供商家族：`local`**。无需关心背后是哪个引擎——选择 `local`，把 `base_url` 指向服务器即可。引擎名也可作为别名使用（`"provider": "llamacpp"`、`"lmstudio"` 等都会解析为 `local`）。
+
+零配置默认指向 llama.cpp `llama-server` 的标准端口：
+
+```json
+{
+  "provider": "local"
+}
+```
+
+这就是一份完整配置——无需 API 密钥、无需模型名（llama.cpp、LM Studio 这类单模型服务器会忽略 `model` 字段），`base_url` 默认为 `http://127.0.0.1:8080/v1`。
+
+其他引擎只需设置 `base_url`：
+
+| 引擎 | 常用 `base_url` | 说明 |
+|---|---|---|
+| llama.cpp（`llama-server`） | `http://127.0.0.1:8080/v1` | 默认值——用 `llama-server -m model.gguf --jinja` 启动 |
+| Ollama | `http://127.0.0.1:11434/v1` | 将 `model` 设为已拉取的模型（如 `llama3.2`），Ollama 按名称选择模型 |
+| vLLM | `http://127.0.0.1:8000/v1` | 将 `model` 设为所服务的模型 id |
+| LM Studio | `http://127.0.0.1:1234/v1` | 单模型；`model` 可不设 |
+
+如果服务器启动时设置了 API 密钥（llama.cpp 的 `--api-key`），照常通过 `api_key_env` 提供。在**共享/多用户机器**上，请务必为服务器设置密钥：未鉴权的 localhost 端点可被任意本地进程抢占绑定，从而截获你的完整对话内容。`ollama`、`vllm` 家族仍然可用且行为一致——推荐使用与引擎无关的 `local`。
+
+**用 `octos doctor` 验证配置。** 对本地家族，doctor 会查询服务器的 `/v1/models` 端点，报告实际加载的模型，并在配置的 `model` 不在列表中或端口无响应时给出警告（并列出常见的本地端点）。
+
+**工具调用注意事项：** Agent 循环依赖工具/函数调用，而对本地服务器来说这取决于*模型及其聊天模板*，与 Octos 无关。请使用支持工具调用的模型；llama.cpp 需以 `--jinja` 启动以启用模板的工具支持。如果聊天正常但工具异常，请首先检查这一点。
+
 ---
 
 ## 4. 故障转移与自适应路由
@@ -415,7 +477,7 @@ octos auth logout --provider openai
 {
   "adaptive_routing": {
     "enabled": true,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -424,7 +486,7 @@ octos auth logout --provider openai
 }
 ```
 
-- **`latency_threshold_ms`** — 平均延迟超过此值的提供商被降权（默认：30 秒）
+- **`latency_threshold_ms`** — 平均延迟超过此值的提供商被降权（默认：10 秒）
 - **`error_rate_threshold`** — 错误率超过此值的提供商被降低优先级（默认：30%）
 - **`probe_probability`** — 发送到非主要提供商的探测请求比例（默认：10%）
 - **`probe_interval_secs`** — 同一提供商两次探测之间的最小间隔（默认：60 秒）
@@ -888,7 +950,8 @@ curl -X POST http://localhost:50080/api/admin/test-provider \
 
 | 命令 | 说明 |
 |------|------|
-| `/new` | 分叉对话 — 创建新会话，复制最后 10 条消息 |
+| `/new` | 清空当前会话历史（等同于 `/clear`） |
+| `/new <name>` | 切换到——或创建——具名会话（`/new slides <name>`、`/new site <preset>` 脚手架生成项目会话） |
 | `/config` | 查看和修改工具配置（见[第 6 节](#6-工具配置)） |
 | `/exit`、`/quit`、`:q` | 退出聊天（仅 CLI 模式） |
 
@@ -898,7 +961,8 @@ curl -X POST http://localhost:50080/api/admin/test-provider \
 
 - **会话持久化：** `.octos/sessions/` 中的 JSONL 文件
 - **最大历史记录：** 通过 `gateway.max_history` 配置（默认：50 条消息）
-- **会话分叉：** `/new` 创建带有 parent_key 追踪的分支对话
+- **具名会话：** `/new <name>` 切换到——或创建——具名会话；裸 `/new` 与 `/clear` 一样清空历史。若一次后台封存被中断（历史已封存、活跃文件缺失），该会话会自愈：打开它，或在网关上 `/new <name>`，都会从封存分段重建活跃文件并接续历史，而不是从空白开始。
+- **内部派生的子会话**（如后台 spawn）带有 `parent_key` 字段指向其来源——用户创建的具名会话没有。
 - **三层上下文压缩（M8.5）：** 工作层 / 冷层 / 归档层。当对话超过 LLM 的上下文窗口时，较旧的消息按首行摘要（工具参数被剥离），最早的消息被推入实体库作为长期记忆。
 - **Sticky `thread_id` 与 `committed_seq`（M8.10）：** 每个会话拥有稳定的 `thread_id`，在首次流式事件之前完成绑定，并在后续 UI Protocol 更新中携带。终态事件还携带 `committed_seq`（最终写入的持久序号），客户端因此能够在断线重连后做确定性回放。详情见 [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md)。
 - **结构化恢复（M8.6）：** 当工作树缺失或子 Agent 失败时，监督者拒绝静默丢弃当前轮次，而是用一个描述失败原因的结构化恢复负载重新驱动 LLM。
@@ -1712,6 +1776,8 @@ octos skills install user/repo --force
 octos skills --profile my-bot install user/repo
 ```
 
+`user/repo` 之后的路径相对仓库根目录解析，因此嵌套目录中的技能需写完整路径——例如位于 `skills/my-skill` 的技能用 `octos skills install user/repo/skills/my-skill` 安装。
+
 **安装过程：**
 1. 尝试从技能注册表下载预编译二进制文件（SHA-256 验证）
 2. 如果存在 `Cargo.toml`，回退到 `cargo build --release`
@@ -1980,7 +2046,7 @@ chmod +x .octos/skills/translator/main
   // 自适应路由
   "adaptive_routing": {
     "enabled": false,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -2018,7 +2084,7 @@ chmod +x .octos/skills/translator/main
   ],
 
   // 智能体设置
-  "max_iterations": 50,
+  "max_iterations": 0, // 交互回合不设硬上限；spawn/MCP 仍有独立上限
 
   // 嵌入（用于记忆中的向量搜索）。
   // 远程，OpenAI 兼容：
@@ -2050,8 +2116,25 @@ chmod +x .octos/skills/translator/main
   // 钩子
   "hooks": [],
 
-  // MCP 服务器
-  "mcp_servers": [],
+  // MCP 服务器 — octos 作为客户端接入的外部工具源。
+  // stdio: command + args(可选 env);HTTP: url(可选 headers 或 oauth)。
+  "mcp_servers": [
+    // {
+    //   "command": "/path/to/server",   // stdio 传输
+    //   "args": ["serve", "--root", "/path/to/repo"],
+    //   // stdio 子进程拿到的是消毒后的环境: 只转发此 map 里显式列出的变量,
+    //   // 注入向量(LD_PRELOAD、DYLD_INSERT_LIBRARIES、NODE_OPTIONS …)
+    //   // 即使写在这里也会被剥掉。指望继承环境拿密钥的服务会静默失败——
+    //   // 在这里显式传,或让服务自读它自己的 secrets 文件。
+    //   "env": {},
+    //   // "safe"(默认)并发调用本服务工具;"exclusive" 串行化——适合
+    //   // 单设备驱动等独占资源。未知值按 exclusive 兜底(fail-safe)。
+    //   "concurrency_class": "exclusive"
+    // },
+    // { "url": "https://mcp.example.com/mcp", "oauth": true, "scopes": [] }
+    // 超时: 握手 30s,单次 tools/call 60s——长任务应由服务端 detach 起跑
+    // (返回句柄),再用只读工具轮询结果。
+  ],
 
   // 沙箱 — 完整说明见 docs/SANDBOX.md。
   // 后端：bwrap（Linux）、sandbox-exec（macOS）、AppContainer（Windows，
@@ -2078,6 +2161,11 @@ chmod +x .octos/skills/translator/main
 
 | 变量 | 说明 |
 |------|------|
+| **长时间运行回合** | |
+| `OCTOS_CONVERGENCE_LLM_CALLS` | 按 LLM 调用次数触发无工具反思（默认 `20`） |
+| `OCTOS_CONVERGENCE_ACTIVE_TOKENS` | 按非缓存输入 + 输出 token 触发反思（默认 `100000`） |
+| `OCTOS_CONVERGENCE_SECS` | 按经过秒数触发反思（默认 `300`） |
+| `OCTOS_FILE_CHURN_THRESHOLD` | 同一文件成功修改多少次后提前反思；第二次越阈同时请求模型/provider 升级（默认 `5`） |
 | **LLM 提供商** | |
 | `ANTHROPIC_API_KEY` | Anthropic（Claude）API 密钥 |
 | `OPENAI_API_KEY` | OpenAI API 密钥 |
@@ -2118,6 +2206,9 @@ chmod +x .octos/skills/translator/main
 | **语音** | |
 | `ASR_API_URL` | 独立批量 ASR 服务基址；设置后转录不再走 OMiniX |
 | `OMINIX_API_URL` | OminiX ASR/TTS API 地址 |
+| **会话存储** | |
+| `OCTOS_SESSION_SEGMENT_BYTES` | 活跃会话文件封存为分段的大小（默认 8 MiB） |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | 普通加载按新到旧读取的会话历史字节数（默认 32 MiB；`0` = 不限） |
 | **系统** | |
 | `RUST_LOG` | 日志级别（error/warn/info/debug/trace） |
 | `OCTOS_LOG_JSON` | 启用 JSON 格式日志（设置为任意值） |

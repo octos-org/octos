@@ -76,6 +76,20 @@ impl Agent {
         iteration: u32,
         input_tokens_estimate: u32,
     ) -> Result<(ChatResponse, bool)> {
+        self.consume_stream_with_input_estimate_mode(stream, iteration, input_tokens_estimate, true)
+            .await
+    }
+
+    /// Variant used by internal convergence checkpoints. The response is
+    /// assembled normally, but private reflection text is not projected into
+    /// the user's streaming transcript.
+    pub(super) async fn consume_stream_with_input_estimate_mode(
+        &self,
+        stream: ChatStream,
+        iteration: u32,
+        input_tokens_estimate: u32,
+        emit_progress: bool,
+    ) -> Result<(ChatResponse, bool)> {
         // Thresholds flow from `AgentConfig` (env-overridable: see
         // `OCTOS_LLM_FIRST_TOKEN_GRACE_SECS` / `OCTOS_LLM_STREAM_IDLE_SECS` /
         // `OCTOS_LLM_CALL_MAX_SECS`). The first-token grace caps the
@@ -97,11 +111,33 @@ impl Agent {
                 StreamTimeouts {
                     first_token_grace_secs: self.config.llm_first_token_grace.as_secs(),
                     inter_chunk_idle_secs: self.config.llm_stream_idle.as_secs(),
-                    overall_max_secs: self.config.llm_call_max.as_secs(),
+                    overall_max_secs: self.effective_llm_call_max_secs(),
                 }
             };
-        self.consume_stream_inner(stream, iteration, input_tokens_estimate, thresholds)
-            .await
+        self.consume_stream_inner(
+            stream,
+            iteration,
+            input_tokens_estimate,
+            thresholds,
+            emit_progress,
+        )
+        .await
+    }
+
+    /// Overall wall-clock cap for a normal (non-voice) turn.
+    ///
+    /// For a local provider (#2229) the cap is disabled by default (`0`) so a
+    /// slow-but-healthy reasoning stream is not guillotined mid-flight while
+    /// tokens are still flowing — Pi has no such cap, and the inter-chunk idle
+    /// and TTFT guards still catch a genuinely dead provider. An operator who
+    /// explicitly sets `OCTOS_LLM_CALL_MAX_SECS` gets exactly that value even on
+    /// local. Cloud keeps the `DEFAULT_LLM_CALL_MAX_SECS` (1200s) backstop.
+    fn effective_llm_call_max_secs(&self) -> u64 {
+        if self.is_local_provider() && std::env::var("OCTOS_LLM_CALL_MAX_SECS").is_err() {
+            0
+        } else {
+            self.config.llm_call_max.as_secs()
+        }
     }
 
     /// Test-only entry point: lets fixtures dial the timeouts down to
@@ -116,7 +152,7 @@ impl Agent {
         input_tokens_estimate: u32,
         thresholds: StreamTimeouts,
     ) -> Result<(ChatResponse, bool)> {
-        self.consume_stream_inner(stream, iteration, input_tokens_estimate, thresholds)
+        self.consume_stream_inner(stream, iteration, input_tokens_estimate, thresholds, true)
             .await
     }
 
@@ -132,12 +168,15 @@ impl Agent {
         // <idle>s forever all terminate. Production thresholds come from
         // `AgentConfig` (env-overridable); test fixtures inject tiny values.
         thresholds: StreamTimeouts,
+        emit_progress: bool,
     ) -> Result<(ChatResponse, bool)> {
         // Clear any pending status line (e.g., "Thinking...")
-        self.reporter().report(ProgressEvent::Response {
-            content: String::new(),
-            iteration,
-        });
+        if emit_progress {
+            self.reporter().report(ProgressEvent::Response {
+                content: String::new(),
+                iteration,
+            });
+        }
 
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -284,26 +323,32 @@ impl Agent {
                 StreamEvent::ReasoningDelta(delta) => {
                     got_first_chunk = true;
                     reasoning.push_str(&delta);
-                    self.reporter().report(ProgressEvent::ReasoningChunk {
-                        text: delta.clone(),
-                        iteration,
-                    });
+                    if emit_progress {
+                        self.reporter().report(ProgressEvent::ReasoningChunk {
+                            text: delta.clone(),
+                            iteration,
+                        });
+                    }
                 }
                 StreamEvent::TextDelta(delta) => {
                     got_first_chunk = true;
                     let (content_part, reasoning_part) = think_splitter.feed(&delta);
                     if !reasoning_part.is_empty() {
                         reasoning.push_str(&reasoning_part);
-                        self.reporter().report(ProgressEvent::ReasoningChunk {
-                            text: reasoning_part,
-                            iteration,
-                        });
+                        if emit_progress {
+                            self.reporter().report(ProgressEvent::ReasoningChunk {
+                                text: reasoning_part,
+                                iteration,
+                            });
+                        }
                     }
                     if !content_part.is_empty() {
-                        self.reporter().report(ProgressEvent::StreamChunk {
-                            text: content_part.clone(),
-                            iteration,
-                        });
+                        if emit_progress {
+                            self.reporter().report(ProgressEvent::StreamChunk {
+                                text: content_part.clone(),
+                                iteration,
+                            });
+                        }
                         text.push_str(&content_part);
                     }
                 }
@@ -371,7 +416,7 @@ impl Agent {
         }
 
         let streamed = !text.is_empty() || !reasoning.is_empty();
-        if streamed {
+        if streamed && emit_progress {
             self.reporter()
                 .report(ProgressEvent::StreamDone { iteration });
         }
@@ -543,15 +588,33 @@ impl Agent {
     /// `None` when that model has no catalog pricing. Pass
     /// `provider_index: None` to price at the active slot — used for
     /// tool-reported usage that has no per-response attribution.
+    ///
+    /// Cache-aware (#1640 follow-up, protocol-aware per #2194 review): the
+    /// resolved slot's PROVIDER + MODEL pick the cache rate card
+    /// (`pricing::cache_rates` — Anthropic protocol 0.1x/1.25x incl. relabeled
+    /// proxies, Gemini 0.25x/0, unknown 1.0x/1.25x so a reported write never
+    /// vanishes), and `TokenUsage`'s crate-wide contract is DISJOINT
+    /// accounting (inclusive wire formats are normalized at each provider's
+    /// parse boundary), so the three counts price independently without
+    /// double-billing.
     pub(super) fn response_usage_cost(
         &self,
         input_tokens: u32,
         output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_write_tokens: u32,
         provider_index: Option<usize>,
     ) -> Option<f64> {
         let metadata = self.llm.provider_metadata_for_index(provider_index);
-        octos_llm::pricing::model_pricing(&metadata.model)
-            .map(|p| p.cost(input_tokens, output_tokens))
+        octos_llm::pricing::model_pricing(&metadata.model).map(|p| {
+            p.cost_with_cache_for_metadata(
+                &metadata,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            )
+        })
     }
 
     /// `attributed_cost` is the caller's per-attempt-priced cost for
@@ -579,7 +642,15 @@ impl Agent {
             .provider_metadata_for_index(response.provider_index);
         let pricing = octos_llm::pricing::model_pricing(&metadata.model);
         let response_cost = attributed_cost.or_else(|| {
-            pricing.map(|p| p.cost(response_usage.input_tokens, response_usage.output_tokens))
+            pricing.map(|p| {
+                p.cost_with_cache_for_metadata(
+                    &metadata,
+                    response_usage.input_tokens,
+                    response_usage.output_tokens,
+                    response_usage.cache_read_tokens,
+                    response_usage.cache_write_tokens,
+                )
+            })
         });
         // Session figures = completed-runs base + this turn so far.
         //
@@ -749,6 +820,138 @@ mod tests {
         fn provider_name(&self) -> &str {
             "mock"
         }
+    }
+
+    /// Provider that never answers but reports a model with catalog pricing
+    /// under a configurable provider label, so cost plumbing (including the
+    /// per-provider cache rate card) can be exercised without a network call.
+    struct PricedNoopProvider {
+        provider: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for PricedNoopProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> Result<ChatResponse> {
+            eyre::bail!("chat() unused in pricing tests")
+        }
+
+        fn model_id(&self) -> &str {
+            "claude-opus-4"
+        }
+
+        fn provider_name(&self) -> &str {
+            self.provider
+        }
+
+        fn provider_metadata(&self) -> octos_llm::ProviderMetadata {
+            // #2194 R4: real providers source their cache lane from their TYPE.
+            // Mirror that so these pricing tests exercise the metadata lane the
+            // production path now uses: an Anthropic-protocol slot reports the
+            // Anthropic lane, everything else the residual lane.
+            let lane = if self.provider == "anthropic" {
+                octos_llm::CacheLane::Anthropic
+            } else {
+                octos_llm::CacheLane::Residual
+            };
+            octos_llm::ProviderMetadata::new(self.provider, self.model_id(), None)
+                .with_cache_lane(lane)
+        }
+    }
+
+    async fn priced_agent(provider_label: &'static str) -> (Agent, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let provider: Arc<dyn LlmProvider> = Arc::new(PricedNoopProvider {
+            provider: provider_label,
+        });
+        let agent = Agent::new(
+            AgentId::new("pricing-test"),
+            provider,
+            ToolRegistry::new(),
+            memory,
+        );
+        (agent, dir)
+    }
+
+    #[tokio::test]
+    async fn should_price_cache_reads_and_writes_at_multiplier_rates_when_usage_reports_them() {
+        // #1640 follow-up: on an ANTHROPIC-labeled slot, runtime pricing
+        // must charge cache reads at 0.1x and cache writes at 1.25x the
+        // input rate instead of ignoring both — otherwise caching
+        // experiments are unpriceable after the fact.
+        let (agent, _dir) = priced_agent("anthropic").await;
+
+        let priced = agent
+            .response_usage_cost(100_000, 10_000, 10_000, 2_000, None)
+            .expect("claude-opus-4 has catalog pricing");
+
+        let pricing = octos_llm::pricing::model_pricing("claude-opus-4").unwrap();
+        let naive = pricing.cost(100_000, 10_000);
+        let expected = pricing.cost_with_cache(100_000, 10_000, 10_000, 2_000);
+        assert!(
+            (priced - expected).abs() < 1e-12,
+            "cache-aware figure expected {expected}, got {priced}"
+        );
+        assert!(
+            (priced - naive).abs() > 1e-9,
+            "cache tokens must move the price off the naive input/output figure ({naive})"
+        );
+        // The exact premium: 10_000 reads at 0.1x + 2_000 writes at 1.25x of
+        // the input rate.
+        let input_rate = pricing.input_per_million;
+        let premium = (10_000.0 / 1_000_000.0) * input_rate * 0.1
+            + (2_000.0 / 1_000_000.0) * input_rate * 1.25;
+        assert!(
+            (priced - (naive + premium)).abs() < 1e-12,
+            "premium must be 0.1x reads + 1.25x writes on the input rate"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_price_unknown_slot_cache_reads_full_and_writes_never_free() {
+        // #2194 review round 2: an unknown-labeled slot bills cache READS at
+        // the full input rate (no invented discount), but cache WRITES are
+        // NEVER free — cache_write_tokens is only ever emitted by the
+        // Anthropic parser, so a write reaching the residual bucket is an
+        // Anthropic-protocol write from an unrecognized proxy and bills at
+        // 1.25x rather than vanishing.
+        let (agent, _dir) = priced_agent("openai").await;
+        let priced = agent
+            .response_usage_cost(100_000, 10_000, 10_000, 2_000, None)
+            .expect("claude-opus-4 has catalog pricing");
+
+        let pricing = octos_llm::pricing::model_pricing("claude-opus-4").unwrap();
+        // reads folded in at full input rate + 2k writes at 1.25x.
+        let expected = pricing.cost(100_000 + 10_000, 10_000)
+            + (2_000.0 / 1_000_000.0) * pricing.input_per_million * 1.25;
+        assert!(
+            (priced - expected).abs() < 1e-12,
+            "unknown slot: reads at full input rate, writes at 1.25x (got {priced})"
+        );
+        // The write must not vanish: dropping it lowers the price.
+        let read_only = agent
+            .response_usage_cost(100_000, 10_000, 10_000, 0, None)
+            .unwrap();
+        assert!(
+            priced - read_only > 1e-9,
+            "a reported cache write must add cost on an unknown slot"
+        );
+
+        // And the Anthropic card is still cheaper (0.1x reads), so the
+        // protocol branch genuinely changes the price.
+        let (anthropic_agent, _dir2) = priced_agent("anthropic").await;
+        let anthropic_priced = anthropic_agent
+            .response_usage_cost(100_000, 10_000, 10_000, 2_000, None)
+            .unwrap();
+        assert!(
+            priced - anthropic_priced > 1e-9,
+            "unknown full-rate reads must cost more than Anthropic 0.1x reads"
+        );
     }
 
     /// Build a bare `Agent` whose backing provider is unused — the streaming

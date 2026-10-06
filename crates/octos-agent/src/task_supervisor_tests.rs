@@ -401,9 +401,11 @@ fn on_terminal_fires_for_cascade_and_orphan_sweep_failures() {
     supervisor2
         .enable_persistence(&temp)
         .expect("enable_persistence");
+    // #27c — parking is peer_handoff-scoped; this fixture's tool keeps
+    // the genuine-Failed verdict, so the terminal sink still fires.
     assert!(
         events2.lock().unwrap().contains(&orphan),
-        "orphan-sweep failure must reach the unified terminal sink"
+        "non-peer orphan failure reaches the unified terminal sink"
     );
 }
 
@@ -576,15 +578,15 @@ fn should_persist_harness_progress_event_for_replay() {
     assert_eq!(detail["workflow_kind"], "deep_research");
     assert_eq!(detail["current_phase"], "fetch");
     assert_eq!(detail["progress_message"], "Fetching 4 pages");
-    // Across restart, the in-flight task has no live worker — the orphan
-    // reaper marks it Failed so callers observe a clean terminal state.
-    // The harness progress detail still survives so operators can inspect
-    // where the task was when the runtime died.
+    // Across restart, the in-flight task has no live worker. #27c: the
+    // #27c — the sweep parks PEER_HANDOFF orphans only; this fixture's
+    // tool is not a peer, so it keeps the legacy genuine-Failed verdict.
+    // The harness progress detail still survives for operator diagnosis.
     assert_eq!(task.status, TaskStatus::Failed);
     assert_eq!(
         task.error.as_deref(),
         Some("orphaned across restart"),
-        "orphan reaper must record a stable error message"
+        "orphan reaper must record a stable park reason"
     );
 }
 
@@ -833,15 +835,15 @@ fn should_restore_running_task_state_after_restart() {
     let tasks = restored.get_all_tasks();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].id, task_id);
-    // The orphan reaper marks non-terminal tasks Failed at startup —
-    // their owning workers are gone. Metadata (lineage, ledger path,
+    // #27c — parking is peer_handoff-scoped; this fixture's tool keeps
+    // the legacy genuine-Failed verdict. Metadata (lineage, ledger path,
     // last-known runtime_detail) is preserved for operator diagnosis.
     assert_eq!(tasks[0].status, TaskStatus::Failed);
     assert_eq!(tasks[0].runtime_state, TaskRuntimeState::Failed);
     assert_eq!(
         tasks[0].error.as_deref(),
         Some("orphaned across restart"),
-        "orphan reaper must mark restored running tasks Failed"
+        "orphan reaper must mark restored running tasks Parked"
     );
     // runtime_detail (the last live progress payload) survives the
     // reap so operators can see where the task was when the worker died.
@@ -2470,6 +2472,89 @@ fn relaunch_unknown_task_returns_not_found() {
     assert_eq!(result, Err(TaskRelaunchError::NotFound));
 }
 
+/// #1595: the relaunch lineage must live on a first-class task field, not
+/// only inside the `runtime_detail` JSON of the spawn transition — the next
+/// `mark_runtime_state` call replaces that JSON wholesale, which would drop
+/// the edge before any later `task/updated` tick could surface it.
+#[test]
+fn relaunch_lineage_survives_runtime_detail_overwrite() {
+    let supervisor = TaskSupervisor::new();
+    let task_id = supervisor.register("run_pipeline", "call-relaunch-lineage", Some("session-L"));
+    supervisor.mark_running(&task_id);
+    supervisor.mark_failed(&task_id, "node 'design' failed".to_string());
+
+    let new_id = supervisor
+        .relaunch(&task_id, RelaunchOpts::default())
+        .expect("relaunch should succeed");
+
+    let spawned = supervisor.get_task(&new_id).expect("successor registered");
+    assert_eq!(
+        spawned.relaunched_from.as_deref(),
+        Some(task_id.as_str()),
+        "first-class lineage names the predecessor",
+    );
+    assert!(
+        spawned
+            .runtime_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(&task_id)),
+        "spawn transition still stamps the legacy runtime_detail JSON",
+    );
+
+    // The next state tick replaces runtime_detail; the first-class field
+    // must survive so every later `task/updated` frame carries the chain.
+    supervisor.mark_runtime_state(
+        &new_id,
+        TaskRuntimeState::ExecutingTool,
+        Some("executing".into()),
+    );
+    let running = supervisor
+        .get_task(&new_id)
+        .expect("successor still registered");
+    assert_eq!(running.runtime_detail.as_deref(), Some("executing"));
+    assert_eq!(
+        running.relaunched_from.as_deref(),
+        Some(task_id.as_str()),
+        "lineage survives the runtime_detail overwrite",
+    );
+
+    // A plain registration has no predecessor.
+    let plain_id = supervisor.register("run_pipeline", "call-plain", None);
+    assert_eq!(
+        supervisor.get_task(&plain_id).unwrap().relaunched_from,
+        None
+    );
+
+    // Chained relaunch (A -> B -> C): each successor names its IMMEDIATE
+    // predecessor, so a client can walk the chain edge by edge.
+    supervisor.mark_failed(&new_id, "second failure".to_string());
+    let third_id = supervisor
+        .relaunch(&new_id, RelaunchOpts::default())
+        .expect("relaunch of the successor succeeds");
+    let third = supervisor.get_task(&third_id).expect("second successor");
+    assert_eq!(
+        third.relaunched_from.as_deref(),
+        Some(new_id.as_str()),
+        "chained relaunch names the immediate predecessor, not the origin",
+    );
+
+    // The field's whole purpose is surviving transitions, so pin the
+    // persisted-snapshot round trip (same serde pattern as the sibling
+    // projection fields).
+    let snapshot = serde_json::to_string(&third).expect("serialize task snapshot");
+    let restored: BackgroundTask =
+        serde_json::from_str(&snapshot).expect("deserialize task snapshot");
+    assert_eq!(restored.relaunched_from, third.relaunched_from);
+    // ... and a pre-#1595 snapshot that never heard of the field still
+    // restores as None via `#[serde(default)]`.
+    let mut legacy: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&snapshot).expect("snapshot to map");
+    legacy.remove("relaunched_from");
+    let restored_legacy: BackgroundTask =
+        serde_json::from_value(serde_json::Value::Object(legacy)).expect("legacy snapshot");
+    assert_eq!(restored_legacy.relaunched_from, None);
+}
+
 #[test]
 fn relaunch_active_task_returns_still_active() {
     let supervisor = TaskSupervisor::new();
@@ -2593,10 +2678,8 @@ fn register_task_refuses_201st_child_for_same_parent() {
     // Every still-active child of the runaway parent should have
     // been force-marked `Failed` with the structured reason so the
     // cascade collapses instead of waiting on each child to finish.
-    let expected_reason = format!(
-        "child fanout exceeded ({} of {})",
-        MAX_CHILDREN_PER_PARENT, MAX_CHILDREN_PER_PARENT
-    );
+    let expected_reason =
+        format!("child fanout exceeded ({MAX_CHILDREN_PER_PARENT} of {MAX_CHILDREN_PER_PARENT})");
     let tasks = supervisor.get_tasks_for_session(parent_session);
     let any_active = tasks.iter().any(|t| t.status.is_active());
     assert!(
@@ -3112,7 +3195,7 @@ fn enable_persistence_reaps_orphan_running_tasks_at_startup() {
     assert_eq!(
         reaped.status,
         TaskStatus::Failed,
-        "orphan task must be marked Failed at startup"
+        "non-peer orphan keeps the genuine-Failed verdict (#27c scope)"
     );
     assert_eq!(reaped.runtime_state, TaskRuntimeState::Failed);
     let error = reaped.error.as_deref().unwrap_or("");
@@ -3122,7 +3205,7 @@ fn enable_persistence_reaps_orphan_running_tasks_at_startup() {
     );
     assert!(
         reaped.completed_at.is_some(),
-        "orphan task must have a completed_at timestamp"
+        "a genuine-Failed orphan carries the terminal completed_at timestamp"
     );
 
     let surviving = restored
@@ -3136,7 +3219,9 @@ fn enable_persistence_reaps_orphan_running_tasks_at_startup() {
     assert_eq!(surviving.runtime_state, TaskRuntimeState::Completed);
 
     // Idempotency: a third supervisor replaying the same ledger must see
-    // task_a already terminal (because the reaper appended a Failed event).
+    // task_a still Parked (#27c — the sweep appended a Parked event, which
+    // replays as Parked; a Parked task has no live worker in ANY process,
+    // so re-sweeping is idempotent and leaves it re-attachable).
     let restored_again = TaskSupervisor::new();
     restored_again.enable_persistence(&ledger_path).unwrap();
     let reread = restored_again
@@ -3802,12 +3887,12 @@ fn on_change_installed_before_enable_persistence_observes_orphan_sweep() {
     restored.enable_persistence(&ledger_path).unwrap();
 
     let snapshots = observed.lock().unwrap();
-    let orphan_failure = snapshots
+    let orphan_failed = snapshots
         .iter()
         .find(|t| t.id == id && t.status == TaskStatus::Failed)
-        .expect("on_change MUST observe the orphaned task transition to Failed");
+        .expect("on_change observes the orphaned task's genuine Failed verdict");
     assert_eq!(
-        orphan_failure.error.as_deref(),
+        orphan_failed.error.as_deref(),
         Some("orphaned across restart"),
     );
 }
@@ -3839,7 +3924,7 @@ fn on_change_installed_after_enable_persistence_misses_orphan_sweep() {
         sink.lock().unwrap().push(task.clone());
     });
 
-    // Stored task is Failed (sweep ran), but the callback never saw it.
+    // Stored task is Failed (sweep ran; non-peer scope), callback never saw it.
     assert_eq!(
         restored.get_task(&id).expect("task").status,
         TaskStatus::Failed
@@ -4018,7 +4103,7 @@ fn dead_task_not_in_live_set_is_still_reaped() {
     assert_eq!(
         task.status,
         TaskStatus::Failed,
-        "a dead task absent from the live-set must still be reaped",
+        "a dead task absent from the live-set must still be reaped (#27c parks)",
     );
     assert_eq!(
         task.error.as_deref(),
@@ -4583,6 +4668,33 @@ async fn start_reaper_loop_reaps_stuck_task_on_interval() {
     assert!(supervisor.cancel_token(&id).is_cancelled());
 }
 
+/// #1930: the reaper loop must not pin the supervisor on its own. A
+/// gateway session actor starts one reaper per session supervisor; when
+/// the session is deleted or idles out, every external owner drops, and
+/// the loop must exit on its next tick instead of pinning the supervisor
+/// until process shutdown.
+#[tokio::test]
+async fn reaper_exits_when_last_supervisor_clone_drops() {
+    let supervisor = Arc::new(TaskSupervisor::new());
+    supervisor.set_reap_interval(Duration::from_millis(10));
+    supervisor.start_reaper();
+
+    let weak = Arc::downgrade(&supervisor);
+    drop(supervisor);
+
+    // The loop may be mid-tick — holding a short-lived upgrade while it
+    // reads the interval or runs a sweep — so allow a few intervals for
+    // it to reach the upgrade-failed exit. It must NEVER pin the
+    // supervisor indefinitely.
+    for _ in 0..50 {
+        if weak.upgrade().is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("reaper kept the supervisor alive after its last external clone dropped");
+}
+
 // ---------------------------------------------------------------------------
 // #2055 — registration observer (`set_on_register`).
 //
@@ -4871,4 +4983,380 @@ fn snapshot_excluding_child_supervisor_inherits_registration_observers() {
         "task maps stay per-subtree"
     );
     assert!(child.get_task(&id).is_some());
+}
+
+/// #27c — the full simulated-restart orphan lifecycle: a running task's
+/// process dies; the next supervisor's boot sweep PARKS it (awaiting client
+/// re-attach) instead of failing it; the returning client revives it with
+/// `mark_running` (Parked → Running) and completes it normally. Red lines:
+/// terminal tasks are never re-parked, and Parked never fires the terminal
+/// failure callback (it is not a verdict, it is a pause).
+#[test]
+fn orphan_restart_parks_then_client_reattach_revives_full_chain() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger_path = temp.path().join("supervisor.jsonl");
+
+    // Boot 1: the "old process" registers a running task and persists it.
+    let old = TaskSupervisor::new();
+    let task_id = old.register("peer_handoff", "call-27c", Some("octos:local:tui#coding"));
+    old.mark_running(&task_id);
+    old.enable_persistence(&ledger_path).unwrap();
+
+    // Boot 2: a fresh supervisor (restart) — no live worker for the task.
+    // The sweep PARKS it, not fails it.
+    let restarted = TaskSupervisor::new();
+    restarted.enable_persistence(&ledger_path).unwrap();
+    let parked = restarted.get_task(&task_id).expect("task survived restart");
+    assert_eq!(parked.status, TaskStatus::Parked, "orphan must be Parked");
+    assert_eq!(parked.error.as_deref(), Some("orphaned across restart"));
+    assert!(
+        !parked.status.is_terminal(),
+        "Parked is re-attachable, not terminal"
+    );
+    assert!(
+        !parked.status.is_active(),
+        "Parked has no live worker in this process"
+    );
+
+    // Boot 3: the returning client re-attaches — mark_running revives the
+    // SAME task (Parked → Running) and drives it to completion.
+    restarted.mark_running(&task_id);
+    let revived = restarted.get_task(&task_id).expect("revived");
+    assert_eq!(
+        revived.status,
+        TaskStatus::Running,
+        "client re-attach revives Parked → Running"
+    );
+    restarted.mark_completed(&task_id, vec![]);
+    let done = restarted.get_task(&task_id).expect("done");
+    assert_eq!(
+        done.status,
+        TaskStatus::Completed,
+        "revived task completes normally"
+    );
+
+    // Red line 1: mark_parked on a terminal task is a no-op.
+    restarted.mark_parked(&task_id, "late park".into());
+    assert_eq!(
+        restarted.get_task(&task_id).unwrap().status,
+        TaskStatus::Completed,
+        "terminal tasks are never re-parked"
+    );
+
+    // Red line 2: a Parked task never fired the terminal-failure path —
+    // its runtime_state slot still reads the parked detail on the way
+    // through, and completion stamped completed_at only at the REAL end.
+    assert!(
+        done.completed_at.is_some(),
+        "completed_at stamps the real terminal"
+    );
+}
+
+// #21 (round-4, codex #17 B3) — the peer-task registration's FIRST durable
+// row carries the workspace stamp; a failed first write rolls the whole
+// registration back.
+
+/// Test ①: after the strict registration (and a simulated crash — a fresh
+/// supervisor over the same ledger), the restored task STILL carries the
+/// workspace scope. No second `set_workspace_root` write ever happened.
+#[test]
+fn peer_workspace_stamp_survives_restart_on_first_durable_row() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let ledger = temp.path().join("tasks.jsonl");
+    let supervisor = TaskSupervisor::new();
+    supervisor.enable_persistence(&ledger).expect("persistence");
+
+    let task_id = supervisor
+        .try_register_peer_with_workspace(
+            "peer_handoff",
+            "tenant:peer:alpha",
+            Some("tenant:api:master"),
+            Some("2f686f6d652f7773"),
+        )
+        .expect("strict registration succeeds");
+    let rows: Vec<PersistedTaskRecord> = std::fs::read_to_string(&ledger)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1, "registration must append exactly one row");
+    assert_eq!(
+        rows[0].task.workspace_root.as_deref(),
+        Some("2f686f6d652f7773"),
+        "a crash immediately after the first append must restore the stamp"
+    );
+    assert_eq!(
+        supervisor.get_task(&task_id).and_then(|t| t.workspace_root),
+        Some("2f686f6d652f7773".to_owned()),
+        "the stamp is on the in-memory row"
+    );
+    drop(supervisor);
+
+    // "Crash" + restart: the FIRST durable row already carried the scope.
+    let restored = TaskSupervisor::new();
+    restored.enable_persistence(&ledger).expect("restore");
+    assert_eq!(
+        restored.get_task(&task_id).and_then(|t| t.workspace_root),
+        Some("2f686f6d652f7773".to_owned()),
+        "the restored row keeps the workspace scope from the FIRST write"
+    );
+}
+
+/// Test ②: a failed first durable write returns
+/// `WorkspacePersistFailed` and leaves NO task row (no half-binding).
+#[test]
+fn peer_workspace_registration_rolls_back_on_failed_first_write() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let supervisor = TaskSupervisor::new();
+    let ledger = temp.path().join("tasks.jsonl");
+    supervisor.enable_persistence(&ledger).expect("persistence");
+    // enable_persistence with zero tasks never creates the ledger file —
+    // create it, then replace it with a directory → appends now fail.
+    std::fs::write(&ledger, "").unwrap();
+    std::fs::remove_file(&ledger).unwrap();
+    std::fs::create_dir_all(&ledger).unwrap();
+    let notifications = Arc::new(AtomicUsize::new(0));
+    let seen = notifications.clone();
+    supervisor.set_on_register(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let result = supervisor.try_register_peer_with_workspace(
+        "peer_handoff",
+        "tenant:peer:beta",
+        Some("tenant:api:master"),
+        Some("deadbeef"),
+    );
+    match result {
+        Err(RegisterTaskError::WorkspacePersistFailed { tool_call_id, .. }) => {
+            assert_eq!(tool_call_id, "tenant:peer:beta");
+        }
+        other => panic!("expected WorkspacePersistFailed, got {other:?}"),
+    }
+    assert_eq!(notifications.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read_dir(&ledger).unwrap().count(), 0);
+    let tasks: Vec<String> = supervisor
+        .tasks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        tasks.iter().all(|id| {
+            supervisor
+                .get_task(id)
+                .is_none_or(|t| t.tool_call_id != "tenant:peer:beta")
+        }),
+        "the rolled-back registration leaves no task row; tasks: {tasks:?}"
+    );
+}
+
+#[test]
+fn peer_workspace_registration_checks_first_write_even_without_scope() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let ledger = temp.path().join("tasks.jsonl");
+    let supervisor = TaskSupervisor::new();
+    supervisor.enable_persistence(&ledger).unwrap();
+    std::fs::create_dir(&ledger).unwrap();
+    assert!(matches!(
+        supervisor.try_register_peer_with_workspace("peer_handoff", "unstamped", None, None),
+        Err(RegisterTaskError::WorkspacePersistFailed { .. })
+    ));
+    assert!(supervisor.get_all_tasks().is_empty());
+}
+
+/// Test ③ (encoding side lives in octos-cli `peers` tests): two DIFFERENT
+/// scopes never alias — asserted here at the row level: distinct scopes
+/// produce distinct stamps, so the purge-side exact match cannot clear the
+/// other's items.
+#[test]
+fn distinct_workspace_scopes_stay_distinct_on_task_rows() {
+    let supervisor = TaskSupervisor::new();
+    let a = supervisor
+        .try_register_peer_with_workspace("peer_handoff", "t:peer:a", Some("t:api:m"), Some("aa"))
+        .expect("a registers");
+    let b = supervisor
+        .try_register_peer_with_workspace("peer_handoff", "t:peer:b", Some("t:api:m"), Some("bb"))
+        .expect("b registers");
+    assert_ne!(
+        supervisor.get_task(&a).and_then(|t| t.workspace_root),
+        supervisor.get_task(&b).and_then(|t| t.workspace_root),
+        "different workspace scopes stay different on the durable rows"
+    );
+}
+
+// #34: equal timestamps are possible for a registered task and its terminal
+// snapshot. Exercise durable merges with exact timestamps, without sleeps.
+fn terminal_timestamp_rows() -> (BackgroundTask, BackgroundTask) {
+    let supervisor = TaskSupervisor::new();
+    let id = supervisor
+        .try_register_peer_with_workspace(
+            "peer_handoff",
+            "timestamp-tie",
+            Some("tenant:api:timestamp"),
+            Some("/tmp/timestamp-ws"),
+        )
+        .unwrap();
+    let spawned = supervisor.get_task(&id).unwrap();
+    supervisor.mark_completed(&id, vec!["result.md".into()]);
+    let mut completed = supervisor.get_task(&id).unwrap();
+    completed.updated_at = spawned.updated_at;
+    completed.completed_at = Some(spawned.updated_at);
+    (spawned, completed)
+}
+
+fn write_terminal_timestamp_rows(path: &PathBuf, rows: &[BackgroundTask]) {
+    let body = rows
+        .iter()
+        .map(|task| {
+            serde_json::to_string(&PersistedTaskRecord {
+                schema_version: CURRENT_TASK_LEDGER_SCHEMA,
+                task: task.clone(),
+            })
+            .unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(path, format!("{body}\n")).unwrap();
+}
+
+#[test]
+fn terminal_timestamp_tie_restores_fast_stamped_completion() {
+    let (spawned, completed) = terminal_timestamp_rows();
+    for reverse in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.jsonl");
+        let rows = if reverse {
+            vec![completed.clone(), spawned.clone()]
+        } else {
+            vec![spawned.clone(), completed.clone()]
+        };
+        write_terminal_timestamp_rows(&path, &rows);
+        let restored = TaskSupervisor::new();
+        restored.enable_persistence(&path).unwrap();
+        let task = restored.get_task(&spawned.id).unwrap();
+        assert_eq!(task.status, TaskStatus::Completed, "reverse={reverse}");
+        assert_eq!(task.workspace_root, spawned.workspace_root);
+        assert_eq!(task.output_files, completed.output_files);
+        assert_eq!(task.updated_at, spawned.updated_at);
+    }
+}
+
+#[test]
+fn terminal_timestamp_tie_all_merge_sites_keep_ownership() {
+    let (spawned, completed) = terminal_timestamp_rows();
+    for mode in ["enable", "bulk", "single"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.jsonl");
+        let mut foreign = completed.clone();
+        foreign.id = "foreign-task".into();
+        write_terminal_timestamp_rows(&path, &[completed.clone(), foreign]);
+        let supervisor = TaskSupervisor::new();
+        supervisor
+            .tasks
+            .lock()
+            .unwrap()
+            .insert(spawned.id.clone(), spawned.clone());
+        if mode == "enable" {
+            supervisor.enable_persistence(&path).unwrap();
+        } else {
+            *supervisor.persistence_path.lock().unwrap() = Some(path.clone());
+            if mode == "bulk" {
+                assert_eq!(supervisor.refresh_from_persistence().unwrap(), 1);
+            } else {
+                supervisor
+                    .refresh_task_from_persistence(&spawned.id)
+                    .unwrap();
+            }
+            assert!(
+                supervisor
+                    .refresh_task_from_persistence("foreign-task")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                supervisor.get_task("foreign-task").is_none(),
+                "refresh must not import foreign IDs"
+            );
+        }
+        assert_eq!(
+            supervisor.get_task(&spawned.id).unwrap().status,
+            TaskStatus::Completed,
+            "{mode}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            2,
+            "no replay rewrite: {mode}"
+        );
+    }
+}
+
+#[test]
+fn terminal_timestamp_tie_respects_final_and_observer_authority() {
+    let (spawned, completed) = terminal_timestamp_rows();
+    let mut observed = completed.clone();
+    observed.status = TaskStatus::Failed;
+    observed.runtime_state = TaskRuntimeState::Failed;
+    observed.failed_by_observer = true;
+    let mut owner_failed = observed.clone();
+    owner_failed.failed_by_observer = false;
+    let mut cancelled = completed.clone();
+    cancelled.status = TaskStatus::Cancelled;
+    cancelled.runtime_state = TaskRuntimeState::Cancelled;
+    let mut parked = spawned.clone();
+    parked.status = TaskStatus::Parked;
+    let mut older_completed = completed.clone();
+    older_completed.updated_at -= chrono::Duration::nanoseconds(1);
+    let mut newer_spawned = spawned.clone();
+    newer_spawned.updated_at += chrono::Duration::nanoseconds(1);
+    for (existing, candidate, expected) in [
+        (observed.clone(), completed.clone(), completed.clone()),
+        (
+            owner_failed.clone(),
+            completed.clone(),
+            owner_failed.clone(),
+        ),
+        (cancelled.clone(), completed.clone(), cancelled),
+        (observed, owner_failed.clone(), owner_failed.clone()),
+        (
+            owner_failed.clone(),
+            {
+                let mut row = owner_failed.clone();
+                row.failed_by_observer = true;
+                row
+            },
+            owner_failed,
+        ),
+        (parked, completed.clone(), completed.clone()),
+        (spawned.clone(), older_completed, spawned.clone()),
+        (completed.clone(), newer_spawned.clone(), newer_spawned),
+        (completed.clone(), spawned, completed),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.jsonl");
+        write_terminal_timestamp_rows(&path, &[existing.clone(), candidate.clone()]);
+        let rows = TaskSupervisor::load_persisted_tasks(&path).unwrap();
+        let actual = &rows[&existing.id];
+        assert_eq!(
+            (
+                actual.status.clone(),
+                actual.failed_by_observer,
+                actual.updated_at
+            ),
+            (
+                expected.status,
+                expected.failed_by_observer,
+                expected.updated_at
+            ),
+            "existing={:?}/{} candidate={:?}/{}",
+            existing.status,
+            existing.failed_by_observer,
+            candidate.status,
+            candidate.failed_by_observer
+        );
+    }
 }

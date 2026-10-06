@@ -81,7 +81,7 @@ The complete configuration structure with all available fields:
   // Adaptive routing
   "adaptive_routing": {
     "enabled": false,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -115,6 +115,13 @@ The complete configuration structure with all available fields:
       "provider": "deepseek",
       "model": "deepseek-chat",
       "description": "Fast model for simple tasks"
+    },
+    // Z.AI GLM lane — api_key_env omitted, defaults to ZAI_API_KEY
+    {
+      "key": "zai",
+      "provider": "zai",
+      "model": "glm-5.2",
+      "description": "Z.AI GLM 5.2 lane (1M context)"
     }
   ],
 
@@ -130,14 +137,19 @@ The complete configuration structure with all available fields:
     "model": null,       // default text-embedding-3-small (1536 dims)
     "dimensions": null   // pin the output size when the model's native size differs
   },
-  // ...or in-process, no API key, any GGUF model over llama.cpp. Needs a
-  // build with `--features embed-llama` (add embed-llama-metal / -cuda to
-  // offload); CPU otherwise. Changing provider or model changes the vector
-  // DIMENSION, which invalidates a populated index — re-embed stored
-  // episodes after switching, or their recall silently degrades to BM25.
+  // ...or in-process over llama.cpp (the DEFAULT when this section is
+  // omitted): EmbeddingGemma-300M Q8_0 is fetched once into
+  // <data_dir>/models/ (334 MB, Gemma Terms of Use — see
+  // docs/THIRD_PARTY_MODELS.md) and used with no API key. `model_path`
+  // points at any other GGUF; `auto_download: false` (or
+  // OCTOS_NO_MODEL_DOWNLOAD=1) keeps memory keyword-only until a model is
+  // supplied. Builds add embed-llama-metal / -cuda to offload; CPU otherwise.
+  // Changing provider or model changes the vector DIMENSION, which
+  // invalidates a populated index — re-embed after switching.
   // "embedding": {
   //   "provider": "llamacpp",
-  //   "model_path": "/path/to/embeddinggemma-300M-Q8_0.gguf"
+  //   "model_path": "/path/to/other-model.gguf",
+  //   "auto_download": true
   // },
 
   // Voice
@@ -372,6 +384,13 @@ like Robrix render native Approve/Deny buttons, others show a text fallback):
 | Variable | Description |
 |----------|-------------|
 | `OMINIX_API_URL` | OminiX ASR/TTS API URL |
+
+### Session Storage
+
+| Variable | Description |
+|----------|-------------|
+| `OCTOS_SESSION_SEGMENT_BYTES` | Active session file size at which it seals into a segment (default 8 MiB) |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | Session history bytes a plain load reads, newest first (default 32 MiB; `0` = unlimited) |
 
 ### System
 

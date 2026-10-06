@@ -1850,6 +1850,11 @@ fn soffice_env() -> Result<Vec<(String, String)>> {
     Ok(env)
 }
 
+/// Guidance appended when soffice cannot be spawned (#2414).
+const SOFFICE_MISSING_HINT: &str = "LibreOffice (soffice) is required for this command; \
+     install it (apt install libreoffice / brew install --cask libreoffice) and \
+     ensure 'soffice' is on PATH";
+
 /// Run soffice with sandbox-safe environment.
 fn run_soffice_cmd(args: &[&str], timeout_secs: Option<u32>) -> Result<std::process::Output> {
     let env = soffice_env()?;
@@ -1886,12 +1891,32 @@ fn run_soffice_cmd(args: &[&str], timeout_secs: Option<u32>) -> Result<std::proc
             for (k, v) in &env {
                 timeout_cmd.env(k, v);
             }
-            return timeout_cmd
-                .output()
-                .wrap_err("failed to run soffice via timeout");
+            return timeout_cmd.output().wrap_err_with(|| {
+                format!("failed to run soffice via timeout — {SOFFICE_MISSING_HINT}")
+            });
         }
     }
-    cmd.output().wrap_err("failed to run soffice")
+    cmd.output()
+        .wrap_err_with(|| format!("failed to run soffice — {SOFFICE_MISSING_HINT}"))
+}
+
+/// Diagnostic for a soffice run that exited without producing the PDF: its
+/// stderr is usually the only signal, and some failures exit 0 without
+/// writing one, so an empty stream must not dead-end on a bare colon (#2414).
+fn pdf_conversion_failure_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!(
+            "soffice failed to convert to PDF ({}): no diagnostic output",
+            output.status
+        )
+    } else {
+        format!(
+            "soffice failed to convert to PDF ({}): {stderr}",
+            output.status
+        )
+    }
 }
 
 /// Set up a LibreOffice macro in a profile directory.
@@ -2613,8 +2638,7 @@ fn cmd_thumbnail(file: &Path, output_prefix: &str, cols: u32) -> Result<()> {
 
     let pdf_path = temp_dir.path().join("input.pdf");
     if !pdf_path.exists() {
-        let stderr = String::from_utf8_lossy(&pdf_output.stderr);
-        bail!("soffice failed to convert to PDF: {stderr}");
+        bail!("{}", pdf_conversion_failure_message(&pdf_output));
     }
 
     // pdftoppm -jpeg -r DPI pdf prefix
@@ -3482,5 +3506,35 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_package(tmp.path(), "//xl/worksheet.xml", true);
         assert!(cmd_validate(tmp.path(), false).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pdf_conversion_failure_message_falls_back_when_stderr_empty() {
+        // #2414 — some soffice failures exit 0 without writing the PDF and
+        // print nothing; the message must not dead-end on a bare colon.
+        use std::os::unix::process::ExitStatusExt;
+
+        let silent = std::process::Output {
+            status: ExitStatusExt::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let message = pdf_conversion_failure_message(&silent);
+        assert!(
+            message.contains("no diagnostic output"),
+            "empty stderr must fall back to a named cause: {message}"
+        );
+
+        let loud = std::process::Output {
+            status: ExitStatusExt::from_raw(0),
+            stdout: Vec::new(),
+            stderr: b"Error: source file could not be loaded".to_vec(),
+        };
+        let message = pdf_conversion_failure_message(&loud);
+        assert!(
+            message.contains("source file could not be loaded"),
+            "stderr must be surfaced verbatim: {message}"
+        );
     }
 }

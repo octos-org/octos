@@ -9,8 +9,9 @@
 //! are treated as version 1 during reads so a future backfill can import legacy
 //! observations idempotently before a migration tightens the schema.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
@@ -57,6 +58,34 @@ pub struct UsageEvent {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// Prompt tokens served from the provider's cache (Anthropic
+    /// `cache_read_input_tokens`, OpenAI/DeepSeek automatic
+    /// `prompt_tokens_details.cached_tokens`).
+    ///
+    /// Disjoint from `input_tokens` — providers report the cached portion
+    /// INSIDE their prompt total, but `TokenUsage` subtracts it at the
+    /// provider boundary, so the full prompt is `input_tokens +
+    /// cache_read_tokens`. Recorded so cache effectiveness is answerable
+    /// after the fact instead of only from a live API probe.
+    ///
+    /// `#[serde(default)]`: ledger records written before this field
+    /// existed decode as 0, which is indistinguishable from a genuinely
+    /// uncached run and needs no migration.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Prompt tokens WRITTEN to the provider's cache (Anthropic
+    /// `cache_creation_input_tokens`). Disjoint from `input_tokens` and
+    /// `cache_read_tokens` under the same `TokenUsage` contract — the full
+    /// prompt is `input + cache_read + cache_write`. Cache writes bill at a
+    /// 1.25x premium on the input rate, so without this field the ledger
+    /// could answer the cache-READ half of a caching experiment but never
+    /// the write-side cost it paid for it.
+    ///
+    /// `#[serde(default)]`: rows written before this field existed decode
+    /// as 0 — indistinguishable from a run with no cache writes, so no
+    /// migration is needed.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
     #[serde(default)]
@@ -95,11 +124,32 @@ impl UsageEvent {
             base_url,
             input_tokens,
             output_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             estimated_cost_usd,
             cost_source,
             channel: channel.into(),
             attribution,
         }
+    }
+
+    /// Record the cache-served portion of this run's prompt.
+    ///
+    /// A builder rather than a 13th positional argument: [`Self::completed_run`]
+    /// is already `#[allow(clippy::too_many_arguments)]`, and most call sites
+    /// have no cache figure to contribute. Those keep the default of 0.
+    #[must_use]
+    pub fn with_cache_read_tokens(mut self, cache_read_tokens: u64) -> Self {
+        self.cache_read_tokens = cache_read_tokens;
+        self
+    }
+
+    /// Record the cache-write portion of this run's prompt. Same builder
+    /// shape (and rationale) as [`Self::with_cache_read_tokens`].
+    #[must_use]
+    pub fn with_cache_write_tokens(mut self, cache_write_tokens: u64) -> Self {
+        self.cache_write_tokens = cache_write_tokens;
+        self
     }
 }
 
@@ -116,6 +166,15 @@ pub struct UsageTotals {
     pub run_count: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache-served prompt tokens, disjoint from `input_tokens` (see
+    /// [`UsageEvent::cache_read_tokens`]). Zero across a whole session
+    /// means every round paid full price for its prefix.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Cache-WRITTEN prompt tokens (see [`UsageEvent::cache_write_tokens`]),
+    /// the 1.25x-premium side of the same ledger dimension.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub estimated_cost_usd: f64,
 }
 
@@ -124,6 +183,12 @@ impl UsageTotals {
         self.run_count = self.run_count.saturating_add(1);
         self.input_tokens = self.input_tokens.saturating_add(event.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(event.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(event.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(event.cache_write_tokens);
         if let Some(cost) = event.estimated_cost_usd {
             self.estimated_cost_usd += cost;
         }
@@ -133,6 +198,12 @@ impl UsageTotals {
         self.run_count = self.run_count.saturating_add(other.run_count);
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
         self.estimated_cost_usd += other.estimated_cost_usd;
     }
 }
@@ -252,6 +323,35 @@ pub struct UsageBackfillReport {
 #[derive(Clone)]
 pub struct PersistentUsageLedger {
     path: PathBuf,
+}
+
+/// How long an open waits out a competing holder of the ledger file before
+/// giving up, and how often it retries while waiting. The budget bounds the
+/// tail latency callers trade for not dropping their event; a long
+/// `backfill_events` or analytics scan in the holding process can consume
+/// most of it.
+const MAX_OPEN_WAIT: Duration = Duration::from_secs(5);
+const OPEN_RETRY_BACKOFF: Duration = Duration::from_millis(5);
+
+/// One open serializer per ledger file directory (see
+/// [`PersistentUsageLedger::open_database`]). Per-directory keys keep a busy
+/// profile's retry loop from queueing unrelated profiles' opens behind it;
+/// redb serializes writers per file anyway, so one waiter at a time per file
+/// costs no throughput. The map grows one entry per profile data dir.
+fn open_serializer(db_path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static OPEN_SERIALIZERS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    // The ledger file may not exist yet on first open, but its directory
+    // does (`open_sync` creates it) and every ledger file carries the same
+    // name — so the directory identifies the file.
+    let dir = db_path.parent().unwrap_or(db_path).to_path_buf();
+    let key = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let mut serializers = OPEN_SERIALIZERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    serializers.entry(key).or_default().clone()
 }
 
 impl PersistentUsageLedger {
@@ -386,15 +486,60 @@ impl PersistentUsageLedger {
         Ok(UsageAnalytics::from_events(&events).totals)
     }
 
+    /// Opening the ledger takes an exclusive redb file lock, and handles are
+    /// opened per call — so two overlapping operations (concurrent turn
+    /// completions in one process, or the serve daemon racing a gateway
+    /// subprocess on the same profile ledger) make the loser fail with
+    /// `DatabaseAlreadyOpen` and its caller drops the event (#2391). Wait
+    /// out the holder — even a several-second backfill or analytics scan —
+    /// and surface the error only once [`MAX_OPEN_WAIT`] is exhausted, the
+    /// trade being bounded tail latency on the waiting operation instead of
+    /// a silently lost billing event. Every other open error bubbles up
+    /// immediately.
     fn open_database(db_path: &Path) -> Result<Database> {
-        let db = Database::create(db_path).wrap_err("failed to open usage ledger database")?;
-        let write_txn = db.begin_write()?;
-        {
-            let _ = write_txn.open_table(USAGE_EVENTS_TABLE)?;
-            let _ = write_txn.open_table(USAGE_PROFILE_INDEX_TABLE)?;
-            let _ = write_txn.open_table(USAGE_SESSION_INDEX_TABLE)?;
+        // Serialize opens per file. `Database::create` uses a non-blocking
+        // lock attempt, so N concurrent openers retry on aligned wakeups and
+        // can starve while a fresh winner emerges each beat; one waiter at a
+        // time turns the burst into a queue that wins as soon as the current
+        // holder closes. (Poison-tolerant: an open that panicked while
+        // holding this must not permanently disable usage recording.)
+        let serializer = open_serializer(db_path);
+        let _open_serializer = serializer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = Instant::now() + MAX_OPEN_WAIT;
+        let db = loop {
+            match Database::create(db_path) {
+                Ok(db) => break db,
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) if Instant::now() < deadline => {
+                    std::thread::sleep(OPEN_RETRY_BACKOFF);
+                }
+                Err(e) => {
+                    return Err(
+                        eyre::Report::new(e).wrap_err("failed to open usage ledger database")
+                    );
+                }
+            }
+        };
+        // `open_table` inside a write transaction creates missing tables,
+        // which a fresh file needs exactly once; redoing that transaction on
+        // every call costs a no-op commit per record. Pay it only when the
+        // tables are not there yet.
+        let needs_init = {
+            let read_txn = db.begin_read()?;
+            read_txn.open_table(USAGE_EVENTS_TABLE).is_err()
+                || read_txn.open_table(USAGE_PROFILE_INDEX_TABLE).is_err()
+                || read_txn.open_table(USAGE_SESSION_INDEX_TABLE).is_err()
+        };
+        if needs_init {
+            let write_txn = db.begin_write()?;
+            {
+                let _ = write_txn.open_table(USAGE_EVENTS_TABLE)?;
+                let _ = write_txn.open_table(USAGE_PROFILE_INDEX_TABLE)?;
+                let _ = write_txn.open_table(USAGE_SESSION_INDEX_TABLE)?;
+            }
+            write_txn.commit()?;
         }
-        write_txn.commit()?;
         Ok(db)
     }
 
@@ -498,6 +643,136 @@ fn event_matches_query(event: &UsageEvent, query: &UsageQuery) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache_event(input_tokens: u64, cache_read_tokens: u64) -> UsageEvent {
+        UsageEvent::completed_run(
+            "p",
+            "s",
+            "r",
+            None,
+            None,
+            None,
+            input_tokens,
+            10,
+            None,
+            UsageCostSource::Unavailable,
+            "test",
+            None,
+        )
+        .with_cache_read_tokens(cache_read_tokens)
+    }
+
+    #[test]
+    fn should_default_cache_read_tokens_to_zero_when_not_set() {
+        let event = cache_event(100, 0);
+        assert_eq!(event.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn should_accumulate_cache_read_tokens_across_events() {
+        let mut totals = UsageTotals::default();
+        totals.add_event(&cache_event(100, 0)); // cold: whole prefix billed
+        totals.add_event(&cache_event(5, 95)); // warm: prefix served from cache
+        assert_eq!(totals.input_tokens, 105);
+        assert_eq!(totals.cache_read_tokens, 95);
+    }
+
+    #[test]
+    fn should_carry_cache_read_tokens_through_merge() {
+        let mut left = UsageTotals::default();
+        left.add_event(&cache_event(10, 40));
+        let mut right = UsageTotals::default();
+        right.add_event(&cache_event(20, 60));
+        left.merge(&right);
+        assert_eq!(left.cache_read_tokens, 100);
+    }
+
+    /// Records written before `cache_read_tokens` existed must keep decoding.
+    /// `#[serde(default)]` is what makes this a no-migration change, so it is
+    /// worth pinning rather than trusting.
+    #[test]
+    fn should_decode_pre_cache_field_records_as_zero() {
+        let legacy = serde_json::json!({
+            "schema_version": USAGE_EVENT_SCHEMA_VERSION,
+            "event_id": "e1",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "profile_id": "p",
+            "session_id": "s",
+            "run_id": "r",
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "cost_source": "unavailable",
+            "channel": "test"
+        });
+        let decoded: UsageEvent = serde_json::from_value(legacy).expect("legacy record decodes");
+        assert_eq!(decoded.cache_read_tokens, 0);
+        assert_eq!(decoded.input_tokens, 100);
+    }
+
+    /// Rows written before `cache_write_tokens` existed (including rows that
+    /// DO carry `cache_read_tokens` — the shape every deployment wrote
+    /// between the two fields landing) must keep decoding, with the write
+    /// side defaulting to 0.
+    #[test]
+    fn should_decode_rows_predating_cache_write_field_as_zero_writes() {
+        let pre_cache_write = serde_json::json!({
+            "schema_version": USAGE_EVENT_SCHEMA_VERSION,
+            "event_id": "e2",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "profile_id": "p",
+            "session_id": "s",
+            "run_id": "r",
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "cache_read_tokens": 640,
+            "cost_source": "unavailable",
+            "channel": "test"
+        });
+        let decoded: UsageEvent =
+            serde_json::from_value(pre_cache_write).expect("pre-cache-write record decodes");
+        assert_eq!(decoded.cache_write_tokens, 0);
+        assert_eq!(decoded.cache_read_tokens, 640);
+        assert_eq!(decoded.input_tokens, 100);
+    }
+
+    #[test]
+    fn should_round_trip_cache_write_tokens_when_recorded() {
+        let event = UsageEvent::completed_run(
+            "p",
+            "s",
+            "r",
+            None,
+            None,
+            None,
+            100,
+            10,
+            None,
+            UsageCostSource::Unavailable,
+            "test",
+            None,
+        )
+        .with_cache_read_tokens(10_000)
+        .with_cache_write_tokens(2_000);
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["cache_write_tokens"], 2_000);
+        let decoded: UsageEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, event);
+        assert_eq!(decoded.cache_write_tokens, 2_000);
+    }
+
+    #[test]
+    fn should_accumulate_cache_write_tokens_across_events_and_merges() {
+        let mut totals = UsageTotals::default();
+        totals.add_event(&cache_event(10, 40).with_cache_write_tokens(15));
+        totals.add_event(&cache_event(20, 55).with_cache_write_tokens(25));
+        assert_eq!(totals.cache_write_tokens, 40);
+
+        let mut other = UsageTotals::default();
+        other.add_event(&cache_event(5, 5).with_cache_write_tokens(60));
+        totals.merge(&other);
+        assert_eq!(totals.cache_write_tokens, 100);
+        assert_eq!(totals.cache_read_tokens, 100);
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn event(
@@ -689,6 +964,111 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].schema_version, USAGE_EVENT_SCHEMA_VERSION);
         assert_eq!(events[0].input_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn record_retries_while_another_opener_holds_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A second opener mid-operation — another in-flight record in this
+        // process, or the serve daemon racing a gateway turn completion —
+        // holds the exclusive redb lock while our record wants to open the
+        // file. The record must wait it out instead of dropping the event.
+        let holder = Database::create(dir.path().join(USAGE_LEDGER_FILE)).unwrap();
+        let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
+        let recording = {
+            let ledger = ledger.clone();
+            tokio::spawn(async move {
+                ledger
+                    .record(event(
+                        "profile-a",
+                        "session-a",
+                        "run-1",
+                        "openai",
+                        "gpt-4.1",
+                        "2026-05-30",
+                        100,
+                        40,
+                        0.012,
+                        "appui",
+                    ))
+                    .await
+            })
+        };
+        // Release the lock while the record is still in flight. Wide
+        // enough that the spawned record reliably starts (and hits the
+        // held lock) even on a loaded CI runner.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        drop(holder);
+
+        recording.await.unwrap().unwrap();
+        assert_eq!(
+            ledger.session_totals("session-a").await.unwrap().run_count,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn open_gives_up_and_surfaces_the_error_once_the_budget_is_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        // A holder that never releases within the budget: the open must
+        // surface the lock error (and the record must be lost) instead of
+        // waiting forever — the caller's warn-and-drop contract.
+        let holder = Database::create(dir.path().join(USAGE_LEDGER_FILE)).unwrap();
+        let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
+        let error = ledger
+            .record(event(
+                "profile-a",
+                "session-a",
+                "run-1",
+                "openai",
+                "gpt-4.1",
+                "2026-05-30",
+                100,
+                40,
+                0.012,
+                "appui",
+            ))
+            .await
+            .expect_err("record must fail once the open budget is exhausted");
+        drop(holder);
+        assert!(
+            error
+                .root_cause()
+                .to_string()
+                .contains("Database already open"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(ledger.list_all().await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_records_all_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = PersistentUsageLedger::open(dir.path()).await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..32 {
+            let ledger = ledger.clone();
+            tasks.spawn(async move {
+                ledger
+                    .record(event(
+                        "profile-a",
+                        "session-a",
+                        &format!("run-{i}"),
+                        "openai",
+                        "gpt-4.1",
+                        "2026-05-30",
+                        10,
+                        4,
+                        0.001,
+                        "appui",
+                    ))
+                    .await
+            });
+        }
+        while let Some(recording) = tasks.join_next().await {
+            recording.unwrap().unwrap();
+        }
+        assert_eq!(ledger.list_all().await.unwrap().len(), 32);
     }
 
     fn rollup<'a>(rollups: &'a [UsageRollup], key: &str) -> &'a UsageTotals {

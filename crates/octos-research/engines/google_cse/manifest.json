@@ -1,0 +1,21 @@
+{
+  "id": "google_cse",
+  "name": "Google (Programmable Search)",
+  "categories": ["general"],
+  "languages": ["*"],
+  "hosts": ["cse.google.com"],
+  "results_page": true,
+  "renders": true,
+  "needs_key": true,
+  "auth": {"query": {"name": "cx"}},
+  "key_env": "OCTOS_GOOGLE_CSE_CX",
+  "rate_limit": {
+    "min_interval_ms": 3000,
+    "source": "No published limit for the hosted search page; kept to a person's pace."
+  },
+  "docs_url": ["https://developers.google.com/custom-search/docs/element", "https://support.google.com/programmable-search/answer/4513751"],
+  "license_note": "Google results through the person's own Programmable Search Engine (its public page, rendered in the person's browser). Needs the engine's ID (`cx`, OCTOS_GOOGLE_CSE_CX), created at programmablesearchengine.google.com and set to search the entire web. Titles, snippets and links only.",
+  "weight": 1.3,
+  "cache_ttl_secs": 900,
+  "timeout_secs": 20
+}

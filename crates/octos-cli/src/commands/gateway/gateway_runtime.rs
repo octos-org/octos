@@ -40,6 +40,7 @@ use crate::persona_service::PersonaService;
 use crate::profiles::UserProfile;
 use crate::qos_catalog::{ExporterMode, build_adaptive_provider_chain};
 use crate::runtime::ProfileRuntime;
+use crate::runtime::session::UNATTENDED_MAX_ITERATIONS_FALLBACK;
 use crate::session_actor::{
     ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
 };
@@ -362,6 +363,15 @@ impl GatewayRuntime {
             config.hooks = resolved.config.hooks.clone();
             config.memory = resolved.config.memory.clone();
             config.approval_policy = resolved.config.approval_policy.clone();
+            // #2217: thread the inherited tool_policy too — the ConfigWatcher
+            // seed (below) is this flattened `config`, while `parse_first`
+            // re-layers defaults on every edit; a mismatch here would make a
+            // tool_policy-only defaults inheritance look like a policy edit
+            // and emit a spurious restart-required signal. ProfileRuntime
+            // already enforces the resolved policy, so this only aligns the
+            // seed with what runs. Pinned by
+            // config_watcher::tests::inherited_tool_policy_does_not_spuriously_restart_on_unrelated_edit.
+            config.tool_policy = resolved.config.tool_policy.clone();
             // OR-merge signing so neither the env-forced host policy (already
             // merged into `config.plugins` above) nor a defaults signing floor
             // is dropped.
@@ -551,6 +561,18 @@ impl GatewayRuntime {
             );
             eprintln!("[gateway] memory store opened");
             store
+        };
+        let recall: Arc<octos_memory::RecallStore> = if let Some(rt) = profile_runtime.as_ref() {
+            rt.recall.clone()
+        } else {
+            let embedder_for_recall = create_embedder(&config);
+            crate::runtime::profile::open_recall_store(
+                &data_dir,
+                &config,
+                embedder_for_recall.as_deref(),
+            )
+            .await
+            .wrap_err("failed to open recall store")?
         };
 
         // Derive project_dir from octos_home (when launched by process_manager)
@@ -1175,7 +1197,18 @@ impl GatewayRuntime {
             }
 
             // Memory bank tools
-            tools.register(octos_agent::RecallMemoryTool::new(memory_store.clone()));
+            tools.register(
+                octos_agent::RecallMemoryTool::new(memory_store.clone())
+                    .with_recall(recall.clone(), gateway_embedder.clone()),
+            );
+            tools.register(octos_agent::MemorySearchTool::new(
+                recall.clone(),
+                gateway_embedder.clone(),
+            ));
+            tools.register(octos_agent::MemoryLoadTool::new(
+                recall.clone(),
+                memory_store.clone(),
+            ));
             tools.register(octos_agent::SaveMemoryTool::new(memory_store.clone()));
             tools.register(octos_agent::RecordMemoryUseTool::new(memory_store.clone()));
             if crate::config::MemoryConfig::refresh_enabled(config.memory.as_ref()) {
@@ -1262,7 +1295,8 @@ impl GatewayRuntime {
         let system_prompt = Arc::new(std::sync::RwLock::new(system_prompt));
 
         // Build agent config (shared by all per-session agents)
-        let max_iterations = cmd.max_iterations.or(config.max_iterations).unwrap_or(50);
+        let max_iterations =
+            resolve_gateway_max_iterations(cmd.max_iterations, config.max_iterations);
         let session_timeout_secs = gw_config
             .session_timeout_secs
             .unwrap_or(octos_agent::DEFAULT_SESSION_TIMEOUT_SECS);
@@ -1276,6 +1310,8 @@ impl GatewayRuntime {
             // can run up to 30 minutes without the agent loop aborting early.
             max_timeout: Some(std::time::Duration::from_secs(session_timeout_secs)),
             chat_max_tokens: gw_config.max_output_tokens,
+            chat_temperature: gw_config.llm_temperature,
+            chat_sampling_params: gw_config.llm_sampling_params.clone(),
             reasoning_effort: gw_config.reasoning_effort,
             // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md): config-driven
             // human-approval rules gate matching tool calls behind a
@@ -1411,6 +1447,7 @@ impl GatewayRuntime {
             // threads the profile's `lane_routing` field.
             lane_routing: None,
             memory_store: Some(memory_store.clone()),
+            recall: Some(recall.clone()),
             // Codex round-2 MAJOR 3 (PR #1327 review): the top-level
             // gateway actor factory is the "admin" path that dispatches
             // by detected profile through `profile_factory.rs`. It
@@ -1452,6 +1489,7 @@ impl GatewayRuntime {
                     tool_config: tool_config.clone(),
                     memory: memory.clone(),
                     memory_store: memory_store.clone(),
+                    recall: recall.clone(),
                     agent_config: actor_factory.agent_config.clone(),
                     session_mgr: session_mgr.clone(),
                     out_tx: out_tx.clone(),
@@ -2265,9 +2303,47 @@ impl GatewayRuntime {
     }
 }
 
+/// Resolve the gateway agent iteration budget: the CLI flag, then
+/// `gateway.max_iterations`, then [`UNATTENDED_MAX_ITERATIONS_FALLBACK`].
+///
+/// The gateway is an unattended lane, so an unset budget must never inherit
+/// the unlimited interactive `AgentConfig` default (see the constant's docs).
+fn resolve_gateway_max_iterations(cli: Option<u32>, configured: Option<u32>) -> u32 {
+    cli.or(configured)
+        .unwrap_or(UNATTENDED_MAX_ITERATIONS_FALLBACK)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_fall_back_to_finite_unattended_cap_when_gateway_max_iterations_unset() {
+        assert_eq!(
+            resolve_gateway_max_iterations(Some(7), Some(120)),
+            7,
+            "the CLI flag wins over config"
+        );
+        assert_eq!(resolve_gateway_max_iterations(None, Some(120)), 120);
+        assert_eq!(
+            resolve_gateway_max_iterations(None, Some(0)),
+            0,
+            "an explicit 0 keeps its documented unlimited meaning"
+        );
+        // The gateway is an UNATTENDED lane: no operator can interrupt a loop
+        // that keeps emitting progress, so unset must resolve to a concrete
+        // finite backstop rather than inherit the unlimited interactive
+        // `AgentConfig` default.
+        assert_eq!(resolve_gateway_max_iterations(None, None), 50);
+        assert_eq!(
+            resolve_gateway_max_iterations(None, None),
+            UNATTENDED_MAX_ITERATIONS_FALLBACK
+        );
+        assert_ne!(
+            resolve_gateway_max_iterations(None, None),
+            AgentConfig::default().max_iterations
+        );
+    }
 
     #[test]
     fn should_resolve_forwarded_host_asr_default_for_profile_gateway() {

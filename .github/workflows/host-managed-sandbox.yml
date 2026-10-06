@@ -1,0 +1,51 @@
+name: Host-managed agent confinement
+
+on:
+  push:
+    branches: [main]
+    paths: ['crates/octos-cli/**', 'crates/octos-agent/**', 'crates/octos-core/**', 'crates/octos-llm/**', 'crates/octos-memory/**', 'crates/octos-sandbox/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/host-managed-sandbox.yml', 'scripts/setup-host-managed-linux-ci.sh']
+  pull_request:
+    paths: ['crates/octos-cli/**', 'crates/octos-agent/**', 'crates/octos-core/**', 'crates/octos-llm/**', 'crates/octos-memory/**', 'crates/octos-sandbox/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/host-managed-sandbox.yml', 'scripts/setup-host-managed-linux-ci.sh']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-managed-sandbox-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  confinement:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux sandbox prerequisites
+        if: runner.os == 'Linux'
+        run: bash scripts/setup-host-managed-linux-ci.sh
+      - name: Run actual kernel escape probes
+        run: cargo test -p octos-sandbox --test host_managed --locked
+      - name: Validate host protocol and memory-only storage
+        run: |
+          cargo test -p octos-llm --lib host:: --locked
+          cargo test -p octos-memory --lib in_memory_stores_are_functional_and_isolated --locked
+      - name: Validate host-managed protocol without ordinary runtime features
+        run: cargo test -p octos-cli --no-default-features --lib commands::acp --locked
+      - name: Validate ordinary ACP and host-managed mode together
+        run: |
+          cargo test -p octos-cli --no-default-features --features api --lib commands::acp --locked
+          cargo test -p octos-cli --no-default-features --features api --test acp_integration --locked
+      - name: Build actual host-managed worker
+        run: cargo build -p octos-cli --no-default-features --locked
+      - name: Run confined Octos model and tool turns
+        run: OCTOS_HOST_MANAGED_BINARY="$PWD/target/debug/octos" cargo test -p octos-sandbox --test host_managed --locked

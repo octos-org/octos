@@ -6,7 +6,7 @@ on:
       ref:
         description: 'Branch or tag to build'
         required: false
-        default: 'fix/pipeline-stream-errors'
+        default: 'main'
 
 permissions:
   contents: read
@@ -29,6 +29,13 @@ jobs:
         run: |
           echo "OCTOS_GIT_HASH=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "OCTOS_BUILD_DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_ENV"
+          # Keep build-machine paths (home dir, cargo registry, checkout) out
+          # of the shipped binaries' panic messages and file!() strings.
+          home_dir="$HOME"; cargo_dir="${CARGO_HOME:-$HOME/.cargo}"; ws_dir="$GITHUB_WORKSPACE"
+          if command -v cygpath >/dev/null 2>&1; then
+            home_dir=$(cygpath -w "$home_dir"); cargo_dir=$(cygpath -w "$cargo_dir"); ws_dir=$(cygpath -w "$ws_dir")
+          fi
+          echo "RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=${home_dir}=~ --remap-path-prefix=${cargo_dir}=/cargo --remap-path-prefix=${ws_dir}=." >> "$GITHUB_ENV"
 
       - name: Build octos CLI and sandbox helper
         run: |

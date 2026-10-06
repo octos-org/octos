@@ -219,7 +219,7 @@ fn unsupported_fallback_result(args: &Value, questions: &[UserQuestion]) -> Tool
             "body": body,
             "request": args,
             "answers": null,
-            "message": "User question recorded; no synchronous host response channel is attached to this runtime."
+            "message": "User question recorded in the transcript; no synchronous host response channel is attached to this runtime (non-interactive or unattended run). Do NOT wait or re-ask: pick the option you would recommend, state that assumption in one line, and continue the task so the user can redirect you later if needed."
         })
         .to_string(),
         success: true,
@@ -707,5 +707,26 @@ mod tests {
             header.chars().count()
         );
         assert_eq!(header, &clamp_header("Favorite Color"));
+    }
+
+    /// #2134: the degraded result must TELL the model to proceed — the
+    /// observed failure was a model that asked, got the fallback, and
+    /// stalled anyway because nothing said "do not wait".
+    #[test]
+    fn should_instruct_model_to_proceed_when_no_response_channel() {
+        let args = serde_json::json!({"questions": [{
+            "header": "Scope",
+            "question": "CPU only, or CUDA too?",
+            "options": [{"label": "CPU"}, {"label": "CUDA"}],
+        }]});
+        let questions = parse_questions(&args).unwrap();
+        let result = unsupported_fallback_result(&args, &questions);
+        assert!(result.success);
+        assert!(
+            result.output.contains("Do NOT wait"),
+            "fallback must instruct the model to continue: {}",
+            result.output
+        );
+        assert!(result.output.contains("redirect you later"));
     }
 }

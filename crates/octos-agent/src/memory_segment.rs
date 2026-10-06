@@ -11,9 +11,14 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use octos_memory::MemoryStore;
+use octos_llm::EmbeddingProvider;
+use octos_memory::{MemoryStore, RecallStore};
 
 use crate::agent::PromptSegmentProvider;
+
+/// Bank rows injected per turn when relevance ranking is active: the
+/// MemoryOS optimum of ~10 pages plus headroom for the stable core.
+pub const RANKED_BANK_ROWS: usize = 12;
 
 /// Name of the named prompt segment carrying the memory block.
 pub const MEMORY_SEGMENT_NAME: &str = "memory";
@@ -79,6 +84,9 @@ struct Fingerprint {
     bank_dir: Option<SystemTime>,
     /// Local date — daily-note windows shift at midnight.
     date: String,
+    /// Relevance-ranked bank slugs for this turn (empty when ranking is
+    /// off or the query matched nothing); a change re-renders the block.
+    ranked: Vec<String>,
 }
 
 /// [`PromptSegmentProvider`] for the `"memory"` segment.
@@ -88,7 +96,17 @@ pub struct MemorySegmentProvider {
     include_capture_policy: bool,
     /// See [`Self::static_snapshot`]: first render only, no re-reads.
     static_after_first: bool,
+    /// Knowledge index used to rank bank pages for the turn (ADR
+    /// personal-memory-tiers, phase 3). `None` keeps the alphabetical,
+    /// all-rows rendering.
+    recall: Option<Arc<RecallStore>>,
+    embedder: Option<Arc<dyn EmbeddingProvider>>,
     last: tokio::sync::Mutex<Option<Fingerprint>>,
+    /// Bank stamp (page count + newest page mtime) at the last index sync; a
+    /// change (save_memory, consolidation, an in-place edit) re-syncs the
+    /// Knowledge index before ranking, so saved pages are searchable within
+    /// the same session.
+    last_bank_sync: tokio::sync::Mutex<Option<(usize, Option<SystemTime>)>>,
 }
 
 impl MemorySegmentProvider {
@@ -102,7 +120,69 @@ impl MemorySegmentProvider {
             max_inject_tokens,
             include_capture_policy,
             static_after_first: false,
+            recall: None,
+            embedder: None,
             last: tokio::sync::Mutex::new(None),
+            last_bank_sync: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Rank bank rows by relevance to each turn instead of listing every
+    /// page alphabetically.
+    pub fn with_recall(
+        mut self,
+        recall: Arc<RecallStore>,
+        embedder: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Self {
+        self.recall = Some(recall);
+        self.embedder = embedder;
+        self
+    }
+
+    /// Re-index bank pages when the bank directory changed since the last
+    /// sync (cheap stat otherwise).
+    async fn resync_bank_if_changed(&self) {
+        let Some(recall) = &self.recall else { return };
+        // Directory mtime misses in-place edits, so stamp the pages
+        // themselves: count + newest modification time.
+        let mut stamp: (usize, Option<SystemTime>) = (0, None);
+        if let Ok(mut entries) = tokio::fs::read_dir(self.store.bank_entities_dir()).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.path().extension().is_some_and(|e| e == "md") {
+                    stamp.0 += 1;
+                    if let Ok(m) = entry.metadata().await {
+                        if let Ok(t) = m.modified() {
+                            stamp.1 = Some(stamp.1.map_or(t, |prev| prev.max(t)));
+                        }
+                    }
+                }
+            }
+        }
+        let mut last = self.last_bank_sync.lock().await;
+        if last.as_ref() == Some(&stamp) {
+            return;
+        }
+        if let Err(e) =
+            crate::memory_index::sync_bank(&self.store, recall, self.embedder.as_deref()).await
+        {
+            tracing::warn!(error = %e, "memory segment: bank index sync failed");
+        }
+        *last = Some(stamp);
+    }
+
+    async fn rank_for(&self, query: Option<&str>) -> Vec<String> {
+        self.resync_bank_if_changed().await;
+        match (&self.recall, query) {
+            (Some(recall), Some(q)) => {
+                crate::memory_index::rank_bank_pages(
+                    recall,
+                    self.embedder.as_deref(),
+                    q,
+                    RANKED_BANK_ROWS,
+                )
+                .await
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -116,7 +196,7 @@ impl MemorySegmentProvider {
         self
     }
 
-    async fn fingerprint(&self) -> Fingerprint {
+    async fn fingerprint(&self, ranked: Vec<String>) -> Fingerprint {
         async fn stat_file(path: std::path::PathBuf) -> Option<(SystemTime, u64)> {
             let meta = tokio::fs::metadata(path).await.ok()?;
             meta.modified().ok().map(|t| (t, meta.len()))
@@ -132,15 +212,25 @@ impl MemorySegmentProvider {
             today_note,
             bank_dir,
             date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+            ranked,
         }
     }
 
     /// Render the full segment content (memory block + optional policy).
     pub async fn render(&self) -> String {
-        let memory_ctx = self
-            .store
-            .get_injectable_context(self.max_inject_tokens)
-            .await;
+        self.render_ranked(&[]).await
+    }
+
+    async fn render_ranked(&self, ranked: &[String]) -> String {
+        let memory_ctx = if self.recall.is_some() {
+            self.store
+                .get_injectable_context_ranked(self.max_inject_tokens, ranked, RANKED_BANK_ROWS)
+                .await
+        } else {
+            self.store
+                .get_injectable_context(self.max_inject_tokens)
+                .await
+        };
         compose_memory_segment(&memory_ctx, self.include_capture_policy)
     }
 }
@@ -163,6 +253,33 @@ pub fn compose_memory_segment(memory_ctx: &str, include_capture_policy: bool) ->
     }
 }
 
+/// Stable instruction half of the memory prompt. OUP keeps this in System for
+/// the lifetime of a prompt-cache epoch even when the injected memory payload
+/// changes between turns.
+pub fn stable_memory_instructions(include_capture_policy: bool) -> String {
+    match include_capture_policy {
+        true => {
+            format!("{MEMORY_USE_GUIDANCE}\n{MEMORY_USAGE_FEEDBACK}\n\n{MEMORY_CAPTURE_POLICY}")
+        }
+        false => format!("{MEMORY_USE_GUIDANCE}\n{MEMORY_USAGE_FEEDBACK}"),
+    }
+}
+
+/// Recover the volatile memory payload from the legacy combined named
+/// segment. This is exact for values produced by [`compose_memory_segment`]
+/// and fail-safe for custom/older segment content (the whole value is treated
+/// as data rather than promoted back to System authority).
+pub fn volatile_memory_content(rendered: &str, include_capture_policy: bool) -> String {
+    if rendered.is_empty() || rendered == MEMORY_CAPTURE_POLICY {
+        return String::new();
+    }
+    let stable = stable_memory_instructions(include_capture_policy);
+    rendered
+        .strip_suffix(&format!("\n\n{stable}"))
+        .unwrap_or(rendered)
+        .to_owned()
+}
+
 #[async_trait::async_trait]
 impl PromptSegmentProvider for MemorySegmentProvider {
     fn segment_name(&self) -> &str {
@@ -170,6 +287,10 @@ impl PromptSegmentProvider for MemorySegmentProvider {
     }
 
     async fn refresh(&self) -> Option<String> {
+        self.refresh_for(None).await
+    }
+
+    async fn refresh_for(&self, query: Option<&str>) -> Option<String> {
         if self.static_after_first {
             let mut last = self.last.lock().await;
             if last.is_some() {
@@ -177,11 +298,13 @@ impl PromptSegmentProvider for MemorySegmentProvider {
             }
             // Any non-None marker: the fingerprint is irrelevant in
             // snapshot mode — one render, then silence.
-            *last = Some(self.fingerprint().await);
+            let ranked = self.rank_for(query).await;
+            *last = Some(self.fingerprint(ranked.clone()).await);
             drop(last);
-            return Some(self.render().await);
+            return Some(self.render_ranked(&ranked).await);
         }
-        let current = self.fingerprint().await;
+        let ranked = self.rank_for(query).await;
+        let current = self.fingerprint(ranked.clone()).await;
         {
             let mut last = self.last.lock().await;
             if last.as_ref() == Some(&current) {
@@ -189,7 +312,7 @@ impl PromptSegmentProvider for MemorySegmentProvider {
             }
             *last = Some(current);
         }
-        Some(self.render().await)
+        Some(self.render_ranked(&ranked).await)
     }
 }
 
@@ -226,6 +349,16 @@ mod tests {
             .unwrap();
         let refreshed = provider.refresh().await;
         assert!(refreshed.is_some_and(|c| c.contains("version two")));
+    }
+
+    #[test]
+    fn stable_and_volatile_memory_halves_roundtrip_combined_segment() {
+        for capture in [false, true] {
+            let combined = compose_memory_segment("remember this", capture);
+            assert_eq!(volatile_memory_content(&combined, capture), "remember this");
+            assert!(!stable_memory_instructions(capture).contains("remember this"));
+        }
+        assert_eq!(volatile_memory_content(MEMORY_CAPTURE_POLICY, true), "");
     }
 
     #[tokio::test]

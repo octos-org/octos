@@ -32,6 +32,11 @@ pub const DEFAULT_RESULT_CEILING_BYTES: usize = 262_144;
 /// `MAX_TEXT_FRAME_BYTES`. Re-declared here (not imported) to keep
 /// octos-pipeline free of an octos-core dependency edge for a single const;
 /// a unit test would catch drift if the core constant ever moved.
+///
+/// Only referenced by the `const _:` drift guard below. Newer rustc's
+/// dead-code pass does not count references inside anonymous-const
+/// initializers, so the const needs an explicit `allow` to stay compiled.
+#[allow(dead_code)]
 const MAX_TEXT_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Blocker 1 — the serialized-size budget the bounded pipeline result body
@@ -71,8 +76,9 @@ pub const MARKER_RESERVE_BYTES: usize = 256;
 // the body-marker reserve) must fit inside the body budget. If
 // `MAX_TEXT_FRAME_BYTES` (mirrored from octos-core) or any budget is ever
 // bumped past these bounds, the build fails loudly rather than letting the
-// producer re-open the `frame_too_large` cliff. Also keeps
-// `MAX_TEXT_FRAME_BYTES` live.
+// producer re-open the `frame_too_large` cliff. (This guard is also the only
+// referencer of `MAX_TEXT_FRAME_BYTES`; newer rustc's dead-code pass does not
+// count uses inside `const _:` initializers, hence the const's `allow`.)
 const _: () = {
     assert!(MAX_FRAME_BUDGET_BYTES < MAX_TEXT_FRAME_BYTES);
     assert!(FOOTER_BUDGET_BYTES + MARKER_RESERVE_BYTES < MAX_FRAME_BUDGET_BYTES);

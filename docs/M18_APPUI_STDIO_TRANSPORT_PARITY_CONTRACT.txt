@@ -171,7 +171,7 @@ Backend verification:
   allowlisted differences; unauthenticated stdio auth-bound methods are capability
   omissions with explicit unsupported reports, not allowlisted runtime diffs.
 - Backend evidence directory:
-  `/Users/yuechen/home/octos/e2e/test-results-m18-appui-transport-parity/20260518T011535Z`.
+  `~/home/octos/e2e/test-results-m18-appui-transport-parity/20260518T011535Z`.
 
 TUI verification:
 
@@ -179,7 +179,7 @@ TUI verification:
   321 lib tests, 3 AppUI UX fixture tests, 2 solo-permissions tests.
 - `cargo clippy --all --workspace -- -D warnings` passed.
 - Live tmux UX soak passed:
-  `/Users/yuechen/home/octoscode/e2e/test-results-m15-live-tmux-ux/m18-stdio-parity-20260518T011554Z/ux-validation.json`.
+  `~/home/octoscode/e2e/test-results-m15-live-tmux-ux/m18-stdio-parity-20260518T011554Z/ux-validation.json`.
 
 Claude review:
 

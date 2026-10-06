@@ -71,6 +71,9 @@ webbrowser = "1"
 keyring = { workspace = true }
 url = { workspace = true }
 htmd = { workspace = true }
+octos-research = { workspace = true, features = ["http"] }
+html5ever = { workspace = true }
+markup5ever_rcdom = { workspace = true }
 dirs = { workspace = true }
 sha2 = { workspace = true }
 flate2 = { workspace = true }
@@ -120,15 +123,26 @@ rustix = { workspace = true }
 # provider yields nothing). The underlying `chromiumoxide` dependency and the
 # `browser` tool itself are always compiled; this feature only toggles the new
 # CDP-backed `web_search` fallback so `--no-default-features` builds keep the
-# pre-existing HTTP-only `web_search` behaviour byte-for-byte.
+# pre-existing HTTP-only `web_search` behaviour byte-for-byte. It also lets
+# metasearch engines that render (Google) load in the person's browser
+# (`octos_research::browser`).
 default = ["browser"]
-browser = []
+browser = ["octos-research/browser"]
+# Results-page engines that need a browser-like client (Google's page for
+# simple phones), as SearXNG does. Not on Windows; building it needs cmake
+# (BoringSSL). Off here: the binary chooses it (octos-cli's `impersonate`,
+# on by default there), so a `--no-default-features` build of the binary,
+# such as the Android kernel, cross-compiles no BoringSSL.
+impersonate = ["octos-research/impersonate"]
 git = ["dep:gix", "dep:similar"]
 ast = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript", "dep:tree-sitter-typescript"]
 # Enable MP3 decoding for the `AudioNonSilent` workspace-policy validator.
 # WAV decoding is always-on via `hound`; MP3 pulls in `symphonia` which is
 # heavier so we keep it opt-in for non-audio workspaces.
 audio_mp3 = ["dep:symphonia"]
+# Test-only helpers exposed to downstream crates' test builds (e.g. the
+# octos-cli #2353 observer-cycle regression test). Off in production builds.
+test-utils = []
 
 [lints]
 workspace = true

@@ -16,21 +16,26 @@ pub(crate) mod coding_tool_contract;
 mod cron_panel;
 mod events;
 mod events_harness;
+mod file_mutations;
 mod frps_plugin;
 mod handlers;
+pub(crate) mod host_managed;
 mod memory_panel;
 pub mod metrics;
 pub(crate) mod ominix_runtime;
+pub(crate) mod pairing;
 pub mod preview;
 pub mod preview_tokens;
+mod private_asr;
 pub mod purge;
 mod router;
 pub(crate) mod session_ingress;
 pub(crate) mod skill_action_jobs;
+mod slide_edits;
 mod smart_home_bridge;
 mod smart_home_panel;
 pub(crate) mod solo_auth;
-mod static_files;
+pub(crate) mod static_files;
 pub mod swarm;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha9_bridge;
@@ -247,8 +252,17 @@ impl RunIdCache {
     }
 }
 
+/// Opaque, per-application OUP persistence resources. Connections share them;
+/// independent in-process applications do not.
+#[derive(Default)]
+pub struct UiProtocolRuntimeResources {
+    ledger: std::sync::OnceLock<Arc<ui_protocol_ledger::UiProtocolLedger>>,
+    commit_observer: std::sync::OnceLock<octos_bus::MessageCommitObserver>,
+}
+
 /// Shared application state for API handlers.
 pub struct AppState {
+    pub ui_protocol: UiProtocolRuntimeResources,
     /// Per-profile runtime catalog. Built at startup from
     /// `ProfileStore::list()` — one [`ProfileRuntime`] per enabled
     /// profile with an active primary LLM. The `/api/chat` handler
@@ -342,6 +356,13 @@ pub struct AppState {
     pub frps_port: Option<u16>,
     /// Deployment mode (local, tenant, or cloud).
     pub deployment_mode: crate::config::DeploymentMode,
+    /// One-time pairing state (WEB-PAIRING-CONTRACT-5100): the single
+    /// per-process pairing code, the API token it can be exchanged for, and
+    /// the loopback origin to hand back. `Some` only for an HTTP `octos
+    /// serve`; `None` in tests, stdio serves and embedded transports, where
+    /// `/pair/info` and `/pair/claim` answer 404 ("pairing not supported")
+    /// and the client falls back to the manual origin+token form.
+    pub pairing: Option<Arc<pairing::PairingState>>,
     /// Opt-in for the no-password "solo" REST login (`/api/auth/solo*`).
     /// OFF by default; set by `octos serve --solo` / `OCTOS_SOLO_LOGIN=1`.
     ///
@@ -352,6 +373,17 @@ pub struct AppState {
     /// configs never set) is the primary defence; the handlers additionally
     /// reject any request carrying proxy-forwarding headers.
     pub solo_login_enabled: bool,
+    /// `octos serve --host-managed`: the embedding host's two credentials,
+    /// the loopback `Host` allowlist and the host-enabled pairing code. `None`
+    /// on every other server. See [`host_managed`].
+    pub host_managed: Option<Arc<host_managed::HostManaged>>,
+    /// The HTTP serve's stop switch — the same `watch` channel the SIGINT /
+    /// SIGTERM watcher flips, so the `server/shutdown` UI Protocol method ends
+    /// the process through exactly the path Ctrl+C takes: stop accepting,
+    /// drain, stop every gateway child. `None` everywhere but HTTP `serve`: a
+    /// `--stdio` server is owned by the client that spawned it, and tests and
+    /// the gateway build no serve loop to stop.
+    pub serve_shutdown: Option<Arc<tokio::sync::watch::Sender<bool>>>,
     /// `--danger-full-access`: sessions with NO explicit `/permissions`
     /// selection default to the dangerous full-access profile (sandbox off,
     /// network allowed, approvals never) instead of the gated
@@ -466,7 +498,15 @@ impl AppState {
         let tmp =
             std::env::temp_dir().join(format!("octos-test-admin-token-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).ok();
+        Self::without_services(&tmp)
+    }
+
+    /// State for an embedded local OUP transport. No HTTP listener, account
+    /// services, login routes or gateway processes are started. Callers must
+    /// install a profile runtime before accepting session/open.
+    pub(crate) fn without_services(data_dir: &std::path::Path) -> Self {
         Self {
+            ui_protocol: UiProtocolRuntimeResources::default(),
             profiles: HashMap::new(),
             session_cache: Arc::new(SessionRuntimeCache::new(
                 64,
@@ -477,8 +517,8 @@ impl AppState {
             broadcaster: Arc::new(EventBroadcaster::new(16)),
             started_at: chrono::Utc::now(),
             auth_token: None,
-            admin_token_store: Arc::new(AdminTokenStore::new(&tmp)),
-            setup_state_store: Arc::new(SetupStateStore::new(&tmp)),
+            admin_token_store: Arc::new(AdminTokenStore::new(data_dir)),
+            setup_state_store: Arc::new(SetupStateStore::new(data_dir)),
             metrics_handle: None,
             profile_store: None,
             process_manager: None,
@@ -499,7 +539,10 @@ impl AppState {
             frps_server: None,
             frps_port: None,
             deployment_mode: crate::config::DeploymentMode::Local,
+            pairing: None,
             solo_login_enabled: false,
+            host_managed: None,
+            serve_shutdown: None,
             dangerous_default_permissions: false,
             default_network_denied: false,
             llm_compaction: false,
@@ -514,7 +557,7 @@ impl AppState {
             appui_default_session_cwd: None,
             preview_tokens: Arc::new(PreviewTokens::new()),
             work_secret_store: Arc::new(
-                octos_agent::bridge::work_secret::WorkSecretGrantStore::new(&tmp),
+                octos_agent::bridge::work_secret::WorkSecretGrantStore::new(data_dir),
             ),
             // Tests don't spawn the sweeper. Tests that exercise the
             // sweeper either drive `sweep_expired_all` directly or

@@ -571,7 +571,7 @@ mod tests {
                 },
                 DecisionRecord {
                     at_turn: 2,
-                    summary: format!("{} revert stateless path", STALE_DECISION_PREFIX),
+                    summary: format!("{STALE_DECISION_PREFIX} revert stateless path"),
                     rationale: None,
                 },
             ],

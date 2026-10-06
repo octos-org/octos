@@ -12,6 +12,9 @@ use secrecy::{ExposeSecret, SecretString};
 
 use crate::vision;
 
+use crate::cache_manifest::{
+    PromptCacheInputManifest, prompt_cache_features_enabled, without_cache_markers,
+};
 use crate::config::ChatConfig;
 use crate::config::ReasoningEffort;
 use crate::provider::{LlmProvider, endpoint_label_from_base_url};
@@ -22,6 +25,10 @@ use crate::types::{
 /// Anthropic Claude provider.
 pub struct AnthropicProvider {
     client: Client,
+    /// Separate client for streaming requests, built without a total request
+    /// timeout so a healthy long generation is never cut off mid-stream. See
+    /// [`crate::provider::build_streaming_http_client`].
+    stream_client: Client,
     api_key: SecretString,
     model: String,
     base_url: String,
@@ -32,10 +39,34 @@ pub struct AnthropicProvider {
     /// Emit `cache_control: {"type": "ephemeral"}` breakpoints so Anthropic
     /// serves the replayed prefix from its prompt cache (~0.1x input rate on
     /// reads) instead of billing the whole conversation at full rate every
-    /// round. Default ON, but the `OCTOS_PROMPT_CACHING` env kill-switch can
-    /// force it off at startup without a rebuild — see
+    /// round. The official endpoint defaults ON, while custom compatible
+    /// endpoints require an explicit opt-in. The `OCTOS_PROMPT_CACHING` env
+    /// kill-switch can force the official default off at startup — see
     /// [`Self::with_prompt_caching`] and [`prompt_caching_default`].
     prompt_caching: bool,
+    /// Whether a builder call explicitly selected the prompt-caching mode.
+    /// Custom Anthropic-compatible endpoints default to off, but an explicit
+    /// override must survive either builder-call order.
+    prompt_caching_override: Option<bool>,
+}
+
+const OFFICIAL_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+
+fn is_official_anthropic_base_url(base_url: &str) -> bool {
+    base_url
+        .trim()
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(OFFICIAL_ANTHROPIC_BASE_URL)
+}
+
+#[cfg(test)]
+fn prompt_caching_default_for_base_url_from(base_url: &str, env_value: Option<&str>) -> bool {
+    is_official_anthropic_base_url(base_url)
+        && crate::cache_manifest::prompt_cache_features_enabled_from(env_value)
+}
+
+fn prompt_caching_default_for_base_url(base_url: &str) -> bool {
+    is_official_anthropic_base_url(base_url) && prompt_cache_features_enabled()
 }
 
 /// Resolve the default prompt-caching state from a raw env value.
@@ -45,20 +76,15 @@ pub struct AnthropicProvider {
 /// other value keeps the default ON. Pure over its input so the kill-switch
 /// is unit-testable without mutating process env (the workspace is
 /// `deny(unsafe_code)`, and `std::env::set_var` is `unsafe` on edition 2024).
+#[cfg(test)]
 fn prompt_caching_default_from(env_value: Option<&str>) -> bool {
-    match env_value {
-        Some(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        None => true,
-    }
+    crate::cache_manifest::prompt_cache_features_enabled_from(env_value)
 }
 
 /// Default prompt-caching state, honoring the `OCTOS_PROMPT_CACHING`
 /// kill-switch. See [`prompt_caching_default_from`].
 fn prompt_caching_default() -> bool {
-    prompt_caching_default_from(std::env::var("OCTOS_PROMPT_CACHING").ok().as_deref())
+    prompt_caching_default_for_base_url(OFFICIAL_ANTHROPIC_BASE_URL)
 }
 
 impl AnthropicProvider {
@@ -69,11 +95,15 @@ impl AnthropicProvider {
                 crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
                 crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
             ),
+            stream_client: crate::provider::build_streaming_http_client(
+                crate::provider::DEFAULT_LLM_CONNECT_TIMEOUT_SECS,
+            ),
             api_key: SecretString::from(api_key.into()),
             model: model.into(),
-            base_url: "https://api.anthropic.com".to_string(),
+            base_url: OFFICIAL_ANTHROPIC_BASE_URL.to_string(),
             provider_label: "anthropic".to_string(),
             prompt_caching: prompt_caching_default(),
+            prompt_caching_override: None,
         }
     }
 
@@ -87,12 +117,21 @@ impl AnthropicProvider {
     /// Set a custom base URL (for compatible endpoints).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        if self.prompt_caching_override.is_none() {
+            self.prompt_caching = prompt_caching_default_for_base_url(&self.base_url);
+        }
         self
     }
 
     /// Replace the HTTP client with one using custom timeouts (in seconds).
+    ///
+    /// `timeout_secs` is the **total** request timeout for non-streaming
+    /// requests. The streaming client is rebuilt only with the connect timeout —
+    /// it never takes a total timeout, so a long streamed generation is not
+    /// capped regardless of this value.
     pub fn with_http_timeout(mut self, timeout_secs: u64, connect_timeout_secs: u64) -> Self {
         self.client = crate::provider::build_http_client(timeout_secs, connect_timeout_secs);
+        self.stream_client = crate::provider::build_streaming_http_client(connect_timeout_secs);
         self
     }
 
@@ -102,7 +141,7 @@ impl AnthropicProvider {
         self
     }
 
-    /// Toggle Anthropic prompt-cache breakpoints (default: enabled).
+    /// Toggle Anthropic prompt-cache breakpoints explicitly.
     ///
     /// When enabled the request carries three ephemeral `cache_control`
     /// breakpoints (Anthropic allows up to 4): the system-prompt block, the
@@ -110,18 +149,27 @@ impl AnthropicProvider {
     /// user-role message — caching the stable prefix (tools + system) plus
     /// the rolling conversation history across loop iterations.
     ///
-    /// Default ON: any endpoint claiming Anthropic Messages API
-    /// compatibility must tolerate `cache_control` (Claude Code sends it
-    /// unconditionally). Disable for odd proxies that reject the field or
-    /// the block-array `system` form; disabling restores the exact
-    /// pre-caching wire shape (plain-string `system`, verbatim tools).
+    /// The official Anthropic endpoint defaults ON. Custom compatible
+    /// endpoints default OFF because some reject `cache_control` or the
+    /// block-array `system` form. Disabling restores the exact pre-caching
+    /// wire shape (plain-string `system`, verbatim tools).
     ///
     /// Operators can flip the default OFF at startup without a rebuild via
     /// `OCTOS_PROMPT_CACHING=0` (see [`prompt_caching_default`]); this
     /// explicit builder still wins over the env default when called.
     pub fn with_prompt_caching(mut self, enabled: bool) -> Self {
         self.prompt_caching = enabled;
+        self.prompt_caching_override = Some(enabled);
         self
+    }
+
+    fn operational_message(&self, stage: crate::provider::OperationalStage) -> String {
+        crate::provider::operational_error_message(
+            stage,
+            &self.provider_label,
+            &self.model,
+            crate::provider::ApiStyle::AnthropicMessages,
+        )
     }
 
     /// Build the shared request struct used by both chat() and chat_stream().
@@ -132,11 +180,34 @@ impl AnthropicProvider {
         config: &'a ChatConfig,
     ) -> AnthropicRequest<'a> {
         let max_tokens = config.max_tokens.unwrap_or(4096);
-        let cache = self.prompt_caching.then_some(EPHEMERAL_CACHE_CONTROL);
-        let mut api_messages = build_anthropic_messages(messages);
+        // Provider default AND the request did not opt out: a one-shot call
+        // (`ChatConfig.cache_retention: None`) pays the 1.25x cache-write
+        // premium on a prefix it never sends again, so it gets the exact
+        // pre-caching wire shape instead (mirrors pi's `cacheRetention:
+        // "none"` on summarization requests).
+        let cache = (self.prompt_caching && config.cache_retention != crate::CacheRetention::None)
+            .then_some(EPHEMERAL_CACHE_CONTROL);
+        let mut api_messages =
+            build_anthropic_messages(messages, config.media_scope_root.as_deref());
         if cache.is_some() {
             apply_message_cache_breakpoint(&mut api_messages);
         }
+        // GLM enables reasoning when this field is absent. An explicit fast
+        // mode must reach its compatible endpoint, rather than inheriting that
+        // default. Preserve the existing request shape for other models.
+        let thinking = if self.model.to_ascii_lowercase().starts_with("glm-")
+            && config.reasoning_effort == Some(ReasoningEffort::Disabled)
+        {
+            Some(AnthropicThinking {
+                r#type: "disabled",
+                budget_tokens: 0,
+            })
+        } else {
+            config
+                .reasoning_effort
+                .and_then(|effort| build_anthropic_thinking(effort, max_tokens))
+        };
+        let (temperature, top_p, top_k) = self.sampling_fields(config);
         AnthropicRequest {
             model: &self.model,
             max_tokens,
@@ -186,12 +257,199 @@ impl AnthropicProvider {
                         .collect(),
                 )
             },
-            thinking: config
-                .reasoning_effort
-                .and_then(|effort| build_anthropic_thinking(effort, max_tokens)),
+            thinking,
             context_management: config.context_management.as_ref(),
+            temperature,
+            top_p,
+            top_k,
+            tool_choice: config.tool_choice.anthropic_wire(!tools.is_empty()),
         }
     }
+
+    fn prompt_cache_input_manifest(
+        &self,
+        request: &AnthropicRequest<'_>,
+        config: &ChatConfig,
+    ) -> PromptCacheInputManifest {
+        let normalized = without_cache_markers(
+            serde_json::to_value(request).unwrap_or_else(|_| serde_json::json!({})),
+        );
+        let mut stable = Vec::new();
+        if let Some(system) = normalized.get("system") {
+            stable.push(("system".to_owned(), system.clone()));
+        }
+        if let Some(tools) = normalized.get("tools").and_then(|value| value.as_array()) {
+            stable.extend(
+                tools
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tool)| (format!("tool:{index}"), tool.clone())),
+            );
+        }
+        for key in ["thinking", "context_management", "tool_choice"] {
+            if let Some(value) = normalized.get(key) {
+                stable.push((format!("config:{key}"), value.clone()));
+            }
+        }
+        let conversation = normalized
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, message)| {
+                let role = message
+                    .get("role")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                (format!("message:{index}:{role}"), message.clone())
+            })
+            .collect();
+        PromptCacheInputManifest::from_normalized_segments(
+            self.provider_label.clone(),
+            self.model.clone(),
+            config
+                .prompt_cache_context
+                .as_ref()
+                .map(|context| context.epoch_id.as_str()),
+            stable,
+            conversation,
+        )
+    }
+
+    fn trace_prompt_cache_input(&self, request: &AnthropicRequest<'_>, config: &ChatConfig) {
+        if tracing::enabled!(target: "octos.prompt_cache", tracing::Level::TRACE) {
+            self.prompt_cache_input_manifest(request, config).trace();
+        }
+    }
+
+    /// Resolve the request's sampling fields (`temperature`, `top_p`,
+    /// `top_k`) from the config, **model-capability-aware** (#2172 — before
+    /// this, the whole Anthropic protocol path silently ignored both knobs;
+    /// a first cut then over-corrected and forwarded them to every model,
+    /// which 400s modern first-party Claude).
+    ///
+    /// Which knobs a model accepts is decided by [`model_accepts_sampling`],
+    /// a default-DENY GLM allowlist: GLM via z.ai (`zai` / `zai-coding`)
+    /// accepts the standard sampler set — the repetition-collapse knobs this
+    /// change exists to deliver — while every other model accepts nothing on
+    /// this path, including first-party Claude (Opus 4.7+/Sonnet 5 REMOVED
+    /// `temperature`/`top_p`/`top_k` and 400 on them; we ship
+    /// `claude-opus-4-7`) and any custom endpoint pointed here. A model that
+    /// rejects a sampler never receives it.
+    ///
+    /// Within an accepting model:
+    /// - `temperature` rides through only when non-zero. `Some(0.0)` is the
+    ///   plumbing's built-in default (see the `build_chat_config` invariant
+    ///   in octos-agent), indistinguishable from "unset" here, so it stays
+    ///   off the wire and no-override requests remain byte-identical to the
+    ///   pre-#2172 shape (prompt-cache prefixes depend on it). Near-greedy
+    ///   decoding is available via e.g. `0.01`.
+    /// - From `sampling_params`, only `top_p` / `top_k` exist on the
+    ///   Anthropic Messages API; every other key (`repeat_penalty`,
+    ///   `frequency_penalty`, `min_p`, …) is dropped with a `warn` naming it,
+    ///   so operators learn why the knob did nothing. `sampling_params` is
+    ///   operator-config-only (stock/internal flows leave it `None`), so the
+    ///   warn never cries wolf.
+    ///
+    /// Rejecting-model suppression is logged at `debug`, not `warn`: stock
+    /// octos reaches it without operator input (compaction and rich_output
+    /// both set `temperature: 0.2` and can target a Claude model), so a warn
+    /// would fire on ordinary turns.
+    fn sampling_fields<'a>(
+        &self,
+        config: &'a ChatConfig,
+    ) -> (
+        Option<f32>,
+        Option<&'a serde_json::Value>,
+        Option<&'a serde_json::Value>,
+    ) {
+        let accepts = model_accepts_sampling(&self.model);
+
+        // 0.0 is the built-in default sentinel; never emit it (see doc).
+        let temperature = config.temperature.filter(|t| *t != 0.0);
+        let mut top_p = None;
+        let mut top_k = None;
+        let mut dropped: Vec<&str> = Vec::new();
+        if let Some(params) = &config.sampling_params {
+            for (key, value) in params {
+                // The guard folds capability into the match: on a rejecting
+                // model `accepts` is false, so `top_p`/`top_k` fall through to
+                // the drop arm exactly like an unknown key — a rejected
+                // sampler can never reach the wire.
+                match key.as_str() {
+                    "top_p" if accepts => top_p = Some(value),
+                    "top_k" if accepts => top_k = Some(value),
+                    other => dropped.push(other),
+                }
+            }
+        }
+        if !dropped.is_empty() {
+            tracing::warn!(
+                provider = %self.provider_label,
+                model = %self.model,
+                dropped_keys = ?dropped,
+                accepts_sampling = accepts,
+                "sampling_params keys not accepted by this model on the \
+                 Anthropic Messages API were dropped (first-party Claude \
+                 accepts none; GLM via z.ai accepts only top_p / top_k)"
+            );
+        }
+
+        if accepts {
+            (temperature, top_p, top_k)
+        } else {
+            if temperature.is_some() {
+                tracing::debug!(
+                    provider = %self.provider_label,
+                    model = %self.model,
+                    temperature = ?temperature,
+                    "model does not accept sampling params on the Anthropic \
+                     Messages API: suppressing temperature (reverts to the \
+                     pre-#2172 no-sampling wire)"
+                );
+            }
+            (None, None, None)
+        }
+    }
+}
+
+/// Whether `model` accepts the standard sampler set (`temperature`, `top_p`,
+/// `top_k`) on the Anthropic Messages API protocol (#2172).
+///
+/// **Default-DENY with a GLM allowlist.** The only class reached by this
+/// provider that is known to accept sampling is GLM via z.ai (the `zai` /
+/// `zai-coding` families, bare model `glm-*` — the repetition-collapse knobs
+/// this change exists to deliver). Everything else returns `false`:
+/// - **first-party Claude** (`anthropic`, and `r9s` claude-* proxies).
+///   Modern Claude (Opus 4.7+, Sonnet 5, …) REMOVED `temperature`/`top_p`/
+///   `top_k` from the Messages API and returns a hard 400 on them; we ship
+///   `claude-opus-4-7` in `model_catalog.json`. Reverting Claude to the
+///   pre-#2172 no-sampling wire is the safe direction — this PR was never
+///   about tuning first-party sampling.
+/// - **any other model an operator might point at this provider** — a
+///   non-GLM OpenAI-path model, a self-hosted endpoint, the empty string.
+///   origin/main forwarded nothing to any of them, so default-deny keeps
+///   them no-worse-than-today (a default-ACCEPT gate would newly 400 a
+///   custom endpoint that rejects sampling).
+///
+/// Matched on the normalized last path segment (lowercased; the segment after
+/// the final `/`, since a custom base_url can pass a family-qualified
+/// `anthropic/claude-*` or `vendor/glm-*`). Default-deny closes the qualified
+/// bypass for free: only an affirmative `glm-` prefix accepts, so a
+/// `claude-*` anywhere in the string — prefix or after a `/` — gets nothing.
+/// The registry strips the catalog's `<family>/` prefix before construction
+/// (`registry::mod` `split_once('/')`), so in practice the model arrives bare;
+/// the segment split only guards the custom-base_url case.
+///
+/// Follow-ups deliberately out of scope (kept minimal and safe): a per-model
+/// Claude carve-out to re-enable sampling on ≤4.6, a broader allowlist for
+/// other Anthropic-compatible endpoints that accept sampling, and any
+/// narrowing of the GLM set under extended thinking (GLM is treated as
+/// accepting the full set; see the PR's stated assumption).
+fn model_accepts_sampling(model: &str) -> bool {
+    let leaf = model.rsplit('/').next().unwrap_or(model);
+    leaf.trim().to_ascii_lowercase().starts_with("glm-")
 }
 
 #[async_trait]
@@ -203,6 +461,7 @@ impl LlmProvider for AnthropicProvider {
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
         let request = self.build_request(messages, tools, config);
+        self.trace_prompt_cache_input(&request, config);
 
         let response = self
             .client
@@ -216,7 +475,14 @@ impl LlmProvider for AnthropicProvider {
             .json(&request)
             .send()
             .await
-            .wrap_err("failed to send request to Anthropic")?;
+            .wrap_err_with(|| {
+                crate::provider::transport_error_message(
+                    false,
+                    &self.provider_label,
+                    &self.model,
+                    crate::provider::ApiStyle::AnthropicMessages,
+                )
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -227,13 +493,13 @@ impl LlmProvider for AnthropicProvider {
                 &body,
                 format!("{}/{}", self.provider_label, self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::AnthropicMessages)
             .into());
         }
 
-        let api_response: AnthropicResponse = response
-            .json()
-            .await
-            .wrap_err("failed to parse Anthropic response")?;
+        let api_response: AnthropicResponse = response.json().await.wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::ParseResponse)
+        })?;
 
         Ok(anthropic_response_to_chat_response(api_response))
     }
@@ -245,15 +511,24 @@ impl LlmProvider for AnthropicProvider {
         config: &ChatConfig,
     ) -> Result<ChatStream> {
         let request = self.build_request(messages, tools, config);
+        self.trace_prompt_cache_input(&request, config);
 
-        let mut body =
-            serde_json::to_value(&request).wrap_err("failed to serialize Anthropic request")?;
+        let mut body = serde_json::to_value(&request).wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::SerializeRequest)
+        })?;
         body.as_object_mut()
-            .ok_or_else(|| eyre::eyre!("failed to build Anthropic request body"))?
+            .ok_or_else(|| {
+                eyre::Report::msg(
+                    self.operational_message(crate::provider::OperationalStage::BuildRequestBody),
+                )
+            })?
             .insert("stream".into(), true.into());
 
+        // Stream client: no total timeout, so a long healthy generation is not
+        // cut off. Stalls are bounded by the client's per-read timeout and the
+        // agent's stream-timeout guards (see build_streaming_http_client).
         let response = self
-            .client
+            .stream_client
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", self.api_key.expose_secret())
             .header("anthropic-version", "2023-06-01")
@@ -261,7 +536,14 @@ impl LlmProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .wrap_err("failed to send streaming request to Anthropic")?;
+            .wrap_err_with(|| {
+                crate::provider::transport_error_message(
+                    true,
+                    &self.provider_label,
+                    &self.model,
+                    crate::provider::ApiStyle::AnthropicMessages,
+                )
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -272,6 +554,7 @@ impl LlmProvider for AnthropicProvider {
                 &body,
                 format!("{}/{}", self.provider_label, self.model),
             )
+            .with_api_style(crate::provider::ApiStyle::AnthropicMessages)
             .into());
         }
 
@@ -287,12 +570,35 @@ impl LlmProvider for AnthropicProvider {
         Ok(Box::pin(event_stream))
     }
 
+    fn estimate_request_tokens(
+        &self,
+        messages: &[Message],
+        tools: &[crate::types::ToolSpec],
+    ) -> u32 {
+        // #2143 part 3: the base estimate (messages + tool schemas) plus the
+        // Anthropic request-envelope overhead the flat estimator omits — each
+        // message is wrapped in a content-block array, system parts are lifted
+        // into a separate top-level `system` array, and cache_control
+        // breakpoints / tool_choice / metadata ride along. Conservative fixed
+        // additions (they only ever OVER-count, so the route-fit guard never
+        // under-estimates and lets an oversized request through).
+        let base = crate::context::estimate_request_tokens_base(messages, tools);
+        let per_message_framing = messages.len() as u32 * 4;
+        const REQUEST_ENVELOPE_OVERHEAD: u32 = 24;
+        base.saturating_add(per_message_framing)
+            .saturating_add(REQUEST_ENVELOPE_OVERHEAD)
+    }
+
     fn model_id(&self) -> &str {
         &self.model
     }
 
     fn provider_name(&self) -> &str {
         &self.provider_label
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        Some(crate::provider::ApiStyle::AnthropicMessages)
     }
 
     fn provider_metadata(&self) -> ProviderMetadata {
@@ -302,6 +608,7 @@ impl LlmProvider for AnthropicProvider {
             None
         };
         ProviderMetadata::new(self.provider_label.clone(), self.model.clone(), endpoint)
+            .with_cache_lane(crate::types::CacheLane::Anthropic)
     }
 }
 
@@ -366,12 +673,34 @@ struct AnthropicRequest<'a> {
     /// non-null and the caller opted in via the builder.
     #[serde(skip_serializing_if = "Option::is_none")]
     context_management: Option<&'a serde_json::Value>,
+    /// Operator temperature override (#2172). `None` both when unset and
+    /// when the config carries the built-in `0.0` default sentinel — absent
+    /// keeps the no-override wire byte-identical to the pre-#2172 shape.
+    /// See [`AnthropicProvider::sampling_fields`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    /// `top_p` from `ChatConfig::sampling_params`, forwarded verbatim (#2172).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<&'a serde_json::Value>,
+    /// `top_k` from `ChatConfig::sampling_params`, forwarded verbatim (#2172).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<&'a serde_json::Value>,
+    /// `ChatConfig.tool_choice` on the wire (`{"type": "none"|"any"|"tool"}`);
+    /// absent for the default `auto`. Anthropic invalidates message-level
+    /// cache entries when this changes, so it is also a manifest segment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
 struct AnthropicThinking {
     r#type: &'static str,
+    #[serde(skip_serializing_if = "is_zero_budget")]
     budget_tokens: u32,
+}
+
+fn is_zero_budget(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Anthropic requires `1024 <= budget_tokens < max_tokens`, and the reply still
@@ -449,10 +778,21 @@ enum AnthropicContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: AnthropicToolResultContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<AnthropicCacheControl>,
     },
+}
+
+/// A `tool_result`'s content: plain text, or blocks when the tool handed
+/// the model an image — the Messages protocol takes image blocks inside
+/// the tool_result, and nowhere else after a tool_use, since roles must
+/// alternate and a second user message would be rejected.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AnthropicToolResultContent {
+    Text(String),
+    Blocks(Vec<AnthropicContentBlock>),
 }
 
 /// Place the rolling-history breakpoint: `cache_control` on the last content
@@ -466,9 +806,10 @@ enum AnthropicContentBlock {
 /// points within the TTL), so advancing the marker EXTENDS the cache rather
 /// than invalidating it.
 fn apply_message_cache_breakpoint(messages: &mut [AnthropicMessage<'_>]) {
-    let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") else {
+    let Some(last_user_index) = last_complete_user_boundary(messages) else {
         return;
     };
+    let last_user = &mut messages[last_user_index];
     match &mut last_user.content {
         AnthropicContent::Parts(parts) => match parts.last_mut() {
             Some(
@@ -494,6 +835,33 @@ fn apply_message_cache_breakpoint(messages: &mut [AnthropicMessage<'_>]) {
     }
 }
 
+/// Last user-role boundary at which every preceding tool-use has a result.
+/// Tracking the full outstanding set prevents a plain user row after a
+/// partially answered parallel batch from receiving a cache marker.
+fn last_complete_user_boundary(messages: &[AnthropicMessage<'_>]) -> Option<usize> {
+    let mut outstanding: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut boundary = None;
+    for (index, message) in messages.iter().enumerate() {
+        if let AnthropicContent::Parts(parts) = &message.content {
+            for part in parts {
+                match part {
+                    AnthropicContentBlock::ToolUse { id, .. } => {
+                        outstanding.insert(id.as_str());
+                    }
+                    AnthropicContentBlock::ToolResult { tool_use_id, .. } => {
+                        outstanding.remove(tool_use_id.as_str());
+                    }
+                    AnthropicContentBlock::Text { .. } | AnthropicContentBlock::Image { .. } => {}
+                }
+            }
+        }
+        if message.role == "user" && outstanding.is_empty() {
+            boundary = Some(index);
+        }
+    }
+    boundary
+}
+
 #[derive(Serialize)]
 struct AnthropicImageSource {
     r#type: String,
@@ -514,7 +882,10 @@ struct AnthropicImageSource {
 ///   every `tool_use` id from the assistant turn to be answered in the
 ///   immediately-following message, so parallel tool results split across
 ///   two user messages would 400.
-fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'static>> {
+fn build_anthropic_messages(
+    messages: &[Message],
+    scope_root: Option<&std::path::Path>,
+) -> Vec<AnthropicMessage<'static>> {
     let mut out: Vec<AnthropicMessage> = Vec::with_capacity(messages.len());
     // True while `out.last()` is the user-role message accumulating the
     // current run of consecutive tool_result blocks.
@@ -528,10 +899,10 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
     let mut pending_tool_use_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
-    for m in messages
-        .iter()
-        .filter(|m| m.role != octos_core::MessageRole::System)
-    {
+    for (index, m) in messages.iter().enumerate() {
+        if m.role == octos_core::MessageRole::System {
+            continue;
+        }
         match m.role {
             octos_core::MessageRole::Assistant => {
                 merging_tool_results = false;
@@ -558,7 +929,7 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
                     .tool_call_id
                     .as_deref()
                     .filter(|id| pending_tool_use_ids.contains(*id))
-                    .and_then(|_| anthropic_tool_result_block(m));
+                    .and_then(|_| anthropic_tool_result_block(messages, index, scope_root));
                 match block {
                     Some(block) => {
                         // Consume the id: a duplicate result for the same
@@ -590,7 +961,7 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
                         pending_tool_use_ids.clear();
                         out.push(AnthropicMessage {
                             role: "user",
-                            content: build_anthropic_content(m),
+                            content: build_anthropic_content(m, scope_root),
                         });
                     }
                 }
@@ -600,7 +971,7 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<AnthropicMessage<'stati
                 pending_tool_use_ids.clear();
                 out.push(AnthropicMessage {
                     role: "user",
-                    content: build_anthropic_content(m),
+                    content: build_anthropic_content(m, scope_root),
                 });
             }
         }
@@ -655,16 +1026,58 @@ fn build_assistant_anthropic_content(msg: &Message) -> Option<AnthropicContent> 
 /// Build the `tool_result` block for a Tool-role message. Returns `None`
 /// when `tool_call_id` is missing/empty (ID-less providers) — an empty
 /// `tool_use_id` would 400, so the caller falls back to plain user text.
-fn anthropic_tool_result_block(msg: &Message) -> Option<AnthropicContentBlock> {
+fn anthropic_tool_result_block(
+    messages: &[Message],
+    index: usize,
+    scope_root: Option<&std::path::Path>,
+) -> Option<AnthropicContentBlock> {
+    let msg = &messages[index];
     let tool_use_id = msg.tool_call_id.as_deref().filter(|id| !id.is_empty())?;
+    // Images a tool handed the model go inside this block; the protocol
+    // has no video block, so a video is named in a note.
+    let shown = crate::tool_media::for_tool_row(messages, index, false, true);
+    let mut text = crate::tool_media::with_note(&msg.content, shown.note.as_deref());
+    let mut blocks = Vec::new();
+    for path in &shown.images {
+        match vision::encode_image(path, scope_root) {
+            Ok((mime, data)) => blocks.push(AnthropicContentBlock::Image {
+                source: AnthropicImageSource {
+                    r#type: "base64".into(),
+                    media_type: mime,
+                    data,
+                },
+                cache_control: None,
+            }),
+            Err(_) => {
+                text = crate::tool_media::with_note(
+                    &text,
+                    Some(&crate::tool_media::unreadable_note(path)),
+                )
+            }
+        }
+    }
+    let content = if blocks.is_empty() {
+        AnthropicToolResultContent::Text(text)
+    } else {
+        if !text.is_empty() {
+            blocks.push(AnthropicContentBlock::Text {
+                text,
+                cache_control: None,
+            });
+        }
+        AnthropicToolResultContent::Blocks(blocks)
+    };
     Some(AnthropicContentBlock::ToolResult {
         tool_use_id: tool_use_id.to_string(),
-        content: msg.content.clone(),
+        content,
         cache_control: None,
     })
 }
 
-fn build_anthropic_content(msg: &Message) -> AnthropicContent {
+fn build_anthropic_content(
+    msg: &Message,
+    scope_root: Option<&std::path::Path>,
+) -> AnthropicContent {
     // Mirror openai.rs: only inline vision content on USER messages.
     // Assistant/Tool media is prior-turn tool output (e.g.
     // send_file(skill-output/slides/<slug>/output/slide-NN.png)) and
@@ -676,10 +1089,39 @@ fn build_anthropic_content(msg: &Message) -> AnthropicContent {
     };
 
     if images.is_empty() {
-        // Include non-image file paths so the agent can use read_file
-        let non_image: Vec<_> = msg.media.iter().filter(|p| !vision::is_image(p)).collect();
-        if non_image.is_empty() {
+        // Include non-image file paths so the agent can use read_file. A
+        // video is named separately: the Messages protocol has no video
+        // block, and `read_file` on an MP4 helps nobody, so the model is
+        // told it cannot watch it rather than sent to read the bytes.
+        let videos: Vec<_> = msg.media.iter().filter(|p| vision::is_video(p)).collect();
+        let non_image: Vec<_> = msg
+            .media
+            .iter()
+            .filter(|p| !vision::is_image(p) && !vision::is_video(p))
+            .collect();
+        if non_image.is_empty() && videos.is_empty() {
             return AnthropicContent::Text(msg.content.clone());
+        }
+        if non_image.is_empty() {
+            let names: Vec<String> = videos
+                .iter()
+                .map(|p| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| (*p).clone())
+                })
+                .collect();
+            let note = format!(
+                "[video attachments this model cannot view: {}. Say so if asked about them; do not guess their contents.]",
+                names.join(", ")
+            );
+            let text = if msg.content.is_empty() {
+                note
+            } else {
+                format!("{}\n{note}", msg.content)
+            };
+            return AnthropicContent::Text(text);
         }
         // Mini5 2026-05-12: the prior note ("Use read_file to access them.")
         // caused DeepSeek/Anthropic to refuse paths under /private/var/...
@@ -707,7 +1149,7 @@ fn build_anthropic_content(msg: &Message) -> AnthropicContent {
 
     let mut parts = Vec::new();
     for path in images {
-        if let Ok((mime, data)) = vision::encode_image(path) {
+        if let Ok((mime, data)) = vision::encode_image(path, scope_root) {
             parts.push(AnthropicContentBlock::Image {
                 source: AnthropicImageSource {
                     r#type: "base64".into(),
@@ -995,12 +1437,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_normalized_manifest_ignores_rolling_marker_and_keeps_system_stable() {
+        let provider = AnthropicProvider::new("test-key", "claude-sonnet-4-6");
+        let config = ChatConfig {
+            prompt_cache_context: Some(crate::PromptCacheContext {
+                affinity_key: "unused".to_owned(),
+                epoch_id: "epoch-one".to_owned(),
+                stable_prefix_hash: "agent-stable".to_owned(),
+                semantic_boundaries: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let tools = vec![ToolSpec {
+            name: "read".to_owned(),
+            description: "read a file".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let first_messages = vec![Message::system("stable"), Message::user("first")];
+        let mut next_messages = first_messages.clone();
+        next_messages.push(Message::assistant("answer"));
+        next_messages.push(Message::user("next"));
+
+        let first_request = provider.build_request(&first_messages, &tools, &config);
+        let next_request = provider.build_request(&next_messages, &tools, &config);
+        let first = provider.prompt_cache_input_manifest(&first_request, &config);
+        let next = provider.prompt_cache_input_manifest(&next_request, &config);
+        let comparison = first.compare_prefix(&next);
+
+        assert_eq!(first.stable_prefix_hash, next.stable_prefix_hash);
+        assert_eq!(comparison.conversation_prefix_segments, 1);
+        assert_eq!(comparison.invalidation_reason, None);
+        assert!(comparison.reusable_normalized_bytes > 0);
+    }
+
     // --- build_anthropic_content tests ---
 
     #[test]
     fn test_build_content_text_only() {
         let m = msg(MessageRole::User, "hello");
-        let content = build_anthropic_content(&m);
+        let content = build_anthropic_content(&m, None);
         match content {
             AnthropicContent::Text(t) => assert_eq!(t, "hello"),
             _ => panic!("expected Text variant"),
@@ -1021,7 +1497,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
         // Non-image media should include file paths for read_file
-        let content = build_anthropic_content(&m);
+        let content = build_anthropic_content(&m, None);
         match content {
             AnthropicContent::Text(t) => {
                 assert!(t.contains("check this"));
@@ -1041,6 +1517,120 @@ mod tests {
             name: name.to_string(),
             arguments: args,
             metadata: None,
+        }
+    }
+
+    /// A tool loop whose tool handed the model an image: user, assistant
+    /// tool call, tool row with the PNG on its media.
+    fn media_loop(dir: &std::path::Path) -> (Vec<Message>, String) {
+        let png = dir.join("grab.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
+        let path = png.to_string_lossy().into_owned();
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_1".into(),
+            name: "view_image".into(),
+            arguments: serde_json::json!({"path": "grab.png"}),
+            metadata: None,
+        }]);
+        let mut tool = mk(MessageRole::Tool, "{\"format\":\"png\"}");
+        tool.tool_call_id = Some("call_1".into());
+        tool.media = vec![path.clone()];
+        (
+            vec![mk(MessageRole::User, "look at grab.png"), assistant, tool],
+            path,
+        )
+    }
+
+    /// The same loop continued: the model answered, the user asked again,
+    /// and a second call ran — the first row's image is now an old batch.
+    fn media_loop_continued(dir: &std::path::Path) -> Vec<Message> {
+        let (mut msgs, _) = media_loop(dir);
+        let mk = |role: MessageRole, content: &str| Message {
+            role,
+            content: content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: None,
+            thread_id: None,
+            timestamp: chrono::Utc::now(),
+        };
+        msgs.push(mk(MessageRole::Assistant, "a red circle"));
+        msgs.push(mk(MessageRole::User, "and the size?"));
+        let mut assistant = mk(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![octos_core::ToolCall {
+            id: "call_2".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"cmd": "file grab.png"}),
+            metadata: None,
+        }]);
+        msgs.push(assistant);
+        let mut tool = mk(MessageRole::Tool, "PNG 480x320");
+        tool.tool_call_id = Some("call_2".into());
+        msgs.push(tool);
+        msgs
+    }
+
+    #[test]
+    fn should_put_tool_media_inside_the_tool_result_and_keep_roles_alternating() {
+        let dir = tempfile::tempdir().unwrap();
+        let (msgs, _) = media_loop(dir.path());
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let body = serde_json::to_value(provider.build_request(&msgs, &[], &ChatConfig::default()))
+            .unwrap();
+        let out = body["messages"].as_array().unwrap();
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user"],
+            "no second user message: {body}"
+        );
+        let result = &out[2]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], "call_1");
+        let content = result["content"]
+            .as_array()
+            .expect("blocks inside the tool_result");
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["type"], "text");
+        assert!(content[1]["text"].as_str().unwrap().contains("png"));
+    }
+
+    #[test]
+    fn should_not_resend_an_older_batch_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let msgs = media_loop_continued(dir.path());
+        let provider = AnthropicProvider::new("test-key", "claude-test");
+        let body = serde_json::to_value(provider.build_request(&msgs, &[], &ChatConfig::default()))
+            .unwrap();
+        let text = body.to_string();
+        assert!(
+            !text.contains("\"type\":\"image\""),
+            "old image must not be re-sent: {text}"
+        );
+        assert!(text.contains("shown to you when it ran"), "{text}");
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        for w in roles.windows(2) {
+            assert_ne!(w[0], w[1], "roles must alternate: {roles:?}");
         }
     }
 
@@ -1346,6 +1936,23 @@ mod tests {
     }
 
     #[test]
+    fn glm_fast_mode_explicitly_disables_provider_default_thinking() {
+        let provider = AnthropicProvider::new("test-key", "glm-5.3-flash")
+            .with_base_url("https://api.z.ai/api/anthropic");
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::Disabled),
+            ..ChatConfig::default()
+        };
+        let body = serde_json::to_value(provider.build_request(
+            &[msg(MessageRole::User, "weather")],
+            &[],
+            &config,
+        ))
+        .unwrap();
+        assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+    }
+
+    #[test]
     fn should_omit_thinking_when_reasoning_is_disabled() {
         let provider = AnthropicProvider::new("test-key", "claude-test");
         let messages = vec![msg(MessageRole::User, "hi")];
@@ -1565,6 +2172,112 @@ mod tests {
         assert_eq!(provider.base_url, "https://custom.api.com");
     }
 
+    /// `tool_choice: {"type": "none"}` must reach the wire for an explicit
+    /// choice and stay absent for the default, so ordinary requests are
+    /// byte-identical to before. Anthropic invalidates message-level cache
+    /// entries when it changes, so it is also a stable manifest segment.
+    #[test]
+    fn should_serialize_tool_choice_none_and_record_it_as_a_manifest_segment() {
+        let provider = AnthropicProvider::new("key", "model");
+        let messages = [
+            msg(MessageRole::System, "system"),
+            msg(MessageRole::User, "hello"),
+        ];
+        let tools = [tool_spec("read", "read a file")];
+        let auto =
+            serde_json::to_value(provider.build_request(&messages, &tools, &ChatConfig::default()))
+                .unwrap();
+        assert!(auto.get("tool_choice").is_none(), "{auto}");
+
+        let none = ChatConfig {
+            tool_choice: crate::ToolChoice::None,
+            ..Default::default()
+        };
+        let request = provider.build_request(&messages, &tools, &none);
+        let body = serde_json::to_value(&request).unwrap();
+        assert_eq!(body["tool_choice"], serde_json::json!({"type": "none"}));
+        let manifest = provider.prompt_cache_input_manifest(&request, &none);
+        assert!(
+            manifest
+                .stable_segments
+                .iter()
+                .any(|segment| segment.kind == "config:tool_choice"),
+            "tool_choice changes Anthropic's message cache and must be visible in the manifest"
+        );
+        let tool_less =
+            serde_json::to_value(provider.build_request(&messages, &[], &none)).unwrap();
+        assert!(tool_less.get("tool_choice").is_none(), "{tool_less}");
+    }
+
+    #[test]
+    fn custom_compatible_endpoint_omits_cache_control_by_default() {
+        let provider =
+            AnthropicProvider::new("key", "model").with_base_url("https://custom.api.com");
+        let body = serde_json::to_value(provider.build_request(
+            &[
+                msg(MessageRole::System, "system"),
+                msg(MessageRole::User, "hello"),
+            ],
+            &[tool_spec("read", "read a file")],
+            &ChatConfig::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(body["system"], "system");
+        assert!(body["messages"][0]["content"].is_string(), "{body}");
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "custom endpoints must opt in to Anthropic cache extensions: {body}"
+        );
+    }
+
+    #[test]
+    fn explicit_prompt_caching_opt_in_wins_for_custom_endpoint_in_either_order() {
+        let custom_then_opt_in = AnthropicProvider::new("key", "model")
+            .with_base_url("https://custom.api.com")
+            .with_prompt_caching(true);
+        let opt_in_then_custom = AnthropicProvider::new("key", "model")
+            .with_prompt_caching(true)
+            .with_base_url("https://custom.api.com");
+
+        for provider in [custom_then_opt_in, opt_in_then_custom] {
+            let body = serde_json::to_value(provider.build_request(
+                &[msg(MessageRole::User, "hello")],
+                &[],
+                &ChatConfig::default(),
+            ))
+            .unwrap();
+            assert!(
+                body.to_string().contains("cache_control"),
+                "an explicit opt-in must survive builder call ordering: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_prompt_cache_defaults_are_official_only_and_honor_kill_switch() {
+        assert!(prompt_caching_default_for_base_url_from(
+            "https://api.anthropic.com",
+            None
+        ));
+        assert!(prompt_caching_default_for_base_url_from(
+            " https://API.ANTHROPIC.COM/ ",
+            Some("true")
+        ));
+        assert!(!prompt_caching_default_for_base_url_from(
+            "https://api.anthropic.com",
+            Some("off")
+        ));
+        assert!(!prompt_caching_default_for_base_url_from(
+            "https://custom.api.com",
+            None
+        ));
+        assert!(!prompt_caching_default_for_base_url_from(
+            "https://custom.api.com",
+            Some("true")
+        ));
+    }
+
     // Codex round-4 MAJOR: the chat() and chat_stream() error paths previously
     // hardcoded `format!("anthropic/{}", self.model)` instead of using
     // `self.provider_label`. Registry entries for `r9s` and `zai` lanes call
@@ -1726,6 +2439,34 @@ mod tests {
     }
 
     #[test]
+    fn should_not_mark_an_incomplete_parallel_tool_result_batch() {
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
+        let mut assistant = msg(MessageRole::Assistant, "");
+        assistant.tool_calls = Some(vec![
+            tool_call("toolu_a", "shell", serde_json::json!({"command": "ls"})),
+            tool_call("toolu_b", "read_file", serde_json::json!({"path": "x"})),
+        ]);
+        let mut result_a = msg(MessageRole::Tool, "out-a");
+        result_a.tool_call_id = Some("toolu_a".into());
+        let messages = vec![msg(MessageRole::User, "go"), assistant, result_a];
+
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &[], &ChatConfig::default()))
+                .unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        let first_user = messages[0]["content"].as_array().unwrap();
+        assert_eq!(
+            first_user.last().unwrap()["cache_control"]["type"],
+            "ephemeral",
+            "the prior complete user turn remains the rolling breakpoint: {body}"
+        );
+        assert!(
+            !messages[2].to_string().contains("cache_control"),
+            "an incomplete tool-result batch must not become a semantic cache boundary: {body}"
+        );
+    }
+
+    #[test]
     fn should_keep_blank_system_as_string_even_when_caching_enabled() {
         // An empty text BLOCK is rejected by Anthropic while `"system": ""`
         // is not — an all-blank system prompt must stay in string form.
@@ -1770,6 +2511,80 @@ mod tests {
         assert!(
             !body.to_string().contains("cache_control"),
             "no cache_control key may appear anywhere when caching is off: {body}"
+        );
+    }
+
+    #[test]
+    fn should_not_emit_cache_control_anywhere_when_request_opts_out_of_cache_writes() {
+        // A one-shot request (`ChatConfig.cache_retention: None`) must not
+        // pay the 1.25x cache-write premium: with caching enabled on the
+        // PROVIDER, the opted-out REQUEST still serializes to the exact
+        // pre-caching wire shape — plain-string system, verbatim tools, no
+        // cache_control key anywhere.
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
+        let tools = vec![
+            tool_spec("alpha", "first tool"),
+            tool_spec("omega", "last tool"),
+        ];
+        let messages = vec![
+            msg(MessageRole::System, "system prompt"),
+            msg(MessageRole::User, "hello"),
+        ];
+        let opted_out = ChatConfig {
+            cache_retention: crate::CacheRetention::None,
+            ..Default::default()
+        };
+        let body =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &opted_out)).unwrap();
+        assert!(
+            !body.contains("cache_control"),
+            "an opted-out request must carry zero cache_control blocks: {body}"
+        );
+
+        // Byte-identical to the shape a caching-disabled provider emits —
+        // the opt-out and the provider-level kill switch are the same wire
+        // contract.
+        let disabled = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(false);
+        let disabled_body = serde_json::to_string(&disabled.build_request(
+            &messages,
+            &tools,
+            &ChatConfig::default(),
+        ))
+        .unwrap();
+        assert_eq!(
+            body, disabled_body,
+            "opted-out request must match the caching-disabled wire shape byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn should_keep_default_request_byte_identical_when_cache_retention_unset() {
+        // The opt-out is strictly per-request: a config that never touches
+        // `cache_retention` (and one that sets it to `Default` explicitly)
+        // must keep the exact cached wire shape, breakpoints included.
+        let provider = AnthropicProvider::new("test-key", "claude-test").with_prompt_caching(true);
+        let tools = vec![tool_spec("alpha", "first tool")];
+        let messages = vec![
+            msg(MessageRole::System, "system prompt"),
+            msg(MessageRole::User, "hello"),
+        ];
+        let unset = serde_json::to_string(&provider.build_request(
+            &messages,
+            &tools,
+            &ChatConfig::default(),
+        ))
+        .unwrap();
+        let explicit_default = ChatConfig {
+            cache_retention: crate::CacheRetention::Default,
+            ..Default::default()
+        };
+        let explicit =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &explicit_default))
+                .unwrap();
+        assert_eq!(unset, explicit);
+        assert!(
+            unset.contains("cache_control"),
+            "the default request must keep its cache breakpoints: {unset}"
         );
     }
 
@@ -1892,5 +2707,334 @@ mod tests {
         let msgs = body["messages"].as_array().unwrap();
         let blocks = msgs.last().unwrap()["content"].as_array().unwrap();
         assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+    }
+    // --- sampling params on the Anthropic protocol path (#2172) ---
+    //
+    // Emission is MODEL-CAPABILITY-AWARE: first-party Claude (claude-*, incl.
+    // Opus 4.7 which we ship) rejects sampling on the Messages API and must
+    // receive NONE (reverting to the pre-#2172 wire); GLM via z.ai accepts
+    // temperature/top_p/top_k. The `model_accepts_sampling` gate below is
+    // pinned from both sides so a "forward to all" mutation fails the Claude
+    // tests and a "forward to none" mutation fails the GLM tests.
+
+    /// Pre-change golden serialization of a representative request (caching
+    /// ON: system + tool + user message, `ChatConfig::default()`), captured
+    /// on the rev before sampling support was added. The no-override wire
+    /// must stay byte-identical — prompt-cache prefixes and Anthropic-
+    /// compatible proxies depend on the exact shape.
+    const NO_OVERRIDE_GOLDEN: &str = r#"{"model":"claude-test","max_tokens":16384,"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}],"system":[{"type":"text","text":"system prompt","cache_control":{"type":"ephemeral"}}],"tools":[{"name":"alpha","description":"first tool","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}]}"#;
+
+    fn fixture_for(model: &str) -> (AnthropicProvider, Vec<ToolSpec>, Vec<Message>) {
+        // Pin caching ON so the wire shape is hermetic w.r.t. an ambient
+        // `OCTOS_PROMPT_CACHING=0` (builder override wins over the env
+        // default), and so the goldens cover cache_control placement.
+        let provider = AnthropicProvider::new("test-key", model).with_prompt_caching(true);
+        let tools = vec![tool_spec("alpha", "first tool")];
+        let messages = vec![
+            msg(MessageRole::System, "system prompt"),
+            msg(MessageRole::User, "hello"),
+        ];
+        (provider, tools, messages)
+    }
+
+    /// First-party Claude, rejects sampling. `claude-opus-4-7` is a real
+    /// `model_catalog.json` entry whose API contract removed the sampler set.
+    fn claude_fixture() -> (AnthropicProvider, Vec<ToolSpec>, Vec<Message>) {
+        fixture_for("claude-opus-4-7")
+    }
+
+    /// GLM via z.ai (the `zai` / `zai-coding` families), accepts sampling.
+    fn glm_fixture() -> (AnthropicProvider, Vec<ToolSpec>, Vec<Message>) {
+        fixture_for("glm-5.3")
+    }
+
+    #[test]
+    fn should_accept_only_glm_and_reject_everything_else() {
+        // The capability gate is DEFAULT-DENY: GLM via z.ai is the sole
+        // affirmatively-accepting class; everything else — first-party Claude
+        // (bare AND family-qualified), other OpenAI-path models that could be
+        // pointed here, custom endpoints, and the empty string — gets
+        // nothing (safe direction; also matches origin/main, which forwarded
+        // no sampling to any Anthropic-path model). Pinned so a forward-to-all
+        // or forward-to-none regression is caught here before the
+        // request-shape tests.
+        for accept in [
+            // every GLM suffix the zai / zai-coding constructors can send
+            // (bare model, after the registry strips the `<family>/` prefix)
+            "glm-4.5-air",
+            "glm-4.7",
+            "glm-5-turbo",
+            "glm-5.1",
+            "glm-5.3",
+            "glm-5.3-flash",
+            "GLM-5.3",        // case-insensitive
+            "zai/glm-4.7",    // family-qualified (custom base_url)
+            "vendor/glm-5.3", // any leading path segment
+        ] {
+            assert!(
+                model_accepts_sampling(accept),
+                "{accept} must be classified as ACCEPTING sampling"
+            );
+        }
+        for reject in [
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-3-5-haiku-20241022",
+            "claude-test",
+            "Claude-Opus-4-7",           // case-insensitive
+            "anthropic/claude-opus-4-7", // family-qualified claude (H1 bypass)
+            "r9s/claude-opus-4-7",       // proxied claude (H1 bypass)
+            "kimi-k2",                   // OpenAI-path model, not GLM
+            "minimax-m2.1",
+            "my-local-model", // unknown custom endpoint
+            "glmini",         // "glm" without the hyphen is not GLM
+            "",               // empty string
+        ] {
+            assert!(
+                !model_accepts_sampling(reject),
+                "{reject} must be classified as REJECTING sampling"
+            );
+        }
+    }
+
+    #[test]
+    fn should_serialize_byte_identical_golden_when_no_sampling_override_configured() {
+        let (provider, tools, messages) = fixture_for("claude-test");
+        // The agent loop's no-override shape: `ChatConfig::default()` carries
+        // the built-in `temperature: Some(0.0)` sentinel (see the #2172
+        // invariant in octos-agent's `build_chat_config`) and no
+        // sampling_params.
+        let config = ChatConfig::default();
+        let wire =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &config)).unwrap();
+        assert_eq!(wire, NO_OVERRIDE_GOLDEN);
+
+        // An explicitly-unset temperature must produce the very same bytes.
+        let config_none = ChatConfig {
+            temperature: None,
+            ..ChatConfig::default()
+        };
+        let wire_none =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &config_none))
+                .unwrap();
+        assert_eq!(wire_none, NO_OVERRIDE_GOLDEN);
+    }
+
+    #[test]
+    fn should_emit_no_sampling_fields_on_accepting_model_when_no_override_configured() {
+        // Byte-identity's sibling on the ACCEPTING path: even a GLM model
+        // adds nothing when the operator configured no override (0.0
+        // sentinel, no sampling_params) — so cloud GLM requests are unchanged
+        // until an operator opts in.
+        let (provider, tools, messages) = glm_fixture();
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &ChatConfig::default()))
+                .unwrap();
+        assert!(body.get("temperature").is_none(), "{body}");
+        assert!(body.get("top_p").is_none(), "{body}");
+        assert!(body.get("top_k").is_none(), "{body}");
+    }
+
+    #[test]
+    fn should_forward_temperature_top_p_and_top_k_to_glm_when_operator_overrides() {
+        let (provider, tools, messages) = glm_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.9));
+        sp.insert("top_k".to_string(), serde_json::json!(40));
+        let config = ChatConfig {
+            // 0.5 is exactly representable in f32, so the f32 -> f64 widening
+            // in `serde_json::to_value` cannot skew the equality check.
+            temperature: Some(0.5),
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert_eq!(body["temperature"], serde_json::json!(0.5), "{body}");
+        assert_eq!(body["top_p"], serde_json::json!(0.9), "{body}");
+        assert_eq!(body["top_k"], serde_json::json!(40), "{body}");
+    }
+
+    #[test]
+    fn should_serialize_temperature_shortest_form_on_glm_wire() {
+        // The non-streaming path serializes the f32 directly (ryu shortest),
+        // so 0.7 reaches the wire as `0.7`, not the widened `0.699999…`.
+        let (provider, tools, messages) = glm_fixture();
+        let config = ChatConfig {
+            temperature: Some(0.7),
+            ..ChatConfig::default()
+        };
+        let wire =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &config)).unwrap();
+        assert!(
+            wire.contains("\"temperature\":0.7"),
+            "temperature override must reach the wire with its exact value: {wire}"
+        );
+    }
+
+    #[test]
+    fn should_treat_zero_temperature_as_unset_sentinel_even_on_accepting_model() {
+        // 0.0 is the plumbing's built-in default (#2172); it is
+        // indistinguishable from "unset" and must never be emitted, even to a
+        // model that WOULD accept a real temperature.
+        let (provider, tools, messages) = glm_fixture();
+        let config = ChatConfig {
+            temperature: Some(0.0),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "the 0.0 default sentinel must stay off the wire: {body}"
+        );
+    }
+
+    #[test]
+    fn should_forward_top_p_top_k_and_drop_openai_only_keys_on_glm() {
+        let (provider, tools, messages) = glm_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.95));
+        sp.insert("top_k".to_string(), serde_json::json!(40));
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        sp.insert("frequency_penalty".to_string(), serde_json::json!(0.5));
+        let config = ChatConfig {
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert_eq!(body["top_p"], serde_json::json!(0.95), "{body}");
+        assert_eq!(body["top_k"], serde_json::json!(40), "{body}");
+        // OpenAI-only sampler knobs are NOT part of the Anthropic Messages
+        // API — they must be dropped (and logged), never forwarded verbatim.
+        assert!(body.get("repeat_penalty").is_none(), "{body}");
+        assert!(body.get("frequency_penalty").is_none(), "{body}");
+    }
+
+    #[test]
+    fn should_drop_modeled_keys_when_smuggled_via_sampling_params_on_glm() {
+        // Defense-in-depth, mirroring the OpenAI path (#2172): keys octos
+        // models with dedicated fields cannot sneak in through
+        // sampling_params and emit duplicate/divergent top-level keys.
+        let (provider, tools, messages) = glm_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("temperature".to_string(), serde_json::json!(1.9));
+        sp.insert("max_tokens".to_string(), serde_json::json!(9));
+        let config = ChatConfig {
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "smuggled temperature must not reach the wire: {body}"
+        );
+        assert_eq!(
+            body["max_tokens"],
+            serde_json::json!(crate::context::default_max_tokens()),
+            "dedicated max_tokens field must win: {body}"
+        );
+    }
+
+    #[test]
+    fn should_keep_cache_breakpoints_unchanged_when_sampling_forwarded_to_glm() {
+        // #1640 interaction: sampling fields are top-level request fields and
+        // must not disturb cache_control placement (system block, LAST tool,
+        // last user content block — exactly three markers). Exercised on the
+        // ACCEPTING path so the sampling fields are actually present.
+        let (provider, tools, messages) = glm_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.9));
+        let config = ChatConfig {
+            temperature: Some(0.7),
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let wire =
+            serde_json::to_string(&provider.build_request(&messages, &tools, &config)).unwrap();
+        assert_eq!(
+            wire.matches("\"cache_control\"").count(),
+            3,
+            "exactly three breakpoints (system, last tool, last user block): {wire}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["tools"].as_array().unwrap().last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
+        let blocks = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+        assert!(body.get("temperature").is_some(), "{body}");
+        assert_eq!(body["top_p"], serde_json::json!(0.9), "{body}");
+    }
+
+    #[test]
+    fn should_not_send_any_sampling_to_first_party_claude_when_operator_overrides() {
+        // H3 core regression: without the model gate, an operator temperature
+        // (and any sampling_params) reach first-party Claude and 400 on
+        // Opus 4.7+. No thinking here — this must hold on the plain path too.
+        let (provider, tools, messages) = claude_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.9));
+        sp.insert("top_k".to_string(), serde_json::json!(40));
+        let config = ChatConfig {
+            temperature: Some(0.7),
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert!(body.get("temperature").is_none(), "{body}");
+        assert!(body.get("top_p").is_none(), "{body}");
+        assert!(body.get("top_k").is_none(), "{body}");
+    }
+
+    #[test]
+    fn should_not_send_any_sampling_to_opus_4_7_when_thinking_omitted_for_small_max_tokens() {
+        // H3 explicit: the small-max_tokens path drops `thinking` (no valid
+        // budget fits), which is exactly where the first cut leaked ALL
+        // sampling to Opus 4.7. The model gate must still suppress everything.
+        let (provider, tools, messages) = claude_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.9));
+        let config = ChatConfig {
+            max_tokens: Some(1_000),
+            temperature: Some(0.7),
+            reasoning_effort: Some(ReasoningEffort::Low),
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert!(body.get("thinking").is_none(), "budget cannot fit: {body}");
+        assert!(body.get("temperature").is_none(), "{body}");
+        assert!(body.get("top_p").is_none(), "{body}");
+        assert!(body.get("top_k").is_none(), "{body}");
+    }
+
+    #[test]
+    fn should_not_send_top_p_to_first_party_claude_even_when_thinking_enabled() {
+        // H4: `thinking + top_p` 400s first-party Claude (top_p is only
+        // conditionally allowed under thinking, and not at all on 4.7+). The
+        // gate drops top_p regardless of the thinking block.
+        let (provider, tools, messages) = claude_fixture();
+        let mut sp = serde_json::Map::new();
+        sp.insert("top_p".to_string(), serde_json::json!(0.9));
+        let config = ChatConfig {
+            max_tokens: Some(32_768),
+            reasoning_effort: Some(ReasoningEffort::High),
+            sampling_params: Some(sp),
+            ..ChatConfig::default()
+        };
+        let body =
+            serde_json::to_value(provider.build_request(&messages, &tools, &config)).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled", "{body}");
+        assert!(body.get("top_p").is_none(), "{body}");
     }
 }

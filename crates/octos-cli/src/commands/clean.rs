@@ -78,7 +78,7 @@ impl Executable for CleanCommand {
         } else if total_size > 1024 {
             format!("{:.1} KB", total_size as f64 / 1024.0)
         } else {
-            format!("{} bytes", total_size)
+            format!("{total_size} bytes")
         };
 
         println!(

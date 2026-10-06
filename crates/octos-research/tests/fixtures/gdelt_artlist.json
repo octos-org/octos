@@ -1,0 +1,6 @@
+{"articles": [
+ {"url": "https://elpais.com/clima/2026-09-26/cumbre-acuerdo.html", "url_mobile": "", "title": "La cumbre del clima cierra con un acuerdo preliminar", "seendate": "20260926T101500Z", "socialimage": "https://elpais.com/img.jpg", "domain": "elpais.com", "language": "Spanish", "sourcecountry": "Spain"},
+ {"url": "https://www.lemonde.fr/planete/article/2026/09/25/sommet-climat.html", "url_mobile": "", "title": "Sommet climat : un accord a minima", "seendate": "20260925T183000Z", "socialimage": "", "domain": "lemonde.fr", "language": "French", "sourcecountry": "France"},
+ {"url": "ftp://bad.example/x", "title": "not http", "seendate": "20260925T183000Z", "domain": "bad.example", "language": "English"},
+ {"url": "https://www.reuters.com/sustainability/climate-summit-2026-09-24/", "title": "Climate summit delegates reach draft deal", "seendate": "20260924T090000Z", "domain": "reuters.com", "language": "English", "sourcecountry": "United States"}
+]}

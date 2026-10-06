@@ -418,10 +418,10 @@ fn compile_node(n: &IrNode) -> PipelineNode {
             timeout_secs,
         } => {
             if let Some(s) = seconds {
-                node.prompt = Some(format!("wait {}s", s));
+                node.prompt = Some(format!("wait {s}s"));
                 node.timeout_secs = Some(*s);
             } else if let Some(cond) = until_condition {
-                node.prompt = Some(format!("wait until {}", cond));
+                node.prompt = Some(format!("wait until {cond}"));
                 node.timeout_secs = Some(timeout_secs.unwrap_or(300));
             }
             node.label = Some("wait".into());

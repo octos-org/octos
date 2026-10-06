@@ -29,6 +29,7 @@ import {
   freshTurnId,
   liveServerEnv,
   uniqueSessionId,
+  waitForTurnTerminal,
 } from "../lib/m9-ws-client";
 
 function expectUnknownApprovalKind(kind: unknown): void {
@@ -154,10 +155,7 @@ test.describe("M9 protocol — approval/respond", () => {
       expect(second.data?.approval_id).toBe(requested.params.approval_id);
       expect(second.data?.recorded_decision).toBe("approve");
 
-      await Promise.race([
-        client.waitForNotification("turn/completed", 45_000),
-        client.waitForNotification("turn/error", 45_000),
-      ]).catch(() => {
+      await waitForTurnTerminal(client, turnId, 45_000).catch(() => {
         // The idempotency contract is already asserted. Some approval fixtures
         // intentionally pause after approval for operator inspection.
       });

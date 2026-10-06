@@ -14,7 +14,8 @@ use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
     resolve_scoped_file_handle, resolve_workspace_file_handle,
 };
-#[cfg(test)]
+// `Message` is used by non-test lib code (`dedupe_history_rows` below),
+// so this import must not be test-gated.
 use octos_core::Message;
 use octos_core::{MAIN_PROFILE_ID, SessionKey};
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,29 @@ fn resolve_within_workspace(
     let candidate = std::fs::canonicalize(workspace_root.join(rel)).ok()?;
     let canon_ws = std::fs::canonicalize(workspace_root).ok()?;
     (candidate.is_file() && candidate.starts_with(&canon_ws)).then_some(candidate)
+}
+
+/// A file the agent delivered in `session_id` from outside the tenant root is
+/// served from the copy stored at delivery time under the caller's own
+/// profile root (`octos_bus::session_artifacts`). The copy existing is the
+/// proof the agent delivered exactly `request_path` in that session; the
+/// lookup never leaves `profile_root`, and the external file is never read.
+fn resolve_delivered_copy(
+    profile_root: &std::path::Path,
+    session_id: &str,
+    request_path: &str,
+) -> Option<std::path::PathBuf> {
+    if session_id.is_empty() || request_path.is_empty() {
+        return None;
+    }
+    let copy = octos_bus::session_artifacts::delivered_copy_path(
+        profile_root,
+        &octos_core::SessionKey(session_id.to_string()),
+        request_path,
+    );
+    let canonical = std::fs::canonicalize(copy).ok()?;
+    let root = std::fs::canonicalize(profile_root).ok()?;
+    (canonical.is_file() && canonical.starts_with(root)).then_some(canonical)
 }
 
 /// Resolve the workspace root for a download request's owning session, matching
@@ -565,6 +589,82 @@ pub struct SessionInfo {
     /// no user message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prompt: Option<String>,
+    /// Does this session have a live (non-terminal) turn RIGHT NOW?
+    ///
+    /// Sourced from the process-global active-turn registry, not from disk —
+    /// so it is honest about sessions the asking connection never opened,
+    /// which is the point: two UI Protocol clients (the TUI and the browser
+    /// client) can attach to one `octos serve`, and this is how one learns the
+    /// other is mid-turn before it tries a `turn/start` that would be refused.
+    ///
+    /// Always serialized (unlike the `Option` fields above, where absence
+    /// means "unknown"): `false` is a real, useful answer. Additive and
+    /// ungated — `session/list` itself is already behind
+    /// `auxiliary.rest_to_ws.v1`, and the sibling additive fields on this
+    /// struct carry no capability of their own. `#[serde(default)]` keeps the
+    /// gateway-merge deserialization below working against an older peer that
+    /// does not emit the field.
+    #[serde(default)]
+    pub active_turn: bool,
+}
+
+/// Does a listing entry correspond to a session with a live turn?
+///
+/// The active-turn registry is keyed by the WIRE [`SessionKey`]
+/// (`<profile>:api:<chat>` — what `turn/start` carries), while a per-profile
+/// or per-project store lists chat-BARE ids, so reconstruct the wire key for
+/// the listing's effective profile. An id that is ALREADY a full key (it
+/// carries the `:` channel separator, as legacy flat-layout entries can) is
+/// also matched verbatim; a chat-bare id is deliberately NOT, or profile A's
+/// live turn on `A:api:web-1` would light up profile B's own `web-1` row.
+/// Callers still holding the full key (the process-wide walk) match it
+/// exactly instead of going through here.
+fn session_id_has_active_turn(
+    active_turns: &std::collections::HashSet<SessionKey>,
+    effective_profile_id: &str,
+    listed_id: &str,
+) -> bool {
+    active_turns
+        .iter()
+        .any(|key| active_turn_key_matches(key, effective_profile_id, listed_id))
+}
+
+/// Does one active-turn registry key denote the session a listing row names?
+///
+/// The registry is keyed by the session id EXACTLY as it arrived on the wire,
+/// which is whatever shape the client chose: a bare handle (`web-1`), a
+/// channel-qualified key (`api:web-1`) or a fully profiled one
+/// (`coding:api:web-1`). The listing stores, meanwhile, hand back either the
+/// full key (the process-wide walk) or the chat id alone (per-profile and
+/// per-project stores). Reconstructing a key from the row would have to guess
+/// both the profile and the CHANNEL, so this inverts the mapping instead and
+/// decomposes the registry key, which needs no guessing.
+///
+/// A profiled key matches only its own profile's rows — profile A's turn on
+/// `A:api:web-1` must never light up profile B's `web-1`. An unprofiled key
+/// carries no tenant dimension to check, so a bare row in another profile's
+/// listing could in principle match it; that ambiguity is inherent to a
+/// client that opened an unprofiled session and is not introduced here.
+/// Topics are folded away by `chat_id`/`base_key`: a turn in `…#research` does
+/// make the session busy.
+fn active_turn_key_matches(key: &SessionKey, effective_profile_id: &str, listed_id: &str) -> bool {
+    // The row carried the whole key (or the client used a colon-less handle
+    // and the store listed it unchanged).
+    if key.0 == listed_id {
+        return true;
+    }
+    // A colon-less key has no chat-id component to compare — `chat_id()`
+    // returns empty for it — so the verbatim check above was its only chance.
+    if !key.base_key().contains(':') {
+        return false;
+    }
+    if key.chat_id() != listed_id {
+        return false;
+    }
+    match key.profile_id() {
+        Some(profile_id) => profile_id == effective_profile_id,
+        None => true,
+    }
 }
 
 fn is_internal_api_session_id(id: &str) -> bool {
@@ -593,6 +693,12 @@ pub async fn list_sessions(
     // `None` (the default, and always when the flag is off) → byte-identical
     // legacy behavior.
     cwd_sessions_root: Option<std::path::PathBuf>,
+    // Sessions with a live (non-terminal) turn, snapshotted from the
+    // process-global active-turn registry by the WS handler BEFORE this call
+    // (never while holding a sessions lock). Stamps `SessionInfo.active_turn`.
+    // The id shapes differ per store, so the mapping back onto the registry's
+    // wire keys happens here, where the effective profile is known.
+    active_turns: &std::collections::HashSet<SessionKey>,
 ) -> Response {
     // Collect sessions from both the standalone store and gateway profiles.
     let mut all: Vec<SessionInfo> = Vec::new();
@@ -607,13 +713,27 @@ pub async fn list_sessions(
         Err(response) => return response,
     };
 
+    // Effective profile scope for this listing. Resolved up here (it used to
+    // sit below the cwd short-circuit) so the per-project branch can stamp
+    // `active_turn` against the same profile as every other scope. Both reads
+    // are pure functions of the state + headers, so hoisting them changes
+    // nothing else.
+    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
+    // A localhost / stdio UI Protocol connection has no routed profile
+    // header, but its authenticated profile is frozen onto the connection.
+    // Use that scope for every legacy fallback below; defaulting to `_main`
+    // here leaks solo/admin session metadata into an ordinary user's list.
+    let connection_scoped_profile_id =
+        connection_profile_id.filter(|_| routed_profile_id.is_none());
+    let effective_profile_id = connection_scoped_profile_id.unwrap_or(&profile_id);
+
     // Per-project listing short-circuit (`appui.sessions_in_cwd`). The
     // authorization gate above still runs (the connection must be allowed to
     // list at all); we then scope the listing to the cwd's `<cwd>/.octos`
     // store instead of the profile/global stores. Runs BEFORE the legacy
     // merge so a project session list never bleeds in another scope's rows.
     if let Some(cwd_root) = cwd_sessions_root {
-        let cwd_sessions = list_profile_sessions(&cwd_root);
+        let cwd_sessions = list_profile_sessions(&cwd_root, active_turns, effective_profile_id);
         return Json(cwd_sessions).into_response();
     }
 
@@ -659,14 +779,6 @@ pub async fn list_sessions(
     // keep the existing header + identity authorized resolution unchanged
     // — Layer-2 authorization still applies, and a parent viewing a
     // sub-account subdomain still lists the routed profile's sessions.
-    let routed_profile_id = routed_profile_id_from_headers(&state, &headers);
-    // A localhost / stdio UI Protocol connection has no routed profile
-    // header, but its authenticated profile is frozen onto the connection.
-    // Use that scope for every legacy fallback below; defaulting to `_main`
-    // here leaks solo/admin session metadata into an ordinary user's list.
-    let connection_scoped_profile_id =
-        connection_profile_id.filter(|_| routed_profile_id.is_none());
-    let effective_profile_id = connection_scoped_profile_id.unwrap_or(&profile_id);
     let profile_data_dir = match connection_profile_id {
         Some(pid) if routed_profile_id.is_none() => {
             resolve_profile_data_dir_by_id(&state, pid).ok()
@@ -676,7 +788,8 @@ pub async fn list_sessions(
             .ok(),
     };
     if let Some(profile_data_dir) = profile_data_dir {
-        let profile_sessions = list_profile_sessions(&profile_data_dir);
+        let profile_sessions =
+            list_profile_sessions(&profile_data_dir, active_turns, effective_profile_id);
         let existing: std::collections::HashSet<String> =
             all.iter().map(|s| s.id.clone()).collect();
         all.extend(
@@ -708,12 +821,17 @@ pub async fn list_sessions(
                     if existing.contains(chat_id) {
                         return None;
                     }
+                    // The process-wide store hands us the FULL wire key
+                    // before the prefix strip, so match the registry exactly
+                    // rather than reconstructing it.
+                    let active_turn = active_turns.contains(&SessionKey(id.clone()));
                     Some(SessionInfo {
                         id: chat_id.to_string(),
                         message_count: count,
                         title,
                         updated_at: updated_at.map(|dt| dt.to_rfc3339()),
                         last_prompt,
+                        active_turn,
                     })
                 }),
         );
@@ -748,9 +866,25 @@ pub async fn list_sessions(
                     // Merge, dedup by id (per-profile / standalone wins).
                     let existing: std::collections::HashSet<String> =
                         all.iter().map(|s| s.id.clone()).collect();
-                    all.extend(gateway_sessions.into_iter().filter(|s| {
-                        !existing.contains(&s.id) && !is_internal_api_session_id(&s.id)
-                    }));
+                    all.extend(
+                        gateway_sessions
+                            .into_iter()
+                            .filter(|s| {
+                                !existing.contains(&s.id) && !is_internal_api_session_id(&s.id)
+                            })
+                            // The gateway is a separate process with its own
+                            // registry, so trust its flag when it sets one and
+                            // otherwise fall back to ours.
+                            .map(|mut s| {
+                                s.active_turn = s.active_turn
+                                    || session_id_has_active_turn(
+                                        active_turns,
+                                        effective_profile_id,
+                                        &s.id,
+                                    );
+                                s
+                            }),
+                    );
                 }
             }
         }
@@ -788,7 +922,11 @@ pub async fn list_sessions(
 /// is needed inside this helper. The caller (`list_sessions`) handles
 /// header/identity authorization via [`resolve_profile_data_dir`]
 /// before invoking us.
-fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo> {
+fn list_profile_sessions(
+    profile_data_dir: &std::path::Path,
+    active_turns: &std::collections::HashSet<SessionKey>,
+    effective_profile_id: &str,
+) -> Vec<SessionInfo> {
     let Ok(mgr) = octos_bus::SessionManager::open(profile_data_dir) else {
         return Vec::new();
     };
@@ -798,12 +936,14 @@ fn list_profile_sessions(profile_data_dir: &std::path::Path) -> Vec<SessionInfo>
             if is_internal_api_session_id(&id) {
                 return None;
             }
+            let active_turn = session_id_has_active_turn(active_turns, effective_profile_id, &id);
             Some(SessionInfo {
                 id,
                 message_count: count,
                 title,
                 updated_at: updated_at.map(|dt| dt.to_rfc3339()),
                 last_prompt,
+                active_turn,
             })
         })
         .collect()
@@ -1446,6 +1586,10 @@ pub async fn session_workspace_contract(
     Json(statuses).into_response()
 }
 
+// The error is a ready-to-return axum response. Keeping it inline avoids an
+// allocation on every rejected file request and matches the profile resolvers
+// below, whose handlers also return the response directly.
+#[allow(clippy::result_large_err)]
 async fn resolve_file_access_data_dir(
     state: &AppState,
     headers: &HeaderMap,
@@ -1997,6 +2141,177 @@ pub async fn upload_site_files(
     Ok(Json(saved))
 }
 
+#[derive(Deserialize)]
+pub struct FileMutationRequest {
+    path: String,
+    session: Option<String>,
+    #[serde(flatten)]
+    operation: FileMutation,
+}
+
+#[derive(Deserialize)]
+pub struct SlideEditQuery {
+    session_id: String,
+    slug: String,
+}
+
+async fn slide_edit_location(
+    state: &AppState,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    query: &SlideEditQuery,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), Response> {
+    if query.session_id.is_empty()
+        || query.session_id.len() > 512
+        || super::file_mutations::validate_filename(&query.slug).is_err()
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid slides project.").into_response());
+    }
+    let data_dir = resolve_file_access_data_dir(state, headers, identity).await?;
+    let root = data_dir
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND.into_response())?;
+    let project = api_session_workspace_dirs(&root, &query.session_id)
+        .into_iter()
+        .map(|workspace| workspace.join("slides").join(&query.slug))
+        .find(|path| path.is_dir())
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Slides scaffold not found.").into_response())?;
+    let relative = project
+        .strip_prefix(&root)
+        .map_err(|_| StatusCode::FORBIDDEN.into_response())?
+        .join(super::slide_edits::FILENAME);
+    Ok((root, relative))
+}
+
+fn slide_edit_error(error: std::io::Error) -> Response {
+    let status = match error.kind() {
+        std::io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
+        std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+        std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+        std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let message = if status == StatusCode::CONFLICT {
+        "Another editor saved a newer revision. Reload before saving."
+    } else {
+        "Unable to access slide edits. Check the project and retry."
+    };
+    (status, message).into_response()
+}
+
+pub async fn get_slide_edits(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    axum::extract::Query(query): axum::extract::Query<SlideEditQuery>,
+) -> Response {
+    let (root, relative) = match slide_edit_location(
+        &state,
+        &headers,
+        identity.as_ref().map(|ext| &ext.0),
+        &query,
+    )
+    .await
+    {
+        Ok(location) => location,
+        Err(response) => return response,
+    };
+    match tokio::task::spawn_blocking(move || super::slide_edits::read(&root, &relative)).await {
+        Ok(Ok(document)) => Json(document).into_response(),
+        Ok(Err(error)) => slide_edit_error(error),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub async fn save_slide_edits(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    axum::extract::Query(query): axum::extract::Query<SlideEditQuery>,
+    Json(request): Json<super::slide_edits::SaveRequest>,
+) -> Response {
+    let (root, relative) = match slide_edit_location(
+        &state,
+        &headers,
+        identity.as_ref().map(|ext| &ext.0),
+        &query,
+    )
+    .await
+    {
+        Ok(location) => location,
+        Err(response) => return response,
+    };
+    match tokio::task::spawn_blocking(move || super::slide_edits::save(&root, &relative, request))
+        .await
+    {
+        Ok(Ok(document)) => Json(document).into_response(),
+        Ok(Err(error)) => slide_edit_error(error),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum FileMutation {
+    Delete,
+    Rename { filename: String },
+}
+
+pub async fn mutate_file(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    Json(request): Json<FileMutationRequest>,
+) -> Response {
+    let identity = identity.as_ref().map(|ext| &ext.0);
+    let data_dir = match resolve_file_access_data_dir(&state, &headers, identity).await {
+        Ok(dir) => dir,
+        Err(response) => return response,
+    };
+    let profile = request_owner_profile(&state, &headers, identity);
+    let workspace = request.session.as_deref().and_then(|session| {
+        resolve_session_workspace_root(&state, &data_dir, profile.as_deref(), session)
+    });
+    let Some(path) = resolve_scoped_download_path(
+        &data_dir,
+        &request.path,
+        profile.as_deref(),
+        workspace.as_deref(),
+    ) else {
+        return (StatusCode::NOT_FOUND, "File not found in this profile.").into_response();
+    };
+    let root = if let Some(owner) = upload_tmpdir_tenant(&path) {
+        octos_bus::file_handle::temp_upload_root().join(owner)
+    } else {
+        data_dir.clone()
+    };
+    let filename = match request.operation {
+        FileMutation::Delete => None,
+        FileMutation::Rename { filename } => Some(filename),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        super::file_mutations::mutate(&root, &path, filename.as_deref())
+    })
+    .await;
+    match result {
+        Ok(Ok(path)) => Json(serde_json::json!({
+            "path": path.as_deref().and_then(|path| response_path_for_profile_file(&data_dir, path)),
+            "filename": path.as_deref().and_then(|path| path.file_name()).map(|name| name.to_string_lossy().to_string()),
+        })).into_response(),
+        Ok(Err(err)) => {
+            let status = match err.kind() {
+                std::io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
+                std::io::ErrorKind::InvalidInput => StatusCode::BAD_REQUEST,
+                std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+                std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, "Unable to change file. Check its name and permissions.").into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "File mutation failed.").into_response(),
+    }
+}
+
 /// GET /api/files?path=... -- serve files by query parameter (for absolute paths).
 pub async fn serve_file_by_query(
     State(state): State<Arc<AppState>>,
@@ -2018,13 +2333,29 @@ pub async fn serve_file_by_query(
     let session_ws = params.get("session").and_then(|s| {
         resolve_session_workspace_root(&state, &data_dir, auth_profile.as_deref(), s)
     });
+    let delivered = delivered_copy_for_request(&state, auth_profile.as_deref(), &params, filename);
     serve_file_impl(
         &data_dir,
         filename,
         auth_profile.as_deref(),
         session_ws.as_deref(),
+        delivered,
     )
     .await
+}
+
+/// The stored copy of a file the agent delivered in the request's `session`,
+/// looked up under the requester's own profile data dir — the root the
+/// session's runtime stored it under.
+fn delivered_copy_for_request(
+    state: &AppState,
+    auth_profile: Option<&str>,
+    params: &std::collections::HashMap<String, String>,
+    filename: &str,
+) -> Option<std::path::PathBuf> {
+    let session_id = params.get("session")?;
+    let profile_root = resolve_profile_data_dir_by_id(state, auth_profile?).ok()?;
+    resolve_delivered_copy(&profile_root, session_id, filename)
 }
 
 /// GET /api/files/:filename -- serve uploaded files and pipeline report files.
@@ -2044,11 +2375,13 @@ pub async fn serve_file(
     let session_ws = params.get("session").and_then(|s| {
         resolve_session_workspace_root(&state, &data_dir, auth_profile.as_deref(), s)
     });
+    let delivered = delivered_copy_for_request(&state, auth_profile.as_deref(), &params, &filename);
     serve_file_impl(
         &data_dir,
         &filename,
         auth_profile.as_deref(),
         session_ws.as_deref(),
+        delivered,
     )
     .await
 }
@@ -2091,9 +2424,11 @@ async fn serve_file_impl(
     filename: &str,
     auth_profile: Option<&str>,
     session_workspace: Option<&std::path::Path>,
+    delivered_copy: Option<std::path::PathBuf>,
 ) -> Response {
     let Some(path) =
         resolve_scoped_download_path(data_dir, filename, auth_profile, session_workspace)
+            .or(delivered_copy)
     else {
         return (StatusCode::FORBIDDEN, "access denied").into_response();
     };
@@ -2160,6 +2495,28 @@ async fn serve_file_impl(
 /// [`standalone_api_session_key_candidates_with_topic`] is for the
 /// process-wide `state.sessions`, where bare keys could theoretically
 /// match a JSONL written by a different tenant.
+/// Refs #2102: collapse exact double-persisted rows (NEW-16 re-entry class)
+/// before they are mapped for a page payload. Adjacent byte-identical rows
+/// (same role, thread_id, content, timestamp) are by construction double
+/// appends — `Message` rows carry no explicit seq field, so tuple identity
+/// within a contiguous run is the durable row identity available here.
+fn dedupe_history_rows(history: &[Message]) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(history.len());
+    for m in history {
+        if let Some(last) = out.last() {
+            if last.role == m.role
+                && last.thread_id == m.thread_id
+                && last.content == m.content
+                && last.timestamp == m.timestamp
+            {
+                continue;
+            }
+        }
+        out.push(m.clone());
+    }
+    out
+}
+
 async fn read_profile_session_messages(
     profile_data_dir: &std::path::Path,
     session_id: &str,
@@ -2184,8 +2541,15 @@ async fn read_profile_session_messages(
         if session.get_history(1).is_empty() {
             continue;
         }
-        let messages: Vec<MessageInfo> = session
-            .get_history(fetch_count)
+        // Refs #2102: collapse exact double-persisted rows (NEW-16 re-entry
+        // class) before the `MessageInfo` mapping. `Message` rows carry no
+        // explicit seq (seq is append-order derived), so byte-identical
+        // consecutive (role, thread_id, content, timestamp) tuples inside one
+        // history window are by construction double-appends. Adjacency is
+        // required so legitimately repeated user text in different turns is
+        // never collapsed.
+        let deduped = dedupe_history_rows(session.get_history(fetch_count));
+        let messages: Vec<MessageInfo> = deduped
             .iter()
             .skip(offset)
             .take(limit)
@@ -2360,6 +2724,10 @@ pub(crate) fn decide_resolved_profile_id(
     }
 }
 
+// The error is a fully-built axum response which callers return directly.
+// Boxing would add allocation and dereference churn without reducing retained
+// response state; use the same targeted exception as the by-id resolver below.
+#[allow(clippy::result_large_err)]
 async fn resolve_profile_data_dir(
     state: &AppState,
     headers: &HeaderMap,
@@ -2951,6 +3319,15 @@ async fn serve_preview_file(project_dir: &std::path::Path, path: std::path::Path
                 preview_content_type(&leaf_for_headers),
             ),
             (axum::http::header::CACHE_CONTROL, cache_control),
+            // Generated HTML must keep an opaque origin even when opened
+            // directly in a new tab. An iframe attribute alone cannot protect
+            // the application's localStorage or parent/opener documents.
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "sandbox allow-scripts allow-forms",
+            ),
+            (axum::http::header::REFERRER_POLICY, "no-referrer"),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         ],
         data,
     )
@@ -3387,7 +3764,7 @@ pub async fn list_content_files(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let identity = identity.as_ref().map(|ext| &ext.0);
-    let data_dir = match resolve_profile_data_dir(&state, &headers, identity).await {
+    let data_dir = match resolve_file_access_data_dir(&state, &headers, identity).await {
         Ok(data_dir) => data_dir,
         Err(response) => return response,
     };
@@ -4041,6 +4418,13 @@ async fn serve_signed_preview_impl(
         axum::http::header::REFERRER_POLICY,
         axum::http::HeaderValue::from_static("no-referrer"),
     );
+    // Only this signed capability route is public. Opaque preview documents
+    // send Origin: null for ES modules/fonts; allow those asset reads without
+    // relaxing the authenticated API's exact-origin CORS policy.
+    resp.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
     resp
 }
 
@@ -4068,6 +4452,27 @@ fn extract_bearer_from_request(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn generated_preview_documents_are_sandboxed_when_opened_directly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("index.html");
+        std::fs::write(&file, b"<script>window.previewRuns = true</script>").unwrap();
+        let response = serve_preview_file(dir.path(), file).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_SECURITY_POLICY],
+            "sandbox allow-scripts allow-forms"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::REFERRER_POLICY],
+            "no-referrer"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+    }
 
     #[tokio::test]
     async fn read_file_no_follow_reads_regular_file_bytes() {
@@ -4120,6 +4525,7 @@ mod tests {
             title: None,
             updated_at: None,
             last_prompt: None,
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["id"], "test-session");
@@ -4146,6 +4552,7 @@ mod tests {
             title: Some("My Pinned Chat".into()),
             updated_at: None,
             last_prompt: None,
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["title"], "My Pinned Chat");
@@ -4159,6 +4566,7 @@ mod tests {
             title: None,
             updated_at: Some("2026-07-02T12:00:00+00:00".into()),
             last_prompt: None,
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["updated_at"], "2026-07-02T12:00:00+00:00");
@@ -4172,6 +4580,7 @@ mod tests {
             title: None,
             updated_at: None,
             last_prompt: Some("what is the capital of France?".into()),
+            active_turn: false,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["last_prompt"], "what is the capital of France?");
@@ -4494,7 +4903,8 @@ mod tests {
             .unwrap();
         }
 
-        let mut sessions = list_profile_sessions(profile_data_dir);
+        let mut sessions =
+            list_profile_sessions(profile_data_dir, &Default::default(), MAIN_PROFILE_ID);
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
 
@@ -4554,7 +4964,8 @@ mod tests {
             .unwrap();
         }
 
-        let sessions = list_profile_sessions(profile_data_dir);
+        let sessions =
+            list_profile_sessions(profile_data_dir, &Default::default(), MAIN_PROFILE_ID);
         let session = sessions
             .iter()
             .find(|s| s.id == "web-501")
@@ -4572,7 +4983,7 @@ mod tests {
     #[tokio::test]
     async fn list_profile_sessions_returns_empty_when_dir_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let sessions = list_profile_sessions(tmp.path());
+        let sessions = list_profile_sessions(tmp.path(), &Default::default(), MAIN_PROFILE_ID);
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
         assert!(
             sessions.is_empty(),
@@ -4630,7 +5041,8 @@ mod tests {
         // call site, where `resolve_profile_data_dir` runs the
         // identity check FIRST and only hands us a path the
         // request is authorized to read.
-        let sessions = list_profile_sessions(profile_data_dir);
+        let sessions =
+            list_profile_sessions(profile_data_dir, &Default::default(), MAIN_PROFILE_ID);
         assert_eq!(sessions.len(), 2, "expected dspfac's two web chats");
         let ids: std::collections::HashSet<_> = sessions.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains("web-1779100000001-aa"));
@@ -4672,6 +5084,7 @@ mod tests {
             Some(Extension(AuthIdentity::Admin)),
             None,
             None,
+            &Default::default(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4759,6 +5172,7 @@ mod tests {
             })),
             Some("tenant-user"),
             None,
+            &Default::default(),
         )
         .await;
 
@@ -4844,7 +5258,15 @@ mod tests {
 
         // connection_profile_id = "dev", empty headers, no identity — the
         // frozen scope a solo stdio connection carries.
-        let response = list_sessions(State(state), HeaderMap::new(), None, Some("dev"), None).await;
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            None,
+            Some("dev"),
+            None,
+            &Default::default(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -5070,6 +5492,47 @@ mod tests {
             resolve_scoped_download_path(current.path(), &other_file.to_string_lossy(), None, None)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn should_serve_a_delivered_file_only_through_its_sessions_stored_copy() {
+        // A file the agent delivered from an external project folder is not
+        // under the tenant root, so the plain rules refuse it; the copy stored
+        // at delivery time is what `/api/files` serves for that session.
+        let profile_root = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("p20-art.png");
+        std::fs::write(&file, b"png").unwrap();
+        let raw = file.to_string_lossy().into_owned();
+        let session = "dev:api:web-6acb";
+        let key = octos_core::SessionKey(session.to_string());
+        assert!(
+            resolve_scoped_download_path(profile_root.path(), &raw, Some("dev"), None).is_none(),
+            "precondition: the external file itself is refused"
+        );
+        assert!(
+            resolve_delivered_copy(profile_root.path(), session, &raw).is_none(),
+            "nothing is served before the agent delivers it"
+        );
+
+        octos_bus::session_artifacts::store_delivered_copies(
+            profile_root.path(),
+            &key,
+            std::slice::from_ref(&raw),
+        );
+
+        let served = resolve_delivered_copy(profile_root.path(), session, &raw)
+            .expect("the delivered copy is served");
+        assert_eq!(std::fs::read(served).unwrap(), b"png");
+        // Only for the session it was delivered in, and only that exact path.
+        assert!(resolve_delivered_copy(profile_root.path(), "dev:api:web-other", &raw).is_none());
+        let sibling = project
+            .path()
+            .join("secret.png")
+            .to_string_lossy()
+            .into_owned();
+        assert!(resolve_delivered_copy(profile_root.path(), session, &sibling).is_none());
+        assert!(resolve_delivered_copy(profile_root.path(), "", &raw).is_none());
     }
 
     #[test]
@@ -5761,7 +6224,15 @@ mod tests {
             ..AppState::empty_for_tests()
         });
 
-        let response = list_sessions(State(state), HeaderMap::new(), None, None, None).await;
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            None,
+            None,
+            None,
+            &Default::default(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -5819,7 +6290,15 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let response = list_sessions(State(state), HeaderMap::new(), None, None, None).await;
+        let response = list_sessions(
+            State(state),
+            HeaderMap::new(),
+            None,
+            None,
+            None,
+            &Default::default(),
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -6295,6 +6774,227 @@ mod tests {
         (dir, state)
     }
 
+    #[tokio::test]
+    async fn review_file_listing_without_gateway_keeps_profile_scope() {
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        assert!(state.process_manager.is_none());
+        let root = resolve_profile_data_dir_by_id(&state, "alice").unwrap();
+        let project = api_session_workspace_dirs(&root, "slides-cold")[0].join("slides/deck");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("script.js"), "real scaffold").unwrap();
+        let state = Arc::new(state);
+        let identity = || {
+            Some(Extension(AuthIdentity::User {
+                id: "alice".into(),
+                role: UserRole::User,
+            }))
+        };
+        let query = || {
+            axum::extract::Query(HashMap::from([
+                ("dirs".into(), "slides/deck".into()),
+                ("session_id".into(), "slides-cold".into()),
+            ]))
+        };
+        let response =
+            list_content_files(State(state.clone()), HeaderMap::new(), identity(), query()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 16384)
+            .await
+            .unwrap();
+        let files: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["filename"], "script.js");
+        let mut foreign = HeaderMap::new();
+        foreign.insert("X-Profile-Id", "bob".parse().unwrap());
+        let denied = list_content_files(State(state), foreign, identity(), query()).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn review_file_mutations_persist_for_owner_and_reject_foreign_profile() {
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        let root = resolve_profile_data_dir_by_id(&state, "alice").unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("report.txt");
+        std::fs::write(&path, "owner report").unwrap();
+        let handle = response_path_for_profile_file(&root, &path).unwrap();
+        let identity = || {
+            Some(Extension(AuthIdentity::User {
+                id: "alice".into(),
+                role: UserRole::User,
+            }))
+        };
+        let state = Arc::new(state);
+        let mut foreign_headers = HeaderMap::new();
+        foreign_headers.insert("X-Profile-Id", "bob".parse().unwrap());
+        let denied = mutate_file(
+            State(state.clone()),
+            foreign_headers,
+            identity(),
+            Json(FileMutationRequest {
+                path: handle.clone(),
+                session: None,
+                operation: FileMutation::Delete,
+            }),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(path.exists());
+        let renamed = mutate_file(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity(),
+            Json(FileMutationRequest {
+                path: handle,
+                session: None,
+                operation: FileMutation::Rename {
+                    filename: "final.txt".into(),
+                },
+            }),
+        )
+        .await;
+        assert_eq!(renamed.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(renamed.into_body(), 4096)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("final.txt")).unwrap(),
+            "owner report"
+        );
+        let deleted = mutate_file(
+            State(state),
+            HeaderMap::new(),
+            identity(),
+            Json(FileMutationRequest {
+                path: response["path"].as_str().unwrap().into(),
+                session: None,
+                operation: FileMutation::Delete,
+            }),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert!(!root.join("final.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn review_slide_edit_api_restores_revisions_and_checks_profile_ownership() {
+        let (_dir, state) = state_with_profiles(&[("alice", None), ("bob", None)]);
+        let root = resolve_profile_data_dir_by_id(&state, "alice").unwrap();
+        let project = api_session_workspace_dirs(&root, "slides-review")[0].join("slides/deck");
+        std::fs::create_dir_all(&project).unwrap();
+        let state = Arc::new(state);
+        let identity = || {
+            Some(Extension(AuthIdentity::User {
+                id: "alice".into(),
+                role: UserRole::User,
+            }))
+        };
+        let query = || {
+            axum::extract::Query(SlideEditQuery {
+                session_id: "slides-review".into(),
+                slug: "deck".into(),
+            })
+        };
+        let request = || {
+            Json(serde_json::from_value(serde_json::json!({ "expectedRevision": null, "baseGeneratedAt": "baseline", "slides": [{ "index": 0, "title": "Updated title", "notes": "Private notes", "layout": "title" }] })).unwrap())
+        };
+        let saved = save_slide_edits(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity(),
+            query(),
+            request(),
+        )
+        .await;
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert!(project.join("manual-edits.json").exists());
+        let loaded =
+            get_slide_edits(State(state.clone()), HeaderMap::new(), identity(), query()).await;
+        assert_eq!(loaded.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(loaded.into_body(), 4096)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(document["slides"][0]["title"], "Updated title");
+        let stale = save_slide_edits(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity(),
+            query(),
+            request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Profile-Id", "bob".parse().unwrap());
+        let denied = get_slide_edits(State(state), headers, identity(), query()).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn review_signed_preview_modules_allow_opaque_cors_and_sandbox_direct_navigation() {
+        use tower::ServiceExt;
+        let (_dir, mut state) = state_with_profiles(&[("alice", None)]);
+        state.auth_token = Some("review-admin-token".into());
+        let root = resolve_profile_data_dir_by_id(&state, "alice").unwrap();
+        let project = api_session_workspace_dirs(&root, "site-review")[0].join("sites/demo");
+        std::fs::create_dir_all(project.join("dist")).unwrap();
+        let mut metadata = crate::project_templates::build_site_project_metadata(
+            "alice",
+            "site-review",
+            "site react",
+            &project,
+        )
+        .unwrap();
+        metadata.site_slug = "demo".into();
+        std::fs::write(
+            project.join("mofa-site-session.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("dist/index.html"),
+            "<script type=module src=./module.js></script>",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("dist/module.js"),
+            "document.body.dataset.ready = 'true'",
+        )
+        .unwrap();
+        let grant = state
+            .preview_tokens
+            .issue(
+                "review-admin-token".into(),
+                AuthIdentity::Admin,
+                "alice".into(),
+                "site-review".into(),
+                "demo".into(),
+            )
+            .await
+            .unwrap();
+        let app = super::super::router::build_router(Arc::new(state));
+        for asset in ["index.html", "module.js"] {
+            let request = axum::http::Request::builder()
+                .uri(format!("/api/preview-signed/{}/{asset}", grant.token))
+                .header("Origin", "null")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                "*"
+            );
+            assert_eq!(
+                response.headers()[axum::http::header::CONTENT_SECURITY_POLICY],
+                "sandbox allow-scripts allow-forms"
+            );
+        }
+    }
+
     #[test]
     fn decide_uses_identity_when_no_header_present() {
         let (_dir, state) = state_with_profiles(&[("alice", None)]);
@@ -6435,5 +7135,52 @@ mod tests {
         let err = decide_resolved_profile_id(&state, Some(&identity), None, None)
             .expect_err("must signal missing context");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The registry is keyed by the session id AS SENT, and clients send three
+    /// different shapes. A live run against a real server caught the original
+    /// mapping reconstructing `<profile>:api:<row>` and therefore reporting a
+    /// colon-less session as idle while a turn was demonstrably running in it.
+    #[test]
+    fn should_match_every_wire_key_shape_when_listing_reports_a_session() {
+        let bare = SessionKey("shared-session".to_owned());
+        let channelled = SessionKey("api:web-1".to_owned());
+        let profiled = SessionKey("coding:api:web-1".to_owned());
+        let topicked = SessionKey("coding:api:web-1#research".to_owned());
+
+        // A colon-less handle is listed unchanged and must match itself.
+        assert!(active_turn_key_matches(&bare, "main", "shared-session"));
+        assert!(!active_turn_key_matches(&bare, "main", "other"));
+
+        // Per-profile stores list the chat id alone.
+        assert!(active_turn_key_matches(&channelled, "main", "web-1"));
+        assert!(active_turn_key_matches(&profiled, "coding", "web-1"));
+        // The process-wide walk lists the whole key.
+        assert!(active_turn_key_matches(
+            &profiled,
+            "coding",
+            "coding:api:web-1"
+        ));
+        // A turn in a topic bucket still makes the session busy.
+        assert!(active_turn_key_matches(&topicked, "coding", "web-1"));
+
+        // Cross-tenant: profile A's turn must not light up profile B's row.
+        assert!(!active_turn_key_matches(
+            &profiled,
+            "other-profile",
+            "web-1"
+        ));
+        // A different conversation in the same profile is not this row.
+        assert!(!active_turn_key_matches(&profiled, "coding", "web-2"));
+    }
+
+    #[test]
+    fn should_report_no_active_turn_when_the_registry_is_empty() {
+        let empty = std::collections::HashSet::new();
+        assert!(!session_id_has_active_turn(
+            &empty,
+            "main",
+            "shared-session"
+        ));
     }
 }

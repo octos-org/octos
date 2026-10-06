@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use eyre::Result;
 
+use crate::local_context_probe::LocalContextProbe;
 use crate::openai::OpenAIProvider;
 use crate::provider::LlmProvider;
 
@@ -18,6 +19,8 @@ pub const ENTRY: ProviderEntry = ProviderEntry {
     requires_model: false,
     // Ollama hosts user-pulled models — no detect pattern.
     detect_patterns: &[],
+    model_discovery: crate::discovery::OPENAI_MODELS,
+    model_discovery_for_model: None,
     create,
 };
 
@@ -44,5 +47,14 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     if let Some((t, c)) = http_timeout {
         provider = provider.with_http_timeout(t, c);
     }
-    Ok(Arc::new(provider))
+    // Same class of local server as the `local` family: the catalog's
+    // context_window is a guess, the running server knows. Ollama serves
+    // neither /props nor context metadata on /v1/models — its allocated
+    // window lives on the native GET /api/ps, so the probe uses that
+    // (#2135 review, P2).
+    Ok(LocalContextProbe::new_ollama(
+        Arc::new(provider),
+        &url,
+        http_timeout,
+    ))
 }

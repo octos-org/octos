@@ -142,7 +142,7 @@ async fn boot_fake_http_server(
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local_addr");
-    let url = format!("http://{}/", addr);
+    let url = format!("http://{addr}/");
     let body_text = response_body.to_string();
 
     let join = tokio::spawn(async move {
@@ -181,7 +181,7 @@ async fn boot_fake_redirect_server(location: &str) -> (String, tokio::task::Join
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local_addr");
-    let url = format!("http://{}/", addr);
+    let url = format!("http://{addr}/");
     let location = location.to_string();
 
     let join = tokio::spawn(async move {

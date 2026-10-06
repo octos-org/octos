@@ -544,6 +544,15 @@ impl McpSessionDispatch for RealSessionDispatch {
         // this host has no backend (Auto → NoSandbox), refuse the session rather
         // than silently running an external caller's tools unsandboxed. An
         // explicit `sandbox.mode = "none"` opt-out is respected.
+        if let Some(refusal) = sandbox.refusal() {
+            // The resolution already refused (an explicit mode unhonorable on
+            // this host, or sandbox.fail_closed): refuse the session with the
+            // typed remediation instead of building one whose every tool call
+            // refuses one by one.
+            return Err(McpServerError::SessionFailed(format!(
+                "session_failed: {refusal}"
+            )));
+        }
         if effective_sandbox_config.enabled
             && effective_sandbox_config.mode != SandboxMode::None
             && sandbox.is_noop()

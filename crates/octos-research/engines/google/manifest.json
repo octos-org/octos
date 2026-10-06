@@ -1,0 +1,18 @@
+{
+  "id": "google",
+  "name": "Google",
+  "categories": ["general"],
+  "languages": ["*"],
+  "hosts": ["www.google.com"],
+  "results_page": true,
+  "client": "legacy_mobile",
+  "rate_limit": {
+    "min_interval_ms": 5000,
+    "source": "No published limit for the results page; kept to a person's pace."
+  },
+  "docs_url": ["https://www.google.com/wml/search", "https://support.google.com/websearch/answer/2466433"],
+  "license_note": "Google's results page for simple phones, fetched with the legacy_mobile client (the browser-like client the page answers; request shape observed black-box from SearXNG's network traffic, no SearXNG code read). Titles, links and snippets only. An \"unusual traffic\" answer suspends the engine; it is never solved or worked around. Google's terms do not allow automated queries: the highest terms risk of the results-page engines (ADR 0002 §6 as amended; OCTOS_ALLOW_SERP_SCRAPE=0 turns results-page search off).",
+  "weight": 1.3,
+  "cache_ttl_secs": 900,
+  "timeout_secs": 20
+}

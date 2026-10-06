@@ -12,15 +12,21 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use eyre::Result;
-use futures::StreamExt;
 use octos_core::Message;
 use tracing::{info, warn};
 
 use crate::config::ChatConfig;
 use crate::error::LlmError;
-use crate::provider::LlmProvider;
+use crate::provider::{
+    LANE_FAILED_FAIL_FAST, LANE_FAILED_NOT_FAILOVER_WORTHY, LANES_EXHAUSTED, LaneFailure,
+    LlmProvider, attribute_lane_failures,
+};
 use crate::retry::RetryProvider;
-use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
+#[cfg(test)]
+use crate::types::StreamEvent;
+use crate::types::{ChatResponse, ChatStream, ProviderMetadata, ToolSpec};
+#[cfg(test)]
+use futures::StreamExt;
 
 /// Circuit breaker state for a single provider.
 struct ProviderSlot {
@@ -154,6 +160,7 @@ impl ProviderChain {
         config: &ChatConfig,
     ) -> Result<ChatResponse> {
         let start = self.pick_start();
+        let mut failures: Vec<LaneFailure> = Vec::new();
         let mut last_error = None;
 
         for offset in 0..self.slots.len() {
@@ -166,21 +173,42 @@ impl ProviderChain {
             }
 
             let result = self
-                .with_lane_timeout(
-                    slot.provider.provider_name(),
-                    slot.provider.chat(messages, tools, config),
-                )
+                .with_lane_timeout(slot.provider.provider_name(), async {
+                    // #2135 rounds 7-8: an ALTERNATE lane receives the
+                    // unchanged request — resolve its readiness and skip it
+                    // when the request cannot fit its window. The guard
+                    // runs INSIDE the lane timeout so a slow local
+                    // readiness counts against the SAME deadline as the
+                    // request and cannot delay failover (round-8 P2).
+                    // Ok(None) = unfit skip, distinct from a lane failure.
+                    if offset > 0
+                        && !crate::context::route_fits_request(&slot.provider, messages, tools)
+                            .await
+                    {
+                        return Ok(None);
+                    }
+                    slot.provider.chat(messages, tools, config).await.map(Some)
+                })
                 .await;
 
             match result {
-                Ok(mut response) => {
+                Ok(None) => {
+                    tracing::warn!(
+                        provider = slot.provider.provider_name(),
+                        window = slot.provider.context_window(),
+                        "skipping failover lane: request does not fit its context window"
+                    );
+                    continue;
+                }
+                Ok(Some(mut response)) => {
                     self.record_success(idx);
-                    response.provider_index = Some(idx);
+                    response.provider_index = Some(self.flat_index(idx, response.provider_index));
                     return Ok(response);
                 }
                 Err(e) => {
                     let retryable = RetryProvider::should_failover(&e);
                     self.record_failure(idx);
+                    failures.push(LaneFailure::capture(slot.provider.as_ref(), &e));
 
                     let fail_fast =
                         crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
@@ -193,12 +221,21 @@ impl ProviderChain {
                         last_error = Some(e);
                         continue;
                     }
-                    return Err(e);
+                    let outcome = if fail_fast {
+                        LANE_FAILED_FAIL_FAST
+                    } else if !retryable {
+                        LANE_FAILED_NOT_FAILOVER_WORTHY
+                    } else {
+                        LANES_EXHAUSTED
+                    };
+                    return Err(attribute_lane_failures(e, outcome, &failures));
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| eyre::eyre!("all providers exhausted")))
+        Err(last_error
+            .map(|e| attribute_lane_failures(e, LANES_EXHAUSTED, &failures))
+            .unwrap_or_else(|| eyre::eyre!("all providers exhausted")))
     }
 
     fn record_failure(&self, index: usize) {
@@ -214,9 +251,24 @@ impl ProviderChain {
     }
 
     fn stream_with_provider_index(&self, idx: usize, stream: ChatStream) -> ChatStream {
-        Box::pin(
-            futures::stream::once(async move { StreamEvent::ProviderIndex(idx) }).chain(stream),
-        )
+        crate::provider::stream_with_lane_offset(self.lane_offset(idx), stream)
+    }
+
+    /// Flat leaf-lane bookkeeping (see [`LlmProvider::provider_lane_count`]):
+    /// slot `idx` owns `[lane_offset(idx), lane_offset(idx) + lane_count)`.
+    fn lane_counts(&self) -> Vec<usize> {
+        self.slots
+            .iter()
+            .map(|slot| slot.provider.provider_lane_count())
+            .collect()
+    }
+
+    fn lane_offset(&self, idx: usize) -> usize {
+        crate::provider::lane_offset_for_slot(&self.lane_counts(), idx)
+    }
+
+    fn flat_index(&self, idx: usize, inner: Option<usize>) -> usize {
+        self.lane_offset(idx) + inner.unwrap_or(0)
     }
 }
 
@@ -242,6 +294,7 @@ impl LlmProvider for ProviderChain {
         config: &ChatConfig,
     ) -> Result<ChatStream> {
         let start = self.pick_start();
+        let mut failures: Vec<LaneFailure> = Vec::new();
         let mut last_error = None;
 
         for offset in 0..self.slots.len() {
@@ -254,22 +307,41 @@ impl LlmProvider for ProviderChain {
 
             // Cap stream *initialization* per lane; consuming the returned
             // stream is unaffected. A hung init is recorded below and the
-            // chain fails over like any other retriable error.
+            // chain fails over like any other retriable error. The fit
+            // guard runs INSIDE the cap (#2135 round-8 P2), and Ok(None)
+            // means an unfit skip, distinct from a lane failure.
             let result = self
-                .with_lane_timeout(
-                    slot.provider.provider_name(),
-                    slot.provider.chat_stream(messages, tools, config),
-                )
+                .with_lane_timeout(slot.provider.provider_name(), async {
+                    if offset > 0
+                        && !crate::context::route_fits_request(&slot.provider, messages, tools)
+                            .await
+                    {
+                        return Ok(None);
+                    }
+                    slot.provider
+                        .chat_stream(messages, tools, config)
+                        .await
+                        .map(Some)
+                })
                 .await;
 
             match result {
-                Ok(stream) => {
+                Ok(None) => {
+                    tracing::warn!(
+                        provider = slot.provider.provider_name(),
+                        window = slot.provider.context_window(),
+                        "skipping failover lane: request does not fit its context window"
+                    );
+                    continue;
+                }
+                Ok(Some(stream)) => {
                     self.record_success(idx);
                     return Ok(self.stream_with_provider_index(idx, stream));
                 }
                 Err(e) => {
                     let retryable = RetryProvider::should_failover(&e);
                     self.record_failure(idx);
+                    failures.push(LaneFailure::capture(slot.provider.as_ref(), &e));
 
                     let fail_fast =
                         crate::current_llm_call_policy() == crate::LlmCallPolicy::FailFast;
@@ -282,12 +354,45 @@ impl LlmProvider for ProviderChain {
                         last_error = Some(e);
                         continue;
                     }
-                    return Err(e);
+                    let outcome = if fail_fast {
+                        LANE_FAILED_FAIL_FAST
+                    } else if !retryable {
+                        LANE_FAILED_NOT_FAILOVER_WORTHY
+                    } else {
+                        LANES_EXHAUSTED
+                    };
+                    return Err(attribute_lane_failures(e, outcome, &failures));
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| eyre::eyre!("all providers exhausted")))
+        Err(last_error
+            .map(|e| attribute_lane_failures(e, LANES_EXHAUSTED, &failures))
+            .unwrap_or_else(|| eyre::eyre!("all providers exhausted")))
+    }
+
+    // #2135 round-6 P1: the MINIMUM across every slot — the chain fails
+    // over with the SAME request, so the prompt must fit the smallest lane
+    // it can land on, not just the preferred one.
+    fn context_window(&self) -> u32 {
+        self.slots
+            .iter()
+            .map(|slot| slot.provider.context_window())
+            .min()
+            .unwrap_or(32_768)
+    }
+
+    fn max_output_tokens(&self) -> u32 {
+        self.slots
+            .iter()
+            .map(|slot| slot.provider.max_output_tokens())
+            .min()
+            .unwrap_or(4096)
+    }
+
+    async fn ensure_ready(&self) {
+        let idx = self.pick_start();
+        self.slots[idx].provider.ensure_ready().await;
     }
 
     fn model_id(&self) -> &str {
@@ -306,11 +411,31 @@ impl LlmProvider for ProviderChain {
     }
 
     fn provider_metadata_for_index(&self, provider_index: Option<usize>) -> ProviderMetadata {
-        let idx = provider_index.unwrap_or_else(|| self.pick_start());
+        let Some(index) = provider_index else {
+            let idx = self.pick_start();
+            return self.slots[idx].provider.provider_metadata_for_index(None);
+        };
+        match crate::provider::slot_for_lane_index(&self.lane_counts(), index) {
+            Some((slot, inner)) => self.slots[slot]
+                .provider
+                .provider_metadata_for_index(Some(inner)),
+            None => self.provider_metadata(),
+        }
+    }
+
+    fn provider_lane_count(&self) -> usize {
+        self.lane_counts().iter().sum()
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        let idx = self.pick_start();
+        self.slots[idx].provider.api_style()
+    }
+
+    fn supports_semantic_checkpoint_hints(&self) -> bool {
         self.slots
-            .get(idx)
-            .map(|slot| slot.provider.provider_metadata())
-            .unwrap_or_else(|| self.provider_metadata())
+            .iter()
+            .any(|slot| slot.provider.supports_semantic_checkpoint_hints())
     }
 
     fn report_late_failure(&self) {
@@ -405,6 +530,46 @@ mod tests {
         fn provider_name(&self) -> &str {
             self.name
         }
+    }
+
+    /// Nested composition the other way round: a `FallbackProvider` inside a
+    /// chain slot. Its fallback lane is flat lane 1; the chain's own second
+    /// slot is flat lane 2.
+    #[tokio::test]
+    async fn should_resolve_serving_lane_when_chain_wraps_fallback_provider() {
+        let inner = crate::FallbackProvider::new(
+            Arc::new(FailingProvider {
+                name: "inner-primary",
+                error: "Primary",
+            }),
+            vec![Arc::new(SuccessProvider {
+                name: "inner-fallback",
+            })],
+        );
+        let chain = ProviderChain::new(vec![
+            Arc::new(inner),
+            Arc::new(SuccessProvider {
+                name: "outer-second",
+            }),
+        ]);
+        assert_eq!(chain.provider_lane_count(), 3);
+
+        let result = chain.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(result.provider_index, Some(1));
+        assert_eq!(
+            chain
+                .provider_metadata_for_index(result.provider_index)
+                .provider,
+            "inner-fallback"
+        );
+        assert_eq!(
+            chain.provider_metadata_for_index(Some(2)).provider,
+            "outer-second"
+        );
+        assert_eq!(
+            chain.provider_metadata_for_index(Some(0)).provider,
+            "inner-primary"
+        );
     }
 
     #[tokio::test]
@@ -698,5 +863,144 @@ mod tests {
             Some(StreamEvent::ProviderIndex(idx)) => assert_eq!(idx, 1),
             other => panic!("expected ProviderIndex(1) first, got {other:?}"),
         }
+    }
+
+    /// #2135 round-6 P1: the chain fails over with the same request, so
+    /// the reported window is the minimum across slots.
+    #[test]
+    fn should_report_minimum_window_across_slots() {
+        let big: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+            Arc::new(SuccessProvider { name: "big" }),
+            262_144,
+        ));
+        let small: Arc<dyn LlmProvider> = Arc::new(crate::ContextWindowOverride::new(
+            Arc::new(SuccessProvider { name: "small" }),
+            32_768,
+        ));
+        let chain = ProviderChain::new(vec![big, small]);
+        assert_eq!(chain.context_window(), 32_768);
+    }
+
+    /// #2135 round-8 P2: the fit guard's readiness runs INSIDE the lane
+    /// timeout — a lane whose local readiness hangs must be abandoned at
+    /// the configured deadline, not delay failover for a probe budget.
+    #[tokio::test]
+    async fn should_cap_readiness_inside_the_lane_timeout() {
+        struct SlowReadyProvider;
+        #[async_trait]
+        impl LlmProvider for SlowReadyProvider {
+            async fn chat(
+                &self,
+                _m: &[Message],
+                _t: &[ToolSpec],
+                _c: &ChatConfig,
+            ) -> Result<ChatResponse> {
+                unreachable!("never dispatched");
+            }
+            fn model_id(&self) -> &str {
+                "slow-ready"
+            }
+            fn provider_name(&self) -> &str {
+                "local"
+            }
+            async fn ensure_ready(&self) {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+        let failing: Arc<dyn LlmProvider> = Arc::new(FailingProvider {
+            name: "primary",
+            error: "boom",
+        });
+        let slow: Arc<dyn LlmProvider> = Arc::new(SlowReadyProvider);
+        let chain = ProviderChain::new(vec![failing, slow])
+            .with_max_request_duration(Some(std::time::Duration::from_millis(100)));
+        let start = std::time::Instant::now();
+        let _ = chain
+            .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+            .await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "slow readiness must be capped by the lane deadline; took {:?}",
+            start.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod lane_attribution_tests {
+    use std::sync::Arc;
+
+    use octos_core::Message;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::ProviderChain;
+    use crate::anthropic::AnthropicProvider;
+    use crate::config::ChatConfig;
+    use crate::openai::OpenAIProvider;
+    use crate::provider::LlmProvider;
+    use crate::retry::RetryProvider;
+    use crate::{LlmCallPolicy, with_llm_call_policy};
+
+    async fn refused_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn should_name_every_failed_lane_with_api_style_when_k3_fails_over_to_anthropic_compatible_lane()
+     {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("k3 upstream exploded"))
+            .mount(&server)
+            .await;
+        let k3: Arc<dyn LlmProvider> = Arc::new(
+            OpenAIProvider::new("key", "k3")
+                .with_base_url(server.uri())
+                .with_provider_label("moonshot-coding@api"),
+        );
+        let zai: Arc<dyn LlmProvider> = Arc::new(
+            AnthropicProvider::new("key", "glm-5.3")
+                .with_base_url(refused_url().await)
+                .with_provider_label("zai-coding"),
+        );
+        let chain = ProviderChain::new(vec![k3, zai]);
+
+        let err = with_llm_call_policy(LlmCallPolicy::Normal, async {
+            chain
+                .chat(&[Message::user("hi")], &[], &ChatConfig::default())
+                .await
+        })
+        .await
+        .expect_err("both lanes fail");
+
+        let display = err.to_string();
+        let alternate = format!("{err:#}");
+        for rendered in [&display, &alternate] {
+            for needle in [
+                "moonshot-coding@api",
+                "k3",
+                "zai-coding",
+                "glm-5.3",
+                "api_style=anthropic_messages",
+                "api_style=openai_chat_completions",
+            ] {
+                assert!(
+                    rendered.contains(needle),
+                    "missing {needle:?} in: {rendered}"
+                );
+            }
+            assert!(
+                !rendered.contains("request to Anthropic"),
+                "a lane the user never configured must not be named: {rendered}"
+            );
+        }
+        assert!(
+            RetryProvider::should_failover(&err),
+            "wrapping must keep the typed lane error classifiable: {alternate}"
+        );
     }
 }

@@ -32,8 +32,19 @@ const MIN_USEFUL_TEXT_LEN: usize = 200;
 /// Maximum retries for near-empty pages.
 const MAX_EMPTY_RETRIES: u32 = 2;
 
-/// Common user agent to avoid headless detection.
-const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// Minimum spacing between page loads on the crawled site.
+const PAGE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Chrome flags for the crawler. Automation is not hidden (OctoSense
+/// ADR 0002): no `AutomationControlled` switches, no spoofed `--user-agent`,
+/// no `--disable-infobars`, no script that rewrites `navigator.webdriver`.
+/// The tab identifies itself with Chrome's own User-Agent plus the octos
+/// product token (see [`identify`]).
+const CRAWL_ARGS: &[&str] = &[
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-background-networking",
+];
 
 /// CDP-based recursive site crawler.
 pub struct DeepCrawlTool {
@@ -80,16 +91,10 @@ async fn launch_browser() -> Result<(
         .tempdir()
         .wrap_err("failed to create temp dir for Chrome")?;
 
-    let mut builder = BrowserConfig::builder()
-        .user_data_dir(temp_dir.path())
-        .arg("--disable-dev-shm-usage")
-        .arg("--disable-extensions")
-        .arg("--disable-background-networking")
-        // Stealth: avoid headless detection by bot-protection services
-        .arg("--disable-blink-features=AutomationControlled")
-        .arg(format!("--user-agent={STEALTH_USER_AGENT}"))
-        .arg("--disable-features=AutomationControlled")
-        .arg("--disable-infobars");
+    let mut builder = BrowserConfig::builder().user_data_dir(temp_dir.path());
+    for arg in CRAWL_ARGS {
+        builder = builder.arg(*arg);
+    }
 
     for var in BLOCKED_ENV_VARS {
         builder = builder.env(*var, "");
@@ -109,17 +114,28 @@ async fn launch_browser() -> Result<(
         .new_page("about:blank")
         .await
         .map_err(|e| eyre::eyre!("failed to create page: {e}"))?;
+    identify(&page).await;
 
     Ok((browser, page, handle, temp_dir))
 }
 
-/// JS to remove automation indicators (navigator.webdriver, etc.)
-const STEALTH_JS: &str = r#"
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    window.chrome = { runtime: {} };
-"#;
+/// The browser's own User-Agent with the octos product token appended, so
+/// sites can tell who is crawling (never a disguised desktop browser).
+fn identifiable_user_agent(base: &str) -> String {
+    format!("{} {}", base.trim(), octos_research::USER_AGENT)
+        .trim()
+        .to_string()
+}
+
+async fn identify(page: &Page) {
+    use chromiumoxide::cdp::browser_protocol::network::SetUserAgentOverrideParams;
+    let base = page.user_agent().await.unwrap_or_default();
+    let _ = page
+        .set_user_agent(SetUserAgentOverrideParams::new(identifiable_user_agent(
+            &base,
+        )))
+        .await;
+}
 
 /// JS to extract links from the page.
 const EXTRACT_LINKS_JS: &str = r#"
@@ -157,10 +173,16 @@ async fn extract_text(page: &Page) -> Result<String, String> {
     }
 }
 
+/// Two-second waits for a self-clearing challenge page (see
+/// `octos_research::access::interstitial_text`).
+const INTERSTITIAL_WAITS: u32 = 5;
+
 /// Check if text looks like a bot-protection page.
 fn is_bot_blocked(text: &str) -> bool {
     let lower = text.to_lowercase();
-    lower.contains("performing security verification")
+    // The shared list (Chinese sites' WAF pages included), on short text.
+    octos_research::access::challenge_text(text)
+        || lower.contains("performing security verification")
         || lower.contains("press & hold to confirm you are")
         || lower.contains("please verify you are a human")
         || lower.contains("checking your browser")
@@ -170,11 +192,9 @@ fn is_bot_blocked(text: &str) -> bool {
 }
 
 /// Crawl a single page: navigate, wait for JS render, extract text and links.
-/// Retries with longer wait if the page is near-empty or bot-blocked.
+/// A near-empty page gets a longer wait (slow single-page apps); a bot
+/// challenge is reported, not bypassed.
 async fn crawl_single_page(page: &Page, url: &str, page_settle_ms: u64) -> CrawledPage {
-    // Inject stealth JS before navigation
-    let _ = page.evaluate(STEALTH_JS).await;
-
     // Navigate
     if let Err(e) = page.goto(url).await {
         return CrawledPage {
@@ -194,9 +214,6 @@ async fn crawl_single_page(page: &Page, url: &str, page_settle_ms: u64) -> Crawl
     .await;
     tokio::time::sleep(Duration::from_millis(page_settle_ms)).await;
 
-    // Re-inject stealth after navigation (some sites check post-load)
-    let _ = page.evaluate(STEALTH_JS).await;
-
     // Extract text with retry for near-empty or bot-blocked pages
     let mut text = match extract_text(page).await {
         Ok(t) => t,
@@ -211,24 +228,40 @@ async fn crawl_single_page(page: &Page, url: &str, page_settle_ms: u64) -> Crawl
         }
     };
 
-    // Retry if page looks empty or bot-blocked
+    // A check that clears itself in a real browser ("Just a moment…",
+    // "正在进行安全检测…"): wait for it, up to ~10 s. Any other challenge is
+    // the site saying no: recorded, not worked around.
+    let mut waits = 0;
+    while waits < INTERSTITIAL_WAITS && octos_research::access::interstitial_text(&text) {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        waits += 1;
+        if let Ok(t) = extract_text(page).await {
+            text = t;
+        }
+    }
+    if is_bot_blocked(&text) {
+        return challenged(url);
+    }
+    // Slow single-page apps: give a near-empty page more time.
     for retry in 0..MAX_EMPTY_RETRIES {
         let trimmed_len = text.trim().len();
-        if trimmed_len >= MIN_USEFUL_TEXT_LEN && !is_bot_blocked(&text) {
+        if trimmed_len >= MIN_USEFUL_TEXT_LEN {
             break;
         }
         warn!(
             url = %url,
             text_len = trimmed_len,
             retry = retry + 1,
-            bot_blocked = is_bot_blocked(&text),
-            "page looks empty or bot-blocked, retrying with longer wait"
+            "page looks empty, waiting longer"
         );
         tokio::time::sleep(Duration::from_millis(PAGE_SETTLE_RETRY_MS)).await;
         text = match extract_text(page).await {
             Ok(t) => t,
             Err(_) => break,
         };
+        if is_bot_blocked(&text) {
+            return challenged(url);
+        }
     }
 
     // Extract links
@@ -244,6 +277,40 @@ async fn crawl_single_page(page: &Page, url: &str, page_settle_ms: u64) -> Crawl
         links,
         error: None,
     }
+}
+
+fn challenged(url: &str) -> CrawledPage {
+    CrawledPage {
+        url: url.to_string(),
+        depth: 0,
+        text: String::new(),
+        links: vec![],
+        error: Some("bot challenge: the site asked to verify a human; not bypassed".to_string()),
+    }
+}
+
+/// robots.txt verdict for `url` when the operator turned robots checks on
+/// (`OCTOS_RESPECT_ROBOTS`); `None` = allowed or checks off.
+async fn robots_refusal(cache: &octos_research::RobotsCache, url: &str) -> Option<String> {
+    if !octos_research::respect_robots(|k| std::env::var(k).ok()) {
+        return None;
+    }
+    let decision = cache
+        .check(url, octos_research::AGENT_TOKEN, |robots_url| async move {
+            match octos_research::net::safe_get(&robots_url, Duration::from_secs(10)).await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let body = octos_research::net::read_capped(resp, 512 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    (Some(status), body)
+                }
+                Err(_) => (None, String::new()),
+            }
+        })
+        .await;
+    (!decision.allowed)
+        .then(|| format!("skipped: {} (OCTOS_RESPECT_ROBOTS is on)", decision.reason))
 }
 
 /// Normalize a URL: remove fragment, trailing slash, lowercase scheme+host.
@@ -274,7 +341,7 @@ fn page_slug(url: &reqwest::Url, index: usize) -> String {
     };
     // Truncate long slugs and prefix with index for ordering
     let truncated = if slug.len() > 80 { &slug[..80] } else { &slug };
-    format!("{:03}_{truncated}", index)
+    format!("{index:03}_{truncated}")
 }
 
 #[async_trait]
@@ -394,6 +461,8 @@ impl Tool for DeepCrawlTool {
         let mut visited: HashSet<String> = HashSet::new();
         let mut queue: VecDeque<(String, u32)> = VecDeque::new(); // (url, depth)
         let mut results: Vec<CrawledPage> = Vec::new();
+        // Account links not followed (reported, not dropped silently).
+        let mut skipped_account: Vec<String> = Vec::new();
 
         let seed_normalized = normalize_url(&input.url).unwrap_or_else(|| input.url.clone());
         visited.insert(seed_normalized.clone());
@@ -407,10 +476,27 @@ impl Tool for DeepCrawlTool {
             "starting deep crawl"
         );
 
+        let robots = octos_research::RobotsCache::new();
+        let throttle = octos_research::HostThrottle::new(PAGE_INTERVAL);
         while let Some((url, depth)) = queue.pop_front() {
             if results.len() >= max_pages as usize {
                 break;
             }
+            if let Some(reason) = robots_refusal(&robots, &url).await {
+                results.push(CrawledPage {
+                    url: url.clone(),
+                    depth,
+                    text: String::new(),
+                    links: vec![],
+                    error: Some(reason),
+                });
+                continue;
+            }
+            let host = reqwest::Url::parse(&url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_default();
+            throttle.wait(&host, None).await;
 
             info!(
                 url = %url,
@@ -454,6 +540,17 @@ impl Tool for DeepCrawlTool {
                         }
                     }
 
+                    // Sign-in, sign-up and sign-out pages hold no content; an
+                    // explicit path_prefix (already applied above) crawls them.
+                    if input.path_prefix.is_none()
+                        && octos_research::urls::is_account_link(&normalized)
+                    {
+                        if !skipped_account.contains(&normalized) {
+                            skipped_account.push(normalized);
+                        }
+                        continue;
+                    }
+
                     // SSRF check on discovered links
                     if check_ssrf(&normalized).await.is_some() {
                         continue;
@@ -491,6 +588,16 @@ impl Tool for DeepCrawlTool {
             ));
         }
         output.push('\n');
+        if !skipped_account.is_empty() {
+            output.push_str(&format!(
+                "## Not followed: {} sign-in/sign-up link(s) (octos_research::urls::is_account_link; set path_prefix to crawl under one)\n",
+                skipped_account.len()
+            ));
+            for u in skipped_account.iter().take(20) {
+                output.push_str(&format!("- {u}\n"));
+            }
+            output.push('\n');
+        }
 
         for (i, crawled) in results.iter().enumerate() {
             // Save full content to disk
@@ -498,7 +605,7 @@ impl Tool for DeepCrawlTool {
             let filename = file_url
                 .as_ref()
                 .map(|u| format!("{}.md", page_slug(u, i)))
-                .unwrap_or_else(|| format!("{:03}_page.md", i));
+                .unwrap_or_else(|| format!("{i:03}_page.md"));
             let file_path = crawl_dir.join(&filename);
 
             let file_content = if let Some(ref err) = crawled.error {
@@ -558,6 +665,41 @@ impl Tool for DeepCrawlTool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn should_not_hide_automation_or_spoof_the_user_agent() {
+        let args = super::CRAWL_ARGS.join(" ");
+        for banned in ["AutomationControlled", "--user-agent", "--disable-infobars"] {
+            assert!(!args.contains(banned), "{banned} in {args}");
+        }
+        let src = include_str!("site_crawl.rs");
+        let webdriver_patch = ["defineProperty(navigator, ", "'webdriver'"].concat();
+        assert!(
+            !src.contains(&webdriver_patch),
+            "no webdriver-hiding script"
+        );
+        let ua = super::identifiable_user_agent("Mozilla/5.0 HeadlessChrome/131.0");
+        assert!(ua.starts_with("Mozilla/5.0 HeadlessChrome/131.0 "), "{ua}");
+        assert!(ua.ends_with(octos_research::USER_AGENT), "{ua}");
+    }
+
+    #[test]
+    fn should_report_bot_challenges_that_do_not_clear() {
+        // Recognised as a challenge; the crawl waits for one that clears
+        // itself (interstitial_text) and reports it only if it stays.
+        assert!(super::is_bot_blocked(
+            "Just a moment... checking your browser"
+        ));
+        assert!(octos_research::access::interstitial_text(
+            "Just a moment... checking your browser"
+        ));
+        assert!(!octos_research::access::interstitial_text(
+            "Please complete the CAPTCHA to continue"
+        ));
+        let page = super::challenged("https://example.com/");
+        assert!(page.error.unwrap().contains("not bypassed"));
+        assert!(page.text.is_empty() && page.links.is_empty());
+    }
+
     use super::*;
 
     #[test]

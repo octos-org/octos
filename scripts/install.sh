@@ -23,7 +23,9 @@
 #     --tenant-name NAME     Tenant subdomain (e.g. "alice") for public access
 #     --frps-token TOKEN     per-tenant tunnel token (goes in metadatas.token)
 #     --frps-token-file FILE Read per-tenant tunnel token from FILE
-#     --frps-server ADDR     frps server address (default: 163.192.33.32)
+#     --frps-server ADDR     frps relay server address (required for the tunnel;
+#                            or set FRPS_SERVER). No default: without it the
+#                            tunnel setup is skipped.
 #     --ssh-port PORT        SSH tunnel remote port (default: 6001)
 #     --domain DOMAIN        Tunnel domain (default: octos-cloud.org)
 
@@ -39,7 +41,7 @@ FRPC_VERSION="0.65.0"
 TENANT_NAME=""
 FRPS_TOKEN="${FRPS_TOKEN:-}"
 FRPS_TOKEN_FILE=""
-FRPS_SERVER="163.192.33.32"
+FRPS_SERVER="${FRPS_SERVER:-}"
 SSH_PORT="6001"
 AUTH_TOKEN=""
 TUNNEL_DOMAIN="octos-cloud.org"
@@ -100,7 +102,8 @@ Optional tunnel (frpc):
   --tenant-name NAME       Tenant subdomain (e.g. "alice") for public access
   --frps-token TOKEN       per-tenant tunnel token (goes in metadatas.token)
   --frps-token-file FILE   Read per-tenant tunnel token from FILE
-  --frps-server ADDR       frps server address (default: 163.192.33.32)
+  --frps-server ADDR       frps relay server address (required for the tunnel;
+                           or set FRPS_SERVER). Without it, tunnel setup is skipped.
   --ssh-port PORT          SSH tunnel remote port (default: 6001)
   --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
 HELPEOF
@@ -211,6 +214,13 @@ validate() {
     fi
 }
 
+# Explain how to supply the tunnel relay server when none was given.
+frps_server_missing() {
+    warn "no tunnel relay (frps) server configured — skipping tunnel setup"
+    hint "Pass --frps-server <host> or set FRPS_SERVER=<host>, using the relay"
+    hint "address from your tenant setup command, then re-run with --tunnel."
+}
+
 # Validate all non-empty user-controlled values that get embedded in config files.
 # Called after CLI parsing AND after every alternate input source (token files,
 # interactive prompts, existing config reads).
@@ -285,6 +295,34 @@ sys.stdout.write(json.dumps({"password": p}, indent=2))
     fi
     chmod 600 "$target"
     ok "wrote SMTP password to $target"
+}
+
+# Write the serve bearer token(s) into `{DATA_DIR}/serve.env` (mode 0600) so
+# the systemd unit can load them via `EnvironmentFile=` without the secrets
+# living in the world-readable unit file (#2388). launchd has no
+# EnvironmentFile equivalent — its plist is installed 0600 instead.
+write_serve_env_file() {
+    [ -d "$DATA_DIR" ] || mkdir -p "$DATA_DIR"
+    local target="$DATA_DIR/serve.env"
+    local token="${AUTH_TOKEN//\\/\\\\}"
+    token="${token//\"/\\\"}"
+    local frps=""
+    if [ -n "$FRPS_TOKEN" ]; then
+        frps="${FRPS_TOKEN//\\/\\\\}"
+        frps="${frps//\"/\\\"}"
+    fi
+    # umask 077 inside the subshell so the file is created 0600 (a
+    # redirect applied to the subshell itself would use the outer umask);
+    # the chmod below stays as belt-and-braces.
+    (
+        umask 077
+        printf 'OCTOS_AUTH_TOKEN="%s"\n' "$token" > "$target"
+        if [ -n "$FRPS_TOKEN" ]; then
+            printf 'FRPS_TOKEN="%s"\n' "$frps" >> "$target"
+        fi
+    )
+    chmod 600 "$target"
+    ok "wrote serve secrets to $target (mode 0600)"
 }
 
 section() { echo ""; echo "==> $1"; }
@@ -631,9 +669,11 @@ write_octos_service() {
         <string>$PORT</string>
         <string>--host</string>
         <string>0.0.0.0</string>
-        <string>--auth-token</string>
-        <string>$AUTH_TOKEN</string>
     </array>
+    <!-- #2371: the token travels via OCTOS_AUTH_TOKEN below, never argv —
+         ProgramArguments are readable by any local process via ps. #2388:
+         the plist holds secrets, so it is installed 0600 root:wheel —
+         launchd reads it as root, no other local user can. -->
     <!--
       UserName: prefer SUDO_USER (the operator who invoked sudo) over `whoami`.
       When this installer is run as `sudo ./install.sh`, `whoami` resolves to
@@ -681,12 +721,16 @@ EOF
             sudo launchctl unload "$plist" 2>/dev/null || true
             sudo mv "$tmp" "$plist"
             sudo chown root:wheel "$plist"
-            sudo chmod 644 "$plist"
+            sudo chmod 600 "$plist"
             sudo launchctl load "$plist"
             ok "octos serve started via launchd"
             ;;
 
         Linux)
+            # #2388: secrets must not be inlined into the unit below — it is
+            # installed world-readable (systemctl cat). They land in
+            # `{DATA_DIR}/serve.env` (0600) and load via EnvironmentFile.
+            write_serve_env_file
             local unit="/etc/systemd/system/octos-serve.service"
             local tmp
             tmp=$(mktemp /tmp/octos-serve.service.XXXXXX)
@@ -699,17 +743,20 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$(whoami)
-ExecStart=$OCTOS_BIN serve --port $PORT --host 0.0.0.0 --auth-token $AUTH_TOKEN
+# #2371: the token never travels via argv — ExecStart is readable by any
+# local user via systemctl cat / ps. #2388: it does not travel inline here
+# either — the unit file is world-readable; secrets load from the 0600
+# DATA_DIR/serve.env via EnvironmentFile.
+ExecStart=$OCTOS_BIN serve --port $PORT --host 0.0.0.0
 Restart=on-failure
 RestartSec=5
+EnvironmentFile=$DATA_DIR/serve.env
 Environment=HOME=$HOME
 Environment=OCTOS_DATA_DIR=$DATA_DIR
 Environment=OCTOS_HOME=$DATA_DIR
-Environment=OCTOS_AUTH_TOKEN=$AUTH_TOKEN
 Environment=PATH=$PREFIX:/usr/local/bin:/usr/bin:/bin
 $(systemd_env_var_line "XDG_CONFIG_HOME" "${XDG_CONFIG_HOME:-}")
 $(systemd_env_var_line "OCTOS_CONFIG_DIR" "${OCTOS_CONFIG_DIR:+$CONFIG_HOME}")
-$(systemd_env_var_line "FRPS_TOKEN" "${FRPS_TOKEN:-}")
 $(systemd_env_var_line "SMTP_HOST" "${SMTP_HOST:-}")
 $(systemd_env_var_line "SMTP_PORT" "${SMTP_PORT:-}")
 $(systemd_env_var_line "SMTP_USERNAME" "${SMTP_USERNAME:-}")
@@ -731,7 +778,7 @@ EOF
 
         *)
             warn "octos serve service setup not supported on $OS"
-            hint "Run manually: $OCTOS_BIN serve --port $PORT --host 0.0.0.0 --auth-token $AUTH_TOKEN"
+            hint "Run manually: OCTOS_AUTH_TOKEN=$AUTH_TOKEN $OCTOS_BIN serve --port $PORT --host 0.0.0.0"
             ;;
     esac
 }
@@ -781,6 +828,12 @@ detect_installed_port() {
             if [ -f "$plist" ]; then
                 detected=$(grep -A1 '>--port<' "$plist" 2>/dev/null | tail -1 | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
             fi
+            # #2388: the plist is 0600 now, so non-root doctor runs can't
+            # read it. Fall back to the running process — its argv is
+            # public information (#2371).
+            if [ -z "$detected" ]; then
+                detected=$(ps -axo args= | sed -n 's/.*octos serve --port \([0-9][0-9]*\).*/\1/p' | head -1)
+            fi
             ;;
         Linux)
             local unit="/etc/systemd/system/octos-serve.service"
@@ -794,6 +847,45 @@ detect_installed_port() {
         printf '%s\n' "$detected"
     else
         printf '%s\n' "$PORT"
+    fi
+}
+
+# Verify the downloaded bundle against the `.sha256` sidecar that
+# bundle-release.sh publishes next to it (#2514). A mismatch aborts the
+# install; a missing or unparseable sidecar (releases older than rc.12,
+# air-gapped mirrors, mirrors that answer 200 with an error page) only
+# warns — there is nothing published we could verify against.
+# Uses globals: INSTALL_TMP, TARBALL
+verify_bundle_checksum() {
+    local sidecar="${INSTALL_TMP}/${TARBALL}.sha256"
+    if [ ! -f "$sidecar" ]; then
+        warn "no ${TARBALL}.sha256 sidecar found — skipping checksum verification"
+        return 0
+    fi
+    # The sidecar must parse as a sha256sum line ("<64-hex>  <filename>").
+    # Strip CR first — GNU sha256sum -c tolerates a CRLF sidecar, macOS
+    # shasum -c does not (it would look for a file named "...tar.gz\r") —
+    # so a text-mode mirror gets the same verdict on both platforms.
+    tr -d '\r' < "$sidecar" > "${sidecar}.norm" || true
+    if grep -Eq '^[0-9a-fA-F]{64}[[:blank:]]+' "${sidecar}.norm"; then
+        mv "${sidecar}.norm" "$sidecar"
+    else
+        warn "malformed ${TARBALL}.sha256 sidecar — skipping checksum verification"
+        rm -f "${sidecar}.norm"
+        return 0
+    fi
+    local verified=false
+    if command -v sha256sum >/dev/null 2>&1; then
+        (cd "$INSTALL_TMP" && sha256sum -c "${TARBALL}.sha256" >/dev/null) && verified=true
+    elif command -v shasum >/dev/null 2>&1; then
+        (cd "$INSTALL_TMP" && shasum -a 256 -c "${TARBALL}.sha256" >/dev/null) && verified=true
+    else
+        err "no SHA-256 tool found (sha256sum/shasum) — refusing to install an unverified bundle"
+    fi
+    if [ "$verified" = true ]; then
+        ok "checksum verified: $TARBALL"
+    else
+        err "checksum MISMATCH for $TARBALL — the download does not match the published checksum. Refusing to install."
     fi
 }
 
@@ -1273,9 +1365,9 @@ if [ -f "$PREFIX/octos" ] && [ "$ENABLE_TUNNEL" = true ]; then
                 ok "per-tenant tunnel token from existing config: ${FRPS_TOKEN:0:8}..."
             fi
         fi
-        if [ "$FRPS_SERVER" = "163.192.33.32" ]; then
+        if [ -z "$FRPS_SERVER" ]; then
             EXISTING_FRPS_SERVER=$(grep 'serverAddr' /etc/frp/frpc.toml 2>/dev/null | head -1 | sed 's/.*= *"\(.*\)"/\1/')
-            if [ -n "$EXISTING_FRPS_SERVER" ] && [ "$EXISTING_FRPS_SERVER" != "163.192.33.32" ]; then
+            if [ -n "$EXISTING_FRPS_SERVER" ]; then
                 FRPS_SERVER="$EXISTING_FRPS_SERVER"
                 ok "frps server from existing config: $FRPS_SERVER"
             fi
@@ -1287,6 +1379,13 @@ if [ -f "$PREFIX/octos" ] && [ "$ENABLE_TUNNEL" = true ]; then
                 ok "ssh port from existing config: $SSH_PORT"
             fi
         fi
+    fi
+
+    # No relay server from flags, env, or existing config: there is no
+    # built-in default, so stop here instead of guessing one.
+    if [ -z "$FRPS_SERVER" ]; then
+        frps_server_missing
+        exit 1
     fi
 
     # Still missing? Prompt interactively
@@ -1349,6 +1448,13 @@ fi
 # ══════════════════════════════════════════════════════════════════════
 # ── Install mode (default) ───────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════
+
+# The tunnel needs an explicit relay server; there is no built-in default.
+# Without one, install everything else and skip the tunnel.
+if [ "$ENABLE_TUNNEL" = true ] && [ -z "$FRPS_SERVER" ]; then
+    frps_server_missing
+    ENABLE_TUNNEL=false
+fi
 
 # ── Detect platform ──────────────────────────────────────────────────
 section "Detecting platform"
@@ -1511,18 +1617,29 @@ if [[ "$DOWNLOAD_URL" == file://* ]]; then
     if ! cp "$LOCAL_PATH" "${INSTALL_TMP}/${TARBALL}"; then
         err "File not found: $LOCAL_PATH"
     fi
+    cp "${LOCAL_PATH}.sha256" "${INSTALL_TMP}/${TARBALL}.sha256" 2>/dev/null || true
 else
     echo "    Downloading $TARBALL..."
     if ! curl -fsSL -o "${INSTALL_TMP}/${TARBALL}" "$DOWNLOAD_URL"; then
         err "Download failed. Check that release $VERSION has a binary for $TRIPLE."
     fi
+    # -f keeps a 404 (pre-rc.12 release) from writing an error page that
+    # would fail verification below.
+    curl -fsSL -o "${INSTALL_TMP}/${TARBALL}.sha256" "${DOWNLOAD_URL}.sha256" 2>/dev/null \
+        || rm -f "${INSTALL_TMP}/${TARBALL}.sha256"
 fi
+
+verify_bundle_checksum
 
 tar -xzf "${INSTALL_TMP}/${TARBALL}" -C "$INSTALL_TMP"
 
 mkdir -p "$PREFIX"
 for bin in "$INSTALL_TMP"/*; do
     [ -f "$bin" ] || continue
+    case "$bin" in
+        # Download artifacts are not programs — never ship them into $PREFIX.
+        *.tar.gz|*.sha256) continue ;;
+    esac
     cp "$bin" "$PREFIX/"
     chmod +x "$PREFIX/$(basename "$bin")"
 done

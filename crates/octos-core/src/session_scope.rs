@@ -201,6 +201,10 @@ pub enum SessionScopeError {
     /// absolute so they can be compared unambiguously against caller
     /// paths (same invariant as `granted_dirs`).
     SkillReadZoneNotAbsolute(usize, PathBuf),
+
+    /// A read-only view root or excluded folder is not absolute, contains
+    /// `..`, or (for an excluded folder) is not strictly inside the root.
+    ReadOnlyViewInvalid(PathBuf),
 }
 
 impl std::fmt::Display for SessionScopeError {
@@ -254,6 +258,12 @@ impl std::fmt::Display for SessionScopeError {
                 "skill_read_zones[{idx}] must be absolute, got: {}",
                 p.display()
             ),
+            Self::ReadOnlyViewInvalid(p) => write!(
+                f,
+                "read-only view path must be absolute, without `..`, and an excluded \
+                 folder strictly inside the view root; got: {}",
+                p.display()
+            ),
         }
     }
 }
@@ -292,6 +302,12 @@ pub enum PathClassification {
     /// Workspace and granted_dirs still take precedence — if a path
     /// happens to be inside both, the higher-trust zone wins.
     InSkillDir { skill_dir: PathBuf },
+    /// Path is inside the scope's read-only view (see
+    /// [`SessionScope::with_read_only_view`]) and outside every folder the
+    /// view excludes. **Reads allowed; writes refused.** Used by a host-owned
+    /// app peer's request context opened with `read_parent` (UPCR-2026-034):
+    /// the context reads its peer's folder, never another context's.
+    InReadOnlyView { root: PathBuf },
     /// Path is outside every declared zone (workspace, shared_zones,
     /// granted_dirs, skill_read_zones). Refuse — this is either a
     /// tenant-boundary escape (multi-tenant) or a path the user has
@@ -403,6 +419,46 @@ pub struct SessionScope {
     /// higher-priority classifications even when a skill_dir happens
     /// to live inside them.
     skill_read_zones: Vec<PathBuf>,
+    /// Optional read-only view of a folder above the workspace, minus the
+    /// folders it excludes. See [`SessionScope::with_read_only_view`].
+    read_only_view: Option<ReadOnlyView>,
+}
+
+/// A read-only view of `root` that hides every folder in `excluded`
+/// (each strictly inside `root`). The workspace keeps its own
+/// classification even when it lies inside an excluded folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadOnlyView {
+    root: PathBuf,
+    excluded: Vec<PathBuf>,
+}
+
+impl ReadOnlyView {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn excluded(&self) -> &[PathBuf] {
+        &self.excluded
+    }
+
+    /// Whether the canonical `path` is inside the view (and in no excluded
+    /// folder). Both sides are canonicalised.
+    fn contains_canonical(&self, canon: &Path) -> bool {
+        canon.starts_with(canonical_root_lossy(&self.root))
+            && !self
+                .excluded
+                .iter()
+                .any(|excluded| canon.starts_with(canonical_root_lossy(excluded)))
+    }
+
+    fn contains_lexical(&self, normalised: &Path) -> bool {
+        normalised.starts_with(&self.root)
+            && !self
+                .excluded
+                .iter()
+                .any(|excluded| normalised.starts_with(excluded))
+    }
 }
 
 /// Canonical names of shared zones under `<root>` for the dspfac /
@@ -480,6 +536,7 @@ impl SessionScope {
                 shared_zones,
             },
             skill_read_zones: Vec::new(),
+            read_only_view: None,
         })
     }
 
@@ -609,6 +666,7 @@ impl SessionScope {
                 shared_zones,
             },
             skill_read_zones: Vec::new(),
+            read_only_view: None,
         })
     }
 
@@ -633,6 +691,7 @@ impl SessionScope {
             root: cwd,
             mode: ScopeMode::Solo { granted_dirs },
             skill_read_zones: Vec::new(),
+            read_only_view: None,
         })
     }
 
@@ -753,6 +812,38 @@ impl SessionScope {
         Ok(self)
     }
 
+    /// Return the read-only view, if any. See [`Self::with_read_only_view`].
+    pub fn read_only_view(&self) -> Option<&ReadOnlyView> {
+        self.read_only_view.as_ref()
+    }
+
+    /// Return a new `SessionScope` whose read-side tools may also read under
+    /// `root`, except under any folder in `excluded` (each must be absolute,
+    /// free of `..` and strictly inside `root`). Writes there are refused.
+    /// The workspace, granted dirs and skill dirs keep their classification;
+    /// the view is consulted after them.
+    pub fn with_read_only_view(
+        mut self,
+        root: PathBuf,
+        excluded: Vec<PathBuf>,
+    ) -> Result<Self, SessionScopeError> {
+        let has_parent = |path: &Path| {
+            path.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        };
+        if !root.is_absolute() || has_parent(&root) {
+            return Err(SessionScopeError::ReadOnlyViewInvalid(root));
+        }
+        for path in &excluded {
+            if !path.is_absolute() || has_parent(path) || path == &root || !path.starts_with(&root)
+            {
+                return Err(SessionScopeError::ReadOnlyViewInvalid(path.clone()));
+            }
+        }
+        self.read_only_view = Some(ReadOnlyView { root, excluded });
+        Ok(self)
+    }
+
     /// Return a new `SessionScope` with `dir` added to `granted_dirs`.
     /// Solo-mode only. Calling on multi-tenant returns
     /// [`SessionScopeError::GrantNotAllowedInMultiTenant`] per codex
@@ -832,6 +923,13 @@ impl SessionScope {
                 };
             }
         }
+        if let Some(view) = &self.read_only_view {
+            if view.contains_lexical(&normalised) {
+                return PathClassification::InReadOnlyView {
+                    root: view.root.clone(),
+                };
+            }
+        }
         if let ScopeMode::MultiTenant { shared_zones, .. } = &self.mode {
             for zone in shared_zones {
                 if normalised.starts_with(zone) {
@@ -888,6 +986,13 @@ impl SessionScope {
             if canon.starts_with(&canon_skill) {
                 return PathClassification::InSkillDir {
                     skill_dir: skill_dir.clone(),
+                };
+            }
+        }
+        if let Some(view) = &self.read_only_view {
+            if view.contains_canonical(&canon) {
+                return PathClassification::InReadOnlyView {
+                    root: view.root.clone(),
                 };
             }
         }
@@ -1876,5 +1981,95 @@ mod tests {
             }
             other => panic!("expected InSkillDir for real skill_dir file, got {other:?}"),
         }
+    }
+
+    /// A peer folder with two request contexts, the scope of context `a`
+    /// with the peer folder as a read-only view minus `contexts/`.
+    fn context_scope_with_view() -> (tempfile::TempDir, PathBuf, SessionScope) {
+        let tmp = tempfile::tempdir().expect("peer root");
+        let peer = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(peer.join("contexts/a")).unwrap();
+        std::fs::create_dir_all(peer.join("contexts/b")).unwrap();
+        std::fs::write(peer.join("notes.md"), b"account notes").unwrap();
+        std::fs::write(peer.join("contexts/b/secret.md"), b"other context").unwrap();
+        let workspace = peer.join("contexts/a");
+        let scope = SessionScope::multi_tenant_at_workspace(
+            workspace.clone(),
+            workspace,
+            "p".into(),
+            "s".into(),
+            vec![],
+        )
+        .unwrap()
+        .with_read_only_view(peer.clone(), vec![peer.join("contexts")])
+        .unwrap();
+        (tmp, peer, scope)
+    }
+
+    #[test]
+    fn should_classify_the_peer_folder_as_read_only_view_when_the_scope_has_one() {
+        let (_tmp, peer, scope) = context_scope_with_view();
+        for classify in [
+            SessionScope::classify_lexical_path,
+            SessionScope::classify_canonical_path,
+        ] {
+            assert_eq!(
+                classify(&scope, &peer.join("notes.md")),
+                PathClassification::InReadOnlyView { root: peer.clone() }
+            );
+            assert_eq!(
+                classify(&scope, &peer.join("contexts/b/secret.md")),
+                PathClassification::OutOfScope
+            );
+            assert_eq!(
+                classify(&scope, &peer.join("contexts")),
+                PathClassification::OutOfScope
+            );
+            assert_eq!(
+                classify(&scope, &peer.join("contexts/a/own.md")),
+                PathClassification::InWorkspace
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_refuse_a_symlink_into_another_context_when_it_sits_in_the_view() {
+        let (_tmp, peer, scope) = context_scope_with_view();
+        std::os::unix::fs::symlink(peer.join("contexts/b"), peer.join("link")).unwrap();
+        assert_eq!(
+            scope.classify_canonical_path(&peer.join("link/secret.md")),
+            PathClassification::OutOfScope
+        );
+    }
+
+    #[test]
+    fn should_refuse_a_view_when_an_excluded_folder_is_outside_its_root() {
+        // abs() over bare "/..." literals: without a drive prefix those are
+        // not absolute on Windows, and solo() would refuse them before the
+        // view validation under test ever runs.
+        let scope = SessionScope::solo(abs("/w"), vec![]).unwrap();
+        assert!(matches!(
+            scope
+                .clone()
+                .with_read_only_view(abs("/p"), vec![abs("/q/contexts")]),
+            Err(SessionScopeError::ReadOnlyViewInvalid(_))
+        ));
+        assert!(matches!(
+            scope.with_read_only_view(abs("/p"), vec![abs("/p")]),
+            Err(SessionScopeError::ReadOnlyViewInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn should_have_no_read_only_view_when_none_is_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let scope = SessionScope::solo(root.join("ws"), vec![]).unwrap();
+        assert!(scope.read_only_view().is_none());
+        assert_eq!(
+            scope.classify_canonical_path(&root.join("notes.md")),
+            PathClassification::OutOfScope
+        );
     }
 }

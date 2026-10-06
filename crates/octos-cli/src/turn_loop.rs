@@ -8,6 +8,9 @@
 use tokio::sync::mpsc;
 
 /// What the turn loop should do next.
+// No per-item allow needed: the only constructor/matcher is the
+// allow-covered `next_turn_loop_step` below, and rustc seeds liveness from
+// allow-covered items — so the enum stays quiet in no-`api` builds too.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TurnLoopStep {
     /// The interrupt signal arrived (reported once — the caller flips its
@@ -23,6 +26,9 @@ pub(crate) enum TurnLoopStep {
 /// first (`biased`). Once `interrupt_observed` is set the interrupt arm is
 /// disabled, mirroring the loop's original guard, so a caller that keeps
 /// draining after an interrupt only ever sees progress/closed.
+// Called only from `run_standalone_turn` in the `api` transport (plus the
+// tests below).
+#[cfg_attr(not(feature = "api"), allow(dead_code))]
 pub(crate) async fn next_turn_loop_step(
     interrupt_rx: &mut mpsc::Receiver<()>,
     progress_rx: &mut mpsc::Receiver<String>,

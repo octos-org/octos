@@ -283,10 +283,8 @@ fn build_client() -> Client {
     Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
+        // Identifiable, never a disguised desktop browser (ADR 0002).
+        .user_agent("octos-news/1.0 (+https://github.com/octos-org/octos)")
         .build()
         .expect("failed to build HTTP client")
 }
@@ -450,7 +448,7 @@ fn fetch_hackernews(client: &Client) -> Result<FetchResult, String> {
             title
         ));
         if !item_url.is_empty() {
-            text.push_str(&format!(" ({})", item_url));
+            text.push_str(&format!(" ({item_url})"));
             urls.push((title.clone(), item_url));
         }
         text.push('\n');

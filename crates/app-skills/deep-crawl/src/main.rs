@@ -57,8 +57,19 @@ const CDP_CONNECT_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_MAX_DEPTH: u32 = 3;
 const DEFAULT_MAX_PAGES: u32 = 50;
 
-const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// Two-second waits for a self-clearing challenge page (see
+/// `octos_research::access::interstitial_text`).
+const INTERSTITIAL_WAITS: u32 = 5;
+
+/// Largest rendered HTML returned per page when `include_html` is set.
+const MAX_PAGE_HTML_BYTES: usize = 2 * 1024 * 1024;
+/// Cap on a robots.txt `Crawl-delay` we will honour between pages.
+const MAX_CRAWL_DELAY_SECS: u64 = 10;
+
+/// Product token appended to the browser's own User-Agent so sites can tell
+/// this is an automated octos reader (policy: no disguised automation; see
+/// SKILL.md "Automation policy").
+const UA_SUFFIX: &str = "octos-research/1.0 (+https://github.com/octos-org/octos)";
 
 /// Environment variables to block when launching Chrome.
 const BLOCKED_ENV_VARS: &[&str] = &[
@@ -95,6 +106,10 @@ struct Input {
     max_pages: u32,
     #[serde(default)]
     path_prefix: Option<String>,
+    /// Return each page's rendered HTML and final URL in `pages` (used by
+    /// `deep-search` to read JS-heavy pages it will cite).
+    #[serde(default)]
+    include_html: bool,
 }
 
 fn default_max_depth() -> u32 {
@@ -104,18 +119,38 @@ fn default_max_pages() -> u32 {
     DEFAULT_MAX_PAGES
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct Output {
     output: String,
     success: bool,
+    /// Rendered pages, only when `include_html` was requested.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pages: Vec<PageHtml>,
 }
 
+#[derive(Serialize)]
+struct PageHtml {
+    url: String,
+    final_url: String,
+    /// Main-frame navigations the browser reported (redirect chain).
+    navigations: Vec<String>,
+    html: String,
+    /// Why the page yielded nothing (e.g. "blocked by a bot challenge (not
+    /// bypassed)"), so the reader can report a specific reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Default)]
 struct CrawledPage {
     url: String,
     depth: u32,
     text: String,
     links: Vec<String>,
     error: Option<String>,
+    final_url: String,
+    html: String,
+    navigations: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +207,24 @@ fn find_free_port() -> u16 {
         .unwrap_or(9222)
 }
 
+/// Chrome command line. Deliberately no automation-hiding switches
+/// (`--disable-blink-features=AutomationControlled`, spoofed `--user-agent`,
+/// `--disable-infobars`): see SKILL.md "Automation policy".
+fn chrome_args(port: u16, user_data_dir: &std::path::Path) -> Vec<String> {
+    vec![
+        "--headless=new".to_string(),
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", user_data_dir.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--disable-gpu".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        "--disable-extensions".to_string(),
+        "--disable-background-networking".to_string(),
+        "about:blank".to_string(),
+    ]
+}
+
 /// Launch headless Chrome with remote debugging and return the child process + debug port.
 fn launch_chrome(user_data_dir: &std::path::Path) -> Result<(Child, u16), String> {
     let chrome_bin = find_chrome_binary()
@@ -180,20 +233,7 @@ fn launch_chrome(user_data_dir: &std::path::Path) -> Result<(Child, u16), String
     let port = find_free_port();
 
     let mut cmd = Command::new(&chrome_bin);
-    cmd.arg("--headless=new")
-        .arg(format!("--remote-debugging-port={port}"))
-        .arg(format!("--user-data-dir={}", user_data_dir.display()))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--disable-gpu")
-        .arg("--disable-dev-shm-usage")
-        .arg("--disable-extensions")
-        .arg("--disable-background-networking")
-        .arg("--disable-blink-features=AutomationControlled")
-        .arg(format!("--user-agent={STEALTH_USER_AGENT}"))
-        .arg("--disable-features=AutomationControlled")
-        .arg("--disable-infobars")
-        .arg("about:blank")
+    cmd.args(chrome_args(port, user_data_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -286,7 +326,8 @@ async fn cdp_send(
                         }
                         return Ok(resp.get("result").cloned().unwrap_or(serde_json::json!({})));
                     }
-                    // Not our response, could be an event -- skip it
+                    // Not our response: an event (maybe a paused request).
+                    handle_event(ws, &resp).await;
                 }
             }
             Ok(Some(Ok(Message::Close(_)))) => {
@@ -373,6 +414,7 @@ async fn cdp_session_send(
                         }
                         return Ok(resp.get("result").cloned().unwrap_or(serde_json::json!({})));
                     }
+                    handle_event(ws, &resp).await;
                 }
             }
             Ok(Some(Ok(Message::Close(_)))) => {
@@ -394,12 +436,12 @@ async fn cdp_session_send(
 // Page interaction via CDP
 // ---------------------------------------------------------------------------
 
-/// JS to remove automation indicators.
-const STEALTH_JS: &str = r#"
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-    window.chrome = { runtime: {} };
+/// JS returning `{href, html}` of the rendered document.
+const PAGE_HTML_JS: &str = r#"
+    JSON.stringify({
+        href: location.href,
+        html: document.documentElement ? document.documentElement.outerHTML : ''
+    })
 "#;
 
 /// JS to extract links from the page.
@@ -447,6 +489,7 @@ async fn navigate(ws: &mut WsStream, session_id: &str, url: &str) -> Result<(), 
         match read_result {
             Ok(Some(Ok(Message::Text(text)))) => {
                 if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
+                    handle_event(ws, &msg).await;
                     if msg.get("method").and_then(|m| m.as_str()) == Some("Page.loadEventFired") {
                         break;
                     }
@@ -498,14 +541,16 @@ async fn evaluate_js(
     }
 }
 
-/// Extract innerText from the page, stripping boilerplate elements.
+/// Extract the page's visible text, stripping boilerplate elements. Hidden
+/// elements are dropped first (a detached clone's `innerText` would include
+/// them), so a check that clears by hiding its panel reads as the article.
 async fn extract_text(ws: &mut WsStream, session_id: &str) -> Result<String, String> {
     // Remove nav, footer, aside, cookie banners, ads before extracting text.
     // This runs in the browser so we get clean content without boilerplate.
     let text = evaluate_js(
         ws,
         session_id,
-        "(function(){if(!document.body)return '';var c=document.body.cloneNode(true);c.querySelectorAll('nav,footer,aside,[role=navigation],[role=banner],[role=complementary],[role=contentinfo],[class*=cookie],[class*=consent],[class*=gdpr],[class*=sidebar],[class*=newsletter],[class*=advertisement],[id*=cookie],[id*=consent],[id*=sidebar],[class*=popup],[class*=modal],[class*=overlay],iframe,svg,form,script,style,noscript').forEach(function(e){e.remove()});return c.innerText||'';})()",
+        "(function(){if(!document.body)return '';var h=[];document.body.querySelectorAll('*').forEach(function(e){if(e.checkVisibility&&!e.checkVisibility()){e.setAttribute('data-octos-hidden','');h.push(e);}});var c=document.body.cloneNode(true);h.forEach(function(e){e.removeAttribute('data-octos-hidden')});c.querySelectorAll('[data-octos-hidden]').forEach(function(e){e.remove()});c.querySelectorAll('nav,footer,aside,[role=navigation],[role=banner],[role=complementary],[role=contentinfo],[class*=cookie],[class*=consent],[class*=gdpr],[class*=sidebar],[class*=newsletter],[class*=advertisement],[id*=cookie],[id*=consent],[id*=sidebar],[class*=popup],[class*=modal],[class*=overlay],iframe,svg,form,script,style,noscript').forEach(function(e){e.remove()});return c.innerText||'';})()",
     )
     .await?;
     Ok(truncate_string(text, MAX_PAGE_TEXT_CHARS))
@@ -525,7 +570,9 @@ async fn extract_links(ws: &mut WsStream, session_id: &str) -> Vec<String> {
 
 fn is_bot_blocked(text: &str) -> bool {
     let lower = text.to_lowercase();
-    lower.contains("performing security verification")
+    // The shared list (Chinese sites' WAF pages included), on short text.
+    octos_research::access::challenge_text(text)
+        || lower.contains("performing security verification")
         || lower.contains("press & hold to confirm you are")
         || lower.contains("please verify you are a human")
         || lower.contains("checking your browser")
@@ -538,74 +585,159 @@ fn is_bot_blocked(text: &str) -> bool {
 // SSRF protection
 // ---------------------------------------------------------------------------
 
-/// Basic SSRF check: block private/loopback/link-local IPs.
+/// SSRF check (shared `octos_research::net`): http(s) only, no private,
+/// loopback, link-local/metadata or reserved address, DNS fail-closed.
 async fn check_ssrf(url_str: &str) -> Option<String> {
-    let parsed = match Url::parse(url_str) {
-        Ok(u) => u,
-        Err(_) => return Some("Invalid URL".to_string()),
-    };
+    octos_research::net::check_url(url_str).await.err()
+}
 
-    let host = match parsed.host_str() {
-        Some(h) => h.to_string(),
-        None => return Some("URL has no host".to_string()),
-    };
+/// Per-host verdicts for in-browser request interception (one DNS lookup
+/// per host per crawl).
+static HOST_VERDICTS: std::sync::Mutex<Vec<(String, bool)>> = std::sync::Mutex::new(Vec::new());
+/// Main-frame document URLs the browser navigated to for the current page.
+static NAVIGATIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Document (page/frame) requests the interceptor refused for the current
+/// page.
+static BLOCKED_REQUESTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-    // Check if host is a raw IP
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if is_private_ip(ip) {
-            return Some(format!(
-                "Blocked: {host} resolves to a private/loopback address"
-            ));
-        }
+/// Decide whether the browser may fetch `url`. `data:`/`blob:` are local;
+/// every network request must pass the SSRF check.
+async fn browser_request_allowed(url: &str) -> bool {
+    let Ok(u) = Url::parse(url) else {
+        return false;
+    };
+    match u.scheme() {
+        "data" | "blob" | "about" => return true,
+        "http" | "https" => {}
+        _ => return false,
     }
+    let key = format!(
+        "{}:{}",
+        u.host_str().unwrap_or(""),
+        u.port_or_known_default().unwrap_or(0)
+    );
+    let cached = HOST_VERDICTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| *v);
+    if let Some(v) = cached {
+        return v;
+    }
+    let ok = check_ssrf(url).await.is_none();
+    HOST_VERDICTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((key, ok));
+    ok
+}
 
-    // DNS resolution check
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    match tokio::net::lookup_host(format!("{host}:{port}")).await {
-        Ok(addrs) => {
-            for addr in addrs {
-                if is_private_ip(addr.ip()) {
-                    return Some(format!(
-                        "Blocked: {host} resolves to a private address ({})",
-                        addr.ip()
-                    ));
+/// Handle a CDP event seen while waiting for something else:
+/// - `Fetch.requestPaused`: every browser request (documents, redirects,
+///   subresources) is held until we allow it; private/internal destinations
+///   are failed with `BlockedByClient`, so the browser never reaches them.
+/// - `Page.frameNavigated` (main frame): recorded so the whole navigation
+///   chain can be re-validated before any content is used.
+async fn handle_event(ws: &mut WsStream, msg: &serde_json::Value) {
+    match msg.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+        "Fetch.requestPaused" => {
+            let params = &msg["params"];
+            let request_id = params["requestId"].as_str().unwrap_or("").to_string();
+            let url = params["request"]["url"].as_str().unwrap_or("").to_string();
+            let is_document = params["resourceType"].as_str() == Some("Document");
+            let allowed = browser_request_allowed(&url).await;
+            let params = if allowed {
+                serde_json::json!({ "requestId": request_id })
+            } else {
+                eprintln!(
+                    "[deep_crawl] blocked browser request to a private/invalid destination: {url}"
+                );
+                if is_document {
+                    BLOCKED_REQUESTS
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(url);
+                }
+                serde_json::json!({ "requestId": request_id, "errorReason": "BlockedByClient" })
+            };
+            let mut out = serde_json::json!({
+                "id": MSG_ID.fetch_add(1, Ordering::SeqCst),
+                "method": if allowed { "Fetch.continueRequest" } else { "Fetch.failRequest" },
+                "params": params,
+            });
+            if let Some(sid) = msg.get("sessionId") {
+                out["sessionId"] = sid.clone();
+            }
+            let _ = ws.send(Message::Text(out.to_string())).await;
+        }
+        "Page.frameNavigated" => {
+            let frame = &msg["params"]["frame"];
+            if frame.get("parentId").is_none() {
+                if let Some(u) = frame["url"].as_str() {
+                    NAVIGATIONS
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(u.to_string());
                 }
             }
         }
-        Err(_) => {
-            // DNS resolution failed -- allow the request, Chrome will handle the error
-        }
+        _ => {}
     }
-
-    None
 }
 
-fn is_private_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_unspecified()
-                // 100.64.0.0/10 (Carrier-grade NAT)
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
-                // 169.254.0.0/16 (link-local, already covered by is_link_local but explicit)
-                || v4.octets()[0] == 169 && v4.octets()[1] == 254
+/// Read and handle CDP events for `dur` (instead of a plain sleep, so paused
+/// requests keep flowing while the page settles).
+async fn pump_events(ws: &mut WsStream, dur: Duration) {
+    let deadline = tokio::time::Instant::now() + dur;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return;
         }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                // ULA fc00::/7
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                // Link-local fe80::/10
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                // IPv4-mapped ::ffff:0:0/96
-                || v6.segments()[..5] == [0, 0, 0, 0, 0] && v6.segments()[5] == 0xffff
-                // IPv4-compatible ::/96 (deprecated)
-                || v6.segments()[..6] == [0, 0, 0, 0, 0, 0] && v6.segments()[6] != 0
+        match timeout(deadline - now, ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
+                    handle_event(ws, &msg).await;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => return,
         }
     }
+}
+
+/// Validate what the browser actually loaded: no document request may have
+/// been blocked, the page must not be a browser error page, and the final
+/// document URL and every main-frame navigation must pass the SSRF check.
+/// Otherwise the page's content is discarded.
+async fn validate_navigation(
+    final_url: &str,
+    navigations: &[String],
+    blocked_documents: &[String],
+) -> Result<(), String> {
+    if let Some(b) = blocked_documents.first() {
+        return Err(format!(
+            "blocked: page tried to navigate to a private/internal address ({b})"
+        ));
+    }
+    if final_url.starts_with("chrome-error:") {
+        return Err("blocked: browser error page (navigation failed or was refused)".to_string());
+    }
+    for u in navigations
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(final_url))
+    {
+        if u.is_empty() || u.starts_with("about:") || u.starts_with("chrome-error:") {
+            // Error pages are rejected above via the final URL.
+            continue;
+        }
+        if let Some(e) = check_ssrf(u).await {
+            return Err(format!("blocked: browser navigated to {u}: {e}"));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +779,7 @@ fn page_slug(url: &Url, index: usize) -> String {
     } else {
         &slug
     };
-    format!("{:03}_{truncated}", index)
+    format!("{index:03}_{truncated}")
 }
 
 /// Truncate a string to max_len at a UTF-8 safe boundary.
@@ -670,56 +802,75 @@ fn truncate_string(mut s: String, max_len: usize) -> String {
 // ---------------------------------------------------------------------------
 
 /// Crawl a single page: navigate, wait for JS render, extract text and links.
+///
+/// No automation hiding: the browser keeps its default automation signals
+/// (`navigator.webdriver`, HeadlessChrome UA plus our product token). A page
+/// that answers with a bot challenge is recorded as blocked, not bypassed.
 async fn crawl_single_page(
     ws: &mut WsStream,
     session_id: &str,
     url: &str,
     page_settle_ms: u64,
+    include_html: bool,
 ) -> CrawledPage {
-    // Inject stealth JS before navigation
-    let _ = evaluate_js(ws, session_id, STEALTH_JS).await;
-
+    NAVIGATIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+    BLOCKED_REQUESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
     // Navigate
     if let Err(e) = navigate(ws, session_id, url).await {
         return CrawledPage {
             url: url.to_string(),
-            depth: 0,
-            text: String::new(),
-            links: vec![],
             error: Some(format!("Navigation failed: {e}")),
+            ..Default::default()
         };
     }
 
-    // Wait for JS settle
-    tokio::time::sleep(Duration::from_millis(page_settle_ms)).await;
+    // Wait for JS settle (keep serving intercepted requests meanwhile)
+    pump_events(ws, Duration::from_millis(page_settle_ms)).await;
 
-    // Re-inject stealth after navigation
-    let _ = evaluate_js(ws, session_id, STEALTH_JS).await;
-
-    // Extract text with retry for near-empty or bot-blocked pages
+    // Extract text, retrying while a slow page is still near-empty.
     let mut text = match extract_text(ws, session_id).await {
         Ok(t) => t,
         Err(e) => {
             return CrawledPage {
                 url: url.to_string(),
-                depth: 0,
-                text: String::new(),
-                links: vec![],
                 error: Some(e),
+                ..Default::default()
             };
         }
     };
 
-    // Retry if page looks empty or bot-blocked
+    // A check that clears itself in a real browser ("Just a moment…",
+    // "正在进行安全检测…"): wait for it, up to ~10 s, instead of giving up.
+    let mut waited = 0;
+    while waited < INTERSTITIAL_WAITS && octos_research::access::interstitial_text(&text) {
+        pump_events(ws, Duration::from_secs(2)).await;
+        waited += 1;
+        if let Ok(t) = extract_text(ws, session_id).await {
+            text = t;
+        }
+    }
+    if is_bot_blocked(&text) {
+        eprintln!("[deep_crawl] bot challenge, not bypassing: {url}");
+        return CrawledPage {
+            url: url.to_string(),
+            error: Some("blocked by a bot challenge (not bypassed)".to_string()),
+            ..Default::default()
+        };
+    }
+
     for _retry in 0..MAX_EMPTY_RETRIES {
         let trimmed_len = text.trim().len();
-        if trimmed_len >= MIN_USEFUL_TEXT_LEN && !is_bot_blocked(&text) {
+        if trimmed_len >= MIN_USEFUL_TEXT_LEN {
             break;
         }
-        eprintln!(
-            "[deep_crawl] page looks empty or bot-blocked (len={trimmed_len}), retrying: {url}"
-        );
-        tokio::time::sleep(Duration::from_millis(PAGE_SETTLE_RETRY_MS)).await;
+        eprintln!("[deep_crawl] page looks empty (len={trimmed_len}), waiting longer: {url}");
+        pump_events(ws, Duration::from_millis(PAGE_SETTLE_RETRY_MS)).await;
         text = match extract_text(ws, session_id).await {
             Ok(t) => t,
             Err(_) => break,
@@ -729,13 +880,108 @@ async fn crawl_single_page(
     // Extract links
     let links = extract_links(ws, session_id).await;
 
+    let (final_url, mut html) = page_html(ws, session_id).await.unwrap_or_default();
+    if !include_html {
+        html.clear();
+    }
+    let navigations = NAVIGATIONS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+
+    // SSRF: whatever the page did (JS/meta redirects), the document we
+    // extracted must come from a public address. Otherwise discard it.
+    let blocked_documents = BLOCKED_REQUESTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Err(e) = validate_navigation(&final_url, &navigations, &blocked_documents).await {
+        eprintln!("[deep_crawl] {e}");
+        return CrawledPage {
+            url: url.to_string(),
+            error: Some(e),
+            final_url,
+            navigations,
+            ..Default::default()
+        };
+    }
+
     CrawledPage {
         url: url.to_string(),
         depth: 0,
         text,
         links,
         error: None,
+        final_url,
+        html,
+        navigations,
     }
+}
+
+/// Rendered `(final_url, outerHTML)`, HTML capped at [`MAX_PAGE_HTML_BYTES`].
+async fn page_html(ws: &mut WsStream, session_id: &str) -> Option<(String, String)> {
+    let raw = evaluate_js(ws, session_id, PAGE_HTML_JS).await.ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let href = v["href"].as_str().unwrap_or("").to_string();
+    let mut html = v["html"].as_str().unwrap_or("").to_string();
+    if html.len() > MAX_PAGE_HTML_BYTES {
+        let mut end = MAX_PAGE_HTML_BYTES;
+        while end > 0 && !html.is_char_boundary(end) {
+            end -= 1;
+        }
+        html.truncate(end);
+    }
+    Some((href, html))
+}
+
+/// Append our product token to the browser's own User-Agent for this tab.
+async fn set_identifiable_user_agent(ws: &mut WsStream, session_id: &str) {
+    let base = cdp_send(ws, "Browser.getVersion", serde_json::json!({}))
+        .await
+        .ok()
+        .and_then(|v| v["userAgent"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let ua = if base.is_empty() {
+        UA_SUFFIX.to_string()
+    } else {
+        format!("{base} {UA_SUFFIX}")
+    };
+    let _ = cdp_session_send(
+        ws,
+        session_id,
+        "Network.setUserAgentOverride",
+        serde_json::json!({ "userAgent": ua }),
+    )
+    .await;
+}
+
+/// Whether robots.txt is applied: operator setting `OCTOS_RESPECT_ROBOTS`,
+/// default off (env lookup injected for tests).
+fn robots_enabled(lookup: impl Fn(&str) -> Option<String>) -> bool {
+    octos_research::respect_robots(lookup)
+}
+
+/// robots.txt check for one URL (RFC 9309 via `octos-research`), fetched
+/// once per origin with an identifiable User-Agent.
+async fn robots_check(
+    cache: &octos_research::RobotsCache,
+    url: &str,
+) -> octos_research::robots::RobotsDecision {
+    cache
+        .check(url, octos_research::AGENT_TOKEN, |robots_url| async move {
+            match octos_research::net::safe_get(&robots_url, Duration::from_secs(10)).await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    // Cap: 500 KiB is the RFC 9309 minimum a parser must handle.
+                    let body = octos_research::net::read_capped(resp, 512 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    (Some(status), body)
+                }
+                Err(_) => (None, String::new()),
+            }
+        })
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -838,6 +1084,7 @@ async fn run() -> Output {
         return Output {
             output: format!("Failed to read stdin: {e}"),
             success: false,
+            ..Default::default()
         };
     }
 
@@ -847,11 +1094,12 @@ async fn run() -> Output {
             return Output {
                 output: format!("Invalid JSON input: {e}"),
                 success: false,
+                ..Default::default()
             };
         }
     };
 
-    let max_depth = input.max_depth.clamp(1, 10);
+    let max_depth = input.max_depth.min(10);
     let max_pages = input.max_pages.clamp(1, 200);
 
     // Validate seed URL
@@ -861,6 +1109,7 @@ async fn run() -> Output {
             return Output {
                 output: "Invalid URL".to_string(),
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -870,6 +1119,7 @@ async fn run() -> Output {
         return Output {
             output: format!("Only http:// and https:// URLs are allowed, got {scheme}://"),
             success: false,
+            ..Default::default()
         };
     }
 
@@ -878,6 +1128,7 @@ async fn run() -> Output {
         return Output {
             output: msg,
             success: false,
+            ..Default::default()
         };
     }
 
@@ -889,6 +1140,7 @@ async fn run() -> Output {
         return Output {
             output: format!("Failed to create output directory: {e}"),
             success: false,
+            ..Default::default()
         };
     }
 
@@ -899,6 +1151,7 @@ async fn run() -> Output {
             return Output {
                 output: format!("Failed to create temp dir: {e}"),
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -912,6 +1165,7 @@ async fn run() -> Output {
             return Output {
                 output: e,
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -929,6 +1183,7 @@ async fn run() -> Output {
             return Output {
                 output: format!("Failed to connect to Chrome: {e}"),
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -940,6 +1195,7 @@ async fn run() -> Output {
             return Output {
                 output: e,
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -952,6 +1208,7 @@ async fn run() -> Output {
             return Output {
                 output: format!("Failed to create browser tab: {e}"),
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -963,6 +1220,7 @@ async fn run() -> Output {
             return Output {
                 output: format!("Failed to attach to browser tab: {e}"),
                 success: false,
+                ..Default::default()
             };
         }
     };
@@ -975,11 +1233,33 @@ async fn run() -> Output {
         serde_json::json!({}),
     )
     .await;
+    set_identifiable_user_agent(&mut ws, &session_id).await;
+    // Hold every browser request (documents, redirects, subresources) until
+    // `handle_event` has SSRF-checked its destination.
+    if let Err(e) = cdp_session_send(
+        &mut ws,
+        &session_id,
+        "Fetch.enable",
+        serde_json::json!({"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}),
+    )
+    .await
+    {
+        let _ = child.kill();
+        return Output {
+            output: format!("Failed to enable request interception: {e}"),
+            success: false,
+            ..Default::default()
+        };
+    }
+    let robots = octos_research::RobotsCache::new();
+    let respect_robots = robots_enabled(|k| std::env::var(k).ok());
 
     // BFS crawl
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<(String, u32)> = VecDeque::new();
     let mut results: Vec<CrawledPage> = Vec::new();
+    // Account links not followed (reported, not dropped silently).
+    let mut skipped_account: Vec<String> = Vec::new();
 
     let seed_normalized = normalize_url(&input.url).unwrap_or_else(|| input.url.clone());
     visited.insert(seed_normalized.clone());
@@ -1025,7 +1305,49 @@ async fn run() -> Output {
             progress_fraction,
         );
 
-        let mut crawled = crawl_single_page(&mut ws, &session_id, &url, PAGE_SETTLE_MS).await;
+        // robots.txt (only when the operator enabled it with
+        // OCTOS_RESPECT_ROBOTS=1; default off, never fetched): a disallowed
+        // (or unreachable-robots) URL is recorded, never navigated, and
+        // Crawl-delay is honoured between pages. Otherwise pages are spaced
+        // by the settle time alone (sequential, one tab).
+        let decision = if respect_robots {
+            robots_check(&robots, &url).await
+        } else {
+            octos_research::robots::RobotsDecision {
+                allowed: true,
+                crawl_delay: None,
+                reason: "robots_off",
+            }
+        };
+        if !decision.allowed {
+            eprintln!(
+                "[deep_crawl] skipped by robots.txt ({}): {url}",
+                decision.reason
+            );
+            results.push(CrawledPage {
+                url: url.clone(),
+                depth,
+                error: Some(format!("skipped: {} (robots.txt)", decision.reason)),
+                ..Default::default()
+            });
+            continue;
+        }
+        if let Some(delay) = decision.crawl_delay {
+            if !results.is_empty() {
+                let delay = delay.min(Duration::from_secs(MAX_CRAWL_DELAY_SECS));
+                tokio::time::sleep(delay.saturating_sub(Duration::from_millis(PAGE_SETTLE_MS)))
+                    .await;
+            }
+        }
+
+        let mut crawled = crawl_single_page(
+            &mut ws,
+            &session_id,
+            &url,
+            PAGE_SETTLE_MS,
+            input.include_html,
+        )
+        .await;
         crawled.depth = depth;
 
         // Enqueue discovered links
@@ -1058,6 +1380,16 @@ async fn run() -> Output {
                     if !link_url.path().starts_with(prefix) {
                         continue;
                     }
+                }
+
+                // Sign-in, sign-up and sign-out pages hold no content; an
+                // explicit path_prefix (already applied above) crawls them.
+                if input.path_prefix.is_none() && octos_research::urls::is_account_link(&normalized)
+                {
+                    if !skipped_account.contains(&normalized) {
+                        skipped_account.push(normalized);
+                    }
+                    continue;
                 }
 
                 // SSRF check on discovered links
@@ -1102,6 +1434,16 @@ async fn run() -> Output {
         ));
     }
     output.push('\n');
+    if !skipped_account.is_empty() {
+        output.push_str(&format!(
+            "## Not followed: {} sign-in/sign-up link(s) (octos_research::urls::is_account_link; set path_prefix to crawl under one)\n",
+            skipped_account.len()
+        ));
+        for u in skipped_account.iter().take(20) {
+            output.push_str(&format!("- {u}\n"));
+        }
+        output.push('\n');
+    }
 
     for (i, crawled) in results.iter().enumerate() {
         // Save full content to disk
@@ -1109,7 +1451,7 @@ async fn run() -> Output {
         let filename = file_url
             .as_ref()
             .map(|u| format!("{}.md", page_slug(u, i)))
-            .unwrap_or_else(|| format!("{:03}_page.md", i));
+            .unwrap_or_else(|| format!("{i:03}_page.md"));
         let file_path = crawl_dir.join(&filename);
 
         let file_content = if let Some(ref err) = crawled.error {
@@ -1169,9 +1511,35 @@ async fn run() -> Output {
         Some(1.0),
     );
 
+    let pages = if input.include_html {
+        results
+            .into_iter()
+            .filter(|p| p.error.is_some() || !p.html.is_empty())
+            .map(|p| PageHtml {
+                final_url: if p.final_url.is_empty() {
+                    p.url.clone()
+                } else {
+                    p.final_url
+                },
+                url: p.url,
+                navigations: p.navigations,
+                // A failed page carries its reason, never its HTML.
+                html: if p.error.is_some() {
+                    String::new()
+                } else {
+                    p.html
+                },
+                error: p.error,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Output {
         output,
         success: true,
+        pages,
     }
 }
 
@@ -1254,14 +1622,50 @@ mod tests {
         assert!(!is_bot_blocked("Welcome to our site"));
     }
 
-    #[test]
-    fn is_private_ip_blocks_loopback_and_private() {
-        let v4_loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let v4_private: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-        let v4_public: std::net::IpAddr = "8.8.8.8".parse().unwrap();
-        assert!(is_private_ip(v4_loopback));
-        assert!(is_private_ip(v4_private));
-        assert!(!is_private_ip(v4_public));
+    #[tokio::test]
+    async fn should_block_browser_requests_and_navigations_to_private_addresses() {
+        for u in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:9222/json/version",
+            "http://[::ffff:10.0.0.1]/",
+            "http://localhost/",
+            "file:///etc/passwd",
+        ] {
+            assert!(!browser_request_allowed(u).await, "{u}");
+        }
+        assert!(browser_request_allowed("data:text/plain,hi").await);
+        assert!(browser_request_allowed("http://93.184.216.34/").await);
+
+        // Fixture: a page whose JS redirect lands on the metadata endpoint.
+        let err = validate_navigation(
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            &["http://93.184.216.34/start".to_string()],
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("169.254.169.254"), "{err}");
+        // A private hop earlier in the chain is caught even if the final
+        // URL is public.
+        let hops = ["http://10.0.0.7/admin".to_string()];
+        assert!(validate_navigation("http://93.184.216.34/end", &hops, &[])
+            .await
+            .is_err());
+        assert!(validate_navigation("http://93.184.216.34/end", &[], &[])
+            .await
+            .is_ok());
+        // An HTTP/JS redirect the interceptor refused leaves Chrome on its
+        // error page: rejected, content discarded.
+        let blocked = ["http://169.254.169.254/latest/meta-data/".to_string()];
+        let err = validate_navigation("chrome-error://chromewebdata/", &[], &blocked)
+            .await
+            .unwrap_err();
+        assert!(err.contains("169.254.169.254"), "{err}");
+        assert!(
+            validate_navigation("chrome-error://chromewebdata/", &[], &[])
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -1269,6 +1673,27 @@ mod tests {
         // Catch any future serialization regression that would crash on
         // non-ASCII content.
         emit_v2_progress("crawling", "page 你好/世界", Some(0.5));
+    }
+
+    #[test]
+    fn should_not_hide_automation_in_chrome_args_or_scripts() {
+        let args = chrome_args(9222, std::path::Path::new("/tmp/x")).join(" ");
+        assert!(!args.contains("AutomationControlled"), "{args}");
+        assert!(!args.contains("--user-agent"), "{args}");
+        assert!(!args.contains("--disable-infobars"), "{args}");
+        let src = include_str!("main.rs");
+        // Split so this test does not match itself.
+        let needle = ["'web", "driver'"].concat();
+        assert!(!src.contains(&needle), "no webdriver-hiding script");
+        assert!(UA_SUFFIX.contains(octos_research::AGENT_TOKEN));
+    }
+
+    #[test]
+    fn should_skip_robots_txt_unless_the_operator_enables_it() {
+        assert!(!robots_enabled(|_| None));
+        assert!(robots_enabled(|k| {
+            (k == octos_research::RESPECT_ROBOTS_ENV).then(|| "1".to_string())
+        }));
     }
 
     #[test]

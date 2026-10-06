@@ -156,7 +156,11 @@ fn cmd_login(bridge_dir: Option<PathBuf>) -> Result<()> {
             .status()
             .map_err(|_| eyre::eyre!("npm not found. Please install Node.js (20+)."))?;
         if !status.success() {
-            eyre::bail!("npm install failed");
+            eyre::bail!(
+                "npm install failed in {}. If node_modules looks broken, remove it and \
+                 re-run. Requires Node.js 20+.",
+                dir.display()
+            );
         }
     }
 
@@ -168,7 +172,7 @@ fn cmd_login(bridge_dir: Option<PathBuf>) -> Result<()> {
         .map_err(|_| eyre::eyre!("npm not found. Please install Node.js (20+)."))?;
 
     if !status.success() {
-        eyre::bail!("Bridge process exited with error");
+        eyre::bail!("WhatsApp bridge process exited with error (see its output above)");
     }
 
     Ok(())

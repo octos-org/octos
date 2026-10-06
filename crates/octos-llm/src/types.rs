@@ -3,6 +3,26 @@
 use octos_core::ToolCall;
 use serde::{Deserialize, Serialize};
 
+/// Which prompt-cache rate card the answering slot bills at.
+///
+/// Sourced from the provider TYPE (which API it speaks), NOT from a guessed
+/// label — so a relabeled Anthropic-API proxy (`zai` / `r9s` serving claude /
+/// `custom` + `api_type=anthropic`) is priced correctly while its label stays
+/// its logical identity for adaptive-lane and persisted-QoS matching. Anthropic
+/// = 0.1x read / 1.25x write; Gemini = 0.25x read / 0 write; Residual = full
+/// read rate, writes never free (the fail-safe default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheLane {
+    /// Anthropic Messages API prompt-cache accounting.
+    Anthropic,
+    /// Gemini implicit caching.
+    Gemini,
+    /// OpenAI-protocol / unknown: no known read discount; writes at 1.25x.
+    #[default]
+    Residual,
+}
+
 /// Structured provenance for the provider instance that produced a response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderMetadata {
@@ -10,6 +30,10 @@ pub struct ProviderMetadata {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// The cache rate card this slot bills at (see [`CacheLane`]). `#[serde(default)]`
+    /// so older persisted metadata deserializes to `Residual`.
+    #[serde(default)]
+    pub cache_lane: CacheLane,
 }
 
 impl ProviderMetadata {
@@ -22,7 +46,16 @@ impl ProviderMetadata {
             provider: provider.into(),
             model: model.into(),
             endpoint,
+            cache_lane: CacheLane::Residual,
         }
+    }
+
+    /// Set the cache rate card (providers that speak Anthropic/Gemini call this
+    /// from their `provider_metadata()`).
+    #[must_use]
+    pub fn with_cache_lane(mut self, lane: CacheLane) -> Self {
+        self.cache_lane = lane;
+        self
     }
 
     pub fn display_label(&self) -> String {
@@ -75,8 +108,8 @@ pub enum StopReason {
 /// Cache accounting contract: `cache_read_tokens` / `cache_write_tokens`
 /// are DISJOINT from `input_tokens` (Anthropic-style) — the total prompt is
 /// `input + cache_read + cache_write`. Anthropic reports this natively;
-/// providers whose wire format counts cached tokens INSIDE the prompt total
-/// (OpenAI `prompt_tokens_details.cached_tokens`, Gemini
+/// providers whose wire format counts cache reads/writes INSIDE the prompt
+/// total (OpenAI `prompt_tokens_details`, Gemini
 /// `cachedContentTokenCount`) are normalized at their parse boundary by
 /// subtracting the cached share from `input_tokens`. Consumers summing
 /// "everything processed" must add all three; never re-add cache counts to
@@ -95,6 +128,23 @@ pub struct TokenUsage {
     /// Tokens written to provider cache.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cache_write_tokens: u32,
+    /// Optional correctness-neutral report from a local/hybrid runtime that
+    /// consumed semantic checkpoint hints. Hosted providers leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_checkpoint: Option<SemanticCheckpointReport>,
+}
+
+/// What a local/hybrid engine actually restored for this request. This is a
+/// provider report, not permission to reuse state: callers validate the id
+/// against the exact-prefix hints they offered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticCheckpointReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_boundary_id: Option<String>,
+    #[serde(default)]
+    pub restored_prefix_tokens: u32,
+    #[serde(default)]
+    pub re_prefill_tokens: u32,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -293,6 +343,41 @@ fn partial_tag_suffix_len(buf: &str, tag: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_usage_without_checkpoint_report_remains_backward_compatible() {
+        let usage: TokenUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 12,
+            "output_tokens": 3
+        }))
+        .unwrap();
+
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 3);
+        assert!(usage.semantic_checkpoint.is_none());
+        let encoded = serde_json::to_value(&usage).unwrap();
+        assert!(encoded.get("semantic_checkpoint").is_none());
+    }
+
+    #[test]
+    fn semantic_checkpoint_report_round_trips_without_prompt_content() {
+        let usage = TokenUsage {
+            semantic_checkpoint: Some(SemanticCheckpointReport {
+                restored_boundary_id: Some("tool_interaction-4-deadbeef".to_string()),
+                restored_prefix_tokens: 4096,
+                re_prefill_tokens: 384,
+            }),
+            ..Default::default()
+        };
+
+        let encoded = serde_json::to_value(&usage).unwrap();
+        assert_eq!(
+            encoded["semantic_checkpoint"]["restored_boundary_id"],
+            "tool_interaction-4-deadbeef"
+        );
+        let decoded: TokenUsage = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.semantic_checkpoint, usage.semantic_checkpoint);
+    }
 
     /// Drive the splitter with an arbitrary chunking of `parts` and collect
     /// both lanes.

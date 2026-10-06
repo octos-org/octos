@@ -25,11 +25,21 @@ impl AgentHandle {
         msgs
     }
 
+    /// `clippy::result_large_err` fires here on Rust 1.98+: tokio's
+    /// `SendError<T>` is `T`-sized, and `OutboundMessage` is ~192 bytes.
+    ///
+    /// Allowed rather than boxed, because the size IS the contract. `SendError`
+    /// hands the un-sent message back so a caller can recover or requeue it;
+    /// boxing would force every caller to unbox to reach it, and would change a
+    /// public signature to satisfy a lint about a type this crate does not own.
+    /// The error path is also the rare one — a closed outbound channel — so the
+    /// stack cost it warns about is not paid on the hot path.
+    #[allow(clippy::result_large_err)]
     pub async fn send_outbound(
         &self,
         msg: OutboundMessage,
-    ) -> Result<(), mpsc::error::SendError<OutboundMessage>> {
-        self.out_tx.send(msg).await
+    ) -> Result<(), Box<mpsc::error::SendError<OutboundMessage>>> {
+        self.out_tx.send(msg).await.map_err(Box::new)
     }
 
     /// Clone the outbound sender for use by tools (e.g. MessageTool).
@@ -124,6 +134,19 @@ mod tests {
             .unwrap();
         let msg = publisher.recv_outbound().await.unwrap();
         assert_eq!(msg.content, "response");
+    }
+
+    #[tokio::test]
+    async fn failed_outbound_send_preserves_the_unsent_message() {
+        let (agent, publisher) = create_bus();
+        drop(publisher);
+
+        let error = agent
+            .send_outbound(make_outbound("not-delivered"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.0.content, "not-delivered");
     }
 
     #[tokio::test]

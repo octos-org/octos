@@ -400,12 +400,63 @@ impl LlmProvider for RetryProvider {
         eyre::bail!("retry loop exited unexpectedly")
     }
 
+    // #2135 review P1: without these delegations the trait defaults re-read
+    // the static catalog by model id, silently discarding a probed or
+    // overridden window on the standard runtime path (every session wraps
+    // the base provider in RetryProvider).
+    fn context_window(&self) -> u32 {
+        self.inner.context_window()
+    }
+
+    fn estimate_request_tokens(
+        &self,
+        messages: &[Message],
+        tools: &[crate::types::ToolSpec],
+    ) -> u32 {
+        // #2143 part 3: delegate so a concrete provider's request-size override
+        // survives this wrapper (mirrors context_window delegation).
+        self.inner.estimate_request_tokens(messages, tools)
+    }
+
+    fn max_output_tokens(&self) -> u32 {
+        self.inner.max_output_tokens()
+    }
+
+    async fn ensure_ready(&self) {
+        self.inner.ensure_ready().await;
+    }
+
     fn model_id(&self) -> &str {
         self.inner.model_id()
     }
 
     fn provider_name(&self) -> &str {
         self.inner.provider_name()
+    }
+
+    fn provider_metadata(&self) -> crate::ProviderMetadata {
+        // #2194 R4: transparent wrapper — carry the inner slot's cache lane
+        // (and identity) through, or pricing sees the default Residual lane.
+        self.inner.provider_metadata()
+    }
+
+    fn provider_metadata_for_index(
+        &self,
+        provider_index: Option<usize>,
+    ) -> crate::types::ProviderMetadata {
+        self.inner.provider_metadata_for_index(provider_index)
+    }
+
+    fn provider_lane_count(&self) -> usize {
+        self.inner.provider_lane_count()
+    }
+
+    fn api_style(&self) -> Option<crate::provider::ApiStyle> {
+        self.inner.api_style()
+    }
+
+    fn supports_semantic_checkpoint_hints(&self) -> bool {
+        self.inner.supports_semantic_checkpoint_hints()
     }
 
     fn report_late_failure(&self) {
@@ -416,6 +467,35 @@ impl LlmProvider for RetryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_provider_propagates_the_inner_cache_lane() {
+        use std::sync::Arc;
+        // #2194 R4: providers are wrapped RetryProvider -> Chain -> Router; a
+        // wrapper that drops the inner cache lane prices a custom-anthropic slot
+        // at the Residual default. RetryProvider must carry it through.
+        let inner: Arc<dyn LlmProvider> = Arc::new(
+            crate::anthropic::AnthropicProvider::new("k", "claude-3-5-sonnet")
+                .with_provider_label("custom"),
+        );
+        assert_eq!(
+            inner.provider_metadata().cache_lane,
+            crate::CacheLane::Anthropic,
+            "sanity: the raw AnthropicProvider reports the Anthropic lane",
+        );
+        let retry = RetryProvider::new(inner);
+        assert_eq!(
+            retry.provider_metadata().cache_lane,
+            crate::CacheLane::Anthropic,
+            "RetryProvider must propagate the inner Anthropic cache lane",
+        );
+        assert_eq!(
+            retry.provider_metadata_for_index(None).cache_lane,
+            crate::CacheLane::Anthropic,
+        );
+        // Identity (label) is preserved — adaptive-lane matching keys on it.
+        assert_eq!(retry.provider_metadata().provider, "custom");
+    }
 
     #[test]
     fn test_is_retryable_429() {
@@ -944,7 +1024,7 @@ mod tests {
     // These drive a real `reqwest` client at a local TCP server that fails
     // the request in the same way z.ai's endpoint does under load, then wrap
     // the error EXACTLY like `anthropic.rs`
-    // (`.send().await.wrap_err("failed to send streaming request to Anthropic")`)
+    // (`.send().await.wrap_err(crate::provider::transport_error_message(true, "zai", "glm-5.2", crate::provider::ApiStyle::AnthropicMessages))`)
     // and assert the retry/failover verdict.
     // ──────────────────────────────────────────────────────────────────────
     use eyre::WrapErr;
@@ -974,7 +1054,12 @@ mod tests {
                 .await;
             return res
                 .map(|_| ())
-                .wrap_err("failed to send streaming request to Anthropic")
+                .wrap_err(crate::provider::transport_error_message(
+                    true,
+                    "zai",
+                    "glm-5.2",
+                    crate::provider::ApiStyle::AnthropicMessages,
+                ))
                 .unwrap_err();
         }
 
@@ -999,7 +1084,12 @@ mod tests {
             .await;
         let _ = accept.await;
         res.map(|_| ())
-            .wrap_err("failed to send streaming request to Anthropic")
+            .wrap_err(crate::provider::transport_error_message(
+                true,
+                "zai",
+                "glm-5.2",
+                crate::provider::ApiStyle::AnthropicMessages,
+            ))
             .unwrap_err()
     }
 
@@ -1056,7 +1146,12 @@ mod tests {
             .send()
             .await
             .map(|_| ())
-            .wrap_err("failed to send streaming request to Anthropic")
+            .wrap_err(crate::provider::transport_error_message(
+                true,
+                "zai",
+                "glm-5.2",
+                crate::provider::ApiStyle::AnthropicMessages,
+            ))
             .unwrap_err();
 
         let is_timeout = err
@@ -1120,7 +1215,12 @@ mod tests {
             .send()
             .await
             .map(|_| ())
-            .wrap_err("failed to send streaming request to Anthropic")
+            .wrap_err(crate::provider::transport_error_message(
+                true,
+                "zai",
+                "glm-5.2",
+                crate::provider::ApiStyle::AnthropicMessages,
+            ))
             .unwrap_err();
         accept.abort();
 
@@ -1132,5 +1232,63 @@ mod tests {
             RetryProvider::should_failover(&err),
             "request timeout must failover to another provider: {err:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod provider_metadata_tests {
+    use std::sync::Arc;
+
+    use super::RetryProvider;
+    use crate::provider::LlmProvider;
+    use crate::provider::test_lanes::TwoLaneStub;
+
+    #[test]
+    fn should_forward_provider_metadata_for_index_to_inner_lane_when_wrapped() {
+        let wrapped = RetryProvider::new(Arc::new(TwoLaneStub));
+        let metadata = wrapped.provider_metadata_for_index(Some(1));
+        assert_eq!(
+            (metadata.provider.as_str(), metadata.model.as_str()),
+            ("lane-b", "model-b"),
+            "slot 1 identity must survive the wrapper: {metadata:?}"
+        );
+        assert_eq!(metadata.endpoint.as_deref(), Some("b.example"));
+        assert_eq!(wrapped.provider_metadata().provider, "lane-a");
+    }
+}
+
+#[cfg(test)]
+mod lane_summary_classification_tests {
+    use super::RetryProvider;
+    use crate::error::{LlmError, LlmErrorKind};
+
+    /// A composite provider wraps the last lane's error with an all-lanes
+    /// summary; the typed kind/status underneath must stay visible to both
+    /// classifiers so failover/backoff semantics are unchanged.
+    #[test]
+    fn should_still_classify_wrapped_lane_errors_when_summary_context_is_added() {
+        let rate_limited: eyre::Report = LlmError::new(
+            LlmErrorKind::RateLimited {
+                retry_after_secs: Some(2),
+            },
+            "slow down",
+        )
+        .with_provider("zai-coding/glm-5.3")
+        .into();
+        let wrapped = rate_limited
+            .wrap_err("all lanes failed: moonshot-coding@api/k3 (api_style=openai_chat_completions): boom; zai-coding/glm-5.3 (api_style=anthropic_messages): slow down");
+        assert!(RetryProvider::should_failover(&wrapped));
+        assert!(RetryProvider::is_retryable_error(&wrapped));
+
+        let server_error: eyre::Report =
+            LlmError::new(LlmErrorKind::ServerError { status: 503 }, "unavailable").into();
+        let wrapped = server_error
+            .wrap_err("all lanes failed: a/b (api_style=openai_chat_completions): unavailable");
+        assert!(RetryProvider::should_failover(&wrapped));
+        assert!(RetryProvider::is_retryable_error(&wrapped));
+
+        let filtered: eyre::Report = LlmError::new(LlmErrorKind::ContentFiltered, "blocked").into();
+        let wrapped = filtered.wrap_err("lane failed: a/b (api_style=anthropic_messages): blocked");
+        assert!(!RetryProvider::should_failover(&wrapped));
     }
 }

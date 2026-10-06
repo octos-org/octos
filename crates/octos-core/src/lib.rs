@@ -7,6 +7,7 @@
 //! - Context and result types
 
 pub mod abort;
+pub mod agent_repo_git;
 pub mod app_ui;
 pub mod app_ui_codec;
 pub mod env_hygiene;
@@ -14,6 +15,7 @@ mod error;
 pub mod gateway;
 pub mod git_worktree;
 mod message;
+pub mod secret_redaction;
 pub mod session_scope;
 mod task;
 mod types;
@@ -35,9 +37,9 @@ pub use git_worktree::{
 pub use message::AgentMessage;
 pub use session_scope::{
     DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES, MULTI_TENANT_USERS_DIR_NAME,
-    MULTI_TENANT_WORKSPACE_DIR_NAME, PathClassification, SESSION_SCOPE_SCHEMA_VERSION, ScopeMode,
-    SessionScope, SessionScopeError, canonical_root_lossy, canonicalize_lossy,
-    canonicalize_skill_read_zones, is_safe_session_id,
+    MULTI_TENANT_WORKSPACE_DIR_NAME, PathClassification, ReadOnlyView,
+    SESSION_SCOPE_SCHEMA_VERSION, ScopeMode, SessionScope, SessionScopeError, canonical_root_lossy,
+    canonicalize_lossy, canonicalize_skill_read_zones, is_safe_session_id,
 };
 pub use task::{
     DecisionRecord, FileRecord, SESSION_SUMMARY_SCHEMA_VERSION, STALE_DECISION_PREFIX,
@@ -50,6 +52,6 @@ pub use types::{
 };
 pub use ui_protocol::{EventEnvelope, TurnContext};
 pub use utils::{
-    SAFE_FILENAME_MAX_BYTES, safe_filename, tool_output_limit, truncate_head_tail, truncate_utf8,
-    truncated_utf8,
+    SAFE_FILENAME_MAX_BYTES, TruncatedBy, TruncationReport, safe_filename, tool_output_limit,
+    truncate_head_tail, truncate_head_tail_report, truncate_utf8, truncated_utf8,
 };

@@ -49,8 +49,32 @@ const FLEET_BOOT_RECONCILE_MAX_ATTEMPTS: u32 = 3;
 /// yields real isolation.
 ///
 /// [`NoSandbox`]: octos_agent::sandbox::NoSandbox
+/// Default idle lifetime of a cached per-session runtime (30 minutes).
+const SESSION_CACHE_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Idle lifetime of a cached per-session runtime.
+///
+/// `OCTOS_SESSION_CACHE_IDLE_TTL_SECS` overrides it (minimum 1 s; a malformed
+/// or zero value keeps the default). Rebuilding an evicted runtime is correct
+/// but slow for a long session, so an operator on a big box may want it
+/// longer; tests want it short.
+fn session_cache_idle_ttl() -> std::time::Duration {
+    std::env::var("OCTOS_SESSION_CACHE_IDLE_TTL_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(SESSION_CACHE_IDLE_TTL, std::time::Duration::from_secs)
+}
+
 fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
-    !octos_agent::sandbox::create_sandbox(sandbox_cfg).is_noop()
+    let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
+    // A refusing resolution (explicit mode unhonorable on this host, or
+    // sandbox.fail_closed with no backend) is fail-closed but useless to a
+    // pool: every worker command would refuse. Treat it like a missing
+    // backend — the pool is not installed — matching the pre-refusal
+    // behaviour where these configs resolved to `NoSandbox` and were caught
+    // by `is_noop()`.
+    !sandbox.is_noop() && sandbox.refusal().is_none()
 }
 
 /// Whether the resolved sandbox backend can grant a `FsGrant::Host` worker FULL
@@ -326,6 +350,27 @@ pub struct ServeCommand {
     #[arg(long)]
     pub stdio: bool,
 
+    /// Run as the loopback server of an embedding host (an app shell), which
+    /// owns this process: the host writes the host token and an optional
+    /// external-client token (an allowlist of UI Protocol methods only) as
+    /// the first two lines of stdin, never the environment; requests must
+    /// name the loopback
+    /// listener in `Host`, only configured browser origins are trusted,
+    /// pairing is off until the host enables it, profiles run in this
+    /// process, and the server stops when stdin reaches EOF. Requires
+    /// `--host 127.0.0.1` and a Local deployment. See
+    /// `docs/HOST_MANAGED_SERVE.md`.
+    #[arg(long, conflicts_with_all = ["stdio", "solo", "auth_token", "danger_full_access", "web_url"])]
+    #[serde(default)]
+    pub host_managed: bool,
+
+    /// With `--host-managed` on Unix: serve on the listening TCP socket the
+    /// host passed as this inherited descriptor (bound to 127.0.0.1) instead
+    /// of binding `--port`, so the host keeps the port across restarts.
+    #[arg(long, value_name = "FD", requires = "host_managed")]
+    #[serde(default)]
+    pub listen_fd: Option<i32>,
+
     /// Working directory (defaults to current directory).
     #[arg(short, long)]
     pub cwd: Option<PathBuf>,
@@ -359,16 +404,28 @@ pub struct ServeCommand {
     #[arg(long)]
     pub model: Option<String>,
 
-    /// Auth token for API access (overrides config).
+    /// Auth token for API access (overrides config). Visible in the process
+    /// list (`ps`) — prefer the OCTOS_AUTH_TOKEN env var or the config file.
     #[arg(long)]
     pub auth_token: Option<String>,
+
+    /// Origin of the web client to build the one-time pairing link from
+    /// (WEB-PAIRING-CONTRACT-5100), e.g. `https://app.example.com`. When set
+    /// and valid, startup prints ONE ready link:
+    /// `Open the web client: <client-origin>/?octos=<server-origin>&pair=<code>`.
+    /// Without the flag — or with a value that is not an http(s) URL — the
+    /// server still starts and prints the origin and the code as two
+    /// labelled lines instead of a broken link.
+    #[arg(long, value_name = "URL")]
+    pub web_url: Option<String>,
 
     /// Enable the no-password "solo" login (`POST /api/auth/solo*`) for a
     /// local single-user install. OFF by default. Only honoured for direct
     /// loopback requests on a Local-mode host with profile/user stores, and
     /// never when the request carries reverse-proxy headers. Also settable
-    /// via `OCTOS_SOLO_LOGIN=1`. Do NOT set on a host fronted by a reverse
-    /// proxy (e.g. the Caddy-fronted fleet) — see `api::solo_auth`.
+    /// via `OCTOS_SOLO_LOGIN=1`. In Local mode profiles run in this process;
+    /// per-profile gateways are not auto-started. Do NOT set on a host fronted by a
+    /// reverse proxy (e.g. the Caddy-fronted fleet) — see `api::solo_auth`.
     #[arg(long)]
     pub solo: bool,
 
@@ -432,20 +489,194 @@ pub struct ServeCommand {
     pub swarm_backend_url: Option<String>,
 }
 
-/// Wire a `task_query_store` for `octos serve --stdio` (the in-process
-/// AppUI/TUI deployment); leave it `None` for HTTP/gateway serve.
+/// Wire a `task_query_store` when AppUI sessions run in this process: stdio
+/// and local solo HTTP. Leave it `None` when HTTP serve proxies to gateways.
 ///
-/// `--stdio` runs session turns in *this* process with no gateway to proxy
+/// These modes run session turns in *this* process with no gateway to proxy
 /// `task/cancel` to. The per-turn `tool_registry.supervisor()` self-registers
 /// into this store (see `ui_protocol.rs`, the `store.register(..)` guarded on
 /// `task_query_store.is_some()`, holding a `Weak<TaskSupervisor>` so it prunes
 /// at end of turn), which lets `handle_task_cancel` reach the live supervisor
 /// and actually cancel a running `spawn_only` background task. Without it the
 /// AppUI task commands fail `runtime_unavailable` ("task supervisor not wired
-/// for AppUI task commands"). HTTP/gateway serve must stay `None` so
-/// `handle_task_cancel` keeps proxying to the gateway via `resolve_api_port`.
-fn stdio_task_query_store(stdio: bool) -> Option<crate::session_actor::SessionTaskQueryStore> {
-    stdio.then(crate::session_actor::SessionTaskQueryStore::default)
+/// for AppUI task commands"). Gateway HTTP serve must stay `None` so
+/// `handle_task_cancel` keeps proxying via `resolve_api_port`.
+fn in_process_task_query_store(
+    in_process: bool,
+) -> Option<crate::session_actor::SessionTaskQueryStore> {
+    in_process.then(crate::session_actor::SessionTaskQueryStore::default)
+}
+
+/// Where the effective dashboard bearer token came from. #2371: the argv
+/// source leaks the token to every local process via `ps`, so it earns a
+/// one-time warning at the call site; the env/config sources do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthTokenSource {
+    Argv,
+    Env,
+    Config,
+}
+
+/// Resolve the operator-supplied auth token with the documented precedence
+/// `--auth-token` > `OCTOS_AUTH_TOKEN` > config `auth_token` (an empty
+/// config token counts as absent). `None` means no operator source produced
+/// a token — the caller then auto-generates one for non-loopback binds.
+fn resolve_auth_token(
+    argv: Option<String>,
+    env: Option<String>,
+    config: Option<&str>,
+) -> Option<(String, AuthTokenSource)> {
+    if let Some(token) = argv {
+        return Some((token, AuthTokenSource::Argv));
+    }
+    if let Some(token) = env {
+        return Some((token, AuthTokenSource::Env));
+    }
+    match config {
+        Some(token) if !token.is_empty() => Some((token.to_string(), AuthTokenSource::Config)),
+        _ => None,
+    }
+}
+
+/// Validate `--host-managed`'s invariants and return `(host token, external
+/// token)`. Loopback IPv4 only (the `Host` allowlist and the listener agree),
+/// Local mode, and a host token from the environment.
+fn host_managed_preflight(
+    host: &str,
+    mode: &crate::config::DeploymentMode,
+    host_token: Option<String>,
+    external_token: Option<String>,
+) -> Result<(String, Option<String>)> {
+    use crate::api::host_managed::{EXTERNAL_TOKEN_ENV, HOST_TOKEN_ENV};
+    eyre::ensure!(
+        host == "127.0.0.1",
+        "--host-managed binds 127.0.0.1 only (got --host {host})"
+    );
+    eyre::ensure!(
+        *mode == crate::config::DeploymentMode::Local,
+        "--host-managed requires a Local deployment"
+    );
+    let host_token = host_token
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| eyre::eyre!("--host-managed requires {HOST_TOKEN_ENV}"))?;
+    let external_token = external_token.filter(|token| !token.is_empty());
+    // Same validation HostManaged::new applies, early and without a port.
+    crate::api::host_managed::HostManaged::new(host_token.clone(), external_token.clone(), 1)
+        .wrap_err_with(|| format!("invalid {HOST_TOKEN_ENV} or {EXTERNAL_TOKEN_ENV}"))?;
+    Ok((host_token, external_token))
+}
+
+/// How long the serve keeps draining in-flight connections after the stop
+/// signal before it stops waiting and proceeds to `stop_all()` + exit anyway.
+/// Axum's graceful shutdown waits for open connections, and an SSE stream
+/// (`GET /api/events/harness`) never ends on its own — without a cap a
+/// `systemctl stop` would hang until `TimeoutStopSec` escalates to SIGKILL,
+/// skipping `stop_all()` and orphaning the gateways exactly like the pre-fix
+/// #2086 behavior.
+const SERVE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Install the HTTP serve's stop-signal handlers EARLY — before the gateway
+/// auto-start loop — and return the watch half the graceful-shutdown future
+/// will await.
+///
+/// Registration must precede auto-start: each enabled profile spends ~2s in
+/// its gateway startup health check before the loop moves on, so with the
+/// handlers installed only inside `axum::serve`'s shutdown future there is a
+/// N×2s window (right when a restarting supervisor sends its SIGTERM) in
+/// which the signal still hits the OS default disposition — the exact #2086
+/// orphaning this fix targets. A dedicated watcher task owns the signal
+/// listeners and latches the first one into the watch channel; because the
+/// channel is stateful, a signal that arrives before `axum::serve` starts
+/// polling its shutdown future is not lost — the future observes it on its
+/// first poll.
+///
+/// On Unix this catches SIGINT (ctrl-c) and SIGTERM — the signal
+/// `pkill`/`systemctl stop`/supervisors send. Off Unix only ctrl-c exists.
+/// If the SIGTERM listener cannot be installed the watcher degrades to
+/// ctrl-c-only with a warning instead of panicking: a panic here would
+/// unwind nowhere near `stop_all()` and reintroduce the orphaning the
+/// handler exists to prevent.
+///
+/// The SIGTERM listener is registered synchronously, before the watcher
+/// task spawns: tokio installs the handler only when `signal()` runs, and a
+/// spawned task is not polled until the runtime yields — deferring
+/// registration into the task would leave a window in which the caller has
+/// already spawned the first gateway while SIGTERM is still on the OS
+/// default disposition. Once the first signal latches the watcher task
+/// ends, but tokio keeps the handler installed for the process lifetime, so
+/// a second signal during the bounded drain is captured-but-unobserved: it
+/// cannot kill the serve before `stop_all()` runs.
+fn spawn_serve_shutdown_signal_watcher(
+    shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
+) -> tokio::sync::watch::Receiver<bool> {
+    // One channel for every stop request: this watcher (SIGINT/SIGTERM) and
+    // the `server/shutdown` UI Protocol method hold the same sender, so a stop
+    // from a client takes exactly the drain path a signal takes.
+    let shutdown_rx = shutdown_tx.subscribe();
+    #[cfg(unix)]
+    let sigterm = {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(sigterm) => Some(sigterm),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to install SIGTERM handler; serving until ctrl-c"
+                );
+                None
+            }
+        }
+    };
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            match sigterm {
+                Some(mut sigterm) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = sigterm.recv() => {}
+                    }
+                }
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        shutdown_tx.send_replace(true);
+    });
+    shutdown_rx
+}
+
+/// The graceful-shutdown future: resolve once the early-registered watcher
+/// (see `spawn_serve_shutdown_signal_watcher`) latched a stop signal.
+async fn serve_shutdown_signal(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    // The watcher may already have fired (signal arrived during auto-start,
+    // before this future was first polled) — borrow first so a latched true
+    // resolves immediately instead of waiting for another change.
+    if !*shutdown_rx.borrow() {
+        let _ = shutdown_rx.changed().await;
+    }
+    let _ = super::serve_console::print_stdout("");
+    let _ = super::serve_console::print_stdout(&format!("{}", "Shutting down server...".yellow()));
+}
+
+/// Resolve `grace` after the stop signal latches — the drain cap the serve
+/// loop races against. Waiting for the latch FIRST matters: wrapping
+/// `axum::serve` in a plain `tokio::time::timeout(grace, ..)` would start
+/// the clock when the serve future is first polled and kill a healthy,
+/// signal-free serve once the grace period passes.
+async fn shutdown_drain_deadline(
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    grace: std::time::Duration,
+) {
+    if !*shutdown_rx.borrow() {
+        let _ = shutdown_rx.changed().await;
+    }
+    tokio::time::sleep(grace).await;
 }
 
 /// Bind the HTTP listener before constructing `AppState`.
@@ -465,12 +696,48 @@ async fn bind_http_listener(
 
     let listener = tokio::net::TcpListener::bind((host, requested_port))
         .await
-        .wrap_err_with(|| format!("failed to bind octos API server to {host}:{requested_port}"))?;
+        .map_err(|error| bind_listener_error(host, requested_port, error))?;
     let actual_port = listener
         .local_addr()
         .wrap_err("failed to inspect bound octos API listener")?
         .port();
     Ok((Some(listener), actual_port))
+}
+
+/// Wrap a listener bind failure. An occupied port gets the remediation the
+/// data-dir lock error already sets the bar for (#2385): how to find the
+/// holder and the `--port` escape hatch. Every other failure keeps the bare
+/// wrap — the io error stays as the `Caused by:` source either way.
+fn bind_listener_error(host: &str, requested_port: u16, error: std::io::Error) -> eyre::Report {
+    let target = format!("{host}:{requested_port}");
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        eyre::Report::new(error).wrap_err(format!(
+            "failed to bind octos API server to {target}: the port is already in use. \
+             Find the holder with `{}`, or pass `--port` to choose another.",
+            port_holder_hint(requested_port)
+        ))
+    } else {
+        eyre::Report::new(error).wrap_err(format!("failed to bind octos API server to {target}"))
+    }
+}
+
+/// Platform-appropriate command for finding which process holds `port`
+/// (the issue's "or your platform equivalent").
+#[cfg(target_os = "linux")]
+fn port_holder_hint(port: u16) -> String {
+    // iproute2's `ss` ships with the base system on essentially every distro
+    // (minimal container images included); `lsof` frequently does not.
+    format!("ss -ltnp 'sport = :{port}'")
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn port_holder_hint(port: u16) -> String {
+    format!("lsof -i :{port}")
+}
+
+#[cfg(windows)]
+fn port_holder_hint(port: u16) -> String {
+    format!("netstat -ano | findstr :{port}")
 }
 
 /// Stable, machine-greppable marker embedded in the "data directory is already
@@ -482,6 +749,23 @@ async fn bind_http_listener(
 /// client matches it verbatim (octoscode `transport.rs` DATA_DIR_LOCKED_MARKER).
 pub(crate) const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
 
+/// Contention on the serve lock is not always a second long-lived serve: the
+/// goal operator CLI holds the same lock across an ms-scale offline append
+/// (#2181), and a serve (re)spawned inside that window must not be refused
+/// with the marker — octoscode STOPS relaunching on it, so a transient
+/// conflict would permanently kill the session until manual intervention
+/// (#2357). Wait out transient holders on this bounded budget before emitting
+/// the marker. A genuinely running serve holds the lock for its whole
+/// lifetime, so the refusal contract (and the greppable marker) is unchanged —
+/// only delayed by at most this budget in the true-conflict case. The budget
+/// assumes the goal CLI's offline hold stays well under it; its append can
+/// fsync a snapshot compaction, so this is a heuristic bound, not a guarantee.
+const SERVE_LOCK_CONTENTION_RETRY_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(2_000);
+/// Poll step for the contention retry: small next to the budget so a
+/// transient release is picked up promptly.
+const SERVE_LOCK_CONTENTION_RETRY_STEP: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Held for the serve process's whole lifetime: an exclusive OS advisory lock
 /// (flock / LockFileEx via `fs2`) on `<data_dir>/.octos-serve.lock`. redb is
 /// single-writer-single-process, so two `octos serve` against one data dir can
@@ -489,18 +773,33 @@ pub(crate) const DATA_DIR_LOCKED_MARKER: &str = "OCTOS_DATA_DIR_LOCKED";
 /// data-dir-level redb store (`admin_audit.redb`) with `DatabaseAlreadyOpen`,
 /// which a stdio client silently respawned in a loop. Taking this lock BEFORE
 /// any store open turns that into one clean, greppable refusal. The lock is
-/// released on process exit (fd close), so a legitimate relaunch AFTER the
-/// previous serve has exited acquires it cleanly (no stale-lock hazard).
+/// released explicitly when the guard drops, so a forked child's temporary
+/// duplicate descriptor cannot prolong ownership after normal serve shutdown.
+/// Closing the final descriptor also releases it on abrupt process exit.
 struct ServeDataDirLock {
     _file: std::fs::File,
 }
 
-/// Acquire the serve single-writer lock for `data_dir`, or return a clear error
-/// carrying [`DATA_DIR_LOCKED_MARKER`] when another serve already holds it.
-/// Contention is detected structurally via the platform's canonical
-/// lock-contended errno (`fs2::lock_contended_error`), never string matching.
-/// Fully-qualified `fs2::FileExt` calls: std 1.89 grew inherent methods of the
-/// same names and the workspace MSRV is 1.85.
+impl Drop for ServeDataDirLock {
+    fn drop(&mut self) {
+        // Unix flock follows the shared open file description, not this one
+        // descriptor. Close-on-exec still leaves a fork-to-exec window where a
+        // child holds a reference. The guard owns the lock lifetime; explicitly
+        // end it before File::drop closes our descriptor. This guard is never
+        // cloned, and remains alive until the serve's stores have shut down.
+        if let Err(error) = fs2::FileExt::unlock(&self._file) {
+            tracing::warn!(%error, "failed to release serve single-writer lock");
+        }
+    }
+}
+
+/// Acquire the serve single-writer lock for `data_dir`, or return a clear
+/// error carrying [`DATA_DIR_LOCKED_MARKER`] when another serve still holds it
+/// after [`SERVE_LOCK_CONTENTION_RETRY_BUDGET`] of waiting out a transient
+/// holder (#2357). Contention is detected structurally via the platform's
+/// canonical lock-contended errno (`fs2::lock_contended_error`), never string
+/// matching. Fully-qualified `fs2::FileExt` calls: std 1.89 grew inherent
+/// methods of the same names and the workspace MSRV is 1.85.
 fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDirLock> {
     std::fs::create_dir_all(data_dir)
         .wrap_err_with(|| format!("failed to create data dir: {}", data_dir.display()))?;
@@ -511,30 +810,48 @@ fn acquire_serve_data_dir_lock(data_dir: &std::path::Path) -> Result<ServeDataDi
         .truncate(false)
         .open(&lock_path)
         .wrap_err_with(|| format!("failed to open serve lockfile: {}", lock_path.display()))?;
-    match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(ServeDataDirLock { _file: file }),
-        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-            Err(eyre::eyre!(
-                "{DATA_DIR_LOCKED_MARKER}: another octos server is already running for this data \
-                 directory ({}). Close the other octoscode (or `octos serve`), or start this one \
-                 against a different --data-dir.",
-                data_dir.display()
-            ))
+    let deadline = std::time::Instant::now() + SERVE_LOCK_CONTENTION_RETRY_BUDGET;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(ServeDataDirLock { _file: file }),
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(eyre::eyre!(
+                        "{DATA_DIR_LOCKED_MARKER}: another octos server is already running for \
+                         this data directory ({}). Close the other octoscode (or `octos serve`), \
+                         or start this one against a different --data-dir.",
+                        data_dir.display()
+                    ));
+                }
+                std::thread::sleep(SERVE_LOCK_CONTENTION_RETRY_STEP.min(deadline - now));
+            }
+            Err(error) => {
+                return Err(eyre::Report::new(error).wrap_err(format!(
+                    "failed to acquire serve single-writer lock: {}",
+                    lock_path.display()
+                )));
+            }
         }
-        Err(error) => Err(eyre::Report::new(error).wrap_err(format!(
-            "failed to acquire serve single-writer lock: {}",
-            lock_path.display()
-        ))),
     }
 }
 
 impl Executable for ServeCommand {
     fn execute(self) -> Result<()> {
-        tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
+            // Serve runs agent turns, skill actions and profile bootstraps on
+            // its workers; give them the same 8 MiB the chat/acp/mcp runtimes
+            // use for deep agent futures (debug builds overflowed 2 MiB).
+            .thread_stack_size(8 * 1024 * 1024)
             .build()
-            .wrap_err("failed to create tokio runtime")?
-            .block_on(self.run_async())
+            .wrap_err("failed to create tokio runtime")?;
+        let result = runtime.block_on(self.run_async());
+        // Background tasks (including blocking stdin watchers) must not hold
+        // the CLI open after gateway cleanup. Return to main so its tracing
+        // guard flushes shutdown records before the process exits.
+        runtime.shutdown_background();
+        result
     }
 }
 
@@ -592,11 +909,15 @@ impl ServeCommand {
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
 
         // Single-writer guard: redb is single-process, so a second `octos serve`
-        // on this data dir can't coexist. Fail FAST here with one clean,
+        // on this data dir can't coexist. Fail here with one clean,
         // client-greppable refusal instead of crashing mid-startup opening
         // `admin_audit.redb` (which a stdio client silently respawned in a
-        // ~5s loop). Held for the whole process via `_data_dir_lock`; released
-        // on exit so a relaunch after the prior serve quits still starts.
+        // ~5s loop). Transient contention (the goal operator CLI's ms-scale
+        // offline-append hold, #2181) is first waited out on a short budget
+        // (#2357): octoscode stops relaunching on the marker, so a transient
+        // conflict must never produce one. Held for the whole process via
+        // `_data_dir_lock`; released on exit so a relaunch after the prior
+        // serve quits still starts.
         let _data_dir_lock = match acquire_serve_data_dir_lock(&data_dir) {
             Ok(guard) => guard,
             Err(error) => {
@@ -604,11 +925,11 @@ impl ServeCommand {
                     // A guaranteed clean, un-colored stderr line the octoscode
                     // client greps on child-exit (color-eyre's rendering of the
                     // returned error may interleave ANSI, so don't rely on it).
-                    eprintln!(
+                    let _ = super::serve_console::print_stderr(&format!(
                         "{DATA_DIR_LOCKED_MARKER}: another octos server already owns data \
                          directory {}",
                         data_dir.display()
-                    );
+                    ));
                 }
                 return Err(error);
             }
@@ -768,17 +1089,54 @@ impl ServeCommand {
         let metrics_handle = Some(init_metrics());
 
         // Security: warn if binding to non-localhost without auth token
-        // Check CLI arg, then OCTOS_AUTH_TOKEN env var
-        let auth_token = if self.auth_token.is_some() {
-            self.auth_token
-        } else if let Ok(env_token) = std::env::var("OCTOS_AUTH_TOKEN") {
-            Some(env_token)
-        } else if let Some(ref cfg_token) = config.auth_token {
-            if !cfg_token.is_empty() {
-                Some(cfg_token.clone())
-            } else {
-                None
+        // Precedence: CLI arg, then OCTOS_AUTH_TOKEN env var, then config
+        // `--host-managed`: validate the mode before anything binds, spawns
+        // or opens stores. The host token comes from the environment only.
+        let host_managed_tokens = if self.host_managed {
+            // Linux/Android: SIGTERM when the host dies (a no-op elsewhere).
+            crate::api::host_managed::bind_to_parent()?;
+            // The tokens arrive on stdin, never in the environment, which any
+            // process of this user (on Android: this app's own tools) can
+            // read from /proc/<pid>/environ.
+            for name in [
+                crate::api::host_managed::HOST_TOKEN_ENV,
+                crate::api::host_managed::EXTERNAL_TOKEN_ENV,
+            ] {
+                eyre::ensure!(
+                    std::env::var_os(name).is_none(),
+                    "--host-managed reads its tokens from stdin; unset {name}"
+                );
             }
+            let (host_token, external_token) = crate::api::host_managed::read_tokens_from_stdin(
+                std::io::stdin(),
+                std::time::Duration::from_secs(60),
+            )?;
+            Some(host_managed_preflight(
+                &self.host,
+                &config.mode,
+                host_token,
+                external_token,
+            )?)
+        } else {
+            None
+        };
+
+        let auth_token = if let Some((host_token, _)) = &host_managed_tokens {
+            Some(host_token.clone())
+        } else if let Some((token, source)) = resolve_auth_token(
+            self.auth_token.clone(),
+            std::env::var("OCTOS_AUTH_TOKEN").ok(),
+            config.auth_token.as_deref(),
+        ) {
+            if source == AuthTokenSource::Argv {
+                // #2371: argv is readable by any local process via `ps`;
+                // steer operators to the env var or the config file.
+                tracing::warn!(
+                    "--auth-token exposes the bearer token in the process list (ps); \
+                     prefer the OCTOS_AUTH_TOKEN env var or the config file"
+                );
+            }
+            Some(token)
         } else if self.host != "127.0.0.1" && self.host != "localhost" && self.host != "::1" {
             tracing::warn!(
                 "Binding to {} without --auth-token is dangerous! \
@@ -811,6 +1169,15 @@ impl ServeCommand {
             crate::profiles::ProfileStore::open(&state_home, &data_dir)
                 .wrap_err("failed to open profile store")?,
         );
+        // Operator goal transitions must serialize with the live
+        // orchestrator. The data-dir serve lock tells the CLI whether this
+        // endpoint is mandatory; a missing endpoint while the lock is held is
+        // therefore a fail-closed old-version/startup condition, never an
+        // excuse to append an offline snapshot behind the live cache.
+        #[cfg(unix)]
+        let _goal_operator_control =
+            crate::commands::goal::spawn_goal_operator_control(&data_dir, profile_store.clone())
+                .wrap_err("failed to start local goal operator-control RPC")?;
 
         // M11-F regression fix REG-4: bootstrap bundled app-skills
         // (`crates/app-skills/`) and platform-skills (`crates/platform-
@@ -904,6 +1271,17 @@ impl ServeCommand {
                         model = %rt.primary_model_id,
                         tools = rt.tool_specs.specs().len(),
                         "ProfileRuntime bootstrapped for /api/chat",
+                    );
+                    // Outer-loop #4 (§4.1/§7.2): install this profile's
+                    // build-cache pool config so `stage_peer` can acquire a
+                    // first-turn slot under `<data_dir>/build-cache/…`.
+                    // Absent `[build_cache]` uses pool defaults. Only roots
+                    // absent from the process side-table have no pool.
+                    // Same key derivation as every release site
+                    // (`<data_dir>/peers`), so acquire/release always agree.
+                    crate::peers::set_build_cache_config(
+                        &rt.data_dir.join("peers"),
+                        Some(profile.config.build_cache.clone().unwrap_or_default()),
                     );
                     profile_runtimes.insert(profile.id.clone(), rt);
                 }
@@ -1154,21 +1532,81 @@ impl ServeCommand {
         }
 
         let session_cache = Arc::new(
-            crate::runtime::SessionRuntimeCache::new(64, std::time::Duration::from_secs(1800))
+            crate::runtime::SessionRuntimeCache::new(64, session_cache_idle_ttl())
                 // Per-project session storage (opt-in, default off). When set,
                 // a cwd-hinted AppUi session's transcript store relocates to
                 // `<cwd>/.octos`; no-hint/gateway sessions are unaffected.
                 .with_sessions_in_cwd(config.appui.sessions_in_cwd),
         );
 
-        let (http_listener, effective_serve_port) =
-            bind_http_listener(self.stdio, &self.host, self.port).await?;
+        let (http_listener, effective_serve_port) = match self.listen_fd {
+            Some(fd) => {
+                let listener = crate::api::host_managed::adopt_listener_fd(fd)?;
+                let port = listener
+                    .local_addr()
+                    .wrap_err("failed to inspect the inherited listener")?
+                    .port();
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .wrap_err("failed to adopt the inherited listener")?;
+                (Some(listener), port)
+            }
+            None => bind_http_listener(self.stdio, &self.host, self.port).await?,
+        };
+        let host_managed = match host_managed_tokens {
+            Some((host_token, external_token)) => {
+                Some(Arc::new(crate::api::host_managed::HostManaged::new(
+                    host_token,
+                    external_token,
+                    effective_serve_port,
+                )?))
+            }
+            None => None,
+        };
+
+        // WEB-PAIRING-CONTRACT-5100 — mint ONE pairing code per process
+        // start, against the REAL bound port (so `--port 0` pairs too). Only
+        // for an HTTP serve: `--stdio` binds no listener, so it exposes no
+        // `/pair/*` surface and the state stays `None`. The code lives in
+        // memory for this process only and is NEVER handed to `tracing`.
+        // A host-managed server mints none at startup: its host enables a
+        // code for the EXTERNAL token on demand (`/api/admin/host/pairing`).
+        let pairing = (!self.stdio && !self.host_managed).then(|| {
+            Arc::new(crate::api::pairing::PairingState::mint(
+                format!("http://127.0.0.1:{effective_serve_port}"),
+                auth_token.clone(),
+            ))
+        });
+
+        // Solo AppUI sessions use this serve process's ProfileRuntime. A
+        // gateway for the same profile would open its episodes.redb again and
+        // lock session/open out of the profile after onboarding. Stdio serve
+        // already has no gateway auto-start; keep HTTP solo consistent.
+        //
+        // `--host-managed` never enables solo login (not even through
+        // `OCTOS_SOLO_LOGIN`) but also runs its profiles in this process.
+        let solo_login_enabled_flag = !self.host_managed
+            && (self.solo
+                || std::env::var("OCTOS_SOLO_LOGIN")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false));
+        let solo_in_process = (solo_login_enabled_flag || self.host_managed)
+            && config.mode == crate::config::DeploymentMode::Local;
 
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
+                .with_solo_in_process(solo_in_process)
                 .with_bridge_js(bridge_js_path)
-                .with_serve_config(effective_serve_port, auth_token.clone())
+                // Host-managed: gateways never start, and the host token
+                // stays out of every child's reach.
+                .with_serve_config(
+                    effective_serve_port,
+                    if self.host_managed {
+                        None
+                    } else {
+                        auth_token.clone()
+                    },
+                )
                 // Section B (codex review round-5 P1.2): every spawned
                 // gateway inherits the host's strict-signing policy via
                 // an env var. `Config::from_file` OR-merges it onto the
@@ -1332,10 +1770,6 @@ impl ServeCommand {
             crate::api::DEFAULT_PREVIEW_SWEEP_INTERVAL,
         );
 
-        let solo_login_enabled_flag = self.solo
-            || std::env::var("OCTOS_SOLO_LOGIN")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
         let dangerous_default_permissions_flag = self.danger_full_access
             || std::env::var("OCTOS_DANGER_FULL_ACCESS")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1379,14 +1813,24 @@ impl ServeCommand {
                 eyre::bail!("OCTOS_APPUI_ALLOWED_ORIGINS must be valid Unicode")
             }
         };
+        // A host-managed server trusts only the configured origins: not even
+        // this listener's own loopback origins (it serves no host UI pages).
         let appui_allowed_origins = resolve_appui_allowed_origins(
             &config.appui.allowed_origins,
             appui_allowed_origins_env.as_deref(),
-            effective_serve_port,
+            if self.host_managed {
+                0
+            } else {
+                effective_serve_port
+            },
         )
         .wrap_err("invalid AppUI browser-origin configuration")?;
 
+        // The stop switch exists before AppState so the `server/shutdown`
+        // method and the signal watcher (installed further down) share it.
+        let serve_shutdown_tx = Arc::new(tokio::sync::watch::channel(false).0);
         let state = Arc::new(AppState {
+            ui_protocol: crate::api::UiProtocolRuntimeResources::default(),
             profiles: profile_runtimes,
             session_cache,
             profile_skill_mutation_locks: Arc::new(crate::api::ProfileSkillMutationLocks::new()),
@@ -1439,7 +1883,11 @@ impl ServeCommand {
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
             host_memory: config.memory.clone(),
+            pairing: pairing.clone(),
             solo_login_enabled: solo_login_enabled_flag,
+            host_managed: host_managed.clone(),
+            // Only the HTTP serve has a loop to stop; see AppState::serve_shutdown.
+            serve_shutdown: (!self.stdio).then(|| serve_shutdown_tx.clone()),
             dangerous_default_permissions: dangerous_default_permissions_flag,
             default_network_denied: default_network_denied_flag,
             llm_compaction: self.llm_compaction,
@@ -1461,15 +1909,10 @@ impl ServeCommand {
             harness_event_sink_path: harness_sink_init,
             credential_pool: credential_pool_init,
             content_classifier: content_classifier_init,
-            // HTTP/gateway serve: session actors live in gateway
-            // processes, so `task_query_store` stays `None` and the
-            // cancel/restart handlers proxy via `resolve_api_port` (the
-            // gateway runtime sets its own store on the embedded api
-            // channel). `--stdio` runs actors in-process with no gateway,
-            // so it wires an empty store the per-turn supervisor
-            // self-registers into — letting AppUI `task/cancel` reach live
-            // `spawn_only` tasks. See `stdio_task_query_store`.
-            task_query_store: stdio_task_query_store(self.stdio),
+            // Stdio and local solo HTTP run session actors in-process, so
+            // their supervisors self-register here. Non-solo HTTP keeps
+            // proxying task commands to each profile gateway.
+            task_query_store: in_process_task_query_store(self.stdio || solo_in_process),
             // Mirror the operator-configured Tier-2 default cwd so
             // `session_tool_registry` can distinguish "operator chose this
             // dir for sessions" from the boot fallback baked in by
@@ -1522,12 +1965,39 @@ impl ServeCommand {
         // it changes nothing about how or when the model is woken.
         crate::api::ui_protocol_transport::spawn_background_activity_sink(state.clone());
 
+        // #2080 — install the `monitor/expired` sink: the expiry transitions
+        // (reconcile sweep + watcher deadline) are connection-independent, so
+        // the sink and its ledger drain live here next to the human sink, for
+        // both `serve --stdio` and the HTTP serve. Ordering: the sweep that
+        // could expire a monitor is only reachable from the global drain
+        // spawned above, whose first tick is skipped — a boot-time reconcile
+        // before this install would drop frames (best-effort tap, trace-log
+        // only). Keep this install ahead of any future eager boot reconcile.
+        crate::api::ui_protocol_transport::spawn_monitor_expired_sink(state.clone());
+
         if self.stdio {
             crate::api::ui_protocol_transport::stdio_connection(state).await?;
             tracing::info!("stopping all gateway child processes");
             let _ = process_manager.stop_all().await;
             return Ok(());
         }
+
+        // Install the stop-signal watcher BEFORE the gateway auto-start loop:
+        // each profile's startup health check holds the loop for ~2s, and a
+        // SIGTERM arriving in that window (a restarting supervisor's pkill is
+        // exactly this) must already be caught, or it hits the OS default
+        // disposition and orphans every gateway (#2086). The stdio path above
+        // returns before this point and keeps its existing behavior — it
+        // spawns no gateways, so there is nothing to orphan.
+        let shutdown_rx = spawn_serve_shutdown_signal_watcher(serve_shutdown_tx.clone());
+        // `--host-managed`: the host owns the lifecycle. Its end of stdin
+        // closing (orderly stop, crash, kill) stops the server through the
+        // same drain path; `server/shutdown` is never offered to clients.
+        if self.host_managed {
+            crate::api::host_managed::spawn_stdin_eof_watcher(serve_shutdown_tx.clone());
+        }
+
+        let gateway_auto_start_enabled = !solo_in_process;
 
         // Auto-start enabled profiles
         let profiles = profile_store.list().unwrap_or_default();
@@ -1537,7 +2007,7 @@ impl ServeCommand {
             enabled = enabled_count,
             "loaded profiles"
         );
-        if enabled_count > 0 {
+        if gateway_auto_start_enabled && enabled_count > 0 {
             for p in &profiles {
                 if p.enabled {
                     if !p.config.has_llm_selection() {
@@ -1546,6 +2016,20 @@ impl ServeCommand {
                             "skipping auto-start: no LLM provider configured"
                         );
                         continue;
+                    }
+                    // A stop signal already latched must not START more
+                    // gateways: each `start()` spends ~2s in its startup
+                    // health check, so finishing the loop for every profile
+                    // would keep spawning children for N×2s after the
+                    // operator asked to stop — children `stop_all()` then
+                    // has to reap under the drain deadline. The in-flight
+                    // `start()` completes (it cannot be interrupted); the
+                    // loop just stops starting new ones.
+                    if *shutdown_rx.borrow() {
+                        tracing::info!(
+                            "stop signal latched during auto-start; skipping remaining gateways"
+                        );
+                        break;
                     }
                     tracing::info!(profile = %p.id, "auto-starting gateway");
                     if let Err(e) = process_manager.start(p).await {
@@ -1556,7 +2040,7 @@ impl ServeCommand {
         }
 
         // Profile file watcher: auto-restart gateways when profile JSON changes.
-        {
+        if gateway_auto_start_enabled {
             let ps = profile_store.clone();
             let pm = process_manager.clone();
             tokio::spawn(async move {
@@ -1770,46 +2254,92 @@ impl ServeCommand {
         tracing::info!(address = %addr, "octos API server starting");
         tracing::info!(app = %format!("http://{}/app/", addr), "web app available");
         tracing::info!(dashboard = %format!("http://{}/admin/", addr), "admin dashboard available");
-        if enabled_count > 0 {
+        if gateway_auto_start_enabled && enabled_count > 0 {
             tracing::info!(count = enabled_count, "gateway profiles auto-started");
         }
 
-        println!("{}", "octos API server".cyan().bold());
-        println!("{}: http://{}", "Listening".green(), addr);
-        println!("{}: http://{}/app/", "App".green(), addr);
-        println!("{}: http://{}/admin/", "Admin dashboard".green(), addr);
-        if enabled_count > 0 {
-            println!(
+        use super::serve_console;
+        let _ = serve_console::print_stdout(&format!("{}", "octos API server".cyan().bold()));
+        let _ = serve_console::print_stdout(&format!("{}: http://{}", "Listening".green(), addr));
+        let _ = serve_console::print_stdout(&format!("{}: http://{}/app/", "App".green(), addr));
+        let _ = serve_console::print_stdout(&format!(
+            "{}: http://{}/admin/",
+            "Admin dashboard".green(),
+            addr
+        ));
+        if gateway_auto_start_enabled && enabled_count > 0 {
+            let _ = serve_console::print_stdout(&format!(
                 "{}: {} profiles auto-started",
                 "Gateways".green(),
                 enabled_count
-            );
+            ));
         }
-        println!();
+        // WEB-PAIRING-CONTRACT-5100 — the pairing code reaches stdout HERE
+        // and nowhere else: no tracing call, at any level, ever sees it, so
+        // it cannot land in a log file the server writes. Printed verbatim
+        // (no ANSI) so the whole link is copy-pasteable.
+        if let Some(ref pairing) = pairing {
+            // An unusable `--web-url` is never fatal: warn once on stderr and
+            // fall through to the two labelled lines below.
+            if let Some(raw) = self.web_url.as_deref() {
+                if crate::api::pairing::validate_web_url(raw).is_none() {
+                    let _ = serve_console::print_stderr(&format!(
+                        "{}: --web-url must be an http(s) URL; printing the origin and code instead",
+                        "warning".yellow()
+                    ));
+                }
+            }
+            for line in crate::api::pairing::pairing_startup_lines(
+                self.web_url.as_deref(),
+                pairing.server_origin(),
+                &pairing.printed_code(),
+            ) {
+                let _ = serve_console::print_stdout(&line);
+            }
+        }
+        let _ = serve_console::print_stdout("");
 
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            println!();
-            println!("{}", "Shutting down server...".yellow());
-        })
-        .await?;
+        // Cap the drain: after the stop signal axum waits for in-flight
+        // connections, and an SSE stream never closes on its own. Past the
+        // cap we proceed to stop_all() + runtime shutdown anyway — better to cut a
+        // long-lived stream than to let the supervisor SIGKILL us with the
+        // gateways still running (#2086).
+        // Both arms funnel into the gateway cleanup below: a serve-loop
+        // error must not `?`-return past `stop_all()` (that would orphan
+        // the gateways it spawned), so log it, reap the children, and
+        // reflect it in the exit code instead.
+        let serve_result = tokio::select! {
+            result = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(serve_shutdown_signal(shutdown_rx.clone())) => result,
+
+            _ = shutdown_drain_deadline(shutdown_rx, SERVE_SHUTDOWN_GRACE) => {
+                tracing::warn!(
+                    grace_secs = SERVE_SHUTDOWN_GRACE.as_secs(),
+                    "shutdown grace period expired with connections still open; stopping gateways anyway"
+                );
+                Ok(())
+            }
+        };
+        if let Err(e) = &serve_result {
+            tracing::error!(error = %e, "HTTP serve loop failed; stopping gateways before exit");
+        }
 
         // Stop all gateway child processes before exiting
         tracing::info!("stopping all gateway child processes");
-        println!("{}", "Stopping gateways...".yellow());
+        let _ = serve_console::print_stdout(&format!("{}", "Stopping gateways...".yellow()));
         let stopped = process_manager.stop_all().await;
         if stopped > 0 {
             tracing::info!(count = stopped, "gateways stopped");
-            println!("  stopped {} gateway(s)", stopped);
+            let _ = serve_console::print_stdout(&format!("  stopped {} gateway(s)", stopped));
         }
 
-        // Force exit — background tokio tasks (profile watcher, auth cleanup,
-        // admin bot) have no shutdown signal and would hang indefinitely.
-        std::process::exit(0);
+        // execute() shuts the runtime down without waiting for background
+        // tasks. Returning lets main drop the asynchronous log writer's
+        // guard; process::exit would discard the queued cleanup records.
+        serve_result.wrap_err("HTTP serve loop failed")
     }
 
     /// F-010: construct an `Option<Arc<SwarmState>>` from the
@@ -1933,9 +2463,9 @@ impl ServeCommand {
         //   `ProfileRuntime::bootstrap`) AND swarm dispatch.
         // - `block_injection_env_vars: true`: adds `LD_PRELOAD`,
         //   `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`, ... to the env
-        //   denylist so a contract carrying those keys fails closed
-        //   even if the underlying backend's own env handling were to
-        //   regress.
+        //   denylist so a contract carrying those keys — or a backend
+        //   configured to set them (#1601) — fails closed even if the
+        //   underlying backend's own env handling were to regress.
         //
         // Approval bridge, sandbox-required, manifest env allowlists,
         // and per-skill gates are **not** wired here — they are
@@ -1965,6 +2495,233 @@ mod tests {
     use super::*;
 
     #[test]
+    fn should_prefer_argv_auth_token_and_report_its_source() {
+        // #2371: precedence is argv > env > config, and the source must be
+        // reported so the serve can warn when the token arrives via the
+        // process list.
+        let resolved = resolve_auth_token(
+            Some("argv-token".to_string()),
+            Some("env-token".to_string()),
+            Some("config-token"),
+        );
+        assert_eq!(
+            resolved,
+            Some(("argv-token".to_string(), AuthTokenSource::Argv))
+        );
+    }
+
+    #[test]
+    fn should_require_loopback_local_mode_and_a_host_token_when_host_managed() {
+        use crate::config::DeploymentMode;
+        let host = "h".repeat(40);
+        let external = "e".repeat(40);
+        let ok = host_managed_preflight(
+            "127.0.0.1",
+            &DeploymentMode::Local,
+            Some(host.clone()),
+            Some(external.clone()),
+        )
+        .unwrap();
+        assert_eq!(ok, (host.clone(), Some(external)));
+        // No external token: host-only (external clients disabled).
+        assert_eq!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Local,
+                Some(host.clone()),
+                Some(String::new())
+            )
+            .unwrap()
+            .1,
+            None
+        );
+        for bad_host in ["0.0.0.0", "::1", "localhost", "192.168.1.2"] {
+            assert!(
+                host_managed_preflight(bad_host, &DeploymentMode::Local, Some(host.clone()), None)
+                    .is_err(),
+                "{bad_host}"
+            );
+        }
+        assert!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Cloud,
+                Some(host.clone()),
+                None
+            )
+            .is_err()
+        );
+        assert!(host_managed_preflight("127.0.0.1", &DeploymentMode::Local, None, None).is_err());
+        assert!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Local,
+                Some("short".into()),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            host_managed_preflight(
+                "127.0.0.1",
+                &DeploymentMode::Local,
+                Some(host.clone()),
+                Some(host)
+            )
+            .is_err(),
+            "the two credentials must differ"
+        );
+    }
+
+    #[test]
+    fn should_refuse_host_managed_with_stdio_solo_or_an_argv_token() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+        for extra in [
+            &["--stdio"][..],
+            &["--solo"],
+            &["--auth-token", "x"],
+            &["--danger-full-access"],
+        ] {
+            let mut argv = vec!["octos", "--host-managed"];
+            argv.extend_from_slice(extra);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{extra:?}");
+        }
+        assert!(
+            Cli::try_parse_from(["octos", "--listen-fd", "3"]).is_err(),
+            "--listen-fd needs --host-managed"
+        );
+        let parsed = Cli::try_parse_from(["octos", "--host-managed", "--listen-fd", "3"]).unwrap();
+        assert!(parsed.serve.host_managed);
+        assert_eq!(parsed.serve.listen_fd, Some(3));
+    }
+
+    #[test]
+    fn should_fall_back_to_env_then_config_auth_token() {
+        assert_eq!(
+            resolve_auth_token(None, Some("env-token".to_string()), Some("config-token")),
+            Some(("env-token".to_string(), AuthTokenSource::Env))
+        );
+        assert_eq!(
+            resolve_auth_token(None, None, Some("config-token")),
+            Some(("config-token".to_string(), AuthTokenSource::Config))
+        );
+        // An empty config token counts as absent — the caller falls through
+        // to the auto-generated-token path for non-loopback binds.
+        assert_eq!(resolve_auth_token(None, None, Some("")), None);
+        assert_eq!(resolve_auth_token(None, None, None), None);
+    }
+
+    /// #2385: an occupied port is the one bind failure a user can fix from
+    /// the message alone, so it must say the port is taken, how to find the
+    /// holder, and the `--port` escape hatch — while keeping the io error as
+    /// the source.
+    #[test]
+    fn bind_error_on_addr_in_use_carries_remediation() {
+        let report = bind_listener_error(
+            "127.0.0.1",
+            8080,
+            std::io::Error::from(std::io::ErrorKind::AddrInUse),
+        );
+        let rendered = format!("{report}");
+        assert!(rendered.contains("already in use"), "actual: {rendered}");
+        assert!(rendered.contains("--port"), "actual: {rendered}");
+        #[cfg(target_os = "linux")]
+        assert!(
+            rendered.contains("ss -ltnp 'sport = :8080'"),
+            "actual: {rendered}"
+        );
+        #[cfg(all(unix, not(target_os = "linux")))]
+        assert!(rendered.contains("lsof -i :8080"), "actual: {rendered}");
+        #[cfg(windows)]
+        assert!(
+            rendered.contains("netstat -ano | findstr :8080"),
+            "actual: {rendered}"
+        );
+        assert!(report.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        }));
+    }
+
+    #[test]
+    fn bind_error_other_kinds_keep_the_bare_wrap() {
+        let report = bind_listener_error(
+            "127.0.0.1",
+            8080,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(
+            format!("{report}"),
+            "failed to bind octos API server to 127.0.0.1:8080"
+        );
+        assert!(report.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        }));
+    }
+
+    /// The remediation path must key off the REAL OS error, not just the
+    /// synthesized kind: hold a socket and drive the production bind through
+    /// it.
+    #[tokio::test]
+    async fn bind_http_listener_reports_remediation_for_occupied_port() {
+        let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let error = bind_http_listener(false, "127.0.0.1", port)
+            .await
+            .unwrap_err();
+        let rendered = format!("{error}");
+        assert!(rendered.contains("already in use"), "actual: {rendered}");
+        assert!(rendered.contains("--port"), "actual: {rendered}");
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        }));
+    }
+
+    /// #2371 tripwire: the repo's own service generators must never place
+    /// the dashboard bearer token in argv — it is readable by any local
+    /// process via ps / systemctl cat. The OCTOS_AUTH_TOKEN env var carries
+    /// it instead (NSSM's AppEnvironmentExtra is the deploy.ps1 equivalent).
+    #[test]
+    fn service_templates_never_pass_auth_token_via_argv() {
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+        for name in [
+            "install.sh",
+            "install.ps1",
+            "local-tenant-deploy.sh",
+            "frp/bootstrap-tenant.sh",
+            "deploy.ps1",
+        ] {
+            let body = std::fs::read_to_string(scripts.join(name))
+                .unwrap_or_else(|e| panic!("read {name}: {e}"));
+            assert!(
+                body.contains("OCTOS_AUTH_TOKEN"),
+                "{name} must still deliver the token via OCTOS_AUTH_TOKEN"
+            );
+            for line in body.lines() {
+                let service_argv_line = line.contains("ExecStart=")
+                    || line.contains("\"$octosBin\" serve")
+                    || line.contains("$nssmExe install")
+                    || line.contains("AppParameters")
+                    || line.trim() == "<string>--auth-token</string>";
+                assert!(
+                    !(service_argv_line && line.contains("--auth-token")),
+                    "{name} puts --auth-token in the service argv: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn stdio_serve_wires_task_query_store_for_in_process_cancel() {
         // `--stdio` runs session actors in-process with no gateway to
         // proxy `task/cancel` to, so the store must be present for the
@@ -1972,7 +2729,7 @@ mod tests {
         // task commands fail `runtime_unavailable` and octoscode Esc/`x`
         // cannot cancel a spawned background task (the reported bug).
         assert!(
-            stdio_task_query_store(true).is_some(),
+            in_process_task_query_store(true).is_some(),
             "stdio serve must wire a task_query_store"
         );
     }
@@ -2028,11 +2785,11 @@ mod tests {
     }
 
     #[test]
-    fn non_stdio_serve_leaves_task_query_store_none_for_gateway_proxy() {
-        // HTTP/gateway serve must leave it `None` so `handle_task_cancel`
+    fn gateway_serve_leaves_task_query_store_none_for_gateway_proxy() {
+        // Non-solo HTTP serve must leave it `None` so `handle_task_cancel`
         // takes the gateway-proxy path; a non-`None` store would skip it.
         assert!(
-            stdio_task_query_store(false).is_none(),
+            in_process_task_query_store(false).is_none(),
             "gateway/http serve must leave task_query_store None"
         );
     }
@@ -2081,6 +2838,33 @@ mod tests {
         assert!(
             !fleet_sandbox_is_isolating(&none_mode),
             "SandboxMode::None must NOT be treated as isolating",
+        );
+    }
+
+    /// Fail-closed twin: a config whose resolution REFUSES (an explicit mode
+    /// unhonorable on this host) is fail-closed but useless to a pool — every
+    /// worker command would refuse — so the boot gate must not install the
+    /// pool behind it, matching the old behaviour where the same configs
+    /// degraded to `NoSandbox` and were caught by `is_noop()`. The refusing
+    /// resolution reports `is_noop() == false`, so without the dedicated
+    /// `refusal()` check this would regress to installing a dead pool.
+    #[test]
+    fn fleet_pool_rejects_a_refusing_sandbox_resolution() {
+        use octos_agent::sandbox::{SandboxConfig, SandboxMode};
+        // Unhonorable on every host this test runs on: landlock requires
+        // Linux (and, on Linux, the octos-sandbox helper, absent in unit-test
+        // runners); appcontainer requires Windows.
+        let unhonorable = SandboxConfig {
+            mode: if cfg!(windows) {
+                SandboxMode::Landlock
+            } else {
+                SandboxMode::AppContainer
+            },
+            ..Default::default()
+        };
+        assert!(
+            !fleet_sandbox_is_isolating(&unhonorable),
+            "a refusing sandbox resolution must NOT install the fleet pool",
         );
     }
 
@@ -2162,10 +2946,12 @@ mod tests {
     }
 
     /// Two `octos serve` against one data dir can't coexist (redb is
-    /// single-process). The second must be refused FAST with a stable,
+    /// single-process). The second must be refused with a stable,
     /// client-greppable marker — not crash mid-startup opening `admin_audit.redb`
     /// (which a stdio client respawned in a silent ~5s loop). Releasing the first
     /// (process exit) must free the lock so a legitimate relaunch still starts.
+    /// (The refusal is delayed by the #2357 contention budget, so this test's
+    /// wall time includes it.)
     #[test]
     fn second_serve_on_same_data_dir_is_refused_with_a_greppable_marker() {
         let dir = tempfile::tempdir().unwrap();
@@ -2189,6 +2975,107 @@ mod tests {
         drop(first);
         let _relaunch = acquire_serve_data_dir_lock(dir.path())
             .expect("after the holder exits, a fresh serve acquires the lock");
+    }
+
+    /// #2357 — the lock is no longer held only by a long-lived serve: the goal
+    /// operator CLI holds it across an ms-scale offline append (#2181). A serve
+    /// spawned inside that window must WAIT OUT the transient holder instead of
+    /// emitting the one-shot marker refusal — octoscode stops relaunching on
+    /// the marker, so a transient conflict would permanently kill the session.
+    /// The holder releases mid-budget; acquisition must retry past the first
+    /// contention and succeed. The acquirer runs on its own thread behind a
+    /// channel handshake so the hold provably overlaps the first try_lock —
+    /// a main-thread scheduling hiccup can never release the lock early and
+    /// turn this into a false pass/fail.
+    #[test]
+    fn serve_lock_acquisition_waits_out_a_transient_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".octos-serve.lock");
+        let transient = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open lockfile");
+        fs2::FileExt::try_lock_exclusive(&transient).expect("transient holder takes the lock");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let dir_path = dir.path().to_path_buf();
+        let acquirer = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce acquisition start");
+            acquire_serve_data_dir_lock(&dir_path)
+        });
+        started_rx.recv().expect("acquirer announces start");
+
+        // Release mid-budget: comfortably past the acquirer's first try_lock,
+        // comfortably inside SERVE_LOCK_CONTENTION_RETRY_BUDGET on any host.
+        let released_at = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(transient);
+
+        let guard = acquirer
+            .join()
+            .expect("acquirer thread")
+            .expect("a transient holder must be waited out, not refused");
+        assert!(
+            released_at.elapsed() >= std::time::Duration::from_millis(150),
+            "acquisition can only succeed after the release, so it must have waited"
+        );
+        drop(guard);
+    }
+
+    /// #2357 — the retry budget must not soften the true-conflict contract: a
+    /// live serve holds the lock for its whole lifetime, so a second serve is
+    /// still refused with the same greppable marker, just delayed by the
+    /// budget. (Wall time of this test grows by the budget.)
+    #[test]
+    fn serve_lock_acquisition_still_refuses_a_live_holder_after_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_serve_data_dir_lock(dir.path()).expect("first serve acquires the lock");
+
+        let started = std::time::Instant::now();
+        let err = acquire_serve_data_dir_lock(dir.path())
+            .err()
+            .expect("a live holder must still be refused after the retry budget");
+        assert!(
+            err.to_string().contains(DATA_DIR_LOCKED_MARKER),
+            "refusal must still carry the stable client-greppable marker; got: {err}"
+        );
+        assert!(
+            started.elapsed() >= SERVE_LOCK_CONTENTION_RETRY_BUDGET,
+            "the refusal must come only after the full contention budget"
+        );
+        drop(first);
+    }
+
+    /// Unix flock ownership follows the open file description, so a forked
+    /// child can briefly retain it even when its descriptor is close-on-exec.
+    /// `try_clone` reproduces that shared-description lifetime deterministically,
+    /// without needing another process or depending on scheduler timing.
+    // fs2's Solaris backend emulates flock with process-owned fcntl locks.
+    #[cfg(all(unix, not(target_os = "solaris")))]
+    #[test]
+    fn should_release_serve_data_dir_lock_when_duplicate_descriptor_outlives_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_serve_data_dir_lock(dir.path()).expect("first serve acquires lock");
+        let inherited = first._file.try_clone().expect("duplicate lock descriptor");
+        assert!(
+            acquire_serve_data_dir_lock(dir.path()).is_err(),
+            "duplicating a descriptor must not release the live guard's lock"
+        );
+
+        drop(first);
+        let relaunch = acquire_serve_data_dir_lock(dir.path())
+            .expect("guard drop must unlock even while a duplicate descriptor remains open");
+        drop(inherited);
+        assert!(
+            acquire_serve_data_dir_lock(dir.path()).is_err(),
+            "closing the previous holder's duplicate must not unlock the new guard"
+        );
+
+        drop(relaunch);
+        let _next = acquire_serve_data_dir_lock(dir.path())
+            .expect("the new guard still releases its own lock on drop");
     }
 
     fn dashboard_smtp_test_env_lock() -> &'static std::sync::Mutex<()> {

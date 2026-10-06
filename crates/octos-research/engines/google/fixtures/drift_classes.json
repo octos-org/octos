@@ -1,0 +1,91 @@
+{
+  "body_file": "drift_classes.body",
+  "expect": [
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "Omarchy - Beautiful, fun & agentic Linux by DHH",
+      "url": "https://omarchy.us/"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "Omarchy - Wikipedia",
+      "url": "https://en.wikipedia.org/wiki/Omarchy"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "Arch Linux (Omarchy) — 8 Months Later: The Good, the Bad ...",
+      "url": "https://www.ssp.sh/blog/linux-omarchy-the-good-bad-and-fixable"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "omacom/omarchy: Beautiful, Modern & Opinionated Linux",
+      "url": "https://github.com/omacom/omarchy"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "What exactly is omarchy getting so popular for? : r/archlinux",
+      "url": "https://www.reddit.com/r/archlinux/comments/1w2lhd2/what_exactly_is_omarchy_getting_so_popular_for"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "I Have SERIOUS Concerns About Omarchy Linux - Medium",
+      "url": "https://medium.com/@michaelswengel/i-have-serious-concerns-about-omarchy-linux-33c522e7f1ec"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "Omarchy - The Agentic Linux Desktop - YouTube",
+      "url": "https://www.youtube.com/watch?v=r1TGWAIoWy0"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "Is Omarchy Any Good...? - DEV Community",
+      "url": "https://dev.to/fstrube/is-omarchy-any-good-3069"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "The Manual - Omarchy",
+      "url": "https://omarchy.org/manual"
+    },
+    {
+      "lang": "en",
+      "published": null,
+      "source": "",
+      "title": "I Tried Omarchy Linux as My Home Lab Workstation This ...",
+      "url": "https://www.virtualizationhowto.com/2026/08/i-tried-omarchy-linux-as-my-home-lab-workstation-this-weekend-heres-what-happened"
+    }
+  ],
+  "http": {
+    "headers": {},
+    "method": "GET",
+    "url": "https://www.google.com/wml/search?q=omarchy+linux&sca_esv=1&hl=en&lr=lang_en&ie=utf8&oe=utf8"
+  },
+  "recorded": "derived from results_en.body with Google's result-block class names renamed, as when Google changes them: the structural fallback must still find the results (without snippets)",
+  "request": {
+    "category": "general",
+    "count": 10,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-28T23:30:00Z",
+    "query": "omarchy linux",
+    "since": null
+  }
+}

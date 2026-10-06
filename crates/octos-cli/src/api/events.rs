@@ -19,6 +19,12 @@
 use octos_agent::{ProgressEvent, ProgressReporter};
 use tokio::sync::broadcast;
 
+/// Producer iteration identity, opaque to clients. It does not depend on how
+/// many progress events were delivered or retained by the ledger.
+pub(super) fn assistant_segment_id_for_iteration(thread_id: &str, iteration: u32) -> String {
+    format!("{thread_id}:assistant:iteration:{iteration}")
+}
+
 /// Process-wide broadcaster of progress events, used by the harness +
 /// swarm event surfaces. Publishes pre-serialized JSON frames so
 /// downstream subscribers (admin dashboard, M7.8 live gate) can forward
@@ -137,8 +143,8 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
                 "message": message,
             })
         }
-        ProgressEvent::StreamChunk { text, .. } => {
-            serde_json::json!({"type": "token", "text": text})
+        ProgressEvent::StreamChunk { text, iteration } => {
+            serde_json::json!({"type": "token", "text": text, "iteration": iteration})
         }
         ProgressEvent::ReasoningChunk { text, iteration } => {
             serde_json::json!({
@@ -180,6 +186,29 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
         }
         ProgressEvent::Thinking { iteration } => {
             serde_json::json!({"type": "thinking", "iteration": iteration})
+        }
+        ProgressEvent::AgentProgress {
+            iteration,
+            active_tokens,
+            elapsed,
+            checkpoints,
+            reflecting,
+        } => {
+            serde_json::json!({
+                "type": "agent_progress",
+                "message": octos_agent::progress::agent_progress_message(
+                    *iteration,
+                    *active_tokens,
+                    *elapsed,
+                    *checkpoints,
+                    *reflecting,
+                ),
+                "iteration": iteration,
+                "active_tokens": active_tokens,
+                "elapsed_ms": elapsed.as_millis() as u64,
+                "checkpoints": checkpoints,
+                "reflecting": reflecting,
+            })
         }
         ProgressEvent::Response { iteration, .. } => {
             serde_json::json!({"type": "response", "iteration": iteration})
@@ -483,6 +512,27 @@ mod tests {
     }
 
     #[test]
+    fn event_to_json_agent_progress_carries_step_tokens_and_time() {
+        let event = ProgressEvent::AgentProgress {
+            iteration: 21,
+            active_tokens: 18_432,
+            elapsed: Duration::from_secs(307),
+            checkpoints: 1,
+            reflecting: false,
+        };
+        let json = event_to_json(&event, None);
+        assert_eq!(json["type"], "agent_progress");
+        assert_eq!(json["iteration"], 21);
+        assert_eq!(json["active_tokens"], 18_432);
+        assert_eq!(json["elapsed_ms"], 307_000);
+        assert_eq!(json["checkpoints"], 1);
+        assert_eq!(
+            json["message"],
+            "Step 21 · 18432 tokens · 5m07s · 1 reflection"
+        );
+    }
+
+    #[test]
     fn event_to_json_response() {
         let event = ProgressEvent::Response {
             content: "answer".into(),
@@ -563,6 +613,16 @@ mod tests {
                 "cost_update",
             ),
             (ProgressEvent::Thinking { iteration: 0 }, "thinking"),
+            (
+                ProgressEvent::AgentProgress {
+                    iteration: 1,
+                    active_tokens: 10,
+                    elapsed: Duration::from_secs(1),
+                    checkpoints: 0,
+                    reflecting: false,
+                },
+                "agent_progress",
+            ),
             (
                 ProgressEvent::Response {
                     content: "c".into(),

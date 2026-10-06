@@ -21,6 +21,10 @@ use octos_core::{
 };
 
 use super::ProfileRuntime;
+use crate::commands::gateway::prompt::{
+    SLASH_COMMANDS_SEGMENT_NAME, accepted_client_commands, render_client_commands,
+    strip_slash_commands,
+};
 
 /// All per-session state derived from a parent [`ProfileRuntime`].
 ///
@@ -142,9 +146,67 @@ pub struct SessionRuntime {
     /// Opened at [`Self::sessions_root`] (which is
     /// [`ProfileRuntime::data_dir`] unless the session is cwd-scoped).
     pub sessions: Arc<tokio::sync::Mutex<SessionManager>>,
+
+    /// The memory stores this session captures into and is injected from:
+    /// the profile's own, or — for a host-bound app peer or one of its
+    /// request contexts (UPCR-2026-034) — the bound app/account namespace.
+    pub memory: super::memory_namespace::SessionMemory,
+
+    /// The app binding (UPCR-2026-034) this runtime was built for, and the
+    /// `peers/` root it was resolved under. A binding decides the workspace,
+    /// the memory stores and the permission clamp, so a runtime built for
+    /// another binding must be rebuilt, never reused
+    /// ([`Self::app_binding_is_current`]).
+    pub(crate) app_binding: crate::peers::app_binding::SessionAppBinding,
+    pub(crate) binding_peers_root: PathBuf,
+    /// The connection whose `client_commands` declaration is currently in
+    /// the prompt, so only that connection's close releases it.
+    client_commands_owner: std::sync::Mutex<Option<u64>>,
+}
+
+/// UPCR-2026-034 `read_parent`: a request context's read-only view of its
+/// peer's folder, minus every context's folder (its own stays its
+/// workspace): `(peer folder, excluded folders)`. Enforced by the session
+/// scope (file tools) and the sandbox (shell), never by convention.
+fn context_read_view(
+    binding: &crate::peers::app_binding::SessionAppBinding,
+) -> Option<(PathBuf, Vec<PathBuf>)> {
+    match binding {
+        crate::peers::app_binding::SessionAppBinding::Bound {
+            read_view: Some(root),
+            ..
+        } => Some((
+            root.clone(),
+            vec![crate::peers::app_binding::contexts_folder(root)],
+        )),
+        _ => None,
+    }
+}
+
+/// Attach [`context_read_view`] to the session scope.
+fn with_context_read_view(
+    scope: Option<Arc<SessionScope>>,
+    binding: &crate::peers::app_binding::SessionAppBinding,
+) -> Result<Option<Arc<SessionScope>>, octos_core::SessionScopeError> {
+    match (scope, context_read_view(binding)) {
+        (Some(scope), Some((root, excluded))) => Ok(Some(Arc::new(
+            (*scope).clone().with_read_only_view(root, excluded)?,
+        ))),
+        (scope, _) => Ok(scope),
+    }
 }
 
 impl SessionRuntime {
+    /// Whether the durable app binding of this session still equals the one
+    /// this runtime was built for. `false` means the runtime is stale (e.g.
+    /// cached before `peer/prepare` bound the session) and must be rebuilt.
+    pub(crate) fn app_binding_is_current(&self) -> bool {
+        crate::peers::app_binding::resolve_session_app_binding(
+            &self.binding_peers_root,
+            &self.session_key,
+        ) == self.app_binding
+    }
+
     /// Construct a [`SessionRuntime`] for the given session key.
     ///
     /// See the M11-C contract in `workstreams/M11-runtime-unification.md`
@@ -161,7 +223,8 @@ impl SessionRuntime {
     ///    This is the M11 fix for the
     ///    `"workspace policy not found"` failure observed on
     ///    yangmi voice clone.
-    /// 3. Create `<workspace_root>/skill-output/` (plugin work dir).
+    /// 3. Resolve the plugin work dir without creating it. Plugin execution
+    ///    creates it on demand; read-only sessions use the profile data dir.
     /// 4. Clone `profile.tool_specs` via
     ///    `ToolRegistry::snapshot_excluding(&[])` and bind it to
     ///    the per-session workspace + output-dir hint.
@@ -217,6 +280,38 @@ impl SessionRuntime {
             EffectivePermissions::workspace_write(),
         )
         .await
+    }
+
+    /// Tell the agent which slash commands the client on connection `owner`
+    /// declared on `session/open` (octoscode#664); an empty list clears them.
+    /// Per-turn agents inherit it via the snapshot. Returns the names that
+    /// were accepted, for the `session/open` result to echo.
+    pub fn apply_client_commands(&self, owner: u64, commands: &[String]) -> Vec<String> {
+        let mut current = self
+            .client_commands_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let accepted = accepted_client_commands(commands);
+        *current = (!accepted.is_empty()).then_some(owner);
+        self.agent.set_prompt_segment(
+            SLASH_COMMANDS_SEGMENT_NAME,
+            render_client_commands(&accepted),
+        );
+        accepted
+    }
+
+    /// Clear the declared commands when connection `owner` closes, unless a
+    /// later `session/open` from another connection has replaced them.
+    pub fn release_client_commands(&self, owner: u64) {
+        let mut current = self
+            .client_commands_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *current == Some(owner) {
+            *current = None;
+            self.agent
+                .set_prompt_segment(SLASH_COMMANDS_SEGMENT_NAME, String::new());
+        }
     }
 
     /// [`Self::bootstrap`] with an explicit `sessions_in_cwd` flag. The
@@ -284,8 +379,81 @@ impl SessionRuntime {
         // BEFORE it is consumed — the sessions-root resolution below keys off
         // "was this a cwd/coding-agent session" (a hint), not off the derived
         // workspace path.
+        //
+        // UPCR-2026-034: a host-bound app peer (or one of its request
+        // contexts) runs ONLY in its bound workspace and on its bound memory
+        // namespace; a closed or never-opened binding refuses to run at all.
+        // The binding is durable kernel state written by `peer/prepare` /
+        // `peer/context/open`, never taken from this open's parameters.
+        let binding_peers_root = profile.data_dir.join("peers");
+        let app_binding = crate::peers::app_binding::resolve_session_app_binding(
+            &binding_peers_root,
+            &session_key,
+        );
+        // Kept on the runtime: a cached runtime whose binding no longer
+        // matches the durable one (the session was bound by `peer/prepare` or
+        // `peer/context/open` after it was cached) is never reused.
+        let bootstrapped_binding = app_binding.clone();
+        let (workspace_hint, bound_memory_namespace) = match app_binding {
+            crate::peers::app_binding::SessionAppBinding::Unbound => (workspace_hint, None),
+            crate::peers::app_binding::SessionAppBinding::Refused(reason) => {
+                eyre::bail!("session {session_key} cannot run: {reason}");
+            }
+            crate::peers::app_binding::SessionAppBinding::Bound {
+                cwd,
+                memory_namespace,
+                read_view,
+            } => {
+                // The bound folder (and a context's read-only view of its
+                // peer's folder) must still be the canonical directory the
+                // binding recorded: a symlink swapped in for it (or an
+                // ancestor) would otherwise re-root the session, or widen
+                // the view, wherever it points.
+                for dir in std::iter::once(&cwd).chain(read_view.iter()) {
+                    if let Err(reason) = crate::peers::app_binding::verify_bound_dir(dir) {
+                        eyre::bail!("session {session_key} cannot run: {reason}");
+                    }
+                }
+                if let Some(hint) = workspace_hint.as_ref() {
+                    let hint_canon = dunce::canonicalize(hint).unwrap_or_else(|_| hint.clone());
+                    let cwd_canon = dunce::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+                    if hint_canon != cwd_canon {
+                        eyre::bail!(
+                            "session {session_key} is bound to workspace {}; refusing {}",
+                            cwd.display(),
+                            hint.display()
+                        );
+                    }
+                }
+                (Some(cwd), Some(memory_namespace))
+            }
+        };
+        // UPCR-2026-035: a host-bound app session never runs with host
+        // filesystem access. `Host` (danger_full_access, e.g. a Solo profile
+        // run with `--danger-full-access`) leaves file tools unscoped and the
+        // sandbox off, so an app's read tools would accept any absolute path.
+        // Clamp it to workspace access, keeping the approval policy; the
+        // session scope is then attached below like for any other session.
+        let (permissions, sandbox_override) =
+            if bound_memory_namespace.is_some() && permissions.filesystem_scope.is_host() {
+                tracing::warn!(
+                    session = %session_key,
+                    "host-bound app session: clamping host filesystem access to its workspace"
+                );
+                (
+                    EffectivePermissions {
+                        approval_policy: permissions.approval_policy,
+                        ..EffectivePermissions::workspace_write()
+                    },
+                    None,
+                )
+            } else {
+                (permissions, sandbox_override)
+            };
         let had_workspace_hint = workspace_hint.is_some();
         let workspace_root = resolve_workspace_root(profile, &session_key, workspace_hint)?;
+        let workspace_profile = profile.for_workspace(&workspace_root).await?;
+        let profile = &workspace_profile;
         std::fs::create_dir_all(&workspace_root).wrap_err_with(|| {
             format!("create workspace root failed: {}", workspace_root.display())
         })?;
@@ -298,16 +466,31 @@ impl SessionRuntime {
         // closing the TOCTOU window an `if !exists() { write }`
         // pattern would leave open under concurrent bootstrap or
         // operator edit. `AlreadyExists` is treated as success.
-        bootstrap_session_policy(&workspace_root)?;
+        if permissions.file_access.allows_write() {
+            bootstrap_session_policy(&workspace_root)?;
+        }
 
-        // Step 3: plugin work dir.
-        let plugin_work_dir = workspace_root.join("skill-output");
-        std::fs::create_dir_all(&plugin_work_dir).wrap_err_with(|| {
-            format!(
-                "create plugin work dir failed: {}",
-                plugin_work_dir.display()
-            )
-        })?;
+        // Step 3: resolve the plugin work dir without materializing it.
+        // PluginTool::execute creates its effective work dir before spawning,
+        // so sessions that never invoke a plugin leave no unused output dir.
+        let plugin_work_dir = if permissions.file_access.allows_write() {
+            workspace_root.join("skill-output")
+        } else {
+            use sha2::{Digest, Sha256};
+            // Read-only applies to bootstrap too. Keep host-generated scratch
+            // outside the selected project, isolated by both cwd and session.
+            let workspace_hash = format!(
+                "{:x}",
+                Sha256::digest(workspace_root.as_os_str().as_encoded_bytes())
+            );
+            profile
+                .data_dir
+                .join("runtime")
+                .join("read-only")
+                .join(workspace_hash)
+                .join(octos_bus::session::encode_path_component(&session_key.0))
+                .join("skill-output")
+        };
 
         // Step 4: clone the profile tool registry and ACTUALLY rebind
         // it to this session's workspace. `set_workspace_root` only
@@ -326,15 +509,25 @@ impl SessionRuntime {
         // `fm_tts` and friends emit into this session's
         // `<workspace>/skill-output/` rather than the profile-template
         // path.
-        let sandbox = sandbox_override
+        let mut sandbox = sandbox_override
             .unwrap_or_else(|| permissions.apply_to_sandbox(&profile.default_sandbox));
+        if let Some((root, excluded)) = context_read_view(&bootstrapped_binding) {
+            sandbox.read_only_view = Some(Box::new(octos_agent::SandboxReadOnlyView {
+                root,
+                excluded,
+            }));
+        }
         let mut tools = profile.tool_specs.rebind_cwd_with_permissions(
             &workspace_root,
             create_sandbox(&sandbox),
             permissions,
         );
         tools.set_output_dir_hint(plugin_work_dir.to_string_lossy().into_owned());
-        tools.rebind_plugin_work_dirs(&plugin_work_dir);
+        tools.rebind_plugin_work_dirs(if profile.session_defaults.is_some() {
+            &workspace_root
+        } else {
+            &plugin_work_dir
+        });
         // #1607 (codex round 4): `run_pipeline` is NOT a CWD-bound tool, so the
         // `rebind_cwd_with_permissions` snapshot above carried the PROFILE-time
         // `run_pipeline` instance — which baked in the profile default sandbox.
@@ -366,12 +559,23 @@ impl SessionRuntime {
         // RFC-0 (#1289): the `activate_tools` meta-tool was removed — every
         // enabled tool is emitted every turn, so there is no per-session
         // meta-tool to re-register or wire.
-        // Per-session policy filter is a no-op for M11; future work
-        // may add session-level policy overrides on top of
-        // `profile.tool_policy`. The profile-level policy itself is
-        // applied at registry-build time by `ProfileRuntime::bootstrap`
-        // (M11-B), so the rebound registry already inherits it.
-
+        profile.apply_tool_envelope(&mut tools);
+        let memory = match bound_memory_namespace.as_deref() {
+            Some(namespace) => {
+                let memory =
+                    super::memory_namespace::SessionMemory::namespaced(profile, namespace).await?;
+                super::memory_namespace::rebind_memory_tools(
+                    &mut tools,
+                    &memory,
+                    profile.embedder.clone(),
+                );
+                // `run_pipeline` captures episodes into the PROFILE's memory;
+                // a namespaced session must not write there.
+                tools.retain(|name| name != "run_pipeline");
+                memory
+            }
+            None => super::memory_namespace::SessionMemory::profile(profile),
+        };
         let tools = Arc::new(tools);
 
         // Step 5: build the per-session Agent. This is the only
@@ -468,7 +672,12 @@ impl SessionRuntime {
         } else {
             workspace_root.clone()
         };
-        let scope_zones: Vec<PathBuf> = if workspace_under_data {
+        // A host-bound app session (UPCR-2026-034) gets no shared zones:
+        // a kernel-provisioned app workspace lives under the data dir, but
+        // the profile's `research/` and `skills/` hold what the system agent
+        // and other apps wrote.
+        let scope_zones: Vec<PathBuf> = if workspace_under_data && bound_memory_namespace.is_none()
+        {
             DEFAULT_MULTI_TENANT_SHARED_ZONE_NAMES
                 .iter()
                 .map(|name| scope_root.join(name))
@@ -545,26 +754,32 @@ impl SessionRuntime {
                 }
             }
         };
+        // A host-bound app session is always fenced to its workspace: never
+        // fall back to the unscoped legacy resolver.
+        if bound_memory_namespace.is_some() && session_scope.is_none() {
+            eyre::bail!("session {session_key} is host-bound but its workspace scope failed");
+        }
+        let session_scope = with_context_read_view(session_scope, &bootstrapped_binding)
+            .wrap_err_with(|| {
+                format!("session {session_key}: the read view of its peer's folder")
+            })?;
 
+        // The prompt's slash commands (`/router`, `/queue`, …) are handled by
+        // bus channels only; serve sessions get the client's own commands
+        // instead, via `apply_client_commands` (octoscode#664).
+        let base_prompt = strip_slash_commands(&profile.prompt_parts.pre_memory);
         let mut agent = Agent::new_shared(
             AgentId::new("api"),
             profile.llm.clone(),
             Arc::clone(&tools),
-            profile.memory.clone(),
+            memory.episodes.clone(),
         )
-        .with_config(AgentConfig {
-            // Honor the configured `max_iterations` instead of a hardcoded cap.
-            // The previous fixed `20` ignored config AND propagated to spawned
-            // sub-agents (which inherit this config), starving multi-step
-            // background tasks that need more iterations.
-            max_iterations: resolve_session_max_iterations(profile.max_iterations),
-            save_episodes: true,
-            // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md)
-            human_approval_rules: profile.human_approval_rules.clone(),
-            // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
-            format_after_edit: profile.format_after_edit,
-            ..Default::default()
-        })
+        .with_config(
+            profile
+                .session_defaults
+                .clone()
+                .unwrap_or_else(|| configured_agent_defaults(profile)),
+        )
         // M11-F regression fix (#891): propagate the pre-assembled
         // profile-scope system prompt onto the per-session agent. The
         // profile assembled it once during `ProfileRuntime::bootstrap`
@@ -575,7 +790,7 @@ impl SessionRuntime {
         // line, the agent's prompt would fall back to the
         // `Agent::new_shared` default and the LLM would lose its
         // skill-aware routing.
-        .with_system_prompt(profile.prompt_parts.pre_memory.clone())
+        .with_system_prompt(base_prompt)
         .with_file_state_cache(file_state_cache)
         .with_subagent_output_router(subagent_output_router)
         .with_subagent_summary_generator(subagent_summary_generator)
@@ -584,7 +799,18 @@ impl SessionRuntime {
         // session from ToolContext::parent_session_key — thread it on the
         // runtime-held agent exactly like the per-turn AppUI rebuild does.
         .with_parent_session_key(session_key.to_string())
-        .with_workspace_root(workspace_root.clone());
+        .with_workspace_root(workspace_root.clone())
+        .with_recall(memory.recall.clone());
+
+        if let Some(coding_profile) = profile.agent_profile.clone() {
+            let definitions = Arc::new(octos_agent::agents::AgentDefinitions::load_dir(
+                &workspace_root.join("agents"),
+            )?);
+            coding_profile.validate_against_registry(&definitions)?;
+            agent = agent
+                .with_profile(coding_profile)
+                .with_agent_definitions(definitions);
+        }
 
         // Phase 1 of the SessionScope migration: attach the constructed
         // scope to the per-session agent. `None` keeps pre-Phase-1
@@ -614,24 +840,31 @@ impl SessionRuntime {
         // fabricates a "memory bank" when asked). The provider re-renders
         // the segment at each turn start when MEMORY.md / daily notes /
         // bank change on disk (one fingerprint stat per turn otherwise).
-        let memory_ctx = profile
+        agent.set_prompt_segment(SLASH_COMMANDS_SEGMENT_NAME, String::new());
+        let memory_ctx = memory
             .memory_store
             .get_injectable_context(profile.memory_inject_tokens)
             .await;
         agent.set_prompt_segment(
             octos_agent::MEMORY_SEGMENT_NAME,
-            octos_agent::compose_memory_segment(&memory_ctx, profile.memory_refresh_enabled),
+            octos_agent::compose_memory_segment(&memory_ctx, memory.refresh_enabled),
         );
         // Contract parity with chat.rs: `memory.refresh.enabled = false`
         // means NO per-turn memory re-read — the segment stays as seeded
         // at session bootstrap. Default-on makes disabled an explicit
         // opt-out.
-        if profile.memory_refresh_enabled {
-            agent.add_prompt_segment_provider(Arc::new(octos_agent::MemorySegmentProvider::new(
-                profile.memory_store.clone(),
-                profile.memory_inject_tokens,
-                true,
-            )));
+        // A namespaced session always re-renders per turn (its own
+        // `save_memory` writes must show up), without the capture policy that
+        // advertises the profile-only `memory_note` path.
+        if profile.memory_refresh_enabled || memory.namespace.is_some() {
+            agent.add_prompt_segment_provider(Arc::new(
+                octos_agent::MemorySegmentProvider::new(
+                    memory.memory_store.clone(),
+                    profile.memory_inject_tokens,
+                    memory.refresh_enabled,
+                )
+                .with_recall(memory.recall.clone(), profile.embedder.clone()),
+            ));
         }
         // Post-memory half AFTER the named segment — the pre-refactor
         // order (memory before skills/tool guidance).
@@ -650,6 +883,16 @@ impl SessionRuntime {
         if let Some(hooks) = profile.hook_executor.clone() {
             agent = agent.with_hooks(hooks);
         }
+
+        // #2246 — populate the hook payload context at session construction,
+        // where both ids are known; before this, chat/serve-stdio turns fired
+        // `before_llm_call` / `after_llm_call` / `after_tool_call` payloads
+        // with no `session_id` / `profile_id` (gateway sessions were already
+        // covered via `ActorFactory::hook_context_template`).
+        agent = agent.with_hook_context(octos_agent::HookContext {
+            session_id: Some(session_key.to_string()),
+            profile_id: Some(profile.profile_id.clone()),
+        });
 
         // RFC-1 (issue #1290): same pattern for the `mofa_make`
         // dispatcher. The loader registered it but its `Weak<ToolRegistry>`
@@ -701,7 +944,79 @@ impl SessionRuntime {
             agent,
             sessions_root,
             sessions,
+            memory,
+            app_binding: bootstrapped_binding,
+            binding_peers_root,
+            client_commands_owner: std::sync::Mutex::new(None),
         }))
+    }
+}
+
+/// Shared configured defaults for OUP, chat and ACP session assembly.
+pub(crate) fn configured_agent_defaults(profile: &ProfileRuntime) -> AgentConfig {
+    AgentConfig {
+        // Honor the configured `max_iterations` instead of a hardcoded cap.
+        // The previous fixed `20` ignored config AND propagated to spawned
+        // sub-agents (which inherit this config), starving multi-step
+        // background tasks that need more iterations.
+        max_iterations: resolve_session_max_iterations(profile.max_iterations),
+        save_episodes: true,
+        // Phase 4 (docs/ROBRIX-PHASE4-APPROVAL-FLOW-ADR.md)
+        human_approval_rules: profile.human_approval_rules.clone(),
+        // #1774: opt-in post-edit formatting (rustfmt/prettier/black/gofmt).
+        format_after_edit: profile.format_after_edit,
+        // #2172: thread the profile's gateway LLM knobs onto serve /
+        // octoscode sessions, exactly as `octos chat` does. Without this a
+        // profile-driven session silently ran with the built-in defaults
+        // (greedy temperature=0.0, no sampler, 16384 max output) — dropping
+        // the local-model repetition-collapse mitigations. Each is `None`
+        // unless the operator set it, so cloud sessions are unchanged.
+        //
+        // #2166 precedence (documented contract): the CONFIGURED MODEL's
+        // typed inference defaults win over the profile-gateway knobs,
+        // which win over the provider defaults —
+        //   session/turn override → model default → gateway knob → none.
+        // The session/turn tier is applied per turn in the AppUI turn
+        // path (ui_protocol_reasoning_effort.rs) and sits on top of
+        // whatever this bootstrap composition produced.
+        chat_max_tokens: profile
+            .config
+            .gateway
+            .as_ref()
+            .and_then(|g| g.max_output_tokens),
+        chat_temperature: profile.config.model_temperature.or_else(|| {
+            profile
+                .config
+                .gateway
+                .as_ref()
+                .and_then(|g| g.llm_temperature)
+        }),
+        chat_sampling_params: {
+            let mut sampling = profile
+                .config
+                .gateway
+                .as_ref()
+                .and_then(|g| g.llm_sampling_params.clone());
+            // #2166 × #2176 coordination: the typed per-model `top_p`
+            // default overrides a same-named `top_p` key in the gateway
+            // sampler passthrough map; every OTHER passthrough key
+            // (`repeat_penalty`, …) is untouched. The passthrough stays
+            // the escape hatch for params octos does not model.
+            if let Some(top_p) = profile.config.model_top_p {
+                sampling
+                    .get_or_insert_with(serde_json::Map::new)
+                    .insert("top_p".into(), serde_json::json!(top_p));
+            }
+            sampling
+        },
+        reasoning_effort: profile.config.model_reasoning_effort.or_else(|| {
+            profile
+                .config
+                .gateway
+                .as_ref()
+                .and_then(|g| g.reasoning_effort)
+        }),
+        ..Default::default()
     }
 }
 
@@ -711,6 +1026,9 @@ impl SessionRuntime {
 /// storage possible: the session store is fully root-parameterized
 /// (`SessionManager::open(root)`), so relocating it is "pass a different
 /// root", not "re-architect the store".
+///
+/// An explicit ephemeral `profile.session_store_root` takes precedence over
+/// both rules below, keeping local chat history out of the profile/workspace.
 ///
 /// - `sessions_in_cwd && had_hint` → `<cwd>/.octos/<profile_id>` (see
 ///   [`project_sessions_root`]), where `<cwd>` is the canonical hinted
@@ -737,7 +1055,9 @@ pub(crate) fn resolve_sessions_root(
     had_hint: bool,
     sessions_in_cwd: bool,
 ) -> PathBuf {
-    if sessions_in_cwd && had_hint {
+    if let Some(root) = &profile.session_store_root {
+        root.clone()
+    } else if sessions_in_cwd && had_hint {
         project_sessions_root(workspace_root, &profile.profile_id)
     } else {
         profile.data_dir.clone()
@@ -815,11 +1135,16 @@ pub(crate) fn write_active_profile_marker(canonical_cwd: &Path, profile_id: &str
 /// canonical `workspace_root`. A canonicalization failure (e.g. a hint that
 /// bootstrap will itself reject as banned/nonexistent) falls back to the raw
 /// path; nothing is cached under a rejected hint, so the fallback is inert.
+/// The ephemeral override takes precedence here too, so cache identity and
+/// actual persistence cannot disagree about the local frontend's store root.
 pub(crate) fn resolve_sessions_root_from_hint(
     profile: &ProfileRuntime,
     workspace_hint: Option<&Path>,
     sessions_in_cwd: bool,
 ) -> PathBuf {
+    if let Some(root) = &profile.session_store_root {
+        return root.clone();
+    }
     match (sessions_in_cwd, workspace_hint) {
         (true, Some(hint)) => {
             let canonical = std::fs::canonicalize(hint).unwrap_or_else(|_| hint.to_path_buf());
@@ -913,17 +1238,45 @@ context_ledgers/
 /// `write_workspace_policy` (no semantic change to the legacy
 /// function).
 fn bootstrap_session_policy(workspace_root: &Path) -> Result<()> {
-    write_workspace_policy_if_absent(workspace_root, &WorkspacePolicy::for_session())
+    // Audit Gap-1 wiring (#2129): `detect_workspace_policy_kind` and
+    // `WorkspacePolicy::for_coding` were authored for exactly this call
+    // site but never called — every session workspace was bootstrapped as
+    // the generic `for_session()` policy, so a repo full of Rust got the
+    // same contract as a podcast workspace. The detector keys on observable
+    // manifests (Cargo.toml / package.json / pyproject.toml), not LLM input.
+    let policy = match octos_agent::workspace_policy::detect_workspace_policy_kind(workspace_root) {
+        octos_agent::workspace_policy::WorkspacePolicyKind::Coding => WorkspacePolicy::for_coding(),
+        _ => WorkspacePolicy::for_session(),
+    };
+    write_workspace_policy_if_absent(workspace_root, &policy)
         .wrap_err("failed to bootstrap session workspace policy")
 }
 
+/// Finite iteration backstop for the UNATTENDED lanes (`octos gateway`,
+/// `octos serve` session actors) when neither the CLI flag nor
+/// `gateway.max_iterations` is configured.
+///
+/// `AgentConfig::default().max_iterations` is `0` (unlimited) on purpose for
+/// the INTERACTIVE lanes (`octos chat`, `octos acp`), where a human is attached
+/// and can interrupt. An unattended channel session has no such operator: the
+/// idle/activity timeouts never fire for a loop that keeps emitting progress,
+/// `max_tokens` defaults to `None`, and loop detection is non-terminal, so this
+/// cap is the only remaining backstop for an actively-looping agent. `50`
+/// restores the ceiling these lanes had before the default became unlimited;
+/// spawned sub-agents keep their own, higher default
+/// (`DEFAULT_SPAWN_MAX_ITERATIONS` in `octos-agent/src/tools/spawn.rs`). An
+/// explicit `0` in config still means unlimited.
+pub(crate) const UNATTENDED_MAX_ITERATIONS_FALLBACK: u32 =
+    super::turn_policy::AUTONOMOUS_MAX_ITERATIONS;
+
 /// Resolve the per-session agent iteration budget from the profile's
-/// configured `gateway.max_iterations`, falling back to the `AgentConfig`
-/// default when unset. Spawned sub-agents inherit the resulting config, so
-/// this is also the cap for background workers — `None` must not collapse to a
-/// small hardcoded value the way the previous fixed `20` did.
+/// configured `gateway.max_iterations`, falling back to
+/// [`UNATTENDED_MAX_ITERATIONS_FALLBACK`] when unset. Session actors are an
+/// unattended lane, so they never inherit the unlimited interactive default;
+/// spawned sub-agents replace the budget with their own finite default at
+/// dispatch time.
 fn resolve_session_max_iterations(configured: Option<u32>) -> u32 {
-    configured.unwrap_or_else(|| AgentConfig::default().max_iterations)
+    super::turn_policy::max_iterations(configured, super::turn_policy::TurnIntent::Autonomous)
 }
 
 /// Resolve a per-session workspace root.
@@ -1053,22 +1406,128 @@ mod tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
+    #[tokio::test]
+    async fn read_only_session_bootstrap_does_not_write_the_selected_workspace() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = make_profile(data.path().to_owned()).await;
+        let runtime = SessionRuntime::bootstrap_with_permissions(
+            &profile,
+            SessionKey::with_profile("main", "cli", "read-only-migration"),
+            Some(workspace.path().to_owned()),
+            octos_agent::EffectivePermissions::read_only(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_dir(workspace.path()).unwrap().count(),
+            0,
+            "a read-only frontend must not create workspace policy or plugin scratch files"
+        );
+        assert!(runtime.plugin_work_dir.starts_with(data.path()));
+        assert!(!runtime.plugin_work_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn writable_session_bootstrap_keeps_skill_output_lazy_and_preserves_artifacts() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = make_profile(data.path().to_owned()).await;
+        let key = SessionKey::new("cli", "lazy-skill-output");
+        let runtime = SessionRuntime::bootstrap_with_permissions(
+            &profile,
+            key.clone(),
+            Some(workspace.path().to_owned()),
+            EffectivePermissions::workspace_write(),
+        )
+        .await
+        .unwrap();
+        let output_dir = runtime.workspace_root.join("skill-output");
+        assert_eq!(runtime.plugin_work_dir, output_dir);
+        assert!(runtime.workspace_root.join(WORKSPACE_POLICY_FILE).is_file());
+        assert!(
+            !output_dir.exists(),
+            "bootstrap must not create skill-output"
+        );
+
+        // Existing output stays at the same path when the session reopens.
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let artifact = output_dir.join("report.md");
+        std::fs::write(&artifact, "existing report").unwrap();
+        drop(runtime);
+        let reopened = SessionRuntime::bootstrap_with_permissions(
+            &profile,
+            key,
+            Some(workspace.path().to_owned()),
+            EffectivePermissions::workspace_write(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reopened.plugin_work_dir, output_dir);
+        assert_eq!(
+            std::fs::read_to_string(artifact).unwrap(),
+            "existing report"
+        );
+    }
+
     #[test]
-    fn resolve_session_max_iterations_honors_config_else_default() {
+    fn should_fall_back_to_finite_unattended_cap_when_session_max_iterations_unset() {
         // A configured gateway.max_iterations must be respected (the bug was a
-        // hardcoded 20 that ignored it and starved spawned sub-agents).
+        // hardcoded 20 that ignored it and starved spawned sub-agents), and an
+        // explicit 0 keeps its documented "unlimited" meaning.
         assert_eq!(resolve_session_max_iterations(Some(120)), 120);
         assert_eq!(resolve_session_max_iterations(Some(5)), 5);
-        // Unset falls back to the AgentConfig default (50), not the old 20.
+        assert_eq!(resolve_session_max_iterations(Some(0)), 0);
+        // Session actors are an UNATTENDED lane: nobody can interrupt a loop
+        // that keeps emitting progress, so unset must resolve to a concrete
+        // finite backstop — neither the unlimited interactive `AgentConfig`
+        // default nor the old fixed 20-call cap.
+        assert_eq!(resolve_session_max_iterations(None), 50);
         assert_eq!(
             resolve_session_max_iterations(None),
-            AgentConfig::default().max_iterations
+            UNATTENDED_MAX_ITERATIONS_FALLBACK
+        );
+        assert_ne!(
+            resolve_session_max_iterations(None),
+            AgentConfig::default().max_iterations,
+            "unset must not inherit the unlimited interactive default"
         );
         assert_ne!(
             resolve_session_max_iterations(None),
             20,
             "unset must not collapse to the old hardcoded cap"
         );
+    }
+
+    #[tokio::test]
+    async fn session_rebinding_preserves_local_tool_profile() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut profile = make_profile(data.path().to_owned()).await;
+        let coding = octos_agent::profile::ProfileDefinition::from_toml_str(
+            r#"version = 1
+name = "minimal"
+[tools]
+mode = "allow_list"
+tools = ["read_file"]
+"#,
+        )
+        .unwrap();
+        Arc::get_mut(&mut profile).unwrap().agent_profile = Some(Arc::new(coding));
+        let runtime = SessionRuntime::bootstrap_with_permissions(
+            &profile,
+            SessionKey::with_profile("main", "acp", "narrow"),
+            Some(workspace.path().to_owned()),
+            octos_agent::EffectivePermissions::workspace_write(),
+        )
+        .await
+        .unwrap();
+        assert!(runtime.tools.get("read_file").is_some());
+        assert!(
+            runtime.tools.get("shell").is_none(),
+            "cwd rebinding must not restore excluded tools"
+        );
+        assert!(runtime.tools.get("run_pipeline").is_none());
     }
 
     use octos_agent::sandbox::create_sandbox;
@@ -1127,12 +1586,17 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let recall = Arc::new(
+            octos_memory::RecallStore::open(&data_dir, octos_memory::RecallConfig::default())
+                .unwrap(),
+        );
         let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
         let base_tools =
             ToolRegistry::with_builtins_and_sandbox(&data_dir, create_sandbox(&sandbox));
         Arc::new(ProfileRuntime {
             profile_id: "_main".to_string(),
             data_dir,
+            session_store_root: None,
             config: crate::config::Config::default(),
             llm: Arc::new(StubLlm),
             goal_verifier_llm: None,
@@ -1146,6 +1610,8 @@ mod tests {
             tool_policy: None,
             default_sandbox: sandbox,
             max_iterations: None,
+            session_defaults: None,
+            agent_profile: None,
             format_after_edit: false,
             snapshots: None,
             tool_specs: Arc::new(base_tools),
@@ -1164,6 +1630,7 @@ mod tests {
             system_prompt,
             memory,
             memory_store,
+            recall,
             embedder: None,
             memory_inject_tokens: 2500,
             memory_refresh_enabled: true,
@@ -1227,6 +1694,173 @@ mod tests {
             prompt.contains("Friday again"),
             "read-refresh must pick up post-bootstrap consolidations: {prompt}"
         );
+    }
+
+    #[tokio::test]
+    async fn serve_sessions_drop_channel_slash_commands_and_take_client_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt =
+            "base rules\n\n## Slash Commands\n\n- `/router` — server router\n\n## Other Rules\n\nbe kind"
+                .to_string();
+        let profile = make_profile_with_prompt(dir.path().to_path_buf(), prompt).await;
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "cmds"), None)
+            .await
+            .expect("bootstrap");
+        let before = rt.agent.system_prompt_snapshot();
+        assert!(!before.contains("`/router`"));
+        assert!(!before.contains("## Slash Commands"));
+        assert!(before.contains("be kind"));
+
+        let accepted =
+            rt.apply_client_commands(1, &["/model".into(), "/router".into(), "/add-model".into()]);
+        assert_eq!(accepted, ["/model", "/add-model"]);
+        let after = rt.agent.system_prompt_snapshot();
+        assert!(!after.contains("`/router`"));
+        assert!(after.contains("`/model`"));
+        assert!(after.contains("`/add-model`"));
+        assert!(after.contains("be kind"));
+
+        rt.apply_client_commands(1, &[]);
+        let none = rt.agent.system_prompt_snapshot();
+        assert!(!none.contains("`/router`"));
+        assert!(!none.contains("`/model`"));
+    }
+
+    #[tokio::test]
+    async fn client_commands_are_released_only_by_the_declaring_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = make_profile(dir.path().to_path_buf()).await;
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "owner"), None)
+            .await
+            .expect("bootstrap");
+
+        rt.apply_client_commands(1, &["/model".into()]);
+        rt.release_client_commands(2);
+        assert!(
+            rt.agent.system_prompt_snapshot().contains("`/model`"),
+            "another connection closing must not clear this declaration"
+        );
+
+        rt.release_client_commands(1);
+        assert!(!rt.agent.system_prompt_snapshot().contains("`/model`"));
+
+        rt.apply_client_commands(1, &["/model".into()]);
+        rt.apply_client_commands(2, &["/add-model".into()]);
+        rt.release_client_commands(1);
+        assert!(
+            rt.agent.system_prompt_snapshot().contains("`/add-model`"),
+            "a superseded declarer closing must not clear the newer declaration"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_agent_threads_profile_gateway_llm_knobs() {
+        // #2172: a serve / octoscode session must honor the profile's gateway
+        // LLM knobs (temperature, sampler, max output) rather than silently
+        // falling back to the greedy 0.0 / 16384 / no-sampler defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = make_profile(dir.path().to_path_buf()).await;
+        let mut sp = serde_json::Map::new();
+        sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+        Arc::get_mut(&mut profile).unwrap().config.gateway = Some(crate::config::GatewayConfig {
+            max_output_tokens: Some(32768),
+            llm_temperature: Some(0.7),
+            llm_sampling_params: Some(sp),
+            reasoning_effort: Some(octos_llm::ReasoningEffort::High),
+            ..Default::default()
+        });
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "gw"), None)
+            .await
+            .expect("bootstrap");
+        let cfg = rt.agent.agent_config();
+        assert_eq!(cfg.chat_max_tokens, Some(32768));
+        assert_eq!(cfg.chat_temperature, Some(0.7));
+        assert_eq!(
+            cfg.chat_sampling_params
+                .and_then(|m| m.get("repeat_penalty").cloned()),
+            Some(serde_json::json!(1.1))
+        );
+        assert_eq!(cfg.reasoning_effort, Some(octos_llm::ReasoningEffort::High));
+    }
+
+    #[tokio::test]
+    async fn session_agent_prefers_model_inference_defaults_over_gateway_knobs() {
+        // #2166 precedence, pinned: the CONFIGURED PRIMARY model's typed
+        // inference defaults win over the profile-gateway knobs —
+        //   session/turn override → model default → gateway knob → none —
+        // and the #2176 gateway sampler passthrough stays intact except for
+        // the same-named `top_p` key, which the typed model default
+        // overrides. (The session/turn tier is applied per turn on top of
+        // this composition by ui_protocol_reasoning_effort.rs.)
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = make_profile(dir.path().to_path_buf()).await;
+        {
+            let cfg = Arc::get_mut(&mut profile).unwrap();
+            cfg.config.model_temperature = Some(0.4);
+            cfg.config.model_top_p = Some(0.9);
+            cfg.config.model_reasoning_effort = Some(octos_llm::ReasoningEffort::High);
+            let mut sp = serde_json::Map::new();
+            sp.insert("repeat_penalty".to_string(), serde_json::json!(1.1));
+            sp.insert("top_p".to_string(), serde_json::json!(0.8));
+            cfg.config.gateway = Some(crate::config::GatewayConfig {
+                max_output_tokens: Some(32768),
+                llm_temperature: Some(0.7),
+                llm_sampling_params: Some(sp),
+                reasoning_effort: Some(octos_llm::ReasoningEffort::Low),
+                ..Default::default()
+            });
+        }
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "gw3"), None)
+            .await
+            .expect("bootstrap");
+        let cfg = rt.agent.agent_config();
+        // Model default beats the gateway knob.
+        assert_eq!(
+            cfg.chat_temperature,
+            Some(0.4),
+            "model default must win over gateway llm_temperature"
+        );
+        assert_eq!(
+            cfg.reasoning_effort,
+            Some(octos_llm::ReasoningEffort::High),
+            "model default must win over gateway reasoning_effort"
+        );
+        // Typed model top_p overrides the same-named passthrough key…
+        let top_p = cfg
+            .chat_sampling_params
+            .as_ref()
+            .and_then(|m| m.get("top_p"))
+            .and_then(|value| value.as_f64())
+            .expect("typed top_p rides the sampler map");
+        assert!(
+            (top_p - 0.9).abs() < 1e-6,
+            "typed model top_p must win over the gateway passthrough key: {top_p}"
+        );
+        // …while UNRELATED passthrough keys are untouched.
+        assert_eq!(
+            cfg.chat_sampling_params
+                .as_ref()
+                .and_then(|m| m.get("repeat_penalty").cloned()),
+            Some(serde_json::json!(1.1)),
+            "the #2176 passthrough stays intact for params octos does not model"
+        );
+        // Gateway-only fields still thread through unchanged.
+        assert_eq!(cfg.chat_max_tokens, Some(32768));
+    }
+
+    #[tokio::test]
+    async fn session_agent_keeps_defaults_when_profile_has_no_gateway_knobs() {
+        // Cloud-safety: a profile without the gateway knobs yields None (the
+        // built-in defaults), so serve behavior is unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let profile = make_profile(dir.path().to_path_buf()).await;
+        let rt = SessionRuntime::bootstrap(&profile, SessionKey::new("appui", "gw2"), None)
+            .await
+            .expect("bootstrap");
+        let cfg = rt.agent.agent_config();
+        assert_eq!(cfg.chat_max_tokens, None);
+        assert_eq!(cfg.chat_temperature, None);
+        assert_eq!(cfg.chat_sampling_params, None);
     }
 
     #[tokio::test]
@@ -1418,9 +2052,9 @@ mod tests {
         let expected_policy = WorkspacePolicy::for_session();
         assert_eq!(loaded, expected_policy);
 
-        // Plugin work dir is created and lives under workspace root.
-        assert!(rt.plugin_work_dir.is_dir());
-        assert!(rt.plugin_work_dir.starts_with(&rt.workspace_root));
+        // Resolving the output path must not create an unused directory.
+        assert_eq!(rt.plugin_work_dir, rt.workspace_root.join("skill-output"));
+        assert!(!rt.plugin_work_dir.exists());
     }
 
     #[tokio::test]
@@ -1805,6 +2439,10 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let memory = Arc::new(EpisodeStore::open(&data_dir).await.unwrap());
         let memory_store = Arc::new(MemoryStore::open(&data_dir).await.unwrap());
+        let recall = Arc::new(
+            octos_memory::RecallStore::open(&data_dir, octos_memory::RecallConfig::default())
+                .unwrap(),
+        );
         let tool_config = Arc::new(octos_agent::ToolConfigStore::open(&data_dir).await.unwrap());
         let sandbox = SandboxConfig::default();
         let base_tools =
@@ -1812,6 +2450,7 @@ mod tests {
         Arc::new(ProfileRuntime {
             profile_id: "_main".to_string(),
             data_dir,
+            session_store_root: None,
             config: crate::config::Config::default(),
             llm: Arc::new(StubLlm),
             goal_verifier_llm: None,
@@ -1826,6 +2465,8 @@ mod tests {
             default_sandbox: sandbox,
             max_iterations: None,
             format_after_edit: false,
+            session_defaults: None,
+            agent_profile: None,
             snapshots: None,
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
@@ -1843,6 +2484,7 @@ mod tests {
             },
             memory,
             memory_store,
+            recall,
             embedder: None,
             memory_inject_tokens: 2500,
             memory_refresh_enabled: true,
@@ -1891,6 +2533,39 @@ mod tests {
             Arc::ptr_eq(&agent_hooks, &executor),
             "agent.hooks() must be the same Arc as profile.hook_executor",
         );
+    }
+
+    /// #2246 — the session agent's hook context must carry both ids at
+    /// session construction: before this, `octos chat` / `serve --stdio`
+    /// fired `before_llm_call` / `after_llm_call` / `after_tool_call`
+    /// payloads with no `session_id` / `profile_id`, leaving per-session
+    /// hook policy (budget, rate limit, audit) stateless-blind.
+    #[tokio::test]
+    async fn session_runtime_agent_carries_hook_context_ids() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("profile-data");
+        let hook = octos_agent::HookConfig {
+            event: octos_agent::HookEvent::BeforeLlmCall,
+            command: vec!["/bin/true".to_string()],
+            timeout_ms: 1000,
+            tool_filter: Vec::new(),
+            path_filter: Vec::new(),
+            requires_bin: None,
+        };
+        let executor = Arc::new(octos_agent::HookExecutor::new(vec![hook]));
+        let profile = make_profile_with_hooks(data_dir, executor).await;
+
+        let key = SessionKey::new("api", "hook-probe");
+        let rt = SessionRuntime::bootstrap(&profile, key.clone(), None)
+            .await
+            .expect("bootstrap");
+
+        let ctx = rt
+            .agent
+            .hook_context()
+            .expect("session agent must carry a hook context (#2246)");
+        assert_eq!(ctx.session_id.as_deref(), Some(key.to_string().as_str()));
+        assert_eq!(ctx.profile_id.as_deref(), Some("_main"));
     }
 
     #[tokio::test]

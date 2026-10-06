@@ -503,8 +503,7 @@ mod tests {
                 .iter()
                 .any(|(p, m)| p == "moonshot" && m == "kimi-k2.5"),
             "moonshot/kimi-k2.5 must appear in InstructionStrong defaults \
-             (mini3/5 declared primary); current list: {:?}",
-            strong,
+             (mini3/5 declared primary); current list: {strong:?}",
         );
     }
 
@@ -521,8 +520,7 @@ mod tests {
                 .iter()
                 .any(|(p, m)| p == "moonshot" && m == "kimi-k2.6"),
             "moonshot/kimi-k2.6 must appear in InstructionStrong defaults \
-             — this is the observed mini1 fallback slot. current list: {:?}",
-            strong,
+             — this is the observed mini1 fallback slot. current list: {strong:?}",
         );
     }
 
@@ -544,9 +542,7 @@ mod tests {
             !matched.is_empty(),
             "InstructionStrong filter found zero matches against the \
              documented mini1 chain — RFC-3 still inert on production. \
-             defaults={:?} slots={:?}",
-            defaults,
-            mini1_slots,
+             defaults={defaults:?} slots={mini1_slots:?}",
         );
         // And confirm the match is on the fallback slot specifically.
         assert!(
@@ -554,8 +550,7 @@ mod tests {
                 .iter()
                 .any(|(p, m)| *p == "moonshot" && *m == "kimi-k2.6"),
             "InstructionStrong must match the mini1 fallback (moonshot/kimi-k2.6); \
-             matched slots: {:?}",
-            matched,
+             matched slots: {matched:?}",
         );
     }
 
@@ -582,10 +577,7 @@ mod tests {
             k25_idx < k26_idx,
             "moonshot/kimi-k2.5 (primary) must precede moonshot/kimi-k2.6 \
              (fallback) so Off/Hedge mode picks k2.5 when both are in the \
-             chain; got k2.5_idx={} k2.6_idx={}, list={:?}",
-            k25_idx,
-            k26_idx,
-            strong,
+             chain; got k2.5_idx={k25_idx} k2.6_idx={k26_idx}, list={strong:?}",
         );
     }
 
@@ -604,9 +596,7 @@ mod tests {
         assert!(
             !matched.is_empty(),
             "InstructionStrong filter found zero matches against the \
-             mini3/5 declared chain. defaults={:?} slots={:?}",
-            defaults,
-            slots,
+             mini3/5 declared chain. defaults={defaults:?} slots={slots:?}",
         );
     }
 
@@ -617,8 +607,7 @@ mod tests {
             fast.iter()
                 .any(|(p, m)| p == "moonshot" && m == "kimi-k2.6"),
             "moonshot/kimi-k2.6 must appear in FastChat defaults so dspfac \
-             fleet primary matches the lane filter; current list: {:?}",
-            fast,
+             fleet primary matches the lane filter; current list: {fast:?}",
         );
     }
 
@@ -632,8 +621,7 @@ mod tests {
             code.iter()
                 .any(|(p, m)| p == "moonshot" && m == "kimi-k2.5"),
             "moonshot/kimi-k2.5 must appear in CodeCapable defaults; \
-             current list: {:?}",
-            code,
+             current list: {code:?}",
         );
     }
 
@@ -646,8 +634,7 @@ mod tests {
             fast.iter()
                 .any(|(p, m)| p == "wisemodel" && m == "kimi-k2.6"),
             "wisemodel/kimi-k2.6 must remain in FastChat defaults for \
-             backward compatibility; current list: {:?}",
-            fast,
+             backward compatibility; current list: {fast:?}",
         );
     }
 
@@ -660,8 +647,7 @@ mod tests {
             strong.first().map(|(p, m)| (p.as_str(), m.as_str())),
             Some(("anthropic", "claude-sonnet-4-6")),
             "anthropic/claude-sonnet-4-6 must remain at the front of \
-             InstructionStrong defaults; current list: {:?}",
-            strong,
+             InstructionStrong defaults; current list: {strong:?}",
         );
     }
 

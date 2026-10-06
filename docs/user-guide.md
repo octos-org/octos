@@ -44,6 +44,12 @@ Octos is a Rust-native AI agent platform that runs in three modes:
 - **`octos gateway`** — A single gateway instance serving messaging channels (Telegram, Discord, DingTalk, Slack, WhatsApp, Matrix, Feishu, Email, WeChat, WeCom, WeCom Bot, QQ Bot, Twilio).
 - **`octos chat`** — Interactive CLI chat for development and testing.
 
+Chat and `octos acp` use the same OUP session runtime as OctosCode, via an
+in-process connection. Both require the default `api` feature; no extra server
+process or network listener is required. They share OUP history, compaction,
+permissions and cancellation. ACP supports `session/load` replay and typed tool
+permissions; structured OUP user questions remain a terminal/OctosCode feature.
+
 ### Architecture
 
 ```
@@ -55,7 +61,7 @@ octos serve (control plane + dashboard, ~140 REST endpoints)
        │
        ├── LLM Provider (15 providers via AdaptiveRouter → ProviderChain → RetryProvider)
        ├── Tool Registry (~50 built-ins + plugins + 9 user-facing app-skills)
-       │     LRU deferral keeps ~15 active; spawn_only auto-routes to background
+       │     Full enabled tool set sent each turn; spawn_only auto-routes to background
        ├── Sandbox (bwrap / sandbox-exec / Docker / Windows AppContainer)
        ├── Pipeline Engine (DOT graphs, per-node model, bounded fan-out)
        ├── Swarm Dispatcher (/api/swarm/dispatch — fan-out to N sub-agents)
@@ -236,11 +242,51 @@ Progress is tracked server-side via:
 
 Source: `crates/octos-cli/src/api/admin_setup.rs`, `dashboard/src/pages/wizard/`.
 
+### 2.5 Stopping the Server
+
+- **Ctrl+C** — in the terminal running the foreground `octos serve`.
+- **Service manager** — for installed services:
+
+  ```bash
+  # Linux (systemd)
+  sudo systemctl stop octos-serve
+
+  # macOS (launchd)
+  sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+  ```
+
+- **`server/shutdown` (WebSocket, local solo only)** — a UI Protocol client connected over the authenticated WebSocket at `/api/ui-protocol/ws` can stop the server the same way Ctrl+C does: connections drain, gateways stop, the process exits. The call is idempotent, and the stop fires ~250 ms after the request is handled; under outbound backpressure the client may miss the acknowledgement, but the stop still happens. It is accepted only on a local deployment (`config.mode = "local"`) with solo login opted in (`octos serve --solo` / `OCTOS_SOLO_LOGIN=1`) and only by an HTTP serve (`octos serve` without `--stdio`); fleet/hosted servers and `--stdio` serve answer `invalid_request` (-32600) with `data.kind: "server_shutdown_unavailable"` and keep running, and session-scoped connections can never call it. One call stops the process for every connected client — their running turns are cancelled. On a solo serve this follows the local-solo trust model: any local process that can reach the WebSocket can stop the server. A host-managed serve (`octos serve --host-managed`, see `docs/HOST_MANAGED_SERVE.md`) never offers it: its host stops it by closing stdin.
+
+### 2.6 Giving an External Agent Session Access (Work Secrets)
+
+An external CLI or scripted agent should not hold your dashboard bearer token. A *work secret* is a short-lived credential that grants one agent access to exactly one session, over the session-ingress WebSocket route (`/v1/session_ingress/ws/{session_id}`):
+
+```bash
+# Operator notes go to stderr, the encoded secret to stdout
+octos auth issue-work-secret \
+  --session "dspfac:local:tui#coding" \
+  --profile dspfac \
+  --ttl 1h \
+  --api-base-url http://127.0.0.1:50080
+
+# List recorded grants (SHA-256 hash prefixes only; the token is never stored)
+octos auth list-work-secrets
+
+# Revoke before expiry
+octos auth revoke-work-secret '<secret>'
+```
+
+- `--ttl` accepts values like `15m`, `1h`, or `3600s` (default `1h`); re-issuing for the same session replaces the earlier grant.
+- The guest decodes the secret and connects with `Authorization: Bearer <token>`. The `?token=` query form still works for WebSocket clients that cannot set headers, but it is deprecated and logged by the server.
+- The grant is revalidated before every client request; a revoked, expired, or replaced grant closes the live socket with close code 1008. Only methods scoped to the granted session are accepted.
+
+Full walkthrough (including a minimal Python client): `docs/OCTOS_WORK_SECRET_SESSION_INGRESS.md`.
+
 ---
 
 ## 3. Setting Up LLM Providers
 
-Octos supports 15 LLM providers out of the box. Each provider requires an API key set as an environment variable.
+Octos supports 17 LLM provider families out of the box. Cloud providers require an API key set as an environment variable; local servers (see [3.6](#36-local-models-llamacpp-ollama-vllm-lm-studio)) need none.
 
 ### 3.1 Supported Providers
 
@@ -256,11 +302,13 @@ Octos supports 15 LLM providers out of the box. Each provider requires an API ke
 | `moonshot` | `MOONSHOT_API_KEY` | kimi-k2.5 | OpenAI-compatible | `kimi` |
 | `dashscope` | `DASHSCOPE_API_KEY` | qwen-max | OpenAI-compatible | `qwen` |
 | `minimax` | `MINIMAX_API_KEY` | MiniMax-Text-01 | OpenAI-compatible | — |
+| `minimax-cn` | `MINIMAX_CN_API_KEY` | MiniMax-M3 | OpenAI-compatible | `minimaxi` |
 | `zhipu` | `ZHIPU_API_KEY` | glm-4-plus | OpenAI-compatible | `glm` |
-| `zai` | `ZAI_API_KEY` | glm-5-turbo | Anthropic-compatible | `z.ai` |
+| `zai` | `ZAI_API_KEY` | glm-5-turbo | OpenAI-compatible | `z.ai` |
 | `nvidia` | `NVIDIA_API_KEY` | meta/llama-3.3-70b-instruct | OpenAI-compatible | `nim` |
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | — |
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | — |
+| `local` | *(none)* | local-default | OpenAI-compatible | `llamacpp`, `llama.cpp`, `llama-server`, `lmstudio`, `openai-compatible` |
 
 #### How to Get API Keys
 
@@ -308,12 +356,12 @@ Octos supports 15 LLM providers out of the box. Each provider requires an API ke
 5. Set it: `export ANTHROPIC_API_KEY="your-key"`
 
 **MiniMax:**
-1. Go to [MiniMax Open Platform](https://platform.minimaxi.com/)
+1. Go to the MiniMax platform for your key's region: [international](https://platform.minimax.io/), or [China](https://platform.minimaxi.com/) — Token-plan subscription keys are issued by the China platform and are region-bound (they 401 against the international endpoint and need the `minimax-cn` family)
 2. Sign up or log in
 3. Navigate to **API Keys** in the console
 4. Click "Create API Key"
 5. Copy the key
-6. Set it: `export MINIMAX_API_KEY="your-key"`
+6. Set it: `export MINIMAX_API_KEY="your-key"` (international) or `export MINIMAX_CN_API_KEY="your-key"` (China)
 
 **Z.AI:**
 1. Go to [Z.AI Platform](https://z.ai/)
@@ -322,7 +370,7 @@ Octos supports 15 LLM providers out of the box. Each provider requires an API ke
 4. Create a new API key
 5. Copy the key
 6. Set it: `export ZAI_API_KEY="your-key"`
-7. Note: Z.AI uses the Anthropic Messages API protocol (`api_type: "anthropic"`)
+7. Note: the `zai` (`api.z.ai/api/paas/v4`) and `zai-coding` (`api.z.ai/api/coding/paas/v4`) lanes speak OpenAI Chat Completions, the only Z.AI protocol that reports prompt-cache hits. A saved `base_url` of `https://api.z.ai/api/anthropic` is migrated to the lane's OpenAI-compatible root with a warning; set `api_type: "anthropic"` to keep the (uncached) Anthropic Messages protocol
 
 **Nvidia NIM:**
 1. Go to [Nvidia NIM](https://build.nvidia.com/)
@@ -406,6 +454,8 @@ Use `base_url` to point to self-hosted or proxy endpoints:
 }
 ```
 
+For local servers (llama.cpp, Ollama, vLLM, LM Studio), prefer the unified `local` family — see [3.6](#36-local-models-llamacpp-ollama-vllm-lm-studio).
+
 ### 3.4 API Type Override
 
 The `api_type` field forces a specific API wire format:
@@ -419,7 +469,7 @@ The `api_type` field forces a specific API wire format:
 ```
 
 - `"openai"` — OpenAI Chat Completions format (default for most providers)
-- `"anthropic"` — Anthropic Messages format (for Anthropic-compatible proxies like Z.AI)
+- `"anthropic"` — Anthropic Messages format (for Anthropic-compatible proxies). For `zai` / `zai-coding` without a `base_url` this targets Z.AI's Anthropic-compatible root (`https://api.z.ai/api/anthropic`), which reports no prompt-cache hits
 
 ### 3.5 Auth Store (OAuth & Paste-Token)
 
@@ -444,6 +494,43 @@ octos auth logout --provider openai
 ```
 
 Credentials are stored in `~/.octos/auth.json` (file mode 0600). The auth store is checked **before** environment variables when resolving API keys.
+
+### 3.6 Local Models (llama.cpp, Ollama, vLLM, LM Studio)
+
+Every popular local model server speaks the same OpenAI-compatible API, so Octos unifies them under **one provider family: `local`**. You don't need to care which engine serves the model — pick `local`, point `base_url` at the server, done. The engine names also work as aliases (`"provider": "llamacpp"`, `"lmstudio"`, … all resolve to `local`).
+
+The zero-config default targets llama.cpp's `llama-server` on its standard port:
+
+```json
+{
+  "provider": "local"
+}
+```
+
+That's a complete config — no API key, no model name (single-model servers like llama.cpp and LM Studio ignore the `model` field and serve whatever they loaded), and `base_url` defaults to `http://127.0.0.1:8080/v1`.
+
+For other engines, set `base_url` to where the server listens:
+
+| Engine | Typical `base_url` | Notes |
+|---|---|---|
+| llama.cpp (`llama-server`) | `http://127.0.0.1:8080/v1` | the default — start with `llama-server -m model.gguf --jinja` |
+| Ollama | `http://127.0.0.1:11434/v1` | set `model` to a pulled model (e.g. `llama3.2`) — Ollama selects by name |
+| vLLM | `http://127.0.0.1:8000/v1` | set `model` to the served model id |
+| LM Studio | `http://127.0.0.1:1234/v1` | single-model; `model` can stay unset |
+
+```json
+{
+  "provider": "local",
+  "model": "llama3.2",
+  "base_url": "http://127.0.0.1:11434/v1"
+}
+```
+
+If the server was started with an API key (llama.cpp's `--api-key`), supply it via `api_key_env` as usual. On a **shared or multi-user machine**, do start the server with a key: an unauthenticated localhost endpoint can be bound by any local process, which would then receive your full conversation content. The engine-branded `ollama` and `vllm` families remain available and behave identically — `local` is the recommended, engine-agnostic choice.
+
+**Verify the setup with `octos doctor`.** For local families it queries the server's `/v1/models` endpoint, reports which models are actually loaded, and warns when your configured `model` isn't among them or when nothing answers on the configured port (listing the common local endpoints to check).
+
+**Tool calling caveat:** the agent loop depends on tool/function calling, and with local servers that is a property of the *model and its chat template*, not of Octos. Use a tool-capable model, and for llama.cpp start the server with `--jinja` so the template's tool support is active. If chat works but tools misbehave, this is the first thing to check.
 
 ---
 
@@ -485,7 +572,7 @@ When multiple fallback models are configured, enable adaptive routing to dynamic
 {
   "adaptive_routing": {
     "enabled": true,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -494,7 +581,7 @@ When multiple fallback models are configured, enable adaptive routing to dynamic
 }
 ```
 
-- **`latency_threshold_ms`** — Providers with average latency above this are penalized (default: 30s)
+- **`latency_threshold_ms`** — Providers with average latency above this are penalized (default: 10s)
 - **`error_rate_threshold`** — Providers with error rates above this are deprioritized (default: 30%)
 - **`probe_probability`** — Fraction of requests sent to non-primary providers as health probes (default: 10%)
 - **`probe_interval_secs`** — Minimum time between probes to the same provider (default: 60s)
@@ -959,7 +1046,8 @@ Model switches are persisted to the profile JSON file. On gateway restart, the b
 
 | Command | Description |
 |---------|-------------|
-| `/new` | Fork the conversation — creates a new session copying the last 10 messages |
+| `/new` | Clear the current session's history (same as `/clear`) |
+| `/new <name>` | Switch to — or create — a named session (`/new slides <name>` / `/new site <preset>` scaffold project sessions) |
 | `/config` | View and modify tool configuration (see [Section 6](#6-tool-configuration)) |
 | `/exit`, `/quit`, `:q` | Exit chat (CLI mode only) |
 
@@ -969,7 +1057,8 @@ Each channel:chat_id pair maintains its own session (conversation history).
 
 - **Session persistence:** JSONL files in `.octos/sessions/`
 - **Max history:** Configurable via `gateway.max_history` (default: 50 messages)
-- **Session forking:** `/new` creates a branched conversation with parent_key tracking
+- **Named sessions:** `/new <name>` switches to — or creates — a named session; bare `/new` clears history like `/clear`. If a background seal was interrupted — the history sits in sealed segments with no active file — the session self-heals: opening it, or `/new <name>` on a gateway, rebuilds the active file from the sealed segments and resumes the history instead of starting empty.
+- **Internally-forked child sessions** (e.g. background spawns) carry a `parent_key` field linking them to their origin — user-created named sessions do not.
 - **Context compaction:** Three-tier (M8.5) — working / cold / archived. When the conversation exceeds the LLM's context window, older messages are summarized to first lines (tool arguments stripped) and the oldest are pushed into the entity bank as long-term memory.
 - **Sticky `thread_id` and `committed_seq` (M8.10)** — every session has a stable `thread_id` that is bound before the first streamed event and carried on subsequent UI Protocol updates. Terminal events include `committed_seq` — the durable history sequence number of the final write — so a web client can replay deterministically after reconnect. See [SESSION_EVENT_ARCHITECTURE.md](./SESSION_EVENT_ARCHITECTURE.md).
 - **Structured resume (M8.6)** — when a worktree is missing or a sub-agent fails, the supervisor refuses to silently drop the turn and re-engages the LLM with a structured-resume payload describing the failure.
@@ -1794,6 +1883,10 @@ octos skills install user/repo --force
 octos skills --profile my-bot install user/repo
 ```
 
+The path after `user/repo` is resolved against the repository root, so a skill
+kept in a nested directory is addressed by its full path (e.g., a skill at
+`skills/my-skill` installs with `octos skills install user/repo/skills/my-skill`).
+
 **Installation process:**
 1. Tries to download pre-built binary from the skill registry (SHA-256 verified)
 2. Falls back to `cargo build --release` if `Cargo.toml` is present
@@ -2063,7 +2156,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   // Adaptive routing
   "adaptive_routing": {
     "enabled": false,
-    "latency_threshold_ms": 30000,
+    "latency_threshold_ms": 10000,
     "error_rate_threshold": 0.3,
     "probe_probability": 0.1,
     "probe_interval_secs": 60,
@@ -2101,7 +2194,7 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   ],
 
   // Agent settings
-  "max_iterations": 50,
+  "max_iterations": 0, // Unlimited interactive turn; spawn/MCP remain bounded
 
   // Embedding (for vector search in memory).
   // Remote, OpenAI-compatible:
@@ -2133,8 +2226,28 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   // Hooks
   "hooks": [],
 
-  // MCP servers
-  "mcp_servers": [],
+  // MCP servers — external tool providers octos connects to as a client.
+  // stdio: command + args (+ optional env). HTTP: url (+ headers, or oauth).
+  "mcp_servers": [
+    // {
+    //   "command": "/path/to/server",   // stdio transport
+    //   "args": ["serve", "--root", "/path/to/repo"],
+    //   // stdio children get a SANITIZED environment: only names listed in
+    //   // this map are forwarded, and injection vectors (LD_PRELOAD,
+    //   // DYLD_INSERT_LIBRARIES, NODE_OPTIONS, …) are stripped even from it.
+    //   // A server expecting inherited credentials fails silently — pass
+    //   // keys explicitly here or let the server read its own secrets file.
+    //   "env": {},
+    //   // "safe" (default) runs this server's tools concurrently;
+    //   // "exclusive" serializes them — right for a single-device driver or
+    //   // any one-at-a-time resource. Unknown values fail safe to exclusive.
+    //   "concurrency_class": "exclusive"
+    // },
+    // { "url": "https://mcp.example.com/mcp", "oauth": true, "scopes": [] }
+    // Timeouts: 30s handshake, 60s per tools/call — long-running work should
+    // be started detached by the server (return a handle) and polled via
+    // read-only tools.
+  ],
 
   // Sandbox — see docs/SANDBOX.md for full reference.
   // Backends: bwrap (Linux), sandbox-exec (macOS), AppContainer (Windows,
@@ -2166,6 +2279,11 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 
 | Variable | Description |
 |----------|-------------|
+| **Long-running turns** | |
+| `OCTOS_CONVERGENCE_LLM_CALLS` | Tools-disabled reflection interval by LLM calls (default `20`) |
+| `OCTOS_CONVERGENCE_ACTIVE_TOKENS` | Reflection interval by uncached input + output tokens (default `100000`) |
+| `OCTOS_CONVERGENCE_SECS` | Reflection interval by elapsed seconds (default `300`) |
+| `OCTOS_FILE_CHURN_THRESHOLD` | Successful edits to one file before an early reflection; the second threshold also requests model/provider escalation (default `5`) |
 | **LLM Providers** | |
 | `ANTHROPIC_API_KEY` | Anthropic (Claude) API key |
 | `OPENAI_API_KEY` | OpenAI API key |
@@ -2208,6 +2326,9 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | **Voice** | |
 | `ASR_API_URL` | Dedicated batch-ASR service base URL; overrides OMiniX for transcription |
 | `OMINIX_API_URL` | OminiX ASR/TTS API URL |
+| **Session storage** | |
+| `OCTOS_SESSION_SEGMENT_BYTES` | Active session file size at which it seals into a segment (default 8 MiB) |
+| `OCTOS_SESSION_LOAD_BUDGET_BYTES` | Session history bytes a plain load reads, newest first (default 32 MiB; `0` = unlimited) |
 | **System** | |
 | `RUST_LOG` | Log level (error/warn/info/debug/trace) |
 | `OCTOS_LOG_JSON` | Enable JSON-formatted logs (set to any value) |

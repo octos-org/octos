@@ -25,6 +25,7 @@ import {
   freshTurnId,
   liveServerEnv,
   uniqueSessionId,
+  waitForTurnTerminal,
 } from "../lib/m9-ws-client";
 
 test.describe("M9 protocol — task/output/read", () => {
@@ -157,7 +158,7 @@ test.describe("M9 protocol — task/output/read", () => {
       if (first.truncated) {
         expect(second.text).not.toBe(first.text);
       }
-      await client.waitForNotification("turn/completed", 45_000);
+      await waitForTurnTerminal(client, turnId, 45_000);
     } finally {
       await client.close();
     }

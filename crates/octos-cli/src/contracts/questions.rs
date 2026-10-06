@@ -29,6 +29,12 @@ struct QuestionEntry {
     request: UserQuestionRequestedEvent,
     runtime_resumable: bool,
     response_tx: Option<tokio::sync::oneshot::Sender<UserQuestionResolution>>,
+    /// The UI Protocol connection whose turn asked (its `ConnectionId`), when
+    /// known. See `PendingApprovalStore::pending_owner`.
+    owner_connection: Option<u64>,
+    /// Asked by an external client's turn (UPCR-2026-036): only
+    /// `owner_connection` sees or answers it.
+    external: bool,
 }
 
 #[derive(Debug)]
@@ -49,7 +55,7 @@ enum QuestionEntryState {
 /// cancelled wire event, so the production drain discards these; the fields
 /// are read by the store tests and by the follow-up wire-emit slice.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct CancelledQuestion {
     pub(crate) question_id: QuestionId,
     pub(crate) turn_id: TurnId,
@@ -68,9 +74,20 @@ pub(crate) struct PendingQuestionStore {
 impl PendingQuestionStore {
     /// Register a runtime-blocking question and return the oneshot the waiting
     /// tool awaits. Mirrors `PendingApprovalStore::request_runtime`.
+    #[cfg(test)]
     pub(crate) fn request_runtime(
         &self,
         event: UserQuestionRequestedEvent,
+    ) -> tokio::sync::oneshot::Receiver<UserQuestionResolution> {
+        self.request_runtime_owned(event, None)
+    }
+
+    /// [`Self::request_runtime`], recording the connection that owns the
+    /// question (see [`Self::pending_owner`]).
+    pub(crate) fn request_runtime_owned(
+        &self,
+        event: UserQuestionRequestedEvent,
+        owner_connection: Option<u64>,
     ) -> tokio::sync::oneshot::Receiver<UserQuestionResolution> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
@@ -82,6 +99,8 @@ impl PendingQuestionStore {
                 request: event,
                 runtime_resumable: true,
                 response_tx: Some(tx),
+                owner_connection,
+                external: false,
             },
         );
         rx
@@ -202,6 +221,44 @@ impl PendingQuestionStore {
     /// `PendingApprovalStore::pending_for_session`. Replayed on `session/open`
     /// and `session/hydrate` (gated by `user_question.v1`) so a reconnecting
     /// client re-renders and can still answer a pending question.
+    /// The owning connection of a PENDING question of `session_id`: `None`
+    /// when no such question is pending, `Some(None)` when it has no recorded
+    /// owner.
+    pub(crate) fn pending_owner(
+        &self,
+        session_id: &SessionKey,
+        question_id: &QuestionId,
+    ) -> Option<Option<u64>> {
+        let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
+        entries
+            .get(question_id)
+            .filter(|entry| {
+                entry.session_id == *session_id
+                    && matches!(&entry.state, QuestionEntryState::Pending)
+            })
+            .map(|entry| entry.owner_connection)
+    }
+
+    /// Mark question `question_id` as asked by an external client's turn
+    /// (UPCR-2026-036): see [`Self::external_owner`].
+    pub(crate) fn mark_external(&self, question_id: &QuestionId) {
+        let mut entries = self.entries.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = entries.get_mut(question_id) {
+            entry.external = true;
+        }
+    }
+
+    /// For a question asked by an external client's turn (in any state):
+    /// `Some(owning connection)`, which alone may see or answer it. `None`
+    /// for every other question.
+    pub(crate) fn external_owner(&self, question_id: &QuestionId) -> Option<Option<u64>> {
+        let entries = self.entries.read().unwrap_or_else(|p| p.into_inner());
+        entries
+            .get(question_id)
+            .filter(|entry| entry.external)
+            .map(|entry| entry.owner_connection)
+    }
+
     pub(crate) fn pending_for_session(
         &self,
         session_id: &SessionKey,

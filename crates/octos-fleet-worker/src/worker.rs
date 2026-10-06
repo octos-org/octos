@@ -330,6 +330,13 @@ pub async fn run_attempt(
              attempt instead of running the agent unsandboxed",
         );
         Computed::terminated("no isolating sandbox available at attempt time".to_string())
+    } else if let Some(refusal) = sandbox.refusal() {
+        tracing::error!(
+            %fleet_id, %task_id, %attempt_id, %refusal,
+            "fleet worker: sandbox resolution refused at attempt time; terminating the \
+             attempt (every command would refuse to run)",
+        );
+        Computed::terminated(format!("sandbox unavailable at attempt time: {refusal}"))
     } else if !worktree_backend_ok {
         tracing::error!(
             %fleet_id, %task_id, %attempt_id,
@@ -1568,6 +1575,11 @@ mod tests {
             || NOW,
         )
         .await;
+        // Platform-true verdict pin: on Unix the CommandExit validator runs and
+        // must accept; on Windows a real sandbox fails command validators closed
+        // (#1607), so the same run must end Rejected. The factory-once pin below
+        // is platform-independent.
+        #[cfg(unix)]
         assert!(
             matches!(
                 outcome,
@@ -1576,6 +1588,16 @@ mod tests {
                 }
             ),
             "CommandExit `true` must be accepted, got {outcome:?}",
+        );
+        #[cfg(windows)]
+        assert!(
+            matches!(
+                outcome,
+                AttemptOutcome::Completed {
+                    verdict: AcceptanceVerdict::Rejected { .. }
+                }
+            ),
+            "a real sandbox must fail the CommandExit validator closed on Windows (#1607), got {outcome:?}",
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1652,6 +1674,87 @@ mod tests {
         assert_eq!(child.status, ChildStatus::Failed);
     }
 
+    /// Fail-closed twin of the no-op gate: a REFUSING sandbox resolution at
+    /// attempt time (explicit mode unhonorable on this host, or
+    /// `sandbox.fail_closed` with no backend) must also terminate the attempt
+    /// before the agent is built — its `is_noop()` is `false` (nothing runs
+    /// unconfined), so without the dedicated refusal check the agent would be
+    /// built and every command would refuse one by one.
+    #[tokio::test]
+    async fn run_attempt_terminates_when_sandbox_resolution_refuses() {
+        use octos_agent::sandbox::{RefusingSandbox, SandboxUnavailable};
+
+        let (_sd, store) = fresh_store().await;
+        let fleet = create_fleet(
+            store.clone(),
+            "f1",
+            vec![task_spec("a", &[], file_exists("out.txt"))],
+        )
+        .await;
+        let attempt = launch(&store, "f1", "a").await;
+
+        let work = TempDir::new().unwrap();
+        let (_md, memory) = fresh_memory().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory = AgentFactory::new(
+            Arc::new(CountingProvider {
+                calls: calls.clone(),
+            }),
+            memory,
+            Arc::new(|_, _| {
+                Arc::new(RefusingSandbox {
+                    error: SandboxUnavailable {
+                        requested: "landlock".to_string(),
+                        reason: "test refusal".to_string(),
+                        remediation: "install a backend".to_string(),
+                    },
+                }) as Arc<dyn Sandbox>
+            }),
+        );
+        let task_view = view_of(&fleet, "a").await;
+
+        let outcome = run_attempt(
+            store.clone(),
+            "f1",
+            "a",
+            &attempt,
+            &task_view,
+            &factory,
+            work.path(),
+            None,
+            Duration::from_secs(30),
+            EPOCH,
+            slot(),
+            tracker(),
+            PROJECTED,
+            || NOW,
+        )
+        .await;
+
+        match outcome {
+            AttemptOutcome::Completed {
+                verdict: AcceptanceVerdict::Terminated { ref reason, .. },
+            } => {
+                assert!(
+                    reason.contains("sandbox unavailable"),
+                    "termination carries the typed refusal: {reason}"
+                );
+            }
+            other => panic!("a refusing sandbox must Terminate the attempt, got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the agent/LLM must never run under a refusing sandbox",
+        );
+        let child = store.get_child("f1", "a").await.unwrap().unwrap();
+        assert_eq!(child.status, ChildStatus::Failed);
+    }
+
+    // POSIX premise (`sleep` is a Unix command); a Windows real sandbox also
+    // fails command validators closed (#1607) — pinned in octos-agent's
+    // validator_runner tests.
+    #[cfg(unix)]
     #[tokio::test]
     async fn acceptance_command_terminates_past_deadline() {
         // P1-5b: a CommandExit validator that sleeps past the remaining

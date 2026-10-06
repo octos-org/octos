@@ -1,0 +1,17 @@
+{
+  "id": "duckduckgo",
+  "name": "DuckDuckGo",
+  "categories": ["general"],
+  "languages": ["*"],
+  "hosts": ["html.duckduckgo.com"],
+  "results_page": true,
+  "rate_limit": {
+    "min_interval_ms": 3000,
+    "source": "No published limit for the results page; kept to a person's pace (one search every few seconds)."
+  },
+  "docs_url": ["https://html.duckduckgo.com/html/", "https://duckduckgo.com/duckduckgo-help-pages/settings/params/"],
+  "license_note": "DuckDuckGo's no-JavaScript results page, read for one person (ADR 0002 §6). Titles, snippets and links only; a challenge page is reported, never worked around.",
+  "weight": 1.0,
+  "cache_ttl_secs": 900,
+  "timeout_secs": 10
+}

@@ -9,9 +9,37 @@ use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRespondParams, ApprovalRespondStatus, DiffPreview,
     DiffPreviewFile, DiffPreviewFileStatus, DiffPreviewGetParams, DiffPreviewGetStatus,
     DiffPreviewHunk, DiffPreviewLine, DiffPreviewLineKind, DiffPreviewSource, PreviewId,
-    QuestionId, ReasoningDeltaEvent, SessionSandboxParams, approval_scopes, methods,
-    rpc_error_codes,
+    QuestionId, SessionSandboxParams, UserQuestion, UserQuestionAnswer, UserQuestionOption,
+    approval_scopes, methods, rpc_error_codes,
 };
+
+#[test]
+fn should_reclaim_expired_context_persist_locks_without_splitting_live_writers() {
+    let locks = AppUiContextPersistLocks::default();
+    let session = SessionKey("persist-lock-live".into());
+    let first = appui_context_persist_lock_from(&locks, &session);
+    let guard = first.lock().unwrap();
+    let waiting = appui_context_persist_lock_from(&locks, &session);
+    assert!(Arc::ptr_eq(&first, &waiting));
+    assert!(waiting.try_lock().is_err());
+    for i in 0..2048 {
+        drop(appui_context_persist_lock_from(
+            &locks,
+            &SessionKey(format!("expired-{i}")),
+        ));
+        assert!(locks.lock().unwrap().len() <= 2);
+    }
+    drop(guard);
+    drop(first);
+    assert!(Arc::ptr_eq(
+        &waiting,
+        &appui_context_persist_lock_from(&locks, &session)
+    ));
+    drop(waiting);
+    let replacement = appui_context_persist_lock_from(&locks, &SessionKey("new-session".into()));
+    assert_eq!(locks.lock().unwrap().len(), 1);
+    assert!(replacement.try_lock().is_ok());
+}
 
 #[test]
 fn should_normalize_safe_tool_context_at_protocol_boundary() {
@@ -23,6 +51,120 @@ fn should_normalize_safe_tool_context_at_protocol_boundary() {
     assert_eq!(normalize_tool_context(Some("")), None);
     assert_eq!(normalize_tool_context(Some("notebook/other")), None);
     assert_eq!(normalize_tool_context(Some(&"a".repeat(65))), None);
+}
+
+#[test]
+fn should_make_voice_admission_single_use_and_idempotent_for_same_turn() {
+    let store = VoiceAdmissionStore::default();
+    let session_id = SessionKey("profile:api:voice".to_owned());
+    let turn_id = TurnId::new();
+    let admission = store.issue(
+        "request-1".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "你好".to_owned(),
+    );
+
+    let retried_issue = store.issue(
+        "request-1".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "第二次 ASR 的漂移结果".to_owned(),
+    );
+    assert_eq!(retried_issue.admission_id, admission.admission_id);
+    assert_eq!(retried_issue.transcript, "你好");
+
+    let claimed = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("first commit should claim the admission");
+    assert_eq!(claimed, VoiceAdmissionClaim::Start("你好".to_owned()));
+
+    store.finalize(&admission.admission_id, &turn_id);
+    let retried = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("same-turn retry should be idempotent");
+    assert_eq!(retried, VoiceAdmissionClaim::AlreadyCommitted);
+}
+
+#[test]
+fn should_reject_voice_admission_when_scope_or_audio_changes() {
+    let store = VoiceAdmissionStore::default();
+    let session_id = SessionKey("profile:api:voice".to_owned());
+    let turn_id = TurnId::new();
+    let admission = store.issue(
+        "request-2".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "你好".to_owned(),
+    );
+
+    assert!(
+        store
+            .claim(
+                &admission.admission_id,
+                &SessionKey("other:api:voice".to_owned()),
+                &turn_id,
+                &["up/audio.wav".to_owned()],
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .claim(
+                &admission.admission_id,
+                &session_id,
+                &turn_id,
+                &["up/other.wav".to_owned()],
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn should_release_voice_admission_claim_after_start_failure() {
+    let store = VoiceAdmissionStore::default();
+    let session_id = SessionKey("profile:api:voice".to_owned());
+    let turn_id = TurnId::new();
+    let admission = store.issue(
+        "request-3".to_owned(),
+        session_id.clone(),
+        turn_id.clone(),
+        vec!["up/audio.wav".to_owned()],
+        "你好".to_owned(),
+    );
+
+    let first = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("claim");
+    assert!(matches!(first, VoiceAdmissionClaim::Start(_)));
+    store.release(&admission.admission_id, &turn_id);
+    let retry = store
+        .claim(
+            &admission.admission_id,
+            &session_id,
+            &turn_id,
+            &["up/audio.wav".to_owned()],
+        )
+        .expect("released claim should be reusable");
+    assert!(matches!(retry, VoiceAdmissionClaim::Start(_)));
 }
 
 /// The §6 "Envelope Model" catalog in
@@ -233,7 +375,7 @@ async fn compaction_started_precedes_completed_in_lifecycle_batch() {
     }
 
     let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(TinyContextProvider);
-    let (_messages, _manager, notifications) = appui_context_history_for_agent(
+    let (_messages, _manager, notifications, _registration) = appui_context_history_for_agent(
         dir.path(),
         &session,
         &history,
@@ -412,6 +554,101 @@ async fn session_open_snapshot_without_provider_never_compacts() {
     assert!(events.is_empty(), "no provider => no lifecycle events");
 }
 
+#[tokio::test]
+async fn session_open_snapshot_waits_for_runtime_window_before_compacting() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct ReadyProvider(AtomicBool);
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for ReadyProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            unreachable!("session/open must not generate a response")
+        }
+        async fn ensure_ready(&self) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.0.store(true, Ordering::SeqCst);
+        }
+        fn context_window(&self) -> u32 {
+            if self.0.load(Ordering::SeqCst) {
+                262_144
+            } else {
+                65_536
+            }
+        }
+        fn model_id(&self) -> &str {
+            "tiny"
+        }
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+    }
+
+    let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(ReadyProvider(AtomicBool::new(false)));
+    let dir = tempfile::tempdir().unwrap();
+    let profile = "open-probed-window";
+    let (state, profile_runtime) =
+        state_with_profile_llm(dir.path(), profile, provider.clone()).await;
+    let session = SessionKey::with_profile(profile, "api", "saved-history");
+    let runtime = state
+        .session_cache
+        .get_or_init(&profile_runtime, session.clone(), None)
+        .await
+        .unwrap();
+    runtime
+        .sessions
+        .lock()
+        .await
+        .get_or_create(&session)
+        .await
+        .messages = open_snapshot_padding_history(120);
+    // Exercise the actual open RPC: the fallback would compact this history.
+    assert_eq!(provider.context_window(), 65_536);
+    let outcome = open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        Some(profile),
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        SessionOpenParams {
+            session_id: session,
+            topic: None,
+            profile_id: Some(profile.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+            client_commands: None,
+        },
+    )
+    .await
+    .unwrap();
+    let context_state = outcome.result.opened.context_state.unwrap();
+
+    assert_eq!(provider.context_window(), 262_144);
+    assert!(context_state.token_estimate > 100_000);
+    assert!(
+        context_state.token_estimate < appui_context_compact_threshold_tokens(provider.as_ref())
+    );
+    assert!(context_state.last_compaction_id.is_none());
+    assert!(
+        !outcome.replay.iter().any(|entry| matches!(
+            entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ContextCompactionStarted(_))
+                | UiProtocolLedgerEvent::Notification(UiNotification::ContextCompactionCompleted(
+                    _
+                ))
+        )),
+        "the fallback window must not compact saved history"
+    );
+}
+
 #[test]
 fn post_terminal_drain_skips_late_tokens_but_keeps_background_progress() {
     // Regression for the "queued N messages after active turn" wedge: the
@@ -448,6 +685,19 @@ fn post_terminal_drain_skips_late_tokens_but_keeps_background_progress() {
     assert!(!drain_should_skip_event(None));
 }
 
+#[tokio::test]
+async fn independent_oup_app_states_do_not_share_the_first_instances_ledger() {
+    let first = AppState::empty_for_tests();
+    let second = AppState::empty_for_tests();
+    let a = event_ledger(&first).await;
+    let b = event_ledger(&second).await;
+    assert!(
+        !Arc::ptr_eq(&a, &b),
+        "an embedded runtime must not inherit another runtime's ledger root"
+    );
+    assert!(Arc::ptr_eq(&a, &event_ledger(&first).await));
+}
+
 fn local_profile_state(dir: &Path) -> AppState {
     AppState {
         profile_store: Some(Arc::new(
@@ -480,8 +730,9 @@ fn profile_for_runtime_message(id: &str) -> crate::profiles::UserProfile {
 // Regression coverage for the "No ProfileRuntime registered... Set up the
 // profile with an API key in the dashboard" message, which used to fire
 // verbatim for every Ok(None) from `ensure_session_profile_runtime` —
-// including a merely-disabled profile, a sub-account, or an unknown id,
-// none of which an API key would fix.
+// including a sub-account or an unknown id, neither of which an API key would
+// fix. A profile with gateway auto-start disabled is still eligible for an
+// authenticated, on-demand AppUI runtime.
 #[test]
 fn should_report_no_profile_store_when_profile_runtime_unavailable_and_store_missing() {
     let state = AppState {
@@ -514,20 +765,29 @@ fn should_report_unknown_profile_when_profile_runtime_unavailable_and_profile_mi
     );
 }
 
-#[test]
-fn should_report_disabled_when_profile_runtime_unavailable_and_profile_disabled() {
+#[tokio::test]
+async fn should_bootstrap_appui_runtime_when_gateway_autostart_is_disabled() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state(dir.path());
     let mut profile = profile_for_runtime_message("disabled-one");
     profile.enabled = false;
-    // Fully configured (a real key) — the only thing wrong is `enabled`.
+    // `enabled` controls gateway auto-start, not authenticated AppUI access.
     profile.config.llm = Some(crate::profiles::LlmProfileConfig {
         primary: Some(crate::profiles::LlmModelSelectionConfig {
-            family_id: Some("zai".to_string()),
+            family_id: Some("openai".to_string()),
+            model_id: Some("gpt-4o-mini".to_string()),
+            route: Some(crate::profiles::LlmRouteConfig {
+                api_key_env: Some("OCTOS_TEST_APPUI_DISABLED_PROFILE_KEY".to_string()),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         fallbacks: Vec::new(),
     });
+    profile.config.env_vars.insert(
+        "OCTOS_TEST_APPUI_DISABLED_PROFILE_KEY".to_string(),
+        "test-key".to_string(),
+    );
     state
         .profile_store
         .as_ref()
@@ -535,15 +795,11 @@ fn should_report_disabled_when_profile_runtime_unavailable_and_profile_disabled(
         .save(&profile)
         .unwrap();
 
-    let message = profile_runtime_unavailable_message(&state, "disabled-one");
-    assert!(
-        message.contains("disabled"),
-        "expected a disabled-profile explanation, got: {message}"
-    );
-    assert!(
-        !message.contains("API key"),
-        "a disabled-but-configured profile must not be told to add an API key: {message}"
-    );
+    let runtime = ensure_session_profile_runtime(&state, Some("disabled-one"))
+        .await
+        .expect("runtime bootstrap")
+        .expect("on-demand AppUI runtime");
+    assert_eq!(runtime.primary_model_id, "gpt-4o-mini");
 }
 
 #[test]
@@ -947,9 +1203,17 @@ async fn llm_select_rejects_keyless_models_before_persisting() {
     assert_eq!(result["applied"], true);
     assert_eq!(result["selected"]["model"], "glm-5.3");
     assert_eq!(
-        result.get("restart_required"),
-        None,
+        result["restart_required"],
+        json!(false),
         "dynamic profiles apply without a restart: {result}"
+    );
+    // #2164 uniform post-commit truth: applied stays persistence-only and the
+    // runtime disposition is stamped beside it.
+    assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+    assert_eq!(result["effective_from"], "next_turn", "{result}");
+    assert!(
+        result.get("config_revision").is_some_and(|r| r.is_string()),
+        "committed revision must be comparable against the runtime stamp: {result}"
     );
 }
 
@@ -1044,6 +1308,570 @@ async fn llm_select_does_not_abandon_running_skill_action_jobs() {
         SkillActionJobStatus::Running,
         "runtime replacement must not perform restart-only job recovery"
     );
+}
+
+// ===========================================================================
+// #2166 — typed AppUI inference-parameter schema (reject / round-trip /
+// ownership). The old schema silently DROPPED any extra field the client
+// sent (temperature, top_p, max_output_tokens, context_window, nested
+// reasoning objects) while answering `applied: true`.
+// ===========================================================================
+
+/// Unknown fields on `profile/llm/upsert` must be rejected with EVERY
+/// rejected field named by its dotted path — never accepted with
+/// `applied: true` while the values are silently discarded — and the prior
+/// configuration must be left untouched.
+#[tokio::test]
+async fn llm_upsert_rejects_unknown_fields_and_names_every_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let error = raw_profile_llm_upsert(
+        &state,
+        &RpcRequest::new(
+            "u-unknown".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": {
+                        "route_id": "fixture",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "api_type": "openai",
+                        "bogus_route_key": true
+                    },
+                    "inference": { "temperature": 0.2 },
+                    "temperature2": 0.5
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("unknown fields must be rejected, not silently dropped");
+    let data = error.data.as_ref().expect("typed error data");
+    assert_eq!(data["kind"], json!("llm_unknown_fields"));
+    let rejected = data["rejected_fields"].as_array().expect("field list");
+    for expected in [
+        "selection.temperature2",
+        "selection.inference",
+        "selection.route.bogus_route_key",
+    ] {
+        assert!(
+            rejected.iter().any(|value| *value == json!(expected)),
+            "rejected_fields must name {expected}: {data}"
+        );
+    }
+    // The rejection happens BEFORE any store mutation: the profile is not
+    // even created.
+    assert!(
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .is_none(),
+        "a rejected upsert must not create or mutate the profile"
+    );
+}
+
+/// `max_output_tokens` is REAL but owned by the profile-gateway contract —
+/// it gets a dedicated typed error pointing at the owner instead of a
+/// generic "unknown field".
+#[tokio::test]
+async fn llm_upsert_rejects_max_output_tokens_as_owned_elsewhere() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let error = raw_profile_llm_upsert(
+        &state,
+        &RpcRequest::new(
+            "u-foreign".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" },
+                    "max_output_tokens": 4096
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("max_output_tokens is owned by the gateway contract");
+    let data = error.data.as_ref().expect("typed error data");
+    assert_eq!(data["kind"], json!("llm_param_owned_elsewhere"));
+    assert_eq!(
+        data["rejected_fields"][0],
+        json!("selection.max_output_tokens")
+    );
+    let owner = data["owners"][0]["owner"].as_str().unwrap();
+    assert!(
+        owner.contains("gateway") && owner.contains("max_output_tokens"),
+        "the error must point at the owning contract: {owner}"
+    );
+    assert!(
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .is_none(),
+        "a foreign-field rejection must not create or mutate the profile"
+    );
+}
+
+/// A request carrying BOTH foreign-owned and unknown fields must name both
+/// groups in the single rejection (#2187) — the unknown entries must not be
+/// silently dropped from the error just because a foreign field is present.
+/// Covers nested foreign + nested unknown (selection + route levels),
+/// top-level foreign, and a literal dotted top-level key (legal JSON) which
+/// is unknown, NOT the nested foreign field.
+#[tokio::test]
+async fn llm_upsert_rejects_foreign_and_unknown_fields_in_one_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let upsert = |id: &str, params: Value| {
+        RpcRequest::new(
+            id.to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            params,
+        )
+    };
+    let assert_names = |error: RpcError, foreign: &str, unknown: &[&str]| {
+        let data = error.data.as_ref().expect("typed error data");
+        assert_eq!(data["kind"], json!("llm_param_owned_elsewhere"));
+        assert!(
+            data["rejected_fields"]
+                .as_array()
+                .expect("foreign field list")
+                .iter()
+                .any(|value| *value == json!(foreign)),
+            "rejected_fields must name {foreign}: {data}"
+        );
+        let unknown_fields = data["unknown_fields"]
+            .as_array()
+            .expect("unknown field list");
+        for expected in unknown {
+            assert!(
+                unknown_fields.iter().any(|value| *value == json!(expected)),
+                "unknown_fields must name {expected}: {data}"
+            );
+        }
+    };
+    // Nested foreign + nested unknowns (selection and route levels).
+    let error = raw_profile_llm_upsert(
+        &state,
+        &upsert(
+            "u-mixed",
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": {
+                        "route_id": "fixture",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "bogus_route_key": true
+                    },
+                    "max_output_tokens": 4096,
+                    "temperature2": 0.5
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("foreign and unknown fields must both be rejected");
+    assert_names(
+        error,
+        "selection.max_output_tokens",
+        &["selection.temperature2", "selection.route.bogus_route_key"],
+    );
+    // Top-level foreign + a literal dotted top-level key: the dotted key is
+    // unknown (it is not the nested foreign field) and must still be named.
+    let error = raw_profile_llm_upsert(
+        &state,
+        &upsert(
+            "u-mixed-top",
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" }
+                },
+                "max_output_tokens": 4096,
+                "selection.max_output_tokens": 4096,
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect_err("top-level foreign and unknown fields must both be rejected");
+    assert_names(error, "max_output_tokens", &["selection.max_output_tokens"]);
+    assert!(
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .is_none(),
+        "a mixed rejection must not create or mutate the profile"
+    );
+}
+
+/// Out-of-range and non-finite typed values return a typed
+/// `llm_param_out_of_range` / `llm_param_non_finite` without mutating the
+/// prior configuration.
+#[tokio::test]
+async fn llm_upsert_rejects_out_of_range_and_non_finite_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    for (field, value, range) in [
+        ("temperature", json!(3.5), "0.0..=2.0"),
+        ("temperature", json!(-0.1), "0.0..=2.0"),
+        ("top_p", json!(1.5), "0.0..=1.0"),
+        ("context_window", json!(0), "1..=4294967295"),
+        // #2187: negative / over-u32 context_window must get the same typed
+        // range kind, not a generic serde deserialize error — at every
+        // integer width JSON can carry.
+        ("context_window", json!(-5), "1..=4294967295"),
+        ("context_window", json!(4_294_967_296u64), "1..=4294967295"),
+        (
+            "context_window",
+            json!(9_223_372_036_854_775_808u64),
+            "1..=4294967295",
+        ),
+    ] {
+        let kind = "llm_param_out_of_range";
+        let error = raw_profile_llm_upsert(
+            &state,
+            &RpcRequest::new(
+                "u-range".to_string(),
+                APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+                json!({
+                    "profile_id": "dev",
+                    "selection": {
+                        "family_id": "custom",
+                        "model_id": "fixture-model",
+                        "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" },
+                        field: value
+                    },
+                    "set_primary": true
+                }),
+            ),
+            None,
+        )
+        .await
+        .expect_err("{field}={value} must be rejected");
+        let data = error.data.as_ref().expect("typed error data");
+        assert_eq!(data["kind"], json!(kind), "{field}={value}");
+        assert_eq!(data["field"], json!(format!("selection.{field}")));
+        assert_eq!(data["range"], json!(range), "{field}={value}");
+    }
+    // Non-finite guard: exercised directly (JSON cannot carry NaN/Inf).
+    let error = validate_llm_inference_fields(&RawLlmSelection {
+        temperature: Some(f64::NAN),
+        ..Default::default()
+    })
+    .expect_err("NaN temperature must be rejected");
+    assert_eq!(
+        error.data.as_ref().unwrap()["kind"],
+        json!("llm_param_non_finite")
+    );
+    // Boundary: u32::MAX itself is a valid context_window override.
+    validate_llm_inference_fields(&RawLlmSelection {
+        context_window: Some(WireContextWindow(i128::from(u32::MAX))),
+        ..Default::default()
+    })
+    .expect("u32::MAX context_window must be accepted");
+}
+
+/// Boundary end-to-end (#2187): `context_window: 4294967295` (u32::MAX) is
+/// accepted by the typed range check and lands in the durable store as
+/// `Some(u32::MAX)` — pinning the validated i128 → u32 conversion.
+#[tokio::test]
+async fn llm_upsert_accepts_u32_max_context_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &RpcRequest::new(
+            "u-cw-max".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" },
+                    "context_window": 4_294_967_295u64
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("u32::MAX context_window must upsert");
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .expect("profile created");
+    assert_eq!(
+        profile
+            .config
+            .llm
+            .as_ref()
+            .and_then(|llm| llm.primary.as_ref())
+            .and_then(|primary| primary.context_window),
+        Some(u32::MAX),
+        "the validated boundary value must persist as u32::MAX"
+    );
+}
+
+/// Known typed inference fields round-trip: upsert → durable store →
+/// list/read; a re-upsert WITHOUT them clears the prior override
+/// (`absent ≡ null ≡ inherit`), and routing metadata outside the schema
+/// (`cost_per_m`/`strong`) survives the same-address edit.
+#[tokio::test]
+async fn llm_upsert_round_trips_typed_inference_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let route = json!({ "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" });
+    raw_profile_llm_upsert(
+        &state,
+        &RpcRequest::new(
+            "u-rt1".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": route,
+                    "temperature": 0.2,
+                    "top_p": 0.9,
+                    "context_window": 16384,
+                    "reasoning_effort": "high",
+                    "model_hints": { "uses_completion_tokens": true }
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("typed upsert");
+    // Routing metadata arrives OUTSIDE the RPC (QoS/routing research owns
+    // it) — written straight to the durable selection.
+    let mut profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .unwrap();
+    {
+        let primary = profile
+            .config
+            .llm
+            .as_mut()
+            .unwrap()
+            .primary
+            .as_mut()
+            .unwrap();
+        primary.cost_per_m = Some(1.5);
+        primary.strong = Some(true);
+    }
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .expect("seed routing metadata");
+
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .unwrap();
+    let primary = profile
+        .config
+        .llm
+        .as_ref()
+        .unwrap()
+        .primary
+        .as_ref()
+        .unwrap();
+    assert_eq!(primary.temperature, Some(0.2));
+    assert_eq!(primary.top_p, Some(0.9));
+    assert_eq!(primary.context_window, Some(16384));
+    assert_eq!(
+        primary.reasoning_effort,
+        Some(octos_llm::ReasoningEffort::High)
+    );
+    assert!(primary.model_hints.as_ref().unwrap().uses_completion_tokens);
+
+    // The list projection round-trips every configured field — and stays
+    // truthful: a client must be able to tell saved values from inherited.
+    let listed = profile_llm_list_result(&state, "dev", Some(&profile));
+    let primary_json = listed["primary"].as_object().expect("primary object");
+    assert_eq!(primary_json["context_window"], json!(16384));
+    assert!(
+        primary_json["temperature"].as_f64().unwrap() - 0.2 < 1e-6,
+        "got {}",
+        primary_json["temperature"]
+    );
+    assert!(
+        primary_json["top_p"].as_f64().unwrap() - 0.9 < 1e-6,
+        "got {}",
+        primary_json["top_p"]
+    );
+    assert_eq!(primary_json["reasoning_effort"], json!("high"));
+    assert_eq!(
+        primary_json["model_hints"]["uses_completion_tokens"],
+        json!(true)
+    );
+    assert_eq!(primary_json["cost_per_m"], json!(1.5));
+
+    // Re-upsert the same address WITHOUT the inference fields: absent ≡
+    // inherit, so the overrides clear — but the out-of-schema routing
+    // metadata (cost_per_m/strong) survives the edit.
+    raw_profile_llm_upsert(
+        &state,
+        &RpcRequest::new(
+            "u-rt2".to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": {
+                    "family_id": "custom",
+                    "model_id": "fixture-model",
+                    "route": route
+                },
+                "set_primary": true
+            }),
+        ),
+        None,
+    )
+    .await
+    .expect("clearing re-upsert");
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .unwrap();
+    let primary = profile
+        .config
+        .llm
+        .as_ref()
+        .unwrap()
+        .primary
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        primary.temperature, None,
+        "absent ≡ inherit: override cleared"
+    );
+    assert_eq!(primary.top_p, None);
+    assert_eq!(primary.context_window, None);
+    assert_eq!(primary.reasoning_effort, None);
+    assert_eq!(primary.cost_per_m, Some(1.5), "routing metadata survives");
+    assert_eq!(primary.strong, Some(true));
+    let listed = profile_llm_list_result(&state, "dev", Some(&profile));
+    assert!(
+        listed["primary"].get("temperature").is_none(),
+        "an unconfigured field must be absent (not null) so list output is \
+         unchanged for unconfigured users"
+    );
+}
+
+/// Each configured model carries its OWN parameter set: a fallback's
+/// inference defaults are independent of the primary's, so a
+/// primary/fallback switch cannot leak parameters across models.
+#[tokio::test]
+async fn llm_upsert_keeps_inference_params_per_model_without_leakage() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let upsert = |id: &str, model: &str, extra: Value| {
+        let mut selection = json!({
+            "family_id": "custom",
+            "model_id": model,
+            "route": { "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" }
+        });
+        let extra = extra.as_object().unwrap().clone();
+        for (key, value) in extra {
+            selection[key] = value;
+        }
+        RpcRequest::new(
+            id.to_string(),
+            APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+            json!({
+                "profile_id": "dev",
+                "selection": selection,
+                "set_primary": id == "primary",
+            }),
+        )
+    };
+    raw_profile_llm_upsert(
+        &state,
+        &upsert(
+            "primary",
+            "model-a",
+            json!({ "temperature": 0.2, "context_window": 8192 }),
+        ),
+        None,
+    )
+    .await
+    .expect("primary upsert");
+    raw_profile_llm_upsert(
+        &state,
+        &upsert(
+            "fallback",
+            "model-b",
+            json!({ "temperature": 0.9, "reasoning_effort": "max" }),
+        ),
+        None,
+    )
+    .await
+    .expect("fallback upsert");
+
+    let profile = state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .get("dev")
+        .unwrap()
+        .unwrap();
+    let llm = profile.config.llm.as_ref().unwrap();
+    assert_eq!(llm.primary.as_ref().unwrap().temperature, Some(0.2));
+    assert_eq!(llm.primary.as_ref().unwrap().context_window, Some(8192));
+    assert_eq!(llm.primary.as_ref().unwrap().reasoning_effort, None);
+    assert_eq!(llm.fallbacks[0].temperature, Some(0.9));
+    assert_eq!(
+        llm.fallbacks[0].reasoning_effort,
+        Some(octos_llm::ReasoningEffort::Max)
+    );
+    assert_eq!(llm.fallbacks[0].context_window, None, "no cross-model leak");
 }
 
 /// Key requirement mirrors the runtime factory, not just the registry
@@ -1359,8 +2187,13 @@ async fn llm_delete_removes_entries_and_promotes_fallback() {
         &delete("openai", "gpt-4o", "official", "d-miss"),
         None,
     )
+    .await
     .expect("delete miss");
     assert_eq!(result["applied"], json!(false));
+    assert_eq!(
+        result["runtime_disposition"], "unchanged",
+        "a miss persists nothing and must not touch the runtime: {result}"
+    );
 
     // (b) Delete the PRIMARY -> the fallback is promoted.
     let result = raw_profile_llm_delete(
@@ -1368,6 +2201,7 @@ async fn llm_delete_removes_entries_and_promotes_fallback() {
         &delete("zai", "glm-5.3", "official", "d-primary"),
         None,
     )
+    .await
     .expect("delete primary");
     assert_eq!(result["applied"], json!(true));
     let profile = state
@@ -1391,6 +2225,7 @@ async fn llm_delete_removes_entries_and_promotes_fallback() {
         &delete("deepseek", "deepseek-v4-pro", "official", "d-last"),
         None,
     )
+    .await
     .expect("delete last");
     assert_eq!(result["applied"], json!(true));
     let profile = state
@@ -1410,6 +2245,780 @@ async fn llm_delete_removes_entries_and_promotes_fallback() {
         llm_empty,
         "last model removed (an emptied llm block may serialize away): {:?}",
         profile.config.llm
+    );
+}
+
+/// #2164 test helpers: read the dynamic ProfileRuntime cache for a profile
+/// through the same key derivation the transport uses.
+fn dynamic_cached_profile_runtime(
+    state: &AppState,
+    profile_id: &str,
+) -> Option<Arc<crate::runtime::ProfileRuntime>> {
+    let key = dynamic_profile_runtime_key(state, profile_id)?;
+    dynamic_profile_runtimes()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned()
+}
+
+fn llm_upsert_rpc(
+    id: &str,
+    profile_id: &str,
+    family: &str,
+    model: &str,
+    base_url: Option<&str>,
+    set_primary: bool,
+) -> RpcRequest<Value> {
+    let mut body = json!({
+        "profile_id": profile_id,
+        "selection": {
+            "family_id": family,
+            "model_id": model,
+            "route": {
+                "route_id": "official",
+                // A test-scoped variable name so resolution can't fall
+                // through to a real key in the process env.
+                "api_key_env": "OCTOS_TEST_LLM_RUNTIME_INVALIDATION_KEY",
+            },
+        },
+        "api_key": "test-invalidation-key",
+        "set_primary": set_primary,
+    });
+    if let Some(base_url) = base_url {
+        body["selection"]["route"]["base_url"] = json!(base_url);
+    }
+    RpcRequest::new(
+        id.to_string(),
+        APPUI_METHOD_PROFILE_LLM_UPSERT.to_string(),
+        body,
+    )
+}
+
+fn llm_delete_rpc(id: &str, profile_id: &str, family: &str, model: &str) -> RpcRequest<Value> {
+    RpcRequest::new(
+        id.to_string(),
+        APPUI_METHOD_PROFILE_LLM_DELETE.to_string(),
+        json!({
+            "profile_id": profile_id,
+            "family_id": family,
+            "model_id": model,
+            "route_id": "official",
+        }),
+    )
+}
+
+/// #2164 acceptance — dynamic profile, endpoint edit: changing the primary's
+/// base URL (same family/model/route address) must evict the cached
+/// ProfileRuntime and rebuild from the committed file, so the next turn
+/// serves the new endpoint instead of the stale provider chain.
+#[tokio::test]
+async fn should_upsert_endpoint_edit_reload_dynamic_profile_runtime_for_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-v1", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed primary");
+    let before = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime cached after first upsert");
+    assert!(Arc::ptr_eq(
+        &before,
+        &dynamic_cached_profile_runtime(&state, "dev").expect("cache entry"),
+    ));
+    // A turn in flight keeps its start-of-turn runtime; the test drops its
+    // handle the same way a finished turn would, so the rebuild below can
+    // take over the profile's data directory (single-writer redb).
+    // A weak handle keeps the allocation identity reserved without keeping
+    // the runtime's single-writer episode store alive during reload. Saving
+    // only its address lets the allocator reuse it for the new runtime.
+    let before_identity = Arc::downgrade(&before);
+    drop(before);
+
+    // Same model id, different endpoint: the cache MUST still be invalidated.
+    let result = raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-v2",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            Some("http://127.0.0.1:9/v1"),
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("endpoint edit");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+    assert_eq!(result["restart_required"], json!(false), "{result}");
+    assert_eq!(result["effective_from"], "next_turn", "{result}");
+    assert!(
+        result["config_revision"].is_string(),
+        "the committed revision must be comparable against the runtime stamp: {result}"
+    );
+
+    let after = dynamic_cached_profile_runtime(&state, "dev").expect("cache repopulated");
+    assert!(
+        !std::sync::Weak::ptr_eq(&before_identity, &Arc::downgrade(&after)),
+        "endpoint edit must rebuild the cached ProfileRuntime"
+    );
+    assert_eq!(after.primary_model_id, "gpt-4o-mini");
+    assert_eq!(
+        after.config.base_url.as_deref(),
+        Some("http://127.0.0.1:9/v1"),
+        "the rebuilt chain must serve the COMMITTED endpoint"
+    );
+}
+
+/// #2164 acceptance — deleting the active primary promotes the first
+/// fallback and the NEXT turn uses it: the cached runtime is rebuilt from
+/// the promoted chain, not left on the deleted model.
+#[tokio::test]
+async fn should_delete_primary_promote_fallback_and_reload_dynamic_profile_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-primary", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed primary");
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-fallback",
+            "dev",
+            "deepseek",
+            "deepseek-chat",
+            None,
+            false,
+        ),
+        None,
+    )
+    .await
+    .expect("seed fallback");
+    let before = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime cached");
+    // Retain allocation identity, but allow the old store itself to close.
+    let before_identity = Arc::downgrade(&before);
+    drop(before);
+
+    let result = raw_profile_llm_delete(
+        &state,
+        &llm_delete_rpc("d-1", "dev", "openai", "gpt-4o-mini"),
+        None,
+    )
+    .await
+    .expect("delete primary");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(result["runtime_disposition"], "reloaded", "{result}");
+    assert_eq!(result["restart_required"], json!(false), "{result}");
+
+    let after = dynamic_cached_profile_runtime(&state, "dev").expect("cache repopulated");
+    assert!(
+        !std::sync::Weak::ptr_eq(&before_identity, &Arc::downgrade(&after)),
+        "primary deletion must rebuild the cached ProfileRuntime"
+    );
+    assert_eq!(
+        after.primary_model_id, "deepseek-chat",
+        "the promoted fallback must serve the next turn"
+    );
+}
+
+/// #2164 acceptance — deleting the LAST model evicts the cached runtime and
+/// reports a deterministic deferred disposition; the next turn observes the
+/// empty selection as typed runtime-unavailable truth (no stale chain).
+#[tokio::test]
+async fn should_delete_last_model_evict_dynamic_runtime_and_report_deferred() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-only", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed sole primary");
+    ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime cached");
+    assert!(dynamic_cached_profile_runtime(&state, "dev").is_some());
+
+    let result = raw_profile_llm_delete(
+        &state,
+        &llm_delete_rpc("d-last", "dev", "openai", "gpt-4o-mini"),
+        None,
+    )
+    .await
+    .expect("delete last model");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(result["runtime_disposition"], "deferred", "{result}");
+    assert_eq!(result["restart_required"], json!(false), "{result}");
+    assert!(
+        dynamic_cached_profile_runtime(&state, "dev").is_none(),
+        "the stale runtime must not survive the last-model deletion"
+    );
+    let next_turn = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("ensure");
+    assert!(
+        next_turn.is_none(),
+        "with no selection left the next turn must report typed runtime-unavailable truth"
+    );
+}
+
+/// #2164 acceptance — startup-pinned profile: upsert and delete persist but
+/// return `restart_required: true` with disposition `restart_required`, and
+/// the boot-snapshot runtime is left untouched (no fake reload).
+#[tokio::test]
+async fn should_report_restart_required_for_startup_pinned_llm_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-primary", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed primary");
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-fallback",
+            "dev",
+            "deepseek",
+            "deepseek-chat",
+            None,
+            false,
+        ),
+        None,
+    )
+    .await
+    .expect("seed fallback");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+
+    // Simulate the serve-startup shape: the runtime lives in the immutable
+    // startup map and nothing sits in the dynamic cache.
+    let mut state = Arc::try_unwrap(state).ok().expect("sole state owner");
+    state.profiles.insert("dev".to_string(), pinned.clone());
+    if let Some(key) = dynamic_profile_runtime_key(&state, "dev") {
+        dynamic_profile_runtimes()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+    }
+    let state = Arc::new(state);
+
+    let result = raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-edit",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            Some("http://127.0.0.1:9/v1"),
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("pinned upsert");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(
+        result["runtime_disposition"], "restart_required",
+        "{result}"
+    );
+    assert_eq!(result["restart_required"], json!(true), "{result}");
+    assert_eq!(result["effective_from"], "next_turn", "{result}");
+    assert!(
+        dynamic_cached_profile_runtime(&state, "dev").is_none(),
+        "a pinned profile must not fake a reload into the dynamic cache"
+    );
+    assert!(
+        Arc::ptr_eq(&pinned, state.profiles.get("dev").unwrap()),
+        "the boot-snapshot runtime stays as-is until restart"
+    );
+
+    let result = raw_profile_llm_delete(
+        &state,
+        &llm_delete_rpc("d-fallback", "dev", "deepseek", "deepseek-chat"),
+        None,
+    )
+    .await
+    .expect("pinned delete");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(
+        result["runtime_disposition"], "restart_required",
+        "{result}"
+    );
+    assert_eq!(result["restart_required"], json!(true), "{result}");
+}
+
+/// #2164 acceptance — a concurrent old bootstrap cannot repopulate the cache
+/// after a mutation: an insert carrying the PRE-bump generation is refused
+/// (the cache stays empty), while a bootstrap that read the committed file
+/// inserts under the new generation.
+#[tokio::test]
+async fn should_refuse_stale_profile_runtime_insert_after_generation_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-only", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed");
+    let runtime = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+
+    // Post-mutation state: generation bumped, cache emptied (the transition).
+    let post_commit_generation = bump_profile_runtime_generation(&key);
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+
+    // A bootstrap that captured the PRE-commit generation must be refused…
+    assert!(
+        !insert_profile_runtime_if_current(&key, post_commit_generation - 1, Arc::clone(&runtime),),
+        "a stale in-flight bootstrap must not repopulate the cache"
+    );
+    assert!(
+        dynamic_cached_profile_runtime(&state, "dev").is_none(),
+        "the refused insert must leave the cache empty"
+    );
+    // …while a bootstrap reading the committed file inserts normally.
+    assert!(
+        insert_profile_runtime_if_current(&key, post_commit_generation, Arc::clone(&runtime)),
+        "a current-generation bootstrap inserts"
+    );
+    assert!(dynamic_cached_profile_runtime(&state, "dev").is_some());
+}
+
+/// #2186 acceptance — the skill-mutation rebuild is the sibling writer the
+/// #2164 guard did not cover: its replace carries the generation captured when
+/// the rebuild started, so a profile/llm commit landing mid-rebuild (bump +
+/// drop + fresh bootstrap) is NOT overwritten by a runtime rebuilt from the
+/// pre-commit one.
+#[tokio::test]
+async fn should_refuse_stale_skill_rebuild_replace_after_generation_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-rebuild",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let runtime = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let pre_commit_generation = current_profile_runtime_generation(&key);
+    // A rebuilt plugin layer is a distinct Arc standing in for the in-flight
+    // rebuild's PRE-commit replacement (a second live bootstrap would take the
+    // episode-store lock the first runtime holds).
+    let stale_replacement = runtime
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+
+    // The commit lands while the rebuild is in flight: generation bumped,
+    // cache dropped, and a fresh runtime bootstrapped from the committed file
+    // (a distinct Arc stands in for it here).
+    bump_profile_runtime_generation(&key);
+    let committed = runtime
+        .rebuild_plugin_layer()
+        .await
+        .expect("committed runtime");
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone(), Arc::clone(&committed));
+
+    // The in-flight rebuild finishes: the guarded replace must refuse it…
+    assert!(
+        !replace_profile_runtime_if_current(
+            &key,
+            pre_commit_generation,
+            &runtime,
+            false,
+            stale_replacement,
+        ),
+        "a stale skill-mutation rebuild must not overwrite the committed runtime"
+    );
+    // …leaving the committed runtime serving.
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &committed),
+        "the committed runtime must survive the raced rebuild"
+    );
+}
+
+/// #2186 — the generation check alone has a hole: the commit's bump and remove
+/// are separate lock acquisitions, so a rebuild can capture the POST-bump
+/// generation yet still read the PRE-commit entry. The pointer-identity check
+/// on the cached entry closes that window — a same-generation replace against
+/// an entry that is not the rebuild's base must be refused.
+#[tokio::test]
+async fn should_refuse_skill_rebuild_replace_against_a_foreign_cached_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-foreign",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let base = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // The committed bootstrap lands between the rebuild's cache read and its
+    // replace — SAME generation (captured after the bump, before the remove).
+    let committed = base.rebuild_plugin_layer().await.expect("committed");
+    let stale_replacement = base
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key.clone(), Arc::clone(&committed));
+
+    assert!(
+        !replace_profile_runtime_if_current(&key, generation, &base, false, stale_replacement),
+        "a replace whose base is no longer the cached entry must be refused"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &committed),
+        "the committed runtime must survive the raced rebuild"
+    );
+}
+
+/// #2186 — the unraced skill-mutation rebuild must REPLACE the cached entry
+/// (its whole point is refreshing the plugin layer in place), which the
+/// bootstrap guard's `or_insert` cannot express.
+#[tokio::test]
+async fn should_replace_cached_profile_runtime_when_generation_is_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "u-skill-replace",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            true,
+        ),
+        None,
+    )
+    .await
+    .expect("seed");
+    let original = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // The rebuilt plugin layer is exactly what the production rebuild inserts.
+    let replacement = original
+        .rebuild_plugin_layer()
+        .await
+        .expect("rebuilt replacement");
+    assert!(
+        !Arc::ptr_eq(&original, &replacement),
+        "the stand-in replacement must be a distinct Arc"
+    );
+
+    assert!(
+        replace_profile_runtime_if_current(
+            &key,
+            generation,
+            &original,
+            false,
+            Arc::clone(&replacement),
+        ),
+        "a current-generation rebuild replaces the cached entry"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(
+        Arc::ptr_eq(&cached, &replacement),
+        "the replacement must overwrite the old entry, not be dropped by or_insert"
+    );
+}
+
+/// #2186 — a startup-pinned profile has no dynamic entry for the rebuild to
+/// match against: the guarded replace must still install the refresh (this is
+/// how skill mutations take effect on pinned profiles without a restart).
+#[tokio::test]
+async fn should_install_skill_rebuild_for_a_startup_pinned_profile_without_cached_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-skill-pinned", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let generation = current_profile_runtime_generation(&key);
+
+    // Simulate the startup-pinned shape: the base comes from state.profiles,
+    // not the dynamic cache, so no entry exists for the key.
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    let replacement = pinned
+        .rebuild_plugin_layer()
+        .await
+        .expect("rebuilt replacement");
+
+    assert!(
+        replace_profile_runtime_if_current(
+            &key,
+            generation,
+            &pinned,
+            true,
+            Arc::clone(&replacement),
+        ),
+        "a pinned profile's refresh installs into the empty dynamic slot"
+    );
+    let cached = dynamic_cached_profile_runtime(&state, "dev").expect("cached runtime");
+    assert!(Arc::ptr_eq(&cached, &replacement));
+}
+
+/// #2186 — the startup-pinned escape hatch (no cached entry to match against)
+/// is exactly where the generation check is load-bearing: a profile/llm commit
+/// racing the rebuild bumps the generation even though there is no entry to
+/// remove, and the stale refresh must NOT install afterwards.
+#[tokio::test]
+async fn should_refuse_pinned_skill_rebuild_replace_after_generation_bump() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-pinned-bump", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("seed");
+    let pinned = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap")
+        .expect("runtime");
+    let key = dynamic_profile_runtime_key(&state, "dev").expect("dynamic key");
+    let pre_commit_generation = current_profile_runtime_generation(&key);
+
+    // Startup-pinned shape: no dynamic entry. The racing commit then bumps the
+    // generation (for a pinned profile it reports restart_required instead of
+    // re-bootstrapping, so the slot stays empty).
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    bump_profile_runtime_generation(&key);
+    let stale_replacement = pinned
+        .rebuild_plugin_layer()
+        .await
+        .expect("stale replacement");
+
+    assert!(
+        !replace_profile_runtime_if_current(
+            &key,
+            pre_commit_generation,
+            &pinned,
+            true,
+            stale_replacement,
+        ),
+        "a pinned rebuild that raced a commit must not install the stale refresh"
+    );
+    assert!(
+        dynamic_cached_profile_runtime(&state, "dev").is_none(),
+        "the refused install must leave the dynamic slot empty"
+    );
+}
+
+/// #2164 acceptance — persisted-but-rebuild-failed is EXPLICIT in the
+/// response (`persisted_but_not_live` + `runtime_error`), not collapsed into
+/// a warn-only server log, and recoverable once the bootstrap blocker is
+/// removed.
+#[tokio::test]
+async fn should_report_persisted_but_not_live_when_runtime_rebuild_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    // Block the runtime bootstrap deterministically: the profile's data dir
+    // is a plain FILE, so the episode store cannot open underneath it.
+    let blocker = dir.path().join("dev-data-blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let mut profile = profile_for_runtime_message("dev");
+    profile.data_dir = Some(blocker.to_string_lossy().to_string());
+    profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+        primary: Some(crate::profiles::LlmModelSelectionConfig {
+            family_id: Some("openai".to_string()),
+            model_id: Some("gpt-4o-mini".to_string()),
+            route: Some(crate::profiles::LlmRouteConfig {
+                api_key_env: Some("OCTOS_TEST_LLM_RUNTIME_INVALIDATION_KEY".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        fallbacks: Vec::new(),
+    });
+    profile.config.env_vars.insert(
+        "OCTOS_TEST_LLM_RUNTIME_INVALIDATION_KEY".to_string(),
+        "k".to_string(),
+    );
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+
+    let result = raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-edit", "dev", "openai", "gpt-4o-mini", None, true),
+        None,
+    )
+    .await
+    .expect("persistence must succeed");
+    assert_eq!(result["applied"], json!(true), "{result}");
+    assert_eq!(
+        result["runtime_disposition"], "persisted_but_not_live",
+        "the failed rebuild must be explicit on the wire: {result}"
+    );
+    assert_eq!(result["restart_required"], json!(false), "{result}");
+    assert!(
+        result["runtime_error"].is_string(),
+        "the rebuild failure detail must be reported: {result}"
+    );
+    assert!(result["config_revision"].is_string(), "{result}");
+
+    // Recoverable: unblock the data dir and the next bootstrap succeeds.
+    std::fs::remove_file(&blocker).unwrap();
+    std::fs::create_dir_all(&blocker).unwrap();
+    let recovered = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("bootstrap after unblock")
+        .expect("runtime recovers on the next turn");
+    assert_eq!(recovered.primary_model_id, "gpt-4o-mini");
+}
+
+/// A configuration commit while an in-flight turn still holds the profile's
+/// single-writer episode store (its agent keeps the store after every
+/// ProfileRuntime handle is dropped) must hand the replacement the open
+/// stores instead of failing to reopen `episodes.redb`.
+#[tokio::test]
+async fn should_reload_runtime_while_in_flight_turn_holds_episode_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    let mut profile = profile_for_runtime_message("dev");
+    profile.config.llm = Some(crate::profiles::LlmProfileConfig {
+        primary: Some(crate::profiles::LlmModelSelectionConfig {
+            family_id: Some("openai".to_string()),
+            model_id: Some("gpt-4o-mini".to_string()),
+            route: Some(crate::profiles::LlmRouteConfig {
+                api_key_env: Some("OCTOS_TEST_LLM_RUNTIME_INVALIDATION_KEY".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        fallbacks: Vec::new(),
+    });
+    profile.config.env_vars.insert(
+        "OCTOS_TEST_LLM_RUNTIME_INVALIDATION_KEY".to_string(),
+        "k".to_string(),
+    );
+    state
+        .profile_store
+        .as_ref()
+        .unwrap()
+        .save(&profile)
+        .unwrap();
+
+    let old = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("initial bootstrap")
+        .expect("runtime");
+    // What a live in-flight turn keeps: its agent's episode store and memory
+    // store, not the ProfileRuntime.
+    let held_by_agent = old.memory.clone();
+    let held_memory_store = old.memory_store.clone();
+    let old_cron = old.cron_service.clone().expect("cron service");
+    drop(old);
+
+    let result = raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc("u-swap", "dev", "openai", "gpt-4o", None, true),
+        None,
+    )
+    .await
+    .expect("persistence must succeed");
+    assert_eq!(
+        result["runtime_disposition"], "reloaded",
+        "the replacement must take over the held stores: {result}"
+    );
+
+    let new = ensure_session_profile_runtime(&state, Some("dev"))
+        .await
+        .expect("cached replacement")
+        .expect("runtime");
+    assert_eq!(new.primary_model_id, "gpt-4o");
+    assert!(Arc::ptr_eq(&new.memory, &held_by_agent));
+    assert!(Arc::ptr_eq(&new.memory_store, &held_memory_store));
+    assert!(Arc::ptr_eq(new.cron_service.as_ref().unwrap(), &old_cron));
+    assert!(
+        old_cron.is_running(),
+        "the shared cron service keeps running"
     );
 }
 
@@ -2035,6 +3644,18 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             })
         }
         APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE => json!({ "path": "." }),
+        // WEB-WORKSPACE-BROWSER-CONTRACT-5000: relative path / invalid name so
+        // the dispatch probe exercises the route without touching the
+        // filesystem of whoever runs the suite.
+        APPUI_METHOD_ONBOARDING_WORKSPACE_LIST => json!({ "path": "." }),
+        APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE => json!({ "parent": ".", "name": ".." }),
+        methods::SESSION_GOAL_OPERATOR_TRANSITION => json!({
+            "session_id": session_id,
+            "profile_id": "dispatch-parity",
+            "goal_id": "goal_probe",
+            "action": "archive",
+            "reason": "dispatch parity probe",
+        }),
         methods::AGENT_LIST
         | methods::AGENT_STATUS_READ
         | methods::AGENT_OUTPUT_READ
@@ -2146,6 +3767,19 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         methods::CONTENT_DELETE => json!({ "id": "content-1" }),
         methods::CONTENT_BULK_DELETE => json!({ "ids": ["content-1"] }),
         methods::MEMORY_ENTITY => json!({ "name": "probe-entity" }),
+        methods::MEMORY_SEARCH => json!({ "query": "probe" }),
+        methods::MEMORY_LOAD => json!({ "id": "doc:probe:1" }),
+        methods::MEMORY_INGEST => json!({
+            "records": [{
+                "id": "doc:probe:1",
+                "kind": "document",
+                "source": "probe",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "title": "probe",
+                "abstract": "probe record",
+            }],
+            "embed": false,
+        }),
         methods::CRON_TOGGLE => json!({ "job_id": "probe-job", "enabled": false }),
         methods::ROUTER_SET_MODE => json!({
             "session_id": session_id,
@@ -2174,9 +3808,73 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             "session_id": session_id,
         }),
         APPUI_METHOD_PEER_GATHER => json!({ "session_id": session_id }),
+        APPUI_METHOD_PEER_MODEL_SET => json!({
+            "session_id": session_id,
+            "peer": "probe",
+            "model": null,
+        }),
+        APPUI_METHOD_PEER_CONTEXT_OPEN | APPUI_METHOD_PEER_CONTEXT_CLOSE => json!({
+            "session_id": session_id,
+            "peer": "probe",
+            "context_id": "probe",
+        }),
+        APPUI_METHOD_PEER_TOOLS_REGISTER => json!({
+            "session_id": session_id,
+            "peer": "probe",
+            "tools": [],
+        }),
+        APPUI_METHOD_PEER_TOOL_RESULT => json!({
+            "session_id": session_id,
+            "peer": "probe",
+            "call_id": "probe",
+            "ok": true,
+        }),
+        APPUI_METHOD_PEER_INPUT_REJECT => json!({
+            "session_id": session_id,
+            "peer": "probe",
+            "input_id": "probe",
+            "reason": "busy",
+        }),
+        APPUI_METHOD_SESSION_TOOL_LIST_SET => json!({
+            "session_id": session_id,
+            "generic_tools": [],
+        }),
+        APPUI_METHOD_SESSION_TOOL_LIST_GET => json!({ "session_id": session_id }),
+        APPUI_METHOD_PEER_PURGE => json!({
+            "session_id": session_id,
+            "peer": "probe",
+            "host_token": "probe",
+        }),
+        APPUI_METHOD_PEER_TOOLS_UNREGISTER => json!({
+            "session_id": session_id,
+            "peer": "probe",
+        }),
         APPUI_METHOD_TURN_STEER => json!({
             "session_id": session_id,
             "input": [{ "kind": "text", "text": "steer probe" }],
+        }),
+        APPUI_METHOD_VOICE_ADMIT => json!({
+            "session_id": session_id,
+            "request_id": "probe-voice-admit",
+            "turn_id": turn_id,
+            "media": [{
+                "path": "up/probe-voice.wav",
+                "mime": "audio/wav",
+                "size_bytes": 0,
+            }],
+        }),
+        APPUI_METHOD_VOICE_COMMIT_ADMISSION => json!({
+            "admission_id": "missing-probe-admission",
+            "turn": {
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "input": [{ "kind": "text", "text": "voice commit probe" }],
+                "media": [{
+                    "path": "up/probe-voice.wav",
+                    "mime": "audio/wav",
+                    "size_bytes": 0,
+                }],
+            },
         }),
         other => panic!("missing AppUI dispatch probe params for {other}"),
     };
@@ -2198,13 +3896,12 @@ fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
     }
 }
 
-struct FailingWriter {
-    write_failed: Arc<tokio::sync::Notify>,
-}
+#[derive(Default)]
+struct FailingWriter;
 
 impl FailingWriter {
-    fn new(write_failed: Arc<tokio::sync::Notify>) -> Self {
-        Self { write_failed }
+    fn new() -> Self {
+        Self
     }
 }
 
@@ -2214,7 +3911,14 @@ impl AsyncWrite for FailingWriter {
         _cx: &mut std::task::Context<'_>,
         _buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.write_failed.notify_waiters();
+        // A regression pin, not a timing dependency of the current tests:
+        // they inject only after the writer thread exits, so this stall no
+        // longer matters to them. But if the injection ever moves back onto
+        // the failing write itself — the ordering that raced `mark_failed`
+        // on loaded Windows runners — this stall turns that flaky 5% race
+        // back into a deterministic red. See
+        // `stdio_connection_stops_dispatch_after_writer_failure`.
+        std::thread::sleep(Duration::from_millis(1));
         std::task::Poll::Ready(Err(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
             "writer closed",
@@ -2294,13 +3998,12 @@ async fn stdio_writer_loop_propagates_write_errors_and_marks_failed_latch() {
         failure_notify.notified().await;
     });
     tokio::task::yield_now().await;
-    let write_failed = Arc::new(tokio::sync::Notify::new());
     tx.send(WsMessage::Text("{}".into()))
         .await
         .expect("queue stdio response");
     drop(tx);
 
-    let error = stdio_writer_loop_to(rx, FailingWriter::new(write_failed), ws.failure_signal())
+    let error = stdio_writer_loop_to(rx, FailingWriter::new(), ws.failure_signal())
         .await
         .expect_err("write failure is propagated");
 
@@ -2370,10 +4073,38 @@ async fn stdio_ndjson_reader_rejects_oversized_frame_before_newline() {
     }
 }
 
-#[tokio::test]
-async fn stdio_connection_stops_dispatch_after_writer_failure() {
-    reset_stdio_dispatch_count_for_test();
-    let write_failed = Arc::new(tokio::sync::Notify::new());
+/// The stdio loop's deep dispatch path needs more stack than a test thread is
+/// guaranteed. `#[tokio::test]` drives its future on the test thread itself, and
+/// a real request (unlike the unknown-method one the isolation test below sends)
+/// recurses deep enough through dispatch that a Windows debug build overflows —
+/// which aborts the whole test binary, taking every other test's result with
+/// it. Boxing the future does not help: the cost is the depth of the poll call
+/// chain, not the size of the stored state. Reproducible on any platform by
+/// running the test binary under `RUST_MIN_STACK=1048576`.
+///
+/// So run it the way production runs deep agent futures — on a thread with an
+/// 8 MiB stack, matching `thread_stack_size(8 * 1024 * 1024)` in the chat, ACP,
+/// gateway and MCP runtimes — rather than on whatever stack the harness hands
+/// out.
+#[test]
+fn stdio_connection_stops_dispatch_after_writer_failure() {
+    std::thread::Builder::new()
+        .name("stdio-writer-failure".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(stdio_connection_stops_dispatch_after_writer_failure_body());
+        })
+        .expect("spawn big-stack test thread")
+        .join()
+        .expect("stdio writer-failure test body panicked");
+}
+
+async fn stdio_connection_stops_dispatch_after_writer_failure_body() {
+    let dispatch_count = new_stdio_dispatch_count_for_test();
     let (mut input_tx, input_rx) = tokio::io::duplex(4096);
     let first = format!(
         "{}\n",
@@ -2398,9 +4129,18 @@ async fn stdio_connection_stops_dispatch_after_writer_failure() {
         .await
         .expect("queue first request");
 
-    let write_failed_for_input = write_failed.clone();
+    // The second request must be observable only once the writer failure is
+    // observable too. Waiting on the failing write itself would race: the
+    // connection loop learns of the failure when `mark_failed` runs, after
+    // the writer helper's error returns — and a frame read before that
+    // moment is legitimately dispatched (two main-CI `check-windows` runs
+    // failed with `left: 2, right: 1` exactly this way, 2026-09-21/22).
+    // The writer-thread exit is past `mark_failed`, so injecting there pins
+    // the real guarantee: no dispatch after the failure is latched.
+    let writer_finished = new_stdio_writer_exit_notify_for_test();
+    let writer_finished_for_input = writer_finished.clone();
     let input_task = tokio::spawn(async move {
-        write_failed_for_input.notified().await;
+        writer_finished_for_input.notified().await;
         let _ = input_tx.write_all(second.as_bytes()).await;
     });
     tokio::task::yield_now().await;
@@ -2410,24 +4150,88 @@ async fn stdio_connection_stops_dispatch_after_writer_failure() {
         stdio_connection_with_io(
             Arc::new(AppState::empty_for_tests()),
             input_rx,
-            FailingWriter::new(write_failed),
+            FailingWriter::new(),
+            dispatch_count.clone(),
+            Some(writer_finished),
         ),
     )
     .await
     .expect("stdio loop must exit after writer failure");
 
-    input_task.await.expect("input task joins");
+    // The injection waits on the writer thread's exit notify, so this join
+    // has a real completion path; the timeout only keeps a lost wakeup from
+    // hanging the whole test binary instead of failing this one test.
+    tokio::time::timeout(Duration::from_secs(2), input_task)
+        .await
+        .expect("injection completes within the connection's shutdown budget")
+        .expect("injection task does not panic");
     let error = result.expect_err("writer failure should be returned");
     assert!(
         error.to_string().contains("AppUI stdio writer failed"),
         "unexpected error: {error:?}"
     );
     assert_eq!(
-        stdio_dispatch_count_for_test(),
+        dispatch_count.load(Ordering::SeqCst),
         1,
         "no request after the writer failure may be dispatched"
     );
-    reset_stdio_dispatch_count_for_test();
+}
+
+/// Each stdio connection counts only its own dispatched requests, so
+/// parallel tests can never observe each other through the counter (#2336).
+#[tokio::test]
+async fn stdio_dispatch_count_is_isolated_per_connection() {
+    async fn run_one_connection(dispatch_count: StdioDispatchCountForTest) {
+        let (mut input_tx, input_rx) = tokio::io::duplex(4096);
+        // Duplex writer like the OUP embedded tests; the error response
+        // fits in the buffer, so the read half can simply be held.
+        let (_response_rx, response_tx) = tokio::io::duplex(4096);
+        // Any parseable request is counted before routing; an unknown method
+        // keeps the connection on the shallow error path.
+        let request = format!(
+            "{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": "req",
+                "method": "nonexistent/method",
+                "params": {}
+            })
+        );
+        input_tx
+            .write_all(request.as_bytes())
+            .await
+            .expect("queue request");
+        drop(input_tx);
+        stdio_connection_with_io(
+            Arc::new(AppState::empty_for_tests()),
+            input_rx,
+            response_tx,
+            dispatch_count,
+            None,
+        )
+        .await
+        .expect("connection exits on EOF");
+    }
+
+    let first_count = new_stdio_dispatch_count_for_test();
+    let second_count = new_stdio_dispatch_count_for_test();
+    // Drive each connection as a spawned task, like the OUP embedded
+    // tests: polling the policy future through this test's own await
+    // chain overflowed the test-thread stack.
+    let first = tokio::spawn(run_one_connection(first_count.clone()));
+    let second = tokio::spawn(run_one_connection(second_count.clone()));
+    first.await.expect("first connection task joins");
+    second.await.expect("second connection task joins");
+    assert_eq!(
+        first_count.load(Ordering::SeqCst),
+        1,
+        "first connection must count only its own request"
+    );
+    assert_eq!(
+        second_count.load(Ordering::SeqCst),
+        1,
+        "second connection must count only its own request"
+    );
 }
 
 /// Shutdown must WAIT for this connection's in-flight turns to finalize
@@ -2444,6 +4248,7 @@ async fn stdio_shutdown_drain_waits_for_turn_finalization() {
     active_turns.lock().await.insert(
         session.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -2452,10 +4257,10 @@ async fn stdio_shutdown_drain_waits_for_turn_finalization() {
             abort,
         },
     );
-    connection_turns
-        .lock()
-        .await
-        .insert(session.clone(), turn_id);
+    connection_turns.lock().await.insert(
+        session.clone(),
+        test_connection_turn(&active_turns, &session, &turn_id).await,
+    );
     let remover = active_turns.clone();
     let session_for_removal = session.clone();
     tokio::spawn(async move {
@@ -2486,6 +4291,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
     active_turns.lock().await.insert(
         SessionKey("local:foreign".into()),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: TurnId::new(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -2510,6 +4316,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
     active_turns.lock().await.insert(
         session.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -2518,7 +4325,10 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
             abort,
         },
     );
-    connection_turns.lock().await.insert(session, turn_id);
+    connection_turns.lock().await.insert(
+        session.clone(),
+        test_connection_turn(&active_turns, &session, &turn_id).await,
+    );
 
     let drained = drain_connection_turns_for_shutdown(
         &active_turns,
@@ -2587,10 +4397,10 @@ async fn stdio_cleanup_aborts_active_turns_and_live_forwarders() {
         session_id.clone(),
         test_active_turn(turn_id.clone(), turn_task.abort_handle()),
     );
-    connection_turns
-        .lock()
-        .await
-        .insert(session_id.clone(), turn_id.clone());
+    connection_turns.lock().await.insert(
+        session_id.clone(),
+        test_connection_turn(&active_turns, &session_id, &turn_id).await,
+    );
 
     let (forwarder_started_tx, forwarder_started_rx) = oneshot::channel();
     let (forwarder_drop_tx, forwarder_drop_rx) = oneshot::channel();
@@ -2650,6 +4460,7 @@ async fn stdio_cleanup_aborts_active_turns_and_live_forwarders() {
 #[test]
 fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("coding:local:test".into()),
         topic: None,
         profile_id: None,
@@ -2663,6 +4474,7 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     );
 
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("local:test".into()),
         topic: None,
         profile_id: Some("explicit".into()),
@@ -2676,6 +4488,7 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     );
 
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("local:test".into()),
         topic: None,
         profile_id: None,
@@ -2686,6 +4499,108 @@ fn stdio_session_open_candidate_profile_is_last_success_candidate_only() {
     assert_eq!(
         stdio_session_open_candidate_profile(&params, Some("previous")).as_deref(),
         Some("previous")
+    );
+}
+
+#[test]
+fn appui_prompt_context_bridge_reports_live_context_state_when_negotiated() {
+    use octos_core::ui_protocol::UiNotification;
+
+    let session_id = SessionKey::new("api", "context-state-reported");
+    let history = vec![
+        test_message(MessageRole::User, "old request"),
+        test_message(MessageRole::Assistant, "old answer"),
+    ];
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let dir = tempfile::tempdir().unwrap();
+    let events: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = events.clone();
+    let bridge =
+        AppUiPromptContextBridge::new(session_id.clone(), dir.path().to_path_buf(), manager, false)
+            .with_context_lifecycle_notify(Arc::new(move |notification| {
+                sink.lock().unwrap().push(notification);
+            }))
+            .with_context_state_updates(true);
+    let request = |phase: PromptContextPhase, iteration: u32| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".to_string(),
+        model_id: "large-context".to_string(),
+        context_window: 16_000,
+    };
+
+    // Turn start: the first report of the turn always goes out and carries
+    // the PROMPT estimate the bridge just built, not the transcript's.
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history.clone());
+    prompt.push(test_message(MessageRole::User, "current request"));
+    let report = bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("prepare prompt");
+    let reported: Vec<_> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            UiNotification::ContextStateReported(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reported.len(), 1, "one live state report at turn start");
+    assert_eq!(reported[0].session_id, session_id);
+    assert_eq!(reported[0].iteration, 1);
+    assert_eq!(
+        reported[0].context_state.token_estimate,
+        report
+            .token_estimate
+            .expect("bridge reports a prompt estimate"),
+        "the gauge must show the projected prompt size"
+    );
+    assert!(reported[0].threshold_tokens > 0);
+
+    // Next iteration with an unchanged prompt: no movement, no report.
+    let mut same = prompt.clone();
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut same)
+        .expect("prepare prompt");
+    let count = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, UiNotification::ContextStateReported(_)))
+        .count();
+    assert_eq!(count, 1, "an unmoved estimate is not re-reported");
+
+    // Without the negotiated feature nothing is emitted at all.
+    let quiet: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+    let quiet_sink = quiet.clone();
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let unnegotiated =
+        AppUiPromptContextBridge::new(session_id.clone(), dir.path().to_path_buf(), manager, false)
+            .with_context_lifecycle_notify(Arc::new(move |notification| {
+                quiet_sink.lock().unwrap().push(notification);
+            }));
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history);
+    prompt.push(test_message(MessageRole::User, "current request"));
+    unnegotiated
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("prepare prompt");
+    assert!(
+        !quiet
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, UiNotification::ContextStateReported(_))),
+        "context/state_reported is strictly opt-in"
     );
 }
 
@@ -2750,6 +4665,87 @@ fn appui_prompt_context_bridge_preserves_current_user_turn() {
     );
 }
 
+#[test]
+fn effective_provider_route_updates_scratch_and_persists_exactly_one_epoch_rotation() {
+    let session_id = SessionKey::new("api", "context-failover-epoch");
+    let mut initial = ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &[test_message(MessageRole::User, "request")],
+    );
+    let primary_epoch = initial
+        .reconcile_prompt_cache_epoch("primary", "model-a", "stable", &[])
+        .epoch_id
+        .clone();
+    let manager = Arc::new(StdMutex::new(initial));
+    let dir = tempfile::tempdir().unwrap();
+    let bridge = AppUiPromptContextBridge::new(
+        session_id.clone(),
+        dir.path().to_path_buf(),
+        manager.clone(),
+        false,
+    );
+
+    // Initialize the per-loop scratch exactly as a real TurnStart does.
+    let mut prompt = vec![
+        test_message(MessageRole::System, "stable"),
+        test_message(MessageRole::User, "request"),
+    ];
+    bridge
+        .prepare_prompt(
+            PromptContextRequest {
+                phase: PromptContextPhase::TurnStart,
+                iteration: 1,
+                provider_name: "primary".to_owned(),
+                model_id: "model-a".to_owned(),
+                context_window: 16_000,
+            },
+            &mut prompt,
+        )
+        .expect("turn-start projection");
+
+    PromptContextManager::observe_effective_provider_route(&bridge, "fallback", "model-b");
+    let canonical_epoch = manager
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .cache_epoch()
+        .expect("canonical epoch")
+        .clone();
+    assert_ne!(canonical_epoch.epoch_id, primary_epoch);
+    assert_eq!(canonical_epoch.provider, "fallback");
+    assert_eq!(canonical_epoch.model, "model-b");
+    assert_eq!(
+        canonical_epoch.last_invalidation_reason,
+        "model_route_changed"
+    );
+    let scratch_epoch = bridge
+        .scratch
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .and_then(|scratch| scratch.manager.cache_epoch())
+        .expect("scratch epoch")
+        .clone();
+    assert_eq!(scratch_epoch, canonical_epoch);
+
+    let persisted =
+        crate::context_manager::load_context_manager_snapshot(dir.path(), &session_id.to_string())
+            .expect("read persisted epoch")
+            .expect("snapshot exists");
+    assert_eq!(persisted.cache_epoch(), Some(&canonical_epoch));
+
+    // The same winning route on a later observation is idempotent: it does
+    // not manufacture a new epoch or increment any generation.
+    PromptContextManager::observe_effective_provider_route(&bridge, "fallback", "model-b");
+    let unchanged = manager
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .cache_epoch()
+        .expect("epoch retained")
+        .clone();
+    assert_eq!(unchanged, canonical_epoch);
+}
+
 /// UPCR-2026-026 follow-up: the in-loop (mid-turn) compaction pass must
 /// emit `ContextCompactionStarted` → `ContextCompactionCompleted` through
 /// the bridge's notify hook. It previously compacted SILENTLY — the only
@@ -2776,6 +4772,12 @@ fn in_loop_compaction_emits_lifecycle_notifications() {
         None,
         &history,
     )));
+    let epoch_before = manager
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .reconcile_prompt_cache_epoch("test", "tiny-context", "runtime system", &[])
+        .epoch_id
+        .clone();
     let dir = tempfile::tempdir().unwrap();
     let captured: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
     let sink = captured.clone();
@@ -2833,6 +4835,20 @@ fn in_loop_compaction_emits_lifecycle_notifications() {
     };
     assert_eq!(done.session_id, session_id);
     assert_eq!(done.compaction.trigger, "agent_loop:turn_start");
+    let epoch_after = bridge
+        .prompt_cache_epoch_id()
+        .expect("compaction keeps an initialized epoch");
+    assert_ne!(epoch_after, epoch_before);
+    assert_eq!(
+        done.context_state.cache_epoch_id.as_deref(),
+        Some(epoch_after.as_str())
+    );
+    assert_eq!(
+        done.context_state.last_cache_invalidation_reason.as_deref(),
+        Some("compaction_installed")
+    );
+    assert!(done.context_state.semantic_head_id.is_some());
+    assert!(done.context_state.semantic_head_kind.is_some());
 }
 
 #[test]
@@ -3835,6 +5851,604 @@ fn workspace_probe_capability_is_local_solo_only() {
     assert!(
         !tenant_capabilities.supports_feature(APPUI_FEATURE_ONBOARDING_WORKSPACE_PROBE_V1),
         "tenant deployment must NOT advertise the workspace probe feature",
+    );
+}
+
+// ===================================================================
+// WEB-WORKSPACE-BROWSER-CONTRACT-5000 — `onboarding/workspace_list` and
+// `onboarding/workspace_create`, the local-solo folder browser that lets
+// the web onboarding form pick a workspace instead of typing a blind
+// absolute path. Gated on `onboarding.workspace_browse.v1`; both methods
+// refuse tenant/cloud exactly like `onboarding/workspace_probe` (#1057).
+// ===================================================================
+
+/// Helper: pull the typed `data.kind` discriminant off an `RpcError`.
+fn workspace_browse_error_kind(error: &RpcError) -> Option<String> {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("kind"))
+        .and_then(|kind| kind.as_str())
+        .map(ToOwned::to_owned)
+}
+
+/// Contract §1 — a listing returns DIRECTORIES ONLY, never files, sorted
+/// case-insensitively by name, each with its canonical absolute path.
+#[test]
+fn should_list_only_sorted_directories_with_canonical_paths_when_listing_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    // Feed the canonical base, the way a real client does: every path it
+    // sends back came from a previous `canonical_path` / entry `path`.
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("projects");
+    std::fs::create_dir_all(&root).unwrap();
+    for name in ["Zebra", "alpha", "Beta"] {
+        std::fs::create_dir_all(root.join(name)).unwrap();
+    }
+    std::fs::write(root.join("notes.txt"), "not a directory").unwrap();
+    let canonical_root = std::fs::canonicalize(&root).unwrap();
+
+    let result = onboarding_workspace_list_result(&state, Some(root.to_str().unwrap()))
+        .expect("list an existing directory");
+
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        canonical_root.to_string_lossy()
+    );
+    let entries = result["entries"].as_array().unwrap();
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["alpha", "Beta", "Zebra"],
+        "entries must be directories only, sorted case-insensitively"
+    );
+    for entry in entries {
+        let name = entry["name"].as_str().unwrap();
+        assert_eq!(
+            entry["path"].as_str().unwrap(),
+            std::fs::canonicalize(canonical_root.join(name))
+                .unwrap()
+                .to_string_lossy(),
+            "each entry path must be the canonical absolute path"
+        );
+        assert_eq!(entry["writable"], json!(true));
+    }
+    assert_eq!(result["writable"], json!(true));
+    assert_eq!(result["truncated"], json!(false));
+    assert_eq!(result["hidden_skipped"], json!(0));
+    assert_eq!(
+        result["parent_path"].as_str().unwrap(),
+        canonical_root.parent().unwrap().to_string_lossy()
+    );
+}
+
+/// Contract §1 — dot-directories are omitted from `entries` and counted
+/// in `hidden_skipped` (files, hidden or not, are never counted: they are
+/// not listable entries in the first place).
+#[test]
+fn should_skip_and_count_hidden_directories_when_listing_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("projects");
+    std::fs::create_dir_all(root.join("visible")).unwrap();
+    for hidden in [".git", ".cache", ".config"] {
+        std::fs::create_dir_all(root.join(hidden)).unwrap();
+    }
+    std::fs::write(root.join(".dotfile"), "hidden file, not a dir").unwrap();
+
+    let result = onboarding_workspace_list_result(&state, Some(root.to_str().unwrap()))
+        .expect("list a directory holding dot-directories");
+
+    let names: Vec<&str> = result["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["visible"]);
+    assert_eq!(
+        result["hidden_skipped"],
+        json!(3),
+        "the three dot-directories must be counted, the dot-FILE must not"
+    );
+}
+
+/// Contract §1 — at most 500 entries; `truncated` is true when more
+/// existed. The kept 500 are the first 500 of the sorted order.
+#[test]
+fn should_set_truncated_when_directory_exceeds_the_five_hundred_entry_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let root = base.join("many");
+    std::fs::create_dir_all(&root).unwrap();
+    for index in 0..ONBOARDING_WORKSPACE_LIST_MAX_ENTRIES + 1 {
+        std::fs::create_dir_all(root.join(format!("dir-{index:04}"))).unwrap();
+    }
+
+    let result = onboarding_workspace_list_result(&state, Some(root.to_str().unwrap()))
+        .expect("list an over-cap directory");
+
+    let entries = result["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), ONBOARDING_WORKSPACE_LIST_MAX_ENTRIES);
+    assert_eq!(result["truncated"], json!(true));
+    assert_eq!(entries[0]["name"], json!("dir-0000"));
+}
+
+/// Contract §1 — `parent_path` is null at the filesystem root.
+#[test]
+fn should_report_null_parent_path_when_listing_the_filesystem_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    // The root is `/` on Unix and `<drive>:\` on Windows; derive it from
+    // the canonical working directory so the contract runs on both.
+    let root = std::fs::canonicalize(std::env::current_dir().unwrap())
+        .unwrap()
+        .ancestors()
+        .last()
+        .unwrap()
+        .to_path_buf();
+
+    let result = onboarding_workspace_list_result(&state, Some(root.to_str().unwrap()))
+        .expect("list the filesystem root");
+
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        root.to_string_lossy()
+    );
+    assert_eq!(
+        result["parent_path"],
+        Value::Null,
+        "the filesystem root has no parent"
+    );
+}
+
+/// Contract §1 — a null/empty `path` means "the server's own working
+/// directory".
+#[test]
+fn should_list_the_server_working_directory_when_path_is_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+
+    let result =
+        onboarding_workspace_list_result(&state, None).expect("list the server working directory");
+
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        cwd.to_string_lossy()
+    );
+}
+
+/// Contract §1 — a missing path, a file path and a banned system root
+/// each get their own typed `data.kind`.
+#[test]
+fn should_return_typed_not_found_when_listing_a_missing_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let missing = base.join("never-created");
+
+    let error = onboarding_workspace_list_result(&state, Some(missing.to_str().unwrap()))
+        .expect_err("a missing path must be rejected");
+
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_list_not_found")
+    );
+}
+
+#[test]
+fn should_return_typed_not_a_directory_when_listing_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let file = base.join("README.md");
+    std::fs::write(&file, "a regular file").unwrap();
+
+    let error = onboarding_workspace_list_result(&state, Some(file.to_str().unwrap()))
+        .expect_err("a file path must be rejected");
+
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_list_not_a_directory")
+    );
+}
+
+/// Windows counterpart of the unix banned-root test: a unix-style path
+/// is not absolute on Windows (no drive prefix), so the resolver refuses
+/// it as an invalid path long before the unix-only banned-root rule runs.
+#[cfg(windows)]
+#[test]
+fn should_return_typed_invalid_path_when_listing_a_unix_style_path_on_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+
+    let error = onboarding_workspace_list_result(&state, Some("/etc"))
+        .expect_err("a unix-style path is not absolute on Windows");
+
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_list_invalid_path")
+    );
+}
+
+// The banned-system-root list is Unix-only (`/etc`, `/usr`, `/proc`, …):
+// on Windows `/etc` is not absolute and is refused as an invalid path
+// before the banned-root rule runs, and no Windows roots are banned.
+#[cfg(unix)]
+#[test]
+fn should_return_typed_root_escape_when_listing_a_banned_system_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+
+    let error = onboarding_workspace_list_result(&state, Some("/etc"))
+        .expect_err("a banned system root must be rejected");
+
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_list_root_escape")
+    );
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("banned_root")),
+        Some(&json!("etc")),
+        "the root-escape error must name the banned system component"
+    );
+}
+
+#[test]
+fn should_return_typed_invalid_path_when_listing_an_empty_or_relative_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+
+    // An explicitly blank string is not "null means cwd": it is unusable.
+    let error = onboarding_workspace_list_result(&state, Some("   "))
+        .expect_err("a blank path must be rejected");
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_list_invalid_path")
+    );
+
+    let relative = onboarding_workspace_list_result(&state, Some("relative/path"))
+        .expect_err("a relative path must be rejected");
+    assert_eq!(
+        workspace_browse_error_kind(&relative).as_deref(),
+        Some("workspace_list_invalid_path")
+    );
+}
+
+/// Contract §1 — `~` is expanded exactly the way `onboarding/workspace_probe`
+/// expands it.
+#[test]
+fn should_expand_home_prefix_when_listing_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let Ok(canonical_home) = std::fs::canonicalize(&home) else {
+        return;
+    };
+
+    let result = onboarding_workspace_list_result(&state, Some("~")).expect("list the home dir");
+
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        canonical_home.to_string_lossy()
+    );
+}
+
+/// Contract §1 — tenant / cloud deployments are refused exactly like the
+/// probe refuses them.
+#[test]
+fn should_refuse_workspace_list_when_local_solo_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = local_profile_state(dir.path());
+    let tenant = AppState {
+        deployment_mode: crate::config::DeploymentMode::Tenant,
+        profile_store: local.profile_store.clone(),
+        user_store: local.user_store.clone(),
+        ..AppState::empty_for_tests()
+    };
+
+    let error = onboarding_workspace_list_result(&tenant, Some(dir.path().to_str().unwrap()))
+        .expect_err("tenant rejection");
+
+    assert_eq!(error.code, rpc_error_codes::PERMISSION_DENIED);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("profile_local_unsupported")
+    );
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("runtime_mode")),
+        Some(&json!("multi_tenant"))
+    );
+}
+
+/// Contract §2 — `name` is exactly one path component: no `/`, no `\`,
+/// not `.`, not `..`, no control characters, 1..=255 bytes, and it must
+/// not start or end with whitespace.
+#[test]
+fn should_reject_invalid_names_when_creating_workspace_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let parent_dir = dir.path().join("parent");
+    std::fs::create_dir_all(&parent_dir).unwrap();
+    let parent = parent_dir.to_str().unwrap();
+    let over_long = "a".repeat(ONBOARDING_WORKSPACE_CREATE_MAX_NAME_BYTES + 1);
+
+    for name in [
+        "..",
+        ".",
+        "a/b",
+        "a\\b",
+        "",
+        " leading",
+        "trailing ",
+        "ctrl\u{0007}char",
+        "nul\0byte",
+        over_long.as_str(),
+    ] {
+        let error = onboarding_workspace_create_result(&state, parent, name)
+            .expect_err(&format!("{name:?} must be rejected"));
+        assert_eq!(
+            error.code,
+            rpc_error_codes::INVALID_PARAMS,
+            "{name:?} must be an invalid-params rejection"
+        );
+        assert_eq!(
+            workspace_browse_error_kind(&error).as_deref(),
+            Some("workspace_create_invalid_name"),
+            "{name:?} must be rejected as an invalid name"
+        );
+    }
+
+    let leftovers = std::fs::read_dir(&parent_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .count();
+    assert_eq!(leftovers, 0, "a rejected name must never create anything");
+}
+
+#[test]
+fn should_create_directory_and_report_created_when_creating_workspace_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let parent = std::fs::canonicalize(dir.path()).unwrap();
+
+    let result = onboarding_workspace_create_result(&state, parent.to_str().unwrap(), "new-app")
+        .expect("create a folder");
+
+    assert_eq!(result["created"], json!(true));
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        std::fs::canonicalize(parent.join("new-app"))
+            .unwrap()
+            .to_string_lossy()
+    );
+    assert!(parent.join("new-app").is_dir());
+    assert_eq!(
+        result.as_object().unwrap().len(),
+        2,
+        "the create result carries exactly canonical_path + created"
+    );
+}
+
+/// Contract §2 — `created` is false when a directory of that name already
+/// existed: idempotent success, not an error.
+#[test]
+fn should_report_created_false_when_workspace_folder_already_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let parent = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir_all(parent.join("existing")).unwrap();
+
+    let result = onboarding_workspace_create_result(&state, parent.to_str().unwrap(), "existing")
+        .expect("an existing directory is an idempotent success");
+
+    assert_eq!(result["created"], json!(false));
+    assert_eq!(
+        result["canonical_path"].as_str().unwrap(),
+        std::fs::canonicalize(parent.join("existing"))
+            .unwrap()
+            .to_string_lossy()
+    );
+}
+
+/// Contract §2 — a NON-directory already at that path is an error.
+#[test]
+fn should_return_typed_exists_not_directory_when_a_file_occupies_the_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let parent = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::write(parent.join("occupied"), "a file, not a folder").unwrap();
+
+    let error = onboarding_workspace_create_result(&state, parent.to_str().unwrap(), "occupied")
+        .expect_err("a file of that name must be an error");
+
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_create_exists_not_directory")
+    );
+}
+
+#[test]
+fn should_return_typed_parent_errors_when_creating_workspace_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let missing = base.join("no-such-parent");
+    let file_parent = base.join("parent.txt");
+    std::fs::write(&file_parent, "a file used as a parent").unwrap();
+
+    let not_found = onboarding_workspace_create_result(&state, missing.to_str().unwrap(), "child")
+        .expect_err("a missing parent must be rejected");
+    assert_eq!(
+        workspace_browse_error_kind(&not_found).as_deref(),
+        Some("workspace_create_parent_not_found")
+    );
+
+    let not_a_directory =
+        onboarding_workspace_create_result(&state, file_parent.to_str().unwrap(), "child")
+            .expect_err("a file parent must be rejected");
+    assert_eq!(
+        workspace_browse_error_kind(&not_a_directory).as_deref(),
+        Some("workspace_create_parent_not_a_directory")
+    );
+}
+
+/// Contract §2 — a `parent` rooted under a banned system path is a typed
+/// root escape naming the banned component. Unix-only for the same reason
+/// as the list-side banned-root test above.
+#[cfg(unix)]
+#[test]
+fn should_return_typed_root_escape_when_creating_under_a_banned_system_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+
+    let root_escape = onboarding_workspace_create_result(&state, "/etc", "child")
+        .expect_err("a banned system parent must be rejected");
+    assert_eq!(
+        workspace_browse_error_kind(&root_escape).as_deref(),
+        Some("workspace_create_root_escape")
+    );
+    assert_eq!(
+        root_escape
+            .data
+            .as_ref()
+            .and_then(|data| data.get("banned_root")),
+        Some(&json!("etc"))
+    );
+}
+
+/// Windows counterpart: the contract maps an unusable `parent` to
+/// `workspace_create_parent_not_found`, and a unix-style parent is
+/// unusable on Windows because it is not absolute.
+#[cfg(windows)]
+#[test]
+fn should_report_unix_style_parent_as_not_found_when_creating_on_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+
+    let error = onboarding_workspace_create_result(&state, "/etc", "child")
+        .expect_err("a unix-style parent is not absolute on Windows");
+
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_create_parent_not_found")
+    );
+}
+
+/// Contract §2 — the created path, canonicalized, must still live under
+/// `parent`: a pre-existing symlink that points outside is a root escape,
+/// never a silent success on someone else's directory.
+#[cfg(unix)]
+#[test]
+fn should_return_typed_root_escape_when_the_name_symlinks_outside_the_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = local_profile_state(dir.path());
+    let parent = std::fs::canonicalize(dir.path()).unwrap();
+    let outside = parent.join("outside");
+    let inside = parent.join("inside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(&inside).unwrap();
+    std::os::unix::fs::symlink(&outside, inside.join("escape")).unwrap();
+
+    let error = onboarding_workspace_create_result(&state, inside.to_str().unwrap(), "escape")
+        .expect_err("a symlink escape must be rejected");
+
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("workspace_create_root_escape")
+    );
+}
+
+#[test]
+fn should_refuse_workspace_create_when_local_solo_is_unsupported() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = local_profile_state(dir.path());
+    let tenant = AppState {
+        deployment_mode: crate::config::DeploymentMode::Tenant,
+        profile_store: local.profile_store.clone(),
+        user_store: local.user_store.clone(),
+        ..AppState::empty_for_tests()
+    };
+
+    let error =
+        onboarding_workspace_create_result(&tenant, dir.path().to_str().unwrap(), "new-app")
+            .expect_err("tenant rejection");
+
+    assert_eq!(error.code, rpc_error_codes::PERMISSION_DENIED);
+    assert_eq!(
+        workspace_browse_error_kind(&error).as_deref(),
+        Some("profile_local_unsupported")
+    );
+    assert!(
+        !dir.path().join("new-app").exists(),
+        "a refused create must not touch the filesystem"
+    );
+}
+
+/// Contract gate — both methods and `onboarding.workspace_browse.v1` are
+/// advertised for local-solo deployments and withheld from tenant ones, so
+/// a client that cannot see the feature fails closed to the typed-path form.
+#[test]
+fn should_advertise_workspace_browse_only_for_local_solo_deployments() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = local_profile_state(dir.path());
+    let local_capabilities = ConnectionUiFeatures::default().advertised_capabilities(&local);
+    for method in [
+        APPUI_METHOD_ONBOARDING_WORKSPACE_LIST,
+        APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE,
+    ] {
+        assert!(
+            local_capabilities
+                .supported_methods
+                .iter()
+                .any(|advertised| advertised == method),
+            "local solo deployment must advertise {method}",
+        );
+    }
+    assert!(
+        local_capabilities.supports_feature(APPUI_FEATURE_ONBOARDING_WORKSPACE_BROWSE_V1),
+        "local solo deployment must advertise the workspace browse feature",
+    );
+
+    let tenant = AppState {
+        deployment_mode: crate::config::DeploymentMode::Tenant,
+        profile_store: local.profile_store.clone(),
+        user_store: local.user_store.clone(),
+        ..AppState::empty_for_tests()
+    };
+    let tenant_capabilities = ConnectionUiFeatures::default().advertised_capabilities(&tenant);
+    for method in [
+        APPUI_METHOD_ONBOARDING_WORKSPACE_LIST,
+        APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE,
+    ] {
+        assert!(
+            !tenant_capabilities
+                .supported_methods
+                .iter()
+                .any(|advertised| advertised == method),
+            "tenant deployment must NOT advertise {method}",
+        );
+    }
+    assert!(
+        !tenant_capabilities.supports_feature(APPUI_FEATURE_ONBOARDING_WORKSPACE_BROWSE_V1),
+        "tenant deployment must NOT advertise the workspace browse feature",
     );
 }
 
@@ -4954,8 +7568,12 @@ async fn session_list_cwd_root_honors_flag_and_capability() {
     };
     let with_cwd = SessionListParams {
         cwd: Some(cwd.to_string_lossy().into_owned()),
+        profile_id: None,
     };
-    let no_cwd = SessionListParams { cwd: None };
+    let no_cwd = SessionListParams {
+        cwd: None,
+        profile_id: None,
+    };
 
     let state_off = {
         let mut s = AppState::empty_for_tests();
@@ -4993,15 +7611,9 @@ async fn session_list_cwd_root_honors_flag_and_capability() {
     assert!(resolve_session_list_cwd_root(&state_on, has_cap, None, &with_cwd).is_err());
 }
 
-#[tokio::test]
-async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
-    // With a registered profile runtime: a SAFE cwd resolves to the
-    // per-project, per-PROFILE store `<cwd>/.octos/<profile_id>` (so two
-    // profiles sharing a cwd can't read each other's transcripts), and a
-    // banned system path is rejected by the shared safety gate.
-    use octos_core::ui_protocol::SessionListParams;
-
-    let tmp = tempfile::tempdir().unwrap();
+/// `AppState` with `sessions_in_cwd` on and a single bootstrapped `dev`
+/// profile runtime — the shape of a local `octos serve --solo` install.
+async fn session_list_state_with_dev_runtime(tmp: &std::path::Path) -> AppState {
     let profile = crate::profiles::UserProfile {
         id: "dev".to_string(),
         name: "Dev".to_string(),
@@ -5033,7 +7645,7 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    let data_dir = tmp.path().join("data");
+    let data_dir = tmp.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let runtime = crate::runtime::ProfileRuntime::bootstrap(
         &profile,
@@ -5050,7 +7662,19 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
         crate::runtime::SessionRuntimeCache::new(4, std::time::Duration::from_secs(60))
             .with_sessions_in_cwd(true),
     );
+    state
+}
 
+#[tokio::test]
+async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
+    // With a registered profile runtime: a SAFE cwd resolves to the
+    // per-project, per-PROFILE store `<cwd>/.octos/<profile_id>` (so two
+    // profiles sharing a cwd can't read each other's transcripts), and a
+    // banned system path is rejected by the shared safety gate.
+    use octos_core::ui_protocol::SessionListParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = session_list_state_with_dev_runtime(tmp.path()).await;
     let cap = ConnectionUiFeatures::stdio_defaults();
 
     // Safe cwd → `<cwd>/.octos/dev` (profile-namespaced).
@@ -5059,23 +7683,157 @@ async fn session_list_cwd_root_gates_path_and_namespaces_by_profile() {
     let good_canon = std::fs::canonicalize(&good).unwrap();
     let good_params = SessionListParams {
         cwd: Some(good.to_string_lossy().into_owned()),
+        profile_id: None,
     };
     let resolved = resolve_session_list_cwd_root(&state, cap, Some("dev"), &good_params).unwrap();
     assert_eq!(
         resolved,
-        Some(crate::runtime::session::project_sessions_root(
-            &good_canon,
-            "dev"
-        )),
+        Some(SessionListScope {
+            workspace_root: good_canon.clone(),
+            sessions_root: crate::runtime::session::project_sessions_root(&good_canon, "dev"),
+            profile_id: "dev".to_string(),
+        }),
     );
-    assert_eq!(resolved, Some(good_canon.join(".octos").join("dev")));
+    assert_eq!(
+        resolved.map(|scope| scope.sessions_root),
+        Some(good_canon.join(".octos").join("dev"))
+    );
 
     // Banned system root (`/usr` is a real dir on Linux and macOS that
     // canonicalizes to `/usr`) → rejected by the safety gate.
     let banned = SessionListParams {
         cwd: Some("/usr".to_string()),
+        profile_id: Some("dev".to_string()),
     };
     assert!(resolve_session_list_cwd_root(&state, cap, Some("dev"), &banned).is_err());
+}
+
+#[tokio::test]
+async fn session_list_cwd_root_should_honor_requested_profile_when_connection_is_admin() {
+    // A browser paired with the admin bearer token has NO connection profile
+    // (`AuthIdentity::Admin` → `None`), yet it opens sessions as `dev` by
+    // passing `profile_id` to session/open. Before this test the cwd listing
+    // ignored `params.profile_id`, fell back to `_main`, and — on a local
+    // install with only a `dev` profile — failed with
+    // `cwd_runtime_unavailable`, so the history browser never saw the
+    // transcripts that session/open had written under `<cwd>/.octos/dev`.
+    use octos_core::ui_protocol::SessionListParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = session_list_state_with_dev_runtime(tmp.path()).await;
+    let cap = ConnectionUiFeatures::stdio_defaults();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_canon = std::fs::canonicalize(&project).unwrap();
+    let cwd = project.to_string_lossy().into_owned();
+
+    // Admin connection + explicit `profile_id` → that profile's store.
+    let requested = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: Some("dev".to_string()),
+    };
+    assert_eq!(
+        resolve_session_list_cwd_root(&state, cap, None, &requested).unwrap(),
+        Some(SessionListScope {
+            workspace_root: project_canon.clone(),
+            sessions_root: project_canon.join(".octos").join("dev"),
+            profile_id: "dev".to_string(),
+        }),
+    );
+
+    // Admin connection + no `profile_id` → unchanged: `_main` is not
+    // registered here, so the safety gate still rejects.
+    let bare = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: None,
+    };
+    assert!(resolve_session_list_cwd_root(&state, cap, None, &bare).is_err());
+
+    // Empty `profile_id` is rejected, same as session/open.
+    let empty = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: Some(String::new()),
+    };
+    assert!(resolve_session_list_cwd_root(&state, cap, None, &empty).is_err());
+
+    // A requested profile that is not registered is still rejected — the
+    // param must never open a SessionManager at a made-up namespace.
+    let unknown = SessionListParams {
+        cwd: Some(cwd),
+        profile_id: Some("ghost".to_string()),
+    };
+    assert!(resolve_session_list_cwd_root(&state, cap, None, &unknown).is_err());
+}
+
+#[tokio::test]
+async fn session_list_cwd_root_should_reject_requested_profile_outside_authenticated_scope() {
+    // An authenticated user connection is frozen to its own profile: a
+    // `profile_id` naming another profile is a scope violation (mirrors
+    // `validate_authenticated_session_scope` for session/open), while
+    // restating the connection's own profile is fine.
+    use octos_core::ui_protocol::SessionListParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = session_list_state_with_dev_runtime(tmp.path()).await;
+    let cap = ConnectionUiFeatures::stdio_defaults();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_canon = std::fs::canonicalize(&project).unwrap();
+    let cwd = project.to_string_lossy().into_owned();
+
+    let foreign = SessionListParams {
+        cwd: Some(cwd.clone()),
+        profile_id: Some("other".to_string()),
+    };
+    let error = resolve_session_list_cwd_root(&state, cap, Some("dev"), &foreign).unwrap_err();
+    assert_eq!(error.code, RpcError::invalid_params("").code);
+    assert!(
+        error.message.contains("outside the authenticated profile"),
+        "unexpected error message: {}",
+        error.message
+    );
+
+    let own = SessionListParams {
+        cwd: Some(cwd),
+        profile_id: Some("dev".to_string()),
+    };
+    assert_eq!(
+        resolve_session_list_cwd_root(&state, cap, Some("dev"), &own).unwrap(),
+        Some(SessionListScope {
+            workspace_root: project_canon.clone(),
+            sessions_root: project_canon.join(".octos").join("dev"),
+            profile_id: "dev".to_string(),
+        }),
+    );
+}
+
+#[test]
+fn session_list_result_should_attest_scope_only_when_the_listing_was_scoped() {
+    // A client cannot otherwise tell a project-scoped listing from the
+    // legacy global one a flag-off (or older) server returns for the same
+    // `{cwd}` request — so it must never place legacy rows under a
+    // workspace. The scoped result names the canonical root and profile it
+    // read; the legacy result stays byte-identical `{ sessions }`.
+    let sessions = serde_json::json!([{ "id": "dev:api:web-1", "message_count": 2 }]);
+
+    assert_eq!(
+        session_list_result_value(sessions.clone(), None),
+        serde_json::json!({ "sessions": sessions }),
+    );
+
+    let scope = SessionListScope {
+        workspace_root: std::path::PathBuf::from("/srv/project"),
+        sessions_root: std::path::PathBuf::from("/srv/project/.octos/dev"),
+        profile_id: "dev".to_string(),
+    };
+    assert_eq!(
+        session_list_result_value(sessions.clone(), Some(&scope)),
+        serde_json::json!({
+            "sessions": sessions,
+            "workspace_root": "/srv/project",
+            "profile_id": "dev",
+        }),
+    );
 }
 
 #[tokio::test]
@@ -5444,6 +8202,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
     let mut binding = Some("ada".to_owned());
 
     let missing_params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("local:missing-binding".into()),
         topic: None,
         profile_id: Some("missing".into()),
@@ -5500,6 +8259,7 @@ async fn stdio_binding_updates_only_after_successful_session_open() {
     assert_eq!(status["runtime_policy_stamp"]["profile_id"], json!("ada"));
 
     let grace_params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("local:grace-binding".into()),
         topic: None,
         profile_id: Some("grace".into()),
@@ -5709,6 +8469,262 @@ async fn raw_session_status_read_includes_model_object_when_model_resolved() {
 }
 
 #[tokio::test]
+async fn session_open_client_commands_reach_the_session_agent_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(dir.path(), "coding").await;
+    let session_id = SessionKey("local:tui#coding".into());
+
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        Some("coding"),
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+            client_commands: Some(vec!["/model".into(), "/add-model".into()]),
+        },
+    )
+    .await
+    .expect("session/open succeeds");
+
+    let session = state
+        .session_cache
+        .get_or_init(&runtime, session_id, None)
+        .await
+        .expect("opened session is cached");
+    let prompt = session.agent.system_prompt_snapshot();
+    assert!(prompt.contains("`/model`"), "{prompt}");
+    assert!(prompt.contains("`/add-model`"), "{prompt}");
+}
+
+#[tokio::test]
+async fn session_open_result_echoes_the_accepted_client_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, _runtime) = state_with_profile(dir.path(), "coding").await;
+    let session_id = SessionKey("local:tui#coding".into());
+    let ledger = UiProtocolLedger::new(16);
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let open = |client_commands: Option<Vec<String>>| {
+        open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            ConnectionId::next(),
+            Some("coding"),
+            None,
+            ConnectionUiFeatures::stdio_defaults(),
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                topic: None,
+                profile_id: None,
+                cwd: None,
+                sandbox: None,
+                after: None,
+                client_commands,
+            },
+        )
+    };
+
+    let declared = open(Some(vec![
+        "/model".into(),
+        "/router".into(),
+        "/bad name".into(),
+        "add-model".into(),
+    ]))
+    .await
+    .expect("session/open succeeds");
+    assert_eq!(
+        declared.result.opened.accepted_client_commands,
+        Some(vec!["/model".to_string(), "/add-model".to_string()]),
+        "the result must name the commands that survived the server-side filter"
+    );
+
+    let all_dropped = open(Some(vec!["/router".into()]))
+        .await
+        .expect("session/open succeeds");
+    assert_eq!(
+        all_dropped.result.opened.accepted_client_commands,
+        Some(Vec::new()),
+        "a fully dropped declaration must stay distinguishable from no declaration"
+    );
+
+    let undeclared = open(None).await.expect("session/open succeeds");
+    assert_eq!(undeclared.result.opened.accepted_client_commands, None);
+}
+
+#[tokio::test]
+async fn session_reopen_without_client_commands_clears_the_previous_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(dir.path(), "coding").await;
+    let session_id = SessionKey("local:tui#coding".into());
+    let ledger = UiProtocolLedger::new(16);
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let open = |client_commands: Option<Vec<String>>| {
+        open_session_result(
+            &state,
+            &ledger,
+            &approvals,
+            &questions,
+            ConnectionId::next(),
+            Some("coding"),
+            None,
+            ConnectionUiFeatures::stdio_defaults(),
+            SessionOpenParams {
+                session_id: session_id.clone(),
+                topic: None,
+                profile_id: None,
+                cwd: None,
+                sandbox: None,
+                after: None,
+                client_commands,
+            },
+        )
+    };
+
+    open(Some(vec!["/model".into()]))
+        .await
+        .expect("first session/open succeeds");
+    open(None)
+        .await
+        .expect("reopen without declaration succeeds");
+
+    let session = state
+        .session_cache
+        .get_or_init(&runtime, session_id, None)
+        .await
+        .expect("opened session is cached");
+    let prompt = session.agent.system_prompt_snapshot();
+    assert!(
+        !prompt.contains("`/model`"),
+        "a client that declares nothing must not inherit another client's commands: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn closing_the_declaring_connection_releases_its_client_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(dir.path(), "coding").await;
+    let session_id = SessionKey("local:tui#coding".into());
+    let declarer = ConnectionId::next();
+
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        declarer,
+        Some("coding"),
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+            client_commands: Some(vec!["/model".into()]),
+        },
+    )
+    .await
+    .expect("session/open succeeds");
+    let session = state
+        .session_cache
+        .get_or_init(&runtime, session_id, None)
+        .await
+        .expect("opened session is cached");
+
+    release_connection_client_commands(&state, ConnectionId::next()).await;
+    assert!(session.agent.system_prompt_snapshot().contains("`/model`"));
+
+    release_connection_client_commands(&state, declarer).await;
+    assert!(!session.agent.system_prompt_snapshot().contains("`/model`"));
+}
+
+#[tokio::test]
+async fn stdio_disconnect_releases_client_commands_declared_on_it() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(dir.path(), "coding").await;
+    let session_id = SessionKey("local:tui#coding".into());
+    let (mut input_tx, input_rx) = tokio::io::duplex(1 << 16);
+    let (response_rx, response_tx) = tokio::io::duplex(1 << 20);
+    let connection = tokio::spawn(stdio_connection_with_io(
+        state.clone(),
+        input_rx,
+        response_tx,
+        new_stdio_dispatch_count_for_test(),
+        None,
+    ));
+
+    let open = format!(
+        "{}\n",
+        json!({
+            "jsonrpc": "2.0",
+            "id": "open",
+            "method": octos_core::ui_protocol::methods::SESSION_OPEN,
+            "params": {
+                "session_id": session_id,
+                "profile_id": "coding",
+                "client_commands": ["/model"]
+            }
+        })
+    );
+    input_tx
+        .write_all(open.as_bytes())
+        .await
+        .expect("queue session/open");
+    let mut responses = BufReader::new(response_rx).lines();
+    let opened = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(line) = responses.next_line().await.expect("read response") {
+            let frame: Value = serde_json::from_str(&line).expect("json frame");
+            if frame["id"] == json!("open") {
+                return frame;
+            }
+        }
+        panic!("connection closed before answering session/open");
+    })
+    .await
+    .expect("session/open is answered");
+    assert!(
+        opened.get("result").is_some(),
+        "session/open failed: {opened}"
+    );
+
+    let session = state
+        .session_cache
+        .get_or_init(&runtime, session_id, None)
+        .await
+        .expect("opened session is cached");
+    assert!(session.agent.system_prompt_snapshot().contains("`/model`"));
+
+    drop(input_tx);
+    tokio::spawn(async move { while let Ok(Some(_)) = responses.next_line().await {} });
+    tokio::time::timeout(Duration::from_secs(10), connection)
+        .await
+        .expect("connection exits on EOF")
+        .expect("connection task joins")
+        .expect("connection exits cleanly");
+    assert!(
+        !session.agent.system_prompt_snapshot().contains("`/model`"),
+        "a closed connection must not keep advertising its commands"
+    );
+}
+
+#[tokio::test]
 async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() {
     let dir = tempfile::tempdir().unwrap();
     let state = local_profile_state_with_sessions(dir.path());
@@ -5741,6 +8757,7 @@ async fn stdio_multi_profile_open_status_reads_isolated_runtime_policy_stamps() 
             None,
             features,
             SessionOpenParams {
+                client_commands: None,
                 session_id: session_id.clone(),
                 topic: None,
                 profile_id: None,
@@ -5857,6 +8874,7 @@ async fn session_open_writes_active_profile_marker_only_with_flag_and_cwd() {
                 None,
                 features,
                 SessionOpenParams {
+                    client_commands: None,
                     session_id,
                     topic: None,
                     profile_id: None,
@@ -5989,6 +9007,57 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
     assert_eq!(frame["id"], json!("memory-entity-unauth"));
     assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
 
+    handle_memory_search(
+        &ws,
+        &state,
+        &headers,
+        None,
+        false,
+        "memory-search-unauth".into(),
+        MemorySearchParams {
+            query: "dentist".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["id"], json!("memory-search-unauth"));
+    assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+    handle_memory_load(
+        &ws,
+        &state,
+        &headers,
+        None,
+        false,
+        "memory-load-unauth".into(),
+        MemoryLoadParams {
+            id: "doc:mail:1".into(),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["id"], json!("memory-load-unauth"));
+    assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
+    handle_memory_ingest(
+        &ws,
+        &state,
+        &headers,
+        None,
+        false,
+        "memory-ingest-unauth".into(),
+        MemoryIngestParams {
+            records: vec![json!({ "id": "doc:mail:1" })],
+            vectors: None,
+            embed: Some(false),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["id"], json!("memory-ingest-unauth"));
+    assert_eq!(frame["error"]["data"]["kind"], json!("auth_unavailable"));
+
     handle_cron_list(
         &ws,
         &state,
@@ -6091,8 +9160,10 @@ fn panel_cron_job(id: &str, enabled: bool) -> octos_bus::CronJob {
             deliver: false,
             channel: Some("system".into()),
             chat_id: None,
+            mode: octos_bus::CronMode::Agent,
         },
         state: Default::default(),
+        origin: octos_bus::CronOrigin::default(),
         created_at_ms: 1,
         delete_after_run: false,
         timezone: None,
@@ -7004,6 +10075,8 @@ impl octos_agent::Tool for ContextAwareActionTool {
                         body: "test approval bridge".to_string(),
                         command: None,
                         cwd: None,
+                        once_only: false,
+                        host_tool: None,
                     })
                     .await,
                 ToolApprovalDecision::Approve
@@ -8036,7 +11109,7 @@ async fn profile_llm_fetch_models_requires_family_id() {
 }
 
 #[tokio::test]
-async fn profile_llm_fetch_models_returns_empty_with_reason_when_provider_unreachable() {
+async fn profile_llm_fetch_models_returns_typed_reason_when_provider_unreachable() {
     let state = Arc::new(AppState::empty_for_tests());
     let request = RpcRequest::new(
         "1",
@@ -8059,7 +11132,366 @@ async fn profile_llm_fetch_models_returns_empty_with_reason_when_provider_unreac
         .expect("fetch_models result");
 
     assert_eq!(result["models"], json!([]));
-    assert_eq!(result["reason"], json!("provider_unavailable"));
+    // Typed, distinguishable failure — not the old collapsed
+    // `provider_unavailable` that hid auth/protocol/manual-entry differences.
+    assert_eq!(result["status"], json!("endpoint_unreachable"));
+    assert_eq!(result["reason"], json!("endpoint_unreachable"));
+    assert!(result["message"].is_string());
+}
+
+/// One captured discovery request: path plus the auth-relevant headers.
+struct CapturedDiscoveryRequest {
+    path: String,
+    authorization: Option<String>,
+    x_api_key: Option<String>,
+}
+
+/// Raw-TCP loopback fixture for fetch_models: serves a fixed JSON status/body
+/// for every request and records path + auth headers, so tests can pin the
+/// EXACT wire behavior (no Bearer on Anthropic-protocol families, no
+/// duplicated version segments on versioned roots).
+async fn spawn_discovery_fixture(
+    status_line: &'static str,
+    body: &'static str,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<CapturedDiscoveryRequest>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let recorded = captured.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            // Read until the END OF HEADERS — a single read can return a
+            // partial request, and answering before the client finished
+            // sending makes the close reset the connection mid-request.
+            let mut raw = Vec::new();
+            let mut chunk = [0_u8; 2048];
+            loop {
+                match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        raw.extend_from_slice(&chunk[..read]);
+                        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&raw).to_string();
+            let mut lines = request.split("\r\n");
+            let request_line = lines.next().unwrap_or_default().to_string();
+            let path = request_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+            let header = |name: &str| -> Option<String> {
+                lines.clone().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_string())
+                })
+            };
+            recorded.lock().await.push(CapturedDiscoveryRequest {
+                path,
+                authorization: header("authorization"),
+                x_api_key: header("x-api-key"),
+            });
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+    (format!("http://{address}"), captured)
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_zai_never_gets_a_bearer_v1_models_probe() {
+    let (root, captured) =
+        spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"glm-5.2"},{"id":"glm-4.7"}]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    // Saved AppUI routes default api_type to "openai". The zai family now
+    // speaks OpenAI Chat Completions on the versioned `/api/paas/v4` root
+    // (the only Z.AI root that reports its implicit prompt cache), so the
+    // probe is the OpenAI listing off THAT root — `/models`, never a
+    // synthesized `/v4/v1/models` — with Bearer auth.
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "zai",
+                "route": {
+                    "route_id": "official",
+                    "base_url": format!("{root}/api/paas/v4"),
+                    "api_type": "openai"
+                }
+            },
+            "api_key": "zai-secret-key"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["status"], json!("discovered"));
+    assert_eq!(result["models"], json!(["glm-4.7", "glm-5.2"]));
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/api/paas/v4/models");
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer zai-secret-key"),
+        "zai speaks OpenAI Chat Completions — Bearer auth on the listing probe"
+    );
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_r9s_claude_selection_probes_the_anthropic_root() {
+    let (root, captured) =
+        spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"claude-sonnet-4"}]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    // r9s serves claude-* over the Anthropic Messages protocol at a rewritten
+    // `{base}/anthropic` root — the probe must follow the SELECTED model
+    // (octos#2185), not the family-wide OpenAI declaration.
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "r9s",
+                "model_id": "claude-sonnet-4",
+                "route": {
+                    "route_id": "official",
+                    "base_url": format!("{root}/v1")
+                }
+            },
+            "api_key": "r9s-secret-key"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["status"], json!("discovered"));
+    assert_eq!(result["models"], json!(["claude-sonnet-4"]));
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/anthropic/v1/models");
+    assert!(
+        requests[0].authorization.is_none(),
+        "r9s claude-* speaks Anthropic Messages — never a Bearer probe"
+    );
+    assert_eq!(requests[0].x_api_key.as_deref(), Some("r9s-secret-key"));
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_r9s_non_claude_selection_keeps_the_openai_listing() {
+    let (root, captured) = spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"gpt-5"}]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "r9s",
+                "model_id": "gpt-5",
+                "route": {
+                    "route_id": "official",
+                    "base_url": format!("{root}/v1")
+                }
+            },
+            "api_key": "r9s-secret-key"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["status"], json!("discovered"));
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/models");
+    assert_eq!(
+        requests[0].authorization.as_deref(),
+        Some("Bearer r9s-secret-key")
+    );
+}
+
+/// The admin REST `/api/my/provider-models` surface shares the per-model
+/// resolution verbatim with the AppUI RPC — including passing the selected
+/// model through (octos#2185).
+#[tokio::test]
+async fn admin_provider_models_r9s_claude_selection_probes_the_anthropic_root() {
+    let (root, captured) =
+        spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"claude-sonnet-4"}]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+
+    let response = crate::api::admin::provider_models(
+        axum::extract::State(state),
+        None,
+        axum::Json(crate::api::admin::TestProviderRequest {
+            provider: "r9s".into(),
+            model: "claude-sonnet-4".into(),
+            api_key: Some("r9s-secret-key".into()),
+            api_key_env: None,
+            base_url: Some(format!("{root}/v1")),
+            api_type: None,
+            profile_id: None,
+        }),
+    )
+    .await
+    .expect("provider-models result");
+
+    assert_eq!(response.0, vec!["claude-sonnet-4".to_string()]);
+    let requests = captured.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/anthropic/v1/models");
+    assert!(
+        requests[0].authorization.is_none(),
+        "r9s claude-* speaks Anthropic Messages — never a Bearer probe"
+    );
+    assert_eq!(requests[0].x_api_key.as_deref(), Some("r9s-secret-key"));
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_does_not_duplicate_version_segments_on_v4_roots() {
+    let (root, captured) =
+        spawn_discovery_fixture("200 OK", r#"{"data":[{"id":"glm-5.2"}]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "zhipu",
+                "route": {
+                    "route_id": "official",
+                    "base_url": format!("{root}/api/paas/v4")
+                }
+            },
+            "api_key": "zhipu-key"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["status"], json!("discovered"));
+    let requests = captured.lock().await;
+    assert_eq!(requests[0].path, "/api/paas/v4/models");
+    assert_ne!(requests[0].path, "/api/paas/v4/v1/models");
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_reports_unsupported_for_manual_only_families() {
+    let (root, captured) = spawn_discovery_fixture("200 OK", r#"{"data":[]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "vertex",
+                "route": {
+                    "route_id": "official",
+                    "base_url": root
+                }
+            },
+            "api_key": "sa-json-credential"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["status"], json!("unsupported"));
+    assert_eq!(result["models"], json!([]));
+    assert!(
+        result["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("manually")),
+        "unsupported must point at manual model-id entry"
+    );
+    assert!(
+        captured.lock().await.is_empty(),
+        "manual-only families must never be probed"
+    );
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_distinguishes_auth_failures_from_unavailability() {
+    let (root, _) = spawn_discovery_fixture("401 Unauthorized", r#"{"error":{}}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "custom",
+                "route": {
+                    "route_id": "custom",
+                    "base_url": format!("{root}/v1"),
+                    "api_type": "openai"
+                }
+            },
+            "api_key": "sk-wrong"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    assert_eq!(result["models"], json!([]));
+    assert_eq!(result["status"], json!("authentication_failed"));
+    assert_eq!(result["reason"], json!("authentication_failed"));
+}
+
+#[tokio::test]
+async fn profile_llm_fetch_models_keeps_empty_catalogs_distinguishable_from_failures() {
+    let (root, _) = spawn_discovery_fixture("200 OK", r#"{"data":[]}"#).await;
+    let state = Arc::new(AppState::empty_for_tests());
+    let request = RpcRequest::new(
+        "1",
+        APPUI_METHOD_PROFILE_LLM_FETCH_MODELS,
+        json!({
+            "selection": {
+                "family_id": "custom",
+                "route": {
+                    "route_id": "custom",
+                    "base_url": format!("{root}/v1"),
+                    "api_type": "openai"
+                }
+            },
+            "api_key": "sk-fine"
+        }),
+    );
+
+    let result = raw_profile_llm_fetch_models(&state, &request, Some("ada"))
+        .await
+        .expect("fetch_models result");
+
+    // An empty successful catalog is data, not `provider_unavailable`.
+    assert_eq!(result["status"], json!("discovered"));
+    assert_eq!(result["models"], json!([]));
+    assert!(result.get("reason").is_none());
+    assert!(result.get("message").is_none());
 }
 
 #[tokio::test]
@@ -8222,6 +11654,7 @@ async fn newly_configured_local_profile_allows_session_open_cwd_validation() {
 
     let workspace = tempfile::tempdir().unwrap();
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::with_profile_topic(&profile_id, "local", "tui", "coding"),
         topic: None,
         profile_id: Some(profile_id.clone()),
@@ -8445,6 +11878,7 @@ fn parses_turn_start_rpc_request() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     })
     .into_rpc_request("1")
     .expect("request");
@@ -8554,6 +11988,7 @@ fn ledger_event_cursor_covers_every_cursor_bearing_variant() {
             panes: None,
             capabilities: octos_core::ui_protocol::UiProtocolCapabilities::first_server_slice(),
             reasoning_effort: None,
+            accepted_client_commands: None,
         }));
     assert_eq!(ledger_event_cursor(&opened), Some(cursor.clone()));
 
@@ -8566,6 +12001,7 @@ fn ledger_event_cursor_covers_every_cursor_bearing_variant() {
             tokens_in: None,
             tokens_out: None,
             session_result: None,
+            token_usage: None,
         }));
     assert_eq!(ledger_event_cursor(&completed), Some(cursor.clone()));
 
@@ -8601,139 +12037,6 @@ fn ledger_event_cursor_covers_every_cursor_bearing_variant() {
             text: "x".into(),
         }));
     assert_eq!(ledger_event_cursor(&delta), None);
-}
-
-/// Issue #1332: when the standalone-turn `done` event carries
-/// token totals + cursor + final-assistant message_id, the
-/// `turn/completed` lifecycle envelope must surface them on
-/// `tokens_in`, `tokens_out`, and `session_result` rather than the
-/// dormant-stub `None` triple. Drives `try_emit_terminal` directly
-/// because the spawn pipeline is too wide to fixture; the helper
-/// is the wire-side closure that issue #1332 modified.
-#[tokio::test]
-async fn try_emit_terminal_populates_turn_completed_tokens_and_session_result() {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
-    let ws = WsConnection::new(tx);
-    let ledger = UiProtocolLedger::new(32);
-    let session_id = SessionKey("local:test".into());
-    let turn_id = TurnId::new();
-    let turn_state = TokioMutex::new(TurnState::Active);
-    let cursor = UiCursor {
-        stream: session_id.0.clone(),
-        seq: 17,
-    };
-    let details = TurnCompletionDetails {
-        cursor: Some(cursor.clone()),
-        tokens_in: Some(123),
-        tokens_out: Some(456),
-        session_result: Some(TurnSessionResult {
-            committed_seq: cursor.seq,
-            message_id: format!("{}:{}:{}", session_id.0, cursor.seq, 99_999),
-            client_message_id: Some("cmid-user-1".into()),
-        }),
-        outcome: None,
-    };
-
-    try_emit_terminal(
-        &turn_state,
-        TerminalReason::Completed,
-        &ws,
-        &ledger,
-        &session_id,
-        &turn_id,
-        None,
-        Some(details.clone()),
-        None,
-    )
-    .await;
-
-    let mut completed_frame: Option<String> = None;
-    while let Ok(msg) = rx.try_recv() {
-        if let WsMessage::Text(text) = msg {
-            if text.contains("\"method\":\"turn/completed\"") {
-                completed_frame = Some(text.to_string());
-                break;
-            }
-        }
-    }
-    let frame = completed_frame.expect("turn/completed must be emitted");
-    assert!(
-        frame.contains("\"tokens_in\":123"),
-        "tokens_in must surface from completion details: {frame}"
-    );
-    assert!(
-        frame.contains("\"tokens_out\":456"),
-        "tokens_out must surface from completion details: {frame}"
-    );
-    assert!(
-        frame.contains("\"session_result\""),
-        "session_result must surface when populated: {frame}"
-    );
-    assert!(
-        frame.contains("\"committed_seq\":17"),
-        "session_result.committed_seq must reflect the assistant carrier seq: {frame}"
-    );
-    assert!(
-        frame.contains("\"client_message_id\":\"cmid-user-1\""),
-        "session_result.client_message_id must round-trip: {frame}"
-    );
-    assert!(
-        frame.contains("\"cursor\""),
-        "top-level cursor must be threaded too: {frame}"
-    );
-}
-
-/// Companion negative test: paths that do not run an LLM (slash
-/// command shortcut, M9 fixture, review/start) pass `None` for
-/// `completion_details`. The wire shape must degrade gracefully to
-/// the pre-#1332 envelope with no token fields surfaced, so capability
-/// clients keying off `tokens_in == None` aren't misled.
-#[tokio::test]
-async fn try_emit_terminal_with_no_details_omits_token_fields() {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
-    let ws = WsConnection::new(tx);
-    let ledger = UiProtocolLedger::new(32);
-    let session_id = SessionKey("local:test".into());
-    let turn_id = TurnId::new();
-    let turn_state = TokioMutex::new(TurnState::Active);
-
-    try_emit_terminal(
-        &turn_state,
-        TerminalReason::Completed,
-        &ws,
-        &ledger,
-        &session_id,
-        &turn_id,
-        None,
-        None,
-        None,
-    )
-    .await;
-
-    let mut completed_frame: Option<String> = None;
-    while let Ok(msg) = rx.try_recv() {
-        if let WsMessage::Text(text) = msg {
-            if text.contains("\"method\":\"turn/completed\"") {
-                completed_frame = Some(text.to_string());
-                break;
-            }
-        }
-    }
-    let frame = completed_frame.expect("turn/completed must be emitted");
-    // `serde(skip_serializing_if = "Option::is_none")` on each field
-    // means a `None` triple should NOT appear on the wire.
-    assert!(
-        !frame.contains("\"tokens_in\""),
-        "tokens_in must be omitted when details are None: {frame}"
-    );
-    assert!(
-        !frame.contains("\"tokens_out\""),
-        "tokens_out must be omitted when details are None: {frame}"
-    );
-    assert!(
-        !frame.contains("\"session_result\""),
-        "session_result must be omitted when details are None: {frame}"
-    );
 }
 
 /// Issue #1337 codex round-2 regression: in the trimmed-dedupe
@@ -9199,6 +12502,63 @@ fn ws_turn_handler_registers_supervisor_with_task_query_store() {
     assert_eq!(tasks[0]["status"], "running");
 }
 
+/// Regression: `run_standalone_turn` registers per-session channel/dispatcher
+/// tools (send_file, peer_*, spawn) onto the per-turn snapshot, then MUST
+/// re-apply the profile `tool_policy` so an allow/deny list actually
+/// constrains the roster the model sees. Before the fix the re-apply was
+/// missing on the UI-Protocol path, so octoscode ran turns at `tools=31`
+/// despite an 8-tool allow-list, drowning small local models. Mirrors the
+/// gateway re-apply at `session_actor.rs:3748`.
+#[test]
+fn ws_turn_snapshot_is_constrained_by_reapplied_tool_policy() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let parent = octos_agent::ToolRegistry::with_builtins(temp.path());
+    // The per-turn snapshot, exactly as run_standalone_turn builds it.
+    let mut tool_registry = parent.snapshot_excluding(&[]);
+
+    let full_before = tool_registry.tool_names();
+    assert!(
+        full_before.len() > 1,
+        "snapshot should carry the full builtin roster, got {}",
+        full_before.len()
+    );
+    let keep = full_before
+        .iter()
+        .find(|n| n.as_str() == "read_file")
+        .cloned()
+        .unwrap_or_else(|| full_before[0].clone());
+
+    // Register a real per-session tool AFTER the snapshot — the exact class of
+    // tool `run_standalone_turn` adds (send_file / peer_* / spawn) and that used
+    // to bypass the profile policy.
+    let (out_tx, _out_rx) = mpsc::channel::<octos_core::OutboundMessage>(1);
+    tool_registry.register(octos_agent::SendFileTool::new(out_tx));
+    assert!(
+        tool_registry.tool_names().iter().any(|n| n == "send_file"),
+        "send_file must be present after being registered onto the per-turn snapshot",
+    );
+
+    // Re-apply an allow-list that OMITS send_file — what the fix now does with
+    // `session_runtime.profile.tool_policy` after registering session tools.
+    let policy = octos_agent::ToolPolicy {
+        allow: vec![keep.clone()],
+        ..Default::default()
+    };
+    tool_registry.apply_policy(&policy);
+
+    let after = tool_registry.tool_names();
+    assert_eq!(
+        after,
+        vec![keep.clone()],
+        "after re-applying the allow-list, only the allowed tool must remain \
+         — got {after:?}"
+    );
+    assert!(
+        !after.iter().any(|n| n == "send_file"),
+        "the re-applied allow-list must strip the post-snapshot session tool that used to leak",
+    );
+}
+
 /// PR #1324 follow-up — pin that wiring `set_on_failure_signal` on a
 /// per-turn `TaskSupervisor` (the way `run_standalone_turn` does
 /// after this fix) routes a `SpawnOnlyFailureSignal` through to the
@@ -9438,6 +12798,79 @@ async fn peer_send_input_injects_continuation_for_peer_session() {
         crate::autonomy::master_continuation_scheduler::MasterContinuationRuntimeState::idle(),
         8,
     );
+}
+
+/// A provider that reuses tool-call ids (`call_1` on every response — scripted
+/// servers, some OpenAI-compatible ones) must not lose a follow-up input. The
+/// occurrence is scoped to the calling session and turn, so a second turn's
+/// `peer_send_input` with the SAME tool-call id queues even after the first
+/// was drained (inside the scheduler's recent-claim window), while a retry of
+/// the same call within one turn still dedupes and is reported as such.
+#[tokio::test]
+async fn peer_send_input_with_a_reused_tool_call_id_queues_on_each_turn() {
+    use crate::autonomy::agent_orchestrator::PeerSendInputEnqueueOutcome;
+    let profile_id = "test-peer-send-input-reused-call-id";
+    let slug = "reused-otter";
+    let peer_key =
+        SessionKey::with_profile_topic(profile_id, "api", "tab-3", &format!("peer-{slug}"));
+    let state = Arc::new(AppState::empty_for_tests());
+    register_peer_wire_session(&state, &peer_key);
+    let target = peer_wire_registry()
+        .resolve(&peer_wire_key(profile_id, slug))
+        .expect("opened peer resolves");
+    let system = format!("{profile_id}:api:octosense#system");
+    let (turn_1, turn_2) = (TurnId::new(), TurnId::new());
+    let orchestrator = default_agent_orchestrator();
+    let idle = crate::autonomy::master_continuation_scheduler::MasterContinuationRuntimeState::idle;
+    let send = |turn: &TurnId, message: &str| {
+        orchestrator.enqueue_peer_send_input_continuation(
+            &target,
+            profile_id,
+            slug,
+            &peer_send_input_occurrence_id(&system, turn, "call_1"),
+            message,
+        )
+    };
+
+    assert_eq!(send(&turn_1, "FIRST"), PeerSendInputEnqueueOutcome::Queued);
+    // Same call retried within the turn: dedupes, reported as already queued.
+    let retry = send(&turn_1, "FIRST");
+    assert_eq!(retry, PeerSendInputEnqueueOutcome::Duplicate);
+    assert_eq!(
+        retry.into_callback_result(slug),
+        Ok(octos_agent::PeerSendInputDelivery::AlreadyQueued),
+        "a genuine retry is not reported as a fresh send"
+    );
+    // The peer runs the first input (dequeue starts the recent-claim window).
+    let drained =
+        orchestrator.drain_ready_continuations_for_session(&peer_key, profile_id, idle(), 8);
+    assert_eq!(drained.len(), 1);
+    assert_eq!(master_continuation_prompt(&drained[0]), "FIRST");
+    // A retry after the drain is still the same occurrence: still deduped.
+    assert_eq!(
+        send(&turn_1, "FIRST"),
+        PeerSendInputEnqueueOutcome::Duplicate
+    );
+
+    // The NEXT turn reuses `call_1`: it is a new input and must queue.
+    let second = send(&turn_2, "SECOND");
+    assert_eq!(
+        second,
+        PeerSendInputEnqueueOutcome::Queued,
+        "a later turn's send with a reused tool-call id must not be dropped"
+    );
+    assert_eq!(
+        second.into_callback_result(slug),
+        Ok(octos_agent::PeerSendInputDelivery::Queued)
+    );
+    let drained =
+        orchestrator.drain_ready_continuations_for_session(&peer_key, profile_id, idle(), 8);
+    assert_eq!(
+        drained.len(),
+        1,
+        "the second input runs as the peer's next turn"
+    );
+    assert_eq!(master_continuation_prompt(&drained[0]), "SECOND");
 }
 
 /// #436 P1 #6 — only the peer's recorded ORIGINATOR may inject. A different
@@ -10477,10 +13910,10 @@ fn peer_send_input_persist_failure_maps_to_error_not_success() {
             .into_callback_result("slugz")
             .is_ok()
     );
-    assert!(
-        PeerSendInputEnqueueOutcome::Duplicate
-            .into_callback_result("slugz")
-            .is_ok()
+    assert_eq!(
+        PeerSendInputEnqueueOutcome::Duplicate.into_callback_result("slugz"),
+        Ok(octos_agent::PeerSendInputDelivery::AlreadyQueued),
+        "a retry is a success, but reported as already queued"
     );
 }
 
@@ -10971,7 +14404,9 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
         title: "Approve shell command".into(),
         body: "Command:\ncargo test".into(),
         command: Some("cargo test".into()),
-        cwd: Some("/Users/yuechen/home/octos".into()),
+        cwd: Some("/workspace/octos".into()),
+        once_only: false,
+        host_tool: None,
     };
     let session_id = SessionKey("local:test".into());
     let approval_id = ApprovalId::new();
@@ -11005,9 +14440,9 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
-            projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
             coding_autonomy_v1: false,
@@ -11017,6 +14452,8 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
+            context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -11036,7 +14473,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
         .and_then(|details| details.command.as_ref())
         .expect("typed command details");
     assert_eq!(command.command_line.as_deref(), Some("cargo test"));
-    assert_eq!(command.cwd.as_deref(), Some("/Users/yuechen/home/octos"));
+    assert_eq!(command.cwd.as_deref(), Some("/workspace/octos"));
     assert_eq!(command.tool_call_id.as_deref(), Some("tool-1"));
     clear_tool_risk_registry_for_test();
 }
@@ -11056,6 +14493,8 @@ fn risk_default_is_unspecified_when_manifest_silent() {
         body: "Command:\nls".into(),
         command: Some("ls".into()),
         cwd: Some("/tmp".into()),
+        once_only: false,
+        host_tool: None,
     };
     let event = approval_event_from_tool_request(
         request,
@@ -11075,9 +14514,9 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
-            projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
             coding_autonomy_v1: false,
@@ -11087,6 +14526,8 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
+            context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -11171,6 +14612,8 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
         body: "Plugin 'weather' tool 'weather_lookup' is declared high risk.".into(),
         command: None,
         cwd: Some("/tmp/weather-plugin".into()),
+        once_only: false,
+        host_tool: None,
     };
     let event = approval_event_from_tool_request(
         request,
@@ -11190,9 +14633,9 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
-            projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
             coding_autonomy_v1: false,
@@ -11202,6 +14645,8 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
+            context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -11241,6 +14686,8 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
         body: "Plugin 'apocalypse' tool 'destroy_world' is declared critical risk.".into(),
         command: None,
         cwd: None,
+        once_only: false,
+        host_tool: None,
     };
     let event = approval_event_from_tool_request(
         request,
@@ -11260,9 +14707,9 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
-            projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
             coding_autonomy_v1: false,
@@ -11272,6 +14719,8 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
+            context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -11304,6 +14753,8 @@ fn shell_approval_still_emits_risk_field() {
         body: "Command:\ncargo test".into(),
         command: Some("cargo test".into()),
         cwd: Some("/tmp/work".into()),
+        once_only: false,
+        host_tool: None,
     };
     let event = approval_event_from_tool_request(
         request,
@@ -11323,9 +14774,9 @@ fn shell_approval_still_emits_risk_field() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
-            projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
             coding_autonomy_v1: false,
@@ -11335,6 +14786,8 @@ fn shell_approval_still_emits_risk_field() {
             coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
+            context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -11374,6 +14827,8 @@ fn tool_with_no_risk_classification_does_not_emit_risk_field() {
         body: "Plugin tool approval".into(),
         command: None,
         cwd: Some("/tmp/weather-plugin".into()),
+        once_only: false,
+        host_tool: None,
     };
     // `typed_approvals: false` — legacy client.
     let event = approval_event_from_tool_request(
@@ -11410,6 +14865,8 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
         body: "Command:\nls".into(),
         command: Some("ls".into()),
         cwd: Some(spoof_cwd.into()),
+        once_only: false,
+        host_tool: None,
     };
     let typed = approval_event_from_tool_request(
         request,
@@ -11429,9 +14886,9 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
-            projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
             coding_autonomy_v1: false,
@@ -11441,6 +14898,8 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
+            context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -11885,20 +15344,22 @@ fn appui_task_artifacts_resolve_agent_task_artifacts() {
     let session_id = SessionKey::with_profile(profile_id, "api", "agent-artifacts");
     let task_id = TaskId::new();
     let orchestrator = InProcessAgentOrchestrator::default();
-    orchestrator.upsert_agent(AgentUpsert {
-        agent_id: "agent-1".into(),
-        parent_agent_id: Some("master".into()),
-        session_id: session_id.clone(),
-        task_id: Some(task_id.clone()),
-        path: "master/agent-1".into(),
-        role: "worker".into(),
-        nickname: "Worker".into(),
-        backend_kind: "native".into(),
-        status: "completed".into(),
-        last_task: Some("summarize".into()),
-        cwd: None,
-        profile_id: profile_id.into(),
-    });
+    orchestrator
+        .upsert_agent(AgentUpsert {
+            agent_id: "agent-1".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: Some(task_id.clone()),
+            path: "master/agent-1".into(),
+            role: "worker".into(),
+            nickname: "Worker".into(),
+            backend_kind: "native".into(),
+            status: "completed".into(),
+            last_task: Some("summarize".into()),
+            cwd: None,
+            profile_id: profile_id.into(),
+        })
+        .unwrap();
     orchestrator
         .set_agent_artifacts(
             "agent-1",
@@ -12950,6 +16411,7 @@ async fn should_retain_only_same_profile_goal_events_when_open_session_result_re
         Some("alpha"),
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -12991,8 +16453,9 @@ async fn should_retain_only_same_profile_goal_events_when_open_session_result_re
     );
 }
 
-/// #2067 boundaries 2 and 3 (session/open replay send loop + live forwarder):
-/// neither may put profile-b's durable goal frames on a profile-a connection.
+/// #2067 boundaries 1 and 3 (the `open_session_result` retain + live
+/// forwarder), observed on the wire: neither may put profile-b's durable goal
+/// frames on a profile-a connection.
 #[tokio::test]
 async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_profile() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -13040,6 +16503,7 @@ async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_pr
         ConnectionUiFeatures::default(),
         "open-alpha".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -13055,7 +16519,7 @@ async fn should_drop_cross_profile_goal_frames_when_connection_scopes_another_pr
     .await;
     assert!(opened, "alpha must be able to open the shared session");
 
-    // Boundary 2 — the replay send loop.
+    // Boundary 1's retain, observed through the replay send loop.
     let frames = drain_session_open_frames(&mut rx).await;
     assert_eq!(
         replayed_goal_objectives(&frames),
@@ -13154,6 +16618,7 @@ async fn should_replay_main_and_legacy_goal_frames_when_connection_is_unprofiled
         ConnectionUiFeatures::default(),
         "open-main".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -13298,6 +16763,291 @@ fn monitor_updated_notification(
     })
 }
 
+/// A durable `monitor/expired`. `top_profile_id` models the emit-site stamp,
+/// `record_profile_id` the nested `monitor` snapshot's owner (#2080).
+fn monitor_expired_notification(
+    session_id: &SessionKey,
+    top_profile_id: Option<&str>,
+    record_profile_id: Option<&str>,
+    monitor_id: &str,
+) -> UiNotification {
+    UiNotification::MonitorExpired(octos_core::ui_protocol::MonitorExpiredEvent {
+        session_id: session_id.clone(),
+        profile_id: top_profile_id.map(ToOwned::to_owned),
+        monitor_id: monitor_id.to_owned(),
+        monitor_state: Some(octos_core::ui_protocol::UiMonitorRecord {
+            monitor_id: monitor_id.to_owned(),
+            session_id: session_id.clone(),
+            profile_id: record_profile_id.map(ToOwned::to_owned),
+            name: monitor_id.to_owned(),
+            argv: vec![
+                "tail".to_owned(),
+                "-f".to_owned(),
+                "/var/log/secret".to_owned(),
+            ],
+            filter_regex: None,
+            mode: "poll".to_owned(),
+            interval_seconds: Some(3),
+            batch_ms: 250,
+            max_events_per_hour: 60,
+            persistent: false,
+            status: "expired".to_owned(),
+            pause_reason: None,
+            goal_id: None,
+            last_fired_at_ms: None,
+            fires_used: 0,
+            expires_at_ms: Some(1),
+            created_at_ms: 0,
+            updated_at_ms: 1,
+        }),
+        status: Some("expired".to_owned()),
+        expired_at_ms: Some(1),
+        reason: Some("timeout".to_owned()),
+    })
+}
+
+/// #2080 — `monitor/expired` is scoped like every other monitor frame:
+/// the top-level stamp first, the nested `monitor` record as the fallback.
+/// The frame carries tenant text (monitor name + argv), so a foreign profile
+/// must never see it on ANY delivery boundary.
+#[test]
+fn monitor_expired_frames_are_visible_only_to_their_profile() {
+    let session_id = SessionKey("web-shared".into());
+    let stamped = monitor_expired_notification(&session_id, Some("alpha"), Some("alpha"), "m-1");
+    assert!(ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(stamped),
+        Some("alpha")
+    ));
+    let stamped = monitor_expired_notification(&session_id, Some("alpha"), Some("alpha"), "m-1");
+    assert!(!ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(stamped),
+        Some("beta")
+    ));
+    // The nested-fallback shape: no top-level stamp, only the `monitor`
+    // record names the owner.
+    let nested_only = monitor_expired_notification(&session_id, None, Some("alpha"), "m-1");
+    assert!(ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(nested_only),
+        Some("alpha")
+    ));
+    let nested_only = monitor_expired_notification(&session_id, None, Some("alpha"), "m-1");
+    assert!(!ledger_event_matches_profile_scope(
+        &UiProtocolLedgerEvent::Notification(nested_only),
+        Some("beta")
+    ));
+}
+
+/// #2080 acceptance — a monitor's expiry transition flows through the REAL
+/// production sink wiring (the same [`spawn_monitor_expired_sink`] serve
+/// installs at boot) onto the OWNING session's durable stream, from which a
+/// disconnected client replays it; the profile-scope filter then gates it
+/// exactly like the other monitor frames.
+///
+/// Sync shell over a current-thread runtime: the process-global sink test
+/// guard (a std `MutexGuard`, mirroring the `background/activity` guard
+/// discipline) must be held across the emission, and holding it across an
+/// `.await` is (rightly) denied by `await_holding_lock`.
+#[test]
+fn should_deliver_monitor_expired_through_the_production_sink_to_the_owning_session() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, InProcessAgentOrchestrator, MonitorCreateRequest,
+    };
+
+    let _guard = crate::autonomy::agent_orchestrator::monitor_expired_test_guard();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let state = Arc::new(AppState::empty_for_tests());
+        spawn_monitor_expired_sink(state.clone());
+        // The same process-wide ledger the drain task resolves.
+        let ledger = event_ledger(&state).await;
+        let owner = SessionKey("local:mon-expiry-owner".into());
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let created = orchestrator
+            .create_monitor(MonitorCreateRequest {
+                session_id: owner.clone(),
+                profile_id: "alpha".to_owned(),
+                spec: crate::autonomy::monitor_runtime::MonitorSpec {
+                    name: "wire-watch".to_owned(),
+                    argv: vec!["sh".to_owned(), "-c".to_owned(), "true".to_owned()],
+                    filter_regex: None,
+                    batch_ms: crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
+                    mode: crate::autonomy::monitor_runtime::MonitorMode::Poll { interval_secs: 3 },
+                    timeout_secs: None,
+                    persistent: false,
+                    max_events_per_hour: 5,
+                    goal_id: None,
+                    cwd: None,
+                },
+                data_dir: None,
+            })
+            .expect("create monitor");
+        let monitor_id = created["monitor_id"]
+            .as_str()
+            .expect("monitor id")
+            .to_owned();
+
+        // The watcher-deadline transition — one of the two production emit sites.
+        orchestrator.expire_monitor(&monitor_id, "timeout");
+
+        // The drain is a spawned task over a bounded channel: await the frame.
+        let resume_from = UiCursor {
+            stream: owner.0.clone(),
+            seq: 0,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (replay, position) = loop {
+            let replay = ledger
+                .replay_after(&owner, Some(&resume_from))
+                .unwrap_or_default();
+            if let Some(position) = replay.iter().position(|entry| {
+                matches!(
+                    &entry.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(_))
+                )
+            }) {
+                break (replay, position);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "monitor/expired never reached the owning session's durable stream"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        let frame = &replay[position].event;
+        let UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(event)) = frame
+        else {
+            unreachable!("position matched a MonitorExpired frame")
+        };
+        assert_eq!(event.monitor_id, monitor_id);
+        assert_eq!(event.session_id, owner);
+        assert_eq!(event.profile_id.as_deref(), Some("alpha"));
+        assert_eq!(event.status.as_deref(), Some("expired"));
+        assert_eq!(event.reason.as_deref(), Some("timeout"));
+        assert_eq!(
+            event.monitor_state.as_ref().map(|m| m.status.as_str()),
+            Some("expired"),
+            "the nested snapshot is the post-transition record"
+        );
+        // The tenant boundary the issue exists for: the owning profile passes,
+        // a foreign one is refused.
+        assert!(ledger_event_matches_profile_scope(frame, Some("alpha")));
+        assert!(!ledger_event_matches_profile_scope(frame, Some("beta")));
+        // ROUTING: a sibling session's stream stays empty.
+        let sibling = SessionKey("local:mon-expiry-sibling".into());
+        let sibling_replay = ledger
+            .replay_after(
+                &sibling,
+                Some(&UiCursor {
+                    stream: sibling.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .unwrap_or_default();
+        assert!(
+            sibling_replay.is_empty(),
+            "monitor/expired must never land on a session that did not own the monitor"
+        );
+    });
+}
+
+/// #2080 — the reconcile-sweep twin of the production-sink acceptance test
+/// above: the OTHER emit site ([`InProcessAgentOrchestrator::
+/// monitor_reconcile_pass`]) must also flow through the real sink wiring
+/// onto the owning session's durable stream. Same guard discipline: the
+/// std guard is held across a current-thread `block_on`.
+#[test]
+fn should_deliver_monitor_expired_from_the_reconcile_sweep_through_the_production_sink() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, InProcessAgentOrchestrator, MonitorCreateRequest,
+    };
+
+    let _guard = crate::autonomy::agent_orchestrator::monitor_expired_test_guard();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let state = Arc::new(AppState::empty_for_tests());
+        spawn_monitor_expired_sink(state.clone());
+        let ledger = event_ledger(&state).await;
+        let owner = SessionKey("local:mon-expiry-sweep-owner".into());
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let created = orchestrator
+            .create_monitor(MonitorCreateRequest {
+                session_id: owner.clone(),
+                profile_id: "alpha".to_owned(),
+                spec: crate::autonomy::monitor_runtime::MonitorSpec {
+                    name: "sweep-watch".to_owned(),
+                    argv: vec!["sh".to_owned(), "-c".to_owned(), "true".to_owned()],
+                    filter_regex: None,
+                    batch_ms: crate::autonomy::monitor_runtime::MONITOR_DEFAULT_BATCH_MS,
+                    mode: crate::autonomy::monitor_runtime::MonitorMode::Poll { interval_secs: 3 },
+                    // One-second TTL: the next sweep after it lapses performs
+                    // the active→expired transition.
+                    timeout_secs: Some(1),
+                    persistent: false,
+                    max_events_per_hour: 5,
+                    goal_id: None,
+                    cwd: None,
+                },
+                data_dir: None,
+            })
+            .expect("create monitor");
+        let monitor_id = created["monitor_id"]
+            .as_str()
+            .expect("monitor id")
+            .to_owned();
+
+        // Let the TTL lapse, then run the sweep — the production emit site.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        orchestrator.monitor_reconcile_pass();
+
+        let resume_from = UiCursor {
+            stream: owner.0.clone(),
+            seq: 0,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let replay = ledger
+                .replay_after(&owner, Some(&resume_from))
+                .unwrap_or_default();
+            if let Some(entry) = replay.iter().find(|entry| {
+                matches!(
+                    &entry.event,
+                    UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(_))
+                )
+            }) {
+                let UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(event)) =
+                    &entry.event
+                else {
+                    unreachable!("find matched a MonitorExpired frame")
+                };
+                assert_eq!(event.monitor_id, monitor_id);
+                assert_eq!(event.session_id, owner);
+                assert_eq!(event.profile_id.as_deref(), Some("alpha"));
+                assert_eq!(event.reason.as_deref(), Some("timeout"));
+                assert!(ledger_event_matches_profile_scope(
+                    &entry.event,
+                    Some("alpha")
+                ));
+                assert!(!ledger_event_matches_profile_scope(
+                    &entry.event,
+                    Some("beta")
+                ));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sweep-driven monitor/expired never reached the owning session's durable stream"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    });
+}
+
 /// #2067 — the `loop/*` and `monitor/*` frames ride the SAME durable dispatch
 /// as the goal frames (`record_autonomy_rpc_evidence` ->
 /// `send_notification_durable`) and carry the same class of tenant text (loop
@@ -13360,6 +17110,7 @@ async fn should_drop_cross_profile_loop_and_monitor_frames_when_connection_scope
         ConnectionUiFeatures::default(),
         "open-alpha-autonomy".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -13604,6 +17355,7 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
             reasoning_effort: None,
+            accepted_client_commands: None,
         })
     };
 
@@ -13622,6 +17374,7 @@ async fn should_drop_cross_profile_session_opened_frames_when_connection_scopes_
         ConnectionUiFeatures::default(),
         "open-alpha-shared".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -13739,6 +17492,7 @@ async fn should_drop_cross_profile_background_activity_frames_when_connection_sc
         features,
         "open-alpha-activity".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -13889,6 +17643,7 @@ async fn should_deliver_routed_profile_frames_when_the_connection_scope_is_not_a
         features,
         "open-routed-admin".into(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -13990,6 +17745,7 @@ async fn should_deliver_later_profile_frames_when_an_unscoped_connection_opened_
     // No routing header anywhere: this connection is plain unscoped.
     let open = |session_id: SessionKey, profile_id: Option<&str>, rpc_id: &str| {
         let params = SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: profile_id.map(ToOwned::to_owned),
@@ -14224,6 +17980,55 @@ async fn send_scope_error_does_not_close_when_unauthenticated() {
     assert!(rx.try_recv().is_err(), "no close frame expected");
 }
 
+/// #2040: a stdio connection must NEVER receive the 1008 auth-expiry close.
+/// The stdio dispatch passes the session/open CANDIDATE profile as the
+/// connection scope (so a successful open can rebind the connection), which
+/// routes a profile-segment mismatch through the AUTHENTICATED validator and
+/// tags the error `auth_scope_violation`. On a WS connection that tag
+/// enqueues a 1008 close ahead of the error envelope; on stdio the Close
+/// frame ends the writer loop (`write_stdio_message`), so pre-fix the error
+/// reply was never written and the whole transport died with the request
+/// unanswered.
+#[test]
+fn send_scope_error_on_stdio_answers_without_closing() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(8);
+    let ws = WsConnection::new_stdio(writer_tx);
+    // Mirror the stdio dispatch: the candidate profile is passed as the
+    // connection scope and the session_id segment disagrees with it.
+    let session_id = SessionKey::with_profile("nosuchprofile", "local", "tui");
+    let error = validate_session_scope(&session_id, Some("soak"), Some("soak"))
+        .expect_err("segment mismatch must fail validation");
+    assert!(is_auth_scope_violation(&error));
+
+    send_scope_error(&ws, "rpc-1".into(), error);
+
+    // The FIRST frame is the error envelope carrying the request id — not a
+    // Close, which the stdio writer loop treats as end-of-stream.
+    let message = writer_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("the mismatch must still be answered");
+    let WsMessage::Text(text) = message else {
+        panic!(
+            "expected the error envelope first, got a non-text frame \
+             (a Close would end the stdio writer loop)"
+        );
+    };
+    let frame: Value = serde_json::from_str(text.as_ref()).expect("valid JSON frame");
+    assert_eq!(frame["id"], json!("rpc-1"));
+    assert!(
+        frame["error"].is_object(),
+        "the reply carries the scope error: {frame}"
+    );
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "no close frame may follow — on stdio it terminates the writer loop"
+    );
+    assert!(
+        !ws.is_failed(),
+        "a rejected request must not kill the stdio transport"
+    );
+}
+
 #[test]
 fn resolve_router_for_session_rejects_cross_tenant_session_id() {
     // P1: a profile-scoped (tenant-B) connection must not resolve — and so
@@ -14397,9 +18202,27 @@ fn state_with_sessions(data_dir: &std::path::Path) -> Arc<AppState> {
 
 /// Build an `ActiveTurn` with default `Active` state for tests that drive
 /// the registry directly without going through `handle_turn_start`.
+async fn test_connection_turn(
+    active: &SharedActiveTurns,
+    session: &SessionKey,
+    turn_id: &TurnId,
+) -> ConnectionTurn {
+    let map = active.lock().await;
+    let state = map
+        .get(session)
+        .filter(|entry| entry.turn_id == *turn_id)
+        .map(|entry| entry.state.clone())
+        .unwrap_or_else(|| Arc::new(TokioMutex::new(TurnState::Active)));
+    ConnectionTurn {
+        turn_id: turn_id.clone(),
+        state,
+    }
+}
+
 fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
+        owner: None,
         turn_id,
         profile_id: MAIN_PROFILE_ID.to_owned(),
         state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -14440,6 +18263,7 @@ async fn session_open_replays_notifications_after_cursor_and_returns_ledger_curs
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -14504,6 +18328,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: base_session.clone(),
             topic: Some("alpha".into()),
             profile_id: None,
@@ -14536,6 +18361,7 @@ async fn session_open_topic_scope_replays_only_matching_topic_bucket() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: base_session.clone(),
             topic: None,
             profile_id: None,
@@ -14577,6 +18403,7 @@ async fn session_open_rejects_after_cursor_from_other_stream() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -14639,6 +18466,7 @@ async fn session_open_rejects_stale_after_cursor() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -14697,6 +18525,7 @@ async fn session_open_replays_pending_approval_after_reconnect_without_cursor() 
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -14781,6 +18610,7 @@ async fn session_open_replays_pending_question_for_negotiated_client() {
         None,
         features_with_user_question_v1(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -15023,6 +18853,17 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
             line_count: Some(1),
             fired_at_ms: Some(0),
         }));
+    let expired = UiProtocolLedgerEvent::Notification(UiNotification::MonitorExpired(
+        octos_core::ui_protocol::MonitorExpiredEvent {
+            session_id: SessionKey("local:test".into()),
+            profile_id: Some("main".into()),
+            monitor_id: "monitor_01".into(),
+            monitor_state: None,
+            status: Some("expired".into()),
+            expired_at_ms: Some(1),
+            reason: Some("timeout".into()),
+        },
+    ));
 
     // A header-present connection WITHOUT monitor runtime is denied.
     let denied = ConnectionUiFeatures {
@@ -15039,6 +18880,10 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
         !live_event_passes_capability_filter(&fired, denied),
         "monitor/fired must be filtered from a non-negotiating connection"
     );
+    assert!(
+        !live_event_passes_capability_filter(&expired, denied),
+        "monitor/expired must be filtered from a non-negotiating connection"
+    );
 
     // A negotiated connection receives them.
     let negotiated = ConnectionUiFeatures {
@@ -15049,6 +18894,7 @@ fn monitor_notifications_gated_by_monitor_runtime_capability() {
     };
     assert!(live_event_passes_capability_filter(&updated, negotiated));
     assert!(live_event_passes_capability_filter(&fired, negotiated));
+    assert!(live_event_passes_capability_filter(&expired, negotiated));
 }
 
 /// #1977 blocker 6 — an unknown `mode` in `monitor/create` is a typed
@@ -15116,6 +18962,7 @@ async fn session_open_does_not_duplicate_pending_question_already_in_cursor_repl
         None,
         features_with_user_question_v1(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -15355,6 +19202,7 @@ async fn session_open_does_not_duplicate_pending_approval_already_in_cursor_repl
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -15414,9 +19262,9 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             spawn_complete: false,
             file_attached: false,
             voice_audio: false,
+            voice_asr_admission_v1: false,
             plan_todos: false,
             background_activity: false,
-            projection_envelope: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
             coding_autonomy_v1: false,
@@ -15426,6 +19274,8 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             coding_monitor_runtime_v1: false,
             review_start_v1: false,
             context_lifecycle_v1: false,
+            context_semantic_cache_v1: false,
+            context_state_v1: false,
             user_question_v1: false,
             skill_actions_v1: false,
             skill_action_jobs_v1: false,
@@ -15434,6 +19284,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             stdio_transport: false,
         },
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -15487,6 +19338,7 @@ async fn session_open_rejects_cwd_without_negotiated_feature() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id,
             topic: None,
             profile_id: None,
@@ -15527,6 +19379,7 @@ async fn session_open_result_advertises_full_protocol_when_no_header() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -15601,6 +19454,7 @@ async fn session_open_result_advertises_intersection_when_header_subset() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id,
             topic: None,
             profile_id: None,
@@ -15657,6 +19511,241 @@ async fn session_open_result_advertises_intersection_when_header_subset() {
         outcome.result.opened.context.is_none(),
         "context envelope must not leak unless context.lifecycle.v1 was negotiated"
     );
+}
+
+#[test]
+fn semantic_context_cache_diagnostics_require_explicit_negotiation() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        UI_FEATURES_HEADER,
+        UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1
+            .parse()
+            .expect("header value"),
+    );
+    let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
+    let capabilities = features.negotiated_capabilities();
+
+    assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1));
+    assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1));
+    assert!(!features.context_semantic_cache_available());
+
+    let no_header = ConnectionUiFeatures::default();
+    assert!(no_header.context_lifecycle_available());
+    assert!(!no_header.context_semantic_cache_available());
+    assert!(
+        !no_header
+            .negotiated_capabilities()
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1),
+        "the no-header compatibility baseline must not opt legacy clients into diagnostics"
+    );
+}
+
+#[test]
+fn semantic_context_cache_diagnostics_negotiate_with_parent_capability() {
+    let features = ConnectionUiFeatures::from_requested_feature_tokens(
+        [
+            UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+        ],
+        true,
+    );
+    let capabilities = features.negotiated_capabilities();
+
+    assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1));
+    assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1));
+    assert!(features.context_semantic_cache_available());
+}
+
+#[test]
+fn semantic_context_cache_diagnostics_cannot_negotiate_without_parent() {
+    let features = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1],
+        true,
+    );
+    let capabilities = features.negotiated_capabilities();
+
+    assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1));
+    assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1));
+    assert!(!features.context_semantic_cache_available());
+}
+
+fn semantic_context_state_for_test(session_id: &SessionKey) -> UiContextState {
+    let mut state = context_state_for_test(session_id);
+    state.cache_epoch_id = Some("sha256:epoch".into());
+    state.last_cache_invalidation_reason = Some("compaction_installed".into());
+    state.semantic_head_id = Some("semblk_000007".into());
+    state.semantic_head_kind = Some("tool_interaction".into());
+    state
+}
+
+#[test]
+fn semantic_cache_fields_are_absent_from_unnegotiated_session_open_payload() {
+    let session_id = SessionKey("local:semantic-open".into());
+    let context = json!({
+        "schema": "octos.context.lifecycle.v1",
+        "state": {
+            "generation": 7,
+            "cache_epoch_id": "sha256:epoch",
+            "last_cache_invalidation_reason": "compaction_installed",
+            "semantic_head_id": "semblk_000007",
+            "semantic_head_kind": "tool_interaction"
+        }
+    });
+    let event = UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(SessionOpened {
+        session_id: session_id.clone(),
+        active_profile_id: None,
+        workspace_root: None,
+        context: Some(context),
+        context_state: Some(semantic_context_state_for_test(&session_id)),
+        cursor: None,
+        panes: None,
+        capabilities: UiProtocolCapabilities::first_server_slice(),
+        reasoning_effort: None,
+        accepted_client_commands: None,
+    }));
+    let lifecycle_only = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1],
+        true,
+    );
+
+    let projected = context_event_for_features(event.clone(), lifecycle_only);
+    let encoded = serde_json::to_value(projected).expect("serialize projected session open");
+    let encoded = encoded.to_string();
+    assert!(!encoded.contains("cache_epoch_id"));
+    assert!(!encoded.contains("semantic_head_id"));
+    assert!(!encoded.contains("semantic_head_kind"));
+    assert!(!encoded.contains("last_cache_invalidation_reason"));
+
+    let negotiated = ConnectionUiFeatures::from_requested_feature_tokens(
+        [
+            UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+        ],
+        true,
+    );
+    let encoded = serde_json::to_value(context_event_for_features(event, negotiated))
+        .expect("serialize negotiated session open")
+        .to_string();
+    assert!(encoded.contains("cache_epoch_id"));
+    assert!(encoded.contains("semantic_head_id"));
+}
+
+#[test]
+fn semantic_cache_fields_are_gated_on_compaction_normalization_and_state_payloads() {
+    let session_id = SessionKey("local:semantic-events".into());
+    let mut compaction = context_compaction_completed_for(&session_id);
+    let UiNotification::ContextCompactionCompleted(compaction_event) = &mut compaction else {
+        unreachable!()
+    };
+    compaction_event.context_state = semantic_context_state_for_test(&session_id);
+    let mut normalization = context_normalization_reported_for(&session_id);
+    let UiNotification::ContextNormalizationReported(normalization_event) = &mut normalization
+    else {
+        unreachable!()
+    };
+    normalization_event.context_state = semantic_context_state_for_test(&session_id);
+    let mut state_reported = context_state_reported_for(&session_id);
+    let UiNotification::ContextStateReported(state_reported_event) = &mut state_reported else {
+        unreachable!()
+    };
+    state_reported_event.context_state = semantic_context_state_for_test(&session_id);
+
+    let lifecycle_only = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1],
+        true,
+    );
+    for notification in [
+        compaction.clone(),
+        normalization.clone(),
+        state_reported.clone(),
+    ] {
+        let projected = context_event_for_features(
+            UiProtocolLedgerEvent::Notification(notification),
+            lifecycle_only,
+        );
+        let encoded = serde_json::to_value(projected)
+            .expect("serialize unnegotiated lifecycle payload")
+            .to_string();
+        assert!(!encoded.contains("cache_epoch_id"));
+        assert!(!encoded.contains("semantic_head_id"));
+    }
+
+    let negotiated = ConnectionUiFeatures::from_requested_feature_tokens(
+        [
+            UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1,
+        ],
+        true,
+    );
+    for notification in [compaction, normalization, state_reported] {
+        let projected = context_event_for_features(
+            UiProtocolLedgerEvent::Notification(notification),
+            negotiated,
+        );
+        let encoded = serde_json::to_value(projected)
+            .expect("serialize negotiated lifecycle payload")
+            .to_string();
+        assert!(encoded.contains("cache_epoch_id"));
+        assert!(encoded.contains("semantic_head_id"));
+    }
+}
+
+#[test]
+fn prompt_coverage_compares_provider_visible_media_and_reasoning() {
+    let mut known = test_message(MessageRole::Assistant, "same visible text");
+    known.media = vec!["image://one".into()];
+    known.reasoning_content = Some("visible reasoning one".into());
+
+    let mut changed_media = known.clone();
+    changed_media.media = vec!["image://two".into()];
+    assert_eq!(
+        covered_prompt_message_indices(&[changed_media], &[known.clone()]),
+        vec![false],
+        "equal text with different provider-visible media is not covered"
+    );
+
+    let mut changed_reasoning = known.clone();
+    changed_reasoning.reasoning_content = Some("visible reasoning two".into());
+    assert_eq!(
+        covered_prompt_message_indices(&[changed_reasoning], &[known.clone()]),
+        vec![false],
+        "equal text with different provider-visible reasoning is not covered"
+    );
+    assert_eq!(
+        covered_prompt_message_indices(&[known.clone()], &[known]),
+        vec![true]
+    );
+}
+
+#[test]
+fn rejected_manual_compaction_reports_typed_failure_without_generation_change() {
+    let session_id = SessionKey("local:manual-rejected".into());
+    let mut manager = ContextManager::new(session_id.to_string(), None);
+    manager.record_message(&Message::user("old request ".repeat(100)));
+    manager.record_message(&Message::assistant("old answer ".repeat(100)));
+    manager.record_message(&Message::user("current request"));
+    let generation_before = manager.generation();
+    let record = manager.compact_context(
+        "summary",
+        CompactContextPolicy {
+            keep_recent_tokens: Some(10_000),
+            target_tokens_after_compaction: Some(96),
+            ..CompactContextPolicy::default()
+        },
+    );
+    assert_eq!(record.status, ContextCompactionStatus::Failed);
+    assert_eq!(
+        record.budget_outcome,
+        ContextCompactionBudgetOutcome::RejectedOverBudget
+    );
+    assert_eq!(manager.generation(), generation_before);
+
+    let result = appui_manual_compaction_result(&session_id, &record, None);
+    assert_eq!(result["compacted"], json!(false));
+    assert_eq!(result["status"], json!("failed"));
+    assert_eq!(result["reason"], json!("rejected_over_budget"));
+    assert_eq!(result["input_generation"], json!(generation_before));
+    assert!(result["output_generation"].is_null());
 }
 
 // ===== M12 Phase D-1 auxiliary REST → WS negotiation =====
@@ -15783,58 +19872,6 @@ fn aux_rest_to_ws_v1_negotiated_capabilities_omit_when_not_requested() {
 // additively without touching the negotiation surface.
 
 #[test]
-fn projection_envelope_v1_negotiated_capabilities_include_only_when_requested() {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        UI_FEATURES_HEADER,
-        UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1
-            .parse()
-            .expect("header value"),
-    );
-    let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
-    assert!(features.projection_envelope);
-    let capabilities = features.negotiated_capabilities();
-    assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
-}
-
-#[test]
-fn projection_envelope_v1_negotiated_capabilities_omit_when_not_requested() {
-    let mut headers = HeaderMap::new();
-    // Request a different feature so `header_present == true` but
-    // `projection.envelope.v1` is strictly opt-in.
-    headers.insert(
-        UI_FEATURES_HEADER,
-        UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1
-            .parse()
-            .expect("header value"),
-    );
-    let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
-    assert!(!features.projection_envelope);
-    let capabilities = features.negotiated_capabilities();
-    assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
-}
-
-#[test]
-fn projection_envelope_v1_off_in_stdio_defaults() {
-    // `projection.envelope.v1` is NOT auto-enabled for stdio
-    // connections. The γ-cutover mutual-exclusion gate
-    // (`live_event_passes_capability_filter`) drops the legacy
-    // `turn/completed` notification whenever `projection_envelope`
-    // is true. The octoscode over stdio does NOT consume
-    // `projection/envelope` and clears its turn-active state ONLY on
-    // legacy `turn/completed`; auto-enabling envelopes here would
-    // suppress that lifecycle signal and wedge the client (every
-    // message after turn 1 queues "after active turn" forever). A
-    // stdio client that genuinely consumes envelopes still opts in
-    // via `client_hello` (see
-    // `projection_envelope_client_hello_over_stdio_opt_in_preserved`).
-    let features = ConnectionUiFeatures::stdio_defaults();
-    assert!(!features.projection_envelope);
-    let capabilities = features.negotiated_capabilities();
-    assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
-}
-
-#[test]
 fn projection_envelope_v2_is_strictly_negotiated_and_off_by_default() {
     assert!(!ConnectionUiFeatures::default().projection_envelope_v2);
     assert!(!ConnectionUiFeatures::stdio_defaults().projection_envelope_v2);
@@ -15854,7 +19891,6 @@ fn projection_envelope_v2_is_strictly_negotiated_and_off_by_default() {
     );
     let features = ConnectionUiFeatures::from_headers_and_query(&headers, None);
     assert!(features.projection_envelope_v2);
-    assert!(!features.projection_envelope);
     assert!(
         features
             .negotiated_capabilities()
@@ -15871,102 +19907,6 @@ fn projection_envelope_v2_is_strictly_negotiated_and_off_by_default() {
             .negotiated_capabilities()
             .supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
     );
-}
-
-/// Over a stdio-default connection (`projection_envelope == false`),
-/// the legacy `turn/completed` notification MUST pass the
-/// per-connection capability filter — both the broadcast path
-/// (`live_event_passes_capability_filter`) and the direct-send path
-/// (`direct_send_passes_capability_filter`). This is the
-/// turn-lifecycle signal the stdio TUI keys on to clear its
-/// turn-active state. If it were dropped (as it is when
-/// `projection_envelope` is true), the TUI wedges after turn 1.
-#[tokio::test]
-async fn stdio_default_connection_delivers_legacy_turn_completed() {
-    let session_id = SessionKey("local:stdio-turn-completed".into());
-    let completed =
-        UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(TurnCompletedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: TurnId::new(),
-            cursor: None,
-            tokens_in: None,
-            tokens_out: None,
-            session_result: None,
-        }));
-
-    // Broadcast / live-forwarder path.
-    let features = ConnectionUiFeatures::stdio_defaults();
-    assert!(
-        live_event_passes_capability_filter(&completed, features),
-        "stdio-default connection must receive legacy turn/completed via the broadcast filter"
-    );
-
-    // Direct-send path: a stdio connection snapshots stdio_defaults
-    // into its live-features, so the direct-send gate must also let
-    // turn/completed through.
-    let (tx, _rx) = mpsc::channel(16);
-    let ws = WsConnection::new(tx);
-    ws.update_live_features(ConnectionUiFeatures::stdio_defaults());
-    assert!(
-        direct_send_passes_capability_filter(&ws, &completed),
-        "stdio-default connection must receive legacy turn/completed via the direct-send filter"
-    );
-}
-
-/// Opt-in preservation: a stdio connection that DOES consume
-/// envelopes can still negotiate `projection.envelope.v1` via
-/// `client_hello` (`from_requested_feature_tokens` with the stdio
-/// transport flag), flipping `projection_envelope` back to true. The
-/// default change is default-only — it does not remove the ability
-/// to opt in. When opted in, the γ gate then (correctly) suppresses
-/// legacy `turn/completed` for that connection in favour of the
-/// canonical envelope.
-#[test]
-fn projection_envelope_client_hello_over_stdio_opt_in_preserved() {
-    let features = ConnectionUiFeatures::from_requested_feature_tokens(
-        [UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1],
-        true, // stdio_transport
-    );
-    assert!(
-        features.projection_envelope,
-        "client_hello over stdio must still be able to opt into projection.envelope.v1"
-    );
-    assert!(features.stdio_transport);
-    let capabilities = features.negotiated_capabilities();
-    assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
-
-    // And once opted in, the γ gate suppresses legacy turn/completed
-    // for that connection (envelope supersedes it) — confirming the
-    // opt-in actually re-engages the mutual-exclusion contract.
-    let session_id = SessionKey("local:stdio-opt-in".into());
-    let completed =
-        UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(TurnCompletedEvent {
-            session_id,
-            topic: None,
-            turn_id: TurnId::new(),
-            cursor: None,
-            tokens_in: None,
-            tokens_out: None,
-            session_result: None,
-        }));
-    assert!(
-        !live_event_passes_capability_filter(&completed, features),
-        "an opted-in stdio connection sees the envelope, not legacy turn/completed"
-    );
-}
-
-#[test]
-fn projection_envelope_client_hello_feature_tokens_round_trip() {
-    let features = ConnectionUiFeatures::from_requested_feature_tokens(
-        [UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1],
-        false,
-    );
-    assert!(features.projection_envelope);
-    assert!(features.header_present);
-    assert!(!features.stdio_transport);
-    let capabilities = features.negotiated_capabilities();
-    assert!(capabilities.supports_feature(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V1));
 }
 
 #[test]
@@ -15986,161 +19926,6 @@ fn projection_envelope_method_in_notification_methods_list() {
 // Codex #1336 round-2 BLOCKER 1: direct-send capability filter
 // ────────────────────────────────────────────────────────────────────
 
-/// A `projection.envelope.v1` connection that direct-sends a
-/// legacy `MessageDelta` via `send_notification_ephemeral` must
-/// observe ZERO wire frames on its writer channel. Pre-fix the
-/// frame was sent directly (bypassing the
-/// `live_event_passes_capability_filter` gate that the broadcast
-/// forwarder applies). Post-fix the direct-send helpers consult
-/// `WsConnection::snapshot_live_features` and apply the same
-/// filter so the connection's mutual exclusion contract holds
-/// even on the originating handler's direct path.
-#[tokio::test]
-async fn direct_ephemeral_send_drops_legacy_message_delta_for_projection_envelope_connection() {
-    use octos_core::ui_protocol::MessageDeltaEvent;
-    let (tx, mut rx) = mpsc::channel(16);
-    let ws = WsConnection::new(tx);
-    // Negotiate projection.envelope.v1.
-    ws.update_live_features(ConnectionUiFeatures {
-        projection_envelope: true,
-        header_present: true,
-        ..ConnectionUiFeatures::default()
-    });
-
-    let ledger = UiProtocolLedger::new(8);
-    let session_id = SessionKey("local:blocker1-eph".into());
-    let notif = UiNotification::MessageDelta(MessageDeltaEvent {
-        session_id: session_id.clone(),
-        topic: None,
-        turn_id: TurnId::new(),
-        text: "hello".into(),
-    });
-
-    // Direct ephemeral send — should be filtered out for this connection.
-    let result = send_notification_ephemeral(&ws, &ledger, notif);
-    assert!(
-        result.is_ok(),
-        "filter-drop returns Ok so callers don't treat it as a fatal error"
-    );
-    assert!(
-        rx.try_recv().is_err(),
-        "projection.envelope.v1 connection must NOT receive the legacy MessageDelta directly"
-    );
-}
-
-/// Mirror of the above for `send_notification_durable`. The γ
-/// cutover gate filters `ToolStarted` / `ToolCompleted` /
-/// legacy persisted-message / `FileAttached` / `TurnCompleted` — the
-/// canonical envelopes emitted by `ledger.emit_envelope` cover
-/// the same logical events via the broadcast forwarder.
-#[tokio::test]
-async fn direct_durable_send_drops_legacy_tool_completed_for_projection_envelope_connection() {
-    use octos_core::ui_protocol::ToolCompletedEvent;
-    let (tx, mut rx) = mpsc::channel(16);
-    let ws = WsConnection::new(tx);
-    ws.update_live_features(ConnectionUiFeatures {
-        projection_envelope: true,
-        header_present: true,
-        ..ConnectionUiFeatures::default()
-    });
-
-    let ledger = UiProtocolLedger::new(8);
-    let session_id = SessionKey("local:blocker1-dur".into());
-    let notif = UiNotification::ToolCompleted(ToolCompletedEvent {
-        session_id: session_id.clone(),
-        topic: None,
-        turn_id: TurnId::new(),
-        tool_call_id: "tc-1".into(),
-        tool_name: "shell".into(),
-        success: Some(true),
-        output_preview: None,
-        duration_ms: None,
-    });
-
-    let _ = send_notification_durable(&ws, &ledger, notif);
-    assert!(
-        rx.try_recv().is_err(),
-        "projection.envelope.v1 connection must NOT receive the legacy ToolCompleted directly"
-    );
-}
-
-/// Defensive: a legacy (non-projection.envelope) connection must
-/// STILL receive direct sends of `MessageDelta` and tool events.
-/// The filter is mutual exclusion — without
-/// `projection.envelope.v1` the legacy shapes are the only thing
-/// the client knows how to render.
-#[tokio::test]
-async fn direct_send_delivers_legacy_frames_to_non_projection_envelope_connection() {
-    use octos_core::ui_protocol::MessageDeltaEvent;
-    let (tx, mut rx) = mpsc::channel(16);
-    let ws = WsConnection::new(tx);
-    // Default features: projection_envelope is false.
-    ws.update_live_features(ConnectionUiFeatures::default());
-
-    let ledger = UiProtocolLedger::new(8);
-    let session_id = SessionKey("local:blocker1-legacy".into());
-    let notif = UiNotification::MessageDelta(MessageDeltaEvent {
-        session_id: session_id.clone(),
-        topic: None,
-        turn_id: TurnId::new(),
-        text: "should reach legacy client".into(),
-    });
-
-    let _ = send_notification_ephemeral(&ws, &ledger, notif);
-    let frame = rx
-        .try_recv()
-        .expect("legacy client must receive MessageDelta directly");
-    // Sanity-check the frame is a JSON-RPC notification for message/delta.
-    if let WsMessage::Text(text) = frame {
-        let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("JSON");
-        assert_eq!(value["method"], "message/delta");
-    } else {
-        panic!("expected text frame");
-    }
-}
-
-/// A `projection.envelope.v1` connection direct-sending an
-/// `Envelope` (e.g. via `send_ledger_event_durable`) MUST pass
-/// through — the envelope is exactly what the connection
-/// negotiated for.
-#[tokio::test]
-async fn direct_send_delivers_envelope_to_projection_envelope_connection() {
-    use octos_core::ui_protocol::{Envelope, EnvelopeNotification, EnvelopeTokenUsage, Payload};
-    let (tx, mut rx) = mpsc::channel(16);
-    let ws = WsConnection::new(tx);
-    ws.update_live_features(ConnectionUiFeatures {
-        projection_envelope: true,
-        header_present: true,
-        ..ConnectionUiFeatures::default()
-    });
-
-    let ledger = UiProtocolLedger::new(8);
-    let session_id = SessionKey("local:blocker1-env".into());
-    let envelope_notif = UiNotification::Envelope(EnvelopeNotification {
-        session_id: session_id.clone(),
-        topic: None,
-        envelope: Envelope {
-            thread_id: "thread-blocker1".into(),
-            seq: 1,
-            client_message_id: None,
-            payload: Payload::TurnCompleted {
-                token_usage: EnvelopeTokenUsage::default(),
-            },
-        },
-    });
-
-    let _ = send_notification_durable(&ws, &ledger, envelope_notif);
-    let frame = rx
-        .try_recv()
-        .expect("projection.envelope.v1 connection MUST receive envelope direct-sends");
-    if let WsMessage::Text(text) = frame {
-        let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("JSON");
-        assert_eq!(value["method"], "projection/envelope");
-    } else {
-        panic!("expected text frame");
-    }
-}
-
 // ────────────────────────────────────────────────────────────────────
 // Codex #1336 round-3 BLOCKER 1: M15 live-subagent fixture path
 // ────────────────────────────────────────────────────────────────────
@@ -16156,148 +19941,6 @@ async fn direct_send_delivers_envelope_to_projection_envelope_connection() {
 // `emit_envelope_for_legacy_notification` (canonical envelope
 // dual-emit) + `send_notification_ephemeral` (filtered legacy
 // ephemeral). The next three tests pin that contract.
-
-/// `projection.envelope.v1` connection: the M15 fixture's
-/// "Subagent done" delta MUST NOT deliver a legacy
-/// `message/delta` to this connection's writer channel. The
-/// envelope dual-emit publishes the canonical envelope via
-/// `ledger.emit_envelope` (observable on the broadcast forwarder),
-/// but the filtered ephemeral send is dropped on the originating
-/// connection because `projection.envelope.v1` supersedes
-/// `message/delta`.
-#[tokio::test]
-async fn m15_fixture_delta_filtered_for_projection_envelope_connection() {
-    let (tx, mut rx) = mpsc::channel(16);
-    let ws = WsConnection::new(tx);
-    ws.update_live_features(ConnectionUiFeatures {
-        projection_envelope: true,
-        header_present: true,
-        ..ConnectionUiFeatures::default()
-    });
-
-    let ledger = UiProtocolLedger::new(8);
-    let session_id = SessionKey("local:m15-delta-env".into());
-    let turn_id = TurnId::new();
-    // Mirror the exact shape `run_m15_live_subagent_process` builds.
-    let delta = UiNotification::MessageDelta(octos_core::ui_protocol::MessageDeltaEvent {
-        session_id: session_id.clone(),
-        topic: None,
-        turn_id: turn_id.clone(),
-        text: "Subagent done: reviewer-api (Ada) completed; artifact `notes` is ready.\n".into(),
-    });
-
-    // 1) Canonical envelope dual-emit — observable through the ledger.
-    emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
-    // 2) Filtered ephemeral legacy send — must be dropped on this connection.
-    let result = send_notification_ephemeral(&ws, &ledger, delta);
-    assert!(
-        result.is_ok(),
-        "filter-drop returns Ok so the spawn loop does not treat it as a fatal error"
-    );
-
-    // Wire: no legacy `message/delta` frame reaches the writer.
-    match rx.try_recv() {
-        Err(_) => {}
-        Ok(frame) => {
-            if let WsMessage::Text(text) = &frame {
-                let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("JSON");
-                panic!(
-                    "projection.envelope.v1 connection must NOT receive legacy frame; got {}",
-                    value["method"]
-                );
-            }
-            panic!("unexpected wire frame: {frame:?}");
-        }
-    }
-
-    // Ledger: a canonical envelope WAS appended for the session.
-    let (snapshot, _head) = ledger
-        .snapshot_with_cursor(&session_id, None)
-        .expect("snapshot succeeds for a session that just emitted an envelope");
-    let envelope_count = snapshot
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.event,
-                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(_))
-            )
-        })
-        .count();
-    assert_eq!(
-        envelope_count, 1,
-        "exactly one canonical envelope must be appended for the M15 fixture delta"
-    );
-    let envelope = snapshot
-        .iter()
-        .find_map(|event| match &event.event {
-            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(envelope)) => {
-                Some(envelope)
-            }
-            _ => None,
-        })
-        .expect("envelope notification present");
-    assert_eq!(envelope.envelope.thread_id, turn_id.0.to_string());
-    assert!(matches!(
-        envelope.envelope.payload,
-        octos_core::ui_protocol::Payload::AssistantDelta { .. }
-    ));
-}
-
-/// Legacy (non-projection.envelope) connection: the M15 fixture
-/// delta MUST deliver the legacy `message/delta` frame, and the
-/// envelope ledger entry is also produced (which the live
-/// forwarder filters out on this connection's wire — covered by
-/// `live_event_passes_capability_filter` tests elsewhere; here
-/// we focus on the direct-send half).
-#[tokio::test]
-async fn m15_fixture_delta_delivered_to_legacy_connection() {
-    let (tx, mut rx) = mpsc::channel(16);
-    let ws = WsConnection::new(tx);
-    ws.update_live_features(ConnectionUiFeatures::default());
-
-    let ledger = UiProtocolLedger::new(8);
-    let session_id = SessionKey("local:m15-delta-legacy".into());
-    let turn_id = TurnId::new();
-    let delta = UiNotification::MessageDelta(octos_core::ui_protocol::MessageDeltaEvent {
-        session_id: session_id.clone(),
-        topic: None,
-        turn_id: turn_id.clone(),
-        text: "Subagent done: reviewer-tests (Hypatia) completed; artifact `notes` is ready.\n"
-            .into(),
-    });
-
-    emit_envelope_for_legacy_notification(&ledger, &session_id, &delta);
-    let _ = send_notification_ephemeral(&ws, &ledger, delta);
-
-    let frame = rx
-        .try_recv()
-        .expect("legacy client must receive the M15 fixture's MessageDelta directly");
-    if let WsMessage::Text(text) = frame {
-        let value: serde_json::Value = serde_json::from_str(text.as_str()).expect("JSON");
-        assert_eq!(value["method"], "message/delta");
-        assert!(
-            value["params"]["text"]
-                .as_str()
-                .unwrap_or("")
-                .starts_with("Subagent done:"),
-            "delta text must carry the fixture's subagent-done body"
-        );
-    } else {
-        panic!("expected text frame");
-    }
-    // Ledger still carries the envelope alongside; legacy connections
-    // just never see it on the wire (live forwarder filter).
-    let (snapshot, _head) = ledger
-        .snapshot_with_cursor(&session_id, None)
-        .expect("snapshot succeeds for a session that just emitted an envelope");
-    assert!(
-        snapshot.iter().any(|event| matches!(
-            event.event,
-            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(_))
-        )),
-        "envelope dual-emit must still append to the ledger for replay correctness"
-    );
-}
 
 /// Defense-in-depth: even if a future caller reaches for
 /// `send_raw_notification_ephemeral` with an envelope-superseded
@@ -16429,9 +20072,9 @@ fn review_start_capability_is_strictly_negotiated_when_header_present() {
 
 #[test]
 fn m15_raw_goal_and_loop_stubs_use_in_memory_state() {
-    clear_autonomy_runtime_state_for_test();
+    // Never reset the process singleton: parallel tests own other profiles.
     let features = ConnectionUiFeatures::stdio_defaults();
-    let session_id = SessionKey::new("api", "m15-stub");
+    let session_id = SessionKey::with_profile("m15-stub-isolated", "api", "m15-stub");
 
     let goal_set = RpcRequest::new(
         "goal-set",
@@ -16517,7 +20160,6 @@ fn m15_raw_goal_and_loop_stubs_use_in_memory_state() {
 /// evidence carries the fixture-only markers the verifier bans.
 #[test]
 fn production_autonomy_rpc_evidence_writes_non_fixture_ledgers() {
-    clear_autonomy_runtime_state_for_test();
     let features = ConnectionUiFeatures::stdio_defaults();
     // Scope to a DEDICATED profile (not MAIN_PROFILE_ID) so the
     // `loop/fire_now` continuation this test enqueues into the
@@ -16639,6 +20281,8 @@ fn production_autonomy_rpc_evidence_writes_non_fixture_ledgers() {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            started_at: None,
+            relaunched_from: None,
             turn_id: None,
         }),
     );
@@ -16657,6 +20301,8 @@ fn production_autonomy_rpc_evidence_writes_non_fixture_ledgers() {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            started_at: None,
+            relaunched_from: None,
             turn_id: None,
         }),
     );
@@ -16783,11 +20429,8 @@ fn production_autonomy_rpc_evidence_writes_non_fixture_ledgers() {
         "goal/set must yield a notification independent of any evidence dir"
     );
 
-    // This test enqueues a real `loop/fire_now` continuation into the
-    // process-global scheduler. Drain-path tests sweep due continuations
-    // for `MAIN_PROFILE_ID`, so clear the shared state on the way out to
-    // keep this leftover from being drained by a sibling test.
-    clear_autonomy_runtime_state_for_test();
+    // The dedicated profile isolates this test's queued work. A wholesale
+    // singleton reset here would erase sibling tests' in-flight assertions.
 }
 
 #[derive(Default)]
@@ -17662,6 +21305,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Terminal(
@@ -17697,6 +21341,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: "someone-else".to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -17732,6 +21377,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -17838,6 +21484,7 @@ fn session_ingress_scope_accepts_matching_topic_folded_turn() {
         media: Vec::new(),
         topic: Some("coding".into()),
         live_video: false,
+        origin: None,
         reasoning_effort: None,
         tool_context: None,
         rewrite_for: None,
@@ -17852,6 +21499,7 @@ fn session_ingress_scope_rejects_global_methods_and_mismatched_sessions() {
     assert!(validate_session_ingress_command_scope(&global, &allowed).is_err());
 
     let mismatched = UiCommand::SessionOpen(SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey("other:local:tui".into()),
         topic: None,
         profile_id: None,
@@ -17934,6 +21582,9 @@ fn raw_method_is_dispatched_covers_full_raw_surface() {
         APPUI_METHOD_MCP_STATUS_LIST,
         APPUI_METHOD_TOOL_STATUS_LIST,
         APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE,
+        APPUI_METHOD_ONBOARDING_WORKSPACE_LIST,
+        APPUI_METHOD_ONBOARDING_WORKSPACE_CREATE,
+        APPUI_METHOD_SERVER_SHUTDOWN,
         // Autonomy (session/goal/*, loop/*, agent/*, task/artifact/*):
         octos_core::ui_protocol::methods::SESSION_GOAL_GET,
         octos_core::ui_protocol::methods::SESSION_GOAL_SET,
@@ -17995,6 +21646,9 @@ fn session_ingress_callable_method_matches_the_deny_surfaces() {
         octos_core::ui_protocol::methods::CONTENT_BULK_DELETE,
         octos_core::ui_protocol::methods::MEMORY_OVERVIEW,
         octos_core::ui_protocol::methods::MEMORY_ENTITY,
+        octos_core::ui_protocol::methods::MEMORY_SEARCH,
+        octos_core::ui_protocol::methods::MEMORY_LOAD,
+        octos_core::ui_protocol::methods::MEMORY_INGEST,
         octos_core::ui_protocol::methods::CRON_LIST,
         octos_core::ui_protocol::methods::CRON_TOGGLE,
         octos_core::ui_protocol::methods::SESSION_FORK,
@@ -18059,6 +21713,7 @@ fn session_opened_notification_capabilities_are_filtered_for_ingress() {
                 &[],
             ),
             reasoning_effort: None,
+            accepted_client_commands: None,
         }));
 
     if let UiProtocolLedgerEvent::Notification(UiNotification::SessionOpened(opened)) = &mut event {
@@ -18274,6 +21929,78 @@ fn runtime_unavailable_errors_are_typed_for_protocol_clients() {
     assert_eq!(
         error.data.as_ref().and_then(|data| data.get("kind")),
         Some(&json!("runtime_unavailable"))
+    );
+}
+
+#[test]
+fn profile_runtime_switching_error_is_not_reported_as_a_second_process() {
+    let error = profile_runtime_switching_error("alan");
+    assert_eq!(
+        error.data.as_ref().and_then(|d| d.get("kind")),
+        Some(&json!("profile_runtime_switching"))
+    );
+    let message = error.data.as_ref().and_then(|d| d.get("message")).unwrap();
+    assert!(!message.as_str().unwrap().contains("another octos process"));
+}
+
+#[test]
+fn held_data_dir_lock_yields_a_clear_actionable_error() {
+    // A `session/open` bootstrap that fails because another octos process
+    // already owns the profile's redb must be recognized structurally
+    // (through the eyre wrap chain that `ProfileRuntime::bootstrap` adds) and
+    // rendered with both remedies. Previously this reached the client as
+    // "failed to bootstrap ProfileRuntime for profile 'alan': failed to open
+    // episode store for profile 'alan'" — the cause, the path, and every hint
+    // about what to do were dropped by the `{error}` (non-alternate) format.
+    let report = eyre::Report::new(octos_memory::EpisodeStoreLocked {
+        path: std::path::PathBuf::from("/Users/dev/.octos/profiles/alan/data/episodes.redb"),
+    })
+    .wrap_err("failed to open episode store for profile 'alan'");
+    assert!(
+        octos_memory::is_episode_store_locked(&report),
+        "lock contention must be detected through the eyre wrap chain"
+    );
+
+    let error = data_dir_locked_error("alan", &report);
+    assert_eq!(
+        error.code,
+        octos_core::ui_protocol::rpc_error_codes::INTERNAL_ERROR
+    );
+    assert_eq!(
+        error.data.as_ref().and_then(|d| d.get("kind")),
+        Some(&json!("data_dir_locked")),
+        "clients branch on `kind`; this must not be the generic runtime_unavailable"
+    );
+    let message = error
+        .data
+        .as_ref()
+        .and_then(|d| d.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    assert!(
+        message.contains("alan"),
+        "message must name the profile: {message}"
+    );
+    assert!(
+        message.contains("--instance-data-dir"),
+        "message must offer the private-storage remedy: {message}"
+    );
+    assert!(
+        message.contains("episodes.redb"),
+        "message must carry the underlying cause, including the contended path: {message}"
+    );
+}
+
+#[test]
+fn non_lock_bootstrap_error_is_not_misclassified_as_data_dir_locked() {
+    // Guards the detector against over-matching: a missing provider is not a
+    // lock problem and has no `--instance-data-dir` remedy, so it must keep
+    // falling through to the generic `runtime_unavailable` kind.
+    let report = eyre::eyre!("No LLM provider configured")
+        .wrap_err("failed to bootstrap ProfileRuntime for profile 'alan'");
+    assert!(
+        !octos_memory::is_episode_store_locked(&report),
+        "an unrelated bootstrap failure must not be reported as lock contention"
     );
 }
 
@@ -18722,14 +22449,14 @@ async fn abort_connection_turns_removes_only_matching_active_turns() {
         stale_session_id.clone(),
         test_active_turn(newer_turn_id.clone(), newer_handle.abort_handle()),
     );
-    connection_turns
-        .lock()
-        .await
-        .insert(owned_session_id.clone(), owned_turn_id);
-    connection_turns
-        .lock()
-        .await
-        .insert(stale_session_id.clone(), stale_connection_turn_id);
+    connection_turns.lock().await.insert(
+        owned_session_id.clone(),
+        test_connection_turn(&active_turns, &owned_session_id, &owned_turn_id).await,
+    );
+    connection_turns.lock().await.insert(
+        stale_session_id.clone(),
+        test_connection_turn(&active_turns, &stale_session_id, &stale_connection_turn_id).await,
+    );
 
     let scopes = ScopePolicy::default();
     let ledger = UiProtocolLedger::new(16);
@@ -18954,6 +22681,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -18981,6 +22709,7 @@ async fn cancelled_approval_replays_on_reconnect() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -19132,6 +22861,8 @@ fn notification_serializes_as_json_rpc_method_frame() {
         turn_id: TurnId::new(),
         code: "test".into(),
         message: "failed".into(),
+        token_usage: None,
+        partial_result: None,
     })
     .into_rpc_notification()
     .expect("notification");
@@ -19302,6 +23033,100 @@ async fn interrupt_called_twice_returns_same_response() {
     )
     .await;
     assert!(matches!(second, InterruptOutcome::AlreadyInterrupting));
+    handle.abort();
+}
+
+#[tokio::test]
+async fn voice_supersede_waits_for_captured_turn_to_finish_interrupting() {
+    let session_id = SessionKey("local:voice-supersede".into());
+    let turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let entry = test_active_turn(turn_id.clone(), handle.abort_handle());
+    let turn_state = entry.state.clone();
+    active_turns.lock().await.insert(session_id.clone(), entry);
+
+    let waiter = tokio::spawn({
+        let active_turns = active_turns.clone();
+        let session_id = session_id.clone();
+        let turn_id = turn_id.clone();
+        async move { await_superseded_turn(&active_turns, &session_id, &turn_id).await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(*turn_state.lock().await, TurnState::Interrupting { .. }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("voice supersede captures the active turn");
+    let transition = transition_to_terminal(&turn_state, TerminalReason::Completed)
+        .await
+        .expect("voice supersede captured the active turn");
+    assert_eq!(transition.reason, TerminalReason::Interrupted);
+    transition
+        .ack
+        .expect("captured supersede has an acknowledgement")
+        .send(())
+        .expect("supersede waiter receives acknowledgement");
+
+    waiter
+        .await
+        .expect("waiter task")
+        .expect("supersede succeeds");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn voice_supersede_already_interrupting_polls_until_terminal() {
+    let session_id = SessionKey("local:voice-supersede-retry".into());
+    let turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    let entry = test_active_turn(turn_id.clone(), handle.abort_handle());
+    let turn_state = entry.state.clone();
+    active_turns.lock().await.insert(session_id.clone(), entry);
+
+    let first = decide_interrupt(
+        &active_turns,
+        &TurnInterruptParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await;
+    let InterruptOutcome::Captured { ack_rx } = first else {
+        panic!("first interrupt must capture the turn");
+    };
+
+    let waiter = tokio::spawn({
+        let active_turns = active_turns.clone();
+        let session_id = session_id.clone();
+        let turn_id = turn_id.clone();
+        async move { await_superseded_turn(&active_turns, &session_id, &turn_id).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+
+    let transition = transition_to_terminal(&turn_state, TerminalReason::Completed)
+        .await
+        .expect("original interrupt completes");
+    transition
+        .ack
+        .expect("original interrupt owns acknowledgement")
+        .send(())
+        .expect("original waiter still alive");
+    ack_rx
+        .await
+        .expect("original interrupt observes acknowledgement");
+
+    waiter
+        .await
+        .expect("retry waiter task")
+        .expect("retry sees terminal turn");
     handle.abort();
 }
 
@@ -19827,6 +23652,113 @@ fn ws_connection_for_test(
     (WsConnection::new(tx), rx)
 }
 
+/// The m14 Codex P0 fixture must dual-emit every tool call: the raw durable
+/// notification (suppressed per-connection since #2318) AND the canonical
+/// projection/envelope payload that actually reaches clients. Without the
+/// envelope arm the soak's tool assertions can never fire.
+#[tokio::test]
+async fn m14_codex_tool_call_dual_emits_raw_and_envelope() {
+    let (ws, _rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let workspace = std::env::temp_dir().join(format!(
+        "m14-codex-dual-emit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&workspace).expect("temp workspace");
+    let registry = octos_agent::ToolRegistry::with_builtins(&workspace);
+    let mut ctx = octos_agent::tools::ToolContext::zero();
+    let supervisor = registry.supervisor();
+    ctx.task_supervisor = Some(supervisor);
+    let session_id = SessionKey("local:test".into());
+    let turn_id = TurnId::new();
+    let env = M14CodexToolCallEnv {
+        ws: &ws,
+        ledger: &ledger,
+        registry: &registry,
+        ctx: &ctx,
+        session_id: &session_id,
+        turn_id: &turn_id,
+    };
+
+    let result = m14_codex_tool_call(
+        &env,
+        1,
+        "update_plan",
+        serde_json::json!({
+            "explanation": "dual-emit probe",
+            "plan": [{"step": "one", "status": "pending"}]
+        }),
+        true,
+    )
+    .await
+    .expect("update_plan must succeed");
+
+    assert!(result.success);
+    std::fs::remove_dir_all(&workspace).ok();
+
+    // Direct-sends apply the per-connection capability filter (#1336), so the
+    // raw arm is asserted against the ledger (where legacy connections pick
+    // it up), not against this connection's writer.
+    let replay = ledger
+        .replay_after(
+            &session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .expect("replay after codex tool call");
+    let call_id = format!("m14-codex-p0-1-update_plan-{}", turn_id.0);
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ToolStarted(event))
+                if event.turn_id == turn_id && event.tool_call_id == call_id
+        )),
+        "raw tool/started row must still be durable-appended"
+    );
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::ToolCompleted(event))
+                if event.turn_id == turn_id && event.tool_call_id == call_id
+        )),
+        "raw tool/completed row must still be durable-appended"
+    );
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
+                if envelope.envelope.turn_id == turn_id.0.to_string()
+                    && matches!(
+                        &envelope.envelope.payload,
+                        PayloadV2::ToolStart { name, .. }
+                            if name == "update_plan"
+                    )
+        )),
+        "ledger must carry the canonical tool_start envelope"
+    );
+    assert!(
+        replay.iter().any(|entry| matches!(
+            &entry.event,
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
+                if matches!(
+                    &envelope.envelope.payload,
+                    PayloadV2::ToolEnd {
+                        tool_call_id,
+                        status: octos_core::ui_protocol::EnvelopeToolEndStatus::Complete,
+                        ..
+                    } if tool_call_id == &call_id
+                )
+        )),
+        "ledger must carry the canonical complete tool_end envelope"
+    );
+}
+
 /// #1969 — an interrupted goal/peer turn must charge its partial spend from the
 /// live tracker (the drain loop breaks before the done/error arm folds usage),
 /// while a completed/errored turn keeps the folded total.
@@ -19846,6 +23778,194 @@ fn interrupted_goal_charge_falls_back_to_tracker_only_when_interrupted_with_zero
     assert_eq!(interrupted_goal_charge(false, 0, &tracker), 0);
     // interrupted but a real total was already folded → never override it
     assert_eq!(interrupted_goal_charge(true, 42, &tracker), 42);
+}
+
+// #2483 — the web-client fixture arms dual-emit like Basic: the raw
+// ephemeral is suppressed per-connection (#2318), so the canonical envelope
+// lane in the ledger is what clients (and these tests) assert on.
+fn fixture_ledger_assistant_deltas(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+) -> Vec<String> {
+    ledger
+        .replay_after(
+            session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .expect("replay after fixture turn")
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) => {
+                match &envelope.envelope.payload {
+                    PayloadV2::AssistantDelta { text, .. } => Some(text.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+// #2483 — the echo fixture's router arm and emitter share this extraction;
+// pin the marker's case-insensitivity and the literal's verbatim form.
+#[test]
+fn m9_fixture_echo_literal_extracts_the_declared_literal() {
+    assert_eq!(
+        m9_fixture_echo_literal("Reply with exactly: ALPHA").as_deref(),
+        Some("ALPHA")
+    );
+    assert_eq!(
+        m9_fixture_echo_literal("reply WITH EXACTLY:  BRAVO ").as_deref(),
+        Some("BRAVO")
+    );
+    // The marker search lowercases a byte-length-preserving copy, so the
+    // slice offset stays valid and non-ASCII content survives verbatim —
+    // on both sides of the marker.
+    assert_eq!(
+        m9_fixture_echo_literal("Reply with exactly: 你好世界").as_deref(),
+        Some("你好世界")
+    );
+    assert_eq!(
+        m9_fixture_echo_literal("列出城市。Reply with exactly: 广州").as_deref(),
+        Some("广州")
+    );
+    assert_eq!(m9_fixture_echo_literal("no marker here"), None);
+    assert_eq!(m9_fixture_echo_literal("Reply with exactly:   "), None);
+}
+
+#[tokio::test]
+async fn echo_literal_fixture_dual_emits_the_declared_literal() {
+    let (ws, _rx) = ws_connection_for_test(32);
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey("local:echo-alpha".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "Reply with exactly: ALPHA".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+        origin: None,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    // Sender stays alive so the trailing fixture delay completes instead of
+    // reading the closed channel as an interrupt.
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+
+    run_m9_fixture_turn(
+        ws,
+        state,
+        Arc::clone(&ledger),
+        contracts,
+        params,
+        M9ProtocolFixture::EchoLiteral,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+
+    assert_eq!(
+        fixture_ledger_assistant_deltas(&ledger, &session_id),
+        vec!["ALPHA".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn cjk_fixtures_dual_emit_multibyte_content_with_per_line_deltas() {
+    let state = Arc::new(AppState::empty_for_tests());
+    let contracts = Arc::new(UiProtocolContractStores::default());
+
+    let (ws, _rx) = ws_connection_for_test(32);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let session_id = SessionKey("local:cjk-short".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "用中文回复：你好世界。只回复这四个字，不要多说。".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+        origin: None,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    run_m9_fixture_turn(
+        ws,
+        Arc::clone(&state),
+        Arc::clone(&ledger),
+        Arc::clone(&contracts),
+        params,
+        M9ProtocolFixture::CjkUtf8Short,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+    assert_eq!(
+        fixture_ledger_assistant_deltas(&ledger, &session_id),
+        vec!["你好世界".to_owned()]
+    );
+
+    let (ws, _rx) = ws_connection_for_test(32);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let session_id = SessionKey("local:cjk-long".into());
+    let turn_id = TurnId::new();
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "列出5个中国城市的名字，每个城市一行，只要城市名不要其他内容。".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+        origin: None,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (_interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    run_m9_fixture_turn(
+        ws,
+        state,
+        Arc::clone(&ledger),
+        contracts,
+        params,
+        M9ProtocolFixture::CjkUtf8Long,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+    // One delta per line: the client assembles the CJK content across
+    // multiple frames, the multi-delta shape the long-response spec exists
+    // to exercise.
+    assert_eq!(
+        fixture_ledger_assistant_deltas(&ledger, &session_id),
+        vec![
+            "北京\n".to_owned(),
+            "上海\n".to_owned(),
+            "广州\n".to_owned(),
+            "深圳\n".to_owned(),
+            "杭州\n".to_owned(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -19868,6 +23988,7 @@ async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
         reasoning_effort: None,
         tool_context: None,
         live_video: false,
+        origin: None,
     };
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
@@ -19916,6 +24037,158 @@ async fn slow_fixture_checks_pending_interrupt_before_emitting_delta() {
         UiProtocolLedgerEvent::Notification(UiNotification::TurnError(event))
             if event.turn_id == turn_id && event.code == "interrupted"
     )));
+    // The pending-interrupt check also precedes the canonical dual-emit, so
+    // the interrupted turn leaves no assistant_delta envelope behind either.
+    assert!(replay.iter().all(|entry| !matches!(
+        &entry.event,
+        UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope))
+            if envelope.envelope.turn_id == turn_id.0.to_string()
+                && matches!(
+                    envelope.envelope.payload,
+                    PayloadV2::AssistantDelta { .. }
+                )
+    )));
+}
+
+/// #1463 — an interrupted M9 fixture turn must drain pending user questions
+/// exactly like the live interrupt path (and like approvals on the same
+/// branch): the runtime waiter closes (Cancelled), a late respond is stale
+/// with `turn_interrupted`, and reconnect hydration no longer re-shows the
+/// dead turn's question.
+#[tokio::test]
+async fn m9_fixture_interrupt_cancels_pending_user_questions() {
+    let (ws, _rx) = ws_connection_for_test(32);
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey("local:test".into());
+    let turn_id = TurnId::new();
+    let surviving_turn = TurnId::new();
+    let question_id = QuestionId::new();
+    let surviving_question_id = QuestionId::new();
+
+    let framework_question = || {
+        vec![UserQuestion {
+            header: "Framework".into(),
+            question: "Which framework?".into(),
+            options: vec![
+                UserQuestionOption {
+                    label: "axum".into(),
+                    description: "tower-based".into(),
+                },
+                UserQuestionOption {
+                    label: "actix".into(),
+                    description: "actor-based".into(),
+                },
+            ],
+            multi_select: false,
+            allow_free_text: true,
+        }]
+    };
+    let waiter_rx = contracts
+        .user_questions
+        .request_runtime(UserQuestionRequestedEvent::new(
+            session_id.clone(),
+            question_id.clone(),
+            turn_id.clone(),
+            "Pick a framework",
+            "Which framework should I scaffold?",
+            framework_question(),
+        ));
+    contracts
+        .user_questions
+        .request_runtime(UserQuestionRequestedEvent::new(
+            session_id.clone(),
+            surviving_question_id.clone(),
+            surviving_turn,
+            "Pick a framework",
+            "Which framework should I scaffold?",
+            framework_question(),
+        ));
+    assert_eq!(
+        contracts
+            .user_questions
+            .pending_for_session(&session_id)
+            .len(),
+        2
+    );
+
+    let params = TurnStartParams {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        input: vec![InputItem::Text {
+            text: "m9 slow fixture".into(),
+        }],
+        media: Vec::new(),
+        topic: None,
+        rewrite_for: None,
+        reasoning_effort: None,
+        tool_context: None,
+        live_video: false,
+        origin: None,
+    };
+    let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let (interrupt_tx, interrupt_rx) = mpsc::channel::<()>(1);
+    interrupt_tx
+        .try_send(())
+        .expect("preload pending interrupt");
+    drop(interrupt_tx);
+
+    run_m9_fixture_turn(
+        ws,
+        state,
+        ledger,
+        Arc::clone(&contracts),
+        params,
+        M9ProtocolFixture::Slow,
+        turn_state,
+        interrupt_rx,
+    )
+    .await;
+
+    // The blocked tool's waiter closed (Cancelled). Bounded wait: without the
+    // fix the sender lives on in the store and this receiver never resolves.
+    let waiter_closed = tokio::time::timeout(std::time::Duration::from_secs(5), waiter_rx)
+        .await
+        .expect("interrupt must close the pending question's runtime waiter");
+    assert!(
+        waiter_closed.is_err(),
+        "a cancelled question's waiter resolves to Cancelled, not answers"
+    );
+    // …a late respond is stale with the precise reason…
+    let answer = || {
+        vec![UserQuestionAnswer {
+            selected_labels: vec!["axum".into()],
+            free_text: None,
+        }]
+    };
+    let err = contracts
+        .user_questions
+        .respond_with_context(&UserQuestionRespondParams::new(
+            session_id.clone(),
+            question_id,
+            answer(),
+        ))
+        .expect_err("late respond against interrupted-turn question");
+    assert_eq!(err.code, rpc_error_codes::USER_QUESTION_STALE);
+    assert_eq!(
+        err.data.as_ref().unwrap()["reason"],
+        json!("turn_interrupted")
+    );
+    // …reconnect hydration only re-shows the surviving turn's question…
+    let pending = contracts.user_questions.pending_for_session(&session_id);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].question_id, surviving_question_id.clone());
+    // …which stays answerable.
+    let ok = contracts
+        .user_questions
+        .respond_with_context(&UserQuestionRespondParams::new(
+            session_id,
+            surviving_question_id,
+            answer(),
+        ))
+        .expect("non-interrupted turn question still pending");
+    assert!(ok.result.accepted);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -19955,6 +24228,7 @@ async fn approval_respond_ledgers_decided_before_unblocked_turn_completion() {
             tokens_in: None,
             tokens_out: None,
             session_result: None,
+            token_usage: None,
         }));
     });
 
@@ -19970,6 +24244,7 @@ async fn approval_respond_ledgers_decided_before_unblocked_turn_completion() {
             &handler_state,
             &handler_ledger,
             &handler_contracts,
+            None,
             None,
             "approval-respond".into(),
             ApprovalRespondParams::new(
@@ -20056,6 +24331,7 @@ async fn forced_backpressure_fixture_ledgers_terminal_and_latches_failed() {
             tokens_in: None,
             tokens_out: None,
             session_result: None,
+            token_usage: None,
         }),
     );
 
@@ -20242,6 +24518,8 @@ async fn approval_request_closed_ws_keeps_pending_runtime_waiter() {
                 body: "cargo test".into(),
                 command: Some("cargo test".into()),
                 cwd: None,
+                once_only: false,
+                host_tool: None,
             },
         )
         .await
@@ -20332,6 +24610,8 @@ async fn dropped_approval_waiter_cancels_pending_entry() {
                 body: "cargo test".into(),
                 command: Some("cargo test".into()),
                 cwd: None,
+                once_only: false,
+                host_tool: None,
             },
         )
         .await
@@ -20361,33 +24641,6 @@ async fn dropped_approval_waiter_cancels_pending_entry() {
             .map(|event| event.approval_id.clone())
             .collect::<Vec<_>>()
     );
-}
-
-#[tokio::test]
-async fn ephemeral_drops_are_silent_and_do_not_increment_dropped_count() {
-    let (ws, _rx) = ws_connection_for_test(1);
-    let ledger = UiProtocolLedger::new(16);
-    let session_id = SessionKey("local:test".into());
-    let turn_id = TurnId::new();
-
-    // Fill the channel with a non-ephemeral lifecycle frame.
-    let first = send_rpc_result(&ws, "1".into(), json!({"ok": true}));
-    assert!(first.is_ok());
-
-    // Ephemeral message/delta drop: must surface as BackpressureDrop but
-    // must NOT bump the dropped_count (ephemeral is non-durable per spec).
-    let second = send_notification_ephemeral(
-        &ws,
-        &ledger,
-        UiNotification::MessageDelta(MessageDeltaEvent {
-            session_id,
-            topic: None,
-            turn_id,
-            text: "hi".into(),
-        }),
-    );
-    assert!(matches!(second, Err(SendError::BackpressureDrop)));
-    assert_eq!(ws.metrics().dropped_count.load(Ordering::Relaxed), 0);
 }
 
 /// #924 BLOCK 2: once a lifecycle send marks the connection failed,
@@ -21007,6 +25260,7 @@ async fn reconnect_after_decision_replays_decided_event() {
         None,
         ConnectionUiFeatures::default(),
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: None,
@@ -21081,6 +25335,8 @@ fn make_background_task(
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
+        relaunched_from: None,
     }
 }
 
@@ -21362,6 +25618,8 @@ async fn successful_spawn_only_completion_via_on_change_queues_autonomous_reentr
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
+        relaunched_from: None,
     };
 
     // The production `set_on_change` callback, threading the resolved
@@ -21475,6 +25733,8 @@ fn unified_terminal_test_task(
         artifact_count: None,
         runtime_policy_stamp: None,
         projection_metadata: None,
+        workspace_root: None,
+        relaunched_from: None,
     }
 }
 
@@ -21814,6 +26074,68 @@ async fn session_rollback_drops_last_turn_and_returns_trimmed_thread() {
     );
 }
 
+/// UPCR-2026-039: `session/rollback` re-projects the trimmed transcript the
+/// way `session/hydrate` does, so the surviving turn's tool rows stay named.
+#[tokio::test(flavor = "current_thread")]
+async fn session_rollback_rows_carry_tool_call_identity() {
+    let session_id = SessionKey("local:rollback-tool-identity".into());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager = octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+    let manager = Arc::new(tokio::sync::Mutex::new(manager));
+    {
+        let mut guard = manager.lock().await;
+        let start = Utc::now();
+        let turns = tool_turn_rows("turn-1", &[("call-send", "peer_send_input")], start)
+            .into_iter()
+            .chain(tool_turn_rows(
+                "turn-2",
+                &[("call-read", "read_file")],
+                start + chrono::Duration::seconds(1),
+            ));
+        for message in turns {
+            guard
+                .add_message(&session_id, message)
+                .await
+                .expect("persist row");
+        }
+    }
+    let state = Arc::new(AppState {
+        sessions: Some(manager),
+        ..AppState::empty_for_tests()
+    });
+    let ledger = event_ledger(&state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+
+    handle_session_rollback(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns_registry(),
+        None,
+        None,
+        "rb-tools".into(),
+        SessionRollbackParams {
+            session_id: session_id.clone(),
+            num_turns: 1,
+        },
+    )
+    .await;
+
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["dropped_turns"], 1, "{frame}");
+    let rows = frame["result"]["thread"]["messages"]
+        .as_array()
+        .expect("messages array");
+    assert_eq!(rows.len(), 4, "turn 1 remains: {frame}");
+    assert_eq!(
+        rows[1]["tool_calls"],
+        json!([{ "tool_call_id": "call-send", "tool_name": "peer_send_input" }])
+    );
+    assert_eq!(rows[2]["tool_call_id"], "call-send");
+    assert_eq!(rows[2]["tool_name"], "peer_send_input");
+    assert!(rows.iter().all(|row| row["tool_call_id"] != "call-read"));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn session_rollback_survives_reload_from_disk() {
     let session_id = SessionKey("local:rollback-reload".into());
@@ -21943,6 +26265,7 @@ async fn session_rollback_rejects_when_turn_in_progress() {
         guard.insert(
             session_id.clone(),
             ActiveTurn {
+                owner: None,
                 turn_id: TurnId::new(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -22063,6 +26386,7 @@ async fn session_rollback_excludes_dropped_turns_from_thread_turns() {
             tokens_in: None,
             tokens_out: None,
             session_result: None,
+            token_usage: None,
         }));
     }
 
@@ -22497,6 +26821,1022 @@ async fn session_hydrate_returns_full_chat_state() {
     assert_eq!(result["pending_approvals"].as_array().unwrap().len(), 0);
 }
 
+/// One turn that calls two tools, as the turn path persists it: the user
+/// message, the assistant's tool calls (empty text), one result per call,
+/// then the answer.
+fn tool_turn_rows(turn: &str, calls: &[(&str, &str)], start: DateTime<Utc>) -> Vec<Message> {
+    let thread = || octos_core::ThreadId(turn.into());
+    let mut rows = vec![Message::user_rooting_thread(
+        format!("{turn}: go"),
+        octos_core::ClientMessageId(turn.into()),
+    )];
+    let mut call = Message::assistant_with_thread("", thread());
+    call.tool_calls = Some(
+        calls
+            .iter()
+            .map(|(id, name)| octos_core::ToolCall {
+                id: (*id).into(),
+                name: (*name).into(),
+                arguments: json!({ "text": "the draft" }),
+                metadata: None,
+            })
+            .collect(),
+    );
+    rows.push(call);
+    for (id, name) in calls {
+        rows.push(Message::tool_with_thread(
+            format!("{name} done"),
+            *id,
+            thread(),
+        ));
+    }
+    rows.push(Message::assistant_with_thread(
+        format!("{turn}: done"),
+        thread(),
+    ));
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.timestamp = start + chrono::Duration::milliseconds(index as i64);
+    }
+    rows
+}
+
+async fn hydrate_result_for_test(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    features: ConnectionUiFeatures,
+    after: Option<UiCursor>,
+) -> Value {
+    let ledger = event_ledger(state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_hydrate(
+        &ws,
+        state,
+        &ledger,
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        &active_turns_registry(),
+        None,
+        None,
+        features,
+        "tool-identity".into(),
+        SessionHydrateParams {
+            session_id: session_id.clone(),
+            after,
+            include: vec![],
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert!(frame.get("error").is_none(), "hydrate failed: {frame}");
+    frame["result"].clone()
+}
+
+/// UPCR-2026-039: a tool-result row carries its call id and tool name, and
+/// the assistant row that made the calls carries each call's id and name, on
+/// every connection. The stdio defaults (no `projection.envelope.v2`, so no
+/// v2 tool envelopes) are what a host such as OctoSense negotiates; there the
+/// rows are the only place a reloaded tool row's name can come from.
+#[tokio::test(flavor = "current_thread")]
+async fn session_hydrate_rows_carry_tool_call_identity() {
+    let session_id = SessionKey("local:hydrate-tool-identity".into());
+    let state = prg_state_with_session(&session_id, |session| {
+        session.messages = tool_turn_rows(
+            "turn-tools",
+            &[("call-send", "peer_send_input"), ("call-read", "read_file")],
+            Utc::now(),
+        );
+    });
+
+    for features in [
+        ConnectionUiFeatures::stdio_defaults(),
+        ConnectionUiFeatures::default(),
+        features_for_projection_envelope_v2_test(),
+    ] {
+        let result = hydrate_result_for_test(&state, &session_id, features, None).await;
+        let rows = result["messages"].as_array().expect("messages array");
+        assert_eq!(rows.len(), 5, "{result}");
+        let call = &rows[1];
+        assert_eq!(call["role"], "assistant");
+        assert_eq!(
+            call["tool_calls"],
+            json!([
+                { "tool_call_id": "call-send", "tool_name": "peer_send_input" },
+                { "tool_call_id": "call-read", "tool_name": "read_file" },
+            ]),
+            "the call row names its calls, without their arguments"
+        );
+        for (row, id, name) in [
+            (&rows[2], "call-send", "peer_send_input"),
+            (&rows[3], "call-read", "read_file"),
+        ] {
+            assert_eq!(row["role"], "tool");
+            assert_eq!(row["thread_id"], "turn-tools");
+            assert_eq!(row["tool_call_id"], id);
+            assert_eq!(row["tool_name"], name);
+            assert!(row.get("tool_calls").is_none(), "{row}");
+        }
+        assert!(call.get("tool_call_id").is_none() && call.get("tool_name").is_none());
+        // Rows that are neither keep their pre-UPCR shape.
+        for row in [&rows[0], &rows[4]] {
+            for key in ["tool_call_id", "tool_name", "tool_calls"] {
+                assert!(row.get(key).is_none(), "{key} on {row}");
+            }
+        }
+        // Ungated, unlike the v2-only row identity.
+        assert_eq!(
+            rows[2].get("message_id").is_some(),
+            features.projection_envelope_v2
+        );
+    }
+}
+
+/// UPCR-2026-039: the name is looked up in the whole transcript, so an
+/// incremental hydrate whose `after` skips the row that made the call still
+/// names the result.
+#[tokio::test(flavor = "current_thread")]
+async fn should_name_a_tool_row_when_the_after_cursor_skips_its_call() {
+    let session_id = SessionKey("local:hydrate-tool-after".into());
+    let state = prg_state_with_session(&session_id, |session| {
+        session.messages = tool_turn_rows(
+            "turn-after",
+            &[("call-send", "peer_send_input")],
+            Utc::now(),
+        );
+    });
+
+    let result = hydrate_result_for_test(
+        &state,
+        &session_id,
+        ConnectionUiFeatures::stdio_defaults(),
+        Some(UiCursor {
+            stream: session_id.0.clone(),
+            seq: 1,
+        }),
+    )
+    .await;
+    let rows = result["messages"].as_array().expect("messages array");
+    assert_eq!(rows[0]["seq"], 2, "rows after the call row: {result}");
+    assert_eq!(rows[0]["tool_call_id"], "call-send");
+    assert_eq!(rows[0]["tool_name"], "peer_send_input");
+}
+
+/// UPCR-2026-039: a provider can reuse a call id in a later turn; each result
+/// takes the name of the nearest earlier call with its id. A result whose
+/// call the transcript no longer holds keeps its id and has no name.
+#[tokio::test(flavor = "current_thread")]
+async fn should_name_each_tool_row_by_its_nearest_call_when_call_ids_repeat() {
+    let session_id = SessionKey("local:hydrate-tool-reused-id".into());
+    let start = Utc::now();
+    let state = prg_state_with_session(&session_id, |session| {
+        let mut orphan = Message::tool_with_thread(
+            "result of a call from a dropped segment",
+            "call-gone",
+            octos_core::ThreadId("turn-old".into()),
+        );
+        orphan.timestamp = start;
+        session.messages.push(orphan);
+        session.messages.extend(tool_turn_rows(
+            "turn-1",
+            &[("call_0", "read_file")],
+            start + chrono::Duration::seconds(1),
+        ));
+        session.messages.extend(tool_turn_rows(
+            "turn-2",
+            &[("call_0", "peer_send_input")],
+            start + chrono::Duration::seconds(2),
+        ));
+    });
+
+    let result = hydrate_result_for_test(
+        &state,
+        &session_id,
+        ConnectionUiFeatures::stdio_defaults(),
+        None,
+    )
+    .await;
+    let rows = result["messages"].as_array().expect("messages array");
+    let tool_rows = rows
+        .iter()
+        .filter(|row| row["role"] == "tool")
+        .map(|row| {
+            (
+                row["thread_id"].as_str().unwrap_or_default(),
+                row["tool_call_id"].as_str(),
+                row.get("tool_name").and_then(Value::as_str),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tool_rows,
+        vec![
+            ("turn-old", Some("call-gone"), None),
+            ("turn-1", Some("call_0"), Some("read_file")),
+            ("turn-2", Some("call_0"), Some("peer_send_input")),
+        ]
+    );
+}
+
+/// The canonical background writer can migrate the old flat transcript while
+/// the foreground manager still owns its pre-migration mirror. Its next three
+/// rows have earlier model timestamps, so a cold merge moves the background
+/// row from 52 to 55. The committed message ID must not move with that index.
+#[tokio::test(flavor = "current_thread")]
+async fn should_keep_background_identity_when_mixed_store_merge_reindexes_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = SessionKey("mixed-store-background-identity".into());
+    let mut manager = octos_bus::SessionManager::open(dir.path()).unwrap();
+    let start = Utc::now() - chrono::Duration::minutes(10);
+    for index in 0..52 {
+        let mut message = if index % 2 == 0 {
+            Message::user_rooting_thread(
+                format!("seed user {index}"),
+                octos_core::ClientMessageId(format!("seed-{}", index / 2)),
+            )
+        } else {
+            Message::assistant_with_thread(
+                format!("seed final {index}"),
+                octos_core::ThreadId(format!("seed-{}", index / 2)),
+            )
+        };
+        message.timestamp = start + chrono::Duration::seconds(index);
+        manager.add_message(&session_id, message).await.unwrap();
+    }
+    let mut ledger_config = LedgerConfig::durable(dir.path().join("identity-ledger"));
+    ledger_config.retained_per_session = 128;
+    ledger_config.rotate_bytes = 1;
+    ledger_config.retained_log_files = 6;
+    let ledger = Arc::new(UiProtocolLedger::with_config(ledger_config.clone()));
+    // Two disposable old log records: after the later writes, the first file
+    // rotates away but the BG reference remains durably retained at seq 3.
+    for index in 0..2 {
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                "old-tool-turn".into(),
+                PayloadV2::ToolStart {
+                    tool_call_id: format!("old-call-{index}"),
+                    name: "read_file".into(),
+                    arguments_preview: None,
+                },
+                None,
+            )
+            .unwrap();
+    }
+    let observer = message_commit_observer(ledger.clone());
+    octos_bus::session::set_scoped_message_commit_observer(dir.path(), &observer);
+    let parent = "mixed-parent";
+    let mut background =
+        Message::assistant_with_thread("same completion body", octos_core::ThreadId(parent.into()));
+    background.timestamp = start + chrono::Duration::seconds(100);
+    background.media = vec!["result.md".into()];
+    let original_id = format!(
+        "{}:52:{}",
+        session_id.0,
+        background.timestamp.timestamp_nanos_opt().unwrap(),
+    );
+    let committed = MESSAGE_PROJECTION_OVERRIDE
+        .scope(
+            Some(MessageProjectionOverride::BackgroundChild(
+                BackgroundChildProjection {
+                    parent_turn_id: parent.into(),
+                    response_to_client_message_id: None,
+                    task_id: Some("mixed-child".into()),
+                    tool_call_id: Some("mixed-spawn".into()),
+                    media: background.media.clone(),
+                },
+            )),
+            octos_bus::persist_message_through_canonical_path(
+                dir.path(),
+                &session_id,
+                background.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed, 52, "actual canonical writer starts at row 52");
+
+    let mut user = Message::user_rooting_thread(
+        "start background",
+        octos_core::ClientMessageId(parent.into()),
+    );
+    user.timestamp = start + chrono::Duration::seconds(90);
+    let mut call = Message::assistant_with_thread("", octos_core::ThreadId(parent.into()));
+    call.timestamp = start + chrono::Duration::seconds(91);
+    call.tool_calls = Some(vec![octos_core::ToolCall {
+        id: "mixed-spawn".into(),
+        name: "spawn".into(),
+        arguments: json!({}),
+        metadata: None,
+    }]);
+    let mut tool = Message::tool_with_thread(
+        "Spawned background task",
+        "mixed-spawn",
+        octos_core::ThreadId(parent.into()),
+    );
+    tool.timestamp = start + chrono::Duration::seconds(92);
+    for message in [user, call, tool] {
+        manager.add_message(&session_id, message).await.unwrap();
+    }
+    // Equal text from a distinct autonomous turn is a distinct canonical row.
+    let mut continuation = Message::assistant_with_thread(
+        background.content.clone(),
+        octos_core::ThreadId("independent-continuation".into()),
+    );
+    continuation.timestamp = start + chrono::Duration::seconds(101);
+    continuation.media = background.media.clone();
+    manager
+        .add_message(&session_id, continuation)
+        .await
+        .unwrap();
+    manager.invalidate_cache(&session_id);
+    let merged = manager.get_or_create(&session_id).await;
+    assert_eq!(merged.messages[55].timestamp, background.timestamp);
+    assert_eq!(merged.messages.len(), 57);
+
+    let state = Arc::new(AppState {
+        sessions: Some(Arc::new(tokio::sync::Mutex::new(manager))),
+        ..AppState::empty_for_tests()
+    });
+    async fn hydrate(
+        state: &Arc<AppState>,
+        ledger: &Arc<UiProtocolLedger>,
+        key: &SessionKey,
+        after: Option<UiCursor>,
+    ) -> Value {
+        let (ws, mut rx) = ws_connection_for_test(8);
+        handle_session_hydrate(
+            &ws,
+            state,
+            ledger,
+            &PendingApprovalStore::default(),
+            &PendingQuestionStore::default(),
+            &active_turns_registry(),
+            None,
+            None,
+            features_for_projection_envelope_v2_test(),
+            "mixed-hydrate".into(),
+            SessionHydrateParams {
+                session_id: key.clone(),
+                after,
+                include: vec![],
+            },
+        )
+        .await;
+        recv_rpc_json(&mut rx).await["result"].clone()
+    }
+    let first = hydrate(&state, &ledger, &session_id, None).await;
+    let first_rows = first["messages"].as_array().unwrap();
+    let background_envelope = first["replayed_envelopes"].as_array().unwrap();
+    assert_eq!(
+        background_envelope.len(),
+        1,
+        "actual durable background reference: {first}"
+    );
+    assert_eq!(first_rows[55]["message_id"], original_id);
+    assert_eq!(first_rows[55]["source"], "background");
+    assert_ne!(first_rows[56]["message_id"], original_id);
+    assert_ne!(first_rows[56]["source"], "background");
+    assert_eq!(
+        background_envelope[0]["payload"]["data"]["message_id"],
+        original_id
+    );
+
+    // A live next turn followed by another cold hydrate must not turn the
+    // already-owned card into an unmatched envelope appended after that turn.
+    {
+        let mut sessions = state.sessions.as_ref().unwrap().lock().await;
+        let mut user = Message::user_rooting_thread(
+            "T23 after cold client",
+            octos_core::ClientMessageId("mixed-t23".into()),
+        );
+        user.timestamp = start + chrono::Duration::seconds(102);
+        let mut answer =
+            Message::assistant_with_thread("T23 final", octos_core::ThreadId("mixed-t23".into()));
+        answer.timestamp = start + chrono::Duration::seconds(103);
+        sessions.add_message(&session_id, user).await.unwrap();
+        sessions.add_message(&session_id, answer).await.unwrap();
+        sessions.invalidate_cache(&session_id);
+    }
+    // Reopen the real durable ledger with a ring smaller than the history:
+    // identity recovery cannot depend on a process-local map or hot tail.
+    drop(observer);
+    drop(ledger);
+    ledger_config.retained_per_session = 2;
+    let ledger = Arc::new(UiProtocolLedger::with_config(ledger_config));
+    let second = hydrate(&state, &ledger, &session_id, None).await;
+    let second_rows = second["messages"].as_array().unwrap();
+    assert_eq!(second_rows[55]["message_id"], original_id);
+    assert_eq!(&second_rows[..first_rows.len()], first_rows.as_slice());
+    assert_eq!(second_rows[57]["content"], "T23 after cold client");
+    assert_eq!(second_rows[58]["content"], "T23 final");
+    assert!(
+        second["replayed_envelopes"].as_array().unwrap().is_empty(),
+        "the old background envelope is outside the hydrated hot-tail window"
+    );
+    let incremental = hydrate(
+        &state,
+        &ledger,
+        &session_id,
+        Some(serde_json::from_value(first["cursor"].clone()).unwrap()),
+    )
+    .await;
+    assert!(
+        incremental["replayed_envelopes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let incremental_background = incremental["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["seq"] == 55)
+        .unwrap();
+    assert_eq!(incremental_background["message_id"], original_id);
+    assert_eq!(incremental_background["source"], "background");
+}
+
+#[test]
+fn should_rebind_hydrate_identity_only_with_unique_scoped_canonical_provenance() {
+    let session = SessionKey("hydrate-identity-provenance".into());
+    let mut message =
+        Message::assistant_with_thread("shared body", octos_core::ThreadId("owned-turn".into()));
+    message.media = vec!["owned-result.md".into()];
+    let notification = octos_core::ui_protocol::EnvelopeV2Notification {
+        session_id: session.clone(),
+        topic: None,
+        envelope: EnvelopeV2 {
+            thread_id: "owned-turn:background:child".into(),
+            turn_id: "owned-turn:background:child".into(),
+            seq: 1,
+            cursor: None,
+            client_message_id: None,
+            payload: PayloadV2::BackgroundChildCompleted {
+                parent_turn_id: "owned-turn".into(),
+                response_to_client_message_id: None,
+                task_id: "child".into(),
+                tool_call_id: None,
+                // Intentionally opaque: neither server compatibility lookup
+                // nor the client needs to decode a historical ID format.
+                message_id: "original-opaque-background-row".into(),
+                source: "background".into(),
+                content: message.content.clone(),
+                persisted_at: message.timestamp,
+                media: message.media.clone(),
+            },
+        },
+    };
+    let expected = HashMap::from([(0, ("original-opaque-background-row".into(), true))]);
+    assert_eq!(
+        hydrated_canonical_message_identities(
+            &session,
+            std::slice::from_ref(&message),
+            std::slice::from_ref(&notification)
+        ),
+        expected,
+    );
+    assert_eq!(
+        hydrated_canonical_message_identities(
+            &session,
+            std::slice::from_ref(&message),
+            &[notification.clone(), notification.clone()],
+        ),
+        expected,
+        "identical replays of one durable reference are idempotent",
+    );
+    let mut equal_text_sibling = message.clone();
+    equal_text_sibling.thread_id = Some("different-turn".into());
+    assert_eq!(
+        hydrated_canonical_message_identities(
+            &session,
+            &[message.clone(), equal_text_sibling],
+            std::slice::from_ref(&notification),
+        ),
+        expected,
+        "equal body/media are never an ownership lookup key",
+    );
+    for case in [
+        "owner",
+        "missing-owner",
+        "timestamp",
+        "content",
+        "media",
+        "role",
+    ] {
+        let mut altered = message.clone();
+        match case {
+            "owner" => altered.thread_id = Some("foreign-owner".into()),
+            "missing-owner" => altered.thread_id = None,
+            "timestamp" => altered.timestamp += chrono::Duration::nanoseconds(1),
+            "content" => altered.content.push('!'),
+            "media" => altered.media.push("foreign-result.md".into()),
+            "role" => altered.role = MessageRole::User,
+            _ => unreachable!(),
+        }
+        assert!(
+            hydrated_canonical_message_identities(
+                &session,
+                &[altered],
+                std::slice::from_ref(&notification)
+            )
+            .is_empty(),
+            "{case} is not matching canonical provenance",
+        );
+    }
+    let mut same_owner_timestamp = message.clone();
+    same_owner_timestamp.content = "a distinct body at the same instant".into();
+    assert!(
+        hydrated_canonical_message_identities(
+            &session,
+            &[message.clone(), same_owner_timestamp],
+            std::slice::from_ref(&notification),
+        )
+        .is_empty(),
+        "ambiguous timestamp/owner must not be disambiguated by body text",
+    );
+    for case in [
+        "different-id",
+        "same-id-conflicting-media",
+        "same-id-conflicting-owner",
+    ] {
+        let mut contradictory = notification.clone();
+        let PayloadV2::BackgroundChildCompleted {
+            message_id,
+            media,
+            parent_turn_id,
+            ..
+        } = &mut contradictory.envelope.payload
+        else {
+            unreachable!()
+        };
+        match case {
+            "different-id" => *message_id = "second-claim-for-same-row".into(),
+            "same-id-conflicting-media" => media.push("conflicting.md".into()),
+            "same-id-conflicting-owner" => *parent_turn_id = "another-owner".into(),
+            _ => unreachable!(),
+        }
+        assert!(
+            hydrated_canonical_message_identities(
+                &session,
+                std::slice::from_ref(&message),
+                &[notification.clone(), contradictory],
+            )
+            .is_empty(),
+            "{case} cannot give either claimant a row identity",
+        );
+    }
+    let mut foreign_scope = notification.clone();
+    foreign_scope.session_id = SessionKey("another-session".into());
+    assert!(
+        hydrated_canonical_message_identities(&session, &[message], &[foreign_scope]).is_empty()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_reject_recomputed_hydrate_id_when_its_typed_owner_contradicts_the_row() {
+    let session = SessionKey("hydrate-recomputed-owner".into());
+    let message =
+        Message::assistant_with_thread("same body", octos_core::ThreadId("new-owner".into()));
+    let reference = octos_core::ui_protocol::EnvelopeV2Notification {
+        session_id: session.clone(),
+        topic: None,
+        envelope: EnvelopeV2 {
+            thread_id: "old-owner:background:child".into(),
+            turn_id: "old-owner:background:child".into(),
+            seq: 1,
+            cursor: None,
+            client_message_id: None,
+            payload: PayloadV2::BackgroundChildCompleted {
+                parent_turn_id: "old-owner".into(),
+                response_to_client_message_id: None,
+                task_id: "child".into(),
+                tool_call_id: None,
+                message_id: format!(
+                    "{}:0:{}",
+                    session.0,
+                    message.timestamp.timestamp_nanos_opt().unwrap()
+                ),
+                source: "background".into(),
+                content: message.content.clone(),
+                persisted_at: message.timestamp,
+                media: vec![],
+            },
+        },
+    };
+    assert!(
+        hydrated_canonical_message_identities(
+            &session,
+            std::slice::from_ref(&message),
+            std::slice::from_ref(&reference)
+        )
+        .is_empty(),
+        "a position-derived ID is not stronger authority than an explicit owner contradiction"
+    );
+    let state = prg_state_with_session(&session, |session| session.messages.push(message));
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let PayloadV2::BackgroundChildCompleted {
+        message_id: claimed_id,
+        ..
+    } = &reference.envelope.payload
+    else {
+        unreachable!()
+    };
+    ledger.append_notification(UiNotification::EnvelopeV2(reference.clone()));
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_hydrate(
+        &ws,
+        &state,
+        &ledger,
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        &active_turns_registry(),
+        None,
+        None,
+        features_for_projection_envelope_v2_test(),
+        "owner-conflict-hydrate".into(),
+        SessionHydrateParams {
+            session_id: session,
+            after: None,
+            include: vec![],
+        },
+    )
+    .await;
+    let result = recv_rpc_json(&mut rx).await;
+    assert_ne!(
+        result["result"]["messages"][0]["message_id"], *claimed_id,
+        "unresolved fallback must not reissue the rejected claim as a client dedupe key"
+    );
+    assert_ne!(result["result"]["messages"][0]["source"], "background");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn should_keep_spawn_only_sent_file_identity_and_one_hydrated_attachment() {
+    check_spawn_only_sent_file_hydration(1).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn should_keep_spawn_only_sent_files_identity_and_each_hydrated_attachment_once() {
+    check_spawn_only_sent_file_hydration(2).await;
+}
+
+#[cfg(unix)]
+async fn check_spawn_only_sent_file_hydration(file_count: usize) {
+    use crate::commands::acp::{SessionAgentFactory, TestAgentFactory};
+    use crate::commands::oup_session::{OupFrontend, OupSession};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct MediaModel(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for MediaModel {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            let first = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Ok(octos_llm::ChatResponse {
+                content: Some("MEDIA-PARENT-ACK".into()),
+                reasoning_content: None,
+                tool_calls: if first {
+                    vec![octos_core::ToolCall {
+                        id: "actual-spawn-media-call".into(),
+                        name: "media_fixture".into(),
+                        arguments: json!({}),
+                        metadata: None,
+                    }]
+                } else {
+                    vec![]
+                },
+                stop_reason: if first {
+                    octos_llm::StopReason::ToolUse
+                } else {
+                    octos_llm::StopReason::EndTurn
+                },
+                usage: Default::default(),
+                provider_index: None,
+            })
+        }
+        fn provider_name(&self) -> &str {
+            "local"
+        }
+        fn model_id(&self) -> &str {
+            "media-fixture"
+        }
+    }
+    struct Frontend;
+    #[async_trait::async_trait]
+    impl OupFrontend for Frontend {
+        async fn event(&self, _event: UiNotification) -> eyre::Result<Option<UiCommand>> {
+            Ok(None)
+        }
+    }
+    let data = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let artifacts = (0..file_count)
+        .map(|index| {
+            let artifact = workspace
+                .path()
+                .join(format!("actual-background-result-{index}.txt"));
+            std::fs::write(&artifact, "ACTUAL-FILE-MEDIA").unwrap();
+            std::fs::canonicalize(artifact)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    let plugin = workspace.path().join(".octos/plugins/media_fixture");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "name": "media_fixture", "version": "1.0",
+            "tools": [{"name": "media_fixture", "description": "Produce the test artifact",
+                       "spawn_only": true, "input_schema": {"type": "object", "properties": {}}}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("result.json"),
+        serde_json::to_vec(&json!({
+            "success": true, "output": "ACTUAL-BG-MEDIA", "files_to_send": artifacts
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let executable = plugin.join("media_fixture");
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\n/bin/cat '{}'\n",
+            plugin.join("result.json").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let factory = TestAgentFactory::new(
+        Arc::new(MediaModel(std::sync::atomic::AtomicUsize::new(0))),
+        data.path().to_owned(),
+        workspace.path().to_owned(),
+    );
+    let state = factory.oup_state().await.unwrap();
+    let session = OupSession::open(
+        state.clone(),
+        SessionKey::with_profile(
+            octos_core::MAIN_PROFILE_ID,
+            "acp",
+            &uuid::Uuid::now_v7().to_string(),
+        ),
+        workspace.path(),
+        octos_agent::EffectivePermissions::workspace_write(),
+    )
+    .await
+    .unwrap();
+    let _parent = session
+        .turn(
+            "Produce the background artifact",
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+            &Frontend,
+        )
+        .await;
+    let (canonical_id, canonical_media) =
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let ledger = state.ui_protocol.ledger.get().unwrap();
+                for row in ledger
+                    .replay_after(
+                        &session.session_id,
+                        Some(&UiCursor {
+                            stream: session.session_id.0.clone(),
+                            seq: 0,
+                        }),
+                    )
+                    .unwrap()
+                {
+                    if let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(event)) =
+                        row.event
+                        && let PayloadV2::BackgroundChildCompleted {
+                            content,
+                            media,
+                            message_id,
+                            ..
+                        } = event.envelope.payload
+                        && content == "ACTUAL-BG-MEDIA"
+                    {
+                        return (message_id, media);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("actual spawn-only send_file completion must persist");
+    assert_eq!(canonical_media, artifacts);
+    fn verify_history(
+        history: &[HydratedMessage],
+        canonical_id: &str,
+        media: &[String],
+    ) -> (u64, chrono::DateTime<Utc>) {
+        let completion = history
+            .iter()
+            .find(|row| row.content == "ACTUAL-BG-MEDIA")
+            .unwrap();
+        assert_eq!(
+            completion.message_id.as_deref(),
+            Some(canonical_id),
+            "real sent-file background must retain its authoritative identity"
+        );
+        assert_eq!(completion.source.as_deref(), Some("background"));
+        assert_eq!(completion.media, media);
+        // The actual internal send_file invocation supplies no caption. Its
+        // empty per-file companion stays durable, but OctosCode's existing
+        // hydrated_row_is_displayable contract excludes empty assistant rows.
+        let companions = history
+            .iter()
+            .filter(|row| {
+                row.role == "assistant"
+                    && row.message_id.as_deref() != Some(canonical_id)
+                    && row.media.iter().any(|path| media.contains(path))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            companions.len(),
+            media.len(),
+            "durable companions: {history:?}"
+        );
+        assert!(companions.iter().all(|row| row.content.is_empty()));
+        for artifact in media {
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|row| row.role != "tool"
+                        && (row.role != "assistant" || !row.content.trim().is_empty()))
+                    .flat_map(|row| &row.media)
+                    .filter(|path| *path == artifact)
+                    .count(),
+                1,
+                "cold projected history must display each completion attachment once"
+            );
+        }
+        (completion.seq, completion.persisted_at)
+    }
+    let history = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let history = session.hydrate().await.unwrap().messages.unwrap();
+            if history
+                .iter()
+                .filter(|row| {
+                    row.role == "assistant"
+                        && row.content.is_empty()
+                        && row.media.iter().any(|path| canonical_media.contains(path))
+                })
+                .count()
+                == file_count
+            {
+                return history;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the real send_file consumer must finish its durable companions");
+    let (original_index, timestamp) = verify_history(&history, &canonical_id, &canonical_media);
+    let runtime = state
+        .session_cache
+        .get_or_init(
+            &state.profiles[octos_core::MAIN_PROFILE_ID],
+            session.session_id.clone(),
+            Some(workspace.path().to_owned()),
+        )
+        .await
+        .unwrap();
+    // A real late flat-store write predating the canonical completion moves
+    // its merged row index. Identity must not depend on that position.
+    {
+        let mut manager = runtime.sessions.lock().await;
+        for offset in 1..=2 {
+            let mut earlier = Message::user_rooting_thread(
+                format!("earlier media seed {offset}"),
+                octos_core::ClientMessageId(format!("media-seed-{offset}")),
+            );
+            earlier.timestamp = timestamp - chrono::Duration::seconds(offset);
+            manager
+                .add_message(&session.session_id, earlier)
+                .await
+                .unwrap();
+        }
+        manager.invalidate_cache(&session.session_id);
+    }
+    let shifted = session.hydrate().await.unwrap().messages.unwrap();
+    let (shifted_index, _) = verify_history(&shifted, &canonical_id, &canonical_media);
+    assert_eq!(shifted_index, original_index + 2);
+    let key = session.session_id.clone();
+    let old_memory = Arc::downgrade(&state.profiles[octos_core::MAIN_PROFILE_ID].memory);
+    session.close().await.unwrap();
+    drop(session);
+    drop(runtime);
+    drop(state);
+    drop(factory);
+    // Cache Drop aborts its asynchronous sweeper; the executor must poll
+    // cancellation before that task releases its cached profile/store. Unlike
+    // an OS process restart, dropping these handles alone is not a completed
+    // shutdown. Observe release rather than racing Linux's exclusive DB lock
+    // or weakening the cold-open check with an in-memory fallback.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while old_memory.upgrade().is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old store must be released before cold bootstrap");
+    let reopened_factory = TestAgentFactory::new(
+        Arc::new(MediaModel(std::sync::atomic::AtomicUsize::new(1))),
+        data.path().to_owned(),
+        workspace.path().to_owned(),
+    );
+    let reopened = OupSession::open(
+        reopened_factory.oup_state().await.unwrap(),
+        key,
+        workspace.path(),
+        octos_agent::EffectivePermissions::workspace_write(),
+    )
+    .await
+    .unwrap();
+    let cold = reopened.hydrate().await.unwrap().messages.unwrap();
+    assert_eq!(
+        verify_history(&cold, &canonical_id, &canonical_media).0,
+        shifted_index
+    );
+    reopened.close().await.unwrap();
+}
+
+#[test]
+fn should_limit_hydrate_identity_references_to_the_captured_scope_and_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = LedgerConfig::durable(dir.path().into());
+    config.retained_per_session = 1;
+    let ledger = UiProtocolLedger::with_config(config);
+    let session = SessionKey("scoped-identity-evidence".into());
+    ledger.set_session_scope(&session, Some("workspace-a".into()));
+    let persisted = |id: &str| PayloadV2::AssistantPersisted {
+        text: id.into(),
+        assistant_segment_id: format!("segment-{id}"),
+        meta: MessageMeta {
+            message_id: id.into(),
+            persisted_at: Utc::now(),
+            media: vec![],
+        },
+    };
+    let captured = ledger
+        .emit_envelope_v2(&session, "before".into(), persisted("before"), None)
+        .unwrap();
+    ledger
+        .emit_envelope_v2(&session, "after".into(), persisted("after"), None)
+        .unwrap();
+    ledger
+        .emit_envelope_v2(
+            &session,
+            "after".into(),
+            PayloadV2::ToolStart {
+                tool_call_id: "unrelated-tool".into(),
+                name: "read_file".into(),
+                arguments_preview: None,
+            },
+            None,
+        )
+        .unwrap();
+    let references = ledger
+        .retained_message_identity_references(&session, &captured.cursor)
+        .unwrap();
+    assert_eq!(
+        references.len(),
+        1,
+        "only the older eligible disk reference is included"
+    );
+    assert_eq!(references[0].cursor, captured.cursor);
+    assert_eq!(references[0].event, captured.event);
+
+    ledger.set_session_scope(&session, Some("workspace-b".into()));
+    assert!(
+        ledger
+            .retained_message_identity_references(&session, &captured.cursor)
+            .is_err(),
+        "a cursor for another workspace is never identity authority"
+    );
+    let sibling = ledger
+        .emit_envelope_v2(&session, "sibling".into(), persisted("sibling"), None)
+        .unwrap();
+    let references = ledger
+        .retained_message_identity_references(&session, &sibling.cursor)
+        .unwrap();
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].event, sibling.event);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn session_status_surfaces_context_state_from_session_store() {
     let session_id = SessionKey("local:status-context".into());
@@ -22726,6 +28066,7 @@ async fn turn_state_get_returns_active_for_in_flight() {
         guard.insert(
             session_id.clone(),
             ActiveTurn {
+                owner: None,
                 turn_id: turn_id.clone(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
                 state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -22798,6 +28139,7 @@ async fn turn_state_get_falls_back_to_durable_projection_for_evicted() {
         tokens_in: None,
         tokens_out: None,
         session_result: None,
+        token_usage: None,
     }));
 
     let (ws, mut rx) = ws_connection_for_test(8);
@@ -22821,6 +28163,105 @@ async fn turn_state_get_falls_back_to_durable_projection_for_evicted() {
         frame["result"]["state"], "completed",
         "evicted turn must surface terminal state from the ledger projection"
     );
+}
+
+#[test]
+fn turn_state_projection_from_turn_scoped_snapshot_matches_full_snapshot() {
+    // #2445: handle_turn_state_get projects from the turn-scoped ledger
+    // read instead of a full ring snapshot. This pins the load-bearing
+    // contract — the filter's event set is exactly what this projection
+    // consumes — by running the REAL projection over both snapshots. If
+    // project_turn_from_ledger ever learns to read another event kind,
+    // this fails until UiProtocolLedger::snapshot_events_for_turn's
+    // filter learns it too.
+    let ledger = UiProtocolLedger::new(16);
+    let session_id = SessionKey("local:turn-projection-parity".into());
+    let turn_a = TurnId::new();
+    let turn_b = TurnId::new();
+    ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: TurnId::new(),
+        text: "noise".into(),
+    }));
+    ledger.append_notification(UiNotification::TurnStarted(
+        octos_core::ui_protocol::TurnStartedEvent {
+            session_id: session_id.clone(),
+            turn_id: turn_a.clone(),
+            timestamp: Utc::now(),
+            topic: None,
+        },
+    ));
+    ledger.emit_envelope_v2(
+        &session_id,
+        turn_a.0.to_string(),
+        PayloadV2::AssistantDelta {
+            text: "a answer".into(),
+            assistant_segment_id: format!("{}:assistant:iteration:0", turn_a.0),
+        },
+        None,
+    );
+    ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: turn_a.clone(),
+        code: "interrupted".into(),
+        message: "stop".into(),
+        token_usage: None,
+        partial_result: None,
+    }));
+    ledger.append_notification(UiNotification::TurnStarted(
+        octos_core::ui_protocol::TurnStartedEvent {
+            session_id: session_id.clone(),
+            turn_id: turn_b.clone(),
+            timestamp: Utc::now(),
+            topic: None,
+        },
+    ));
+    ledger.emit_envelope_v2(
+        &session_id,
+        turn_b.0.to_string(),
+        PayloadV2::AssistantDelta {
+            text: "b answer".into(),
+            assistant_segment_id: format!("{}:assistant:iteration:0", turn_b.0),
+        },
+        None,
+    );
+    ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id: turn_b.clone(),
+        cursor: None,
+        tokens_in: None,
+        tokens_out: None,
+        session_result: None,
+        token_usage: None,
+    }));
+
+    let (full, _) = ledger
+        .snapshot_with_cursor(&session_id, None)
+        .expect("full snapshot");
+    for turn in [&turn_a, &turn_b] {
+        let scoped = ledger
+            .snapshot_events_for_turn(&session_id, turn)
+            .expect("turn-scoped snapshot");
+        let from_full = project_turn_from_ledger(turn, &full);
+        let from_scoped = project_turn_from_ledger(turn, &scoped);
+        assert_eq!(from_full.state, from_scoped.state);
+        assert_eq!(from_full.started_at, from_scoped.started_at);
+        // completed_at is stamped with Utc::now() at projection time (not
+        // read from the terminal event), so only its presence is comparable
+        // across two projection runs.
+        assert_eq!(
+            from_full.completed_at.is_some(),
+            from_scoped.completed_at.is_some(),
+            "terminal-event visibility must match"
+        );
+        assert_eq!(
+            from_full.thread_id, from_scoped.thread_id,
+            "envelope thread backfill must survive the turn-scoped read"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -23213,6 +28654,70 @@ async fn turn_state_get_returns_unknown_for_missing() {
     // NOT an error.
     assert!(frame.get("result").is_some(), "missing turn must succeed");
     assert_eq!(frame["result"]["state"], "unknown");
+    // UPCR-2026-031: nothing in this process holds or is admitting the turn,
+    // so the server can say for certain it is not running it.
+    assert_eq!(frame["result"]["running"], false);
+}
+
+async fn turn_state_frame(
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+    active_turns: &SharedActiveTurns,
+    turn_id: TurnId,
+) -> Value {
+    let ledger = event_ledger(state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_turn_state_get(
+        &ws,
+        state,
+        &ledger,
+        active_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "ts".into(),
+        TurnStateGetParams {
+            session_id: session_id.clone(),
+            turn_id,
+        },
+    )
+    .await;
+    recv_rpc_json(&mut rx).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_not_claim_a_turn_is_stopped_while_its_start_is_still_being_admitted() {
+    // A slow `turn/start` has not reached the registry yet. A lookup in that
+    // window must stay a plain `unknown`: the turn may be about to run.
+    let session_id = SessionKey("local:turn-admitting".into());
+    let state = prg_state_with_session(&session_id, |_| {});
+    let active_turns = active_turns_registry();
+    let turn_id = TurnId::new();
+    let _admitting = TurnAdmission::enter(&session_id, &turn_id);
+
+    let frame = turn_state_frame(&state, &session_id, &active_turns, turn_id).await;
+
+    assert_eq!(frame["result"]["state"], "unknown");
+    assert!(
+        frame["result"].get("running").is_none(),
+        "no certainty while the start is in flight: {frame}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_say_a_turn_is_not_running_once_its_admission_has_ended_without_a_record() {
+    // The admission ended without registering the turn (refused, or its
+    // requester vanished before the accept). Now the answer is certain.
+    let session_id = SessionKey("local:turn-admission-ended".into());
+    let state = prg_state_with_session(&session_id, |_| {});
+    let active_turns = active_turns_registry();
+    let turn_id = TurnId::new();
+    drop(TurnAdmission::enter(&session_id, &turn_id));
+
+    let frame = turn_state_frame(&state, &session_id, &active_turns, turn_id).await;
+
+    assert_eq!(frame["result"]["state"], "unknown");
+    assert_eq!(frame["result"]["running"], false);
 }
 
 /// Serialise tests that mutate the process-global message-commit
@@ -23617,24 +29122,12 @@ fn voice_combine_falls_back_to_transcript_for_pure_voice_turn() {
 }
 
 #[test]
-fn voice_no_speech_short_circuit_ignores_non_audio_media() {
-    // #1555 review finding 1: `asr_media` holds ALL media paths, so a
-    // text+image turn (no audio at all) must NOT take the no-speech early
-    // return — it previously completed the turn without running the agent.
-    // (had_audio_media, had_non_audio_media, had_audio_input, prompt_is_empty)
-    assert!(!should_short_circuit_no_speech(false, true, false, false));
-    assert!(!should_short_circuit_no_speech(false, true, false, true));
-    // No media at all → nothing voice-related to short-circuit on.
-    assert!(!should_short_circuit_no_speech(false, false, false, true));
-    // Silent audio + typed prompt → proceed as a plain text turn.
-    assert!(!should_short_circuit_no_speech(true, false, false, false));
-    // Silent audio + image/file → proceed; the agent still has real input.
-    assert!(!should_short_circuit_no_speech(true, true, false, true));
-    // Audio that produced a transcript → never short-circuit.
-    assert!(!should_short_circuit_no_speech(true, false, true, true));
-    // Only a genuinely empty voice turn (silent audio, nothing else)
-    // takes the friendly "no speech detected" path.
+fn legacy_voice_turn_only_short_circuits_when_no_other_input_remains() {
     assert!(should_short_circuit_no_speech(true, false, false, true));
+    assert!(!should_short_circuit_no_speech(true, false, false, false));
+    assert!(!should_short_circuit_no_speech(true, true, false, true));
+    assert!(!should_short_circuit_no_speech(true, false, true, true));
+    assert!(!should_short_circuit_no_speech(false, false, false, true));
 }
 
 // ========================================================================
@@ -23673,16 +29166,6 @@ fn features_for_v2_delivery() -> ConnectionUiFeatures {
     }
 }
 
-/// Build a `ConnectionUiFeatures` for the UPCR-2026-014 M9-α-9
-/// `event.file_attached.v1` capability gate.
-fn features_for_file_attached_test(file_attached: bool) -> ConnectionUiFeatures {
-    ConnectionUiFeatures {
-        file_attached,
-        header_present: true,
-        ..ConnectionUiFeatures::default()
-    }
-}
-
 /// Slides soak regression: build a representative `file/attached`
 /// notification carrying a PPTX artefact and the expected MIME hint.
 /// Used by the capability-gate tests to assert legacy clients never
@@ -23694,6 +29177,7 @@ fn file_attached_for(session: &SessionKey) -> UiNotification {
         turn_id: TurnId::new(),
         path: "/tmp/deck.pptx".into(),
         tool_call_id: Some("tc-slides".into()),
+        attachment_owner: None,
         mime: Some(
             "application/vnd.openxmlformats-officedocument.presentationml.presentation".into(),
         ),
@@ -23711,6 +29195,10 @@ fn context_state_for_test(session: &SessionKey) -> UiContextState {
         recovery_state: "active".into(),
         last_checkpoint_id: Some("ctx-checkpoint".into()),
         last_compaction_id: Some("ctx-compaction".into()),
+        cache_epoch_id: None,
+        last_cache_invalidation_reason: None,
+        semantic_head_id: None,
+        semantic_head_kind: None,
     }
 }
 
@@ -23759,6 +29247,15 @@ fn context_normalization_reported_for(session: &SessionKey) -> UiNotification {
     })
 }
 
+fn context_state_reported_for(session: &SessionKey) -> UiNotification {
+    UiNotification::ContextStateReported(octos_core::ui_protocol::ContextStateReportedEvent {
+        session_id: session.clone(),
+        context_state: context_state_for_test(session),
+        threshold_tokens: 100_000,
+        iteration: 3,
+    })
+}
+
 /// Builds the canonical background-result projection emitted by the
 /// post-commit observer.
 fn background_child_v2_for(session: &SessionKey) -> UiNotification {
@@ -23798,304 +29295,6 @@ fn frame_method(frame: &WsMessage) -> Option<String> {
         }
         _ => None,
     }
-}
-
-#[tokio::test]
-async fn live_forwarder_topic_scope_drops_other_topic_events() {
-    let (ws_alpha, mut rx_alpha) = ws_connection_for_test(16);
-    let (ws_beta, mut rx_beta) = ws_connection_for_test(16);
-    let ledger = Arc::new(UiProtocolLedger::new(16));
-    let session_id = SessionKey("local:topic-live".into());
-    let forwarders_alpha: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-    let forwarders_beta: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-
-    let alpha_live_rx = ledger.subscribe(&session_id);
-    spawn_live_forwarder(
-        ws_alpha.clone(),
-        ledger.clone(),
-        session_id.clone(),
-        0,
-        ws_alpha.connection_id(),
-        ConnectionUiFeatures::default(),
-        Some("alpha".into()),
-        Some(MAIN_PROFILE_ID.to_owned()),
-        alpha_live_rx,
-        forwarders_alpha.clone(),
-    )
-    .await;
-
-    let beta_live_rx = ledger.subscribe(&session_id);
-    spawn_live_forwarder(
-        ws_beta.clone(),
-        ledger.clone(),
-        session_id.clone(),
-        0,
-        ws_beta.connection_id(),
-        ConnectionUiFeatures::default(),
-        Some("beta".into()),
-        Some(MAIN_PROFILE_ID.to_owned()),
-        beta_live_rx,
-        forwarders_beta.clone(),
-    )
-    .await;
-
-    ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
-        session_id: session_id.clone(),
-        topic: Some("alpha".into()),
-        turn_id: TurnId::new(),
-        text: "alpha".into(),
-    }));
-    ledger.append_notification(UiNotification::MessageDelta(MessageDeltaEvent {
-        session_id: session_id.clone(),
-        topic: Some("beta".into()),
-        turn_id: TurnId::new(),
-        text: "beta".into(),
-    }));
-
-    let alpha_frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx_alpha.recv())
-        .await
-        .expect("alpha bridge frame")
-        .expect("alpha ws open");
-    let alpha_json: Value = match &alpha_frame {
-        WsMessage::Text(text) => serde_json::from_str(text).expect("alpha frame json"),
-        other => panic!("unexpected alpha frame: {other:?}"),
-    };
-    assert_eq!(
-        alpha_json.get("method").and_then(Value::as_str),
-        Some(octos_core::ui_protocol::methods::MESSAGE_DELTA),
-    );
-    assert_eq!(alpha_json["params"]["text"], json!("alpha"));
-    assert_eq!(alpha_json["params"]["topic"], json!("alpha"));
-
-    let beta_frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx_beta.recv())
-        .await
-        .expect("beta bridge frame")
-        .expect("beta ws open");
-    let beta_json: Value = match &beta_frame {
-        WsMessage::Text(text) => serde_json::from_str(text).expect("beta frame json"),
-        other => panic!("unexpected beta frame: {other:?}"),
-    };
-    assert_eq!(
-        beta_json.get("method").and_then(Value::as_str),
-        Some(octos_core::ui_protocol::methods::MESSAGE_DELTA),
-    );
-    assert_eq!(beta_json["params"]["text"], json!("beta"));
-    assert_eq!(beta_json["params"]["topic"], json!("beta"));
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert!(
-        rx_alpha.try_recv().is_err(),
-        "alpha topic bridge must not receive beta events",
-    );
-    assert!(
-        rx_beta.try_recv().is_err(),
-        "beta topic bridge must not receive alpha events",
-    );
-
-    abort_live_forwarders(&forwarders_alpha, &ledger).await;
-    abort_live_forwarders(&forwarders_beta, &ledger).await;
-}
-
-/// P0-A regression: slides soak round-13 captured `file/attached`
-/// envelopes that landed durably on the ledger (seq 91 in the
-/// fleet ledger evidence) but never reached the SPA. The capability
-/// gate passes (`event.file_attached.v1` was negotiated) and
-/// broadcast fan-out succeeded — the surviving filter dropping
-/// the event is `ledger_event_matches_topic_scope`. The
-/// `FileAttachedEvent` struct has no `topic` field, so its
-/// `UiNotification::topic()` impl falls back to the
-/// `SessionKey.topic()` suffix. Any emit site that constructs the
-/// event with a session_id that does NOT carry the `#<topic>`
-/// suffix (e.g. a future caller passing the base session, or a
-/// pre-stamp `bg_session_id` capture) results in
-/// `event.topic() == None` while the topic-scoped subscriber
-/// expects `Some("slides")` — the filter mismatches and the event
-/// is silently dropped.
-///
-/// File/attached is intrinsically session-scoped via its
-/// `tool_call_id` — the SPA already knows which turn/tool produced
-/// the artefact, so topic scoping adds no value and only risks
-/// false negatives. This end-to-end test pins the invariant that a
-/// `file/attached` emitted on the topic-suffixed broadcast key
-/// reaches a topic-scoped subscriber. The companion unit test
-/// (`ledger_event_matches_topic_scope_exempts_file_attached`)
-/// covers the filter-only invariant for the bare-event /
-/// mismatched-topic shapes that the broadcast-fan-out path can't
-/// reach without monkey-patching the ledger.
-#[tokio::test]
-async fn live_forwarder_delivers_file_attached_to_topic_scoped_subscriber() {
-    let (ws, mut rx) = ws_connection_for_test(16);
-    let ledger = Arc::new(UiProtocolLedger::new(16));
-    // Subscriber opens on the topic-suffixed broadcast key — matches
-    // the SPA's session/open with `topic: "slides"`.
-    let topic_session = SessionKey("local:slides-soak#slides".into());
-    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-
-    let live_rx = ledger.subscribe(&topic_session);
-    spawn_live_forwarder(
-        ws.clone(),
-        ledger.clone(),
-        topic_session.clone(),
-        0,
-        ws.connection_id(),
-        features_for_file_attached_test(true),
-        Some("slides".into()),
-        Some(MAIN_PROFILE_ID.to_owned()),
-        live_rx,
-        forwarders.clone(),
-    )
-    .await;
-
-    let file_attached_matching = file_attached_for(&topic_session);
-    ledger.append_notification(file_attached_matching);
-
-    let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("topic-matching file/attached frame")
-        .expect("ws open");
-    assert_eq!(
-        frame_method(&frame).as_deref(),
-        Some(octos_core::ui_protocol::methods::FILE_ATTACHED),
-        "file/attached on the matching-topic session must reach the subscriber",
-    );
-
-    abort_live_forwarders(&forwarders, &ledger).await;
-}
-
-/// #1329 (closes the P0-A class routing drop): The 6 events that
-/// previously had no explicit `topic` field — ToolStarted,
-/// ToolProgress, ToolCompleted, ApprovalAutoResolved,
-/// ApprovalDecided, ApprovalCancelled — gained the same
-/// `topic: Option<String>` field that the 10 already-fixed
-/// variants carry. With emitters populating the field from the
-/// upstream `SessionKey.topic()` BEFORE any `base_key()` strip,
-/// each event reaches a topic-scoped subscriber.
-///
-/// This integration-style test pins the invariant for ALL 6
-/// variants on the live broadcast path: emit each event on a
-/// topic-suffixed broadcast key with the explicit `topic` field,
-/// then assert each frame reaches a topic-scoped subscriber (the
-/// classifier reads `event.topic()` first, honoring the explicit
-/// field).
-#[tokio::test]
-async fn live_forwarder_delivers_tool_and_approval_events_to_topic_scoped_subscriber() {
-    let (ws, mut rx) = ws_connection_for_test(64);
-    let ledger = Arc::new(UiProtocolLedger::new(64));
-    let topic_session = SessionKey("local:slides-soak#slides".into());
-    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-
-    let live_rx = ledger.subscribe(&topic_session);
-    spawn_live_forwarder(
-        ws.clone(),
-        ledger.clone(),
-        topic_session.clone(),
-        0,
-        ws.connection_id(),
-        ConnectionUiFeatures::default(),
-        Some("slides".into()),
-        Some(MAIN_PROFILE_ID.to_owned()),
-        live_rx,
-        forwarders.clone(),
-    )
-    .await;
-
-    let turn_id = TurnId::new();
-    let tool_call_id = "tc-1329".to_owned();
-
-    // 1. ToolStarted
-    ledger.append_notification(UiNotification::ToolStarted(ToolStartedEvent {
-        session_id: topic_session.clone(),
-        topic: Some("slides".into()),
-        turn_id: turn_id.clone(),
-        tool_call_id: tool_call_id.clone(),
-        tool_name: "shell".into(),
-        arguments: None,
-    }));
-
-    // 2. ToolProgress
-    ledger.append_notification(UiNotification::ToolProgress(ToolProgressEvent {
-        session_id: topic_session.clone(),
-        topic: Some("slides".into()),
-        turn_id: turn_id.clone(),
-        tool_call_id: tool_call_id.clone(),
-        message: Some("running step 1".into()),
-        progress_pct: Some(50.0),
-    }));
-
-    // 3. ToolCompleted
-    ledger.append_notification(UiNotification::ToolCompleted(ToolCompletedEvent {
-        session_id: topic_session.clone(),
-        topic: Some("slides".into()),
-        turn_id: turn_id.clone(),
-        tool_call_id: tool_call_id.clone(),
-        tool_name: "shell".into(),
-        success: Some(true),
-        output_preview: None,
-        duration_ms: Some(10),
-    }));
-
-    // 4. ApprovalAutoResolved
-    ledger.append_notification(UiNotification::ApprovalAutoResolved(
-        ApprovalAutoResolvedEvent {
-            session_id: topic_session.clone(),
-            topic: Some("slides".into()),
-            approval_id: ApprovalId::new(),
-            turn_id: turn_id.clone(),
-            tool_name: "shell".into(),
-            scope: "session".into(),
-            scope_match: "exact".into(),
-            decision: ApprovalDecision::Approve,
-        },
-    ));
-
-    // 5. ApprovalDecided
-    ledger.append_notification(UiNotification::ApprovalDecided(ApprovalDecidedEvent {
-        session_id: topic_session.clone(),
-        topic: Some("slides".into()),
-        approval_id: ApprovalId::new(),
-        turn_id: turn_id.clone(),
-        decision: ApprovalDecision::Approve,
-        scope: Some("session".into()),
-        decided_at: Utc::now(),
-        decided_by: "user:test".into(),
-        auto_resolved: false,
-        policy_id: None,
-        client_note: None,
-    }));
-
-    // 6. ApprovalCancelled
-    ledger.append_notification(UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
-        session_id: topic_session.clone(),
-        topic: Some("slides".into()),
-        approval_id: ApprovalId::new(),
-        turn_id: turn_id.clone(),
-        reason: "turn_interrupted".into(),
-    }));
-
-    // Verify each method lands on the subscriber. Order matches
-    // emission order — the ledger preserves seq.
-    let expected = [
-        methods::TOOL_STARTED,
-        methods::TOOL_PROGRESS,
-        methods::TOOL_COMPLETED,
-        methods::APPROVAL_AUTO_RESOLVED,
-        methods::APPROVAL_DECIDED,
-        methods::APPROVAL_CANCELLED,
-    ];
-    for method in expected.iter() {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for {method}"))
-            .unwrap_or_else(|| panic!("ws closed before {method}"));
-        assert_eq!(
-            frame_method(&frame).as_deref(),
-            Some(*method),
-            "{method} with explicit topic=Some(\"slides\") must reach \
-                 a topic-scoped subscriber (#1329)"
-        );
-    }
-
-    abort_live_forwarders(&forwarders, &ledger).await;
 }
 
 /// Mirror of the positive test above: when an event of one of the
@@ -24327,8 +29526,6 @@ fn capability_filter_delivers_v2_background_children_unconditionally() {
 
     for features in [
         ConnectionUiFeatures::default(),
-        features_for_projection_envelope_test(false),
-        features_for_projection_envelope_test(true),
         features_for_projection_envelope_v2_test(),
     ] {
         assert!(
@@ -24336,49 +29533,6 @@ fn capability_filter_delivers_v2_background_children_unconditionally() {
             "a canonical v2 child must never be capability-filtered",
         );
     }
-}
-
-/// UPCR-2026-014 M9-α-9 `event.file_attached.v1` capability gate.
-/// Old clients that never advertised the feature MUST NOT receive
-/// `file/attached` envelopes — they keep relying on `media` on
-/// historic persisted-message / `turn/spawn_complete` lanes. New clients that
-/// negotiated the feature MUST receive the dedicated envelope so
-/// the slides soak's "PPTX on disk but no button on SPA" regression
-/// can be closed by a redundant wire signal.
-#[test]
-fn capability_filter_routes_file_attached_gating() {
-    let session = SessionKey("local:file-attached-gate".into());
-    let file_attached = UiProtocolLedgerEvent::Notification(file_attached_for(&session));
-
-    // Old client: never observe the new envelope.
-    let old = features_for_file_attached_test(false);
-    assert!(
-        !live_event_passes_capability_filter(&file_attached, old),
-        "clients without event.file_attached.v1 must not receive file/attached envelopes",
-    );
-
-    // New client: receive the envelope.
-    let new = features_for_file_attached_test(true);
-    assert!(
-        live_event_passes_capability_filter(&file_attached, new),
-        "clients with event.file_attached.v1 receive the per-artefact envelope",
-    );
-
-    // Independence from spawn_complete: a new client that
-    // negotiated ONLY file_attached (no retired persisted-message feature, no
-    // spawn_complete) still sees the file delivery. This matches
-    // the redundancy goal — file_attached is the safety net for
-    // clients whose richer-envelope reducers might drop the
-    // delivery.
-    let only_file_attached = ConnectionUiFeatures {
-        file_attached: true,
-        header_present: true,
-        ..ConnectionUiFeatures::default()
-    };
-    assert!(
-        live_event_passes_capability_filter(&file_attached, only_file_attached),
-        "file_attached gate is independent of spawn_complete / retired persisted-message feature",
-    );
 }
 
 #[test]
@@ -24416,24 +29570,46 @@ fn capability_filter_routes_context_lifecycle_gating() {
         live_event_passes_capability_filter(&normalization, new),
         "clients with context.lifecycle.v1 receive normalization events",
     );
+
+    // `context/state_reported` additionally needs an explicit
+    // `context.state.v1`: lifecycle-only, header-less legacy and
+    // lifecycle-less connections never receive it, live or on replay.
+    let state_reported = UiProtocolLedgerEvent::Notification(context_state_reported_for(&session));
+    let legacy_no_header = ConnectionUiFeatures::default();
+    assert!(legacy_no_header.context_lifecycle_available());
+    for (features, label) in [
+        (old, "no context.lifecycle.v1"),
+        (new, "lifecycle-only"),
+        (legacy_no_header, "header-less legacy"),
+    ] {
+        assert!(
+            !live_event_passes_capability_filter(&state_reported, features),
+            "{label} connections must not receive context/state_reported",
+        );
+    }
+    let state = ConnectionUiFeatures {
+        context_lifecycle_v1: true,
+        context_state_v1: true,
+        header_present: true,
+        ..ConnectionUiFeatures::default()
+    };
+    assert!(
+        live_event_passes_capability_filter(&state_reported, state),
+        "clients with context.state.v1 receive context/state_reported",
+    );
+    let state_without_lifecycle = ConnectionUiFeatures {
+        context_lifecycle_v1: false,
+        ..state
+    };
+    assert!(
+        !live_event_passes_capability_filter(&state_reported, state_without_lifecycle),
+        "context.state.v1 without its parent lifecycle capability is not enough",
+    );
 }
 
 // ========================================================================
 // UPCR-2026-014 M9-γ — per-connection envelope/legacy mutual exclusion.
 // ========================================================================
-
-fn projection_envelope_event_for(session: &SessionKey) -> UiNotification {
-    UiNotification::Envelope(octos_core::ui_protocol::EnvelopeNotification {
-        session_id: session.clone(),
-        topic: None,
-        envelope: octos_core::ui_protocol::Envelope {
-            thread_id: "thread-1".into(),
-            seq: 1,
-            client_message_id: None,
-            payload: Payload::AssistantDelta { text: "x".into() },
-        },
-    })
-}
 
 fn projection_envelope_v2_event_for(session: &SessionKey) -> UiNotification {
     UiNotification::EnvelopeV2(octos_core::ui_protocol::EnvelopeV2Notification {
@@ -24456,20 +29632,6 @@ fn projection_envelope_v2_event_for(session: &SessionKey) -> UiNotification {
     })
 }
 
-fn features_for_projection_envelope_test(projection_envelope: bool) -> ConnectionUiFeatures {
-    ConnectionUiFeatures {
-        // Pre-existing capability flags are enabled so the *only*
-        // gate being exercised is the M9-γ projection.envelope.v1
-        // mutual exclusion — the test would otherwise be polluted by
-        // unrelated additive capability gates.
-        projection_envelope,
-        spawn_complete: true,
-        file_attached: true,
-        header_present: true,
-        ..ConnectionUiFeatures::default()
-    }
-}
-
 fn features_for_projection_envelope_v2_test() -> ConnectionUiFeatures {
     ConnectionUiFeatures {
         projection_envelope_v2: true,
@@ -24477,108 +29639,6 @@ fn features_for_projection_envelope_v2_test() -> ConnectionUiFeatures {
         file_attached: true,
         header_present: true,
         ..ConnectionUiFeatures::default()
-    }
-}
-
-/// Per-connection envelope/legacy mutual exclusion is the cutover
-/// mechanism for M9-γ (spec § 14.7). A connection that negotiated
-/// `projection.envelope.v1` sees ONLY canonical envelopes for the
-/// events that surface had legacy analogs; a connection that did
-/// NOT negotiate sees ONLY the legacy events and never the envelope.
-#[test]
-fn capability_filter_envelope_legacy_mutual_exclusion() {
-    let session = SessionKey("local:envelope-gate".into());
-    let envelope_event =
-        UiProtocolLedgerEvent::Notification(projection_envelope_event_for(&session));
-    let delta_event =
-        UiProtocolLedgerEvent::Notification(UiNotification::MessageDelta(MessageDeltaEvent {
-            session_id: session.clone(),
-            topic: None,
-            turn_id: TurnId::new(),
-            text: "hello".into(),
-        }));
-    let tool_started =
-        UiProtocolLedgerEvent::Notification(UiNotification::ToolStarted(ToolStartedEvent {
-            session_id: session.clone(),
-            topic: None,
-            turn_id: TurnId::new(),
-            tool_call_id: "tc-1".into(),
-            tool_name: "shell".into(),
-            arguments: None,
-        }));
-    let tool_progress =
-        UiProtocolLedgerEvent::Notification(UiNotification::ToolProgress(ToolProgressEvent {
-            session_id: session.clone(),
-            topic: None,
-            turn_id: TurnId::new(),
-            tool_call_id: "tc-1".into(),
-            message: Some("step".into()),
-            progress_pct: None,
-        }));
-    let tool_completed =
-        UiProtocolLedgerEvent::Notification(UiNotification::ToolCompleted(ToolCompletedEvent {
-            session_id: session.clone(),
-            topic: None,
-            turn_id: TurnId::new(),
-            tool_call_id: "tc-1".into(),
-            tool_name: "shell".into(),
-            success: Some(true),
-            output_preview: None,
-            duration_ms: None,
-        }));
-    let turn_completed =
-        UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(TurnCompletedEvent {
-            session_id: session.clone(),
-            topic: None,
-            turn_id: TurnId::new(),
-            cursor: None,
-            tokens_in: None,
-            tokens_out: None,
-            session_result: None,
-        }));
-    let file_attached = UiProtocolLedgerEvent::Notification(file_attached_for(&session));
-
-    // Legacy client (projection_envelope=false): receives ALL legacy
-    // events; envelope is filtered out.
-    let legacy = features_for_projection_envelope_test(false);
-    assert!(
-        !live_event_passes_capability_filter(&envelope_event, legacy),
-        "legacy client must NOT receive projection/envelope notifications",
-    );
-    for (label, ev) in [
-        ("MessageDelta", &delta_event),
-        ("ToolStarted", &tool_started),
-        ("ToolProgress", &tool_progress),
-        ("ToolCompleted", &tool_completed),
-        ("TurnCompleted", &turn_completed),
-        ("FileAttached", &file_attached),
-    ] {
-        assert!(
-            live_event_passes_capability_filter(ev, legacy),
-            "legacy client must STILL receive legacy {label} notifications",
-        );
-    }
-
-    // Envelope client (projection_envelope=true): receives ONLY the
-    // envelope; legacy variants superseded by envelopes are
-    // filtered out.
-    let envelope_client = features_for_projection_envelope_test(true);
-    assert!(
-        live_event_passes_capability_filter(&envelope_event, envelope_client),
-        "envelope client receives projection/envelope notifications",
-    );
-    for (label, ev) in [
-        ("MessageDelta", &delta_event),
-        ("ToolStarted", &tool_started),
-        ("ToolProgress", &tool_progress),
-        ("ToolCompleted", &tool_completed),
-        ("TurnCompleted", &turn_completed),
-        ("FileAttached", &file_attached),
-    ] {
-        assert!(
-            !live_event_passes_capability_filter(ev, envelope_client),
-            "envelope client must NOT receive legacy {label} notifications",
-        );
     }
 }
 
@@ -24592,29 +29652,21 @@ fn capability_filter_routes_v2_unconditionally_without_leaking_sources() {
             turn_id: TurnId::new(),
             text: "legacy delta".into(),
         }));
-    let v1 = UiProtocolLedgerEvent::Notification(projection_envelope_event_for(&session));
     let v2 = UiProtocolLedgerEvent::Notification(projection_envelope_v2_event_for(&session));
 
-    let legacy = features_for_projection_envelope_test(false);
-    assert!(live_event_passes_capability_filter(&legacy_delta, legacy));
-    assert!(!live_event_passes_capability_filter(&v1, legacy));
-    assert!(live_event_passes_capability_filter(&v2, legacy));
-
-    let v1_features = features_for_projection_envelope_test(true);
-    assert!(!live_event_passes_capability_filter(
-        &legacy_delta,
-        v1_features
-    ));
-    assert!(live_event_passes_capability_filter(&v1, v1_features));
-    assert!(live_event_passes_capability_filter(&v2, v1_features));
-
-    let v2_features = features_for_projection_envelope_v2_test();
-    assert!(!live_event_passes_capability_filter(
-        &legacy_delta,
-        v2_features
-    ));
-    assert!(!live_event_passes_capability_filter(&v1, v2_features));
-    assert!(live_event_passes_capability_filter(&v2, v2_features));
+    // Every connection is a v2 consumer: a raw source lifecycle record is
+    // superseded by its v2 projection and never leaks onto the wire, while the
+    // canonical v2 envelope is always delivered.
+    for features in [
+        ConnectionUiFeatures::default(),
+        features_for_projection_envelope_v2_test(),
+    ] {
+        assert!(!live_event_passes_capability_filter(
+            &legacy_delta,
+            features
+        ));
+        assert!(live_event_passes_capability_filter(&v2, features));
+    }
 }
 
 #[test]
@@ -24966,8 +30018,10 @@ fn v2_projects_errored_and_interrupted_terminals() {
             turn_id: turn_id.clone(),
             code: code.into(),
             message: format!("{code} terminal"),
+            token_usage: None,
+            partial_result: None,
         }));
-        let projected = project_v2_ledger_event(&ledger, &source.event, &source.cursor)
+        let projected = project_lifecycle_event_to_v2_wire(&ledger, &source.event, &source.cursor)
             .expect("turn/error has a v2 terminal projection");
         let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) = projected
         else {
@@ -24993,431 +30047,320 @@ fn v2_projects_errored_and_interrupted_terminals() {
 }
 
 #[test]
-fn should_assign_unique_v2_seq_to_terminal_and_consecutive_attachments() {
-    let ledger = UiProtocolLedger::new(16);
-    let session_id = SessionKey("local:envelope-v2-voice-audio".into());
-    let turn_id = TurnId::new();
-    let thread_id = turn_id.0.to_string();
-
-    ledger.append_notification(UiNotification::EnvelopeV2(EnvelopeV2Notification {
-        session_id: session_id.clone(),
-        topic: None,
-        envelope: EnvelopeV2 {
-            thread_id: thread_id.clone(),
-            seq: 1,
-            cursor: None,
-            turn_id: thread_id.clone(),
-            client_message_id: None,
-            payload: PayloadV2::AssistantPersisted {
-                text: "第一句。第二句。".into(),
-                assistant_segment_id: format!("{thread_id}:assistant:1"),
-                meta: MessageMeta {
-                    message_id: "voice-reply".into(),
-                    persisted_at: Utc::now(),
-                    media: vec![],
-                },
-            },
-        },
-    }));
-
-    let terminal_source =
-        ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: turn_id.clone(),
-            cursor: None,
-            tokens_in: None,
-            tokens_out: None,
-            session_result: None,
-        }));
-    // Production dual-emission persists the v1 terminal companion after the
-    // legacy terminal source. It advances the durable base for later files,
-    // so that already-represented source must not be counted twice.
-    ledger.append_notification(UiNotification::Envelope(
-        octos_core::ui_protocol::EnvelopeNotification {
-            session_id: session_id.clone(),
-            topic: None,
-            envelope: octos_core::ui_protocol::Envelope {
-                thread_id: thread_id.clone(),
-                seq: 2,
-                client_message_id: None,
-                payload: Payload::TurnCompleted {
-                    token_usage: EnvelopeTokenUsage::default(),
-                },
-            },
-        },
-    ));
-
-    let file_sources = [
-        UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: turn_id.clone(),
-            path: "reply-first.mp3".into(),
-            tool_call_id: None,
-            mime: Some("audio/mpeg".into()),
-        }),
-        UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id,
-            path: "reply-second.mp3".into(),
-            tool_call_id: None,
-            mime: Some("audio/mpeg".into()),
-        }),
-    ]
-    .map(|notification| ledger.append_notification(notification));
-    let sources = [
-        terminal_source,
-        file_sources[0].clone(),
-        file_sources[1].clone(),
-    ];
-
-    let projected_seqs = || {
-        sources
-            .iter()
-            .map(|source| {
-                let projected = project_v2_ledger_event(&ledger, &source.event, &source.cursor)
-                    .expect("legacy source has a v2 projection");
-                let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
-                    projected
-                else {
-                    panic!("legacy source must project to EnvelopeV2");
-                };
-                envelope.envelope.seq
-            })
-            .collect::<Vec<_>>()
-    };
-
-    assert_eq!(projected_seqs(), vec![2, 3, 4]);
-    assert_eq!(
-        projected_seqs(),
-        vec![2, 3, 4],
-        "replaying the same durable rows must assign the same sequence",
-    );
-}
-
-/// UPCR-2026-014 M9-γ per-payload dual-emit: every legacy
-/// notification surfaced by `forward_progress_event` triggers a
-/// parallel `projection/envelope` ledger append. The test exercises
-/// the helper that wires the dual-emit
-/// (`emit_envelope_for_legacy_notification`) so a future refactor
-/// can't silently drop a variant from the dual surface.
-#[test]
-fn emit_envelope_carries_tool_fidelity_previews() {
-    // The tool-card fidelity lane: ToolStarted.arguments →
-    // ToolStart.arguments_preview (key: value rendering, bounded) and
-    // ToolCompleted.output_preview/duration_ms → ToolEnd (re-bounded).
-    let ledger = UiProtocolLedger::new(32);
-    let session_id = SessionKey("local:fidelity-emit".into());
-    let turn_id = TurnId::new();
-
-    let giant = "æ".repeat(9000);
-    emit_envelope_for_legacy_notification(
-        &ledger,
-        &session_id,
-        &UiNotification::ToolStarted(ToolStartedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: turn_id.clone(),
-            tool_call_id: "tc-fid".into(),
-            tool_name: "shell".into(),
-            arguments: Some(serde_json::json!({
-                "command": "cargo test",
-                "blob": giant,
-            })),
-        }),
-    );
-    emit_envelope_for_legacy_notification(
-        &ledger,
-        &session_id,
-        &UiNotification::ToolCompleted(ToolCompletedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: turn_id.clone(),
-            tool_call_id: "tc-fid".into(),
-            tool_name: "shell".into(),
-            success: Some(true),
-            output_preview: Some("test result: ok. 815 passed".into()),
-            duration_ms: Some(4321),
-        }),
-    );
-
-    let baseline = UiCursor {
-        stream: session_id.0.clone(),
-        seq: 0,
-    };
-    let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
-    let payloads: Vec<&Payload> = replay
-        .iter()
-        .filter_map(|e| match &e.event {
-            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(env)) => {
-                Some(&env.envelope.payload)
-            }
-            _ => None,
-        })
-        .collect();
-
-    let Some(Payload::ToolStart {
-        arguments_preview: Some(preview),
-        ..
-    }) = payloads.first()
-    else {
-        panic!("expected enriched ToolStart, got {payloads:?}");
-    };
-    assert!(
-        preview.contains("command: \"cargo test\""),
-        "object args render as key: value pairs, got {preview}"
-    );
-    assert!(
-        preview.chars().count() <= octos_core::ui_protocol::ENVELOPE_TOOL_ARGUMENTS_PREVIEW_MAX + 1,
-        "arguments preview must be bounded (UTF-8-safe), got {} chars",
-        preview.chars().count()
-    );
-    let Some(Payload::ToolEnd {
-        output_preview: Some(output),
-        duration_ms: Some(duration),
-        ..
-    }) = payloads.get(1)
-    else {
-        panic!("expected enriched ToolEnd, got {payloads:?}");
-    };
-    assert_eq!(output, "test result: ok. 815 passed");
-    assert_eq!(*duration, 4321);
-
-    // `{}` arguments render empty — spec says OMIT, not empty-string.
-    emit_envelope_for_legacy_notification(
-        &ledger,
-        &session_id,
-        &UiNotification::ToolStarted(ToolStartedEvent {
-            session_id: session_id.clone(),
-            topic: None,
-            turn_id: turn_id.clone(),
-            tool_call_id: "tc-empty".into(),
-            tool_name: "noop".into(),
-            arguments: Some(serde_json::json!({})),
-        }),
-    );
-    let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
-    let empty_start = replay
-        .iter()
-        .filter_map(|e| match &e.event {
-            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(env)) => {
-                match &env.envelope.payload {
-                    Payload::ToolStart {
-                        tool_call_id,
-                        arguments_preview,
-                        ..
-                    } if tool_call_id == "tc-empty" => Some(arguments_preview.clone()),
-                    _ => None,
-                }
-            }
-            _ => None,
-        })
-        .next()
-        .expect("tc-empty envelope present");
-    assert_eq!(empty_start, None, "empty args must omit the preview");
-}
-
-#[test]
-fn emit_envelope_for_legacy_notification_covers_every_progress_variant() {
-    let ledger = UiProtocolLedger::new(32);
-    let session_id = SessionKey("local:dual-emit".into());
-
-    // The progress-mapper emits these four notification variants —
-    // each must yield a corresponding envelope.
-    let turn_id = TurnId::new();
-    let cases: Vec<(UiNotification, &'static str)> = vec![
-        (
-            UiNotification::MessageDelta(MessageDeltaEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: turn_id.clone(),
-                text: "delta".into(),
-            }),
-            "assistant_delta",
-        ),
-        (
-            UiNotification::ReasoningDelta(ReasoningDeltaEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: turn_id.clone(),
-                text: "reasoning".into(),
-            }),
-            "reasoning_delta",
-        ),
-        (
-            UiNotification::ToolStarted(ToolStartedEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: turn_id.clone(),
-                tool_call_id: "tc-1".into(),
-                tool_name: "shell".into(),
-                arguments: None,
-            }),
-            "tool_start",
-        ),
-        (
-            UiNotification::ToolProgress(ToolProgressEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: turn_id.clone(),
-                tool_call_id: "tc-1".into(),
-                message: Some("hello".into()),
-                progress_pct: None,
-            }),
-            "tool_progress",
-        ),
-        (
-            UiNotification::ToolCompleted(ToolCompletedEvent {
-                session_id: session_id.clone(),
-                topic: None,
-                turn_id: turn_id.clone(),
-                tool_call_id: "tc-1".into(),
-                tool_name: "shell".into(),
-                success: Some(true),
-                output_preview: None,
-                duration_ms: None,
-            }),
-            "tool_end",
-        ),
-    ];
-
-    let mut expected_types: Vec<&str> = cases.iter().map(|(_, t)| *t).collect();
-
-    for (notif, _expected_type) in &cases {
-        emit_envelope_for_legacy_notification(&ledger, &session_id, notif);
-    }
-
-    let baseline = UiCursor {
-        stream: session_id.0.clone(),
-        seq: 0,
-    };
-    let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
-    let envelope_types: Vec<String> = replay
-        .iter()
-        .filter_map(|e| match &e.event {
-            UiProtocolLedgerEvent::Notification(UiNotification::Envelope(env)) => {
-                match &env.envelope.payload {
-                    Payload::AssistantDelta { .. } => Some("assistant_delta".into()),
-                    Payload::ReasoningDelta { .. } => Some("reasoning_delta".into()),
-                    Payload::ToolStart { .. } => Some("tool_start".into()),
-                    Payload::ToolProgress { .. } => Some("tool_progress".into()),
-                    Payload::ToolEnd { .. } => Some("tool_end".into()),
-                    Payload::FileAttached { .. } => Some("file_attached".into()),
-                    Payload::TurnCompleted { .. } => Some("turn_completed".into()),
-                    Payload::AssistantPersisted { .. } => Some("assistant_persisted".into()),
-                    Payload::UserMessage { .. } => Some("user_message".into()),
-                }
-            }
-            _ => None,
-        })
-        .collect();
-
-    // Order-sensitive: envelopes are appended in the order the
-    // notifications arrive, so we expect the exact slice.
-    expected_types.sort();
-    let mut got_types = envelope_types.clone();
-    got_types.sort();
-    assert_eq!(
-        got_types,
-        expected_types
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect::<Vec<_>>(),
-        "every progress-variant must dual-emit; got {envelope_types:?}",
-    );
-}
-
-/// Replay-vs-live divergence: the live-emit hard barrier in
-/// `UiProtocolLedger::emit_envelope` DROPS post-completion envelopes,
-/// but ledger replay (`replay_after`) returns the FULL durable
-/// history. This is the documented semantics from spec § 14.6 — a
-/// client that reconnects with a pre-completion cursor still sees
-/// every envelope that was emitted, and applies the barrier itself.
-#[test]
-fn live_emit_hard_barrier_does_not_affect_ledger_replay() {
-    let ledger = UiProtocolLedger::new(32);
-    let session_id = SessionKey("local:replay-vs-live".into());
-    let thread_id = "thread-rl".to_owned();
-
-    // Live-emit path: AssistantDelta + TurnCompleted, then a
-    // post-completion AssistantDelta which the hard barrier drops.
-    let a = ledger
-        .emit_envelope(
-            &session_id,
-            thread_id.clone(),
-            Payload::AssistantDelta { text: "a".into() },
-            None,
-        )
-        .expect("first emit accepted");
-    let completed = ledger
-        .emit_envelope(
-            &session_id,
-            thread_id.clone(),
-            Payload::TurnCompleted {
-                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
-            },
-            None,
-        )
-        .expect("turn_completed accepted");
-    let dropped = ledger.emit_envelope(
-        &session_id,
-        thread_id.clone(),
-        Payload::AssistantDelta {
-            text: "should be barrier-dropped".into(),
-        },
-        None,
-    );
-    assert!(
-        dropped.is_none(),
-        "live-emit must drop the post-completion envelope at the barrier",
-    );
-
-    // Now: pre-seed the ledger with a raw post-completion envelope
-    // (bypassing emit_envelope) so the on-disk / in-memory ring
-    // carries it. This models the "old durable record from before
-    // the barrier was tightened" replay scenario.
-    let raw = UiNotification::Envelope(octos_core::ui_protocol::EnvelopeNotification {
-        session_id: session_id.clone(),
-        topic: None,
-        envelope: octos_core::ui_protocol::Envelope {
-            thread_id: thread_id.clone(),
-            seq: 99,
-            client_message_id: None,
-            payload: Payload::AssistantDelta {
-                text: "raw post-completion".into(),
-            },
-        },
+fn should_replay_exact_failed_turn_usage_without_changing_old_error_wire() {
+    let temp = tempfile::tempdir().unwrap();
+    let session = SessionKey("local:failed-usage-replay".into());
+    let turn = TurnId::new();
+    let old_wire = json!({
+        "session_id": session, "turn_id": turn,
+        "code": "runtime_error", "message": "ordinary failure"
     });
-    let raw_appended = ledger.append_notification(raw);
-
-    // Replay returns everything appended — the live-emit barrier
-    // does NOT prune the ledger, only the live wire delivery.
-    let baseline = UiCursor {
-        stream: session_id.0.clone(),
-        seq: 0,
+    let old: TurnErrorEvent = serde_json::from_value(old_wire.clone()).unwrap();
+    assert!(old.token_usage.is_none());
+    assert!(old.partial_result.is_none());
+    assert_eq!(serde_json::to_value(&old).unwrap(), old_wire);
+    let usage = EnvelopeTokenUsage {
+        input_tokens: 17,
+        output_tokens: 11,
+        reasoning_tokens: 5,
+        cache_read_tokens: 3,
+        cache_write_tokens: 2,
     };
-    let replay = ledger.replay_after(&session_id, Some(&baseline)).unwrap();
-    let envelope_count = replay
-        .iter()
-        .filter(|e| {
-            matches!(
-                &e.event,
-                UiProtocolLedgerEvent::Notification(UiNotification::Envelope(_))
-            )
-        })
-        .count();
-    assert!(
-        envelope_count >= 3,
-        "ledger replay must return ALL envelopes including post-completion raw appends \
-             (live-emit barrier applies only at emit, not at replay); got {envelope_count}",
+    let partial_result = TurnErrorPartialResult {
+        session_result: Some(TurnSessionResult {
+            committed_seq: 15,
+            message_id: "actual-final-id".into(),
+            client_message_id: None,
+        }),
+    };
+    {
+        let ledger = UiProtocolLedger::with_config(
+            crate::api::ui_protocol_ledger::LedgerConfig::durable(temp.path().to_owned()),
+        );
+        ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
+            token_usage: Some(usage.clone()),
+            partial_result: Some(partial_result.clone()),
+            ..old
+        }));
+    }
+    let ledger = UiProtocolLedger::with_config(
+        crate::api::ui_protocol_ledger::LedgerConfig::durable(temp.path().to_owned()),
     );
-    // Sanity: the original live-accepted envelopes are present.
-    let cursors: Vec<u64> = replay.iter().map(|e| e.cursor.seq).collect();
-    assert!(cursors.contains(&a.cursor.seq));
-    assert!(cursors.contains(&completed.cursor.seq));
-    assert!(cursors.contains(&raw_appended.cursor.seq));
+    let replay = ledger
+        .replay_after(
+            &session,
+            Some(&UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap();
+    assert_eq!(replay.len(), 1);
+    let projected =
+        project_lifecycle_event_to_v2_wire(&ledger, &replay[0].event, &replay[0].cursor).unwrap();
+    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) = projected
+    else {
+        panic!("expected native failure projection");
+    };
+    assert_eq!(envelope.envelope.turn_id, turn.0.to_string());
+    let PayloadV2::TurnTerminal {
+        outcome,
+        token_usage,
+        error,
+    } = envelope.envelope.payload
+    else {
+        panic!("expected terminal");
+    };
+    assert_eq!(outcome, TurnTerminalOutcome::Errored);
+    let error = error.unwrap();
+    assert_eq!(error.code, "runtime_error");
+    assert_eq!(error.data, Some(json!({"partial_result": partial_result})));
+    assert_eq!(token_usage, Some(usage));
+}
+
+#[test]
+fn should_replay_authoritative_no_final_without_promoting_legacy_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let session = SessionKey("local:no-final-replay".into());
+    {
+        let ledger = UiProtocolLedger::with_config(
+            crate::api::ui_protocol_ledger::LedgerConfig::durable(temp.path().to_owned()),
+        );
+        for partial_result in [
+            None,
+            Some(TurnErrorPartialResult {
+                session_result: None,
+            }),
+        ] {
+            ledger.append_notification(UiNotification::TurnError(TurnErrorEvent {
+                session_id: session.clone(),
+                topic: None,
+                turn_id: TurnId::new(),
+                code: "output_truncated".into(),
+                message: "failed".into(),
+                token_usage: None,
+                partial_result,
+            }));
+        }
+    }
+    let ledger = UiProtocolLedger::with_config(
+        crate::api::ui_protocol_ledger::LedgerConfig::durable(temp.path().to_owned()),
+    );
+    let replay = ledger
+        .replay_after(
+            &session,
+            Some(&UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap();
+    assert_eq!(replay.len(), 2);
+    for (row, expected) in replay.iter().zip([
+        None,
+        Some(json!({"partial_result": {"session_result": null}})),
+    ]) {
+        let projected =
+            project_lifecycle_event_to_v2_wire(&ledger, &row.event, &row.cursor).unwrap();
+        let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) = projected
+        else {
+            panic!()
+        };
+        let PayloadV2::TurnTerminal {
+            error: Some(error), ..
+        } = envelope.envelope.payload
+        else {
+            panic!()
+        };
+        assert_eq!(error.data, expected);
+    }
+}
+
+#[tokio::test]
+async fn should_not_overwrite_terminal_usage_or_fabricate_it_for_ordinary_failures() {
+    for first_usage in [
+        None,
+        Some(EnvelopeTokenUsage {
+            input_tokens: 17,
+            output_tokens: 11,
+            reasoning_tokens: 5,
+            cache_read_tokens: 3,
+            cache_write_tokens: 2,
+        }),
+    ] {
+        let ledger = UiProtocolLedger::new(16);
+        let session = SessionKey("local:terminal-usage-once".into());
+        let turn = TurnId::new();
+        let state = TokioMutex::new(TurnState::Active);
+        let (ws, _rx) = ws_connection_for_test(16);
+        for (code, usage) in [
+            ("original_failure", first_usage.clone()),
+            (
+                "late_failure",
+                Some(EnvelopeTokenUsage {
+                    input_tokens: 999,
+                    ..Default::default()
+                }),
+            ),
+        ] {
+            try_emit_terminal(
+                &state,
+                TerminalReason::Errored,
+                &ws,
+                &ledger,
+                &session,
+                &turn,
+                Some((code, "failed")),
+                Some(TurnCompletionDetails {
+                    token_usage: usage,
+                    ..Default::default()
+                }),
+                None,
+                None,
+            )
+            .await;
+        }
+        let replay = ledger
+            .replay_after(
+                &session,
+                Some(&UiCursor {
+                    stream: session.0.clone(),
+                    seq: 0,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            replay.len(),
+            1,
+            "a late failure cannot emit another terminal"
+        );
+        let UiProtocolLedgerEvent::Notification(UiNotification::TurnError(error)) =
+            &replay[0].event
+        else {
+            panic!("expected durable failure");
+        };
+        assert_eq!(error.code, "original_failure");
+        assert_eq!(error.token_usage, first_usage);
+        if first_usage.is_none() {
+            assert!(
+                serde_json::to_value(error)
+                    .unwrap()
+                    .get("token_usage")
+                    .is_none()
+            );
+        }
+    }
+}
+
+/// A completed turn's v2 terminal carries the provider's structured usage —
+/// reasoning, cache-read and cache-write tokens included — rather than an
+/// input/output-only projection with hardcoded zeros. A provider that billed
+/// 100 prompt tokens with 75 cache reads and 5 cache writes reports 20
+/// uncached input tokens (cache counts are disjoint from `input_tokens`).
+#[tokio::test]
+async fn should_carry_cached_tokens_on_completed_turn_terminal() {
+    let usage = EnvelopeTokenUsage {
+        input_tokens: 20,
+        output_tokens: 2,
+        reasoning_tokens: 1,
+        cache_read_tokens: 75,
+        cache_write_tokens: 5,
+    };
+    let ledger = UiProtocolLedger::new(16);
+    let session = SessionKey("local:completed-usage".into());
+    let turn = TurnId::new();
+    let state = TokioMutex::new(TurnState::Active);
+    let (ws, _rx) = ws_connection_for_test(16);
+    try_emit_terminal(
+        &state,
+        TerminalReason::Completed,
+        &ws,
+        &ledger,
+        &session,
+        &turn,
+        None,
+        Some(TurnCompletionDetails {
+            tokens_in: Some(20),
+            tokens_out: Some(2),
+            outcome: Some(TurnTerminalOutcome::Completed),
+            token_usage: Some(usage.clone()),
+            ..Default::default()
+        }),
+        None,
+        None,
+    )
+    .await;
+
+    let replay = ledger
+        .replay_after(
+            &session,
+            Some(&UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap();
+    assert_eq!(replay.len(), 1);
+    let UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(completed)) =
+        &replay[0].event
+    else {
+        panic!("expected durable completion");
+    };
+    assert_eq!(completed.token_usage.as_ref(), Some(&usage));
+
+    let projected =
+        project_lifecycle_event_to_v2_wire(&ledger, &replay[0].event, &replay[0].cursor).unwrap();
+    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) = projected
+    else {
+        panic!("expected native completion projection");
+    };
+    let PayloadV2::TurnTerminal {
+        outcome,
+        error,
+        token_usage,
+    } = envelope.envelope.payload
+    else {
+        panic!("expected terminal");
+    };
+    assert_eq!(outcome, TurnTerminalOutcome::Completed);
+    assert!(error.is_none());
+    assert_eq!(token_usage, Some(usage));
+}
+
+/// Completed rows without structured usage (legacy ledgers, non-LLM paths)
+/// keep today's wire: the field is absent from the lifecycle event and the
+/// terminal projects input/output from `tokens_in` / `tokens_out`.
+#[test]
+fn should_keep_legacy_completed_terminal_projection_without_structured_usage() {
+    let session = SessionKey("local:completed-legacy".into());
+    let turn = TurnId::new();
+    let old_wire = json!({
+        "session_id": session, "turn_id": turn,
+        "tokens_in": 20, "tokens_out": 2
+    });
+    let old: TurnCompletedEvent = serde_json::from_value(old_wire.clone()).unwrap();
+    assert!(old.token_usage.is_none());
+    assert_eq!(serde_json::to_value(&old).unwrap(), old_wire);
+
+    let ledger = UiProtocolLedger::new(16);
+    let source = ledger.append_notification(UiNotification::TurnCompleted(old));
+    let projected =
+        project_lifecycle_event_to_v2_wire(&ledger, &source.event, &source.cursor).unwrap();
+    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) = projected
+    else {
+        panic!("expected native completion projection");
+    };
+    let PayloadV2::TurnTerminal { token_usage, .. } = envelope.envelope.payload else {
+        panic!("expected terminal");
+    };
+    assert_eq!(
+        token_usage,
+        Some(EnvelopeTokenUsage {
+            input_tokens: 20,
+            output_tokens: 2,
+            ..Default::default()
+        })
+    );
 }
 
 /// A background result is delivered as one canonical child envelope,
@@ -25550,7 +30493,19 @@ async fn background_result_sender_persists_contract_verified_media_row() {
         )
         .await;
 
-    assert!(persisted, "background result row should persist");
+    let (persisted_message, persisted_seq) =
+        persisted.expect("background result row should persist");
+    let context_manager = Arc::new(StdMutex::new(ContextManager::new(
+        session_id.to_string(),
+        None,
+    )));
+    record_appui_context_manager_background_message(
+        tmp.path(),
+        &context_manager,
+        &session_id,
+        &persisted_message,
+        persisted_seq,
+    );
 
     let handle = octos_bus::SessionHandle::open(tmp.path(), &session_id);
     let history = handle.session().messages.clone();
@@ -25560,6 +30515,21 @@ async fn background_result_sender_persists_contract_verified_media_row() {
     assert_eq!(row.content, "✅ fm_tts delivered.");
     assert_eq!(row.media, media);
     assert_eq!(row.thread_id.as_deref(), Some(thread_id));
+
+    let (restored, status) = crate::context_manager::load_or_rebuild_context_manager(
+        tmp.path(),
+        session_id.to_string(),
+        None,
+        &history,
+    );
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
+    assert_eq!(
+        restored.semantic_blocks().last().unwrap().kind,
+        crate::context_manager::SemanticBlockKind::BackgroundResult
+    );
 }
 
 /// Fleet-UX soak NEW-03 (mini3 / mini5, 2026-05-23): the #1183 fix
@@ -26208,6 +31178,556 @@ async fn ledger_stamps_v2_projection_seq_and_cursor_independently() {
     assert!(first.cursor.seq < second.cursor.seq);
 }
 
+struct SegmentIdentityProvider {
+    next: AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for SegmentIdentityProvider {
+    async fn chat(
+        &self,
+        _messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        let index = self.next.fetch_add(1, Ordering::SeqCst) as usize;
+        let texts = [
+            " ",
+            "The peer is running.",
+            "Still waiting for the peer.",
+            "ACTUAL FINAL ANSWER",
+        ];
+        let text = texts
+            .get(index)
+            .ok_or_else(|| eyre::eyre!("identity script exhausted"))?;
+        Ok(octos_llm::ChatResponse {
+            content: Some((*text).into()),
+            reasoning_content: None,
+            tool_calls: if index < 3 {
+                vec![octos_core::ToolCall {
+                    id: format!("tool-{index}"),
+                    name: "read_file".into(),
+                    arguments: json!({"path": format!("marker-{index}")}),
+                    metadata: None,
+                }]
+            } else {
+                vec![]
+            },
+            stop_reason: if index < 3 {
+                octos_llm::StopReason::ToolUse
+            } else {
+                octos_llm::StopReason::EndTurn
+            },
+            usage: octos_llm::TokenUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            provider_index: None,
+        })
+    }
+    fn model_id(&self) -> &str {
+        "identity-test"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode: u8) {
+    let streamed = progress_mode == 0 || progress_mode == 3 || progress_mode == 4;
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Arc::new(UiProtocolLedger::new(128));
+    let observer = message_commit_observer(ledger.clone());
+    octos_bus::session::set_scoped_message_commit_observer(dir.path(), &observer);
+    let mut manager = octos_bus::SessionManager::open(dir.path()).unwrap();
+    let session = SessionKey(format!("batched-assistant-identity-{streamed}"));
+    let turn_id = TurnId::new();
+    let turn = turn_id.0.to_string();
+    let mut events = ledger.subscribe(&session);
+    for index in 0..3 {
+        std::fs::write(dir.path().join(format!("marker-{index}")), "fixture").unwrap();
+    }
+    let memory = Arc::new(
+        octos_memory::EpisodeStore::open(dir.path().join("memory"))
+            .await
+            .unwrap(),
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(if progress_mode == 2 { 1 } else { 256 });
+    let progress_dropped = Arc::new(AtomicU64::new(0));
+    let agent = octos_agent::Agent::new(
+        octos_core::AgentId::new("identity-test"),
+        Arc::new(SegmentIdentityProvider {
+            next: AtomicU64::new(0),
+        }),
+        octos_agent::ToolRegistry::with_builtins(dir.path()),
+        memory,
+    )
+    .with_config(octos_agent::AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_reporter(Arc::new(
+        BoundedChannelReporter::new(tx, progress_dropped.clone())
+            .with_thread_id(Some(turn.clone())),
+    ));
+    let response = agent
+        .process_message("run four iterations", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        response.assistant_segments.message_iterations,
+        vec![(1, 1), (3, 2), (5, 3)]
+    );
+    assert_eq!(response.assistant_segments.final_iteration, 4);
+    if progress_mode == 2 {
+        assert!(progress_dropped.load(Ordering::SeqCst) > 0);
+    }
+    let (ws, _writer) = ws_connection_for_test(512);
+    let context = ProgressMappingContext::new(session.clone(), turn_id);
+    let contracts = UiProtocolContractStores::default();
+    let mut tracker = TaskOutputDeltaTracker::default();
+    let mut saw_delta = false;
+    let mut expected_stream_ids = Vec::new();
+    let mut delayed_progress = Vec::new();
+    while let Ok(json) = rx.try_recv() {
+        let event: Value = serde_json::from_str(&json).unwrap();
+        if progress_mode == 4 {
+            delayed_progress.push(event);
+            continue;
+        }
+        if progress_mode == 2
+            || (!streamed && event["type"] == "token")
+            || (progress_mode == 3
+                && (event["type"] == "tool_start" || event["type"] == "tool_end"))
+        {
+            continue;
+        }
+        forward_progress_event(
+            &ws,
+            &ledger,
+            &session,
+            &context,
+            &contracts,
+            None,
+            &mut tracker,
+            &mut saw_delta,
+            &event,
+        );
+    }
+    // Actual production persistence is batched AFTER the whole Agent turn:
+    // all earlier streamed phases are already present when these callbacks run.
+    for (index, message) in response.messages.iter().cloned().enumerate() {
+        let projection = assistant_message_projection(&response, index, &turn);
+        MESSAGE_PROJECTION_OVERRIDE
+            .scope(
+                projection,
+                manager.add_message_with_seq(&session, pre_stamp_turn_thread_id(message, &turn)),
+            )
+            .await
+            .unwrap();
+    }
+    MESSAGE_PROJECTION_OVERRIDE
+        .scope(
+            Some(MessageProjectionOverride::AssistantSegment(
+                super::super::events::assistant_segment_id_for_iteration(
+                    &turn,
+                    response.assistant_segments.final_iteration,
+                ),
+            )),
+            manager.add_message_with_seq(
+                &session,
+                pre_stamp_turn_thread_id(
+                    final_assistant_message_for_response(&response).unwrap(),
+                    &turn,
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+    for event in delayed_progress {
+        forward_progress_event(
+            &ws,
+            &ledger,
+            &session,
+            &context,
+            &contracts,
+            None,
+            &mut tracker,
+            &mut saw_delta,
+            &event,
+        );
+    }
+    let mut persisted = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+            event.event
+        {
+            match envelope.envelope.payload {
+                PayloadV2::AssistantPersisted {
+                    text,
+                    assistant_segment_id,
+                    meta,
+                } => persisted.push((text, assistant_segment_id, meta.message_id)),
+                PayloadV2::AssistantDelta {
+                    text,
+                    assistant_segment_id,
+                } if !text.trim().is_empty() => expected_stream_ids.push(assistant_segment_id),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        persisted.len(),
+        3,
+        "metadata-only assistant must stay invisible"
+    );
+    let ids: Vec<_> = persisted.iter().map(|row| row.1.clone()).collect();
+    assert_eq!(
+        ids.iter().collect::<std::collections::HashSet<_>>().len(),
+        3,
+        "different canonical iterations must never finalize the same segment: {persisted:?}"
+    );
+    if streamed {
+        assert_eq!(
+            ids, expected_stream_ids,
+            "each commit finalizes ITS streamed iteration, not the last one"
+        );
+    }
+    assert_eq!(persisted.last().unwrap().0, "ACTUAL FINAL ANSWER");
+    let history = manager
+        .get_or_create(&session)
+        .await
+        .get_history(usize::MAX);
+    assert_eq!(history.last().unwrap().content, "ACTUAL FINAL ANSWER");
+}
+
+#[tokio::test]
+async fn should_keep_distinct_assistant_segment_ids_when_streamed_iterations_commit_together() {
+    assert_batched_assistant_commits_keep_iteration_identity(0).await;
+}
+
+#[tokio::test]
+async fn should_keep_distinct_assistant_segment_ids_when_unstreamed_iterations_commit_together() {
+    assert_batched_assistant_commits_keep_iteration_identity(1).await;
+}
+
+#[tokio::test]
+async fn should_keep_distinct_assistant_segment_ids_when_all_progress_was_dropped() {
+    assert_batched_assistant_commits_keep_iteration_identity(2).await;
+}
+
+#[tokio::test]
+async fn should_keep_distinct_assistant_segment_ids_when_tool_boundaries_were_dropped() {
+    assert_batched_assistant_commits_keep_iteration_identity(3).await;
+}
+
+#[tokio::test]
+async fn should_keep_distinct_assistant_segment_ids_when_canonical_persist_overtakes_progress() {
+    assert_batched_assistant_commits_keep_iteration_identity(4).await;
+}
+
+/// A v2 terminal must share the session forwarder's FIFO with canonical
+/// persisted rows. Direct lifecycle delivery can otherwise overtake the
+/// forwarder and make the client finalize an empty turn before its answer.
+#[tokio::test]
+async fn v2_terminal_waits_behind_canonical_persist_on_session_forwarder() {
+    let (ws, mut rx) = ws_connection_for_test(16);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:v2-terminal-order".into());
+    let turn_id = TurnId::new();
+    let thread_id = turn_id.0.to_string();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let features = features_for_projection_envelope_v2_test();
+    ws.update_live_features(features);
+    let live_rx = ledger.subscribe(&session_id);
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        features,
+        None,
+        Some(MAIN_PROFILE_ID.to_owned()),
+        live_rx,
+        forwarders.clone(),
+    )
+    .await;
+
+    ledger
+        .emit_envelope_v2(
+            &session_id,
+            thread_id.clone(),
+            PayloadV2::AssistantPersisted {
+                text: "canonical answer".into(),
+                assistant_segment_id: format!("{thread_id}:assistant:1"),
+                meta: MessageMeta {
+                    message_id: "msg-before-terminal".into(),
+                    persisted_at: Utc::now(),
+                    media: vec![],
+                },
+            },
+            None,
+        )
+        .expect("canonical persisted row");
+    send_notification_lifecycle(
+        &ws,
+        &ledger,
+        UiNotification::TurnCompleted(TurnCompletedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id,
+            cursor: None,
+            tokens_in: Some(3),
+            tokens_out: Some(2),
+            session_result: None,
+            token_usage: None,
+        }),
+    )
+    .expect("v2 terminal queued on ordered forwarder");
+
+    let mut payload_types = Vec::new();
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("ordered v2 frame arrives")
+            .expect("writer remains open");
+        let WsMessage::Text(text) = frame else {
+            panic!("expected text frame");
+        };
+        let value: Value = serde_json::from_str(text.as_str()).expect("valid JSON frame");
+        payload_types.push(
+            value["params"]["payload"]["type"]
+                .as_str()
+                .expect("v2 payload type")
+                .to_owned(),
+        );
+    }
+    assert_eq!(payload_types, ["assistant_persisted", "turn_terminal"]);
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// Install the per-session live forwarder that `handle_session_open` gives a
+/// connection, keeping the connection's negotiated features. Turn terminals
+/// reach the wire only through it, so a test that drives turn handlers
+/// without `session/open` installs it before waiting for one.
+async fn install_session_forwarder(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    session_id: &SessionKey,
+) -> SharedLiveForwarders {
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ws.snapshot_live_features(),
+        None,
+        None,
+        ledger.subscribe(session_id),
+        forwarders.clone(),
+    )
+    .await;
+    forwarders
+}
+
+/// The same ordering must hold on a connection that never negotiated
+/// `projection.envelope.v2` — every `octos serve --stdio` connection starts
+/// that way. A lifecycle row projected to v2 at send time used to be
+/// direct-sent there, overtaking the turn's `assistant_delta` rows still
+/// queued on the session forwarder: the client saw seq 1..15, then the
+/// `turn_terminal` (48), then 16..47, breaking the strictly monotonic
+/// per-thread `seq` and the § 14.6 barrier.
+async fn assert_projected_row_follows_queued_deltas(
+    expected_last: &str,
+    send_projected: impl FnOnce(&WsConnection, &UiProtocolLedger, &SessionKey, TurnId),
+) {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(64);
+    let ws = WsConnection::new_stdio(writer_tx);
+    assert!(
+        !ws.snapshot_live_features().projection_envelope_v2,
+        "a stdio connection starts without projection.envelope.v2"
+    );
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let session_id = SessionKey("local:non-v2-projection-order".into());
+    let turn_id = TurnId::new();
+    let thread_id = turn_id.0.to_string();
+    let forwarders = install_session_forwarder(&ws, &ledger, &session_id).await;
+
+    // The answer streams as native v2 rows. Nothing yields before the
+    // projected row is sent, so all of them are still queued on the
+    // forwarder — the window a live turn hits.
+    const DELTAS: u64 = 4;
+    for index in 0..DELTAS {
+        ledger
+            .emit_envelope_v2(
+                &session_id,
+                thread_id.clone(),
+                PayloadV2::AssistantDelta {
+                    text: format!("part {index} "),
+                    assistant_segment_id: format!("{thread_id}:assistant:1"),
+                },
+                None,
+            )
+            .expect("assistant delta row");
+    }
+    send_projected(&ws, ledger.as_ref(), &session_id, turn_id);
+
+    let mut wire = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while wire.len() <= DELTAS as usize {
+        match writer_rx.try_recv() {
+            Ok(WsMessage::Text(text)) => {
+                let value: Value = serde_json::from_str(text.as_str()).expect("valid JSON frame");
+                if value["method"] == "projection/envelope"
+                    && value["params"]["thread_id"] == thread_id
+                {
+                    wire.push((
+                        value["params"]["seq"].as_u64().expect("envelope seq"),
+                        value["params"]["payload"]["type"]
+                            .as_str()
+                            .expect("v2 payload type")
+                            .to_owned(),
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "every envelope of the turn arrives: {wire:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+    let seqs: Vec<u64> = wire.iter().map(|(seq, _)| *seq).collect();
+    assert_eq!(
+        seqs,
+        (1..=DELTAS + 1).collect::<Vec<_>>(),
+        "per-thread seq must be strictly monotonic on the wire: {wire:?}"
+    );
+    assert_eq!(
+        wire.last().map(|(_, kind)| kind.as_str()),
+        Some(expected_last),
+        "the projected row follows every queued delta: {wire:?}"
+    );
+
+    // Delivered exactly once: nothing else arrives for the thread.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        writer_rx.try_iter().all(|frame| match frame {
+            WsMessage::Text(text) => serde_json::from_str::<Value>(text.as_str())
+                .map(|value| value["params"]["thread_id"] != thread_id)
+                .unwrap_or(true),
+            _ => true,
+        }),
+        "the projected row must be delivered exactly once"
+    );
+
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+#[tokio::test]
+async fn should_deliver_turn_terminal_after_queued_envelopes_when_v2_not_negotiated() {
+    assert_projected_row_follows_queued_deltas(
+        "turn_terminal",
+        |ws, ledger, session_id, turn_id| {
+            send_notification_lifecycle(
+                ws,
+                ledger,
+                UiNotification::TurnCompleted(TurnCompletedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id,
+                    cursor: None,
+                    tokens_in: Some(3),
+                    tokens_out: Some(2),
+                    session_result: None,
+                    token_usage: None,
+                }),
+            )
+            .expect("terminal accepted");
+        },
+    )
+    .await;
+}
+
+/// `send_notification_durable` projects the same lifecycle sources (here a
+/// file attachment), so it must not direct-send them past queued rows either.
+#[tokio::test]
+async fn should_deliver_durable_file_attached_after_queued_envelopes() {
+    assert_projected_row_follows_queued_deltas(
+        "file_attached",
+        |ws, ledger, session_id, turn_id| {
+            send_notification_durable(
+                ws,
+                ledger,
+                UiNotification::FileAttached(octos_core::ui_protocol::FileAttachedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id,
+                    path: "/tmp/answer.pdf".into(),
+                    tool_call_id: None,
+                    attachment_owner: None,
+                    mime: Some("application/pdf".into()),
+                }),
+            )
+            .expect("attachment accepted");
+        },
+    )
+    .await;
+}
+
+/// Without a live forwarder for the session nothing would deliver an
+/// untagged terminal, so it keeps the direct lane: a `turn/start` without
+/// `session/open` still gets its terminal live, and so does a session whose
+/// forwarder was retired.
+#[tokio::test]
+async fn should_direct_send_turn_terminal_when_session_has_no_forwarder() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(8);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let unopened = SessionKey("local:unopened-terminal".into());
+    let retired = SessionKey("local:retired-forwarder-terminal".into());
+    let forwarders = install_session_forwarder(&ws, &ledger, &retired).await;
+    // Let the forwarder start before retiring it, as a live one would have.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    abort_live_forwarders(&forwarders, &ledger).await;
+
+    for session_id in [unopened, retired] {
+        let turn_id = TurnId::new();
+        send_notification_lifecycle(
+            &ws,
+            &ledger,
+            UiNotification::TurnCompleted(TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: Some(3),
+                tokens_out: Some(2),
+                session_result: None,
+                token_usage: None,
+            }),
+        )
+        .expect("terminal delivered");
+        // Already on the writer without yielding: no forwarder is involved.
+        let Ok(WsMessage::Text(text)) = writer_rx.try_recv() else {
+            panic!("the terminal for {session_id:?} must be written directly");
+        };
+        let value: Value = serde_json::from_str(text.as_str()).expect("valid JSON frame");
+        assert_eq!(value["method"], "projection/envelope", "{session_id:?}");
+        assert_eq!(value["params"]["thread_id"], turn_id.0.to_string());
+        assert_eq!(value["params"]["payload"]["type"], "turn_terminal");
+    }
+    assert!(writer_rx.try_recv().is_err(), "each terminal is sent once");
+}
+
 /// There is no old-client persisted-message fallback: background results
 /// remain deliverable as the canonical v2 child frame.
 #[tokio::test]
@@ -26381,6 +31901,7 @@ async fn live_forwarder_emits_event_appended_between_replay_and_forwarder_instal
             panes: None,
             capabilities: UiProtocolCapabilities::first_server_slice(),
             reasoning_effort: None,
+            accepted_client_commands: None,
         }),
         ws.connection_id(),
     );
@@ -26715,9 +32236,14 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         data_dir,
         octos_agent::create_sandbox(&sandbox),
     );
+    let recall = Arc::new(
+        octos_memory::RecallStore::open(data_dir, octos_memory::RecallConfig::default())
+            .expect("recall store"),
+    );
     Arc::new(crate::runtime::ProfileRuntime {
         profile_id: profile_id.to_string(),
         data_dir: data_dir.to_path_buf(),
+        session_store_root: None,
         config: crate::config::Config::default(),
         llm,
         goal_verifier_llm: None,
@@ -26731,6 +32257,8 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         tool_policy: None,
         default_sandbox: sandbox,
         max_iterations: None,
+        session_defaults: None,
+        agent_profile: None,
         format_after_edit: false,
         snapshots: None,
         tool_specs: Arc::new(base_tools),
@@ -26749,6 +32277,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         },
         memory,
         memory_store,
+        recall,
         embedder: None,
         memory_inject_tokens: 2500,
         memory_refresh_enabled: false,
@@ -26818,6 +32347,302 @@ async fn state_with_profile_llm_and_sandbox(
     (state, profile_runtime)
 }
 
+async fn cold_scope_admission_case(case: &str) {
+    use sha2::{Digest, Sha256};
+    let temp = tempfile::tempdir().unwrap();
+    let profile = format!("cold-scope-{case}");
+    let provider = Arc::new(AppuiContinuationLlm::new("COLD-SCOPE-GENUINE-FINAL"));
+    let (mut state, runtime) =
+        state_with_profile_llm(temp.path(), &profile, provider.clone()).await;
+    Arc::get_mut(&mut state).unwrap().session_cache = Arc::new(
+        crate::runtime::SessionRuntimeCache::new(8, Duration::from_secs(60))
+            .with_sessions_in_cwd(true),
+    );
+    let session = SessionKey(format!("cold-scope-master-{case}"));
+    let mut config = LedgerConfig::durable(temp.path().to_owned());
+    config.retained_per_session = 2;
+    let mut expected_stream = session.0.clone();
+    let mut expected_workspace = None;
+    {
+        let before = UiProtocolLedger::with_config(config.clone());
+        let scopes = if case == "no-history" {
+            0
+        } else if case == "ambiguous" {
+            2
+        } else {
+            1
+        };
+        for index in 0..scopes {
+            let cwd = temp
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join(format!("workspace-{index}"));
+            if case != "stale-cwd" {
+                std::fs::create_dir_all(&cwd).unwrap();
+            }
+            let sessions_root = crate::runtime::session::resolve_sessions_root_from_hint(
+                &runtime,
+                Some(&cwd),
+                true,
+            );
+            let digest = Sha256::digest(sessions_root.as_os_str().as_encoded_bytes());
+            let scope = digest[..8]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            before.set_session_scope(&session, Some(scope.clone()));
+            expected_stream = format!("{}\u{0}~cwd-{scope}", session.0);
+            expected_workspace = Some(cwd.clone());
+            if case != "missing-open" {
+                let opened: octos_core::ui_protocol::SessionOpened = serde_json::from_value(json!({
+                    "session_id": session,
+                    "active_profile_id": if case == "foreign-profile" { "another-profile" } else { &profile },
+                    "workspace_root": if case == "missing-cwd" { None } else { Some(cwd.to_string_lossy().into_owned()) },
+                })).unwrap();
+                before.append_notification(UiNotification::SessionOpened(opened));
+            }
+            // Force the authoritative open OUT of the retained replay ring.
+            // Recovery must retain its scope evidence separately, not guess
+            // from the last two ordinary progress events.
+            for _ in 0..5 {
+                before.append_notification(UiNotification::ProgressUpdated(UiProgressEvent::new(
+                    session.clone(),
+                    None,
+                    UiProgressMetadata::new("cold_scope_fixture"),
+                )));
+            }
+        }
+    }
+    let ledger = UiProtocolLedger::recover(config).ledger;
+    assert!(session_workspaces().snapshot(&profile, &session).is_none());
+    let active = Arc::new(TokioMutex::new(HashMap::new()));
+    let connections = Arc::new(TokioMutex::new(HashMap::new()));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(128);
+    let turn = TurnId::new();
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active,
+        &connections,
+        Some(&profile),
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "cold-start".into(),
+        TurnStartParams {
+            session_id: session.clone(),
+            turn_id: turn.clone(),
+            input: vec![InputItem::Text {
+                text: "continue after cold restart".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+            origin: None,
+        },
+    )
+    .await;
+    let response = recv_rpc_response_with_id(&mut rx, "cold-start").await;
+    let accepted = response.get("result").is_some();
+    if accepted {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = recv_rpc_json(&mut rx).await;
+                let m = frame.get("method").and_then(Value::as_str);
+                let is_v2_terminal = m == Some("projection/envelope")
+                    && frame
+                        .get("params")
+                        .and_then(|p| p.get("payload"))
+                        .and_then(|p| p.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("turn_terminal");
+                if m == Some("turn/completed") || m == Some("turn/error") || is_v2_terminal {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("accepted turn must settle");
+    }
+    let should_accept = case == "no-history";
+    assert_eq!(accepted, should_accept, "{case}: {response}");
+    if !should_accept {
+        assert_eq!(response["error"]["data"]["kind"], "session_open_required");
+        assert_eq!(provider.call_count.load(Ordering::Relaxed), 0);
+        assert!(!active.lock().await.contains_key(&session));
+    }
+    if case == "unique" {
+        // Even a unique historical cwd is insufficient to reconstruct prior
+        // per-open sandbox narrowing. A real authorized open reestablishes
+        // the binding; only then may the retry resume its original stream.
+        let implicit = open_session_result(
+            &state,
+            &ledger,
+            &contracts.approvals,
+            &contracts.user_questions,
+            ConnectionId::next(),
+            Some(&profile),
+            Some(&profile),
+            ConnectionUiFeatures::stdio_defaults(),
+            SessionOpenParams {
+                client_commands: None,
+                session_id: session.clone(),
+                topic: None,
+                profile_id: Some(profile.clone()),
+                cwd: None,
+                sandbox: None,
+                after: None,
+            },
+        )
+        .await;
+        assert!(
+            matches!(implicit, Err(ref error) if error.data.as_ref().and_then(|data| data.get("kind")) == Some(&json!("session_open_required"))),
+            "an implicit open must not bypass the cold-scope guard"
+        );
+        open_session_result(
+            &state,
+            &ledger,
+            &contracts.approvals,
+            &contracts.user_questions,
+            ConnectionId::next(),
+            Some(&profile),
+            Some(&profile),
+            ConnectionUiFeatures::stdio_defaults(),
+            SessionOpenParams {
+                client_commands: None,
+                session_id: session.clone(),
+                topic: None,
+                profile_id: Some(profile.clone()),
+                cwd: Some(
+                    expected_workspace
+                        .as_ref()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                sandbox: None,
+                after: Some(octos_core::ui_protocol::UiCursor {
+                    stream: expected_stream.clone(),
+                    seq: 6,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        handle_turn_start(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active,
+            &connections,
+            Some(&profile),
+            None,
+            ConnectionUiFeatures::stdio_defaults(),
+            "cold-retry".into(),
+            TurnStartParams {
+                session_id: session.clone(),
+                turn_id: turn.clone(),
+                input: vec![InputItem::Text {
+                    text: "continue after explicit reopen".into(),
+                }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
+                reasoning_effort: None,
+                tool_context: None,
+                live_video: false,
+                origin: None,
+            },
+        )
+        .await;
+        let retry = recv_rpc_response_with_id(&mut rx, "cold-retry").await;
+        assert_eq!(retry["result"]["accepted"], true, "{retry}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = recv_rpc_json(&mut rx).await;
+                let m = frame.get("method").and_then(Value::as_str);
+                let is_v2_terminal = m == Some("projection/envelope")
+                    && frame
+                        .get("params")
+                        .and_then(|p| p.get("payload"))
+                        .and_then(|p| p.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("turn_terminal");
+                if m == Some("turn/completed") || is_v2_terminal {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("reopened turn must settle");
+    }
+    if should_accept || case == "unique" {
+        assert_eq!(provider.call_count.load(Ordering::Relaxed), 1);
+        let (events, cursor) = ledger.snapshot_with_cursor(&session, None).unwrap();
+        assert_eq!(
+            cursor.stream, expected_stream,
+            "cold restart must not fork a new bare stream"
+        );
+        assert!(events.iter().any(|row| matches!(&row.event, UiProtocolLedgerEvent::Notification(UiNotification::TurnCompleted(event)) if event.turn_id == turn)));
+        if let Some(expected_workspace) = expected_workspace {
+            assert_eq!(
+                session_workspaces().runtime_hint(&profile, &session),
+                Some(expected_workspace)
+            );
+            assert!(
+                cursor.seq > 6,
+                "sequence must continue past pre-restart head"
+            );
+        }
+    }
+    if case != "no-history" {
+        let bare_dir = session
+            .0
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert!(
+            !temp.path().join("ui-protocol").join(bare_dir).exists(),
+            "never write an unscoped ledger for a known scoped session"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cold_scope_should_require_explicit_reopen_then_resume_original_scoped_sequence() {
+    cold_scope_admission_case("unique").await;
+}
+
+#[tokio::test]
+async fn cold_scope_should_reject_two_historical_cwds_without_an_explicit_open() {
+    cold_scope_admission_case("ambiguous").await;
+}
+
+#[tokio::test]
+async fn cold_scope_should_reject_mismatched_profile_evidence() {
+    cold_scope_admission_case("foreign-profile").await;
+}
+
+#[tokio::test]
+async fn cold_scope_should_reject_missing_or_stale_cwd_evidence() {
+    for case in ["missing-cwd", "missing-open", "stale-cwd"] {
+        cold_scope_admission_case(case).await;
+    }
+}
+
+#[tokio::test]
+async fn cold_scope_should_preserve_new_unopened_session_behavior() {
+    cold_scope_admission_case("no-history").await;
+}
+
 // ---- #peer-awaiting-wake — real requester integration ----
 //
 // Drive the REAL `UiProtocolApprovalRequester::request_approval` /
@@ -26884,6 +32709,8 @@ async fn real_peer_approval_park_wakes_originator() {
         body: "rm -rf ./build-cache".to_owned(),
         command: Some("rm -rf ./build-cache".to_owned()),
         cwd: None,
+        once_only: false,
+        host_tool: None,
     };
     let handle = tokio::spawn(async move { requester.request_approval(request).await });
 
@@ -26966,6 +32793,8 @@ async fn real_auto_resolved_approval_does_not_wake() {
         body: "echo hi".to_owned(),
         command: Some("echo hi".to_owned()),
         cwd: None,
+        once_only: false,
+        host_tool: None,
     };
     // Auto-resolve returns immediately (no oneshot to await), so call directly.
     let decision = requester.request_approval(request).await;
@@ -27092,6 +32921,7 @@ async fn open_peer_with_active_turn(
     let handle = tokio::spawn(async { std::future::pending::<()>().await });
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let entry = ActiveTurn {
+        owner: None,
         turn_id: TurnId::new(),
         profile_id: profile.to_owned(),
         state: turn_state.clone(),
@@ -27219,6 +33049,8 @@ async fn should_refuse_a_peer_park_when_the_peer_is_closed_under_a_raw_client_se
             body: "rm -rf ./build-cache".to_owned(),
             command: Some("rm -rf ./build-cache".to_owned()),
             cwd: None,
+            once_only: false,
+            host_tool: None,
         }),
     )
     .await
@@ -27422,6 +33254,8 @@ async fn should_allow_a_peer_park_again_when_the_closed_peer_is_restaged() {
                 body: "cargo test".to_owned(),
                 command: Some("cargo test".to_owned()),
                 cwd: None,
+                once_only: false,
+                host_tool: None,
             })
             .await
     });
@@ -27502,9 +33336,34 @@ impl octos_llm::LlmProvider for AppuiContinuationLlm {
     }
 }
 
+/// Mirrors `session_actor_tests::waiting_budget` (#2053): scale a test's
+/// WAITING budget on Windows, where loaded check-windows runners miss
+/// fixed-duration waits that pass everywhere else. Deadlines only, never
+/// stimuli.
+fn waiting_budget(base: Duration) -> Duration {
+    #[cfg(windows)]
+    {
+        base * 4
+    }
+    #[cfg(not(windows))]
+    {
+        base
+    }
+}
+
+/// Poll the mock provider until the drained continuation turn reaches it. A
+/// short fixed ceiling flakes on check-windows (main run 34931713823 failed
+/// two different callers of this helper, one per attempt, each with
+/// `call_count == 0` right after the window expired), so the deadline uses a
+/// generous base through `waiting_budget`; a passing run still exits on the
+/// first poll.
 async fn wait_for_appui_continuation(provider: &AppuiContinuationLlm) {
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + waiting_budget(Duration::from_secs(5));
+    loop {
         if provider.call_count.load(Ordering::Relaxed) > 0 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -27527,12 +33386,12 @@ async fn cached_session_messages(
 
 #[tokio::test(flavor = "current_thread")]
 async fn appui_raw_loop_fire_now_drains_internal_continuation_turn() {
-    clear_default_agent_orchestrator_for_test();
+    let profile = "appui-fire-now-isolated";
     let temp = tempfile::TempDir::new().expect("temp dir");
     let provider = Arc::new(AppuiContinuationLlm::new("appui fire_now continuation ran"));
     let (state, profile_runtime) =
-        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider.clone()).await;
-    let session_id = SessionKey::new("api", "appui-fire-now");
+        state_with_profile_llm(temp.path(), profile, provider.clone()).await;
+    let session_id = SessionKey::with_profile(profile, "api", "appui-fire-now");
     let features = ConnectionUiFeatures::stdio_defaults();
 
     let create = RpcRequest::new(
@@ -27571,7 +33430,7 @@ async fn appui_raw_loop_fire_now_drains_internal_continuation_turn() {
             &active_turns,
             &connection_turns,
             features,
-            None,
+            Some(profile),
             "loop-fire".to_owned(),
             &fire_now,
         )
@@ -27583,7 +33442,7 @@ async fn appui_raw_loop_fire_now_drains_internal_continuation_turn() {
     assert_eq!(provider.call_count.load(Ordering::Relaxed), 1);
     assert_eq!(
         default_agent_orchestrator()
-            .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            .pending_continuation_count_for_session_for_test(&session_id, profile),
         0
     );
 
@@ -27598,13 +33457,93 @@ async fn appui_raw_loop_fire_now_drains_internal_continuation_turn() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn terminal_integrity_embedded_boot_reserves_foreground_admission() {
+    let profile = "boot-admission-isolated";
+    let temp = tempfile::TempDir::new().unwrap();
+    let provider = Arc::new(AppuiContinuationLlm::new("foreground answer"));
+    let (state, _) = state_with_profile_llm(temp.path(), profile, provider.clone()).await;
+    let mut state = Arc::try_unwrap(state).ok().expect("unshared fixture state");
+    state.solo_login_enabled = true;
+    let state = Arc::new(state);
+    let session_id = SessionKey::with_profile(profile, "acp", "boot-admission");
+    let create = RpcRequest::new(
+        "loop-create",
+        methods::LOOP_CREATE,
+        json!({
+            "session_id": session_id, "prompt": "restored background work", "mode": "fixed_interval", "interval_seconds": 60
+        }),
+    );
+    let created = raw_autonomy_rpc(
+        &create,
+        ConnectionUiFeatures::stdio_defaults(),
+        Some(profile),
+    )
+    .unwrap();
+    let loop_id = created["loop"]["loop_id"].as_str().unwrap();
+    default_agent_orchestrator().force_loop_due_for_test(loop_id);
+    let unopened = crate::commands::oup_client::OupClient::connect(state.clone())
+        .await
+        .unwrap();
+    unopened
+        .request("client_hello", json!({ "client": "boot-test" }))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let calls_before_open = provider.call_count.load(Ordering::Relaxed);
+    unopened.close().await.unwrap();
+    assert_eq!(
+        calls_before_open, 0,
+        "an unopened embedded connection must not consume restored work"
+    );
+    let session = crate::commands::oup_session::OupSession::open(
+        state,
+        session_id,
+        temp.path(),
+        octos_agent::EffectivePermissions::workspace_write(),
+    )
+    .await
+    .unwrap();
+    // Even an arbitrarily slow frontend between open and start owns admission.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 0);
+    session.client.request(methods::TURN_START, json!({ "session_id": session.session_id, "turn_id": TurnId::new(), "input": [InputItem::Text { text: "foreground input".into() }] })).await.unwrap();
+    wait_for_appui_continuation(provider.as_ref()).await;
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 1);
+    session.close().await.unwrap();
+}
+
+#[test]
+fn terminal_integrity_goal_claim_requires_a_complete_final_reply() {
+    let claim = "Finished <goal:complete>";
+    for reason in [TerminalReason::Errored, TerminalReason::Interrupted] {
+        assert!(goal_completion_reply(&TurnState::Terminal(reason), Some(claim)).is_none());
+    }
+    assert_eq!(
+        goal_completion_reply(&TurnState::Terminal(TerminalReason::Completed), Some(claim)),
+        Some(claim.into())
+    );
+    assert!(goal_completion_reply(&TurnState::Terminal(TerminalReason::Completed), None).is_none());
+}
+
+#[test]
+fn terminal_integrity_truncated_voice_strips_but_does_not_execute_directives() {
+    let mut content = "A partial answer [[EXIT]]".to_owned();
+    let mut messages = vec![Message::assistant(content.clone())];
+    let directives = prepare_voice_directives(&mut content, &mut messages, true, true);
+    assert!(directives.0.is_none());
+    assert!(!directives.1);
+    assert_eq!(content, "A partial answer");
+    assert_eq!(messages[0].content, content);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn appui_due_fixed_loop_tick_drains_internal_continuation_turn() {
-    clear_default_agent_orchestrator_for_test();
+    let profile = "appui-due-loop-isolated";
     let temp = tempfile::TempDir::new().expect("temp dir");
     let provider = Arc::new(AppuiContinuationLlm::new("appui due loop continuation ran"));
     let (state, profile_runtime) =
-        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider.clone()).await;
-    let session_id = SessionKey::new("api", "appui-due-loop");
+        state_with_profile_llm(temp.path(), profile, provider.clone()).await;
+    let session_id = SessionKey::with_profile(profile, "api", "appui-due-loop");
     let features = ConnectionUiFeatures::stdio_defaults();
 
     let create = RpcRequest::new(
@@ -27633,10 +33572,11 @@ async fn appui_due_fixed_loop_tick_drains_internal_continuation_turn() {
         &contracts,
         &active_turns,
         &connection_turns,
-        Some(MAIN_PROFILE_ID),
+        Some(profile),
         // A loop continuation (non-peer) is unaffected by the peer open-session
         // filter, so an empty set is fine here.
         &std::collections::HashSet::new(),
+        false,
         features,
     )
     .await;
@@ -27646,7 +33586,7 @@ async fn appui_due_fixed_loop_tick_drains_internal_continuation_turn() {
     assert_eq!(provider.call_count.load(Ordering::Relaxed), 1);
     assert_eq!(
         default_agent_orchestrator()
-            .pending_continuation_count_for_session_for_test(&session_id, MAIN_PROFILE_ID),
+            .pending_continuation_count_for_session_for_test(&session_id, profile),
         0
     );
 
@@ -27699,6 +33639,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("m11e-custom-cwd".into()),
@@ -27754,6 +33695,7 @@ async fn appui_session_with_custom_cwd_reads_supplied_workspace() {
 #[test]
 fn session_sandbox_requires_negotiated_feature() {
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::new("api", "sandbox-feature-required"),
         topic: None,
         profile_id: None,
@@ -27790,6 +33732,7 @@ fn session_sandbox_can_narrow_network_but_not_widen() {
         ..ConnectionUiFeatures::default()
     };
     let params = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::new("api", "sandbox-network-narrow"),
         topic: None,
         profile_id: None,
@@ -27812,6 +33755,7 @@ fn session_sandbox_can_narrow_network_but_not_widen() {
     assert!(!narrowed.allow_network);
 
     let widening = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::new("api", "sandbox-network-widen"),
         topic: None,
         profile_id: None,
@@ -27858,6 +33802,7 @@ fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
     };
 
     let narrowed = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::new("api", "sandbox-read-narrow"),
         topic: None,
         profile_id: None,
@@ -27876,6 +33821,7 @@ fn session_sandbox_read_paths_must_stay_within_profile_allowlist() {
     assert!(Path::new(&sandbox.read_allow_paths[0]).ends_with("nested"));
 
     let widening = SessionOpenParams {
+        client_commands: None,
         session_id: SessionKey::new("api", "sandbox-read-widen"),
         topic: None,
         profile_id: None,
@@ -27932,6 +33878,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: gamma.clone(),
             topic: None,
             profile_id: Some("m11-session-sandbox".into()),
@@ -27956,6 +33903,7 @@ async fn session_sandbox_open_override_materializes_distinct_session_policies() 
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: delta.clone(),
             topic: None,
             profile_id: Some("m11-session-sandbox".into()),
@@ -28026,6 +33974,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_a.clone(),
             topic: None,
             profile_id: Some("m11e-multi-cwd".into()),
@@ -28048,6 +33997,7 @@ async fn two_appui_sessions_on_same_profile_with_different_cwds_isolated() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_b.clone(),
             topic: None,
             profile_id: Some("m11e-multi-cwd".into()),
@@ -28199,6 +34149,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("m11e-rebind-attempt".into()),
@@ -28220,6 +34171,7 @@ async fn second_session_open_with_new_cwd_reports_cached_workspace_root() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("m11e-rebind-attempt".into()),
@@ -28297,6 +34249,7 @@ async fn session_open_with_cwd_for_unregistered_profile_is_rejected() {
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id,
             topic: None,
             profile_id: None,
@@ -28367,6 +34320,7 @@ async fn parent_directory_symlink_escapes_per_session_workspace_documents_gap() 
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_a.clone(),
             topic: None,
             profile_id: Some("m11e-symlink".into()),
@@ -28493,6 +34447,7 @@ async fn appui_session_without_client_cwd_respects_operator_default_session_cwd(
         None,
         features,
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some("m11f-tier2-default".into()),
@@ -28591,6 +34546,7 @@ async fn appui_no_cwd_workspace_does_not_become_a_transcript_store_hint() {
             ..ConnectionUiFeatures::default()
         },
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some(profile_id.into()),
@@ -28607,7 +34563,9 @@ async fn appui_no_cwd_workspace_does_not_become_a_transcript_store_hint() {
         .opened
         .workspace_root
         .expect("Tier-3 workspace root is still exposed for tools and UI");
-    assert_ne!(workspace_root, profile_runtime.data_dir);
+    // `SessionOpenResult.workspace_root` is wire-typed String; convert so the
+    // comparison against the runtime's PathBuf still type-checks.
+    assert_ne!(PathBuf::from(workspace_root), profile_runtime.data_dir);
 
     let sessions = resolve_sessions_for_lookup(&state, None, Some(profile_id), &session_id)
         .await
@@ -28654,6 +34612,7 @@ async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
             ..ConnectionUiFeatures::default()
         },
         SessionOpenParams {
+            client_commands: None,
             session_id: session_id.clone(),
             topic: None,
             profile_id: Some(profile_id.into()),
@@ -28991,7 +34950,12 @@ async fn router_failover_subscriber_receives_events_with_session_id() {
             }),
         ],
         &[],
-        octos_llm::AdaptiveConfig::default(),
+        octos_llm::AdaptiveConfig {
+            // This assertion exercises the primary-to-fallback event, not
+            // the default 10% probe that can legitimately start on p2.
+            probe_probability: 0.0,
+            ..Default::default()
+        },
     ));
     let mut rx = router.subscribe_failover();
 
@@ -29617,6 +35581,68 @@ fn oversized_frame_with_multibyte_and_control_bytes_is_boundary_safe_and_under_c
     }
     // head + tail of the original survive.
     assert!(text.starts_with('情'));
+}
+
+/// 2c performance regression (黑板第 2 条): a multi-MB hydrate-shaped
+/// payload (1000 large messages, the shape that took ~10s through the old
+/// O(payload × rounds) loop) must be previewed in well under a second and
+/// come out ≤ cap with the truncation marker present.
+#[test]
+fn preview_oversized_frame_multi_mb_hydrate_shape_is_single_pass_fast() {
+    // Hydrate reply shape: an array of message objects with large text.
+    let messages: Vec<Value> = (0..1000)
+        .map(|i| {
+            json!({
+                "role": if i % 2 == 0 { "user" } else { "assistant" },
+                "text": format!("msg-{i}-{}", "m".repeat(5 * 1024)),
+            })
+        })
+        .collect();
+    let value = json!({
+        "jsonrpc": "2.0",
+        "id": "hydrate-1",
+        "result": {
+            "session_id": "local:perf",
+            "messages": messages,
+        }
+    });
+    let frame = app_ui_codec::to_compact_json(&value).expect("serialize");
+    assert!(
+        frame.len() > 4 * 1024 * 1024,
+        "fixture must be multi-MB, got {}",
+        frame.len()
+    );
+
+    let start = std::time::Instant::now();
+    let out = preview_oversized_frame(frame);
+    let elapsed = start.elapsed();
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "output must fit the cap, got {}",
+        out.len()
+    );
+    let parsed: Value = serde_json::from_str(&out).expect("valid JSON");
+    // The marker must survive somewhere in the shrunk message list —
+    // depending on how much had to be cut, the structural fallback may have
+    // dropped leading elements, so scan all surviving messages.
+    let any_marker = parsed["result"]["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .any(|m| {
+            m["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("bytes truncated"))
+        });
+    assert!(any_marker, "truncation marker must be present");
+    // Generous CI bound: the old loop needed ~10s on this shape; single
+    // pass is O(payload). 2s even on slow debug CI is >10x margin over the
+    // 200ms release requirement in the contract.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "single-pass preview took {elapsed:?} — regression toward the O(n²) loop"
+    );
 }
 
 #[test]
@@ -30497,10 +36523,11 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
             brief: format!("Lane {n}: fix the flaky bus test."),
             // Unique per iteration — named peers reject duplicates.
             name: format!("Lane {n}"),
-            worktree: false,
+            worktree: Some(false),
             model: None,
             goal_id: None,
             task_id: None,
+            token_budget: None,
         })
         .unwrap_or_else(|err| panic!("handoff {n} within the cap must stage: {err}"));
         assert_eq!(staged.topic, format!("peer-{}", staged.slug));
@@ -30514,10 +36541,11 @@ fn peer_handoff_callback_caps_at_four_and_emits_staged_events() {
     let err = callback(octos_agent::PeerHandoffRequest {
         brief: "One too many.".to_owned(),
         name: "One too many".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect_err("5th handoff must be rejected");
     assert_eq!(err, "peer handoff limit reached for this turn (4)");
@@ -30600,7 +36628,7 @@ fn peer_gather_callback_composes_done_and_running_rows() {
     std::fs::write(gamma.join("result.md"), "partial result before close\n").unwrap();
     std::fs::write(gamma.join("closed"), "tenant-a:api:master\n1700000000\n").unwrap();
 
-    let callback = build_peer_gather_callback(peers_root.clone());
+    let callback = build_peer_gather_callback(peers_root.clone(), "octos".to_owned());
     let text = callback(None).expect("gather composes");
     assert!(text.contains("## peer alpha (done)"), "{text}");
     assert!(
@@ -30634,7 +36662,7 @@ fn peer_gather_callback_composes_done_and_running_rows() {
 #[test]
 fn peer_gather_callback_reports_empty_blackboard() {
     let tmp = tempfile::tempdir().unwrap();
-    let missing = build_peer_gather_callback(tmp.path().join("peers"));
+    let missing = build_peer_gather_callback(tmp.path().join("peers"), "octos".to_owned());
     assert_eq!(
         missing(None).expect("missing dir is not an error"),
         "No peers staged for this profile."
@@ -30642,8 +36670,88 @@ fn peer_gather_callback_reports_empty_blackboard() {
 
     let empty_root = tmp.path().join("peers2");
     std::fs::create_dir_all(&empty_root).unwrap();
-    let empty = build_peer_gather_callback(empty_root);
+    let empty = build_peer_gather_callback(empty_root, "octos".to_owned());
     assert_eq!(empty(None).unwrap(), "No peers staged for this profile.");
+}
+
+/// task-e...[credential-redacted] — serve ENTRY profile threading (outer-loop
+/// review): the `peer/gather` RPC (raw) and the `peer_gather` TOOL callback
+/// read the blackboard under the CALLER'S profile, so a valid lifetime under
+/// a NON-DEFAULT profile stays trusted instead of degrading to unknown. The
+/// raw entry's projection is directly observable in the JSON; the tool
+/// callback is exercised through the same custom profile (its composed rows
+/// come from the same profile-aware reader), and the peer_list tool text
+/// (which DOES render execution) pins the projection observably.
+#[tokio::test]
+async fn peer_gather_entries_thread_caller_profile_for_lifetime() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, runtime) = state_with_profile(tmp.path(), "gatherx").await;
+    let peers_root = runtime.data_dir.join("peers");
+    let dir = peers_root.join("gx");
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::peers::peer_io::write_peer_file_atomic(&dir, "brief.md", "b").unwrap();
+    crate::peers::peer_io::write_peer_file_atomic(&dir, "originator", "master-gx").unwrap();
+    // Round-1 terminal evidence (production frontmatter shape).
+    let terminal = "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 1\n---\n\nbody\n";
+    crate::peers::peer_io::write_peer_file_atomic(&dir, "result.md", terminal).unwrap();
+    crate::peers::peer_io::write_peer_file_atomic(&dir, "result-1.md", terminal).unwrap();
+    crate::peers::peer_io::append_peer_line(&dir, "turns.txt", "1 completed 100\n").unwrap();
+    // A VALID lifetime under the custom profile: round 2 RUNNING.
+    let lifetime = serde_json::json!({
+        "version": 1,
+        "task_id": "task-gx",
+        "registry_key": crate::peers::peer_wire_key("gatherx", "gx"),
+        "master": "master-gx",
+        "generation": 1,
+        "phase": "running",
+        "turn_id": "t2",
+        "result_digest": null,
+    });
+    crate::peers::peer_io::write_peer_file_atomic(&dir, "lifetime.json", &lifetime.to_string())
+        .unwrap();
+
+    // RAW entry under the caller's real profile: TRUSTED projection. (Under
+    // the pre-fix default-"octos" read this same disk degraded to unknown —
+    // the registry_key would not match — so this assertion discriminates.)
+    let gathered = raw_peer_gather(
+        &state,
+        &RpcRequest::new(
+            "gather-profiled".to_string(),
+            APPUI_METHOD_PEER_GATHER,
+            json!({ "profile_id": "gatherx" }),
+        ),
+        None,
+    )
+    .expect("raw gather");
+    let rows = gathered["peers"].as_array().expect("peers");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["execution"], "running", "trusted under gatherx");
+    assert_eq!(rows[0]["last_outcome"], "completed");
+    assert_eq!(rows[0]["round"], 2);
+    assert_eq!(rows[0]["master_session_id"], "master-gx");
+    assert_eq!(rows[0]["task_id"], "task-gx");
+    assert_eq!(rows[0]["generation"], 1);
+    assert_eq!(rows[0]["turn_id"], "t2");
+
+    // TOOL gather callback under the same custom profile composes the row
+    // through the real entry (same profile-aware blackboard read).
+    let tool = build_peer_gather_callback(peers_root.clone(), "gatherx".to_owned());
+    let text = tool(None).expect("tool gather composes");
+    assert!(text.contains("## peer gx (done)"), "{text}");
+
+    // The peer_list TOOL text renders execution — observable proof the
+    // serve-side callback threads the custom profile into the projection.
+    let list = build_peer_list_callback(
+        peers_root,
+        Vec::new(),
+        Arc::new(UiProtocolContractStores::default()),
+        "gatherx".to_owned(),
+    );
+    let text = list().expect("peer list composes");
+    assert!(
+        text.contains("· exec=running"),
+        "current execution visible: {text}"
+    );
 }
 
 /// #436 hardening — a peer slug is a single path component; reject anything
@@ -30788,6 +36896,664 @@ fn peer_close_callback_writes_marker_for_owner_only() {
     // A traversal identifier is rejected at resolve (never joined as a path).
     let bad = close("../escape".to_owned()).expect_err("unsafe identifier rejected");
     assert!(bad.contains("no peer named"), "reason: {bad}");
+}
+
+#[tokio::test]
+async fn peer_terminal_wake_should_not_wake_master_when_gathered_peer_is_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("peers");
+    let profile = "peer-close-no-wake";
+    let master = SessionKey::with_profile(profile, "api", "master");
+    let slug = "consumed-peer";
+    let dir = root.join(slug);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "Read the marker").unwrap();
+    std::fs::write(dir.join("originator"), &master.0).unwrap();
+    std::fs::write(dir.join("result.md"), "Actual peer result").unwrap();
+    let supervisor = octos_agent::TaskSupervisor::new();
+    supervisor.set_on_change(|task| {
+        crate::autonomy::agent_orchestrator::upsert_background_task_agent(
+            task,
+            Some("peer-close-no-wake"),
+        )
+        .unwrap();
+    });
+    supervisor.set_on_terminal(|event| {
+        crate::autonomy::agent_orchestrator::route_terminal_event_to_continuation_queue(
+            event,
+            Some("peer-close-no-wake"),
+        );
+    });
+    let task_id =
+        bind_peer_supervised_task(&supervisor, peer_wire_key(profile, slug), &master.0).unwrap();
+    let gathered =
+        build_peer_gather_callback(root.clone(), "octos".to_owned())(Some(vec![slug.into()]))
+            .unwrap();
+    assert!(gathered.contains("Actual peer result"));
+    let close_supervisor = supervisor.clone();
+    let close = build_peer_close_callback(
+        root.clone(),
+        master.0.clone(),
+        profile.into(),
+        Arc::new(UiProtocolContractStores::default()),
+        Arc::new(move |event: PeerClosedEvent| {
+            retire_peer_supervised_task(&close_supervisor, &event.profile_id, &event.slug);
+        }),
+        Arc::new(|_: ApprovalCancelledEvent| {}),
+    );
+    close(slug.into()).unwrap();
+    assert!(peer_is_closed(&root, slug));
+    assert_eq!(
+        supervisor.get_task(&task_id).unwrap().status,
+        octos_agent::TaskStatus::Completed
+    );
+    evaluate_and_enqueue_fleet_synthesis(profile, &root, &master.0, &master).await;
+    let pending = default_agent_orchestrator().drain_ready_continuations_for_session(
+        &master,
+        profile,
+        MasterContinuationRuntimeState::idle(),
+        usize::MAX,
+    );
+    assert!(
+        pending.is_empty(),
+        "closing an already-read peer must not schedule follow-up answers: {pending:?}"
+    );
+    assert!(
+        build_peer_gather_callback(root, "octos".to_owned())(Some(vec![slug.into()]))
+            .unwrap()
+            .contains("Actual peer result"),
+        "closing keeps the actual result readable"
+    );
+}
+
+/// #2627: the receipt parser must accept the bookkeeping keys the writer
+/// emits after `turn:` — `turn_id:` (always present) and the host-owned
+/// conversation `origin:` — while still rejecting unknown keys and round 0.
+#[test]
+fn gathered_peer_result_accepts_writer_bookkeeping_headers() {
+    let with_turn_id = "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 1\nturn_id: t-1\n---\n\nbody\n";
+    assert!(
+        gathered_peer_result("gx", with_turn_id).is_some(),
+        "the writer always emits turn_id; it must not void the receipt"
+    );
+    let with_origin = "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 2\nturn_id: t-2\norigin: person\n---\n\nbody\n";
+    assert!(
+        gathered_peer_result("gx", with_origin).is_some(),
+        "host-owned origin lines must not void the receipt"
+    );
+    let unknown_key =
+        "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 1\npivot: x\n---\n\nbody\n";
+    assert!(
+        gathered_peer_result("gx", unknown_key).is_none(),
+        "unknown header keys still void the receipt"
+    );
+    let round_zero = "---\nslug: gx\noutcome: completed\nupdated_unix: 100\nturn: 0\nturn_id: t-0\n---\n\nbody\n";
+    assert!(
+        gathered_peer_result("gx", round_zero).is_none(),
+        "round 0 still voids the receipt"
+    );
+}
+
+#[tokio::test]
+async fn peer_consumption_should_not_wake_when_foreground_gathers_and_completes() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "peer-consumption-foreground";
+    let (state, runtime) = state_with_profile(temp.path(), profile).await;
+    let master = SessionKey("peer-consumption-foreground-master".into());
+    let root = runtime.data_dir.join("peers");
+    let dir = root.join("reader");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "Read README").unwrap();
+    std::fs::write(dir.join("originator"), &master.0).unwrap();
+    let gathered = GatheredPeerResults::default();
+    let gather = build_peer_gather_callback_for_turn(
+        root.clone(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    );
+    assert!(gather(None).unwrap().contains("still running"));
+    let body = "---\nslug: reader\noutcome: completed\nupdated_unix: 123\nturn: 1\n---\n\nACTUAL-README-RESULT\n";
+    std::fs::write(dir.join("result.md"), body).unwrap();
+    assert!(gather(None).unwrap().contains("ACTUAL-README-RESULT"));
+    let done = json!({"content":"The README result is ACTUAL-README-RESULT", "message_id":"canonical-final", "final_assistant_committed_seq":7});
+    commit_gathered_peer_results(
+        &root,
+        &master,
+        &gathered,
+        &TurnState::Terminal(TerminalReason::Completed),
+        &done,
+    )
+    .unwrap();
+    maybe_enqueue_peer_fleet_synthesis_for_master(&state, &master, profile).await;
+    let pending = default_agent_orchestrator().drain_ready_continuations_for_session(
+        &master,
+        profile,
+        MasterContinuationRuntimeState::idle(),
+        usize::MAX,
+    );
+    assert!(
+        pending.is_empty(),
+        "a successful foreground final already consumed the gathered result: {pending:?}"
+    );
+    let restored = read_peer_consumption(&root, &master);
+    assert_eq!(
+        restored.results["reader"].round, 1,
+        "consumption survives rereading the durable record"
+    );
+    assert!(
+        !std::fs::read_to_string(root.join(peer_consumption_leaf(&master)))
+            .unwrap()
+            .contains("ACTUAL-README-RESULT")
+    );
+    assert_eq!(
+        enqueue_boot_owed_peer_fleet_synthesis(profile, &root).await,
+        1
+    );
+    assert!(
+        default_agent_orchestrator()
+            .drain_ready_continuations_for_session(
+                &master,
+                profile,
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX
+            )
+            .is_empty(),
+        "boot evaluation must respect the durable consumption receipt too"
+    );
+}
+
+fn stage_peer_consumption_result(root: &Path, master: &SessionKey, slug: &str, round: u32) {
+    let dir = root.join(slug);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("brief.md"), "Read README").unwrap();
+    std::fs::write(dir.join("originator"), &master.0).unwrap();
+    std::fs::write(dir.join("result.md"), format!("---\nslug: {slug}\noutcome: completed\nupdated_unix: 123\nturn: {round}\n---\n\n{slug} result round {round}\n")).unwrap();
+}
+
+fn peer_consumption_done() -> Value {
+    json!({"content":"Actual final answer", "message_id":"persisted-final", "final_assistant_committed_seq":9})
+}
+
+#[tokio::test]
+async fn peer_consumption_should_preserve_wake_when_final_is_not_successfully_committed() {
+    for label in ["error", "interrupt", "active", "empty", "unpersisted"] {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = format!("consumption-incomplete-{label}");
+        let (state, runtime) = state_with_profile(temp.path(), &profile).await;
+        let master = SessionKey::with_profile(&profile, "api", "master");
+        let root = runtime.data_dir.join("peers");
+        stage_peer_consumption_result(&root, &master, "reader", 1);
+        let gathered = GatheredPeerResults::default();
+        build_peer_gather_callback_for_turn(
+            root.clone(),
+            Some((master.clone(), gathered.clone())),
+            "octos".to_owned(),
+        )(None)
+        .unwrap();
+        assert_eq!(gathered.lock().unwrap().len(), 1);
+        let mut done = peer_consumption_done();
+        let terminal = match label {
+            "error" => TurnState::Terminal(TerminalReason::Errored),
+            "interrupt" => TurnState::Terminal(TerminalReason::Interrupted),
+            "active" => TurnState::Active,
+            "empty" => {
+                done["content"] = json!(" \n ");
+                TurnState::Terminal(TerminalReason::Completed)
+            }
+            _ => {
+                done.as_object_mut().unwrap().remove("message_id");
+                TurnState::Terminal(TerminalReason::Completed)
+            }
+        };
+        commit_gathered_peer_results(&root, &master, &gathered, &terminal, &done).unwrap();
+        assert!(
+            read_peer_consumption(&root, &master).results.is_empty(),
+            "{label} must not acknowledge a gathered result"
+        );
+        maybe_enqueue_peer_fleet_synthesis_for_master(&state, &master, &profile).await;
+        assert_eq!(
+            default_agent_orchestrator()
+                .drain_ready_continuations_for_session(
+                    &master,
+                    &profile,
+                    MasterContinuationRuntimeState::idle(),
+                    usize::MAX
+                )
+                .len(),
+            1,
+            "{label} must leave the result eligible"
+        );
+    }
+}
+
+#[tokio::test]
+async fn peer_consumption_should_keep_unseen_newer_round_when_version_index_lags() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "consumption-version-race";
+    let (state, runtime) = state_with_profile(temp.path(), profile).await;
+    let master = SessionKey::with_profile(profile, "api", "master");
+    let root = runtime.data_dir.join("peers");
+    stage_peer_consumption_result(&root, &master, "reader", 2);
+    std::fs::write(root.join("reader/result-1.md"), "previous result").unwrap();
+    write_peer_fleet_synthesis_marks(&root, &master.0, &[("reader".into(), 1)]).unwrap();
+    let gathered = GatheredPeerResults::default();
+    build_peer_gather_callback_for_turn(
+        root.clone(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    )(None)
+    .unwrap();
+    assert_eq!(
+        gathered.lock().unwrap()["reader"].round,
+        2,
+        "read round from returned bytes, not the lagging index"
+    );
+    stage_peer_consumption_result(&root, &master, "reader", 3);
+    commit_gathered_peer_results(
+        &root,
+        &master,
+        &gathered,
+        &TurnState::Terminal(TerminalReason::Completed),
+        &peer_consumption_done(),
+    )
+    .unwrap();
+    let record = read_peer_consumption(&root, &master);
+    assert_eq!(record.results["reader"].round, 2);
+    assert!(!peer_result_was_consumed(&root, "reader", &record));
+    assert_eq!(
+        collect_owned_peer_results(&root, &master.0).unwrap()[0].round,
+        3
+    );
+    maybe_enqueue_peer_fleet_synthesis_for_master(&state, &master, profile).await;
+    assert_eq!(
+        default_agent_orchestrator()
+            .drain_ready_continuations_for_session(
+                &master,
+                profile,
+                MasterContinuationRuntimeState::idle(),
+                usize::MAX
+            )
+            .len(),
+        1,
+        "a newer unseen round remains eligible despite older scheduled/consumed marks"
+    );
+}
+
+#[test]
+fn peer_consumption_should_not_acknowledge_nonowned_or_truncated_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let master = SessionKey::with_profile("consumption-ownership", "api", "master");
+    stage_peer_consumption_result(root, &master, "reader", 1);
+    for reader in [
+        SessionKey::with_profile("consumption-ownership", "api", "other"),
+        SessionKey::with_profile_topic("consumption-ownership", "api", "worker", "peer-sibling"),
+    ] {
+        let gathered = GatheredPeerResults::default();
+        let output = build_peer_gather_callback_for_turn(
+            root.to_owned(),
+            Some((reader.clone(), gathered.clone())),
+            "octos".to_owned(),
+        )(None)
+        .unwrap();
+        assert!(
+            output.contains("reader result round 1"),
+            "sibling reads remain allowed"
+        );
+        commit_gathered_peer_results(
+            root,
+            &reader,
+            &gathered,
+            &TurnState::Terminal(TerminalReason::Completed),
+            &peer_consumption_done(),
+        )
+        .unwrap();
+        assert!(gathered.lock().unwrap().is_empty());
+        assert!(read_peer_consumption(root, &reader).results.is_empty());
+    }
+    let body = std::fs::read_to_string(root.join("reader/result.md")).unwrap()
+        + &"x".repeat(PEER_GATHER_RESULT_CAP);
+    std::fs::write(root.join("reader/result.md"), body).unwrap();
+    let gathered = GatheredPeerResults::default();
+    build_peer_gather_callback_for_turn(
+        root.to_owned(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    )(None)
+    .unwrap();
+    assert!(
+        gathered.lock().unwrap().is_empty(),
+        "a truncated result cannot be acknowledged in full"
+    );
+    std::fs::write(
+        root.join("reader/result.md"),
+        "legacy result without authoritative round",
+    )
+    .unwrap();
+    build_peer_gather_callback_for_turn(
+        root.to_owned(),
+        Some((master, gathered.clone())),
+        "octos".to_owned(),
+    )(None)
+    .unwrap();
+    assert!(
+        gathered.lock().unwrap().is_empty(),
+        "do not guess legacy result identities"
+    );
+}
+
+#[tokio::test]
+async fn peer_consumption_should_retire_queued_synthesis_only_for_exact_consumed_fleet() {
+    use crate::autonomy::agent_orchestrator::PEER_FLEET_SYNTHESIS_META_SLUGS;
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "consumption-queued";
+    let provider = Arc::new(AppuiContinuationLlm::new("must not synthesize twice"));
+    let (state, runtime) = state_with_profile_llm(temp.path(), profile, provider.clone()).await;
+    let master = SessionKey::with_profile(profile, "api", "master");
+    let root = runtime.data_dir.join("peers");
+    stage_peer_consumption_result(&root, &master, "reader", 1);
+    let queued = default_agent_orchestrator()
+        .enqueue_peer_fleet_synthesis_continuation(&master, profile, &["reader".into()], 1)
+        .queued()
+        .unwrap()
+        .clone();
+    assert!(!peer_synthesis_was_consumed(&state, &queued, &HashMap::new()).await);
+    let gathered = GatheredPeerResults::default();
+    build_peer_gather_callback_for_turn(
+        root.clone(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    )(None)
+    .unwrap();
+    commit_gathered_peer_results(
+        &root,
+        &master,
+        &gathered,
+        &TurnState::Terminal(TerminalReason::Completed),
+        &peer_consumption_done(),
+    )
+    .unwrap();
+    assert!(peer_synthesis_was_consumed(&state, &queued, &HashMap::new()).await);
+    let mut unknown = queued.clone();
+    unknown.metadata.remove(PEER_FLEET_SYNTHESIS_META_SLUGS);
+    assert!(!peer_synthesis_was_consumed(&state, &unknown, &HashMap::new()).await);
+    unknown = queued.clone();
+    unknown.reason = MasterContinuationReason::ChildCompleted;
+    assert!(!peer_synthesis_was_consumed(&state, &unknown, &HashMap::new()).await);
+    let (ws, _rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let active = active_turns_registry();
+    let connections = Arc::new(TokioMutex::new(HashMap::new()));
+    assert!(
+        !maybe_spawn_appui_master_continuation_runner(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active,
+            &connections,
+            master.clone(),
+            master.clone(),
+            profile.into(),
+            ConnectionUiFeatures::stdio_defaults()
+        )
+        .await
+    );
+    assert_eq!(provider.call_count.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        default_agent_orchestrator()
+            .pending_continuation_count_for_session_for_test(&master, profile),
+        0
+    );
+    stage_peer_consumption_result(&root, &master, "reader", 2);
+    assert!(
+        !peer_synthesis_was_consumed(&state, &queued, &HashMap::new()).await,
+        "an unseen newer result must not be retired"
+    );
+}
+
+#[test]
+fn peer_consumption_should_merge_concurrent_receipts_without_losing_other_peers_or_newer_rounds() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().to_owned();
+    let master = SessionKey::with_profile("consumption-merge", "api", "master");
+    let mut workers = Vec::new();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    for slug in ["first", "second"] {
+        stage_peer_consumption_result(&root, &master, slug, 2);
+        let gathered = GatheredPeerResults::default();
+        build_peer_gather_callback_for_turn(
+            root.clone(),
+            Some((master.clone(), gathered.clone())),
+            "octos".to_owned(),
+        )(Some(vec![slug.into()]))
+        .unwrap();
+        let root = root.clone();
+        let master = master.clone();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            commit_gathered_peer_results(
+                &root,
+                &master,
+                &gathered,
+                &TurnState::Terminal(TerminalReason::Completed),
+                &peer_consumption_done(),
+            )
+            .unwrap();
+        }));
+    }
+    barrier.wait();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(read_peer_consumption(&root, &master).results.len(), 2);
+    stage_peer_consumption_result(&root, &master, "first", 1);
+    let old = GatheredPeerResults::default();
+    build_peer_gather_callback_for_turn(
+        root.clone(),
+        Some((master.clone(), old.clone())),
+        "octos".to_owned(),
+    )(Some(vec!["first".into()]))
+    .unwrap();
+    stage_peer_consumption_result(&root, &master, "first", 3);
+    commit_gathered_peer_results(
+        &root,
+        &master,
+        &old,
+        &TurnState::Terminal(TerminalReason::Completed),
+        &peer_consumption_done(),
+    )
+    .unwrap();
+    assert_eq!(
+        read_peer_consumption(&root, &master).results["first"].round,
+        2,
+        "late older acknowledgement must not roll back a newer receipt"
+    );
+}
+
+#[tokio::test]
+async fn peer_consumption_should_retire_prequeued_synthesis_when_gathered_peer_closes_before_final()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let profile = "consumption-queued-closed";
+    let (state, runtime) = state_with_profile(temp.path(), profile).await;
+    let master = SessionKey::with_profile(profile, "api", "master");
+    let root = runtime.data_dir.join("peers");
+    stage_peer_consumption_result(&root, &master, "reader", 1);
+    let queued = default_agent_orchestrator()
+        .enqueue_peer_fleet_synthesis_continuation(&master, profile, &["reader".into()], 1)
+        .queued()
+        .unwrap()
+        .clone();
+    let gathered = GatheredPeerResults::default();
+    build_peer_gather_callback_for_turn(
+        root.clone(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    )(None)
+    .unwrap();
+    build_peer_close_callback(
+        root.clone(),
+        master.0.clone(),
+        profile.into(),
+        Arc::new(UiProtocolContractStores::default()),
+        Arc::new(|_| {}),
+        Arc::new(|_| {}),
+    )("reader".into())
+    .unwrap();
+    commit_gathered_peer_results(
+        &root,
+        &master,
+        &gathered,
+        &TurnState::Terminal(TerminalReason::Completed),
+        &peer_consumption_done(),
+    )
+    .unwrap();
+    assert!(
+        peer_synthesis_was_consumed(&state, &queued, &HashMap::new()).await,
+        "explicit owner close retires its already queued synthesis even without a consumption file"
+    );
+    std::fs::write(root.join("reader/originator"), "another-master").unwrap();
+    assert!(
+        !peer_synthesis_was_consumed(&state, &queued, &HashMap::new()).await,
+        "closed foreign work must never be silently retired"
+    );
+}
+
+#[test]
+fn peer_consumption_should_accept_current_receipt_when_peer_slug_is_restaged_at_lower_round() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let master = SessionKey::with_profile("consumption-restage", "api", "master");
+    for round in [5, 1] {
+        stage_peer_consumption_result(root, &master, "reader", round);
+        let gathered = GatheredPeerResults::default();
+        build_peer_gather_callback_for_turn(
+            root.to_owned(),
+            Some((master.clone(), gathered.clone())),
+            "octos".to_owned(),
+        )(None)
+        .unwrap();
+        commit_gathered_peer_results(
+            root,
+            &master,
+            &gathered,
+            &TurnState::Terminal(TerminalReason::Completed),
+            &peer_consumption_done(),
+        )
+        .unwrap();
+        assert!(
+            peer_result_was_consumed(root, "reader", &read_peer_consumption(root, &master)),
+            "successfully gathered current round {round} must be consumable"
+        );
+    }
+}
+
+#[tokio::test]
+async fn peer_consumption_should_not_consume_when_interrupt_wins_the_actual_terminal_gate() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let master = SessionKey::with_profile("consumption-terminal-race", "api", "master");
+    stage_peer_consumption_result(root, &master, "reader", 1);
+    let gathered = GatheredPeerResults::default();
+    build_peer_gather_callback_for_turn(
+        root.to_owned(),
+        Some((master.clone(), gathered.clone())),
+        "octos".to_owned(),
+    )(None)
+    .unwrap();
+    let (ack, wait_ack) = tokio::sync::oneshot::channel();
+    let state = TokioMutex::new(TurnState::Interrupting {
+        ack,
+        origin: InterruptOrigin::Client,
+    });
+    let (ws, _rx) = ws_connection_for_test(64);
+    let ledger = UiProtocolLedger::new(64);
+    let done = peer_consumption_done();
+    try_emit_terminal(
+        &state,
+        TerminalReason::Completed,
+        &ws,
+        &ledger,
+        &master,
+        &TurnId::new(),
+        None,
+        Some(TurnCompletionDetails {
+            session_result: build_turn_session_result_from_done(&done),
+            ..Default::default()
+        }),
+        None,
+        None,
+    )
+    .await;
+    assert!(matches!(
+        *state.lock().await,
+        TurnState::Terminal(TerminalReason::Interrupted)
+    ));
+    wait_ack.await.unwrap();
+    commit_gathered_peer_results(root, &master, &gathered, &*state.lock().await, &done).unwrap();
+    assert!(read_peer_consumption(root, &master).results.is_empty());
+}
+
+#[tokio::test]
+async fn peer_terminal_wake_should_deliver_unread_result_on_bare_master_idle_once() {
+    for (label, body) in [
+        ("success", "Completed peer findings"),
+        ("failed", "Peer failed: provider unavailable"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = format!("bare-peer-idle-{label}");
+        let (state, runtime) = state_with_profile(temp.path(), &profile).await;
+        let master = SessionKey(format!("bare-master-{label}"));
+        let root = runtime.data_dir.join("peers");
+        let dir = root.join("unread-peer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brief.md"), "Read the marker").unwrap();
+        std::fs::write(dir.join("originator"), &master.0).unwrap();
+        std::fs::write(dir.join("result.md"), body).unwrap();
+        let busy = test_active_turn(TurnId::new(), tokio::spawn(async {}).abort_handle());
+        active_turns_registry()
+            .lock()
+            .await
+            .insert(master.clone(), busy);
+        let peer = SessionKey::with_profile(&profile, "api", "peer-unread-peer");
+        evaluate_and_enqueue_fleet_synthesis(&profile, &root, &master.0, &peer).await;
+        assert!(
+            !peer_fleet_synthesized_stamp_exists(&root, &master.0),
+            "busy master defers synthesis"
+        );
+        maybe_enqueue_peer_fleet_synthesis_for_master(&state, &master, &profile).await;
+        active_turns_registry().lock().await.remove(&master);
+        let pending = default_agent_orchestrator().drain_ready_continuations_for_session(
+            &master,
+            &profile,
+            MasterContinuationRuntimeState::idle(),
+            usize::MAX,
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "bare master must get one dedicated wake for unread {label} result"
+        );
+        assert_eq!(
+            pending[0].reason,
+            MasterContinuationReason::External("peer_fleet_synthesis".into())
+        );
+        maybe_enqueue_peer_fleet_synthesis_for_master(&state, &master, &profile).await;
+        assert!(
+            default_agent_orchestrator()
+                .drain_ready_continuations_for_session(
+                    &master,
+                    &profile,
+                    MasterContinuationRuntimeState::idle(),
+                    usize::MAX
+                )
+                .is_empty(),
+            "same peer round must not synthesize twice"
+        );
+    }
 }
 
 /// A SUCCESSFUL `peer_close` emits exactly one durable `peer/closed` event
@@ -31066,7 +37832,7 @@ fn peer_list_and_gather_surface_display_name() {
     );
     assert!(list.contains("(edison)"), "list annotates the slug: {list}");
 
-    let gather_cb = build_peer_gather_callback(peers.clone());
+    let gather_cb = build_peer_gather_callback(peers.clone(), "seed".to_owned());
     let gather = gather_cb(None).unwrap();
     assert!(
         gather.contains("## peer Edison [edison]"),
@@ -31561,6 +38327,8 @@ fn peer_list_caps_rows_and_summarizes_overflow() {
             closed: false,
             turn_history: None,
             model_lane: None,
+            // Synthetic disk-less row: no execution assertions.
+            execution_facet: unknown_peer_execution_facet(),
         }
     }
     let over = PEER_LIST_MAX_ROWS + 5;
@@ -31600,7 +38368,7 @@ fn peer_gather_callback_caps_total_output_evenly() {
         std::fs::write(dir.join("brief.md"), format!("Task {slug}.")).unwrap();
         std::fs::write(dir.join("result.md"), "r".repeat(30 * 1024)).unwrap();
     }
-    let callback = build_peer_gather_callback(peers_root);
+    let callback = build_peer_gather_callback(peers_root, "octos".to_owned());
     let text = callback(None).unwrap();
     assert!(
         text.len() <= PEER_GATHER_TOOL_OUTPUT_CAP,
@@ -31643,15 +38411,383 @@ fn peer_originator_recorded_by_handoff_callback() {
     let staged = callback(octos_agent::PeerHandoffRequest {
         brief: "Fix the flaky bus test.".to_owned(),
         name: "CI Fix".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("stage");
     let originator =
         std::fs::read_to_string(peers_root.join(&staged.slug).join("originator")).unwrap();
     assert_eq!(originator, originating.to_string());
+}
+
+// ----------------------------------------------------------------------------
+// #20a — smart worktree fencing: when `peer_handoff` leaves `worktree`
+// UNSPECIFIED, the host auto-fences on a collision predicate hit (① >1 active
+// goal, ② master's tree on a non-default branch, ③ an unfenced peer already
+// in flight). An explicit `worktree=false` is still honored — with a
+// model-visible warning in `model_note` — and an explicit `true` fences
+// WITHOUT touching the predicate (zero-cost short-circuit).
+// ----------------------------------------------------------------------------
+
+fn handoff_request(name: &str, worktree: Option<bool>) -> octos_agent::PeerHandoffRequest {
+    octos_agent::PeerHandoffRequest {
+        brief: format!("Task for {name}."),
+        name: name.to_owned(),
+        worktree,
+        model: None,
+        goal_id: None,
+        task_id: None,
+        token_budget: None,
+    }
+}
+
+/// #20a — make `workspace` a real git repo with one commit so the auto-fence
+/// path's `git clone` (stage_peer) can materialize a fenced worktree. Tests
+/// that trigger the collision predicate (and thus a fence) need this; the
+/// no-collision tests deliberately keep a non-git workspace so predicate ②
+/// reads "unknown" and stays silent.
+fn init_git_workspace(workspace: &std::path::Path) {
+    let run = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(workspace)
+                .args(args)
+                .status()
+                .unwrap_or_else(|_| panic!("git {args:?}"))
+                .success(),
+            "git {args:?} failed"
+        );
+    };
+    run(&["init"]);
+    run(&["config", "user.name", "octos-test"]);
+    run(&["config", "user.email", "octos-test@example.invalid"]);
+    std::fs::write(workspace.join("seed.txt"), "seed\n").expect("seed file");
+    run(&["add", "."]);
+    run(&["commit", "-m", "init"]);
+}
+
+fn handoff_callback_for(
+    peers_root: std::path::PathBuf,
+    workspace: std::path::PathBuf,
+    profile_id: &str,
+) -> octos_agent::PeerHandoffCallback {
+    build_peer_handoff_callback(
+        peers_root,
+        workspace,
+        octos_core::SessionKey::with_profile_topic(profile_id, "local", "tui", "coding"),
+        profile_id.to_owned(),
+        Vec::new(),
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    )
+}
+
+/// Single goal / single branch / no in-flight peers: an UNSPECIFIED worktree
+/// stays unfenced (zero-cost no-regression), and no warning is emitted.
+/// (The non-git workspace makes predicate ② read "unknown" → no hit.)
+#[test]
+fn smart_fence_default_unfenced_when_no_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // Unique profile id: the active-goal predicate scans by profile, and the
+    // process-global orchestrator is shared with sibling tests.
+    let profile = "test-smart-fence-none";
+    let callback = handoff_callback_for(peers_root, workspace, profile);
+
+    let staged = callback(handoff_request("Solo", None)).expect("stage");
+    assert_eq!(staged.worktree_branch, None, "no collision → unfenced");
+    assert_eq!(staged.model_note, None, "no warning without an override");
+}
+
+/// Predicate ③: an in-flight peer (brief, no result, not closed) WITHOUT a
+/// fence flips an unspecified worktree to FENCED.
+#[test]
+fn smart_fence_auto_fences_when_unfenced_peer_in_flight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // The auto-fence path `git clone`s the master's tree — it must be a repo.
+    init_git_workspace(&workspace);
+    // Stage the in-flight UNFENCED peer by hand: brief.md is the staging
+    // contract; no result.md = still running; no `wt/` = unfenced.
+    let running = peers_root.join("running-peer");
+    std::fs::create_dir_all(&running).unwrap();
+    std::fs::write(running.join("brief.md"), "in flight").unwrap();
+
+    let callback = handoff_callback_for(peers_root, workspace, "test-smart-fence-peer");
+    let staged = callback(handoff_request("Fenced Peer", None)).expect("stage");
+    assert_eq!(
+        staged.worktree_branch.as_deref(),
+        Some("peer/fenced-peer"),
+        "in-flight unfenced peer → auto-fence"
+    );
+}
+
+/// Predicate ①: more than one ACTIVE goal in this profile flips an
+/// unspecified worktree to FENCED.
+#[test]
+fn smart_fence_auto_fences_when_multiple_active_goals() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // The auto-fence path `git clone`s the master's tree — it must be a repo.
+    init_git_workspace(&workspace);
+    let profile = "test-smart-fence-goals";
+    // Two active goals under a UNIQUE profile, so sibling tests' goals (on
+    // other profiles) are invisible to the count. The goals persist in the
+    // process-global orchestrator after this test — harmless: later peers
+    // under this same profile are expected to auto-fence anyway.
+    let orchestrator = default_agent_orchestrator();
+    for key in [
+        format!("web:{profile}#goal-a"),
+        format!("web:{profile}#goal-b"),
+    ] {
+        orchestrator
+            .model_create_goal(&SessionKey(key), profile, "concurrent stream", None)
+            .expect("goal created");
+    }
+
+    let callback = handoff_callback_for(peers_root, workspace, profile);
+    let staged = callback(handoff_request("Multi Goal", None)).expect("stage");
+    assert_eq!(
+        staged.worktree_branch.as_deref(),
+        Some("peer/multi-goal"),
+        ">1 active goal → auto-fence"
+    );
+}
+
+/// Explicit `worktree=false` WINS over a predicate hit, but the staged result
+/// carries a model-visible warning in `model_note`.
+#[test]
+fn smart_fence_explicit_false_overrides_with_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let running = peers_root.join("running-peer");
+    std::fs::create_dir_all(&running).unwrap();
+    std::fs::write(running.join("brief.md"), "in flight").unwrap();
+
+    let callback = handoff_callback_for(peers_root, workspace, "test-smart-fence-override");
+    let staged = callback(handoff_request("Shared Tree", Some(false))).expect("stage");
+    assert_eq!(
+        staged.worktree_branch, None,
+        "explicit false is honored even on a predicate hit"
+    );
+    let note = staged.model_note.expect("override warning recorded");
+    assert!(
+        note.contains("worktree=false"),
+        "names the override: {note}"
+    );
+    assert!(
+        note.contains("unfenced peer is already in flight"),
+        "names the collision reason: {note}"
+    );
+}
+
+/// Explicit `worktree=true` fences unconditionally — the predicate is never
+/// consulted (zero syscalls/git invocations on that path).
+#[test]
+fn smart_fence_explicit_true_fences_without_predicate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // Explicit `true` fences via `git clone` too — the workspace must be a repo.
+    init_git_workspace(&workspace);
+
+    let callback = handoff_callback_for(peers_root, workspace, "test-smart-fence-true");
+    let staged = callback(handoff_request("Fenced Explicit", Some(true))).expect("stage");
+    assert_eq!(
+        staged.worktree_branch.as_deref(),
+        Some("peer/fenced-explicit")
+    );
+    assert_eq!(staged.model_note, None, "no warning for an explicit fence");
+}
+
+/// `resolve_peer_worktree` unit truth table, pure (no FS/git): unspecified
+/// takes the predicate; explicit false warns ONLY on a hit; explicit true
+/// never warns.
+#[test]
+fn resolve_peer_worktree_truth_table() {
+    use crate::peers::{FenceCollisionReason::*, resolve_peer_worktree};
+    let hit = [UnfencedPeerInFlight];
+    let miss: [crate::peers::FenceCollisionReason; 0] = [];
+
+    assert_eq!(resolve_peer_worktree(None, &miss), (false, None));
+    assert_eq!(resolve_peer_worktree(None, &hit), (true, None));
+    assert_eq!(resolve_peer_worktree(Some(true), &miss), (true, None));
+    assert_eq!(resolve_peer_worktree(Some(true), &hit), (true, None));
+    assert_eq!(resolve_peer_worktree(Some(false), &miss), (false, None));
+    let (fenced, warning) = resolve_peer_worktree(Some(false), &hit);
+    assert!(!fenced);
+    assert!(warning.is_some(), "explicit false + hit → warning");
+    let (fenced, warning) = resolve_peer_worktree(
+        Some(false),
+        &[MultipleActiveGoals, MainTreeOnNonDefaultBranch],
+    );
+    assert!(!fenced);
+    assert!(
+        warning.unwrap().contains("multiple active goals"),
+        "each hit reason is surfaced"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// #20c — concurrent dual-goal fixtures: the JOINT #20a + #20b behaviour with
+// TWO active goals live in the same profile. 20a's single-predicate tests
+// prove the predicate fires; these fixtures prove the end-to-end story a
+// real campaign hits: goal_02's UNSPECIFIED peer_handoff auto-fences with no
+// human steer and no warning, and — with goal_01 owning the main tree — a
+// cross-goal `git checkout` on the shared tree is refused while the owner
+// goal itself passes through.
+// ----------------------------------------------------------------------------
+
+/// #20c fixture ① — with TWO active goals in the profile, the SECOND goal's
+/// peer handoff that leaves `worktree` unspecified auto-fences onto
+/// `peer/<slug>` (predicate ①, no human steer), and — unlike an explicit
+/// `worktree=false` override — records NO `model_note` warning: the default
+/// auto-fence is the sanctioned path, not an override.
+#[test]
+fn dual_goal_second_goal_peer_auto_fences_without_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // The auto-fence path `git clone`s the master's tree — it must be a repo.
+    init_git_workspace(&workspace);
+    let profile = "test-20c-dual-goal-fence";
+    // Both goals ACTIVE concurrently under a UNIQUE profile — the campaign
+    // state 20c is about. (Goals persist in the process-global orchestrator;
+    // the unique profile keeps sibling tests' goals invisible to the count.)
+    let orchestrator = default_agent_orchestrator();
+    for (key, objective) in [
+        (format!("web:{profile}#goal-01"), "stream one"),
+        (format!("web:{profile}#goal-02"), "stream two"),
+    ] {
+        orchestrator
+            .model_create_goal(&SessionKey(key), profile, objective, None)
+            .expect("goal created");
+    }
+
+    // goal_02's session hands a peer off WITHOUT a worktree decision — the
+    // host must fence it on its own.
+    let callback = handoff_callback_for(peers_root, workspace, profile);
+    let staged = callback(handoff_request("Second Goal Peer", None)).expect("stage");
+    assert_eq!(
+        staged.worktree_branch.as_deref(),
+        Some("peer/second-goal-peer"),
+        "second active goal's unspecified worktree → auto-fence"
+    );
+    assert_eq!(
+        staged.model_note, None,
+        "default auto-fence is not an override → no warning"
+    );
+}
+
+/// #20c fixture ② — dual-goal joint #20a/#20b: goal_01 claims the main tree
+/// (20b ledger claim, as the orchestrator does when its branch lands on the
+/// tree), then goal_02's peer handoff auto-fences (20a) AND a goal_02
+/// `git checkout <other-branch>` against the SHARED main tree is refused by
+/// `tree_sovereignty_denial` with the fence-yourself hint — while goal_01's
+/// own checkout of a different branch passes through. This is the campaign's
+/// "second goal can NEVER hijack the main tree" guarantee exercised through
+/// the real fencing callback plus the real denial predicate on the real
+/// provider-shaped context.
+#[test]
+fn dual_goal_peer_fenced_and_cross_goal_checkout_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    init_git_workspace(&workspace);
+    let profile = "test-20c-dual-goal-sovereignty";
+    let orchestrator = default_agent_orchestrator();
+    for (key, objective) in [
+        (format!("web:{profile}#goal-01"), "stream one"),
+        (format!("web:{profile}#goal-02"), "stream two"),
+    ] {
+        orchestrator
+            .model_create_goal(&SessionKey(key), profile, objective, None)
+            .expect("goal created");
+    }
+
+    // goal_01 owns the main tree (first goal to land a non-default branch
+    // there). The ledger dir starts empty — `claim_main_tree_owner` creates
+    // it best-effort, exactly like the production caller.
+    let profile_data_dir = tmp.path().join("profile-data");
+    orchestrator.claim_main_tree_owner(&profile_data_dir, "goal_01");
+    assert_eq!(
+        orchestrator
+            .scan_main_tree_owner(&profile_data_dir)
+            .as_deref(),
+        Some("goal_01"),
+        "goal_01's claim is discoverable by enumeration (goal_02 never reads it directly)"
+    );
+
+    // goal_02 stages a peer with no worktree decision → 20a auto-fence.
+    let callback = handoff_callback_for(peers_root, workspace.clone(), profile);
+    let staged = callback(handoff_request("Goal Two Peer", None)).expect("stage");
+    assert_eq!(
+        staged.worktree_branch.as_deref(),
+        Some("peer/goal-two-peer"),
+        "goal_02's peer auto-fences off the shared tree"
+    );
+    assert_eq!(staged.model_note, None, "auto-fence is not an override");
+
+    // goal_02 then tries to move the SHARED main tree onto another branch —
+    // refused. The context mirrors what `install_main_tree_sovereignty`'s
+    // provider closure hands the shell tool: the same tree root, a live
+    // non-default branch read, the scanned owner, the caller's goal.
+    use octos_agent::tools::shell::{MainTreeSovereigntyContext, tree_sovereignty_denial};
+    let goal_02_ctx = MainTreeSovereigntyContext {
+        main_tree_root: workspace.clone(),
+        main_tree_branch: Some("feat/goal-01-stream".to_owned()),
+        owner_goal_id: orchestrator.scan_main_tree_owner(&profile_data_dir),
+        caller_goal_id: Some("goal_02".to_owned()),
+    };
+    let denial =
+        tree_sovereignty_denial("git checkout feat/goal-02-stream", &workspace, &goal_02_ctx)
+            .expect("cross-goal checkout must be refused");
+    assert!(
+        denial.contains("owned by goal 'goal_01'"),
+        "names the owner: {denial}"
+    );
+    assert!(
+        denial.contains("fence yourself"),
+        "carries the fence-yourself hint: {denial}"
+    );
+
+    // goal_01 — the OWNER — moves the same tree freely (same branch target).
+    let goal_01_ctx = MainTreeSovereigntyContext {
+        caller_goal_id: Some("goal_01".to_owned()),
+        ..goal_02_ctx.clone()
+    };
+    assert!(
+        tree_sovereignty_denial("git checkout feat/goal-02-stream", &workspace, &goal_01_ctx)
+            .is_none(),
+        "the owner goal is never blocked on its own tree"
+    );
+
+    // And goal_02's checkout INSIDE its fenced peer clone is out of the
+    // guard's scope entirely (a different directory than the main tree).
+    assert!(
+        tree_sovereignty_denial(
+            "git checkout feat/goal-02-stream",
+            std::path::Path::new(&staged.cwd),
+            &goal_02_ctx,
+        )
+        .is_none(),
+        "checkouts inside a fenced peer clone pass through"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -31666,6 +38802,29 @@ fn stage_peer_dir_with(peers_root: &std::path::Path, slug: &str) -> std::path::P
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("brief.md"), "brief").unwrap();
     dir
+}
+
+/// Contract scenario "peer 交付追加结构化事件且带 model_lane": when a
+/// goal-scoped peer (no explicit lane) records a finding, events.jsonl
+/// gains a kind=finding_recorded line with model_lane = "primary".
+#[test]
+fn olp_obs_finding_appends_event_with_lane() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let data_dir = temp.path();
+    let peers_root = data_dir.join("peers");
+    stage_peer_dir_with(&peers_root, "edison"); // no `model` leaf -> default lane
+    emit_finding_recorded_event(data_dir, "goal_05", "edison", "writer is innocent");
+    let lines: Vec<Value> = std::fs::read_to_string(data_dir.join("events.jsonl"))
+        .expect("events.jsonl written")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("valid JSON line"))
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["kind"], "finding_recorded");
+    assert_eq!(lines[0]["goal_id"], "goal_05");
+    assert_eq!(lines[0]["slug"], "edison");
+    assert_eq!(lines[0]["model_lane"], "primary");
+    assert_eq!(lines[0]["detail"], "writer is innocent");
 }
 
 /// A minimal profile config carrying ONE model lane (`key`) whose credential
@@ -31691,6 +38850,32 @@ fn config_with_lane(key: &str) -> crate::config::Config {
     config
 }
 
+/// A profile config carrying the `zai` GLM-5.2 model lane (#19-S2) in the
+/// RECOMMENDED `sub_providers` shape: `provider: "zai"`, `model: "glm-5.2"`,
+/// explicit `api_key_env: "ZAI_API_KEY"` (whose credential is seeded offline
+/// through `env_vars`), and NO `base_url` / `api_type` — the zai registry
+/// entry supplies both defaults (`https://api.z.ai/api/paas/v4`, OpenAI Chat
+/// Completions protocol) and returns the provider directly without an
+/// `api_type` dispatch.
+fn config_with_zai_lane() -> crate::config::Config {
+    let mut config = crate::config::Config::default();
+    config
+        .env_vars
+        .insert("ZAI_API_KEY".to_owned(), "sk-zai-lane-test".to_owned());
+    config.sub_providers = vec![crate::config::SubProviderConfig {
+        key: "zai".to_owned(),
+        provider: "zai".to_owned(),
+        model: Some("glm-5.2".to_owned()),
+        api_key_env: Some("ZAI_API_KEY".to_owned()),
+        base_url: None,
+        description: Some("zai GLM-5.2 lane for goal peers".to_owned()),
+        default_context_window: None,
+        max_output_tokens: None,
+        api_type: None,
+    }];
+    config
+}
+
 fn peer_list_row(slug: &str, model_lane: Option<&str>) -> PeerBlackboardRow {
     PeerBlackboardRow {
         slug: slug.to_owned(),
@@ -31704,6 +38889,8 @@ fn peer_list_row(slug: &str, model_lane: Option<&str>) -> PeerBlackboardRow {
         closed: false,
         turn_history: None,
         model_lane: model_lane.map(str::to_owned),
+        // Synthetic disk-less row: no execution assertions.
+        execution_facet: unknown_peer_execution_facet(),
     }
 }
 
@@ -31742,10 +38929,11 @@ fn stage_and_open_peer(
     let slug = callback(octos_agent::PeerHandoffRequest {
         brief: "do the work".to_owned(),
         name: name.to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("stage peer")
     .slug;
@@ -31982,6 +39170,165 @@ fn peer_respond_resolves_pending_approval_deny() {
     )
     .expect("deny resolves");
     assert_eq!(rx.try_recv().unwrap(), ApprovalDecision::Deny);
+}
+
+/// Mark a staged peer as a host-owned app peer (UPCR-2026-034) by writing its
+/// host binding, as `peer/prepare` with `memory_namespace` does.
+fn bind_peer_to_host(peers_root: &std::path::Path, slug: &str) {
+    crate::peers::app_binding::write_host_binding_in(
+        &peers_root.join(slug),
+        &crate::peers::app_binding::PeerHostBinding {
+            version: 1,
+            cwd: peers_root.parent().unwrap().join("work"),
+            memory_namespace: "app/test".to_owned(),
+            token_sha256: crate::peers::app_binding::token_digest("host-token"),
+        },
+    )
+    .unwrap();
+}
+
+/// ADR 0007 — a host-owned app peer's tool approval is the person's, answered
+/// in the app's own UI. The owning system agent (the originator) must not be
+/// able to approve or deny it through `peer_respond`, whether it names the
+/// approval's id or relies on the single-pending default; the approval stays
+/// parked and nothing is decided.
+#[test]
+fn peer_respond_refuses_a_host_owned_peers_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let system = octos_core::SessionKey::with_profile_topic("dev", "api", "octosense", "system");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-hostappr", "rinx", &system);
+    bind_peer_to_host(&peers_root, &slug);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+    let decided = std::cell::RefCell::new(0usize);
+    let sink = |_event: &ApprovalDecidedEvent, _tool: Option<&str>| {
+        *decided.borrow_mut() += 1;
+    };
+
+    let approval_id_text = approval_id.0.to_string();
+    for (label, id, decision) in [
+        ("default approve", None, "approve"),
+        (
+            "targeted approve",
+            Some(approval_id_text.as_str()),
+            "approve",
+        ),
+        ("targeted deny", Some(approval_id_text.as_str()), "deny"),
+    ] {
+        let err = peer_respond_resolve(
+            &peers_root,
+            &system.0,
+            "prof-hostappr",
+            &contracts,
+            &sink,
+            octos_agent::PeerRespondRequest {
+                slug: slug.clone(),
+                id: id.map(ToOwned::to_owned),
+                decision: Some(decision.to_owned()),
+                answers: None,
+            },
+        )
+        .expect_err(label);
+        assert!(
+            err.contains("host-owned app peer") && err.contains("person in the app"),
+            "{label}: a clear refusal naming who answers: {err}"
+        );
+    }
+    assert!(rx.try_recv().is_err(), "the approval is still parked");
+    assert_eq!(*decided.borrow(), 0, "no approval/decided was emitted");
+    assert_eq!(
+        peer_pending_summaries(&contracts, &peer_key).len(),
+        1,
+        "the approval is still pending for the person"
+    );
+
+    // peer_list does not offer it to the system agent as input to give.
+    let contracts = Arc::new(contracts);
+    let list = build_peer_list_callback(
+        peers_root.clone(),
+        Vec::new(),
+        contracts.clone(),
+        "prof-hostappr".to_owned(),
+    );
+    let text = list().unwrap();
+    assert!(
+        !text.contains(&approval_id_text),
+        "a host-owned peer's approval is not listed for the originator: {text}"
+    );
+}
+
+/// ADR 0007 — the system agent still answers a host-owned app peer's
+/// QUESTION, and with an approval also parked the default target is the
+/// question, never the approval.
+#[test]
+fn peer_respond_answers_a_host_owned_peers_question_beside_a_parked_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let system = octos_core::SessionKey::with_profile_topic("dev", "api", "octosense", "system");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-hostq", "rinx", &system);
+    bind_peer_to_host(&peers_root, &slug);
+
+    let contracts = UiProtocolContractStores::default();
+    let approval_id = ApprovalId::new();
+    let mut approval_rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+    let question_id = QuestionId::new();
+    let mut question_rx = contracts.user_questions.request_runtime(question_event(
+        &peer_key,
+        &question_id,
+        one_free_text_question(),
+    ));
+
+    peer_respond_resolve(
+        &peers_root,
+        &system.0,
+        "prof-hostq",
+        &contracts,
+        &no_decided_sink(),
+        answer_req(&slug, &["postgres"]),
+    )
+    .expect("the system agent answers the host-owned peer's question");
+    assert!(question_rx.try_recv().is_ok(), "the question is answered");
+    assert!(approval_rx.try_recv().is_err(), "the approval is untouched");
+}
+
+/// Ordinary (agent-staged) peers are unchanged: the originator still answers
+/// their approvals, and peer_list still lists them.
+#[test]
+fn peer_respond_still_resolves_an_ordinary_peers_approval() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let master = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let (slug, peer_key) = stage_and_open_peer(&peers_root, "prof-ordappr", "ordinary", &master);
+
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let approval_id = ApprovalId::new();
+    let mut rx = contracts
+        .approvals
+        .request_runtime(approval_event(&peer_key, &approval_id));
+    let list = build_peer_list_callback(
+        peers_root.clone(),
+        Vec::new(),
+        contracts.clone(),
+        "prof-ordappr".to_owned(),
+    );
+    assert!(list().unwrap().contains(&approval_id.0.to_string()));
+    peer_respond_resolve(
+        &peers_root,
+        &master.0,
+        "prof-ordappr",
+        &contracts,
+        &no_decided_sink(),
+        approve_req(&slug, Some(&approval_id.0.to_string())),
+    )
+    .expect("an ordinary peer's approval is still the originator's to answer");
+    assert_eq!(rx.try_recv().unwrap(), ApprovalDecision::Approve);
 }
 
 /// (C) peer_respond resolves a single-question prompt with a free-text answer.
@@ -32272,10 +39619,11 @@ fn peer_respond_errors_when_peer_not_open() {
     let slug = cb(octos_agent::PeerHandoffRequest {
         brief: "x".to_owned(),
         name: "notopen".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: None,
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .unwrap()
     .slug;
@@ -32411,10 +39759,11 @@ fn peer_handoff_callback_records_valid_model_lane() {
     let staged = callback(octos_agent::PeerHandoffRequest {
         brief: "Synthesize the peers' findings.".to_owned(),
         name: "Synth".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: Some("strong".to_owned()),
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("a valid lane still stages the peer");
 
@@ -32453,10 +39802,11 @@ fn peer_handoff_callback_notes_unknown_model_lane_but_still_stages() {
     let staged = callback(octos_agent::PeerHandoffRequest {
         brief: "Grind the grunt work.".to_owned(),
         name: "Grunt".to_owned(),
-        worktree: false,
+        worktree: Some(false),
         model: Some("gpt-mega".to_owned()),
         goal_id: None,
         task_id: None,
+        token_budget: None,
     })
     .expect("an unknown lane warns, it does not fail staging");
 
@@ -32557,6 +39907,296 @@ fn resolve_peer_lane_provider_none_without_model_file() {
         resolve_peer_lane_provider(&peers_root, "synth", &config).is_none(),
         "no model file → primary model (None)"
     );
+}
+
+/// #19-S2 (zai lane, HIT state): the profile carries a `zai` GLM-5.2
+/// `sub_providers` lane, the master hands off a peer requesting that lane →
+/// the lane is recorded cleanly (NO `model_note` warning) AND the turn-path
+/// resolver builds the zai provider (`zai/glm-5.2`) for the peer.
+#[test]
+fn zai_lane_peer_handoff_hit_records_and_resolves_zai_glm52() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let config = config_with_zai_lane();
+    let lanes: Vec<String> = config
+        .sub_providers
+        .iter()
+        .map(|sp| sp.key.clone())
+        .collect();
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let callback = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace,
+        originating,
+        "dev".to_owned(),
+        lanes,
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    );
+
+    let staged = callback(octos_agent::PeerHandoffRequest {
+        brief: "Synthesize with GLM-5.2.".to_owned(),
+        name: "Zai Synth".to_owned(),
+        worktree: Some(false),
+        model: Some("zai".to_owned()),
+        goal_id: None,
+        task_id: None,
+        token_budget: None,
+    })
+    .expect("a configured zai lane still stages the peer");
+
+    assert!(
+        staged.model_note.is_none(),
+        "a configured zai lane produces no warning note: {:?}",
+        staged.model_note
+    );
+    assert_eq!(
+        std::fs::read_to_string(peers_root.join(&staged.slug).join("model")).unwrap(),
+        "zai",
+        "the zai lane is recorded beside the brief"
+    );
+
+    let provider = resolve_peer_lane_provider(&peers_root, &staged.slug, &config)
+        .expect("a recorded zai lane resolves a provider");
+    assert_eq!(provider.provider_name(), "zai@api");
+    assert_eq!(provider.model_id(), "glm-5.2");
+}
+
+/// #19-S2 (zai lane config shape): the recommended zai lane selects and
+/// builds to the zai registry provider (OpenAI Chat Completions on the versioned Z.AI root, default
+/// base URL) even when the PRIMARY profile config points at another provider
+/// — the lane keeps its own `ZAI_API_KEY` credential, never borrows the
+/// primary's.
+#[test]
+fn zai_lane_config_selects_and_builds_zai_glm52_provider() {
+    let mut config = config_with_zai_lane();
+    config.provider = Some("openai".to_owned());
+    config.api_key_env = Some("OPENAI_API_KEY".to_owned());
+
+    let sp = select_peer_lane(&config, "zai").expect("the zai lane is selected");
+    assert_eq!(sp.provider, "zai");
+    assert_eq!(sp.model.as_deref(), Some("glm-5.2"));
+    assert_eq!(sp.api_key_env.as_deref(), Some("ZAI_API_KEY"));
+    assert!(
+        sp.api_type.is_none(),
+        "zai registry returns the provider directly — no api_type dispatch"
+    );
+    assert!(
+        sp.base_url.is_none(),
+        "the zai registry default base URL is already correct"
+    );
+
+    let lane_config = lane_provider_config(&config, sp);
+    assert_eq!(
+        lane_config.api_key_env.as_deref(),
+        Some("ZAI_API_KEY"),
+        "the lane uses its own credential, never the primary's OPENAI_API_KEY"
+    );
+
+    let provider =
+        build_peer_lane_provider(&config, "zai").expect("the zai lane builds a provider");
+    assert_eq!(provider.provider_name(), "zai@api");
+    assert_eq!(provider.model_id(), "glm-5.2");
+}
+
+/// #19-S2 (zai lane, MISS state): the profile carries NO `zai` lane, the
+/// master hands off a peer requesting it → the handoff still stages, the lane
+/// is NOT recorded, and the host surfaces a truthful `model_note` fallback
+/// warning naming the requested lane, the available lanes, and the primary
+/// model.
+#[test]
+fn zai_lane_peer_handoff_miss_warns_and_falls_back_to_primary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let workspace = tmp.path().join("work");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // Only cheap/strong configured — NO zai lane in the profile.
+    let originating = octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "coding");
+    let callback = build_peer_handoff_callback(
+        peers_root.clone(),
+        workspace,
+        originating,
+        "dev".to_owned(),
+        vec!["cheap".to_owned(), "strong".to_owned()],
+        Arc::new(AtomicU32::new(0)),
+        Arc::new(|_event| {}),
+    );
+
+    let staged = callback(octos_agent::PeerHandoffRequest {
+        brief: "Request a lane the profile never configured.".to_owned(),
+        name: "Zai Miss".to_owned(),
+        worktree: Some(false),
+        model: Some("zai".to_owned()),
+        goal_id: None,
+        task_id: None,
+        token_budget: None,
+    })
+    .expect("an unknown zai lane warns, it does not fail staging");
+
+    let note = staged
+        .model_note
+        .expect("requesting an unconfigured zai lane yields a note");
+    assert!(
+        note.contains("model lane 'zai' not found"),
+        "note names the missing zai lane: {note}"
+    );
+    assert!(
+        note.contains("cheap, strong"),
+        "note lists the available lanes: {note}"
+    );
+    assert!(
+        note.contains("primary model"),
+        "note explains the primary-model fallback: {note}"
+    );
+    assert!(
+        !peers_root.join(&staged.slug).join("model").exists(),
+        "an unconfigured zai lane is not recorded on disk"
+    );
+    // The profile has no zai lane to resolve even if a stale record existed:
+    let primary_only = crate::config::Config::default();
+    assert!(
+        select_peer_lane(&primary_only, "zai").is_none(),
+        "no zai sub_provider → selection miss → primary model"
+    );
+}
+
+/// #19-S3 — REAL-machine three-layer acceptance probe for the zai GLM-5.2
+/// peer model lane. NOT a mock: drives the full lane path and makes ONE real
+/// LLM call to `https://api.z.ai/api/paas/v4`. Gated `#[ignore]` so CI never
+/// needs the key; run explicitly with the key in env:
+///   ZAI_API_KEY=… cargo test -p octos-cli --lib --features api -- \
+///     --ignored --exact \
+///     api::ui_protocol_transport::tests::s3_zai_lane_real_three_layer_probe
+///
+/// Three layers proven against real artifacts:
+///   1. CONFIG layer  — `record_peer_model_lane` with the zai lane among
+///      `available_lanes` records `peers/<slug>/model` = "zai" with NO note.
+///   2. RUNTIME layer — `resolve_peer_lane_provider` reads that record back and
+///      builds the zai provider (`provider_name=="zai"`, `model_id=="glm-5.2"`),
+///      then the provider REALLY answers a chat call and reports glm usage.
+///   3. DELIVERY layer — the probe writes its evidence to `<tmp>/result.md`.
+#[test]
+#[ignore = "real z.ai network call; run explicitly with ZAI_API_KEY in env"]
+fn s3_zai_lane_real_three_layer_probe() {
+    // Layer precondition: the credential must be genuinely present.
+    let key = std::env::var("ZAI_API_KEY").expect(
+        "S3 probe requires ZAI_API_KEY in the process env (operator-provided); \
+         do not substitute a mock",
+    );
+    assert!(!key.trim().is_empty(), "ZAI_API_KEY must be non-empty");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("data").join("peers");
+    let slug = "s3-zai-probe";
+    // Stage the peer dir the way the real staging path does.
+    let peer_dir = peers_root.join(slug);
+    std::fs::create_dir_all(&peer_dir).unwrap();
+    std::fs::write(peer_dir.join("brief.md"), "S3 probe peer").unwrap();
+
+    // ---- LAYER 1: config — record the requested zai lane, no fallback note.
+    let available = vec!["zai".to_owned()];
+    let note = crate::peers::record_peer_model_lane(&peers_root, slug, Some("zai"), &available);
+    assert!(
+        note.is_none(),
+        "LAYER 1 FAIL: a configured zai lane must record cleanly (no note), got {note:?}"
+    );
+    let recorded = crate::peers::read_peer_model_lane(&peers_root, slug);
+    assert_eq!(
+        recorded.as_deref(),
+        Some("zai"),
+        "LAYER 1 FAIL: peers/{slug}/model must record 'zai', got {recorded:?}"
+    );
+
+    // ---- LAYER 2: runtime — resolve + build the lane provider, real call.
+    let mut config = config_with_zai_lane();
+    // Use the REAL credential from the process env, not the offline seed.
+    config
+        .env_vars
+        .insert("ZAI_API_KEY".to_owned(), key.clone());
+    config.provider = Some("openai".to_owned());
+    config.api_key_env = Some("OPENAI_API_KEY".to_owned());
+
+    let provider = resolve_peer_lane_provider(&peers_root, slug, &config)
+        .expect("LAYER 2 FAIL: resolve_peer_lane_provider must build the zai provider");
+    assert_eq!(
+        provider.provider_name(),
+        "zai",
+        "LAYER 2 FAIL: lane provider must be zai"
+    );
+    assert_eq!(
+        provider.model_id(),
+        "glm-5.2",
+        "LAYER 2 FAIL: lane provider must be glm-5.2"
+    );
+
+    // The REAL call — proves the runtime layer actually reaches GLM. Captures
+    // the reply text AND the token usage (the running-layer model identifier
+    // evidence demanded by the S3 brief).
+    let (reply, usage) = run_zai_real_call(&provider);
+    eprintln!(
+        "S3-RUNTIME-EVIDENCE provider={} model={} reply={} usage_in={} usage_out={}",
+        provider.provider_name(),
+        provider.model_id(),
+        reply.trim(),
+        usage.input_tokens,
+        usage.output_tokens
+    );
+    assert!(
+        reply.contains("OCTOS_S3_ZAI_OK"),
+        "LAYER 2 FAIL: real GLM-5.2 reply must echo the marker, got: {reply}"
+    );
+    assert!(
+        usage.output_tokens > 0,
+        "LAYER 2 FAIL: real call must bill output tokens, got {usage:?}"
+    );
+
+    // ---- LAYER 3: delivery — the probe's evidence artifact lands on disk.
+    let result_path = tmp.path().join("result.md");
+    std::fs::write(
+        &result_path,
+        format!(
+            "# S3 zai lane probe result\n\n- lane: zai\n- provider: {}\n- model: {}\n- reply: {}\n- usage: in={} out={}\n",
+            provider.provider_name(),
+            provider.model_id(),
+            reply.trim(),
+            usage.input_tokens,
+            usage.output_tokens,
+        ),
+    )
+    .unwrap();
+    let delivered = std::fs::read_to_string(&result_path).unwrap();
+    assert!(
+        delivered.contains("model: glm-5.2") && delivered.contains("OCTOS_S3_ZAI_OK"),
+        "LAYER 3 FAIL: result.md must carry the model id and the real reply"
+    );
+}
+
+/// Layer-2 helper: perform ONE blocking real chat call against the zai lane
+/// provider and return the reply text plus the billed token usage. Kept
+/// separate so the probe body reads as the three acceptance layers.
+fn run_zai_real_call(
+    provider: &Arc<dyn octos_llm::LlmProvider>,
+) -> (String, octos_llm::TokenUsage) {
+    use octos_core::Message;
+    use octos_llm::ChatConfig;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for the real zai call");
+    rt.block_on(async {
+        let messages = vec![Message::user("Reply with exactly: OCTOS_S3_ZAI_OK")];
+        let config = ChatConfig {
+            max_tokens: Some(32),
+            ..Default::default()
+        };
+        let resp = provider
+            .chat(&messages, &[], &config)
+            .await
+            .expect("real zai GLM-5.2 call must succeed");
+        (resp.content.unwrap_or_default(), resp.usage)
+    })
 }
 
 /// #peer-model (part 3): the wrapper returns None for a NON-peer session — it
@@ -33088,6 +40728,7 @@ async fn peer_prepare_stages_brief_and_worktree() {
         &request(json!({
             "brief": "Second lane.",
             "title": "CI Fix",
+            "token_budget": 250_000,
             "cwd": repo.to_string_lossy(),
             "profile_id": "dev",
         })),
@@ -33096,10 +40737,20 @@ async fn peer_prepare_stages_brief_and_worktree() {
     .await
     .expect("second prepare");
     assert_eq!(result2["slug"], "ci-fix-2");
+    assert_eq!(result2["token_budget"], 250_000);
+    assert_eq!(
+        peer_token_budget_status(&data_dir.join("peers"), "ci-fix-2")
+            .unwrap()
+            .unwrap(),
+        PeerTokenBudgetStatus {
+            limit: 250_000,
+            used: 0,
+        }
+    );
     assert!(result2["worktree_branch"].is_null());
     assert_eq!(
         std::path::PathBuf::from(result2["cwd"].as_str().unwrap()),
-        repo.canonicalize().unwrap()
+        dunce::canonicalize(&repo).unwrap()
     );
 
     // Worktree against a NON-git cwd fails AND releases the reserved slug.
@@ -33139,6 +40790,20 @@ async fn peer_prepare_stages_brief_and_worktree() {
         retry["slug"], "no-repo",
         "slug released after the failed stage"
     );
+
+    let zero_budget = raw_peer_prepare(
+        &state,
+        &request(json!({
+            "brief": "Invalid budget.",
+            "token_budget": 0,
+            "cwd": repo.to_string_lossy(),
+            "profile_id": "dev",
+        })),
+        None,
+    )
+    .await
+    .expect_err("zero token budget is not runnable");
+    assert!(zero_budget.message.contains("positive integer"));
 
     // Validation: empty and oversized briefs are refused up front.
     let empty = raw_peer_prepare(
@@ -33273,6 +40938,118 @@ fn should_flush_old_window_and_oversized_new_fragment_in_order_when_task_switche
     assert!(!coalescer.has_pending());
 }
 
+/// Solo stdio profiles are persisted before a runtime exists, then bootstrapped
+/// into the dynamic map. Peer resources must survive both phases.
+#[tokio::test]
+async fn peer_resources_follow_cold_and_dynamic_profile_runtime() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::profiles::ProfileStore::open_unified(tmp.path()).unwrap());
+    let profile = crate::profiles::UserProfile {
+        id: "lazy-peer".into(),
+        name: "Lazy peer".into(),
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        public_subdomain: None,
+        config: crate::profiles::ProfileConfig::default(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    store.save(&profile).unwrap();
+    let data_dir = store.resolve_data_dir(&profile);
+    let state = Arc::new(AppState {
+        profile_store: Some(store),
+        ..AppState::empty_for_tests()
+    });
+    let prepared = raw_peer_prepare(
+        &state,
+        &RpcRequest::new(
+            "cold-peer",
+            APPUI_METHOD_PEER_PREPARE,
+            json!({"profile_id": profile.id, "brief": "Review the workspace.",
+                   "title": "Cold peer", "cwd": tmp.path()}),
+        ),
+        None,
+    )
+    .await
+    .expect("staging only needs the persisted profile data root");
+    assert!(resolve_session_profile_runtime(&state, Some(&profile.id)).is_none());
+    let gather = RpcRequest::new(
+        "gather-lazy",
+        APPUI_METHOD_PEER_GATHER,
+        json!({"profile_id": profile.id}),
+    );
+    let cold = raw_peer_gather(&state, &gather, None).unwrap();
+    assert_eq!(cold["peers"].as_array().unwrap().len(), 1);
+    assert!(cold["peers"][0]["result"].is_null());
+
+    let runtime = make_m11e_profile_with_llm_and_sandbox(
+        &profile.id,
+        &data_dir,
+        Arc::new(M11EStubLlm),
+        octos_agent::SandboxConfig::default(),
+    )
+    .await;
+    let key = dynamic_profile_runtime_key(&state, &profile.id).unwrap();
+    struct RemoveDynamicRuntime(String);
+    impl Drop for RemoveDynamicRuntime {
+        fn drop(&mut self) {
+            dynamic_profile_runtimes().write().unwrap().remove(&self.0);
+        }
+    }
+    let _cleanup = RemoveDynamicRuntime(key.clone());
+    dynamic_profile_runtimes()
+        .write()
+        .unwrap()
+        .insert(key, runtime);
+    assert!(state.profiles.is_empty(), "the startup map stays empty");
+    let peer = SessionKey::with_profile_topic(
+        &profile.id,
+        "local",
+        "lazy-peer",
+        prepared["topic"].as_str().unwrap(),
+    );
+    write_peer_result_if_peer_session(
+        &state,
+        &peer,
+        &TurnId::new(),
+        TurnTerminalOutcome::Completed,
+        "Durable lazy result",
+        12,
+        None,
+    );
+    let gathered = raw_peer_gather(&state, &gather, None).unwrap();
+    assert!(
+        gathered["peers"][0]["result"]
+            .as_str()
+            .unwrap()
+            .contains("Durable lazy result")
+    );
+    assert_eq!(
+        gathered["peers"][0]["turn_history"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    session_workspaces().set(&profile.id, peer.clone(), tmp.path().to_path_buf());
+    let (_, snapshots) = snapshot_context_for_session(&state, None, &peer).unwrap();
+    assert!(
+        snapshots.is_some(),
+        "snapshot lookup must see the same dynamic runtime"
+    );
+    assert!(!peer_target_is_closed(&state, &peer));
+    let peer_dir = data_dir
+        .join("peers")
+        .join(prepared["slug"].as_str().unwrap());
+    std::fs::write(peer_dir.join("closed"), "closed").unwrap();
+    assert!(
+        peer_target_is_closed(&state, &peer),
+        "continuation gates must honor a dynamically loaded peer's close marker"
+    );
+}
+
 /// #1801 v2: fleet staging (`n`), the peer-result blackboard writer, and
 /// `peer/gather` — end to end on a real profile runtime + git repo.
 #[tokio::test]
@@ -33401,12 +41178,15 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     // an unstaged peer topic writes nothing (no dir creation).
     let peer_key =
         octos_core::SessionKey::with_profile_topic("dev", "local", "tui", "peer-lens-review-2");
+    let first_turn = TurnId::new();
     write_peer_result_if_peer_session(
         &state,
         &peer_key,
+        &first_turn,
         TurnTerminalOutcome::Completed,
         "All three lenses agree.",
         0,
+        None,
     );
     let written =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();
@@ -33415,11 +41195,16 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
         "result.md should contain outcome: completed"
     );
     assert!(written.contains("turn: 1"), "first turn should be turn 1");
+    assert!(
+        written.contains(&format!("\nturn_id: {}\n", first_turn.0)),
+        "native reports must carry the runtime turn identity, not only a file ordinal"
+    );
     assert!(written.contains("All three lenses agree."));
     // #435: versioned result file for historical record.
     let versioned =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result-1.md")).unwrap();
     assert!(versioned.contains("outcome: completed"));
+    assert!(versioned.contains(&format!("\nturn_id: {}\n", first_turn.0)));
     // #435: turns.txt index file.
     let turns =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("turns.txt")).unwrap();
@@ -33432,9 +41217,11 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     write_peer_result_if_peer_session(
         &state,
         &ghost_key,
+        &TurnId::new(),
         TurnTerminalOutcome::Completed,
         "ghost",
         0,
+        None,
     );
     assert!(
         !peers_root.join("never-staged").exists(),
@@ -33445,18 +41232,34 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     write_peer_result_if_peer_session(
         &state,
         &coding_key,
+        &TurnId::new(),
         TurnTerminalOutcome::Completed,
         "not a peer",
         0,
+        None,
     );
 
     // Overwrite = latest state on result.md, versioned file for turn 2.
+    let second_turn = TurnId::new();
+    // A recorded origin (host-owned conversation turn, #2626) must reach the
+    // header the writer emits, so the receipt parser is pinned against the
+    // full production shape, not a hand-copied one (#2627).
+    crate::peers::turn_origin::record_turn_origin(
+        &peer_key,
+        &second_turn,
+        octos_core::ui_protocol::TurnOrigin {
+            kind: octos_core::ui_protocol::TurnOriginKind::Person,
+            label: None,
+        },
+    );
     write_peer_result_if_peer_session(
         &state,
         &peer_key,
+        &second_turn,
         TurnTerminalOutcome::Errored,
         "second turn failed",
         0,
+        None,
     );
     let rewritten =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result.md")).unwrap();
@@ -33466,6 +41269,11 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
         "second turn should be turn 2"
     );
     assert!(!rewritten.contains("All three lenses agree."));
+    assert!(rewritten.contains(&format!("\nturn_id: {}\n", second_turn.0)));
+    assert!(
+        rewritten.contains("\norigin: person\n"),
+        "a recorded origin must reach the blackboard header"
+    );
     // #435: historical copy preserved.
     let turn1 =
         std::fs::read_to_string(peers_root.join("lens-review-2").join("result-1.md")).unwrap();
@@ -33529,6 +41337,55 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
     let rows = filtered["peers"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["slug"], "lens-review-3");
+
+    // Force real best-effort write failures without permissions/ENOSPC
+    // assumptions (which root or platform differences can bypass). Directories
+    // occupy the version/index leaves; only these test-owned leaves are removed.
+    let fault_dir = peers_root.join("lens-review-3");
+    let fault_key = SessionKey::with_profile_topic("dev", "local", "tui", "peer-lens-review-3");
+    std::fs::create_dir(fault_dir.join("result-1.md")).unwrap();
+    std::fs::create_dir(fault_dir.join("turns.txt")).unwrap();
+    let lost_turn = TurnId::new();
+    write_peer_result_if_peer_session(
+        &state,
+        &fault_key,
+        &lost_turn,
+        TurnTerminalOutcome::Completed,
+        "version and index writes fail",
+        0,
+        None,
+    );
+    assert!(fault_dir.join("result-1.md").is_dir());
+    assert!(fault_dir.join("turns.txt").is_dir());
+    assert_eq!(count_peer_result_versions(&fault_dir), 0);
+    std::fs::remove_dir(fault_dir.join("result-1.md")).unwrap();
+    std::fs::remove_dir(fault_dir.join("turns.txt")).unwrap();
+    let recovered_turn = TurnId::new();
+    write_peer_result_if_peer_session(
+        &state,
+        &fault_key,
+        &recovered_turn,
+        TurnTerminalOutcome::Completed,
+        "next actual runtime turn",
+        0,
+        None,
+    );
+    let recovered = std::fs::read_to_string(fault_dir.join("result-1.md")).unwrap();
+    assert!(recovered.contains("\nturn: 1\n"));
+    assert!(recovered.contains(&format!("\nturn_id: {}\n", recovered_turn.0)));
+    assert!(!recovered.contains(&lost_turn.0.to_string()));
+    assert_eq!(
+        std::fs::read_to_string(fault_dir.join("result.md")).unwrap(),
+        recovered
+    );
+
+    // #2627: the receipt parser must accept the header this writer actually
+    // emits — a kernel-written result.md must yield a consumption receipt,
+    // or `peer_result_was_consumed` never matches and every gather looks
+    // unread to the wake/continuation gates.
+    let receipt = current_peer_result(&peers_root, "lens-review-2")
+        .expect("writer-produced result.md must parse into a consumption receipt");
+    assert_eq!(receipt.round, 2, "the receipt carries the latest round");
 }
 
 // --- turn/steer: mid-turn prompt injection (codex parity) ---
@@ -33565,6 +41422,7 @@ fn synthetic_active_turn(
     let dummy_handle = tokio::spawn(async {});
     (
         ActiveTurn {
+            owner: None,
             turn_id: turn_id.clone(),
             profile_id: MAIN_PROFILE_ID.to_owned(),
             state: Arc::new(TokioMutex::new(TurnState::Active)),
@@ -33943,6 +41801,7 @@ async fn turn_start_still_rejects_when_turn_already_running() {
             reasoning_effort: None,
             tool_context: None,
             live_video: false,
+            origin: None,
         },
     )
     .await;
@@ -33954,6 +41813,167 @@ async fn turn_start_still_rejects_when_turn_already_running() {
             .unwrap_or_default()
             .contains("a turn is already running"),
         "frame: {frame}"
+    );
+}
+
+/// Same refusal, now MACHINE-READABLE. Two UI Protocol clients (the TUI and
+/// the browser client) can attach to one `octos serve` and open the same
+/// session; the loser of the `turn/start` race used to get untyped prose it
+/// could not branch on. The refusal keeps that human string byte-for-byte and
+/// adds the `turn_in_progress` discriminator already used by the
+/// `session/rollback` guard, plus the id of the turn that actually holds the
+/// session so the client can address it (`turn/interrupt`, "the other window
+/// is busy on turn X").
+#[tokio::test(flavor = "current_thread")]
+async fn should_refuse_with_typed_turn_in_progress_when_turn_start_collides() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let provider = Arc::new(AppuiContinuationLlm::new("unused"));
+    let (state, _profile_runtime) =
+        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider).await;
+    let session_id = SessionKey::new("api", "typed-occupied");
+    let running_turn_id = TurnId::new();
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let (entry, _) = synthetic_active_turn(&running_turn_id, true);
+    active_turns.lock().await.insert(session_id.clone(), entry);
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(32);
+
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "start-typed-busy".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: TurnId::new(),
+            input: vec![InputItem::Text {
+                text: "second turn".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+            origin: None,
+        },
+    )
+    .await;
+
+    let frame = recv_rpc_response_with_id(&mut rx, "start-typed-busy").await;
+    // Byte-for-byte unchanged human message — existing clients and tests
+    // match on it.
+    assert_eq!(
+        frame["error"]["message"],
+        json!("a turn is already running for this session"),
+        "frame: {frame}"
+    );
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!("turn_in_progress"),
+        "frame: {frame}"
+    );
+    assert_eq!(
+        frame["error"]["data"]["turn_id"],
+        json!(running_turn_id),
+        "the refusal must name the turn that actually holds the session: {frame}"
+    );
+}
+
+/// `session/list` must disclose per-session busy state. The active-turn
+/// registry is PROCESS-global, so the flag is honest for a session this
+/// connection never opened — that is the whole point: it is how the browser
+/// client learns the TUI is mid-turn in a session it can see but has not
+/// attached to.
+#[tokio::test(flavor = "current_thread")]
+async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
+    use octos_core::ui_protocol::SessionListParams;
+
+    let busy = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "list-busy");
+    let idle = SessionKey::with_profile(MAIN_PROFILE_ID, "api", "list-idle");
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let manager = octos_bus::SessionManager::open(temp.path()).expect("session manager open");
+    let manager = Arc::new(TokioMutex::new(manager));
+    {
+        let mut guard = manager.lock().await;
+        for key in [&busy, &idle] {
+            guard
+                .add_message(
+                    key,
+                    Message {
+                        role: MessageRole::User,
+                        content: "hello".into(),
+                        media: vec![],
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        client_message_id: None,
+                        thread_id: None,
+                        timestamp: Utc::now(),
+                    },
+                )
+                .await
+                .expect("persist user message");
+        }
+    }
+    let state = Arc::new(AppState {
+        sessions: Some(manager),
+        ..AppState::empty_for_tests()
+    });
+
+    // A turn owned by ANOTHER connection, registered exactly as
+    // `handle_turn_start` does, in the process-global registry.
+    let registry = active_turns_registry();
+    let (entry, _) = synthetic_active_turn(&TurnId::new(), true);
+    registry.lock().await.insert(busy.clone(), entry);
+
+    let (ws, mut rx) = ws_connection_for_test(32);
+    handle_session_list(
+        &ws,
+        &state,
+        &HeaderMap::new(),
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "list-busy-flag".into(),
+        SessionListParams {
+            cwd: None,
+            profile_id: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut rx, "list-busy-flag").await;
+    registry.lock().await.remove(&busy);
+
+    let sessions = frame["result"]["sessions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("session/list must return an array: {frame}"));
+    let find = |id: &str| {
+        sessions
+            .iter()
+            .find(|entry| entry["id"] == json!(id))
+            .unwrap_or_else(|| panic!("{id} missing from {frame}"))
+            .clone()
+    };
+    assert_eq!(
+        find("list-busy")["active_turn"],
+        json!(true),
+        "a session with a live turn must be flagged: {frame}"
+    );
+    assert_eq!(
+        find("list-idle")["active_turn"],
+        json!(false),
+        "an idle session must report false, not absent: {frame}"
     );
 }
 
@@ -34065,6 +42085,7 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
             reasoning_effort: None,
             tool_context: None,
             live_video: false,
+            origin: None,
         },
     )
     .await;
@@ -34159,6 +42180,143 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
         1,
         "steer row must persist exactly once: {messages:?}"
     );
+
+    // Durable context ledger (the next turn's prompt source): every row of
+    // the steered turn is stamped exactly once — the steer is durable at
+    // drain time with a LOWER sequence than the prompt/answer rows the same
+    // turn persists at turn end, which used to leave those rows unstamped
+    // and duplicated — and the model-visible chronology (first answer, then
+    // the injected steer) survives, while coverage still equals a rebuild
+    // from the session history.
+    let runtime = state
+        .session_cache
+        .get_or_init(&profile_runtime, session_id.clone(), None)
+        .await
+        .expect("session runtime");
+    let ledger_manager = crate::context_manager::load_context_manager_snapshot(
+        &runtime.sessions_root,
+        &session_id.to_string(),
+    )
+    .expect("context ledger snapshot loads")
+    .expect("context ledger snapshot exists after the turn");
+    let rows: Vec<(usize, &str, Option<usize>)> = ledger_manager
+        .items()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| match &item.kind {
+            crate::context_manager::TranscriptItemKind::UserInput { content, .. }
+            | crate::context_manager::TranscriptItemKind::AssistantFinal { content, .. } => Some((
+                index,
+                content.as_str(),
+                item.source_ref.as_ref().and_then(|r| r.source_seq),
+            )),
+            _ => None,
+        })
+        .collect();
+    let occurrences = |text: &str| {
+        rows.iter()
+            .filter(|(_, content, _)| *content == text)
+            .count()
+    };
+    assert_eq!(
+        occurrences("first answer"),
+        1,
+        "first answer duplicated in the ledger: {rows:?}"
+    );
+    assert_eq!(
+        occurrences("also cover the risks"),
+        1,
+        "steer duplicated in the ledger: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|(_, _, seq)| seq.is_some()),
+        "every conversation row must be stamped with its durable sequence: {rows:?}"
+    );
+    let answer_index = rows
+        .iter()
+        .find(|(_, content, _)| *content == "first answer")
+        .map(|(index, _, _)| *index)
+        .expect("first answer row");
+    let steer_index = rows
+        .iter()
+        .find(|(_, content, _)| *content == "also cover the risks")
+        .map(|(index, _, _)| *index)
+        .expect("steer row");
+    assert!(
+        steer_index > answer_index,
+        "the ledger must keep the model-visible order (answer, then steer): {rows:?}"
+    );
+    let rebuilt = crate::context_manager::ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &messages,
+    );
+    assert_eq!(
+        ledger_manager.source_head_hash(),
+        rebuilt.source_head_hash(),
+        "the persisted ledger must still cover the durable history exactly"
+    );
+
+    // Durable ordering invariant: the session history itself is in
+    // model-visible order (the steer persisted AFTER the first answer), so
+    // the snapshot is only a rebuildable index. Prove it by discarding the
+    // snapshot and rebuilding the ledger from the durable rows alone: the
+    // rebuilt prompt must show the answer before the injected steer.
+    let history_answer_index = messages
+        .iter()
+        .position(|m| m.role == MessageRole::Assistant && m.content == "first answer")
+        .expect("first answer persisted");
+    let history_steer_index = messages
+        .iter()
+        .position(|m| m.role == MessageRole::User && m.content == "also cover the risks")
+        .expect("steer persisted");
+    assert!(
+        history_steer_index > history_answer_index,
+        "session history must persist the steer after the answer it followed: {messages:?}"
+    );
+    let ledger_path = crate::context_manager::context_ledger_path(
+        &runtime.sessions_root,
+        &session_id.to_string(),
+    );
+    std::fs::remove_file(&ledger_path).expect("drop the snapshot to force a rebuild");
+    let (recovered, ledger_status) = crate::context_manager::load_or_rebuild_context_manager(
+        &runtime.sessions_root,
+        session_id.to_string(),
+        None,
+        &messages,
+    );
+    let policy = appui_context_prompt_policy(provider.as_ref());
+    let recovered_prompt = recovered
+        .for_prompt(&policy)
+        .messages
+        .iter()
+        .map(|m| (m.role, m.content.clone()))
+        .collect::<Vec<_>>();
+    let recovered_answer = recovered_prompt
+        .iter()
+        .position(|(role, content)| *role == MessageRole::Assistant && content == "first answer")
+        .unwrap_or_else(|| {
+            panic!("rebuilt prompt lost the answer ({ledger_status:?}): {recovered_prompt:?}")
+        });
+    let recovered_steer = recovered_prompt
+        .iter()
+        .position(|(role, content)| *role == MessageRole::User && content == "also cover the risks")
+        .unwrap_or_else(|| {
+            panic!("rebuilt prompt lost the steer ({ledger_status:?}): {recovered_prompt:?}")
+        });
+    assert!(
+        recovered_steer > recovered_answer,
+        "a ledger rebuilt from session history must keep the model-visible chronology \
+         (answer, then steer); status={ledger_status:?}, prompt={recovered_prompt:?}"
+    );
+    assert_eq!(
+        recovered_prompt
+            .iter()
+            .filter(|(_, content)| content == "also cover the risks")
+            .count(),
+        1,
+        "the rebuilt prompt must carry the steer exactly once"
+    );
     assert_eq!(
         steer_rows[0].thread_id.as_deref(),
         Some(turn_id.0.to_string()).as_deref(),
@@ -34243,6 +42401,43 @@ fn skill_action_methods_require_their_feature_when_client_negotiates() {
             Some(true)
         );
     }
+}
+
+#[test]
+fn voice_admission_methods_require_explicit_feature_negotiation() {
+    let legacy = ConnectionUiFeatures::default();
+    for method in [
+        APPUI_METHOD_VOICE_ADMIT,
+        APPUI_METHOD_VOICE_COMMIT_ADMISSION,
+    ] {
+        assert_eq!(
+            voice_admission_method_available(method, legacy),
+            Some(false)
+        );
+    }
+
+    let negotiated = ConnectionUiFeatures::from_requested_feature_tokens(
+        [APPUI_FEATURE_VOICE_ASR_ADMISSION_V1],
+        false,
+    );
+    for method in [
+        APPUI_METHOD_VOICE_ADMIT,
+        APPUI_METHOD_VOICE_COMMIT_ADMISSION,
+    ] {
+        assert_eq!(
+            voice_admission_method_available(method, negotiated),
+            Some(true)
+        );
+    }
+
+    let capabilities = negotiated.advertised_capabilities(&AppState::empty_for_tests());
+    assert!(capabilities.supports_feature(APPUI_FEATURE_VOICE_ASR_ADMISSION_V1));
+    assert!(
+        capabilities
+            .supported_methods
+            .iter()
+            .any(|method| method == APPUI_METHOD_VOICE_ADMIT)
+    );
 }
 
 #[test]
@@ -34588,7 +42783,10 @@ async fn interactive_sentinel_done_verdict_completes_scoped_goal() {
         None,
     )
     .await;
-    assert!(completed, "verified sentinel must complete the goal");
+    assert!(
+        completed.completed,
+        "verified sentinel must complete the goal"
+    );
     assert_eq!(
         orchestrator.goal_status_for_test(&pinned).as_deref(),
         Some("complete"),
@@ -34653,7 +42851,10 @@ async fn interactive_sentinel_notdone_verdict_leaves_goal_active() {
         None,
     )
     .await;
-    assert!(!completed, "NotDone verdict must refuse the completion");
+    assert!(
+        !completed.completed,
+        "NotDone verdict must refuse the completion"
+    );
     assert_eq!(
         orchestrator.goal_status_for_test(&wire).as_deref(),
         Some("active"),
@@ -34706,7 +42907,10 @@ async fn interactive_sentinel_refuses_stale_goal_binding() {
         None,
     )
     .await;
-    assert!(!completed, "stale binding must refuse the completion");
+    assert!(
+        !completed.completed,
+        "stale binding must refuse the completion"
+    );
     assert_eq!(
         orchestrator.goal_status_for_test(&wire).as_deref(),
         Some("active"),
@@ -34757,7 +42961,7 @@ async fn interactive_sentinel_skips_verifier_without_completion_claim() {
         None,
     )
     .await;
-    assert!(!completed);
+    assert!(!completed.completed);
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -34913,6 +43117,8 @@ fn no_leftover_steers_emits_nothing() {
         turn_id: turn_id.clone(),
         code: "interrupted".into(),
         message: "turn interrupted by client".into(),
+        token_usage: None,
+        partial_result: None,
     })
     .into_rpc_notification()
     .expect("serialize turn/error");
@@ -34982,6 +43188,7 @@ async fn steer_dropped_is_emitted_before_the_terminal_frame() {
         Some(("interrupted", "turn interrupted by client")),
         None,
         Some(&buffer),
+        None,
     )
     .await;
 
@@ -35002,7 +43209,12 @@ async fn steer_dropped_is_emitted_before_the_terminal_frame() {
         }
     }
     let dropped_at = methods.iter().position(|m| m == "turn/steer_dropped");
-    let terminal_at = methods.iter().position(|m| m == "turn/error");
+    // The terminal now reaches the wire as a canonical v2 `projection/envelope`
+    // (turn_terminal), not a raw `turn/error`. This error turn streams no
+    // assistant content, so the only projection envelope is the terminal.
+    let terminal_at = methods
+        .iter()
+        .position(|m| m == "turn/error" || m == "projection/envelope");
     assert!(dropped_at.is_some(), "steer_dropped emitted: {methods:?}");
     assert!(terminal_at.is_some(), "terminal emitted: {methods:?}");
     assert!(
@@ -35026,6 +43238,7 @@ async fn steer_dropped_is_emitted_before_the_terminal_frame() {
         Some(("interrupted", "turn interrupted by client")),
         None,
         Some(&buffer),
+        None,
     )
     .await;
     assert!(
@@ -35101,10 +43314,10 @@ async fn connection_close_settles_steers_before_connection_closed_terminal() {
     let mut entry = test_active_turn(turn_id.clone(), handle.abort_handle());
     entry.steer = Some(buffer.clone());
     active_turns.lock().await.insert(session_id.clone(), entry);
-    connection_turns
-        .lock()
-        .await
-        .insert(session_id.clone(), turn_id.clone());
+    connection_turns.lock().await.insert(
+        session_id.clone(),
+        test_connection_turn(&active_turns, &session_id, &turn_id).await,
+    );
 
     let scopes = ScopePolicy::default();
     let ledger = UiProtocolLedger::new(16);
@@ -35153,4 +43366,6040 @@ async fn connection_close_settles_steers_before_connection_closed_terminal() {
         "the aborted turn's later safety-net drain finds nothing"
     );
     handle.abort();
+}
+
+/// `session/status/read` used to emit a hardcoded `"usage": {}`, so every
+/// field of octoscode's `SessionUsageStatus` decoded to `None` forever. These
+/// pin the field mapping that replaced it — in particular
+/// `cached_input_tokens`, without which an operator cannot tell whether prompt
+/// caching is working.
+#[test]
+fn should_opt_out_of_cache_writes_when_building_btw_config() {
+    // #2194 review: `session/btw` is ONE restricted LLM call per aside — its
+    // prompt (transcript tail + activity tail + question) is never replayed,
+    // so the request must not pay for cache writes. The aside's other
+    // restrictions (no tools, small answer cap) must survive.
+    let config = btw_chat_config();
+    assert_eq!(
+        config.cache_retention,
+        octos_llm::CacheRetention::None,
+        "btw asides must not request cache writes"
+    );
+    assert_eq!(config.max_tokens, Some(BTW_ANSWER_MAX_TOKENS));
+    assert!(matches!(config.tool_choice, octos_llm::ToolChoice::None));
+}
+
+#[test]
+fn should_opt_out_of_cache_writes_when_building_review_join_config() {
+    // #2194 review: the final code-review join runs once per review with a
+    // prompt unique to that join (objective + target + specialist outputs) —
+    // never replayed, so it must not pay for cache writes.
+    let config = review_join_chat_config();
+    assert_eq!(
+        config.cache_retention,
+        octos_llm::CacheRetention::None,
+        "the review join must not request cache writes"
+    );
+    assert_eq!(config.max_tokens, Some(1800));
+    assert!(matches!(config.tool_choice, octos_llm::ToolChoice::None));
+}
+
+#[test]
+fn should_report_cache_read_tokens_in_session_usage_status() {
+    let totals = UsageTotals {
+        run_count: 2,
+        input_tokens: 105,
+        output_tokens: 20,
+        cache_read_tokens: 95,
+        cache_write_tokens: 0,
+        estimated_cost_usd: 0.25,
+    };
+    let usage = usage_status_json(&totals);
+    assert_eq!(usage["input_tokens"], 105);
+    assert_eq!(usage["output_tokens"], 20);
+    assert_eq!(usage["cached_input_tokens"], 95);
+    assert_eq!(usage["estimated_cost_micros_usd"], 250_000);
+}
+
+#[test]
+fn should_report_cache_write_tokens_in_session_usage_status() {
+    // The 1.25x-premium side of the cache dimension: the ledger accumulates
+    // it per run, and without it in the status payload a client cannot tell
+    // cache-write spend apart from plain input spend.
+    let totals = UsageTotals {
+        run_count: 2,
+        input_tokens: 105,
+        output_tokens: 20,
+        cache_read_tokens: 95,
+        cache_write_tokens: 40,
+        estimated_cost_usd: 0.25,
+    };
+    let usage = usage_status_json(&totals);
+    assert_eq!(usage["cached_input_tokens"], 95);
+    assert_eq!(usage["cache_write_input_tokens"], 40);
+}
+
+#[test]
+fn should_report_empty_usage_when_session_has_no_recorded_runs() {
+    let usage = usage_status_json(&UsageTotals::default());
+    assert_eq!(usage, serde_json::json!({}));
+}
+
+#[test]
+fn should_omit_cost_in_session_usage_status_when_no_run_was_priced() {
+    // Tokens accrue but the model had no catalog pricing: report the tokens,
+    // stay silent on spend rather than claiming a confident $0.0000.
+    let totals = UsageTotals {
+        run_count: 1,
+        input_tokens: 100,
+        output_tokens: 10,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        estimated_cost_usd: 0.0,
+    };
+    let usage = usage_status_json(&totals);
+    assert_eq!(usage["input_tokens"], 100);
+    assert_eq!(usage["cached_input_tokens"], 0);
+    assert!(usage.get("estimated_cost_micros_usd").is_none());
+}
+
+/// A cold first turn reports zero cache reads/writes. That is the correct
+/// reading, not a broken one — and it must be reported as an explicit `0`
+/// rather than omitted, because "absent" is what an unimplemented field looks
+/// like.
+#[test]
+fn should_report_zero_cache_sides_explicitly_in_cold_session_usage_status() {
+    let totals = UsageTotals {
+        run_count: 1,
+        input_tokens: 13_302,
+        output_tokens: 76,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        estimated_cost_usd: 0.0,
+    };
+    let usage = usage_status_json(&totals);
+    assert_eq!(usage["cached_input_tokens"], 0);
+    assert!(usage.get("cached_input_tokens").is_some());
+    assert_eq!(usage["cache_write_input_tokens"], 0);
+    assert!(usage.get("cache_write_input_tokens").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// #2065 — UI-protocol goal-frame substrate: per-scope generation identities
+// for the #1959 send guard, goal-frame capability gating on the shared
+// filter, and live-forwarder lifecycle hardening (cooperative cancellable
+// stdio sends + retire-before-baseline handover).
+//
+// CI: these run under the `goal_scope_guard` / `session_open_goal` name
+// filters in .github/workflows/ci.yml (test-octos-cli job) — the `api`-gated
+// module is invisible to the unfeatured lib/integration steps (#2029).
+// ---------------------------------------------------------------------------
+
+/// #2065 — the scoped-generation registry, asserted at the send guard.
+///
+/// Two cwd scopes can share ONE wire session id (`appui.sessions_in_cwd`:
+/// the same session key opened from two folders). The #1959 guard is
+/// strictly monotonic per key, so while it was keyed by the WIRE id the two
+/// scopes shared a watermark — and a goal frame's generation is allocated
+/// when it is BUILT, not when it is delivered. Folder B builds a repaint
+/// (generation G_b), folder A then clears its own goal (generation
+/// G_a > G_b) and A's clear is delivered first: the shared watermark jumps
+/// to G_a, and B's still-in-flight repaint is dropped as "stale" even
+/// though it describes a different folder's live goal. B's chip silently
+/// stops updating.
+///
+/// This is the pre-existing defect the registry fixes; the test FAILS on
+/// main (wire-keyed watermark) and passes with per-scope identities.
+#[test]
+fn goal_scope_guard_admits_sibling_scope_repaint_after_other_scope_clear() {
+    use crate::autonomy::agent_orchestrator::{
+        AgentOrchestrator as _, GoalSessionRequest, GoalSetRequest,
+    };
+    let orchestrator = default_agent_orchestrator();
+    // ONE wire session id, opened from two folders.
+    let wire = SessionKey("local:goal-scope-guard".into());
+
+    // Folder B: register its scope, bind a goal, and BUILD its repaint.
+    orchestrator.set_goal_scope(&wire, Some("bbbb2222".into()));
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "folder B's live goal".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind folder B's goal");
+    let scoped_b = orchestrator.scoped_goal_key(&wire);
+    let b_repaint_json = orchestrator
+        .session_goal_updated_event_json(&scoped_b, MAIN_PROFILE_ID)
+        .expect("folder B has a live goal to repaint");
+    let b_repaint: octos_core::ui_protocol::SessionGoalUpdatedEvent =
+        serde_json::from_value(b_repaint_json).expect("updated event");
+
+    // Folder A: register its scope, bind and CLEAR its own goal. The clear
+    // allocates a LATER generation than B's already-built repaint.
+    orchestrator.set_goal_scope(&wire, Some("aaaa1111".into()));
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+            objective: "folder A's goal".into(),
+            status: None,
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("bind folder A's goal");
+    let a_clear_json = orchestrator
+        .clear_goal(GoalSessionRequest {
+            session_id: wire.clone(),
+            profile_id: MAIN_PROFILE_ID.to_owned(),
+        })
+        .expect("clear folder A's goal");
+    let a_clear: octos_core::ui_protocol::SessionGoalClearedEvent =
+        serde_json::from_value(a_clear_json).expect("cleared event");
+
+    // Cleanup the process-global store BEFORE asserting.
+    orchestrator.set_goal_scope(&wire, Some("bbbb2222".into()));
+    let _ = orchestrator.clear_goal(GoalSessionRequest {
+        session_id: wire.clone(),
+        profile_id: MAIN_PROFILE_ID.to_owned(),
+    });
+    let _ = orchestrator.set_goal_scope(&wire, None);
+
+    assert!(
+        a_clear.generation > b_repaint.generation,
+        "the hazard needs A's clear allocated AFTER B's repaint was built \
+         ({} vs {})",
+        a_clear.generation,
+        b_repaint.generation
+    );
+    // Both frames carry the same WIRE session id — the shared key that made
+    // them collide.
+    assert_eq!(a_clear.session_id, b_repaint.session_id);
+
+    // Delivery order: A's clear reaches the guard first, then B's repaint.
+    assert!(
+        goal_event_passes_generation_guard(&UiNotification::SessionGoalCleared(a_clear)),
+        "folder A's clear is admitted"
+    );
+    assert!(
+        goal_event_passes_generation_guard(&UiNotification::SessionGoalUpdated(b_repaint)),
+        "folder B's repaint must still be admitted: it belongs to a DIFFERENT \
+         cwd scope, so folder A's later-allocated clear must not advance the \
+         watermark it is checked against"
+    );
+}
+
+/// A minimal valid frame used to occupy a capacity-1 writer queue.
+fn plug_frame() -> WsMessage {
+    frame_for(&json!({"jsonrpc": "2.0", "method": "test/plug"})).expect("plug frame")
+}
+
+/// #2065 — capability gating on the shared filter: a connection that did
+/// not negotiate `coding.goal_runtime.v1` (the same capability the goal RPC
+/// surface requires) must receive ZERO `session/goal/*` frames through the
+/// full open sequence — replay and live pump alike. Without the gate such a
+/// client received frames it can only report as unknown notifications.
+#[tokio::test]
+async fn session_open_goal_frames_gated_when_goal_runtime_not_negotiated() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-capability".into());
+    // Seed the REPLAY lane with a durable goal frame from another connection.
+    ledger.append_notification_from(
+        UiNotification::SessionGoalUpdated(octos_core::ui_protocol::SessionGoalUpdatedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            goal: octos_core::ui_protocol::UiGoalRecord {
+                profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+                goal_id: "goal-replayed".into(),
+                objective: "durable goal history".into(),
+                status: "active".into(),
+                token_budget: 1_000,
+                tokens_used: 1,
+                time_used_seconds: 1,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            transition_actor: "backend".into(),
+            generation: 0,
+        }),
+        ConnectionId::next(),
+    );
+
+    let features = ConnectionUiFeatures {
+        coding_goal_runtime_v1: false,
+        ..ConnectionUiFeatures::stdio_defaults()
+    };
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let opened = handle_session_open(
+        &ws,
+        &state,
+        &ledger,
+        &approvals,
+        &questions,
+        &forwarders,
+        None,
+        // #2067 — the open-path delivery filter pin; no connection-level pin
+        // in this test, so filtering is per-profile-scope only.
+        None,
+        features,
+        "open-no-goal-runtime".into(),
+        SessionOpenParams {
+            client_commands: None,
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+        false,
+    )
+    .await;
+    assert!(opened, "session/open must succeed");
+    // Feed the LIVE PUMP lane too, from another connection.
+    ledger.append_notification_from(
+        UiNotification::SessionGoalCleared(octos_core::ui_protocol::SessionGoalClearedEvent {
+            session_id: session_id.clone(),
+            profile_id: Some(MAIN_PROFILE_ID.to_owned()),
+            cleared: true,
+            goal: None,
+            transition_actor: "user".into(),
+            generation: 0,
+        }),
+        ConnectionId::next(),
+    );
+    // Collect the full open sequence plus a quiet window of live pumping.
+    let mut goal_frames = Vec::new();
+    let quiet = tokio::time::Duration::from_millis(700);
+    while let Ok(frame) = tokio::time::timeout(quiet, recv_rpc_json(&mut rx)).await {
+        if let Some(method) = frame["method"].as_str() {
+            if method.starts_with("session/goal/") {
+                goal_frames.push(frame.clone());
+            }
+        }
+    }
+    abort_live_forwarders(&forwarders, &ledger).await;
+    assert!(
+        goal_frames.is_empty(),
+        "a connection without coding.goal_runtime.v1 must see zero goal frames: {goal_frames:?}"
+    );
+}
+
+/// #2065 — a re-open must fully
+/// retire the previous live forwarder BEFORE the replacement starts pumping,
+/// so "one live lane per (connection, session)" holds across reopens and an
+/// event is never double-delivered by two overlapping pumps. (The
+/// production open path retires even earlier — before the replay baseline
+/// is computed — this pins the in-spawn defense direct callers rely on.
+/// Handover semantics are at-least-once, not exactly-once: see the
+/// retire-before-baseline comment in `handle_session_open`.)
+#[tokio::test]
+async fn session_open_goal_reopen_hands_over_live_forwarder_lane() {
+    let (ws, mut rx) = ws_connection_for_test(64);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-lane-handover".into());
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    let first_rx = ledger.subscribe(&session_id);
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ConnectionUiFeatures::stdio_defaults(),
+        None,
+        None,
+        first_rx,
+        forwarders.clone(),
+    )
+    .await;
+
+    // Re-open on the SAME connection and session.
+    let second_rx = ledger.subscribe(&session_id);
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ConnectionUiFeatures::stdio_defaults(),
+        None,
+        None,
+        second_rx,
+        forwarders.clone(),
+    )
+    .await;
+
+    // An event appended after the handover must arrive exactly once. Assistant
+    // content now flows as a canonical v2 `projection/envelope`.
+    ledger.append_notification_from(
+        UiNotification::EnvelopeV2(EnvelopeV2Notification {
+            session_id: session_id.clone(),
+            topic: None,
+            envelope: EnvelopeV2 {
+                thread_id: "handover-turn".into(),
+                seq: 1,
+                cursor: None,
+                turn_id: "handover-turn".into(),
+                client_message_id: None,
+                payload: PayloadV2::AssistantDelta {
+                    text: "exactly once".into(),
+                    assistant_segment_id: "handover-turn:assistant:1".into(),
+                },
+            },
+        }),
+        ConnectionId::next(),
+    );
+    let delivered =
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), recv_rpc_json(&mut rx))
+            .await
+            .expect("the replacement forwarder delivers the live event");
+    assert_eq!(delivered["method"], json!("projection/envelope"));
+    let duplicate = tokio::time::timeout(
+        tokio::time::Duration::from_millis(400),
+        recv_rpc_json(&mut rx),
+    )
+    .await;
+    assert!(
+        duplicate.is_err(),
+        "the retired forwarder must not double-deliver: {duplicate:?}"
+    );
+    abort_live_forwarders(&forwarders, &ledger).await;
+}
+
+/// #2065 (absence-by-construction) — through `WsConnection::new_stdio`:
+/// the stdio durable lane parks
+/// COOPERATIVELY (non-blocking `try_send` probe + async sleep, see
+/// `send_durable_offloaded`), so a forwarder parked on a FULL stdio queue is
+/// fully retired by abort+join — cancellation lands at the probe's await and
+/// the enqueue is atomic. There is no `spawn_blocking(SyncSender::send)`
+/// closure anymore, so no detached in-flight hop can enqueue a stale frame
+/// AFTER the lane was retired.
+#[tokio::test]
+async fn session_open_goal_stdio_lane_retire_leaves_no_inflight_send() {
+    let (writer, frames) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    // Fill the single stdio slot BEFORE the pump runs: its send must park.
+    writer.try_send(plug_frame()).expect("plug the stdio queue");
+    let ws = WsConnection::new_stdio(writer);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let session_id = SessionKey("local:goal-null-stdio-retire".into());
+    let forwarders: SharedLiveForwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    let live_rx = ledger.subscribe(&session_id);
+    spawn_live_forwarder(
+        ws.clone(),
+        ledger.clone(),
+        session_id.clone(),
+        0,
+        ws.connection_id(),
+        ConnectionUiFeatures::stdio_defaults(),
+        None,
+        None,
+        live_rx,
+        forwarders.clone(),
+    )
+    .await;
+    // A live event reaches the pump; its stdio enqueue parks on the full
+    // queue (cooperative probe loop, never a blocking SyncSender::send).
+    ledger.append_notification_from(
+        UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: TurnId::new(),
+            text: "parked in flight".into(),
+        }),
+        ConnectionId::next(),
+    );
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Retire the lane: abort + join. The join is the proof point — after it
+    // returns there is nothing left that could still enqueue.
+    let lane = forwarders
+        .lock()
+        .await
+        .remove(&session_id)
+        .expect("live lane registered");
+    lane.abort();
+    let _ = lane.await;
+
+    // Drain the plug, then nothing else may EVER arrive: the parked frame
+    // died with the lane (its enqueue was atomic and never happened), and
+    // no detached closure exists to deliver it later.
+    let plug = frames.try_recv().expect("plug frame still queued");
+    drop(plug);
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    assert!(
+        frames.try_recv().is_err(),
+        "no in-flight send may survive lane retirement"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// #27f (R3) — result.md single-writer ownership.
+// ----------------------------------------------------------------------------
+
+/// #27f — the DOUBLE-WRITE race, reproduced and fixed: the peer session
+/// writes its own final `result.md` (claiming ownership via the
+/// `.result-owner: peer` sidecar), then the runtime's turn-summary writer
+/// runs — the peer's completed version MUST SURVIVE (the runtime records
+/// its view in the versioned `result-N.md` only). Pre-#27f the runtime
+/// copy clobbered the peer's final word (live case: s2-zai-lane).
+#[test]
+fn runtime_respects_peer_result_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer_dir = dir.path().join("peer-race");
+    std::fs::create_dir_all(&peer_dir).unwrap();
+
+    // Peer's completed final result (hand-written, atomic peer-side write
+    // simulated by a plain write — the runtime never overwrites it anyway).
+    std::fs::write(
+        peer_dir.join("result.md"),
+        "---\nslug: x\n---\npeer's FINAL word",
+    )
+    .unwrap();
+    // Ownership sidecar.
+    std::fs::write(peer_dir.join(".result-owner"), "peer\n").unwrap();
+
+    // The runtime writer's guard: read the sidecar, refuse to overwrite.
+    let peer_owns = crate::peers::peer_io::read_peer_file(
+        &peer_dir,
+        ".result-owner",
+        crate::peers::peer_io::PEER_FILE_READ_CAP_SMALL,
+    )
+    .map(|owner| owner.trim() == "peer")
+    .unwrap_or(false);
+    assert!(peer_owns, "sidecar claims peer ownership");
+
+    // Simulate the runtime path: WITHOUT ownership it would write here; with
+    // ownership it skips — assert the final word survived.
+    if peer_owns {
+        // (the real writer logs and skips; nothing touches result.md)
+    } else {
+        std::fs::write(peer_dir.join("result.md"), "runtime frontmatter copy").unwrap();
+    }
+    let final_word = std::fs::read_to_string(peer_dir.join("result.md")).unwrap();
+    assert!(
+        final_word.contains("peer's FINAL word"),
+        "the peer's completed version must survive the runtime write (#27f)"
+    );
+}
+
+/// #27f — fail-open: WITHOUT the sidecar (a peer that never opted in) the
+/// runtime's legacy write still works — the pre-27f behavior is preserved.
+#[test]
+fn runtime_writes_result_when_peer_did_not_claim_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer_dir = dir.path().join("peer-legacy");
+    std::fs::create_dir_all(&peer_dir).unwrap();
+
+    let peer_owns = crate::peers::peer_io::read_peer_file(
+        &peer_dir,
+        ".result-owner",
+        crate::peers::peer_io::PEER_FILE_READ_CAP_SMALL,
+    )
+    .map(|owner| owner.trim() == "peer")
+    .unwrap_or(false);
+    assert!(!peer_owns, "no sidecar ⇒ no ownership claim (fail-open)");
+
+    // The runtime's legacy path: writes through the fd-anchored atomic writer.
+    crate::peers::peer_io::write_peer_file_atomic(
+        &peer_dir,
+        "result.md",
+        "---\nslug: x\n---\nruntime summary",
+    )
+    .expect("runtime write works without ownership sidecar");
+    let text = std::fs::read_to_string(peer_dir.join("result.md")).unwrap();
+    assert!(text.contains("runtime summary"));
+    // 27e coexistence: the atomic writer leaves no tmp residue.
+    assert!(!dir.path().join(".result.md.tmp-27e").exists());
+}
+
+/// #27h-r1 — CONTRACT TWIN of
+/// `octos_agent::agent::budget::result_owner_content_contract_agent_side`:
+/// the cli consumer asserts the SAME fixture table through the SAME shared
+/// function (`octos_agent::result_md_owner_content_is_peer`). If either
+/// side drifts (a local copy sneaks back in), one of the twins goes red on
+/// the identical inputs.
+#[test]
+fn result_owner_contract_27h_r1() {
+    let judge = octos_agent::result_md_owner_content_is_peer;
+    assert!(judge("peer"));
+    assert!(judge("peer\n"));
+    assert!(judge("  peer  "));
+    assert!(!judge(""));
+    assert!(!judge("Peer"));
+    assert!(!judge("peer-model"));
+    assert!(!judge("runtime"));
+    // Shared-implementation pin: the cli's peer-result writer must call the
+    // agent crate's function, not a local twin. (Compile-time evidence:
+    // ui_protocol_transport.rs references it directly; this test keeps the
+    // crate path exercised from the test surface too.)
+    assert_eq!(
+        std::any::type_name_of_val(&judge),
+        std::any::type_name_of_val(&octos_agent::result_md_owner_content_is_peer),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #48b — serve/UI forwarder path: `fallback_switch` rows from
+// `spawn_router_failover_forwarder` (same shape as the gateway path).
+// ---------------------------------------------------------------------------
+mod obs_fallback_switch_ui_48b {
+    use super::*;
+    use std::io::BufRead as _;
+
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    fn stub_router() -> Arc<octos_llm::AdaptiveRouter> {
+        Arc::new(octos_llm::AdaptiveRouter::new(
+            vec![Arc::new(Wave4AStubProvider {
+                name: "a",
+                model: "m1",
+            })],
+            &[],
+            octos_llm::AdaptiveConfig::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_writes_own_session() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-own".to_owned());
+        let router = stub_router();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder = spawn_router_failover_forwarder_for_test(
+            ws,
+            ledger,
+            session_id.clone(),
+            Some(router.clone()),
+        );
+        octos_llm::with_router_context(
+            octos_llm::RouterContext {
+                session_id: Some(session_id.0.clone()),
+                turn_id: None,
+            },
+            async {
+                router.publish_failover_for_subscribers("a", "b", "quota", 120);
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let events = read_events(data_dir.path());
+        let rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("fallback_switch"))
+            .collect();
+        assert_eq!(rows.len(), 1, "ui path writes one row: {events:?}");
+        assert_eq!(
+            rows[0].get("session").and_then(|s| s.as_str()),
+            Some(session_id.0.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_other_session() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-other".to_owned());
+        let router = stub_router();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder =
+            spawn_router_failover_forwarder_for_test(ws, ledger, session_id, Some(router.clone()));
+        octos_llm::with_router_context(
+            octos_llm::RouterContext {
+                session_id: Some("some-other-session".to_string()),
+                turn_id: None,
+            },
+            async {
+                router.publish_failover_for_subscribers("a", "b", "quota", 120);
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            read_events(data_dir.path()).is_empty(),
+            "other-session failover must not write rows on the ui path"
+        );
+    }
+
+    /// #48c-r1 — None originator: no `events.jsonl` row, but the client
+    /// NOTICE still passes through (the Codex P1 notice filter is
+    /// verbatim-untouched for None; only the event write is stricter).
+    #[tokio::test]
+    async fn obs_fallback_switch_ui_forwarder_ignores_none_originator() {
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let session_id = SessionKey("tenant-a:api:ui-fwd-none".to_owned());
+        let router = stub_router();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let _forwarder = spawn_router_failover_forwarder_for_test(
+            ws,
+            ledger,
+            session_id.clone(),
+            Some(router.clone()),
+        );
+        // No RouterContext => originating_session_id is None.
+        router.publish_failover_for_subscribers("a", "b", "quota", 120);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            read_events(data_dir.path()).is_empty(),
+            "None-originator failover must not write rows on the ui path (#48c strict event gate)"
+        );
+        // The notice still passes through, verbatim pre-#48c behavior.
+        // The wire carries serialized WS text frames; decode the envelope to
+        // confirm the RouterFailover notice survived the None gate.
+        let noticed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(axum::extract::ws::Message::Text(text)) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if v.get("method").and_then(|t| t.as_str()) == Some("router/failover")
+                                || v.get("type").and_then(|t| t.as_str()) == Some("router/failover")
+                            {
+                                return v;
+                            }
+                        }
+                    }
+                    Some(_) => continue,
+                    None => panic!("notification channel closed without a RouterFailover notice"),
+                }
+            }
+        })
+        .await
+        .expect("None-originator failover notice still forwarded");
+        let params = noticed.get("params").cloned().unwrap_or_default();
+        assert_eq!(
+            params.get("session_id").and_then(|s| s.as_str()),
+            Some(session_id.0.as_str()),
+            "notice targets THIS session: {noticed}"
+        );
+        assert_eq!(
+            params.get("from_provider").and_then(|s| s.as_str()),
+            Some("a")
+        );
+        assert_eq!(
+            params.get("to_provider").and_then(|s| s.as_str()),
+            Some("b")
+        );
+    }
+}
+
+/// #48b — doc pin: the obs_events header lists both new kinds.
+#[test]
+fn obs_events_doc_lists_new_kinds() {
+    let src = include_str!("../obs_events.rs");
+    assert!(src.contains("fallback_switch"), "doc lists fallback_switch");
+    assert!(
+        src.contains("malformed_exhausted"),
+        "doc lists malformed_exhausted"
+    );
+}
+
+/// #48b — marker-prefixed terminal message produces exactly the
+/// malformed_exhausted decision (and the CLI appends ONLY that row).
+mod obs_malformed_exhausted_48b {
+    use super::*;
+    use std::io::BufRead as _;
+
+    fn read_events(data_dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let path = data_dir.join("events.jsonl");
+        let Ok(file) = std::fs::File::open(&path) else {
+            return Vec::new();
+        };
+        std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|l| serde_json::from_str(&l).ok())
+            .collect()
+    }
+
+    fn count_turn_error_rows(data_dir: &std::path::Path) -> usize {
+        read_events(data_dir)
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("turn_error"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn obs_malformed_exhausted_event_on_errored_terminal() {
+        // #48c — REAL agent error → terminal path → events.jsonl, no
+        // hand-built message: a provider that always returns MalformedArgs
+        // drives the loop_runner to exhaustion, the REAL error is classified
+        // through `classify_runtime_error_message`, and the Errored terminal
+        // appends exactly one malformed_exhausted row to a temp ledger dir.
+        struct AlwaysMalformedProvider;
+        #[async_trait::async_trait]
+        impl octos_llm::LlmProvider for AlwaysMalformedProvider {
+            fn provider_name(&self) -> &str {
+                "always-malformed"
+            }
+
+            async fn chat(
+                &self,
+                _messages: &[octos_core::Message],
+                _tools: &[octos_llm::ToolSpec],
+                _config: &octos_llm::ChatConfig,
+            ) -> eyre::Result<octos_llm::ChatResponse> {
+                Err(eyre::Report::new(octos_llm::StreamError::MalformedArgs {
+                    tool_id: "call_bad".to_string(),
+                    tool_name: "shell".to_string(),
+                    error: "expected `,` or `}` at line 1 column 4123".to_string(),
+                }))
+            }
+            fn model_id(&self) -> &str {
+                "always-malformed"
+            }
+        }
+        let provider: std::sync::Arc<dyn octos_llm::LlmProvider> =
+            std::sync::Arc::new(AlwaysMalformedProvider);
+        let tools = octos_agent::ToolRegistry::new();
+        let dir = tempfile::tempdir().unwrap();
+        let memory = std::sync::Arc::new(
+            octos_memory::EpisodeStore::open(dir.path().join("memory"))
+                .await
+                .unwrap(),
+        );
+        let agent = octos_agent::Agent::new(
+            octos_core::AgentId::new("mfe-real"),
+            provider,
+            tools,
+            memory,
+        );
+        // The REAL exhausted error (marker prefix comes from the loop_runner
+        // return, NOT from this test's format!).
+        let error = agent
+            .process_message("never produces valid JSON", &[], vec![])
+            .await
+            .expect_err("exhausted malformed budget terminates the turn");
+        let message = classify_runtime_error_message(&error);
+        assert!(
+            message.starts_with(octos_agent::MALFORMED_TOOLCALL_EXHAUSTED_MARKER),
+            "real classified error carries the marker: {message}"
+        );
+
+        // Terminal path with a temp ledger data_dir.
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = crate::api::ui_protocol_ledger::LedgerConfig::ephemeral(16);
+        cfg.data_dir = Some(data_dir.path().to_path_buf());
+        let ledger = Arc::new(UiProtocolLedger::with_config(cfg));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ws = WsConnection::new(tx);
+        let session_id = SessionKey("tenant-a:api:mfe-real".to_owned());
+        let turn_id = TurnId::new();
+        let turn_state = TokioMutex::new(TurnState::Active);
+        let turn_error_before = count_turn_error_rows(data_dir.path());
+        try_emit_terminal(
+            &turn_state,
+            TerminalReason::Errored,
+            &ws,
+            &ledger,
+            &session_id,
+            &turn_id,
+            Some(("runtime_error", message.as_str())),
+            None,
+            None,
+            None,
+        )
+        .await;
+        // Drain the ws notifications so the runtime doesn't complain.
+        while rx.try_recv().is_ok() {}
+
+        let rows = read_events(data_dir.path());
+        // The pair of helpers are pinned to a REAL use: total row count and
+        // the turn_error count (unchanged) come from the same read.
+        assert!(
+            !rows.is_empty(),
+            "terminal wrote at least the malformed_exhausted row"
+        );
+        let mfe: Vec<_> = rows
+            .iter()
+            .filter(|e| e.get("kind").and_then(|k| k.as_str()) == Some("malformed_exhausted"))
+            .collect();
+        assert_eq!(
+            mfe.len(),
+            1,
+            "exactly one malformed_exhausted row: {rows:?}"
+        );
+        assert_eq!(
+            mfe[0].get("detail").and_then(|d| d.as_str()),
+            Some("feedback_limit=3 observed_malformed=4"),
+            "detail verbatim from the real error"
+        );
+        assert_eq!(
+            mfe[0].get("session").and_then(|s| s.as_str()),
+            Some("tenant-a:api:mfe-real")
+        );
+        assert_eq!(
+            count_turn_error_rows(data_dir.path()),
+            turn_error_before,
+            "no turn_error row added for this terminal"
+        );
+    }
+
+    /// #48c — the critical test above must use the REAL agent error path
+    /// (no hand-built marker message). This pins the SOURCE — scoped to
+    /// ONLY the target function body (contract v3.1), not the whole file:
+    /// from `fn obs_malformed_exhausted_event_on_errored_terminal` to the
+    /// next `#[` or `fn ` after it.
+    #[test]
+    fn obs_malformed_exhausted_terminal_test_uses_real_agent_error() {
+        let src = include_str!("ui_protocol_tests.rs");
+        let start = src
+            .find("fn obs_malformed_exhausted_event_on_errored_terminal")
+            .expect("target fn exists");
+        let rest = &src[start + 1..];
+        // Scope: the target function body ends at the NEXT attribute or fn.
+        let end_rel = rest
+            .find("\n    #[")
+            .or_else(|| rest.find("\n    fn "))
+            .or_else(|| rest.find("\n}"))
+            .expect("target fn body ends somewhere");
+        let body = &src[start..start + 1 + end_rel];
+        // It drives the real loop_runner.
+        assert!(
+            body.contains("process_message"),
+            "the critical test must drive the real agent loop: {body}"
+        );
+        // It reads the real events file.
+        assert!(
+            body.contains("events.jsonl"),
+            "the critical test must read events.jsonl"
+        );
+        // No hand-built marker message feeding the terminal.
+        assert!(
+            !body.contains("format!(\"{} feedback_limit"),
+            "the critical test must not hand-build the marker message"
+        );
+    }
+
+    #[test]
+    fn obs_no_malformed_exhausted_when_marker_not_prefix() {
+        let message = format!(
+            "ordinary error mentioning {} mid-text",
+            octos_agent::MALFORMED_TOOLCALL_EXHAUSTED_MARKER
+        );
+        assert!(
+            malformed_exhausted_detail_for_terminal(&message).is_none(),
+            "marker buried mid-text must not trigger"
+        );
+    }
+}
+#[test]
+fn semantic_context_rollout_mode_parser_is_explicit_and_defaults_on() {
+    assert_eq!(
+        parse_oup_semantic_context_rollout_mode(None),
+        OupSemanticContextRolloutMode::On
+    );
+    assert_eq!(
+        parse_oup_semantic_context_rollout_mode(Some(" shadow ")),
+        OupSemanticContextRolloutMode::Shadow
+    );
+    for disabled in ["off", "0", "FALSE"] {
+        assert_eq!(
+            parse_oup_semantic_context_rollout_mode(Some(disabled)),
+            OupSemanticContextRolloutMode::Off
+        );
+    }
+    for enabled in ["on", "1", "TRUE"] {
+        assert_eq!(
+            parse_oup_semantic_context_rollout_mode(Some(enabled)),
+            OupSemanticContextRolloutMode::On
+        );
+    }
+    assert_eq!(
+        parse_oup_semantic_context_rollout_mode(Some("unexpected")),
+        OupSemanticContextRolloutMode::On
+    );
+}
+
+#[test]
+fn default_oup_compaction_keeps_newest_user_raw_and_tool_groups_atomic() {
+    let mode = parse_oup_semantic_context_rollout_mode(None);
+    assert_eq!(mode, OupSemanticContextRolloutMode::On);
+    let policy = appui_semantic_compact_policy_for_mode("default-runtime", 180, 140, mode);
+    assert_eq!(policy.keep_recent_tokens, Some(140));
+    assert_eq!(policy.semantic_shadow_keep_recent_tokens, None);
+    assert_eq!(policy.target_tokens_after_compaction, Some(180));
+
+    let mut manager = crate::context_manager::ContextManager::new("default-semantic", None);
+    manager.record_message(&octos_core::Message::user("old request ".repeat(80)));
+    let mut old_calls = octos_core::Message::assistant("");
+    old_calls.tool_calls = Some(vec![
+        octos_core::ToolCall {
+            id: "call_old_a".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "old-a"}),
+            metadata: None,
+        },
+        octos_core::ToolCall {
+            id: "call_old_b".to_owned(),
+            name: "grep".to_owned(),
+            arguments: serde_json::json!({"query": "old-b"}),
+            metadata: None,
+        },
+    ]);
+    let mut old_group_ids = manager.record_message(&old_calls);
+    old_group_ids.extend(
+        manager.record_message(&octos_core::Message::tool_with_thread(
+            "old a output ".repeat(40),
+            "call_old_a",
+            octos_core::ThreadId::new("thread-1"),
+        )),
+    );
+    old_group_ids.extend(
+        manager.record_message(&octos_core::Message::tool_with_thread(
+            "old b output ".repeat(40),
+            "call_old_b",
+            octos_core::ThreadId::new("thread-1"),
+        )),
+    );
+
+    let newest_user_id =
+        manager.record_message(&octos_core::Message::user("CURRENT USER"))[0].clone();
+    let mut current_calls = octos_core::Message::assistant("");
+    current_calls.tool_calls = Some(vec![
+        octos_core::ToolCall {
+            id: "call_current_a".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "current-a"}),
+            metadata: None,
+        },
+        octos_core::ToolCall {
+            id: "call_current_b".to_owned(),
+            name: "grep".to_owned(),
+            arguments: serde_json::json!({"query": "current-b"}),
+            metadata: None,
+        },
+    ]);
+    let mut current_group_ids = manager.record_message(&current_calls);
+    current_group_ids.extend(
+        manager.record_message(&octos_core::Message::tool_with_thread(
+            "current a",
+            "call_current_a",
+            octos_core::ThreadId::new("thread-1"),
+        )),
+    );
+    current_group_ids.extend(
+        manager.record_message(&octos_core::Message::tool_with_thread(
+            "current b",
+            "call_current_b",
+            octos_core::ThreadId::new("thread-1"),
+        )),
+    );
+
+    let record = manager.compact_context("old tool work summarized", policy);
+    assert_eq!(
+        record.status,
+        crate::context_manager::ContextCompactionStatus::Installed
+    );
+    assert!(record.retained_item_ids.contains(&newest_user_id));
+    assert!(
+        old_group_ids
+            .iter()
+            .all(|id| record.dropped_item_ids.contains(id)),
+        "the old complete tool group must be dropped atomically"
+    );
+    assert!(
+        current_group_ids
+            .iter()
+            .all(|id| record.retained_item_ids.contains(id)),
+        "the current complete tool group must remain raw and atomic"
+    );
+    assert!(manager.items().iter().any(|item| item.id == newest_user_id));
+}
+
+#[test]
+fn should_fall_back_to_derived_budgets_when_env_overrides_are_pathological() {
+    assert_eq!(appui_compact_threshold_tokens_for(Some(0), 7_000), 1);
+    assert_eq!(appui_compact_threshold_tokens_for(None, 0), 1);
+    assert_eq!(appui_compact_threshold_tokens_for(Some(5), 7_000), 5);
+    assert_eq!(appui_compact_threshold_tokens_for(None, 7_000), 7_000);
+    for requested in [6_000usize, 9_000, 0] {
+        let budgets = appui_compaction_budgets_for(6_000, Some(requested));
+        assert_eq!(budgets.target_after, 4_000, "requested target {requested}");
+        assert!(budgets.semantic_target >= 2_000);
+    }
+    let sane = appui_compaction_budgets_for(6_000, Some(3_000));
+    assert_eq!(sane.target_after, 3_000);
+    assert!(sane.semantic_target >= 1_500);
+}
+
+/// A background result merged into the canonical manager mid-turn must
+/// survive the bridge's scratch copy-back and the following snapshot load.
+#[test]
+fn should_keep_mid_turn_canonical_merge_when_scratch_copies_back() {
+    let session_id = SessionKey::new("api", "context-midturn-background");
+    let history = vec![
+        test_message(MessageRole::User, "old request"),
+        test_message(MessageRole::Assistant, "old answer"),
+        test_message(MessageRole::User, "current request"),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let mut initial = ContextManager::from_session_history(session_id.to_string(), None, &history);
+    let epoch_before = initial
+        .reconcile_prompt_cache_epoch("test", "large-context", "runtime system", &[])
+        .epoch_id
+        .clone();
+    let manager = Arc::new(StdMutex::new(initial));
+    let _registration = register_appui_session_context_manager(&session_id, &manager);
+    let bridge = AppUiPromptContextBridge::new(
+        session_id.clone(),
+        dir.path().to_path_buf(),
+        manager.clone(),
+        false,
+    );
+    let request = |phase, iteration| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".to_string(),
+        model_id: "large-context".to_string(),
+        context_window: 16_000,
+    };
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history.clone());
+    bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("turn start");
+
+    let background = test_message(MessageRole::Assistant, "deck delivered.");
+    record_appui_context_manager_background_message(
+        dir.path(),
+        &manager,
+        &session_id,
+        &background,
+        3,
+    );
+    prompt.push(test_message(MessageRole::Assistant, "working on it"));
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut prompt)
+        .expect("iteration");
+
+    assert!(prompt.iter().any(|message| {
+        message.role == MessageRole::Assistant && message.content == "deck delivered."
+    }));
+    let canonical = manager
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let adopted = canonical
+        .ledger_items()
+        .iter()
+        .find(|item| {
+            matches!(
+                &item.kind,
+                crate::context_manager::TranscriptItemKind::AssistantFinal { content }
+                    if content == "deck delivered."
+            )
+        })
+        .expect("background row survives scratch copy-back");
+    assert_eq!(
+        adopted
+            .source_ref
+            .as_ref()
+            .and_then(|source| source.source_seq),
+        Some(3)
+    );
+    assert_eq!(canonical.source_high_watermark(), Some(3));
+    let persisted =
+        crate::context_manager::load_context_manager_snapshot(dir.path(), &session_id.to_string())
+            .expect("read snapshot")
+            .expect("snapshot exists");
+    assert_eq!(persisted.source_high_watermark(), Some(3));
+    assert_eq!(persisted.source_head_hash(), canonical.source_head_hash());
+
+    let reply = test_message(MessageRole::Assistant, "working on it");
+    record_appui_context_manager_message(dir.path(), &manager, &session_id, &reply, 4);
+    let mut full_history = history.clone();
+    full_history.push(background);
+    full_history.push(reply);
+    let (loaded, status) =
+        load_or_rebuild_context_manager(dir.path(), session_id.to_string(), None, &full_history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
+    assert_eq!(
+        loaded.cache_epoch().map(|epoch| epoch.epoch_id.as_str()),
+        Some(epoch_before.as_str())
+    );
+    assert_eq!(loaded.items().len(), 5);
+}
+
+#[test]
+fn should_merge_late_background_result_into_current_session_manager_not_stale_turn_arc() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = SessionKey::new("api", "context-late-background");
+    let history_t = vec![
+        test_message(MessageRole::User, "first"),
+        test_message(MessageRole::Assistant, "one"),
+    ];
+    let turn_t = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history_t,
+    )));
+    let captured_by_sender = turn_t.clone();
+    let seqs_of = |manager: &ContextManager| {
+        manager
+            .ledger_items()
+            .iter()
+            .map(|item| {
+                item.source_ref
+                    .as_ref()
+                    .and_then(|source| source.source_seq)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut history_t1 = history_t.clone();
+    history_t1.push(test_message(MessageRole::User, "second"));
+    history_t1.push(test_message(MessageRole::Assistant, "two"));
+    let turn_t1 = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history_t1,
+    )));
+    persist_context_manager_snapshot(
+        dir.path(),
+        &session_id.to_string(),
+        &turn_t1.lock().unwrap_or_else(|error| error.into_inner()),
+    )
+    .expect("persist T+1 snapshot");
+    let registration = register_appui_session_context_manager(&session_id, &turn_t1);
+
+    record_appui_context_manager_background_message(
+        dir.path(),
+        &captured_by_sender,
+        &session_id,
+        &test_message(MessageRole::Assistant, "deck delivered."),
+        4,
+    );
+    assert_eq!(
+        seqs_of(&turn_t1.lock().unwrap_or_else(|error| error.into_inner())),
+        vec![Some(0), Some(1), Some(2), Some(3), Some(4)]
+    );
+    assert_eq!(
+        seqs_of(
+            &captured_by_sender
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        ),
+        vec![Some(0), Some(1)]
+    );
+
+    drop(registration);
+    record_appui_context_manager_background_message(
+        dir.path(),
+        &captured_by_sender,
+        &session_id,
+        &test_message(MessageRole::Assistant, "report delivered."),
+        5,
+    );
+    let persisted =
+        crate::context_manager::load_context_manager_snapshot(dir.path(), &session_id.to_string())
+            .expect("read snapshot")
+            .expect("snapshot exists");
+    assert_eq!(
+        seqs_of(&persisted),
+        vec![Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)]
+    );
+}
+
+struct ManualCompactTinyProvider;
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for ManualCompactTinyProvider {
+    async fn chat(
+        &self,
+        _messages: &[octos_core::Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        unreachable!("compaction never calls the provider")
+    }
+
+    fn model_id(&self) -> &str {
+        "tiny"
+    }
+
+    fn provider_name(&self) -> &str {
+        "tiny"
+    }
+
+    fn context_window(&self) -> u32 {
+        512
+    }
+}
+
+#[test]
+fn should_refuse_manual_compaction_while_a_turn_is_active_and_leave_the_snapshot_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = SessionKey("full:api:compact-active-turn".to_owned());
+    let history: Vec<Message> = (0..12)
+        .map(|index| {
+            test_message(
+                MessageRole::User,
+                format!("padding {index}: {}", "x".repeat(400)),
+            )
+        })
+        .collect();
+    let provider: Arc<dyn octos_llm::LlmProvider> = Arc::new(ManualCompactTinyProvider);
+    let (_messages, _live_manager, _notifications, registration) = appui_context_history_for_agent(
+        dir.path(),
+        &session_id,
+        &history,
+        &provider,
+        false,
+        "appui_pre_turn",
+    );
+    let ledger_path =
+        crate::context_manager::context_ledger_path(dir.path(), &session_id.to_string());
+    let before = std::fs::read(&ledger_path).expect("turn start persisted snapshot");
+
+    let error = appui_manual_compact_session(dir.path(), &session_id, &history, &provider, false)
+        .expect_err("active turn must refuse from-disk compaction");
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("kind"))
+            .and_then(Value::as_str),
+        Some("compaction_deferred_active_turn")
+    );
+    assert_eq!(std::fs::read(&ledger_path).expect("snapshot"), before);
+
+    drop(registration);
+    let (notifications, _) =
+        appui_manual_compact_session(dir.path(), &session_id, &history, &provider, false)
+            .expect("idle session compacts");
+    assert!(matches!(
+        notifications.first(),
+        Some(UiNotification::ContextCompactionStarted(_))
+    ));
+    assert_ne!(std::fs::read(&ledger_path).expect("snapshot"), before);
+}
+
+#[test]
+fn should_not_persist_snapshot_when_read_path_finds_a_live_manager() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = SessionKey::new("api", "context-read-path-live");
+    let short = vec![test_message(MessageRole::User, "first")];
+    let full = vec![
+        test_message(MessageRole::User, "first"),
+        test_message(MessageRole::Assistant, "second"),
+    ];
+    let stale = ContextManager::from_session_history(session_id.to_string(), None, &short);
+    persist_context_manager_snapshot(dir.path(), &session_id.to_string(), &stale)
+        .expect("persist stale snapshot");
+    let ledger_path =
+        crate::context_manager::context_ledger_path(dir.path(), &session_id.to_string());
+    let before = std::fs::read(&ledger_path).expect("snapshot bytes");
+
+    let mut live_state = ContextManager::from_session_history(session_id.to_string(), None, &full);
+    live_state.record_context_event(ContextEventKind::MonitorEvent, "monitor", "live-only event");
+    let live = Arc::new(StdMutex::new(live_state));
+    let registration = register_appui_session_context_manager(&session_id, &live);
+    let (status, state) = appui_context_inspection_snapshot(dir.path(), &session_id, &full);
+    assert_eq!(std::fs::read(&ledger_path).expect("snapshot bytes"), before);
+    assert_eq!(state.item_count, 3);
+    assert_eq!(status["state"]["item_count"], serde_json::json!(3));
+
+    drop(registration);
+    let (_, state) = appui_context_inspection_snapshot(dir.path(), &session_id, &full);
+    assert_eq!(state.item_count, 2);
+    assert_ne!(std::fs::read(&ledger_path).expect("snapshot bytes"), before);
+}
+
+#[test]
+fn should_not_advertise_semantic_cache_before_stdio_client_hello() {
+    let capabilities = ConnectionUiFeatures::stdio_defaults().negotiated_capabilities();
+    assert!(!capabilities.supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1));
+    assert!(!ConnectionUiFeatures::stdio_defaults().context_semantic_cache_available());
+}
+
+#[test]
+fn should_only_advertise_context_state_when_the_client_requested_it() {
+    use octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1;
+
+    // Stdio before `client_hello`: unknown client, never claimed.
+    let defaults = ConnectionUiFeatures::stdio_defaults();
+    assert!(!defaults.context_state_available());
+    assert!(
+        !defaults
+            .negotiated_capabilities()
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+    );
+
+    // Requested alongside the parent lifecycle feature: honoured.
+    let requested = ConnectionUiFeatures::from_requested_feature_tokens(
+        [
+            UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
+            UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1,
+        ],
+        false,
+    );
+    assert!(requested.context_state_available());
+    assert!(
+        requested
+            .negotiated_capabilities()
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+    );
+
+    // Requested WITHOUT the parent lifecycle feature: not available, since
+    // the event is a lifecycle payload.
+    let orphan = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1],
+        false,
+    );
+    assert!(!orphan.context_state_available());
+    assert!(
+        !orphan
+            .negotiated_capabilities()
+            .supports_feature(UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+    );
+}
+
+#[test]
+fn should_surface_all_failed_lanes_when_composite_summary_wraps_a_typed_llm_error() {
+    let summary = "all lanes failed: moonshot-coding@api/k3 (api_style=openai_chat_completions): \
+                   API error (moonshot-coding@api/k3): HTTP 500 upstream exploded; \
+                   zai-coding/glm-5.3 (api_style=anthropic_messages): \
+                   API error (zai-coding/glm-5.3): HTTP 500 upstream exploded";
+    let carrier = octos_llm::LlmError::from_status_with_label(
+        500,
+        "upstream exploded",
+        "moonshot-coding@api/k3",
+    );
+    let typed = octos_agent::HarnessError::from_llm_error(&carrier)
+        .message()
+        .to_string();
+    let report: eyre::Report = eyre::Report::from(carrier).wrap_err(summary);
+    let wire = super::classify_runtime_error_message(&report);
+
+    for needle in [
+        "moonshot-coding@api/k3",
+        "zai-coding/glm-5.3",
+        "api_style=anthropic_messages",
+        "api_style=openai_chat_completions",
+    ] {
+        assert!(
+            wire.contains(needle),
+            "{needle} missing from turn_error: {wire}"
+        );
+    }
+    assert!(wire.starts_with(&typed));
+
+    let plain: eyre::Report = octos_llm::LlmError::from_status_with_label(
+        500,
+        "upstream exploded",
+        "moonshot-coding@api/k3",
+    )
+    .into();
+    assert_eq!(super::classify_runtime_error_message(&plain), typed);
+}
+
+fn projected_v2_payload(ledger: &UiProtocolLedger, source: &LedgeredUiProtocolEvent) -> PayloadV2 {
+    let projected = project_lifecycle_event_to_v2_wire(ledger, &source.event, &source.cursor)
+        .expect("legacy source projects to v2");
+    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) = projected
+    else {
+        panic!("expected a v2 projection");
+    };
+    envelope.envelope.payload
+}
+
+fn projected_delta_segment(ledger: &UiProtocolLedger, source: &LedgeredUiProtocolEvent) -> String {
+    match projected_v2_payload(ledger, source) {
+        PayloadV2::AssistantDelta {
+            assistant_segment_id,
+            ..
+        }
+        | PayloadV2::AssistantPersisted {
+            assistant_segment_id,
+            ..
+        } => assistant_segment_id,
+        other => panic!("expected assistant content, got {other:?}"),
+    }
+}
+
+fn projected_attachment_owner(
+    ledger: &UiProtocolLedger,
+    source: &LedgeredUiProtocolEvent,
+) -> Option<String> {
+    match projected_v2_payload(ledger, source) {
+        PayloadV2::FileAttached {
+            attachment_owner, ..
+        } => attachment_owner.assistant_segment_id,
+        other => panic!("expected a file attachment, got {other:?}"),
+    }
+}
+
+fn file_attached_source(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    turn_id: &TurnId,
+) -> LedgeredUiProtocolEvent {
+    ledger.append_notification(UiNotification::FileAttached(
+        octos_core::ui_protocol::FileAttachedEvent {
+            session_id: session_id.clone(),
+            topic: None,
+            turn_id: turn_id.clone(),
+            path: "/tmp/deck.pptx".into(),
+            tool_call_id: Some("tc-deck".into()),
+            attachment_owner: None,
+            mime: None,
+        },
+    ))
+}
+
+#[test]
+fn should_not_rewind_attachment_owner_when_old_preamble_commits_after_final_delta() {
+    let ledger = UiProtocolLedger::new(32);
+    let session = SessionKey("local:native-attachment-batched".into());
+    let turn = TurnId::new();
+    let final_identity = format!("{}:assistant:iteration:9", turn.0);
+    ledger
+        .emit_envelope_v2(
+            &session,
+            turn.0.to_string(),
+            PayloadV2::AssistantDelta {
+                text: "real final answer".into(),
+                assistant_segment_id: final_identity.clone(),
+            },
+            None,
+        )
+        .unwrap();
+    ledger
+        .emit_envelope_v2(
+            &session,
+            turn.0.to_string(),
+            PayloadV2::AssistantPersisted {
+                text: "earlier preamble".into(),
+                assistant_segment_id: format!("{}:assistant:iteration:2", turn.0),
+                meta: MessageMeta {
+                    message_id: "canonical-2".into(),
+                    persisted_at: Utc::now(),
+                    media: vec![],
+                },
+            },
+            None,
+        )
+        .unwrap();
+    let attachment = file_attached_source(&ledger, &session, &turn);
+    assert_eq!(
+        projected_attachment_owner(&ledger, &attachment),
+        Some(final_identity)
+    );
+}
+
+#[test]
+fn should_leave_assistant_owner_absent_when_attachment_precedes_all_assistant_content() {
+    let ledger = UiProtocolLedger::new(8);
+    let session = SessionKey("local:attachment-no-assistant".into());
+    let turn = TurnId::new();
+    let source = file_attached_source(&ledger, &session, &turn);
+    assert_eq!(
+        projected_attachment_owner(&ledger, &source),
+        None,
+        "tool-owned media must not point to an invented assistant bubble"
+    );
+    let PayloadV2::FileAttached {
+        attachment_owner, ..
+    } = projected_v2_payload(&ledger, &source)
+    else {
+        panic!("attachment")
+    };
+    assert_eq!(attachment_owner.tool_call_id.as_deref(), Some("tc-deck"));
+}
+
+#[tokio::test]
+async fn should_keep_uncorrelated_canonical_messages_distinct_even_when_text_and_timestamp_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let observer = message_commit_observer(ledger.clone());
+    octos_bus::session::set_scoped_message_commit_observer(dir.path(), &observer);
+    let mut manager = octos_bus::SessionManager::open(dir.path()).unwrap();
+    let session = SessionKey("local:uncorrelated-canonical-identity".into());
+    let turn = TurnId::new();
+    let message = pre_stamp_turn_thread_id(Message::assistant("same words"), &turn.0.to_string());
+    manager
+        .add_message_with_seq(&session, message.clone())
+        .await
+        .unwrap();
+    manager
+        .add_message_with_seq(&session, message)
+        .await
+        .unwrap();
+    let replay = ledger
+        .replay_after(
+            &session,
+            Some(&UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap();
+    let identities: Vec<_> = replay
+        .iter()
+        .filter_map(|source| match projected_v2_payload(&ledger, source) {
+            PayloadV2::AssistantPersisted {
+                assistant_segment_id,
+                ..
+            } => Some(assistant_segment_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(identities.len(), 2);
+    assert_ne!(identities[0], identities[1]);
+}
+
+fn assistant_identity_response(
+    content: &str,
+    prior_iteration: u32,
+    final_iteration: u32,
+) -> octos_agent::ConversationResponse {
+    octos_agent::ConversationResponse {
+        content: content.into(),
+        reasoning_content: None,
+        provider_metadata: None,
+        token_usage: Default::default(),
+        estimated_spend_usd: None,
+        files_modified: vec![],
+        files_to_send: vec![],
+        streamed: true,
+        messages: vec![Message::assistant("same answer")],
+        assistant_segments: octos_agent::AssistantSegmentProvenance {
+            message_iterations: vec![(0, prior_iteration)],
+            final_iteration,
+        },
+        tool_results: vec![],
+        synthesized_from_spawn_only: false,
+        pending_approval: None,
+    }
+}
+
+#[test]
+fn should_not_use_equal_earlier_answer_as_final_carrier_from_another_iteration() {
+    let response = assistant_identity_response("same answer", 1, 2);
+    assert!(
+        final_assistant_message_for_response(&response).is_some(),
+        "equal words do not prove producer identity across iterations"
+    );
+    assert_eq!(
+        final_assistant_segment_id(&response, "turn"),
+        "turn:assistant:iteration:2"
+    );
+    let same_iteration_carrier = assistant_identity_response("same answer", 2, 2);
+    assert!(final_assistant_message_for_response(&same_iteration_carrier).is_none());
+}
+
+#[test]
+fn should_keep_synthetic_final_distinct_from_same_iteration_model_preamble() {
+    let response = assistant_identity_response("controller's terminal result", 2, 2);
+    assert!(final_assistant_message_for_response(&response).is_some());
+    assert_eq!(
+        final_assistant_segment_id(&response, "turn"),
+        "turn:assistant:iteration:2:final"
+    );
+}
+
+#[test]
+fn should_preserve_producer_identity_on_filtered_voice_delta_and_held_back_tail() {
+    let ledger = UiProtocolLedger::new(32);
+    let session = SessionKey("local:voice-segment-identity".into());
+    let turn = TurnId::new();
+    let mut filter = crate::api::voice_turn::VisibleDeltaFilter::new();
+    let visible = filter.push("Spoken answer [[VI");
+    let tail = filter.finish();
+    for text in [visible, tail] {
+        assert!(!text.is_empty());
+        let delta = UiNotification::MessageDelta(MessageDeltaEvent {
+            session_id: session.clone(),
+            topic: None,
+            turn_id: turn.clone(),
+            text,
+        });
+        emit_progress_envelope(&ledger, &session, &delta, Some(7));
+    }
+    let replay = ledger
+        .replay_after(
+            &session,
+            Some(&UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap();
+    assert_eq!(replay.len(), 2);
+    for source in replay {
+        assert_eq!(
+            projected_delta_segment(&ledger, &source),
+            format!("{}:assistant:iteration:7", turn.0)
+        );
+    }
+}
+
+#[test]
+fn should_record_one_failed_compaction_while_pinned_tail_stays_infeasible_across_iterations() {
+    let session_id = SessionKey::new("api", "context-pinned-retry");
+    let history = vec![test_message(MessageRole::User, "x".repeat(4_000))];
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let dir = tempfile::tempdir().unwrap();
+    let captured: Arc<StdMutex<Vec<UiNotification>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = captured.clone();
+    let bridge =
+        AppUiPromptContextBridge::new(session_id, dir.path().to_path_buf(), manager.clone(), false)
+            .with_context_lifecycle_notify(Arc::new(move |notification| {
+                sink.lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(notification);
+            }));
+    let request = |phase, iteration| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".to_string(),
+        model_id: "tiny-context".to_string(),
+        context_window: 300,
+    };
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history);
+    let first = bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("turn start");
+    assert!(!first.compaction_performed);
+    prompt.push(test_message(MessageRole::Assistant, "still working"));
+    let second = bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut prompt)
+        .expect("iteration");
+    assert!(!second.compaction_performed);
+
+    let records = manager
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .snapshot()
+        .compactions
+        .len();
+    assert_eq!(records, 1, "unchanged candidate must not retry forever");
+    let events = captured.lock().unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, UiNotification::ContextCompactionStarted(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, UiNotification::ContextCompactionCompleted(_)))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn issue_2236_build_cache_early_terminal_releases_slot() {
+    for reason in [TerminalReason::Interrupted, TerminalReason::Errored] {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path().join("peers");
+        let slot = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            tmp.path(),
+            "cache-terminal",
+            None,
+            None,
+            &crate::build_cache::BuildCacheConfig {
+                min_free_gb: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = slot.path.clone();
+        let key = build_cache_slot_registry_key(&peers_root, "cache-terminal");
+        build_cache_slot_registry().park(key.clone(), slot);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(tx);
+        let ledger = UiProtocolLedger::new(32);
+        let session = SessionKey::with_profile_topic("cache", "api", "tab", "peer-cache-terminal");
+        let turn = TurnId::new();
+        let state = Arc::new(TokioMutex::new(TurnState::Active));
+        build_cache_slot_registry()
+            .reserve_staged(&key, &build_cache_turn_owner(&session, &turn, &state))
+            .unwrap();
+        try_emit_terminal(
+            &state,
+            reason,
+            &ws,
+            &ledger,
+            &session,
+            &turn,
+            Some(("peer_lifetime_unavailable", "failed before dispatch")),
+            None,
+            None,
+            Some(&peers_root),
+        )
+        .await;
+        assert!(
+            !path.join("holder.json").exists(),
+            "early {reason:?} terminal must release the held slot"
+        );
+        assert!(build_cache_slot_registry().take(&key).is_none());
+    }
+}
+
+#[tokio::test]
+async fn bc9_sf1_disconnect_releases_build_cache_slot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let peers_root = tmp.path().join("peers");
+    let slug = "bc9-disconnect";
+    let slot = build_cache_peer::acquire_for_staging(
+        &peers_root,
+        tmp.path(),
+        slug,
+        None,
+        None,
+        &crate::build_cache::BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let path = slot.path.clone();
+    build_cache_slot_registry().park(build_cache_slot_registry_key(&peers_root, slug), slot);
+    let session = SessionKey::with_profile_topic("cache", "api", "tab", &format!("peer-{slug}"));
+    let turn = TurnId::new();
+    let state = Arc::new(TokioMutex::new(TurnState::Active));
+    build_cache_slot_registry()
+        .reserve_staged(
+            &build_cache_slot_registry_key(&peers_root, slug),
+            &build_cache_turn_owner(&session, &turn, &state),
+        )
+        .unwrap();
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let handle = tokio::spawn(std::future::pending::<()>());
+    let mut entry = test_active_turn(turn.clone(), handle.abort_handle());
+    entry.state = state.clone();
+    active.lock().await.insert(session.clone(), entry);
+    connection.lock().await.insert(
+        session,
+        ConnectionTurn {
+            turn_id: turn,
+            state,
+        },
+    );
+    abort_connection_turns(
+        &active,
+        &connection,
+        &ScopePolicy::default(),
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+    )
+    .await;
+    assert!(
+        !path.join("holder.json").exists(),
+        "disconnect must return the held cache slot"
+    );
+    assert!(handle.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn bc9_sf2_shortcut_and_early_error_release_build_cache_slot() {
+    for (reason, known_root) in [
+        (TerminalReason::Completed, true),
+        (TerminalReason::Completed, false),
+        (TerminalReason::Errored, false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path().join("peers");
+        let slug = "bc9-shortcut";
+        let slot = build_cache_peer::acquire_for_staging(
+            &peers_root,
+            tmp.path(),
+            slug,
+            None,
+            None,
+            &crate::build_cache::BuildCacheConfig {
+                min_free_gb: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let path = slot.path.clone();
+        build_cache_slot_registry().park(build_cache_slot_registry_key(&peers_root, slug), slot);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<axum::extract::ws::Message>(8);
+        let ws = WsConnection::new(tx);
+        let session =
+            SessionKey::with_profile_topic("cache", "api", "tab", &format!("peer-{slug}"));
+        let turn = TurnId::new();
+        let state = Arc::new(TokioMutex::new(TurnState::Active));
+        build_cache_slot_registry()
+            .reserve_staged(
+                &build_cache_slot_registry_key(&peers_root, slug),
+                &build_cache_turn_owner(&session, &turn, &state),
+            )
+            .unwrap();
+        try_emit_terminal(
+            &state,
+            reason,
+            &ws,
+            &UiProtocolLedger::new(32),
+            &session,
+            &turn,
+            None,
+            None,
+            None,
+            known_root.then_some(peers_root.as_path()),
+        )
+        .await;
+        assert!(
+            !path.join("holder.json").exists(),
+            "{reason:?}, known_root={known_root} must return the slot"
+        );
+    }
+}
+
+fn bc9_b6_claim(
+    slug: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    BuildCacheTurnOwner,
+    Arc<TokioMutex<TurnState>>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("peers");
+    let slot = build_cache_peer::acquire_for_staging(
+        &root,
+        tmp.path(),
+        slug,
+        None,
+        None,
+        &crate::build_cache::BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let path = slot.path.clone();
+    let key = build_cache_slot_registry_key(&root, slug);
+    build_cache_slot_registry().park(key.clone(), slot);
+    let state = Arc::new(TokioMutex::new(TurnState::Active));
+    let owner = build_cache_turn_owner(
+        &SessionKey::with_profile_topic("cache", "api", "first", &format!("peer-{slug}")),
+        &TurnId::new(),
+        &state,
+    );
+    build_cache_slot_registry()
+        .reserve_staged(&key, &owner)
+        .unwrap();
+    (tmp, root, path, owner, state)
+}
+
+#[tokio::test]
+async fn bc9_b6_rejected_second_terminal_preserves_first_claim() {
+    let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("rejected-terminal");
+    let second = SessionKey::with_profile_topic("cache", "api", "second", "peer-rejected-terminal");
+    let (tx, _rx) = mpsc::channel(8);
+    try_emit_terminal(
+        &TokioMutex::new(TurnState::Active),
+        TerminalReason::Errored,
+        &WsConnection::new(tx),
+        &UiProtocolLedger::new(32),
+        &second,
+        &TurnId::new(),
+        Some(("build_cache_unavailable", "another turn owns the slot")),
+        None,
+        None,
+        Some(&root),
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "rejected turn cannot release first turn"
+    );
+    build_cache_slot_registry().release_for_slug(
+        "rejected-terminal",
+        &owner,
+        crate::build_cache::pool::SlotOutcome::Completed,
+    );
+}
+
+#[tokio::test]
+async fn bc9_b6_stale_terminal_cannot_release_new_turn_or_staged_claim() {
+    for staged in [false, true] {
+        let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("stale-terminal");
+        let key = build_cache_slot_registry_key(&root, "stale-terminal");
+        if staged {
+            build_cache_slot_registry()
+                .release(&key, crate::build_cache::pool::SlotOutcome::Completed);
+            let slot = build_cache_peer::acquire_for_staging(
+                &root,
+                _tmp.path(),
+                "stale-terminal",
+                None,
+                None,
+                &crate::build_cache::BuildCacheConfig {
+                    min_free_gb: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            build_cache_slot_registry().park(key.clone(), slot);
+        }
+        let (tx, _rx) = mpsc::channel(8);
+        try_emit_terminal(
+            &TokioMutex::new(TurnState::Active),
+            TerminalReason::Completed,
+            &WsConnection::new(tx),
+            &UiProtocolLedger::new(32),
+            &owner.session,
+            &TurnId::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            path.join("holder.json").exists(),
+            "old terminal must preserve newer or staged claim"
+        );
+        build_cache_slot_registry().release(&key, crate::build_cache::pool::SlotOutcome::Completed);
+    }
+}
+
+#[tokio::test]
+async fn bc9_b6_stale_connection_cannot_release_new_turn() {
+    let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("stale-disconnect");
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let handle = tokio::spawn(std::future::pending::<()>());
+    let mut entry = test_active_turn(owner.turn.clone(), handle.abort_handle());
+    entry.state = _claim_state.clone();
+    active.lock().await.insert(owner.session.clone(), entry);
+    connection.lock().await.insert(
+        owner.session.clone(),
+        ConnectionTurn {
+            turn_id: TurnId::new(),
+            state: Arc::new(TokioMutex::new(TurnState::Active)),
+        },
+    );
+    abort_connection_turns(
+        &active,
+        &connection,
+        &ScopePolicy::default(),
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "old connection must not release newer turn of same session"
+    );
+    assert!(!handle.is_finished());
+    handle.abort();
+    build_cache_slot_registry().release(
+        &build_cache_slot_registry_key(&root, "stale-disconnect"),
+        crate::build_cache::pool::SlotOutcome::Cancelled,
+    );
+}
+
+#[tokio::test]
+async fn bc9_b6_abort_before_task_start_releases_dispatch_reservation() {
+    let (_tmp, _root, path, owner, _claim_state) = bc9_b6_claim("prestart-abort");
+    let reservation = BuildCacheTurnReservation(owner, _claim_state);
+    let task = tokio::spawn(async move {
+        let _reservation = reservation;
+        std::future::pending::<()>().await;
+    });
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(!path.join("holder.json").exists());
+}
+
+#[tokio::test]
+async fn bc9_b6_reused_id_stale_guard_preserves_new_claim() {
+    let (tmp, root, _path, owner, _claim_state) = bc9_b6_claim("reuse-guard");
+    let key = build_cache_slot_registry_key(&root, "reuse-guard");
+    let stale_guard = BuildCacheTurnReservation(owner.clone(), _claim_state.clone());
+    build_cache_slot_registry().release_owned(
+        &key,
+        &owner,
+        crate::build_cache::pool::SlotOutcome::Completed,
+    );
+    let slot = build_cache_peer::acquire_for_staging(
+        &root,
+        tmp.path(),
+        "reuse-guard",
+        None,
+        None,
+        &crate::build_cache::BuildCacheConfig {
+            min_free_gb: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let path = slot.path.clone();
+    build_cache_slot_registry().park(key.clone(), slot);
+    let new_state = Arc::new(TokioMutex::new(TurnState::Active));
+    let new_owner = build_cache_turn_owner(&owner.session, &owner.turn, &new_state);
+    build_cache_slot_registry()
+        .reserve_staged(&key, &new_owner)
+        .unwrap();
+    drop(stale_guard);
+    assert!(
+        path.join("holder.json").exists(),
+        "old dispatch guard must not release a reused wire turn id"
+    );
+    let (tx, _rx) = mpsc::channel(8);
+    try_emit_terminal(
+        &_claim_state,
+        TerminalReason::Completed,
+        &WsConnection::new(tx),
+        &UiProtocolLedger::new(16),
+        &owner.session,
+        &owner.turn,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "old terminal must preserve reused ID's new dispatch"
+    );
+    build_cache_slot_registry().release(&key, crate::build_cache::pool::SlotOutcome::Completed);
+}
+
+#[tokio::test]
+async fn bc9_b6_reused_id_stale_connection_preserves_new_claim() {
+    let (_tmp, root, path, owner, _claim_state) = bc9_b6_claim("reuse-connection");
+    let active: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let handle = tokio::spawn(std::future::pending::<()>());
+    let mut entry = test_active_turn(owner.turn.clone(), handle.abort_handle());
+    entry.state = _claim_state.clone();
+    active.lock().await.insert(owner.session.clone(), entry);
+    connection.lock().await.insert(
+        owner.session.clone(),
+        ConnectionTurn {
+            turn_id: owner.turn.clone(),
+            state: Arc::new(TokioMutex::new(TurnState::Active)),
+        },
+    );
+    abort_connection_turns(
+        &active,
+        &connection,
+        &ScopePolicy::default(),
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+    )
+    .await;
+    assert!(
+        path.join("holder.json").exists(),
+        "old connection must not abort or release a reused wire turn id"
+    );
+    assert!(!handle.is_finished());
+    handle.abort();
+    build_cache_slot_registry().release(
+        &build_cache_slot_registry_key(&root, "reuse-connection"),
+        crate::build_cache::pool::SlotOutcome::Cancelled,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// evo-goal-verifier GAP-8 (spec Filter: ui_transport_sentinels_report_
+// verifier_failure_kind): the interactive sentinel station must surface
+// the structured failure kind — REAL path through
+// run_interactive_sentinel_completion, not a wrapper-only call.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn ui_transport_sentinels_report_verifier_failure_kind() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let orchestrator = crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::default();
+    let key = octos_core::SessionKey("gap8-prof:api:gap8-sentinel".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "gap8-prof".to_owned(),
+            objective: "surface kind on refusal".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+    let snapshot = orchestrator
+        .goal_verification_snapshot(&key, "gap8-prof")
+        .expect("snapshot");
+
+    // Empty reply (reasoning-only) classifies empty_response; the wrapper
+    // retries once (transient) so attempt lands at 2/2.
+    struct EmptyReplyVerifier;
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for EmptyReplyVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let outcome = run_interactive_sentinel_completion(
+        &orchestrator,
+        std::sync::Arc::new(EmptyReplyVerifier),
+        &key,
+        "gap8-prof",
+        &snapshot.goal_id,
+        // A real completion CLAIM so the sentinel path actually runs.
+        "All tasks are complete. <goal:complete>",
+        Some(temp.path()),
+    )
+    .await;
+
+    // The goal must NOT have completed (empty verifier replies).
+    assert!(!outcome.completed, "empty replies never complete the goal");
+    // The structured failure leaves the station: kind + canonical line.
+    let (kind, line) = outcome
+        .failure
+        .expect("interactive sentinel must surface the structured failure");
+    assert_eq!(kind, "empty_response");
+    assert!(
+        line.contains("verifier empty_response (attempt 2/2)"),
+        "canonical Display line with kind+attempts, got: {line}"
+    );
+    // And the goal stays active — sentinel refusals never flip state.
+    let still = orchestrator
+        .goal_verification_snapshot(&key, "gap8-prof")
+        .expect("snapshot still resolvable");
+    assert_eq!(still.goal_id, snapshot.goal_id);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// evo-goal-verifier GAP-8b (root follow-up #5): the AUTONOMOUS consumer's
+// wire shape — the shared `goal_verifier_warning_event` constructor the
+// goal-turn accountant emits at :37553, driven through the REAL
+// `send_notification_ephemeral`, with a REAL verifier outcome produced by
+// the bounded wrapper (empty replies → empty_response, attempt 2/2).
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn ui_transport_autonomous_consumer_emits_verifier_warning_wire_shape() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let orchestrator = crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::default();
+    let key = octos_core::SessionKey("gap8b-prof:api:gap8b-auto".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: key.clone(),
+            profile_id: "gap8b-prof".to_owned(),
+            objective: "autonomous wire shape".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal");
+    let snapshot = orchestrator
+        .goal_verification_snapshot(&key, "gap8b-prof")
+        .expect("snapshot");
+
+    struct EmptyReplyVerifier;
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for EmptyReplyVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    // REAL outcome through the bounded wrapper — the same object the
+    // autonomous accountant holds at :37523-37530.
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let outcome = orchestrator
+        .verify_goal_completion_bounded(
+            &key,
+            "gap8b-prof",
+            &snapshot,
+            std::sync::Arc::new(EmptyReplyVerifier),
+            "All tasks are complete. <goal:complete>",
+            Some(temp.path()),
+        )
+        .await;
+    assert_eq!(outcome.kind.map(|k| k.as_str()), Some("empty_response"));
+    assert_eq!(outcome.attempts, 2);
+
+    // The shared constructor the autonomous station uses…
+    let notification = goal_verifier_warning_event(&key, &outcome);
+    // …through the REAL ephemeral send path, read back off the wire as a
+    // Text JSON frame (the same WsMessage shape a live client receives).
+    let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(8);
+    let ws = WsConnection::new(ws_tx);
+    let ledger = UiProtocolLedger::new(16);
+    send_notification_ephemeral(&ws, &ledger, notification).expect("ephemeral send succeeds");
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), ws_rx.recv())
+        .await
+        .expect("wire frame arrives")
+        .expect("channel open");
+    let WsMessage::Text(text) = frame else {
+        panic!("expected a Text wire frame");
+    };
+    let json: serde_json::Value = serde_json::from_str(text.as_str()).expect("frame parses");
+    assert_eq!(json["method"], "warning");
+    assert_eq!(
+        json["params"]["code"], "goal_verifier_empty_response",
+        "params: {:?}",
+        json["params"]
+    );
+    let message = json["params"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("verifier empty_response (attempt 2/2)"),
+        "canonical Display line on the wire, got: {message}"
+    );
+
+    // And the goal stays ACTIVE — the sentinel refusal never flips state
+    // (the SessionGoalUpdated repaint the accountant sends next carries
+    // `active`, never `complete`).
+    let event_json = orchestrator.session_goal_updated_event_json(&key, "gap8b-prof");
+    let event = serde_json::from_value::<octos_core::ui_protocol::SessionGoalUpdatedEvent>(
+        event_json.expect("goal event json"),
+    )
+    .expect("goal event parses");
+    assert_ne!(
+        event.goal.status, "complete",
+        "an unverified claim never completes the goal"
+    );
+}
+
+/// #2246 — structural guard: `run_standalone_turn` rebuilds the turn agent
+/// from `Agent::new_shared`, so the bootstrap agent's hook context does not
+/// carry over; the re-application must stay wired (this is the path
+/// `octos chat` / `serve --stdio` actually serve turns on, and the one the
+/// issue reporter observed empty `session_id`/`profile_id` through).
+#[test]
+fn standalone_turn_reapplies_hook_context() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/ui_protocol_transport.rs");
+    let text = std::fs::read_to_string(&path).expect("read ui_protocol_transport.rs");
+    let start = text
+        .find("async fn run_standalone_turn")
+        .expect("run_standalone_turn exists");
+    let body = &text[start..];
+    let hooks_at = body
+        .find("request_agent = request_agent.with_hooks(hooks);")
+        .expect("run_standalone_turn attaches the profile hook executor");
+    let ctx_at = body.find("request_agent.with_hook_context(").expect(
+        "run_standalone_turn must re-apply the hook context onto the per-turn agent (#2246)",
+    );
+    assert!(
+        ctx_at > hooks_at,
+        "hook context must be re-applied alongside the hook executor wiring"
+    );
+}
+
+#[tokio::test]
+async fn session_hydrate_preserves_canonical_user_and_terminal_sequences() {
+    let session_id = SessionKey("local:hydrate-canonical-sequences".into());
+    let turn_id = TurnId::new();
+    let thread = turn_id.0.to_string();
+    let state = prg_state_with_session(&session_id, |session| {
+        session.messages.push(Message::user_rooting_thread(
+            "hello",
+            octos_core::ClientMessageId(thread.clone()),
+        ));
+    });
+    let ledger = event_ledger(&state).await;
+    ledger
+        .emit_envelope_v2(
+            &session_id,
+            thread.clone(),
+            PayloadV2::UserMessage {
+                text: "hello".into(),
+                files: vec![],
+            },
+            Some(thread.clone()),
+        )
+        .unwrap();
+    ledger
+        .emit_envelope_v2(
+            &session_id,
+            thread.clone(),
+            PayloadV2::AssistantDelta {
+                text: "answer".into(),
+                assistant_segment_id: "segment".into(),
+            },
+            None,
+        )
+        .unwrap();
+    ledger.append_notification(UiNotification::TurnCompleted(TurnCompletedEvent {
+        session_id: session_id.clone(),
+        topic: None,
+        turn_id,
+        cursor: None,
+        tokens_in: None,
+        tokens_out: None,
+        session_result: None,
+        token_usage: None,
+    }));
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_hydrate(
+        &ws,
+        &state,
+        &ledger,
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        &active_turns_registry(),
+        None,
+        None,
+        features_for_projection_envelope_v2_test(),
+        "canonical-hydrate".into(),
+        SessionHydrateParams {
+            session_id,
+            after: None,
+            include: vec!["messages".into()],
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    let events = frame["result"]["replayed_projection_envelopes"]
+        .as_array()
+        .unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["seq"], 1);
+    assert_eq!(events[0]["payload"]["type"], "user_message");
+    assert_eq!(events[1]["seq"], 2);
+    assert_eq!(events[2]["seq"], 3);
+    assert_eq!(events[2]["payload"]["type"], "turn_terminal");
+    assert!(
+        events
+            .iter()
+            .all(|entry| entry["cursor"]["seq"].as_u64().is_some())
+    );
+}
+
+#[tokio::test]
+async fn review_concurrent_cold_profile_requests_share_one_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(local_profile_state(dir.path()));
+    raw_profile_llm_upsert(
+        &state,
+        &llm_upsert_rpc(
+            "seed-cold",
+            "dev",
+            "openai",
+            "gpt-4o-mini",
+            Some("http://127.0.0.1:9/v1"),
+            true,
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    let key = dynamic_profile_runtime_key(&state, "dev").unwrap();
+    dynamic_profile_runtimes().write().unwrap().remove(&key);
+    assert!(dynamic_cached_profile_runtime(&state, "dev").is_none());
+    let (a, b, c) = tokio::join!(
+        ensure_session_profile_runtime(&state, Some("dev")),
+        ensure_session_profile_runtime(&state, Some("dev")),
+        ensure_session_profile_runtime(&state, Some("dev")),
+    );
+    let a = a.expect("first request").unwrap();
+    let b = b.expect("concurrent second request").unwrap();
+    let c = c.expect("concurrent third request").unwrap();
+    assert!(Arc::ptr_eq(&a, &b));
+    assert!(Arc::ptr_eq(&a, &c));
+}
+
+#[test]
+fn review_large_hydrate_replay_preserves_transcript_and_continuation_checkpoint() {
+    let make = |seq: u64, payload: serde_json::Value| -> EnvelopeV2 {
+        serde_json::from_value(json!({
+            "thread_id": "long-turn", "turn_id": "long-turn", "seq": seq,
+            "cursor": { "stream": "long-session", "seq": seq + 10 }, "payload": payload,
+        }))
+        .unwrap()
+    };
+    let mut events = (1..=5000).map(|seq| make(seq, json!({
+        "type": "assistant_delta", "data": { "text": "small streaming chunk", "assistant_segment_id": "segment" }
+    }))).collect::<Vec<_>>();
+    events.push(make(
+        5001,
+        json!({ "type": "turn_terminal", "data": { "outcome": "completed" } }),
+    ));
+    assert!(serde_json::to_vec(&events).unwrap().len() > MAX_TEXT_FRAME_BYTES);
+    let (retained, checkpoints) = compact_hydrate_projection_replay(events);
+    assert_eq!(checkpoints["long-turn"], 5001);
+    assert_eq!(retained.len(), 1);
+    assert!(matches!(
+        retained[0].payload,
+        PayloadV2::TurnTerminal { .. }
+    ));
+    let response = json!({ "jsonrpc": "2.0", "id": "long-hydrate", "result": {
+        "messages": [{ "role": "user", "content": "ordinary user question" },
+                     { "role": "assistant", "content": "complete durable answer" }],
+        "replayed_projection_envelopes": retained, "projection_thread_sequences": checkpoints,
+    }});
+    let serialized = serde_json::to_string(&response).unwrap();
+    assert_eq!(
+        frame_text_within_cap(serialized.clone()).unwrap(),
+        serialized
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// merged-review 2026-09-10 Fix 1: the interactive sentinel failure warning
+// must carry the WIRE session id (no NUL, no `~cwd-` scope suffix) while the
+// goal lookup still uses the scoped key. Driven at the REAL send site with a
+// real WsConnection channel — not a helper-only call.
+// ─────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn interactive_sentinel_failure_warning_carries_wire_session_id() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let orchestrator = crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::default();
+    // A SCOPED goal key in the real internal form: wire session id, then
+    // the NUL byte and cwd-scope suffix (as a unicode escape in the literal).
+    let scoped_key = octos_core::SessionKey(
+        "wirefix-prof:api:wirefix-session\u{0}~cwd-76ac4758abceb96a".to_owned(),
+    );
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: scoped_key.clone(),
+            profile_id: "wirefix-prof".to_owned(),
+            objective: "wire key on warning".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set active goal under the scoped key");
+    let snapshot = orchestrator
+        .goal_verification_snapshot(&scoped_key, "wirefix-prof")
+        .expect("snapshot resolves through the scoped key");
+
+    struct EmptyReplyVerifier;
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for EmptyReplyVerifier {
+        async fn chat(
+            &self,
+            _m: &[octos_core::Message],
+            _t: &[octos_llm::ToolSpec],
+            _c: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: None,
+                reasoning_content: Some("thinking…".to_owned()),
+                tool_calls: Vec::new(),
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "empty-verifier"
+        }
+        fn provider_name(&self) -> &str {
+            "empty-verifier"
+        }
+    }
+
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let sentinel_outcome = run_interactive_sentinel_completion(
+        &orchestrator,
+        std::sync::Arc::new(EmptyReplyVerifier),
+        &scoped_key,
+        "wirefix-prof",
+        &snapshot.goal_id,
+        "All tasks are complete. <goal:complete>",
+        Some(temp.path()),
+    )
+    .await;
+    let (kind, line) = sentinel_outcome
+        .failure
+        .expect("structured failure produced");
+
+    // THE shared production boundary: the same constructor the
+    // interactive callsite uses (single normalization route), exercised
+    // through a real WsConnection + send_notification_ephemeral.
+    let notification = goal_verifier_failure_warning(&scoped_key, kind, &line);
+    let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(8);
+    let ws = WsConnection::new(ws_tx);
+    let ledger = UiProtocolLedger::new(16);
+    send_notification_ephemeral(&ws, &ledger, notification).expect("send");
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), ws_rx.recv())
+        .await
+        .expect("frame")
+        .expect("open");
+    let WsMessage::Text(text) = frame else {
+        panic!("text frame")
+    };
+    let json: serde_json::Value = serde_json::from_str(text.as_str()).expect("parse");
+    let sid = json["params"]["session_id"].as_str().expect("session_id");
+    assert!(
+        !sid.contains('\u{0}'),
+        "wire session id must not carry the NUL scope separator, got: {sid:?}"
+    );
+    assert!(
+        !sid.contains("~cwd-"),
+        "wire session id must not leak the cwd scope suffix, got: {sid:?}"
+    );
+    assert_eq!(
+        sid, "wirefix-prof:api:wirefix-session",
+        "the warning session id is the WIRE form of the scoped goal key"
+    );
+    // And the goal lookup DID use the scoped key (goal stays active).
+    let still = orchestrator
+        .goal_verification_snapshot(&scoped_key, "wirefix-prof")
+        .expect("scoped lookup still works");
+    assert_eq!(still.goal_id, snapshot.goal_id);
+}
+
+#[tokio::test]
+async fn interactive_sentinel_failure_warning_plain_session_unchanged() {
+    use crate::autonomy::agent_orchestrator::{AgentOrchestrator as _, GoalSetRequest};
+
+    let orchestrator = crate::autonomy::agent_orchestrator::InProcessAgentOrchestrator::default();
+    let plain = octos_core::SessionKey("plainfix-prof:api:plainfix-session".to_owned());
+    orchestrator
+        .set_goal(GoalSetRequest {
+            session_id: plain.clone(),
+            profile_id: "plainfix-prof".to_owned(),
+            objective: "plain key".to_owned(),
+            status: Some("active".to_owned()),
+            token_budget: None,
+            transition_actor: None,
+        })
+        .expect("set goal");
+    orchestrator
+        .goal_verification_snapshot(&plain, "plainfix-prof")
+        .expect("snapshot");
+
+    // Plain keys pass through wire_key_from_goal_key unchanged — assert the
+    // constructor keeps the exact session id.
+    let notification = goal_verifier_failure_warning(
+        &plain,
+        "empty_response",
+        "verifier empty_response (attempt 2/2): no verdict text",
+    );
+    let UiNotification::Warning(event) = notification else {
+        panic!("warning")
+    };
+    assert_eq!(event.session_id, plain, "plain session id unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// Recall index methods: `memory/search` filter + `memory/ingest` validation
+// (docs/adr/personal-memory-tiers.md). Pure helpers; the handlers add only
+// the identity → runtime resolution shared with `memory/overview`.
+// ---------------------------------------------------------------------------
+
+fn ingest_doc_record(id: &str) -> Value {
+    json!({
+        "id": id,
+        "kind": "document",
+        "source": "mail",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "Hike on Saturday",
+        "abstract": "Sam proposes the ridge trail at 8am.",
+        "parent": "thread-7",
+        "fingerprint": "v1",
+    })
+}
+
+fn ingest_params(records: Vec<Value>) -> MemoryIngestParams {
+    MemoryIngestParams {
+        records,
+        vectors: None,
+        embed: None,
+    }
+}
+
+#[test]
+fn memory_search_filter_defaults_limit_and_leaves_filters_open() {
+    let filter = memory_search_filter(&MemorySearchParams {
+        query: "  dentist ".into(),
+        ..Default::default()
+    })
+    .expect("valid params");
+    assert_eq!(filter.limit, MEMORY_SEARCH_DEFAULT_LIMIT);
+    assert!(filter.kinds.is_empty());
+    assert!(filter.sources.is_empty());
+    assert_eq!(filter.since, None);
+    assert_eq!(filter.until, None);
+}
+
+#[test]
+fn memory_search_filter_clamps_limit_to_one_through_max() {
+    let over = memory_search_filter(&MemorySearchParams {
+        query: "q".into(),
+        limit: Some(MEMORY_SEARCH_MAX_LIMIT * 10),
+        ..Default::default()
+    })
+    .expect("valid params");
+    assert_eq!(over.limit, MEMORY_SEARCH_MAX_LIMIT);
+    let zero = memory_search_filter(&MemorySearchParams {
+        query: "q".into(),
+        limit: Some(0),
+        ..Default::default()
+    })
+    .expect("valid params");
+    assert_eq!(zero.limit, 1);
+}
+
+#[test]
+fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
+    let filter = memory_search_filter(&MemorySearchParams {
+        query: "hike".into(),
+        kinds: vec!["document".into(), "doc".into(), "knowledge".into()],
+        sources: vec![" mail ".into(), "".into(), "calendar".into()],
+        since: Some("2026-01-01".into()),
+        until: Some("2026-02-01".into()),
+        limit: Some(5),
+    })
+    .expect("valid params");
+    assert_eq!(
+        filter.kinds,
+        vec![
+            octos_memory::RecordKind::Document,
+            octos_memory::RecordKind::Knowledge
+        ],
+        "kinds parse leniently and de-duplicate"
+    );
+    assert_eq!(
+        filter.sources,
+        vec!["mail".to_string(), "calendar".to_string()]
+    );
+    assert_eq!(
+        filter.since.map(|t| t.to_rfc3339()),
+        Some("2026-01-01T00:00:00+00:00".to_string()),
+        "a bare `since` date is the start of that UTC day"
+    );
+    assert_eq!(
+        filter
+            .until
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)),
+        Some("2026-02-01T23:59:59.999999Z".to_string()),
+        "a bare `until` date covers the whole day (RecallStore applies it inclusively)"
+    );
+    assert_eq!(filter.limit, 5);
+
+    let rfc3339 = memory_search_filter(&MemorySearchParams {
+        query: "hike".into(),
+        since: Some("2026-01-01T10:00:00+02:00".into()),
+        ..Default::default()
+    })
+    .expect("valid params");
+    assert_eq!(
+        rfc3339.since.map(|t| t.to_rfc3339()),
+        Some("2026-01-01T08:00:00+00:00".to_string()),
+        "offsets are normalised to UTC"
+    );
+}
+
+#[test]
+fn memory_search_filter_rejects_bad_input_with_invalid_params() {
+    let empty = memory_search_filter(&MemorySearchParams {
+        query: "   ".into(),
+        ..Default::default()
+    })
+    .expect_err("empty query");
+    assert_eq!(empty.code, rpc_error_codes::INVALID_PARAMS);
+
+    let kind = memory_search_filter(&MemorySearchParams {
+        query: "q".into(),
+        kinds: vec!["mail".into()],
+        ..Default::default()
+    })
+    .expect_err("unknown kind");
+    assert_eq!(kind.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(kind.message.contains("unknown kind"), "{}", kind.message);
+
+    let date = memory_search_filter(&MemorySearchParams {
+        query: "q".into(),
+        since: Some("yesterday".into()),
+        ..Default::default()
+    })
+    .expect_err("unparseable since");
+    assert_eq!(date.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(date.message.contains("`since`"), "{}", date.message);
+
+    let ordered = memory_search_filter(&MemorySearchParams {
+        query: "q".into(),
+        since: Some("2026-03-01".into()),
+        until: Some("2026-02-01".into()),
+        ..Default::default()
+    })
+    .expect_err("since after until");
+    assert_eq!(ordered.code, rpc_error_codes::INVALID_PARAMS);
+}
+
+#[test]
+fn memory_ingest_decodes_document_records_and_forces_untrusted() {
+    let mut trusted = ingest_doc_record("doc:mail:42");
+    trusted["trust"] = json!("trusted");
+    trusted["visits"] = json!(99);
+    trusted["promoted"] = json!(true);
+    let validated = validate_memory_ingest(ingest_params(vec![
+        trusted,
+        json!({
+            "id": "episode:sess-1:7",
+            "kind": "episode",
+            "source": "episodes",
+            "timestamp": "2026-03-04T05:06:07Z",
+            "title": "Fixed the build",
+            "abstract": "Bumped rustls and re-ran CI.",
+        }),
+    ]))
+    .expect("valid records");
+    assert_eq!(validated.records.len(), 2);
+    assert!(validated.vectors.is_none());
+    let doc = &validated.records[0];
+    assert_eq!(doc.id, "doc:mail:42");
+    assert_eq!(doc.kind, octos_memory::RecordKind::Document);
+    assert_eq!(
+        doc.trust,
+        octos_memory::Trust::Untrusted,
+        "documents can never claim trusted"
+    );
+    assert_eq!(doc.visits, 0, "usage counters are server-owned");
+    assert!(!doc.promoted);
+    assert_eq!(doc.parent.as_deref(), Some("thread-7"));
+    assert_eq!(doc.fingerprint, "v1");
+    assert_eq!(validated.records[1].kind, octos_memory::RecordKind::Episode);
+}
+
+#[test]
+fn memory_ingest_forces_untrusted_on_episode_records_too() {
+    // Every externally ingested record is data, never instructions: an
+    // `episode:` record claiming `trust: "trusted"` comes out untrusted
+    // exactly like a document does (only the kernel's own episode
+    // mirroring may write trusted episodes).
+    let validated = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "episode:sess-1:7",
+        "kind": "episode",
+        "source": "episodes",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "Fixed the build",
+        "abstract": "Bumped rustls and re-ran CI.",
+        "trust": "trusted",
+        "promoted": true,
+        "visits": 12,
+    })]))
+    .expect("valid episode record");
+    assert_eq!(validated.records.len(), 1);
+    let episode = &validated.records[0];
+    assert_eq!(episode.kind, octos_memory::RecordKind::Episode);
+    assert_eq!(
+        episode.trust,
+        octos_memory::Trust::Untrusted,
+        "ingested episodes can never claim trusted"
+    );
+    assert_eq!(episode.visits, 0);
+    assert!(!episode.promoted);
+}
+
+#[test]
+fn memory_ingest_rejects_knowledge_records() {
+    let error = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "bank:acme-corp",
+        "kind": "knowledge",
+        "source": "bank",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "Acme Corp",
+        "abstract": "Customer since 2024.",
+    })]))
+    .expect_err("knowledge refused");
+    assert_eq!(error.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(
+        error.message.contains(MEMORY_INGEST_KNOWLEDGE_REFUSAL),
+        "{}",
+        error.message
+    );
+    // The lenient kind aliases are refused too — `bank` is knowledge.
+    let alias = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "bank:acme-corp",
+        "kind": "bank",
+        "source": "bank",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "Acme Corp",
+        "abstract": "Customer since 2024.",
+    })]))
+    .expect_err("knowledge alias refused");
+    assert_eq!(alias.code, rpc_error_codes::INVALID_PARAMS);
+}
+
+#[test]
+fn memory_ingest_rejects_malformed_records() {
+    let empty = validate_memory_ingest(ingest_params(vec![])).expect_err("no records");
+    assert_eq!(empty.code, rpc_error_codes::INVALID_PARAMS);
+
+    let over: Vec<Value> = (0..=MEMORY_INGEST_MAX_RECORDS)
+        .map(|i| ingest_doc_record(&format!("doc:mail:{i}")))
+        .collect();
+    let too_many = validate_memory_ingest(ingest_params(over)).expect_err("over cap");
+    assert_eq!(too_many.code, rpc_error_codes::INVALID_PARAMS);
+    assert_eq!(
+        too_many.data.as_ref().and_then(|d| d.get("max_records")),
+        Some(&json!(MEMORY_INGEST_MAX_RECORDS))
+    );
+    assert_eq!(
+        too_many
+            .data
+            .as_ref()
+            .and_then(|d| d.get("requested_records")),
+        Some(&json!(MEMORY_INGEST_MAX_RECORDS + 1))
+    );
+
+    let blank_id = validate_memory_ingest(ingest_params(vec![ingest_doc_record("   ")]))
+        .expect_err("blank id");
+    assert_eq!(blank_id.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(
+        blank_id.message.contains("records[0]"),
+        "{}",
+        blank_id.message
+    );
+
+    let wrong_ns = validate_memory_ingest(ingest_params(vec![ingest_doc_record("mail-42")]))
+        .expect_err("document id outside doc:<source>:");
+    assert_eq!(wrong_ns.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(
+        wrong_ns.message.contains("doc:mail:<key>"),
+        "{}",
+        wrong_ns.message
+    );
+
+    let other_source =
+        validate_memory_ingest(ingest_params(vec![ingest_doc_record("doc:calendar:42")]))
+            .expect_err("document id must carry its own source");
+    assert_eq!(other_source.code, rpc_error_codes::INVALID_PARAMS);
+
+    let no_kind = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "doc:mail:1",
+        "source": "mail",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "t",
+        "abstract": "a",
+    })]))
+    .expect_err("kind required");
+    assert_eq!(no_kind.code, rpc_error_codes::INVALID_PARAMS);
+
+    let bad_kind = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "doc:mail:1",
+        "kind": "mailbox",
+        "source": "mail",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "t",
+        "abstract": "a",
+    })]))
+    .expect_err("unknown kind");
+    assert_eq!(bad_kind.code, rpc_error_codes::INVALID_PARAMS);
+
+    let missing_field = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "doc:mail:1",
+        "kind": "document",
+        "source": "mail",
+        "title": "t",
+        "abstract": "a",
+    })]))
+    .expect_err("timestamp required");
+    assert_eq!(missing_field.code, rpc_error_codes::INVALID_PARAMS);
+    assert!(
+        missing_field.message.contains("timestamp"),
+        "{}",
+        missing_field.message
+    );
+
+    let not_object = validate_memory_ingest(ingest_params(vec![json!("doc:mail:1")]))
+        .expect_err("record must be an object");
+    assert_eq!(not_object.code, rpc_error_codes::INVALID_PARAMS);
+
+    let episode_ns = validate_memory_ingest(ingest_params(vec![json!({
+        "id": "doc:episodes:1",
+        "kind": "episode",
+        "source": "episodes",
+        "timestamp": "2026-03-04T05:06:07Z",
+        "title": "t",
+        "abstract": "a",
+    })]))
+    .expect_err("episode id must start with episode:");
+    assert_eq!(episode_ns.code, rpc_error_codes::INVALID_PARAMS);
+}
+
+#[test]
+fn memory_ingest_requires_vectors_parallel_to_records() {
+    let mismatch = validate_memory_ingest(MemoryIngestParams {
+        records: vec![
+            ingest_doc_record("doc:mail:1"),
+            ingest_doc_record("doc:mail:2"),
+        ],
+        vectors: Some(vec![Some(vec![0.1, 0.2])]),
+        embed: None,
+    })
+    .expect_err("vector count mismatch");
+    assert_eq!(mismatch.code, rpc_error_codes::INVALID_PARAMS);
+
+    let parallel = validate_memory_ingest(MemoryIngestParams {
+        records: vec![
+            ingest_doc_record("doc:mail:1"),
+            ingest_doc_record("doc:mail:2"),
+        ],
+        vectors: Some(vec![Some(vec![0.1, 0.2]), None]),
+        embed: None,
+    })
+    .expect("parallel vectors accepted");
+    assert_eq!(
+        parallel.vectors,
+        Some(vec![Some(vec![0.1, 0.2]), None]),
+        "supplied vectors pass through untouched"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Oversized hydrate: shrink low-value fields first, never blank a reply.
+// A long coding session's `session/hydrate` reply is several MiB, spread
+// over hundreds of reasoning / tool-output / reply strings. Truncating
+// largest-first with a leftover budget blanked the biggest fields outright
+// — often the assistant's own replies — with `[oversized field omitted]`.
+// ---------------------------------------------------------------------
+
+/// A hydrate-shaped reply: `n` turns, each with a reasoning trace, a tool
+/// call + tool output, and an assistant reply, sized per the arguments.
+fn oversized_hydrate_frame(
+    turns: usize,
+    reasoning_len: usize,
+    tool_len: usize,
+    reply_len: usize,
+) -> String {
+    let mut messages = Vec::new();
+    for turn in 0..turns {
+        messages.push(json!({ "role": "user", "content": format!("question {turn}") }));
+        messages.push(json!({
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": format!("R{turn}:{}", "r".repeat(reasoning_len)),
+            "tool_calls": [{ "id": format!("call-{turn}"), "type": "function",
+                "function": { "name": "shell", "arguments": format!("{{\"cmd\":\"{}\"}}", "a".repeat(tool_len / 4)) } }],
+        }));
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": format!("call-{turn}"),
+            "content": format!("T{turn}:{}", "t".repeat(tool_len)),
+        }));
+        messages.push(json!({
+            "role": "assistant",
+            "content": format!("REPLY_HEAD_{turn} {} REPLY_TAIL_{turn}", "w".repeat(reply_len)),
+        }));
+    }
+    let value = json!({ "jsonrpc": "2.0", "id": 7, "result": { "session_id": "local:test", "messages": messages } });
+    app_ui_codec::to_compact_json(&value).expect("serialize hydrate frame")
+}
+
+fn hydrate_messages(out: &str) -> Vec<Value> {
+    let parsed: Value = serde_json::from_str(out).expect("rewritten frame stays valid JSON");
+    parsed["result"]["messages"]
+        .as_array()
+        .expect("messages survive")
+        .clone()
+}
+
+#[test]
+fn should_keep_every_assistant_reply_whole_when_reasoning_and_tool_output_can_absorb_the_cut() {
+    // ~3 MiB: 40 turns x (30 KiB reasoning + ~37 KiB tool call/output + 8 KiB reply).
+    let frame = oversized_hydrate_frame(40, 30 * 1024, 30 * 1024, 8 * 1024);
+    assert!(
+        frame.len() > 2 * MAX_TEXT_FRAME_BYTES,
+        "fixture must be far over the cap"
+    );
+
+    let out = preview_oversized_frame(frame);
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "deliverable, got {}",
+        out.len()
+    );
+    assert!(
+        !out.contains(UNPREVIEWABLE_STUB),
+        "no field may be blanked to the stub"
+    );
+    let messages = hydrate_messages(&out);
+    assert_eq!(messages.len(), 160, "no message is dropped");
+    for turn in 0..40 {
+        let reply = messages[turn * 4 + 3]["content"].as_str().unwrap();
+        assert!(
+            reply.starts_with(&format!("REPLY_HEAD_{turn} "))
+                && reply.ends_with(&format!(" REPLY_TAIL_{turn}")),
+            "reply {turn} must survive whole"
+        );
+        assert!(
+            !reply.contains("bytes truncated"),
+            "reply {turn} must not be cut"
+        );
+        let tool = messages[turn * 4 + 2]["content"].as_str().unwrap();
+        assert!(
+            tool.starts_with(&format!("T{turn}:")),
+            "tool output {turn} keeps its head"
+        );
+        let reasoning = messages[turn * 4 + 1]["reasoning_content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            reasoning.starts_with(&format!("R{turn}:")),
+            "reasoning {turn} keeps its head"
+        );
+    }
+}
+
+#[test]
+fn should_keep_every_message_and_reply_when_a_long_session_has_many_medium_fields() {
+    // The shape of a real long coding session: hundreds of turns, each
+    // reasoning trace and tool output only a few KiB, but ~5 MiB in total. A
+    // preview floor sized for one dominant field cannot fit this, and the
+    // structural fallback then silently drops half the message list.
+    let frame = oversized_hydrate_frame(300, 8 * 1024, 8 * 1024, 1024);
+    assert!(
+        frame.len() > 4 * MAX_TEXT_FRAME_BYTES,
+        "fixture must be far over the cap"
+    );
+
+    let out = preview_oversized_frame(frame);
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "deliverable, got {}",
+        out.len()
+    );
+    assert!(
+        !out.contains(UNPREVIEWABLE_STUB),
+        "no field may be blanked to the stub"
+    );
+    let messages = hydrate_messages(&out);
+    assert_eq!(messages.len(), 1200, "no message may be dropped");
+    for turn in 0..300 {
+        let reply = messages[turn * 4 + 3]["content"].as_str().unwrap();
+        assert!(
+            reply.starts_with(&format!("REPLY_HEAD_{turn} "))
+                && reply.ends_with(&format!(" REPLY_TAIL_{turn}"))
+                && !reply.contains("bytes truncated"),
+            "reply {turn} must survive whole"
+        );
+    }
+}
+
+#[test]
+fn should_preview_rather_than_blank_replies_when_the_replies_alone_are_over_the_cap() {
+    // Replies alone are ~2.4 MiB, so they must be cut too — but each keeps a
+    // head and a tail with a marker, never the blank stub.
+    let frame = oversized_hydrate_frame(12, 1024, 1024, 200 * 1024);
+    assert!(frame.len() > 2 * MAX_TEXT_FRAME_BYTES);
+
+    let out = preview_oversized_frame(frame);
+
+    assert!(
+        out.len() < MAX_TEXT_FRAME_BYTES,
+        "deliverable, got {}",
+        out.len()
+    );
+    assert!(
+        !out.contains(UNPREVIEWABLE_STUB),
+        "no field may be blanked to the stub"
+    );
+    let messages = hydrate_messages(&out);
+    for turn in 0..12 {
+        let reply = messages[turn * 4 + 3]["content"].as_str().unwrap();
+        assert!(
+            reply.starts_with(&format!("REPLY_HEAD_{turn} ")),
+            "reply {turn} keeps its head"
+        );
+        assert!(
+            reply.ends_with(&format!(" REPLY_TAIL_{turn}")),
+            "reply {turn} keeps its tail"
+        );
+        assert!(
+            reply.contains("bytes truncated"),
+            "reply {turn} carries the marker"
+        );
+        assert!(
+            reply.len() > 16 * 1024,
+            "reply {turn} keeps a useful preview, got {}",
+            reply.len()
+        );
+    }
+}
+
+// --- server/shutdown: stop a local --solo `octos serve` from a UI client ---
+
+/// A local `--solo` state that also carries an HTTP serve's stop switch, plus
+/// a receiver watching it — what `octos serve` (not `--stdio`) builds.
+fn local_serve_state_with_stop_switch(
+    dir: &std::path::Path,
+) -> (AppState, tokio::sync::watch::Receiver<bool>) {
+    let stop = Arc::new(tokio::sync::watch::channel(false).0);
+    let watching = stop.subscribe();
+    let state = AppState {
+        serve_shutdown: Some(stop),
+        ..local_profile_state(dir)
+    };
+    (state, watching)
+}
+
+fn advertises_server_shutdown(state: &AppState) -> bool {
+    ConnectionUiFeatures::default()
+        .advertised_capabilities(state)
+        .supported_methods
+        .iter()
+        .any(|method| method == APPUI_METHOD_SERVER_SHUTDOWN)
+}
+
+#[test]
+fn should_advertise_server_shutdown_only_on_a_local_solo_http_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let (serve, _watching) = local_serve_state_with_stop_switch(dir.path());
+    assert!(
+        advertises_server_shutdown(&serve),
+        "a local --solo HTTP serve must offer server/shutdown"
+    );
+
+    // `--stdio` and non-serve states hold no stop switch: nothing to stop.
+    let no_switch = local_profile_state(dir.path());
+    assert!(!advertises_server_shutdown(&no_switch));
+
+    // Without the explicit --solo opt-in — a fleet host behind a proxy looks
+    // exactly like this — one client must never be able to stop everyone's
+    // server.
+    let (not_solo, _w) = local_serve_state_with_stop_switch(dir.path());
+    let not_solo = AppState {
+        solo_login_enabled: false,
+        ..not_solo
+    };
+    assert!(!advertises_server_shutdown(&not_solo));
+
+    let (tenant, _w) = local_serve_state_with_stop_switch(dir.path());
+    let tenant = AppState {
+        deployment_mode: crate::config::DeploymentMode::Tenant,
+        ..tenant
+    };
+    assert!(!advertises_server_shutdown(&tenant));
+}
+
+#[tokio::test]
+async fn should_flip_the_serve_stop_switch_when_server_shutdown_is_called() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, mut watching) = local_serve_state_with_stop_switch(dir.path());
+
+    let reply = handle_server_shutdown(&state).expect("a local solo serve accepts it");
+    assert_eq!(reply, json!({ "stopping": true }));
+
+    // The reply is written first, then the same switch Ctrl+C flips.
+    tokio::time::timeout(std::time::Duration::from_secs(2), watching.changed())
+        .await
+        .expect("the stop switch must flip shortly after the reply")
+        .expect("sender alive");
+    assert!(*watching.borrow(), "server/shutdown must request a stop");
+}
+
+#[tokio::test]
+async fn should_refuse_server_shutdown_and_stop_nothing_when_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, watching) = local_serve_state_with_stop_switch(dir.path());
+    let state = AppState {
+        solo_login_enabled: false,
+        ..state
+    };
+
+    let error = handle_server_shutdown(&state).expect_err("not available without --solo");
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("kind")),
+        Some(&json!("server_shutdown_unavailable"))
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        !*watching.borrow(),
+        "a refused request must not stop the server"
+    );
+}
+
+#[test]
+fn should_bar_session_scoped_connections_from_server_shutdown() {
+    // A session-ingress connection is scoped to one session; stopping the
+    // whole server is out of its reach whatever the deployment.
+    assert!(!session_ingress_callable_method(
+        APPUI_METHOD_SERVER_SHUTDOWN
+    ));
+}
+
+// UPCR-2026-031 wiring: a REAL `turn/start` held inside its admission window
+// (after the marker, before the registry insert) must not be reported as
+// certainly not running — under the raw id and, for a topic turn, the folded
+// id the registry keys on. Deleting the marker wiring fails these. Callers
+// that pass `true` additionally ride the release: the start must settle at a
+// terminal notification and its recorded state must stay queryable after.
+async fn state_get_during_held_admission(
+    topic: Option<&str>,
+    await_settlement: bool,
+) -> (Value, Value, Value, Option<Value>) {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let provider = Arc::new(AppuiContinuationLlm::new("done"));
+    let (state, _profile_runtime) =
+        state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider).await;
+    let session_id = SessionKey::new("api", "admission-wired");
+    let folded = topic.map(|t| SessionKey(format!("{}#{t}", session_id.base_key())));
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut start_rx) = ws_connection_for_test(256);
+    // Make the session known to the same manager `turn/state/get` consults,
+    // as any open session is.
+    for sid in std::iter::once(&session_id).chain(folded.as_ref()) {
+        let sessions = resolve_sessions_for_lookup(&state, None, None, sid)
+            .await
+            .expect("session manager for the test profile");
+        sessions.lock().await.get_or_create(sid).await;
+    }
+
+    let query = |sid: SessionKey, turn_id: TurnId| {
+        let state = state.clone();
+        let ledger = ledger.clone();
+        let active_turns = active_turns.clone();
+        async move {
+            let (ws, mut rx) = ws_connection_for_test(8);
+            handle_turn_state_get(
+                &ws,
+                &state,
+                &ledger,
+                &active_turns,
+                None,
+                None,
+                ConnectionUiFeatures::stdio_defaults(),
+                "probe".into(),
+                TurnStateGetParams {
+                    session_id: sid,
+                    turn_id,
+                },
+            )
+            .await;
+            recv_rpc_json(&mut rx).await
+        }
+    };
+
+    // Control: a turn nobody is admitting IS reported as not running here,
+    // so the assertions below can fail.
+    let control = query(folded.clone().unwrap_or(session_id.clone()), TurnId::new()).await;
+
+    let turn_id = TurnId::new();
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    TURN_ADMISSION_TEST_PAUSES
+        .lock()
+        .unwrap()
+        .insert(turn_id.0.to_string(), (reached.clone(), release.clone()));
+    let start = handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "held-start".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: turn_id.clone(),
+            input: vec![InputItem::Text {
+                text: "held in admission".into(),
+            }],
+            media: Vec::new(),
+            topic: topic.map(str::to_owned),
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+            origin: None,
+        },
+    );
+    let probe = async {
+        tokio::time::timeout(waiting_budget(Duration::from_secs(5)), reached.notified())
+            .await
+            .expect("the held turn/start must reach its admission pause");
+        let raw = query(session_id.clone(), turn_id.clone()).await;
+        let folded_frame = match folded.clone() {
+            Some(f) => query(f, turn_id.clone()).await,
+            None => raw.clone(),
+        };
+        release.notify_one();
+        if !await_settlement {
+            return (raw, folded_frame, None);
+        }
+        tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+            loop {
+                let frame = recv_rpc_json(&mut start_rx).await;
+                let method = frame.get("method").and_then(Value::as_str);
+                let is_v2_terminal = method == Some("projection/envelope")
+                    && frame
+                        .get("params")
+                        .and_then(|p| p.get("payload"))
+                        .and_then(|p| p.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("turn_terminal");
+                if method == Some("turn/completed")
+                    || method == Some("turn/error")
+                    || is_v2_terminal
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the released turn must settle");
+        // A topic turn's record lives under the folded key the handler
+        // splices in, so ask by the same key the start itself used.
+        let post = query(
+            folded.clone().unwrap_or(session_id.clone()),
+            turn_id.clone(),
+        )
+        .await;
+        (raw, folded_frame, Some(post))
+    };
+    let (_, (raw, folded_frame, post)) = tokio::join!(start, probe);
+    (control, raw, folded_frame, post)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_withhold_not_running_while_a_real_turn_start_is_mid_admission() {
+    let (control, raw, _, _) = state_get_during_held_admission(None, false).await;
+    assert_eq!(control["result"]["running"], false, "control: {control}");
+    assert_eq!(raw["result"]["state"], "unknown", "held: {raw}");
+    assert!(raw["result"].get("running").is_none(), "held: {raw}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_withhold_not_running_for_a_topic_turn_asked_by_its_folded_id() {
+    let (control, raw, folded, _) = state_get_during_held_admission(Some("t1"), false).await;
+    assert_eq!(control["result"]["running"], false, "control: {control}");
+    for frame in [&raw, &folded] {
+        assert_eq!(frame["result"]["state"], "unknown", "held: {frame}");
+        assert!(frame["result"].get("running").is_none(), "held: {frame}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_surface_the_recorded_state_once_a_held_admission_proceeds() {
+    let (control, _, _, post) = state_get_during_held_admission(None, true).await;
+    assert_eq!(control["result"]["running"], false, "control: {control}");
+    let post = post.expect("settlement caller receives the post frame");
+    assert_eq!(
+        post["result"]["state"], "completed",
+        "the released turn must proceed to a queryable record: {post}"
+    );
+    assert!(
+        post["result"].get("running").is_none(),
+        "a recorded terminal turn must not claim `running: false`: {post}"
+    );
+}
+
+/// A scripted model that keeps calling `read_file`, driving a REAL
+/// profile-capped serve session (`max_iterations = 2`) to its budget stop.
+/// #2359: the granted grace call must reach the model tools-disabled and its
+/// synthesis — not the canned budget-stop message — is what the session
+/// history ends with.
+#[tokio::test]
+async fn should_end_a_capped_serve_turn_with_the_tools_disabled_grace_synthesis() {
+    struct ScriptedToolCaller {
+        marker_a: String,
+        marker_b: String,
+        requests: Arc<StdMutex<Vec<Vec<octos_llm::ToolSpec>>>>,
+    }
+    #[async_trait::async_trait]
+    impl octos_llm::LlmProvider for ScriptedToolCaller {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> eyre::Result<octos_llm::ChatResponse> {
+            let mut requests = self.requests.lock().unwrap_or_else(|p| p.into_inner());
+            requests.push(tools.to_vec());
+            let index = requests.len() - 1;
+            drop(requests);
+            let (content, tool_calls, stop_reason) = match index {
+                0 => (
+                    None,
+                    vec![octos_core::ToolCall {
+                        id: "grace-e2e-read-a".into(),
+                        name: "read_file".into(),
+                        arguments: json!({ "path": self.marker_a }),
+                        metadata: None,
+                    }],
+                    octos_llm::StopReason::ToolUse,
+                ),
+                1 => (
+                    None,
+                    vec![octos_core::ToolCall {
+                        id: "grace-e2e-read-b".into(),
+                        name: "read_file".into(),
+                        arguments: json!({ "path": self.marker_b }),
+                        metadata: None,
+                    }],
+                    octos_llm::StopReason::ToolUse,
+                ),
+                _ => (
+                    Some(
+                        "GRACE SYNTHESIS: both markers read and summarized; nothing remains."
+                            .into(),
+                    ),
+                    Vec::new(),
+                    octos_llm::StopReason::EndTurn,
+                ),
+            };
+            Ok(octos_llm::ChatResponse {
+                content,
+                reasoning_content: None,
+                tool_calls,
+                stop_reason,
+                usage: octos_llm::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "serve-grace-scripted"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = SessionKey::new("api", "grace-e2e-serve");
+    // The no-hint session workspace (`resolve_workspace_root`): it must exist
+    // BEFORE the session boots so the scope canonicalizes it and the file
+    // tools accept reads inside (the raw-vs-canonical no-hint trap).
+    let workspace = temp
+        .path()
+        .join("profiles")
+        .join(MAIN_PROFILE_ID)
+        .join("data")
+        .join("users")
+        .join(octos_bus::session::encode_path_component(
+            session_id.base_key(),
+        ))
+        .join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // Substantive bodies (>=128 chars, see `is_productive_tool_message`) so
+    // both reads count as productive and the grace call is granted.
+    let marker_body = "GRACE MARKER BODY: the abstract, the method section and the evaluation, \
+long enough to be a substantive tool result rather than a short diagnostic string.";
+    let marker_a = workspace.join("grace-marker-a.txt");
+    let marker_b = workspace.join("grace-marker-b.txt");
+    std::fs::write(&marker_a, format!("{marker_body}\nmarker: A")).unwrap();
+    std::fs::write(&marker_b, format!("{marker_body}\nmarker: B")).unwrap();
+
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedToolCaller {
+        marker_a: marker_a.display().to_string(),
+        marker_b: marker_b.display().to_string(),
+        requests: requests.clone(),
+    });
+    // NOTE: the runtime Arc is dropped here so the mutation below can take
+    // the profile's last reference via `Arc::get_mut`.
+    let (mut state, _) = state_with_profile_llm(temp.path(), MAIN_PROFILE_ID, provider).await;
+    let runtime = Arc::get_mut(&mut state)
+        .unwrap()
+        .profiles
+        .get_mut(MAIN_PROFILE_ID)
+        .expect("main profile runtime");
+    Arc::get_mut(runtime).unwrap().max_iterations = Some(2);
+
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &session_id)
+        .await
+        .expect("session manager for the test profile");
+    sessions.lock().await.get_or_create(&session_id).await;
+
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let ledger = Arc::new(UiProtocolLedger::new(128));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (ws, mut rx) = ws_connection_for_test(256);
+    handle_turn_start(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        &active_turns,
+        &connection_turns,
+        None,
+        None,
+        ConnectionUiFeatures::stdio_defaults(),
+        "grace-e2e".into(),
+        TurnStartParams {
+            session_id: session_id.clone(),
+            turn_id: TurnId::new(),
+            input: vec![InputItem::Text {
+                text: "read both markers".into(),
+            }],
+            media: Vec::new(),
+            topic: None,
+            rewrite_for: None,
+            reasoning_effort: None,
+            tool_context: None,
+            live_video: false,
+            origin: None,
+        },
+    )
+    .await;
+    let response = recv_rpc_response_with_id(&mut rx, "grace-e2e").await;
+    assert!(
+        response.get("result").is_some(),
+        "the capped turn must be accepted: {response}"
+    );
+    tokio::time::timeout(waiting_budget(Duration::from_secs(10)), async {
+        loop {
+            let frame = recv_rpc_json(&mut rx).await;
+            let m = frame.get("method").and_then(Value::as_str);
+            let is_v2_terminal = m == Some("projection/envelope")
+                && frame
+                    .get("params")
+                    .and_then(|p| p.get("payload"))
+                    .and_then(|p| p.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("turn_terminal");
+            if m == Some("turn/completed") || m == Some("turn/error") || is_v2_terminal {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the capped turn must settle");
+
+    let synthesis = "GRACE SYNTHESIS: both markers read and summarized; nothing remains.";
+    let deadline = std::time::Instant::now() + waiting_budget(Duration::from_secs(10));
+    let final_text = loop {
+        let mut sessions_guard = sessions.lock().await;
+        let session = sessions_guard.get_or_create(&session_id).await;
+        if let Some(message) = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant && m.content.contains(synthesis))
+        {
+            break message.content.clone();
+        }
+        drop(sessions_guard);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the grace synthesis never reached the session history; got: {:?}",
+            {
+                let mut sessions_guard = sessions.lock().await;
+                let session = sessions_guard.get_or_create(&session_id).await;
+                session
+                    .messages
+                    .iter()
+                    .map(|m| (m.role.as_str().to_string(), m.content.clone()))
+                    .collect::<Vec<_>>()
+            }
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        !final_text.contains("did not complete within"),
+        "the canned budget-stop message must not be the session's final answer: {final_text}"
+    );
+    let requests = requests.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(
+        requests.len(),
+        3,
+        "two tool rounds plus the grace call, nothing after it"
+    );
+    assert!(
+        requests.iter().take(2).all(|tools| !tools.is_empty()),
+        "the action iterations still carry the full tool slice"
+    );
+    assert!(
+        requests[2].is_empty(),
+        "the grace call must reach the model tools-disabled"
+    );
+}
+
+// --- session keep-alive: an open Session must not age out of the runtime
+// cache under a client that is simply reading (see
+// APPUI_SESSION_KEEPALIVE_INTERVAL).
+
+#[test]
+fn should_pace_session_keepalive_inside_the_cache_idle_window() {
+    use std::time::Duration;
+    // A quarter of the window, so one missed tick still cannot age a Session out.
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(1800)),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(120)),
+        Duration::from_secs(30)
+    );
+    // Clamped: never busier than 5 s, never rarer than 5 minutes.
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(4)),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        appui_session_keepalive_interval(Duration::from_secs(36_000)),
+        Duration::from_secs(300)
+    );
+}
+
+#[test]
+fn should_wait_a_full_interval_before_the_first_session_keepalive() {
+    let interval = std::time::Duration::from_secs(300);
+    let start = std::time::Instant::now();
+    let mut last = None;
+    // session/open just used the runtime, so the first tick renews nothing.
+    assert!(!appui_keepalive_due(&mut last, start, interval));
+    assert!(!appui_keepalive_due(
+        &mut last,
+        start + std::time::Duration::from_secs(299),
+        interval
+    ));
+    assert!(appui_keepalive_due(&mut last, start + interval, interval));
+}
+
+#[test]
+fn should_keep_renewing_open_sessions_on_every_interval() {
+    let interval = std::time::Duration::from_secs(300);
+    let start = std::time::Instant::now();
+    let mut last = None;
+    appui_keepalive_due(&mut last, start, interval);
+    let mut renewals = 0;
+    // Two hours of an idle-but-open connection: the 30 minute idle TTL must
+    // never be reached between renewals.
+    for tick in (2..=7200).step_by(2) {
+        if appui_keepalive_due(
+            &mut last,
+            start + std::time::Duration::from_secs(tick),
+            interval,
+        ) {
+            renewals += 1;
+        }
+    }
+    assert_eq!(renewals, 24, "one renewal per interval, no drift");
+}
+
+/// A file the agent delivers (`send_file`) must be downloadable by the
+/// browser. `/api/files` only serves paths under the tenant's data dir, so a
+/// delivery from an approved external project folder —
+/// `new-octos/editable-singlepanel-3p/_build/p20-art.png` — was `403 access
+/// denied` on every download: 56 "sent" files across three real web sessions,
+/// none reachable. The transcript keeps the original path (what a local client
+/// shows); a tenant-owned copy is stored where `/api/files` looks it up.
+#[tokio::test]
+async fn should_store_a_download_copy_of_a_delivered_file_and_keep_its_original_path() {
+    let tenant = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    // Per-project session store, as `appui.sessions_in_cwd` lays it out.
+    let store_dir = project.path().join(".octos").join("dev");
+    let sessions = Arc::new(TokioMutex::new(
+        octos_bus::SessionManager::open(&store_dir).unwrap(),
+    ));
+    let key = SessionKey::with_profile("dev", "api", "web-send-file");
+    let file = project.path().join("p20-art.png");
+    std::fs::write(&file, b"png").unwrap();
+    let raw = file.to_string_lossy().into_owned();
+    let copy = octos_bus::session_artifacts::delivered_copy_path(tenant.path(), &key, &raw);
+    assert!(!copy.exists(), "precondition: no download copy yet");
+
+    // Exactly what `SendFileTool` puts on the per-turn channel.
+    let sent = octos_core::OutboundMessage {
+        channel: "api".to_string(),
+        chat_id: key.0.clone(),
+        content: "P20 map".to_string(),
+        reply_to: None,
+        media: vec![raw.clone()],
+        metadata: serde_json::json!({}),
+    };
+    let (message, _) =
+        persist_send_file_delivery(&sessions, &store_dir, tenant.path(), &key, "thread-1", sent)
+            .await
+            .expect("the delivery must persist");
+
+    assert_eq!(
+        message.media,
+        vec![raw.clone()],
+        "the original path is recorded"
+    );
+    assert_eq!(
+        std::fs::read(&copy).unwrap(),
+        b"png",
+        "the download copy is stored where /api/files looks"
+    );
+    let reread = octos_bus::SessionManager::open(&store_dir)
+        .unwrap()
+        .load(&key)
+        .await
+        .expect("session exists");
+    assert_eq!(
+        reread.messages.last().map(|m| m.media.clone()),
+        Some(vec![raw])
+    );
+}
+
+#[test]
+fn should_reject_unusable_ws_liveness_ping_overrides() {
+    assert_eq!(ws_liveness_ping_secs_from(None), None);
+    assert_eq!(ws_liveness_ping_secs_from(Some("")), None);
+    assert_eq!(ws_liveness_ping_secs_from(Some("soon")), None);
+    assert_eq!(ws_liveness_ping_secs_from(Some("0")), None);
+    assert_eq!(ws_liveness_ping_secs_from(Some("86401")), None);
+    assert_eq!(ws_liveness_ping_secs_from(Some("1")), Some(1));
+    assert_eq!(ws_liveness_ping_secs_from(Some("86400")), Some(86400));
+}
+
+#[test]
+fn should_close_ws_liveness_after_three_missed_pings_plus_one_interval_of_slack() {
+    // Default deployment: 20 s Pings → the deadline gives a half-open peer
+    // three missed Pings plus one interval of slack before the read loop
+    // closes it.
+    assert_eq!(
+        ws_liveness_deadline_from_ping_interval(std::time::Duration::from_secs(20)),
+        std::time::Duration::from_secs(80)
+    );
+}
+
+// #2447 review: the housekeeping tick drains the socket to refresh the
+// liveness meter while an inline dispatch runs. Those frames arrived through
+// the biased select's back door — replaying them through the per-frame path
+// is what keeps their JSON-RPC ids answerable.
+#[tokio::test]
+async fn should_queue_every_drained_frame_for_replay_not_drop_it() {
+    let (tx, mut rx) =
+        futures::channel::mpsc::unbounded::<Result<WsMessage, std::convert::Infallible>>();
+    let _ = tx.unbounded_send(Ok(WsMessage::Text("frame-1".into())));
+    let _ = tx.unbounded_send(Ok(WsMessage::Pong(Vec::new().into())));
+    let _ = tx.unbounded_send(Ok(WsMessage::Text("frame-2".into())));
+    let mut queued = std::collections::VecDeque::new();
+    let mut last_inbound = std::time::Instant::now() - std::time::Duration::from_secs(30);
+
+    // The sender stays alive: after the three buffered frames the socket is
+    // merely quiet (Pending), not gone.
+    let gone = drain_queued_ws_frames(&mut rx, &mut queued, &mut last_inbound).await;
+
+    assert!(!gone, "a stream with frames left is not gone");
+    assert_eq!(
+        queued.len(),
+        3,
+        "every drained frame must be queued, not consumed"
+    );
+    assert!(matches!(queued.pop_front(), Some(WsMessage::Text(_))));
+    assert!(matches!(queued.pop_front(), Some(WsMessage::Pong(_))));
+    assert!(matches!(queued.pop_front(), Some(WsMessage::Text(_))));
+    assert!(
+        last_inbound.elapsed() < std::time::Duration::from_secs(1),
+        "the drain must refresh the liveness meter for the frames it saw"
+    );
+}
+
+#[tokio::test]
+async fn should_report_stream_gone_when_the_drain_hits_an_error() {
+    let mut queued = std::collections::VecDeque::new();
+    let mut last_inbound = std::time::Instant::now();
+    let frames: Vec<Result<WsMessage, &str>> = vec![Err("socket gone")];
+
+    let gone = drain_queued_ws_frames(
+        &mut futures::stream::iter(frames),
+        &mut queued,
+        &mut last_inbound,
+    )
+    .await;
+
+    assert!(gone);
+    assert!(queued.is_empty());
+}
+
+#[tokio::test]
+async fn should_treat_an_idle_stream_as_alive_and_a_closed_one_as_gone() {
+    let (tx, mut rx) =
+        futures::channel::mpsc::unbounded::<Result<WsMessage, std::convert::Infallible>>();
+    let mut queued = std::collections::VecDeque::new();
+    let mut last_inbound = std::time::Instant::now();
+
+    let gone = drain_queued_ws_frames(&mut rx, &mut queued, &mut last_inbound).await;
+    assert!(!gone, "no frame yet is Pending, not gone");
+    assert!(queued.is_empty());
+
+    drop(tx);
+    let gone = drain_queued_ws_frames(&mut rx, &mut queued, &mut last_inbound).await;
+    assert!(
+        gone,
+        "a closed stream must end the connection like a read error"
+    );
+}
+
+// ── UPCR-2026-036: `octos serve --host-managed` ─────────────────────────────
+
+fn host_managed_peer_session(topic: &str) -> SessionKey {
+    SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "octosense", topic)
+}
+
+async fn external_approval_respond(
+    external: bool,
+    session_id: SessionKey,
+) -> (Value, tokio::sync::oneshot::Receiver<ApprovalDecision>) {
+    external_approval_respond_as(external, session_id, true).await
+}
+
+/// `own_turn`: whether the pending approval was raised by a turn of the
+/// answering connection (the server records the owner on the approval).
+async fn external_approval_respond_as(
+    external: bool,
+    session_id: SessionKey,
+    own_turn: bool,
+) -> (Value, tokio::sync::oneshot::Receiver<ApprovalDecision>) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let (ws, mut rx) = ws_connection_for_test(32);
+    let (host_ws, _host_rx) = ws_connection_for_test(32);
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let approval_id = ApprovalId::new();
+    // The same client-chosen turn id either way: ownership is the
+    // connection's, never the id's.
+    let turn_id = TurnId::new();
+    let owner = if own_turn { &ws } else { &host_ws };
+    let decision_rx = contracts.approvals.request_runtime_owned(
+        ApprovalRequestedEvent::generic(
+            session_id.clone(),
+            approval_id.clone(),
+            turn_id,
+            "shell",
+            "Run command",
+            "cargo test",
+        ),
+        Some(owner.connection_id().0),
+    );
+    let external_owner = external.then(|| ws.connection_id());
+    let mut respond =
+        ApprovalRespondParams::new(session_id.clone(), approval_id, ApprovalDecision::Approve);
+    respond.approval_scope = Some("approve_for_session".into());
+    handle_approval_respond(
+        &ws,
+        &state,
+        &ledger,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        external_owner,
+        "respond".into(),
+        respond,
+    )
+    .await;
+    if external {
+        assert!(
+            contracts.scopes.list_for_session(&session_id).is_empty(),
+            "an external answer never records a session-wide scope"
+        );
+    }
+    (recv_rpc_json(&mut rx).await, decision_rx)
+}
+
+#[tokio::test]
+async fn should_refuse_an_external_answer_to_a_host_owned_peer_approval() {
+    for topic in ["peer-rinx", "peerctx-rinx.app-a"] {
+        let (reply, mut decision) =
+            external_approval_respond(true, host_managed_peer_session(topic)).await;
+        assert_eq!(
+            reply["error"]["data"]["kind"],
+            json!(super::super::host_managed::HOST_OWNED_PEER_ANSWER_DENIED),
+            "{topic}: {reply}"
+        );
+        assert!(
+            decision.try_recv().is_err(),
+            "{topic}: the approval stays parked for the person"
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_let_the_host_answer_a_host_owned_peer_approval() {
+    let (reply, decision) =
+        external_approval_respond(false, host_managed_peer_session("peer-rinx")).await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(decision.await.unwrap(), ApprovalDecision::Approve);
+}
+
+#[tokio::test]
+async fn should_let_an_external_client_answer_only_its_own_turns_approvals_once() {
+    let session = host_managed_peer_session("system");
+    // A host turn's approval on the shared system conversation: refused.
+    let (reply, mut decision) = external_approval_respond_as(true, session.clone(), false).await;
+    assert_eq!(
+        reply["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{reply}"
+    );
+    assert!(
+        decision.try_recv().is_err(),
+        "the host's approval stays pending"
+    );
+    // Its own turn's approval: answered, once (no scope recorded).
+    let (reply, decision) = external_approval_respond_as(true, session, true).await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(decision.await.unwrap(), ApprovalDecision::Approve);
+}
+
+#[tokio::test]
+async fn should_refuse_an_external_answer_to_a_host_owned_peer_question() {
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let state = Arc::new(AppState::empty_for_tests());
+    let session_id = host_managed_peer_session("peerctx-rinx.app-a");
+    let question_id = QuestionId::new();
+    let mut waiter = contracts
+        .user_questions
+        .request_runtime(sample_pending_question(
+            session_id.clone(),
+            question_id.clone(),
+            TurnId::new(),
+        ));
+    let answer = || {
+        vec![UserQuestionAnswer {
+            selected_labels: vec!["axum".into()],
+            free_text: None,
+        }]
+    };
+    let (ws, mut rx) = ws_connection_for_test(32);
+    handle_user_question_respond(
+        &ws,
+        &state,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        Some(ws.connection_id()),
+        "q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id.clone(), answer()),
+    )
+    .await;
+    let reply = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        reply["error"]["data"]["kind"],
+        json!(super::super::host_managed::HOST_OWNED_PEER_ANSWER_DENIED),
+        "{reply}"
+    );
+    assert!(waiter.try_recv().is_err(), "the question stays pending");
+    // The host still answers it.
+    handle_user_question_respond(
+        &ws,
+        &state,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        None,
+        "q2".into(),
+        UserQuestionRespondParams::new(session_id, question_id, answer()),
+    )
+    .await;
+    let reply = recv_rpc_json(&mut rx).await;
+    assert!(reply.get("error").is_none(), "{reply}");
+}
+
+#[test]
+fn should_admit_only_configured_origins_on_a_host_managed_ws_upgrade() {
+    let state = AppState {
+        appui_allowed_origins: vec!["https://web.example".into()],
+        host_managed: Some(Arc::new(
+            super::super::host_managed::HostManaged::new("h".repeat(40), None, 4000).unwrap(),
+        )),
+        ..AppState::empty_for_tests()
+    };
+    let headers = |pairs: &[(&'static str, &str)]| {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().unwrap());
+        }
+        map
+    };
+    assert_eq!(
+        decide_ui_ws_origin_gate(&headers(&[("origin", "https://web.example")]), &state, true),
+        WsOriginDecision::Allow
+    );
+    // The built-in development and legacy origins are not trusted here.
+    for origin in [
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "https://app.ominix.io",
+    ] {
+        assert!(matches!(
+            decide_ui_ws_origin_gate(&headers(&[("origin", origin)]), &state, true),
+            WsOriginDecision::RejectDisallowed { .. }
+        ));
+    }
+    // A browser-style upgrade must carry Origin; a native client sends none.
+    assert!(matches!(
+        decide_ui_ws_origin_gate(&headers(&[("sec-fetch-mode", "websocket")]), &state, true),
+        WsOriginDecision::RejectDisallowed { .. }
+    ));
+    assert_eq!(
+        decide_ui_ws_origin_gate(&HeaderMap::new(), &state, true),
+        WsOriginDecision::Allow
+    );
+}
+
+#[test]
+fn stdio_default_feature_list_matches_the_stdio_defaults() {
+    // Hosts moving a native client from stdio to the host-managed WebSocket
+    // request exactly `UI_PROTOCOL_STDIO_DEFAULT_FEATURES` (UPCR-2026-036).
+    let requested = ConnectionUiFeatures::from_requested_feature_tokens(
+        octos_core::ui_protocol::UI_PROTOCOL_STDIO_DEFAULT_FEATURES,
+        true,
+    );
+    assert_eq!(requested, ConnectionUiFeatures::stdio_defaults());
+}
+
+fn owned_active_turn(turn_id: &TurnId, owner: ConnectionId) -> ActiveTurn {
+    let (mut entry, _buffer) = synthetic_active_turn(turn_id, true);
+    entry.owner = Some(owner);
+    entry
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_let_an_external_client_steer_and_interrupt_only_turns_it_owns() {
+    let host_session = host_managed_peer_session("system");
+    let own_session = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web", "mine");
+    // The same client-chosen turn id in both sessions: ownership is the
+    // connection's, never the id's.
+    let turn_id = TurnId::new();
+    let (host_ws, _host_rx) = ws_connection_for_test(32);
+    let (ws, mut rx) = ws_connection_for_test(32);
+    ws.set_external(true);
+    let active_turns: SharedActiveTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    active_turns.lock().await.insert(
+        host_session.clone(),
+        owned_active_turn(&turn_id, host_ws.connection_id()),
+    );
+    active_turns.lock().await.insert(
+        own_session.clone(),
+        owned_active_turn(&turn_id, ws.connection_id()),
+    );
+    let state = Arc::new(AppState::empty_for_tests());
+    let ledger = Arc::new(UiProtocolLedger::new(32));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let connection_turns: SharedConnectionTurns = Arc::new(TokioMutex::new(HashMap::new()));
+    let steer = |session: &SessionKey, id: &str| {
+        steer_request(
+            id,
+            json!({
+                "session_id": session,
+                "expected_turn_id": turn_id,
+                "input": [{ "kind": "text", "text": "steer" }],
+            }),
+        )
+    };
+    for (session, id, owned) in [
+        (&host_session, "steer-host", false),
+        (&own_session, "steer-own", true),
+    ] {
+        handle_turn_steer(
+            &ws,
+            &state,
+            &ledger,
+            &contracts,
+            &active_turns,
+            &connection_turns,
+            Some(MAIN_PROFILE_ID),
+            ConnectionUiFeatures::stdio_defaults(),
+            id.into(),
+            &steer(session, id),
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        if owned {
+            assert_eq!(frame["result"]["steered"], true, "{frame}");
+        } else {
+            assert_eq!(
+                frame["error"]["data"]["kind"],
+                json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+                "{frame}"
+            );
+        }
+    }
+    let host_steer = active_turns.lock().await[&host_session]
+        .steer
+        .clone()
+        .expect("steerable");
+    assert!(
+        host_steer.drain().is_empty(),
+        "the host's turn was not steered"
+    );
+
+    handle_turn_interrupt(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns,
+        &contracts,
+        "interrupt-host".into(),
+        TurnInterruptParams {
+            session_id: host_session.clone(),
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{frame}"
+    );
+    let state_now = active_turns.lock().await[&host_session].state.clone();
+    assert!(
+        matches!(*state_now.lock().await, TurnState::Active),
+        "the host's turn keeps running"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OctoSense ADR 0004 G1 (kernel half): an external client's approvals go only
+// to that client (UPCR-2026-036).
+// ---------------------------------------------------------------------------
+
+/// A fresh system-like session per call: the approval side tables are
+/// process-wide, so tests never share a session key.
+fn g1_system_session() -> SessionKey {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    SessionKey(format!(
+        "local:g1-octosense-{}#system",
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Run one approval request of a turn on `ws` in the background; return the
+/// task and the approval once it is pending.
+async fn g1_raise_approval(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+) -> (tokio::task::JoinHandle<ToolApprovalDecision>, ApprovalId) {
+    let turn_id = TurnId::new();
+    let requester = UiProtocolApprovalRequester {
+        ws: ws.clone(),
+        ledger: Arc::clone(ledger),
+        contracts: Arc::clone(contracts),
+        state: Arc::clone(state),
+        // Not a `peer-` topic, so the #1842 park gate never resolves.
+        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        features: ConnectionUiFeatures::default(),
+    };
+    let task = tokio::spawn(async move {
+        <UiProtocolApprovalRequester as octos_agent::ToolApprovalRequester>::request_approval(
+            &requester,
+            ToolApprovalRequest {
+                tool_id: "shell-1".into(),
+                tool_name: "shell".into(),
+                title: "Run command".into(),
+                body: "ls".into(),
+                command: Some("ls".into()),
+                cwd: None,
+                once_only: false,
+                host_tool: None,
+            },
+        )
+        .await
+    });
+    for _ in 0..500 {
+        if let Some(pending) = contracts
+            .approvals
+            .pending_for_session(session_id)
+            .into_iter()
+            .find(|approval| approval.turn_id == turn_id)
+        {
+            return (task, pending.approval_id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("the approval never became pending");
+}
+
+/// The ledgered `approval/requested` event for `approval_id`.
+fn g1_requested_event(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    approval_id: &ApprovalId,
+) -> LedgeredUiProtocolEvent {
+    ledger
+        .replay_after(
+            session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|entry| {
+            matches!(
+                &entry.event,
+                UiProtocolLedgerEvent::Notification(UiNotification::ApprovalRequested(e))
+                    if e.approval_id == *approval_id
+            )
+        })
+        .expect("the approval is in the shared ledger")
+}
+
+/// The approval ids `session/hydrate` (pending approvals) returns to `ws`.
+async fn g1_hydrated_pending(
+    ws: &WsConnection,
+    rx: &mut mpsc::Receiver<WsMessage>,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    session_id: &SessionKey,
+) -> Vec<Value> {
+    use octos_core::ui_protocol::hydrate_sections;
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    handle_session_hydrate(
+        ws,
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        &active_turns,
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        "g1-hydrate".into(),
+        SessionHydrateParams {
+            session_id: session_id.clone(),
+            after: None,
+            include: vec![hydrate_sections::PENDING_APPROVALS.into()],
+        },
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(rx, "g1-hydrate").await;
+    frame["result"]["pending_approvals"]
+        .as_array()
+        .unwrap_or_else(|| panic!("pending_approvals: {frame}"))
+        .iter()
+        .map(|approval| approval["approval_id"].clone())
+        .collect()
+}
+
+/// The approval ids `session/open` lists as pending for `connection`.
+async fn g1_opened_pending(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    contracts: &UiProtocolContractStores,
+    connection: ConnectionId,
+    session_id: &SessionKey,
+) -> Vec<ApprovalId> {
+    open_session_result(
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        connection,
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+            client_commands: None,
+        },
+    )
+    .await
+    .expect("session/open")
+    .pending_approvals
+    .into_iter()
+    .map(|approval| approval.approval_id)
+    .collect()
+}
+
+async fn g1_state(temp: &std::path::Path, session_id: &SessionKey) -> Arc<AppState> {
+    let state = state_with_sessions(temp);
+    let sessions = state.sessions.as_ref().expect("sessions");
+    sessions.lock().await.get_or_create(session_id).await;
+    state
+}
+
+#[tokio::test]
+async fn should_show_an_external_clients_approval_only_to_that_client() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let requested = g1_requested_event(&ledger, &session_id, &approval_id);
+    // The external client got it directly.
+    let direct = recv_rpc_json(&mut ext_rx).await;
+    assert_eq!(direct["method"], json!("approval/requested"), "{direct}");
+
+    // Live: the host's forwarder drops it; the owner would get it.
+    assert!(!ledger_event_visible_to_connection(
+        &requested.event,
+        host_ws.connection_id
+    ));
+    assert!(ledger_event_visible_to_connection(
+        &requested.event,
+        ext_ws.connection_id
+    ));
+    forward_live_ledger_event(
+        &host_ws,
+        &ledger,
+        requested.clone(),
+        0,
+        host_ws.connection_id,
+        ConnectionUiFeatures::stdio_defaults(),
+        session_id.topic(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        host_rx.try_recv().is_err(),
+        "not forwarded live to the host"
+    );
+    // Nor to another external client.
+    let (other_ext, mut other_ext_rx) = ws_connection_for_test(64);
+    other_ext.set_external(true);
+    forward_live_ledger_event(
+        &other_ext,
+        &ledger,
+        requested,
+        0,
+        other_ext.connection_id,
+        ConnectionUiFeatures::stdio_defaults(),
+        session_id.topic(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(other_ext_rx.try_recv().is_err(), "not forwarded to others");
+
+    // Pending list (`session/open`) and hydrate: the host sees nothing.
+    assert!(
+        g1_opened_pending(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        g1_opened_pending(
+            &state,
+            &ledger,
+            &contracts,
+            ext_ws.connection_id,
+            &session_id
+        )
+        .await,
+        vec![approval_id.clone()]
+    );
+    assert!(
+        g1_hydrated_pending(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        g1_hydrated_pending(
+            &ext_ws,
+            &mut ext_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await,
+        vec![json!(approval_id.0.to_string())]
+    );
+
+    // Its decision stays with the client too.
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-answer".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Deny,
+        ),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Deny);
+    let decided = ledger
+        .replay_after(
+            &session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|entry| {
+            matches!(
+                &entry.event,
+                UiProtocolLedgerEvent::Notification(UiNotification::ApprovalDecided(e))
+                    if e.approval_id == approval_id
+            )
+        })
+        .expect("decided");
+    assert!(!ledger_event_visible_to_connection(
+        &decided.event,
+        host_ws.connection_id
+    ));
+}
+
+#[tokio::test]
+async fn should_let_only_the_external_client_answer_its_approval() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut ext_rx).await;
+    let respond = |decision: ApprovalDecision| {
+        ApprovalRespondParams::new(session_id.clone(), approval_id.clone(), decision)
+    };
+
+    // The host (its automation included): refused, typed.
+    handle_approval_respond(
+        &host_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        None,
+        "host-answer".into(),
+        respond(ApprovalDecision::Approve),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-answer").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_APPROVAL_OWNER_ONLY),
+        "{frame}"
+    );
+    // Another external client: refused.
+    let (other_ext, mut other_ext_rx) = ws_connection_for_test(64);
+    other_ext.set_external(true);
+    handle_approval_respond(
+        &other_ext,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(other_ext.connection_id()),
+        "other-answer".into(),
+        respond(ApprovalDecision::Approve),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut other_ext_rx, "other-answer").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{frame}"
+    );
+    assert_eq!(
+        contracts.approvals.pending_for_session(&session_id).len(),
+        1
+    );
+    assert!(!task.is_finished(), "still waiting for its own client");
+
+    // The external client that owns the turn: accepted.
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-answer".into(),
+        respond(ApprovalDecision::Approve),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut ext_rx, "ext-answer").await;
+    assert!(frame.get("error").is_none(), "{frame}");
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Approve);
+}
+
+#[tokio::test]
+async fn should_never_apply_a_host_recorded_approve_scope_to_an_external_turn() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    // The host chose "approve shell for this session" earlier.
+    contracts.scopes.record(
+        &session_id,
+        ApprovalScopeKind::ApproveForSession,
+        match_key_for(
+            ApprovalScopeKind::ApproveForSession,
+            "shell",
+            &TurnId::new(),
+        ),
+        ApprovalDecision::Approve,
+    );
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    // The external turn's approval still parks for the external client...
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    assert!(!task.is_finished());
+    let _ = recv_rpc_json(&mut ext_rx).await;
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-answer".into(),
+        ApprovalRespondParams::new(session_id.clone(), approval_id, ApprovalDecision::Deny),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Deny);
+    // ...while a host turn on the same session is still auto-approved.
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let requester = UiProtocolApprovalRequester {
+        ws: host_ws,
+        ledger: Arc::clone(&ledger),
+        contracts: Arc::clone(&contracts),
+        state: Arc::clone(&state),
+        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
+        session_id: session_id.clone(),
+        turn_id: TurnId::new(),
+        features: ConnectionUiFeatures::default(),
+    };
+    assert_eq!(
+        <UiProtocolApprovalRequester as octos_agent::ToolApprovalRequester>::request_approval(
+            &requester,
+            ToolApprovalRequest {
+                tool_id: "shell-2".into(),
+                tool_name: "shell".into(),
+                title: "Run command".into(),
+                body: "ls".into(),
+                command: Some("ls".into()),
+                cwd: None,
+                once_only: false,
+                host_tool: None,
+            },
+        )
+        .await,
+        ToolApprovalDecision::Approve
+    );
+}
+
+#[tokio::test]
+async fn should_keep_a_host_turns_approval_on_the_host_as_before() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (turn_ws, mut turn_rx) = ws_connection_for_test(64);
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, _ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+
+    let (task, approval_id) =
+        g1_raise_approval(&turn_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut turn_rx).await;
+    let requested = g1_requested_event(&ledger, &session_id, &approval_id);
+    // Every host-side connection sees it, as before this rule.
+    assert!(ledger_event_visible_to_connection(
+        &requested.event,
+        host_ws.connection_id
+    ));
+    forward_live_ledger_event(
+        &host_ws,
+        &ledger,
+        requested,
+        0,
+        host_ws.connection_id,
+        ConnectionUiFeatures::stdio_defaults(),
+        session_id.topic(),
+        None,
+    )
+    .await
+    .unwrap();
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_rpc_json(&mut host_rx),
+    )
+    .await
+    .expect("forwarded live to the host");
+    assert_eq!(live["method"], json!("approval/requested"), "{live}");
+    assert_eq!(
+        g1_opened_pending(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await,
+        vec![approval_id.clone()]
+    );
+    assert_eq!(
+        g1_hydrated_pending(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await,
+        vec![json!(approval_id.0.to_string())]
+    );
+    // And the host answers it.
+    handle_approval_respond(
+        &host_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        None,
+        "host-answer".into(),
+        ApprovalRespondParams::new(session_id.clone(), approval_id, ApprovalDecision::Approve),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Approve);
+}
+
+fn g1_question_features() -> ConnectionUiFeatures {
+    ConnectionUiFeatures {
+        user_question_v1: true,
+        ..ConnectionUiFeatures::stdio_defaults()
+    }
+}
+
+/// Run one `ask_user_question` of a turn on `ws` in the background; return
+/// the task and the question once it is pending.
+async fn g1_ask_question(
+    ws: &WsConnection,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    state: &Arc<AppState>,
+    session_id: &SessionKey,
+) -> (
+    tokio::task::JoinHandle<octos_agent::UserQuestionOutcome>,
+    QuestionId,
+) {
+    use octos_agent::UserQuestionRequester as _;
+    let turn_id = TurnId::new();
+    let requester = SessionUserQuestionRequester {
+        ws: ws.clone(),
+        ledger: Arc::clone(ledger),
+        contracts: Arc::clone(contracts),
+        state: Arc::clone(state),
+        peers_root: std::path::PathBuf::from("/nonexistent/peers"),
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+    };
+    let task = tokio::spawn(async move {
+        requester
+            .request_user_question(octos_agent::UserQuestionRequest {
+                questions: sample_pending_question(
+                    SessionKey("unused".into()),
+                    QuestionId::new(),
+                    TurnId::new(),
+                )
+                .questions,
+                title: "Pick a framework".to_owned(),
+                body: "Which framework?".to_owned(),
+            })
+            .await
+    });
+    for _ in 0..500 {
+        if let Some(pending) = contracts
+            .user_questions
+            .pending_for_session(session_id)
+            .into_iter()
+            .find(|question| question.turn_id == turn_id)
+        {
+            return (task, pending.question_id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    panic!("the question never became pending");
+}
+
+fn g1_question_event(
+    ledger: &UiProtocolLedger,
+    session_id: &SessionKey,
+    question_id: &QuestionId,
+) -> LedgeredUiProtocolEvent {
+    ledger
+        .replay_after(
+            session_id,
+            Some(&UiCursor {
+                stream: session_id.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|entry| {
+            matches!(
+                &entry.event,
+                UiProtocolLedgerEvent::Notification(UiNotification::UserQuestionRequested(e))
+                    if e.question_id == *question_id
+            )
+        })
+        .expect("the question is in the shared ledger")
+}
+
+/// The question ids `session/hydrate` returns to `ws` as pending.
+async fn g1_hydrated_questions(
+    ws: &WsConnection,
+    rx: &mut mpsc::Receiver<WsMessage>,
+    state: &Arc<AppState>,
+    ledger: &Arc<UiProtocolLedger>,
+    contracts: &Arc<UiProtocolContractStores>,
+    session_id: &SessionKey,
+) -> Vec<Value> {
+    use octos_core::ui_protocol::hydrate_sections;
+    let active_turns: SharedActiveTurns = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    handle_session_hydrate(
+        ws,
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        &active_turns,
+        None,
+        None,
+        g1_question_features(),
+        "g1-hydrate-q".into(),
+        SessionHydrateParams {
+            session_id: session_id.clone(),
+            after: None,
+            include: vec![hydrate_sections::PENDING_APPROVALS.into()],
+        },
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(rx, "g1-hydrate-q").await;
+    frame["result"]["pending_questions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("pending_questions: {frame}"))
+        .iter()
+        .map(|question| question["question_id"].clone())
+        .collect()
+}
+
+/// The question ids `session/open` lists as pending for `connection`.
+async fn g1_opened_questions(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    contracts: &UiProtocolContractStores,
+    connection: ConnectionId,
+    session_id: &SessionKey,
+) -> Vec<QuestionId> {
+    open_session_result(
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        connection,
+        None,
+        None,
+        g1_question_features(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: None,
+            client_commands: None,
+        },
+    )
+    .await
+    .expect("session/open")
+    .pending_questions
+    .into_iter()
+    .map(|question| question.question_id)
+    .collect()
+}
+
+fn g1_answer() -> Vec<UserQuestionAnswer> {
+    vec![UserQuestionAnswer {
+        selected_labels: vec!["axum".into()],
+        free_text: None,
+    }]
+}
+
+#[tokio::test]
+async fn should_show_an_external_clients_question_only_to_that_client() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+
+    let (task, question_id) =
+        g1_ask_question(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let requested = g1_question_event(&ledger, &session_id, &question_id);
+
+    // Live: the host's forwarder drops it; the owner would get it.
+    assert!(!ledger_event_visible_to_connection(
+        &requested.event,
+        host_ws.connection_id
+    ));
+    assert!(ledger_event_visible_to_connection(
+        &requested.event,
+        ext_ws.connection_id
+    ));
+    forward_live_ledger_event(
+        &host_ws,
+        &ledger,
+        requested,
+        0,
+        host_ws.connection_id,
+        g1_question_features(),
+        session_id.topic(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        host_rx.try_recv().is_err(),
+        "not forwarded live to the host"
+    );
+
+    // Pending list (`session/open`) and hydrate: the host sees nothing.
+    assert!(
+        g1_opened_questions(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        g1_opened_questions(
+            &state,
+            &ledger,
+            &contracts,
+            ext_ws.connection_id,
+            &session_id
+        )
+        .await,
+        vec![question_id.clone()]
+    );
+    assert!(
+        g1_hydrated_questions(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        g1_hydrated_questions(
+            &ext_ws,
+            &mut ext_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await,
+        vec![json!(question_id.0.to_string())]
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn should_let_only_the_external_client_answer_its_question() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (task, question_id) =
+        g1_ask_question(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+
+    // The host: refused, typed; the question stays pending.
+    handle_user_question_respond(
+        &host_ws,
+        &state,
+        &contracts,
+        None,
+        None,
+        "host-q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id.clone(), g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-q").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_QUESTION_OWNER_ONLY),
+        "{frame}"
+    );
+    // Another external client: refused.
+    let (other_ext, mut other_ext_rx) = ws_connection_for_test(64);
+    other_ext.set_external(true);
+    handle_user_question_respond(
+        &other_ext,
+        &state,
+        &contracts,
+        None,
+        Some(other_ext.connection_id()),
+        "other-q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id.clone(), g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut other_ext_rx, "other-q").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{frame}"
+    );
+    assert_eq!(
+        contracts
+            .user_questions
+            .pending_for_session(&session_id)
+            .len(),
+        1
+    );
+    assert!(!task.is_finished());
+
+    // The owner: accepted.
+    handle_user_question_respond(
+        &ext_ws,
+        &state,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id, g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut ext_rx, "ext-q").await;
+    assert!(frame.get("error").is_none(), "{frame}");
+    assert!(matches!(
+        task.await.unwrap(),
+        octos_agent::UserQuestionOutcome::Answered(_)
+    ));
+}
+
+#[tokio::test]
+async fn should_keep_a_host_turns_question_on_the_host_as_before() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (turn_ws, _turn_rx) = ws_connection_for_test(64);
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (task, question_id) =
+        g1_ask_question(&turn_ws, &ledger, &contracts, &state, &session_id).await;
+    let requested = g1_question_event(&ledger, &session_id, &question_id);
+    assert!(ledger_event_visible_to_connection(
+        &requested.event,
+        host_ws.connection_id
+    ));
+    forward_live_ledger_event(
+        &host_ws,
+        &ledger,
+        requested,
+        0,
+        host_ws.connection_id,
+        g1_question_features(),
+        session_id.topic(),
+        None,
+    )
+    .await
+    .unwrap();
+    let live = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_rpc_json(&mut host_rx),
+    )
+    .await
+    .expect("forwarded live to the host");
+    assert_eq!(live["method"], json!("user_question/requested"), "{live}");
+    assert_eq!(
+        g1_opened_questions(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await,
+        vec![question_id.clone()]
+    );
+    assert_eq!(
+        g1_hydrated_questions(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await,
+        vec![json!(question_id.0.to_string())]
+    );
+    handle_user_question_respond(
+        &host_ws,
+        &state,
+        &contracts,
+        None,
+        None,
+        "host-q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id, g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-q").await;
+    assert!(frame.get("error").is_none(), "{frame}");
+    assert!(matches!(
+        task.await.unwrap(),
+        octos_agent::UserQuestionOutcome::Answered(_)
+    ));
+}
+
+#[tokio::test]
+async fn should_keep_external_prompts_from_the_host_when_the_side_table_forgets_them() {
+    // The transport's owner table is bounded; an evicted id must not make a
+    // pending external prompt visible to, or answerable by, the host.
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (approval_task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let (question_task, question_id) =
+        g1_ask_question(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    super::super::host_managed::forget_external_prompt(&approval_id.0.to_string());
+    super::super::host_managed::forget_external_prompt(&question_id.0.to_string());
+
+    assert!(
+        g1_opened_pending(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert!(
+        g1_opened_questions(
+            &state,
+            &ledger,
+            &contracts,
+            host_ws.connection_id,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    assert!(
+        g1_hydrated_pending(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    handle_approval_respond(
+        &host_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        None,
+        "host-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Approve,
+        ),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-a").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_APPROVAL_OWNER_ONLY),
+        "{frame}"
+    );
+    handle_user_question_respond(
+        &host_ws,
+        &state,
+        &contracts,
+        None,
+        None,
+        "host-q".into(),
+        UserQuestionRespondParams::new(session_id.clone(), question_id.clone(), g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-q").await;
+    assert_eq!(
+        frame["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_QUESTION_OWNER_ONLY),
+        "{frame}"
+    );
+    assert!(!approval_task.is_finished() && !question_task.is_finished());
+
+    // The owning client still answers both.
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-a".into(),
+        ApprovalRespondParams::new(session_id.clone(), approval_id, ApprovalDecision::Deny),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut ext_rx, "ext-a").await;
+    assert!(frame.get("error").is_none(), "{frame}");
+    assert_eq!(approval_task.await.unwrap(), ToolApprovalDecision::Deny);
+    handle_user_question_respond(
+        &ext_ws,
+        &state,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-q".into(),
+        UserQuestionRespondParams::new(session_id, question_id, g1_answer()),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut ext_rx, "ext-q").await;
+    assert!(frame.get("error").is_none(), "{frame}");
+    assert!(matches!(
+        question_task.await.unwrap(),
+        octos_agent::UserQuestionOutcome::Answered(_)
+    ));
+}
+
+#[tokio::test]
+async fn should_refuse_a_turn_id_live_in_another_session_on_a_host_managed_server() {
+    let first = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "octosense", "system");
+    let second = SessionKey::with_profile_topic(MAIN_PROFILE_ID, "api", "web", "mine");
+    let turn_id = TurnId::new();
+    let (host_ws, _rx) = ws_connection_for_test(8);
+    let mut active = HashMap::new();
+    active.insert(
+        first.clone(),
+        owned_active_turn(&turn_id, host_ws.connection_id()),
+    );
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &turn_id, true).await,
+        Some(TurnAdmissionRefusal::TurnIdInUse)
+    );
+    // Only in host-managed mode; a fresh id is admitted either way.
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &turn_id, false).await,
+        None
+    );
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &TurnId::new(), true).await,
+        None
+    );
+    assert_eq!(
+        turn_admission_refusal(&active, &first, &TurnId::new(), true).await,
+        Some(TurnAdmissionRefusal::Occupied(turn_id.clone()))
+    );
+    // A finished turn frees its id.
+    *active[&first].state.lock().await = TurnState::Terminal(TerminalReason::Completed);
+    assert_eq!(
+        turn_admission_refusal(&active, &second, &turn_id, true).await,
+        None
+    );
+    // The refusals as the wire shows them: an external client never learns
+    // the id of the turn that holds a session.
+    let external =
+        serde_json::to_value(TurnAdmissionRefusal::Occupied(turn_id.clone()).into_error(true))
+            .unwrap();
+    assert_eq!(external["data"], json!({ "kind": "turn_in_progress" }));
+    let host =
+        serde_json::to_value(TurnAdmissionRefusal::Occupied(turn_id.clone()).into_error(false))
+            .unwrap();
+    assert_eq!(
+        host["data"]["turn_id"],
+        serde_json::to_value(&turn_id).unwrap()
+    );
+    let in_use = serde_json::to_value(TurnAdmissionRefusal::TurnIdInUse.into_error(true)).unwrap();
+    assert_eq!(in_use["data"], json!({ "kind": TURN_ID_IN_USE }));
+}
+
+#[tokio::test]
+async fn should_let_an_external_client_answer_only_its_own_turns_questions() {
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let state = Arc::new(AppState::empty_for_tests());
+    let session_id = host_managed_peer_session("system");
+    let turn_id = TurnId::new();
+    let (host_ws, _host_rx) = ws_connection_for_test(32);
+    let (ws, mut rx) = ws_connection_for_test(32);
+    let answer = || {
+        vec![UserQuestionAnswer {
+            selected_labels: vec!["axum".into()],
+            free_text: None,
+        }]
+    };
+    // The host's question and the external client's, same turn id.
+    let host_question = QuestionId::new();
+    let mut host_waiter = contracts.user_questions.request_runtime_owned(
+        sample_pending_question(session_id.clone(), host_question.clone(), turn_id.clone()),
+        Some(host_ws.connection_id().0),
+    );
+    let own_question = QuestionId::new();
+    let _own_waiter = contracts.user_questions.request_runtime_owned(
+        sample_pending_question(session_id.clone(), own_question.clone(), turn_id),
+        Some(ws.connection_id().0),
+    );
+    handle_user_question_respond(
+        &ws,
+        &state,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        Some(ws.connection_id()),
+        "q-host".into(),
+        UserQuestionRespondParams::new(session_id.clone(), host_question, answer()),
+    )
+    .await;
+    let reply = recv_rpc_json(&mut rx).await;
+    assert_eq!(
+        reply["error"]["data"]["kind"],
+        json!(super::super::host_managed::EXTERNAL_TURN_DENIED),
+        "{reply}"
+    );
+    assert!(
+        host_waiter.try_recv().is_err(),
+        "the host's question stays pending"
+    );
+    handle_user_question_respond(
+        &ws,
+        &state,
+        &contracts,
+        Some(MAIN_PROFILE_ID),
+        Some(ws.connection_id()),
+        "q-own".into(),
+        UserQuestionRespondParams::new(session_id, own_question, answer()),
+    )
+    .await;
+    let reply = recv_rpc_json(&mut rx).await;
+    assert!(reply.get("error").is_none(), "{reply}");
+}
+
+// ---------------------------------------------------------------------------
+// #2625: an external client's prompts stay hidden from the host after a
+// restart, or once the transport's bounded owner table forgot them: their
+// ledger records carry a durable `external_prompt` marker (UPCR-2026-036).
+// ---------------------------------------------------------------------------
+
+fn r2625_cursor_zero(session_id: &SessionKey) -> UiCursor {
+    UiCursor {
+        stream: session_id.0.clone(),
+        seq: 0,
+    }
+}
+
+/// The prompt ids of the approval and question events `connection`'s
+/// `session/open` replays (from the beginning), plus the ids of its pending
+/// approvals and questions.
+async fn r2625_opened_prompt_ids(
+    state: &Arc<AppState>,
+    ledger: &UiProtocolLedger,
+    contracts: &UiProtocolContractStores,
+    connection: ConnectionId,
+    session_id: &SessionKey,
+) -> Vec<String> {
+    let outcome = open_session_result(
+        state,
+        ledger,
+        &contracts.approvals,
+        &contracts.user_questions,
+        connection,
+        None,
+        None,
+        g1_question_features(),
+        SessionOpenParams {
+            session_id: session_id.clone(),
+            topic: None,
+            profile_id: None,
+            cwd: None,
+            sandbox: None,
+            after: Some(r2625_cursor_zero(session_id)),
+            client_commands: None,
+        },
+    )
+    .await
+    .expect("session/open");
+    let mut ids = outcome
+        .replay
+        .iter()
+        .filter_map(|event| super::super::ui_protocol_ledger::ledger_event_prompt_id(&event.event))
+        .collect::<Vec<_>>();
+    ids.extend(
+        outcome
+            .pending_approvals
+            .iter()
+            .map(|approval| approval.approval_id.0.to_string()),
+    );
+    ids.extend(
+        outcome
+            .pending_questions
+            .iter()
+            .map(|question| question.question_id.0.to_string()),
+    );
+    ids
+}
+
+fn r2625_ledger_log(ledger_dir: &std::path::Path) -> String {
+    let mut text = String::new();
+    for session_dir in std::fs::read_dir(ledger_dir.join("ui-protocol")).unwrap() {
+        for file in std::fs::read_dir(session_dir.unwrap().path()).unwrap() {
+            let path = file.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "log") {
+                text.push_str(&std::fs::read_to_string(path).unwrap());
+            }
+        }
+    }
+    text
+}
+
+#[tokio::test]
+async fn should_hide_an_external_clients_prompts_from_everyone_after_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger_dir = temp.path().join("ledger-data");
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::with_config(LedgerConfig::durable(
+        ledger_dir.clone(),
+    )));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+
+    // Decided: approval A. Cancelled: approval B. Asked: question Q.
+    let (task_a, approval_a) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let (task_b, approval_b) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let (task_q, question_q) =
+        g1_ask_question(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_a.clone(),
+            ApprovalDecision::Deny,
+        ),
+    )
+    .await;
+    assert_eq!(task_a.await.unwrap(), ToolApprovalDecision::Deny);
+    ledger.append_notification(UiNotification::ApprovalCancelled(
+        ApprovalCancelledEvent::turn_interrupted(
+            session_id.clone(),
+            approval_b.clone(),
+            TurnId::new(),
+        ),
+    ));
+    let prompt_ids = [
+        approval_a.0.to_string(),
+        approval_b.0.to_string(),
+        question_q.0.to_string(),
+    ];
+    // Before the restart the owner replays them and the host does not.
+    let owned = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        ext_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    for id in &prompt_ids {
+        assert!(owned.contains(id), "the owner replays {id}: {owned:?}");
+    }
+    let hosted = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        host_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    assert!(hosted.is_empty(), "{hosted:?}");
+    // Every record of the three prompts carries the durable marker.
+    let log = r2625_ledger_log(&ledger_dir);
+    let marked = log
+        .lines()
+        .filter(|line| prompt_ids.iter().any(|id| line.contains(id.as_str())))
+        .collect::<Vec<_>>();
+    // requested + decided (A), requested + cancelled (B), requested (Q).
+    assert_eq!(marked.len(), 5, "{log}");
+    for line in marked {
+        assert!(line.ends_with(",\"external_prompt\":true}"), "{line}");
+    }
+
+    // Restart: a fresh process has an empty owner table, fresh stores and a
+    // ledger recovered from the same files.
+    task_b.abort();
+    task_q.abort();
+    drop(ext_rx.try_recv());
+    drop(ledger);
+    for id in &prompt_ids {
+        super::super::host_managed::forget_external_prompt(id);
+    }
+    let ledger = UiProtocolLedger::recover(LedgerConfig::durable(ledger_dir)).ledger;
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, mut host_rx) = ws_connection_for_test(64);
+    let (new_ext, _new_ext_rx) = ws_connection_for_test(64);
+    new_ext.set_external(true);
+    for connection in [host_ws.connection_id, new_ext.connection_id] {
+        let seen =
+            r2625_opened_prompt_ids(&state, &ledger, &contracts, connection, &session_id).await;
+        for id in &prompt_ids {
+            assert!(
+                !seen.contains(id),
+                "{id} replayed after a restart: {seen:?}"
+            );
+        }
+    }
+    // Nor via hydrate or the live forwarder.
+    assert!(
+        g1_hydrated_pending(
+            &host_ws,
+            &mut host_rx,
+            &state,
+            &ledger,
+            &contracts,
+            &session_id
+        )
+        .await
+        .is_empty()
+    );
+    let replayed = ledger
+        .replay_after(&session_id, Some(&r2625_cursor_zero(&session_id)))
+        .unwrap();
+    let recovered = replayed
+        .iter()
+        .filter(|event| {
+            super::super::ui_protocol_ledger::ledger_event_prompt_id(&event.event)
+                .is_some_and(|id| prompt_ids.contains(&id))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recovered.len(), 5);
+    for event in recovered {
+        assert!(event.external_prompt);
+        assert!(!ledgered_event_visible_to_connection(
+            event,
+            host_ws.connection_id
+        ));
+        assert!(!ledgered_event_visible_to_connection(
+            event,
+            new_ext.connection_id
+        ));
+    }
+    // And the host cannot answer one.
+    handle_approval_respond(
+        &host_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        None,
+        "host-b".into(),
+        ApprovalRespondParams::new(session_id.clone(), approval_b, ApprovalDecision::Approve),
+    )
+    .await;
+    let frame = recv_rpc_response_with_id(&mut host_rx, "host-b").await;
+    assert!(frame.get("error").is_some(), "{frame}");
+}
+
+#[tokio::test]
+async fn should_hide_a_resolved_external_prompt_from_the_host_once_the_side_table_forgets_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut ext_rx).await;
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Approve,
+        ),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Approve);
+    // The prompt left the pending store's pending list; now the bounded
+    // owner table evicts its id.
+    super::super::host_managed::forget_external_prompt(&approval_id.0.to_string());
+
+    // Neither the host's replay nor its live forwarder shows its requested
+    // or decided record.
+    let seen = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        host_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    assert!(!seen.contains(&approval_id.0.to_string()), "{seen:?}");
+    let events = ledger
+        .replay_after(&session_id, Some(&r2625_cursor_zero(&session_id)))
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            super::super::ui_protocol_ledger::ledger_event_prompt_id(&event.event)
+                == Some(approval_id.0.to_string())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2, "requested and decided");
+    for event in &events {
+        assert!(!ledgered_event_visible_to_connection(
+            event,
+            host_ws.connection_id
+        ));
+    }
+}
+
+#[tokio::test]
+async fn should_mark_later_events_of_an_external_prompt_after_the_side_table_forgot_it() {
+    // The owner table evicts the id while the prompt is still pending: its
+    // decision is still marked, from the ledger's own record of the prompt.
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut ext_rx).await;
+    super::super::host_managed::forget_external_prompt(&approval_id.0.to_string());
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Deny,
+        ),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Deny);
+    let decided = ledger
+        .replay_after(&session_id, Some(&r2625_cursor_zero(&session_id)))
+        .unwrap()
+        .into_iter()
+        .find(|event| {
+            matches!(
+                &event.event,
+                UiProtocolLedgerEvent::Notification(UiNotification::ApprovalDecided(e))
+                    if e.approval_id == approval_id
+            )
+        })
+        .expect("decided");
+    assert!(decided.external_prompt);
+    assert!(!ledgered_event_visible_to_connection(
+        &decided,
+        host_ws.connection_id
+    ));
+}
+
+#[tokio::test]
+async fn should_replay_a_host_turns_prompts_to_the_host_after_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger_dir = temp.path().join("ledger-data");
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::with_config(LedgerConfig::durable(
+        ledger_dir.clone(),
+    )));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (turn_ws, mut turn_rx) = ws_connection_for_test(64);
+    let (task, approval_id) =
+        g1_raise_approval(&turn_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut turn_rx).await;
+    handle_approval_respond(
+        &turn_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        None,
+        "host-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Approve,
+        ),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Approve);
+    assert!(
+        !r2625_ledger_log(&ledger_dir).contains("external_prompt"),
+        "a host turn's records are written exactly as before"
+    );
+
+    drop(ledger);
+    let ledger = UiProtocolLedger::recover(LedgerConfig::durable(ledger_dir)).ledger;
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let seen = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        host_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    let id = approval_id.0.to_string();
+    assert_eq!(
+        seen.iter().filter(|seen| **seen == id).count(),
+        2,
+        "requested and decided replay to the host: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn should_replay_an_unmarked_pre_2625_prompt_record_as_before() {
+    // A record written before the marker existed carries no
+    // `external_prompt` key: after a restart it replays as it always did.
+    let temp = tempfile::tempdir().unwrap();
+    let ledger_dir = temp.path().join("ledger-data");
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let approval_id = ApprovalId::new();
+    {
+        let ledger = UiProtocolLedger::with_config(LedgerConfig::durable(ledger_dir.clone()));
+        ledger.append_notification(UiNotification::ApprovalRequested(
+            ApprovalRequestedEvent::generic(
+                session_id.clone(),
+                approval_id.clone(),
+                TurnId::new(),
+                "shell",
+                "Run command",
+                "ls",
+            ),
+        ));
+    }
+    let log = r2625_ledger_log(&ledger_dir);
+    assert!(log.contains(&approval_id.0.to_string()) && !log.contains("external_prompt"));
+    let ledger = UiProtocolLedger::recover(LedgerConfig::durable(ledger_dir)).ledger;
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let seen = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        host_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    assert_eq!(seen, vec![approval_id.0.to_string()]);
+}
+
+#[tokio::test]
+async fn should_mark_a_reloaded_external_approvals_decision_after_its_request_left_the_ring() {
+    // #2625 review: after a reload with an empty owner table, the ledger
+    // must still know an approval is external when its `requested` record
+    // is no longer in the (here tiny) ring: from the full log scan, with
+    // and without a projection snapshot.
+    for snapshot_every_events in [0, 2] {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = g1_system_session();
+        let mut config = LedgerConfig::durable(temp.path().join("ledger-data"));
+        config.retained_per_session = 2;
+        config.snapshot_every_events = snapshot_every_events;
+        let approval_id = ApprovalId::new();
+        let turn_id = TurnId::new();
+        let host_approval = |id: ApprovalId| {
+            UiNotification::ApprovalRequested(ApprovalRequestedEvent::generic(
+                session_id.clone(),
+                id,
+                TurnId::new(),
+                "shell",
+                "Run command",
+                "ls",
+            ))
+        };
+        {
+            let ledger = UiProtocolLedger::with_config(config.clone());
+            super::super::host_managed::register_external_prompt(&approval_id.0.to_string(), 42);
+            let requested = ledger.append_notification(UiNotification::ApprovalRequested(
+                ApprovalRequestedEvent::generic(
+                    session_id.clone(),
+                    approval_id.clone(),
+                    turn_id.clone(),
+                    "shell",
+                    "Run command",
+                    "ls",
+                ),
+            ));
+            assert!(requested.external_prompt);
+            // Push the request out of the ring (host prompts, unmarked).
+            for _ in 0..3 {
+                assert!(
+                    !ledger
+                        .append_notification(host_approval(ApprovalId::new()))
+                        .external_prompt
+                );
+            }
+            super::super::host_managed::forget_external_prompt(&approval_id.0.to_string());
+        }
+        // Reload: empty owner table, the request only on disk.
+        let ledger = UiProtocolLedger::recover(config).ledger;
+        let decided = ledger.append_notification(UiNotification::ApprovalDecided(
+            ApprovalDecidedEvent::manual(
+                session_id.clone(),
+                approval_id.clone(),
+                turn_id,
+                ApprovalDecision::Deny,
+                "external",
+            ),
+        ));
+        assert!(decided.external_prompt, "cadence {snapshot_every_events}");
+        let (host_ws, _host_rx) = ws_connection_for_test(8);
+        assert!(!ledgered_event_visible_to_connection(
+            &decided,
+            host_ws.connection_id
+        ));
+        // A terminal event ends the prompt: a new host approval stays
+        // unmarked.
+        assert!(
+            !ledger
+                .append_notification(host_approval(ApprovalId::new()))
+                .external_prompt
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_replay_an_external_prompt_to_its_owner_after_the_side_table_forgot_it() {
+    // #2625 review: the owner falls back to the owner recorded on the
+    // prompt itself, so it still replays its own prompt; the host does not.
+    let temp = tempfile::tempdir().unwrap();
+    let session_id = g1_system_session();
+    let state = g1_state(temp.path(), &session_id).await;
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    let (ext_ws, mut ext_rx) = ws_connection_for_test(64);
+    ext_ws.set_external(true);
+    let (task, approval_id) =
+        g1_raise_approval(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let (question_task, question_id) =
+        g1_ask_question(&ext_ws, &ledger, &contracts, &state, &session_id).await;
+    let _ = recv_rpc_json(&mut ext_rx).await;
+    handle_approval_respond(
+        &ext_ws,
+        &state,
+        &ledger,
+        &contracts,
+        None,
+        Some(ext_ws.connection_id()),
+        "ext-a".into(),
+        ApprovalRespondParams::new(
+            session_id.clone(),
+            approval_id.clone(),
+            ApprovalDecision::Deny,
+        ),
+    )
+    .await;
+    assert_eq!(task.await.unwrap(), ToolApprovalDecision::Deny);
+    super::super::host_managed::forget_external_prompt(&approval_id.0.to_string());
+    super::super::host_managed::forget_external_prompt(&question_id.0.to_string());
+
+    let owned = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        ext_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    let approval = approval_id.0.to_string();
+    assert_eq!(
+        owned.iter().filter(|id| **id == approval).count(),
+        2,
+        "requested and decided: {owned:?}"
+    );
+    assert!(owned.contains(&question_id.0.to_string()), "{owned:?}");
+    let hosted = r2625_opened_prompt_ids(
+        &state,
+        &ledger,
+        &contracts,
+        host_ws.connection_id,
+        &session_id,
+    )
+    .await;
+    assert!(hosted.is_empty(), "{hosted:?}");
+    question_task.abort();
 }

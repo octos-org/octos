@@ -21,6 +21,7 @@ cat >"$fixture/octos-web/package.json" <<'JSON'
 {
   "name": "octos-web-base-url-fixture",
   "private": true,
+  "packageManager": "pnpm@10.0.0",
   "scripts": {
     "build": "node build.mjs"
   }
@@ -41,19 +42,24 @@ writeFileSync(
 );
 JS
 
-# On Windows, force the same native npm.cmd boundary used by release builds.
-# On Unix, wrapping the regular npm executable keeps the fixture portable.
+# The build script installs via pnpm (octos-web is a pnpm workspace, no
+# package-lock.json). Provide a stub pnpm that proxies to the same real
+# npm boundary as before — `pnpm install` is skipped because the fixture
+# ships a pre-populated node_modules, so only the `pnpm run build`
+# invocation reaches npm here, which runs it as `npm exec build`.
 if command -v npm.cmd >/dev/null 2>&1; then
     real_npm="$(command -v npm.cmd)"
 else
     real_npm="$(command -v npm)"
 fi
 mkdir -p "$fixture/bin"
-{
-    echo '#!/bin/sh'
-    printf 'exec %q "$@"\n' "$real_npm"
-} >"$fixture/bin/npm"
-chmod +x "$fixture/bin/npm"
+for tool in npm pnpm; do
+    {
+        echo '#!/bin/sh'
+        printf 'exec %q "$@"\n' "$real_npm"
+    } >"$fixture/bin/$tool"
+    chmod +x "$fixture/bin/$tool"
+done
 
 PATH="$fixture/bin:$PATH" "$BASH" "$fixture/scripts/build-web-app.sh"
 

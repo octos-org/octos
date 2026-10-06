@@ -2,12 +2,12 @@
   "name": "deep-search",
   "version": "2.0.0",
   "author": "octos",
-  "description": "Deep multi-round web research: iterative search across multiple angles, parallel page crawling, reference chasing, and structured report generation.",
+  "description": "Deep multi-round web research: free sources first (GDELT, Google News RSS, optional SearXNG, then keyed APIs), polite page reading (honest User-Agent, per-host spacing, browser for JS-heavy pages; robots.txt optional, off by default), reference chasing, a cited report and structured items.",
   "timeout_secs": 600,
   "tools": [
     {
       "name": "search",
-      "description": "Single-binary research pipeline (one synthesis model, fixed flow): searches a focused topic from multiple angles, fetches pages in parallel, chases references, and writes one structured report.\n\nWHEN TO USE: focused single-topic lookups where one report suffices and you don't need parallel sub-queries or per-node model control.\n\nWHEN TO USE `run_pipeline` INSTEAD (PREFERRED for 深度研究 / deep research / comprehensive analysis): the user asks for multi-perspective research, comparative analysis across topics, or any query phrased as 深度研究/深入调研/深度分析/comprehensive/thorough — write an inline DOT graph with `run_pipeline` so each perspective gets its own search node (run in parallel), its own analysis node, and a final synthesis node. This gives you parallel fan-out, per-node model selection (cheap models for search, strong models for synthesis), and a much richer output than this single-binary tool.\n\nReport file path is printed at end of output.",
+      "description": "Single-binary research pipeline (one synthesis model, fixed flow): searches a focused topic from multiple angles, fetches pages in parallel, chases references, and writes one structured report.\n\nWHEN TO USE: focused single-topic lookups where one report suffices and you don't need parallel sub-queries or per-node model control.\n\nWHEN TO USE `run_pipeline` INSTEAD (PREFERRED for 深度研究 / deep research / comprehensive analysis): the user asks for multi-perspective research, comparative analysis across topics, or any query phrased as 深度研究/深入调研/深度分析/comprehensive/thorough — write an inline DOT graph with `run_pipeline` so each perspective gets its own search node (run in parallel), its own analysis node, and a final synthesis node. This gives you parallel fan-out, per-node model selection (cheap models for search, strong models for synthesis), and a much richer output than this single-binary tool.\n\nControls: lang (one or many), region, since, max_per_domain, domains_allow/deny. output=items returns structured items (title, url, source, lang, published date, summary, citation). News works without any API key. Report file path is printed at end of output.",
       "concurrency_class": "exclusive",
       "entrypoint": "target/release/deep-search",
       "env": [
@@ -16,13 +16,19 @@
         "PERPLEXITY_API_KEY",
         "BRAVE_API_KEY",
         "YDC_API_KEY",
+        "SEARXNG_URL",
         "DEEPSEEK_API_KEY",
         "KIMI_API_KEY",
         "MOONSHOT_API_KEY",
         "DASHSCOPE_API_KEY",
         "OPENAI_API_KEY",
         "DEEP_SEARCH_SYNTHESIS_MODEL",
-        "DEEP_SEARCH_MAX_BROWSERS"
+        "DEEP_SEARCH_SYNTHESIS_MAX_TOKENS",
+        "DEEP_SEARCH_MAX_BROWSERS",
+        "DEEP_SEARCH_HOST_INTERVAL_MS",
+        "OCTOS_ALLOW_SERP_SCRAPE",
+        "OCTOS_RESPECT_ROBOTS",
+        "OCTOS_ALLOW_BROWSER_SERP"
       ],
       "input_schema": {
         "type": "object",
@@ -41,7 +47,69 @@
           },
           "search_engine": {
             "type": "string",
-            "description": "Preferred search engine: perplexity, duckduckgo, brave, you (default: auto-detect, prefers perplexity)"
+            "description": "Try one provider first: gdelt, google_news_rss, searxng, serper, tavily, perplexity, brave, you; or all. Default: automatic order (free sources first: GDELT + Google News for news, then SearXNG if configured, then keyed APIs). Results-page search (duckduckgo, bing_cdp) runs last for general web results unless the operator turned it off. Falls back to the automatic order if it returns nothing."
+          },
+          "output": {
+            "type": "string",
+            "enum": ["report", "items"],
+            "description": "report (default): Markdown report. items: structured JSON items (url, title, source, lang, published, summary, citation) instead; the report and <slug>_report.items.json are written either way."
+          },
+          "lang": {
+            "description": "BCP-47 language(s) to search in and keep, e.g. \"en\" or [\"en\", \"zh-CN\", \"es\"]. Each language gets its own queries. Unknown-language results are kept.",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ]
+          },
+          "query_by_lang": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The query in each language's own words, keyed by BCP-47 tag, e.g. {\"zh\": \"人工智能 监管\"} alongside query \"AI regulation\". Each language is searched with its own query (and searched even if not listed in lang). Translate the query yourself when researching several languages."
+          },
+          "region": {
+            "type": "string",
+            "description": "ISO 3166-1 alpha-2 region, e.g. US or TW (Google News edition, Brave/Serper country)."
+          },
+          "since": {
+            "type": "string",
+            "description": "Only results published since an ISO date (2026-09-01) or a span: 24h, 7d, 2w, 3m, 1y. Applied via provider date filters and page/feed dates; undated results are kept."
+          },
+          "category": {
+            "type": "string",
+            "enum": ["auto", "news", "general", "science", "it", "social"],
+            "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (DuckDuckGo, Bing, Brave and Google results pages, Wikipedia, Wikidata), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
+          },
+          "max_per_domain": {
+            "type": "integer",
+            "description": "At most this many sources per domain."
+          },
+          "domains_allow": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Only use these domains (subdomains included)."
+          },
+          "domains_deny": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Never use these domains (subdomains included)."
+          },
+          "render": {
+            "type": "string",
+            "enum": ["auto", "off"],
+            "description": "auto (default): render JS-heavy pages in a headless browser when plain HTTP returns no main text. off: plain HTTP only."
           },
           "synthesis_config": {
             "type": "object",

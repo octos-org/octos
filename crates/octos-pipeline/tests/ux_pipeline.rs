@@ -955,7 +955,7 @@ async fn test_09_shell_timeout() {
         Err(e) => {
             // Timeout error is also acceptable
             let err_str = format!("{e}");
-            println!("[shell-timeout] OK: error={}", err_str);
+            println!("[shell-timeout] OK: error={err_str}");
             assert!(elapsed.as_secs() < 15);
         }
     }
@@ -1761,11 +1761,7 @@ async fn test_23_send_large_file() {
     // Verify the file at the media path is still intact
     let sent_path = &msg.media[0];
     let sent_size = std::fs::metadata(sent_path).unwrap().len();
-    assert_eq!(
-        sent_size, 5_000_000,
-        "file should be 5MB, got {}B",
-        sent_size
-    );
+    assert_eq!(sent_size, 5_000_000, "file should be 5MB, got {sent_size}B");
     println!("[large-file] OK: 5MB file queued for delivery");
 }
 

@@ -309,7 +309,7 @@ describe('SwarmPage', () => {
         body: {
           dispatch_id: 'review-1',
           accepted: true,
-          reviewer: 'ychen@futurewei.com',
+          reviewer: 'reviewer@example.com',
           schema_version: 1,
         },
       },
@@ -327,7 +327,7 @@ describe('SwarmPage', () => {
     )
     await user.type(
       screen.getByTestId('swarm-review-reviewer'),
-      'ychen@futurewei.com',
+      'reviewer@example.com',
     )
     await user.click(screen.getByTestId('swarm-review-accept'))
     await waitFor(() => {

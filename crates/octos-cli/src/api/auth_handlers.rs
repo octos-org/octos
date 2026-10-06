@@ -25,6 +25,36 @@ use super::router::AuthIdentity;
 /// Allows at most 3 requests per 5-minute window per email address.
 static OTP_RATE_LIMIT: LazyLock<Mutex<HashMap<String, (u32, std::time::Instant)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+const OTP_RATE_LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+const OTP_RATE_LIMIT_MAX_KEYS: usize = 4096;
+
+fn otp_rate_limit_exceeded(
+    limits: &mut HashMap<String, (u32, std::time::Instant)>,
+    rate_limit_key: String,
+    now: std::time::Instant,
+) -> bool {
+    // Unknown addresses are deliberately rate-limited too, but they are
+    // attacker-controlled. Prune expired buckets before enforcing a hard cap
+    // so unique probes cannot grow this process-global map without bound.
+    if limits.len() >= OTP_RATE_LIMIT_MAX_KEYS {
+        limits.retain(|_, (_, started_at)| {
+            now.saturating_duration_since(*started_at) < OTP_RATE_LIMIT_WINDOW
+        });
+    }
+    if !limits.contains_key(&rate_limit_key) && limits.len() >= OTP_RATE_LIMIT_MAX_KEYS {
+        return true;
+    }
+
+    let entry = limits.entry(rate_limit_key).or_insert((0, now));
+    if now.saturating_duration_since(entry.1) >= OTP_RATE_LIMIT_WINDOW {
+        *entry = (0, now);
+    }
+    if entry.0 >= 3 {
+        return true;
+    }
+    entry.0 += 1;
+    false
+}
 
 pub(crate) fn is_top_level_profile_id(state: &AppState, profile_id: &str) -> bool {
     state
@@ -488,30 +518,9 @@ pub async fn send_code(
         None
     };
 
-    if scoped_profile_id.is_some() {
-        if scoped_login_target.is_none() {
-            tracing::warn!(
-                email = %requested_email,
-                scoped_profile = ?scoped_profile_id,
-                "OTP skipped — email does not match scoped profile"
-            );
-            return Ok(Json(SendCodeResponse {
-                ok: false,
-                message: Some("This email is not registered for this account".into()),
-            }));
-        }
-    } else if root_login_target.is_none() {
-        if !auth_mgr.allow_self_registration() {
-            tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
-            return Ok(Json(SendCodeResponse {
-                ok: false,
-                message: Some("This email is not registered for login".into()),
-            }));
-        }
-        tracing::info!(email = %requested_email, "sending OTP for self-registration (no existing profile)");
-    }
-
-    // Rate-limit OTP sends: max 3 per email per 5-minute window.
+    // Rate-limit every request, including unknown/uninvited addresses. Keeping
+    // this before the eligibility exits prevents a fast, unlimited probe path.
+    // Max 3 requests per email per 5-minute window.
     {
         let mut limits = OTP_RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
         let rate_limit_key = scoped_login_target
@@ -526,13 +535,7 @@ pub async fn send_code(
                 })
             })
             .unwrap_or_else(|| requested_email.clone());
-        let entry = limits
-            .entry(rate_limit_key)
-            .or_insert((0, std::time::Instant::now()));
-        if entry.1.elapsed() > std::time::Duration::from_secs(300) {
-            *entry = (0, std::time::Instant::now()); // reset after 5 min
-        }
-        if entry.0 >= 3 {
+        if otp_rate_limit_exceeded(&mut limits, rate_limit_key, std::time::Instant::now()) {
             tracing::warn!(email = %req.email, "OTP rate limit exceeded");
             // Return generic success to avoid leaking rate-limit state
             return Ok(Json(SendCodeResponse {
@@ -540,7 +543,31 @@ pub async fn send_code(
                 message: Some("Verification code sent to your email".into()),
             }));
         }
-        entry.0 += 1;
+    }
+
+    if scoped_profile_id.is_some() && scoped_login_target.is_none() {
+        tracing::warn!(
+            email = %requested_email,
+            scoped_profile = ?scoped_profile_id,
+            "OTP skipped — email does not match scoped profile"
+        );
+        delay_ineligible_otp_response().await;
+        return Ok(Json(SendCodeResponse {
+            ok: true,
+            message: Some("Verification code sent to your email".into()),
+        }));
+    }
+    if scoped_profile_id.is_none() && root_login_target.is_none() {
+        tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
+        // The body is identical to an eligible request. A short jittered delay
+        // also reduces the otherwise-obvious microseconds-vs-SMTP timing gap.
+        // It cannot perfectly reproduce arbitrary SMTP latency, so the edge
+        // rate limit remains part of the public deployment's defence in depth.
+        delay_ineligible_otp_response().await;
+        return Ok(Json(SendCodeResponse {
+            ok: true,
+            message: Some("Verification code sent to your email".into()),
+        }));
     }
 
     tracing::info!(email = %requested_email, "login OTP requested");
@@ -579,6 +606,15 @@ pub async fn send_code(
             }))
         }
     }
+}
+
+async fn delay_ineligible_otp_response() {
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_millis() as u64
+        % 201;
+    tokio::time::sleep(std::time::Duration::from_millis(350 + jitter_ms)).await;
 }
 
 /// GET /api/auth/status
@@ -837,6 +873,7 @@ pub async fn me(
                     crate::process_manager::ProcessStatus::stopped()
                 };
                 Some(ProfileResponse {
+                    runtime: None,
                     email: None,
                     profile: mask_secrets(&p),
                     status,
@@ -913,6 +950,7 @@ pub async fn me(
                 crate::process_manager::ProcessStatus::stopped()
             };
             Some(ProfileResponse {
+                runtime: None,
                 email: None,
                 profile: mask_secrets(&p),
                 status,
@@ -1255,12 +1293,13 @@ pub async fn remove_my_profile_skill(
 /// profiles saving different secrets under the same env var never overwrite a
 /// single shared keychain item (each profile reads back its own credential).
 ///
-/// `is_macos` and `set_secret` are injected for testability.
+/// `store_available` (a secret-store backend exists on this host) and
+/// `set_secret` are injected for testability.
 pub(crate) fn relocate_secret_to_keychain(
     env_vars: &mut HashMap<String, String>,
     key: &str,
     profile_id: &str,
-    is_macos: bool,
+    store_available: bool,
     set_secret: impl Fn(&str, &str) -> eyre::Result<()>,
 ) -> Result<(), String> {
     let Some(value) = env_vars.get(key) else {
@@ -1271,9 +1310,9 @@ pub(crate) fn relocate_secret_to_keychain(
     if !value.starts_with('{') {
         return Ok(());
     }
-    if !is_macos {
+    if !store_available {
         return Err(format!(
-            "{key}: keychain-backed credential storage is only supported on macOS"
+            "{key}: keychain-backed credential storage is unavailable on this host (no secret store backend)"
         ));
     }
     let account = crate::auth::keychain::scoped_account(key, profile_id);
@@ -1288,6 +1327,10 @@ pub async fn update_my_profile(
     axum::Extension(identity): axum::Extension<AuthIdentity>,
     body: String,
 ) -> Result<Json<ProfileResponse>, (StatusCode, String)> {
+    let runtime_config_changed = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("config").cloned())
+        .is_some();
     let req: super::admin::UpdateProfileRequest = serde_json::from_str(&body).map_err(|e| {
         tracing::warn!(error = %e, body = %body, "failed to parse my profile update request");
         (
@@ -1323,7 +1366,8 @@ pub async fn update_my_profile(
     if let Some(enabled) = req.enabled {
         profile.enabled = enabled;
     }
-    super::admin::merge_profile_config_from_body(&mut profile.config, &body, true);
+    super::admin::merge_profile_config_from_body(&mut profile.config, &body, true)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     // Relocate freshly-entered keychain-backed secrets (e.g. the Vertex SA JSON,
     // including a private key pasted under a custom env name) into the OS
     // keychain before persisting. Uses the shared content-detecting helper so
@@ -1336,6 +1380,19 @@ pub async fn update_my_profile(
         tracing::error!(profile = %profile.id, error = %e, "failed to save user profile");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
+
+    let runtime_transition = if runtime_config_changed {
+        Some(
+            crate::api::ui_protocol_transport::refresh_profile_runtime_after_profile_update(
+                &state,
+                &profile.id,
+                Some(profile.updated_at.to_rfc3339()),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
     tracing::info!(profile = %profile.id, "user profile updated");
     let status = if let Some(ref pm) = state.process_manager {
@@ -1350,7 +1407,8 @@ pub async fn update_my_profile(
     // and again right after a save on PUT.
     Ok(Json(
         ProfileResponse::from(mask_secrets(&profile), status)
-            .with_email_lookup(state.user_store.as_deref()),
+            .with_email_lookup(state.user_store.as_deref())
+            .with_runtime_transition(runtime_transition),
     ))
 }
 
@@ -1514,7 +1572,7 @@ pub struct VoiceLeg {
 #[derive(Serialize)]
 pub struct VoiceAsrLeg {
     pub ready: bool,
-    /// Effective route: `"external"` (`ASR_API_URL`) or `"ominix"`.
+    /// Effective route: `"private"`, `"external"` (`ASR_API_URL`), or `"ominix"`.
     pub mode: String,
     pub detail: String,
 }
@@ -1584,10 +1642,11 @@ async fn external_asr_readiness(client: &reqwest::Client, base_url: &str) -> Voi
 }
 
 fn voice_readiness_needs_ominix(
+    private_asr_configured: bool,
     asr_route: &crate::skills_scope::AsrRoute,
     tts_route: crate::api::voice_turn::TtsRoute,
 ) -> bool {
-    matches!(asr_route, crate::skills_scope::AsrRoute::Ominix(_))
+    (!private_asr_configured && matches!(asr_route, crate::skills_scope::AsrRoute::Ominix(_)))
         || tts_route == crate::api::voice_turn::TtsRoute::Local
 }
 
@@ -1777,10 +1836,12 @@ pub(crate) async fn synthesize_speech(
         .map_err(|status| SpeechSynthesisError::new(status, "profile unavailable"))?;
     let _synthesis_permit = acquire_speech_synthesis_permit(&profile_id)?;
     consume_speech_synthesis_quota(&profile_id, text.chars().count())?;
-    let runtime = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+    let runtime = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
         &state,
         Some(&profile_id),
     )
+    .await
+    .map_err(|error| SpeechSynthesisError::new(StatusCode::SERVICE_UNAVAILABLE, error.message))?
     .ok_or_else(|| {
         SpeechSynthesisError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1830,8 +1891,8 @@ pub(crate) async fn synthesize_speech(
 /// GET /api/voice/readiness — per-tenant pre-flight for the voice assistant.
 ///
 /// Confirms the whole pipeline can run under THIS profile's current config:
-/// - **ASR**: `ASR_API_URL` health when explicitly configured; otherwise the
-///   OMiniX ASR model.
+/// - **ASR**: the private browser ASR service when configured; otherwise
+///   `ASR_API_URL` health when explicitly configured; otherwise OMiniX.
 /// - **LLM**: the profile's provider chain is constructed (running runtime with
 ///   a named provider).
 /// - **TTS**: the *chosen* route is actually usable — cloud credentials resolve
@@ -1859,10 +1920,13 @@ pub async fn voice_readiness(
     // runtimes (onboarding, `profile/llm/upsert`) that live outside
     // `state.profiles` — so readiness can't report "not started" while voice
     // turns actually work.
-    let rt = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+    let rt = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
         &state,
         Some(&profile_id),
-    );
+    )
+    .await
+    .ok()
+    .flatten();
     let llm = VoiceLeg {
         ready: rt
             .as_ref()
@@ -1882,35 +1946,45 @@ pub async fn voice_readiness(
         .unwrap_or_else(|| ("auto".to_string(), None));
     let cloud_configured = crate::api::voice_turn::cloud_tts_configured(cloud.as_ref());
     let tts_route = crate::api::voice_turn::classify_tts_route(&provider, cloud_configured);
+    let private_asr = super::private_asr::readiness(&state.http_client).await;
     let asr_route = crate::skills_scope::discover_asr_route();
-    let ominix_runtime = if voice_readiness_needs_ominix(&asr_route, tts_route) {
-        Some(crate::api::ominix_runtime::runtime_status(&state.http_client).await)
-    } else {
-        None
-    };
+    let ominix_runtime =
+        if voice_readiness_needs_ominix(private_asr.is_some(), &asr_route, tts_route) {
+            Some(crate::api::ominix_runtime::runtime_status(&state.http_client).await)
+        } else {
+            None
+        };
 
     // ── ASR leg (route-aware) ──
-    let asr = match &asr_route {
-        crate::skills_scope::AsrRoute::External(url) => {
-            external_asr_readiness(&state.http_client, url).await
+    let asr = if let Some(private) = private_asr {
+        VoiceAsrLeg {
+            ready: private.ready,
+            mode: "private".into(),
+            detail: private.detail,
         }
-        crate::skills_scope::AsrRoute::Ominix(_) => {
-            let runtime = ominix_runtime
-                .as_ref()
-                .expect("OMiniX ASR route requires an OMiniX runtime probe");
-            let health_healthy = runtime.health.healthy;
-            let ready =
-                crate::api::ominix_runtime::asr_ready(health_healthy, &runtime.voice_models);
-            VoiceAsrLeg {
-                ready,
-                mode: "ominix".into(),
-                detail: if ready {
-                    "OMiniX ASR ready".into()
-                } else if !health_healthy {
-                    "OMiniX voice engine unavailable".into()
-                } else {
-                    "OMiniX ASR model not ready".into()
-                },
+    } else {
+        match &asr_route {
+            crate::skills_scope::AsrRoute::External(url) => {
+                external_asr_readiness(&state.http_client, url).await
+            }
+            crate::skills_scope::AsrRoute::Ominix(_) => {
+                let runtime = ominix_runtime
+                    .as_ref()
+                    .expect("OMiniX ASR route requires an OMiniX runtime probe");
+                let health_healthy = runtime.health.healthy;
+                let ready =
+                    crate::api::ominix_runtime::asr_ready(health_healthy, &runtime.voice_models);
+                VoiceAsrLeg {
+                    ready,
+                    mode: "ominix".into(),
+                    detail: if ready {
+                        "OMiniX ASR ready".into()
+                    } else if !health_healthy {
+                        "OMiniX voice engine unavailable".into()
+                    } else {
+                        "OMiniX ASR model not ready".into()
+                    },
+                }
             }
         }
     };
@@ -3504,6 +3578,7 @@ pub async fn my_sub_accounts(
     for s in subs {
         let status = pm.status(&s.id).await;
         items.push(crate::api::admin::ProfileResponse {
+            runtime: None,
             email: None,
             profile: crate::profiles::mask_secrets(&s),
             status,
@@ -3544,6 +3619,7 @@ pub async fn my_sub_account(
     let sub = resolve_my_sub_account(&identity, ps, &state, &headers, &sub_id)?;
     let status = pm.status(&sub.id).await;
     Ok(Json(crate::api::admin::ProfileResponse {
+        runtime: None,
         email: None,
         profile: crate::profiles::mask_secrets(&sub),
         status,
@@ -3586,46 +3662,23 @@ pub async fn create_my_sub_account(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     if !req.env_vars.is_empty() {
-        sub.config.env_vars = req.env_vars;
-        // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
-        // persisting so a sub-account never writes a private key to disk.
-        let sub_id = sub.id.clone();
-        super::admin::relocate_keychain_backed_secrets(&mut sub.config.env_vars, &sub_id)?;
-        sub.updated_at = chrono::Utc::now();
-        ps.save(&sub)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        super::admin::apply_sub_account_env_vars(
+            ps,
+            &mut sub,
+            req.env_vars,
+            super::admin::relocate_keychain_backed_secrets,
+        )?;
     }
 
     if let Some(email) = &req.email {
-        let email = email.trim().to_lowercase();
-        if !email.is_empty() {
-            super::admin::validate_email(&email).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-            if let Some(user_store) = state.user_store.as_ref() {
-                if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        format!("Email '{email}' is already registered to another account"),
-                    ));
-                }
-                let user = crate::user_store::User {
-                    id: sub.id.clone(),
-                    email,
-                    name: sub.name.clone(),
-                    role: crate::user_store::UserRole::User,
-                    created_at: chrono::Utc::now(),
-                    last_login_at: None,
-                };
-                user_store
-                    .save(&user)
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
-        }
+        super::admin::create_sub_account_user_entry(&state, ps, &sub, email)?;
     }
 
     let status = pm.status(&sub.id).await;
     Ok((
         StatusCode::CREATED,
         Json(crate::api::admin::ProfileResponse {
+            runtime: None,
             email: None,
             profile: crate::profiles::mask_secrets(&sub),
             status,
@@ -3683,7 +3736,8 @@ pub async fn update_my_sub_account(
     if let Some(enabled) = req.enabled {
         sub.enabled = enabled;
     }
-    super::admin::merge_profile_config_from_body(&mut sub.config, &body, true);
+    super::admin::merge_profile_config_from_body(&mut sub.config, &body, true)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     // Relocate keychain-backed secrets (e.g. the Vertex SA JSON) before
     // persisting so a sub-account never writes a private key to disk.
     let sub_id = sub.id.clone();
@@ -3730,6 +3784,7 @@ pub async fn update_my_sub_account(
 
     let status = pm.status(&sub.id).await;
     Ok(Json(crate::api::admin::ProfileResponse {
+        runtime: None,
         email: None,
         profile: crate::profiles::mask_secrets(&sub),
         status,
@@ -4162,6 +4217,57 @@ fn build_portal_state(
 // WeChat QR Login (user-scoped)
 // ---------------------------------------------------------------------------
 
+/// Persist a confirmed WeChat bot token onto `profile_id`: ensure the WeChat
+/// channel exists, set WECHAT_BOT_TOKEN, and save. Shared by the user-scoped
+/// and admin QR poll handlers so a QR confirmed through either route lands on
+/// the profile the client was actually editing.
+pub(crate) fn persist_wechat_bot_token(
+    ps: &crate::profiles::ProfileStore,
+    profile_id: &str,
+    bot_token: &str,
+) {
+    if bot_token.is_empty() {
+        return;
+    }
+    match ps.get(profile_id) {
+        Ok(Some(mut profile)) => {
+            let has_wechat = profile
+                .config
+                .channels
+                .iter()
+                .any(|c| matches!(c, crate::profiles::ChannelCredentials::WeChat { .. }));
+            if !has_wechat {
+                profile
+                    .config
+                    .channels
+                    .push(crate::profiles::ChannelCredentials::WeChat {
+                        token_env: "WECHAT_BOT_TOKEN".into(),
+                        base_url: "https://ilinkai.weixin.qq.com".into(),
+                    });
+            }
+            profile
+                .config
+                .env_vars
+                .insert("WECHAT_BOT_TOKEN".into(), bot_token.to_string());
+            if let Err(e) = ps.save(&profile) {
+                tracing::error!(profile_id, "failed to persist WeChat bot token: {e}");
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(
+                profile_id,
+                "WeChat QR confirmed for unknown profile; token dropped"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                profile_id,
+                "failed to load profile for WeChat bot token: {e}"
+            );
+        }
+    }
+}
+
 /// GET /api/my/profile/wechat/qr-start
 pub async fn my_wechat_qr_start(
     State(state): State<Arc<AppState>>,
@@ -4275,43 +4381,7 @@ pub async fn my_wechat_qr_poll(
             .to_string();
 
         if !bot_token.is_empty() {
-            if let Ok(Some(mut profile)) = ps.get(&profile_id) {
-                let has_wechat = profile
-                    .config
-                    .channels
-                    .iter()
-                    .any(|c| matches!(c, crate::profiles::ChannelCredentials::WeChat { .. }));
-                if !has_wechat {
-                    profile
-                        .config
-                        .channels
-                        .push(crate::profiles::ChannelCredentials::WeChat {
-                            token_env: "WECHAT_BOT_TOKEN".into(),
-                            base_url: "https://ilinkai.weixin.qq.com".into(),
-                        });
-                }
-                profile
-                    .config
-                    .env_vars
-                    .insert("WECHAT_BOT_TOKEN".into(), bot_token.clone());
-                let _ = ps.save(&profile);
-                // Set env var so the running wechat channel picks it up on next reconnect
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let _ = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open("/tmp/octos-wechat-token")
-                        .and_then(|mut f| std::io::Write::write_all(&mut f, bot_token.as_bytes()));
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::write("/tmp/octos-wechat-token", &bot_token).ok();
-                }
-            }
+            persist_wechat_bot_token(ps, &profile_id, &bot_token);
         }
 
         // Don't expose bot_token to client — already saved server-side
@@ -4329,6 +4399,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn otp_rate_limit_prunes_expired_keys_and_stays_bounded() {
+        let now = std::time::Instant::now();
+        let mut limits = (0..OTP_RATE_LIMIT_MAX_KEYS)
+            .map(|index| (format!("probe-{index}@example.com"), (1, now)))
+            .collect::<HashMap<_, _>>();
+
+        assert!(otp_rate_limit_exceeded(
+            &mut limits,
+            "overflow@example.com".into(),
+            now
+        ));
+        assert_eq!(limits.len(), OTP_RATE_LIMIT_MAX_KEYS);
+        assert!(!limits.contains_key("overflow@example.com"));
+
+        limits.insert(
+            "probe-0@example.com".into(),
+            (
+                1,
+                now - OTP_RATE_LIMIT_WINDOW - std::time::Duration::from_secs(1),
+            ),
+        );
+        assert!(!otp_rate_limit_exceeded(
+            &mut limits,
+            "replacement@example.com".into(),
+            now
+        ));
+        assert_eq!(limits.len(), OTP_RATE_LIMIT_MAX_KEYS);
+        assert!(limits.contains_key("replacement@example.com"));
+        assert!(!limits.contains_key("probe-0@example.com"));
+    }
+
+    #[test]
     fn should_require_ominix_only_for_local_voice_legs() {
         use crate::api::voice_turn::TtsRoute;
         use crate::skills_scope::AsrRoute;
@@ -4336,10 +4438,32 @@ mod tests {
         let external = AsrRoute::External("http://127.0.0.1:8093".to_string());
         let ominix = AsrRoute::Ominix(Some("http://127.0.0.1:8081".to_string()));
 
-        assert!(!voice_readiness_needs_ominix(&external, TtsRoute::Cloud));
-        assert!(voice_readiness_needs_ominix(&external, TtsRoute::Local));
-        assert!(voice_readiness_needs_ominix(&ominix, TtsRoute::Cloud));
-        assert!(voice_readiness_needs_ominix(&ominix, TtsRoute::Local));
+        assert!(!voice_readiness_needs_ominix(
+            false,
+            &external,
+            TtsRoute::Cloud
+        ));
+        assert!(voice_readiness_needs_ominix(
+            false,
+            &external,
+            TtsRoute::Local
+        ));
+        assert!(voice_readiness_needs_ominix(
+            false,
+            &ominix,
+            TtsRoute::Cloud
+        ));
+        assert!(voice_readiness_needs_ominix(
+            false,
+            &ominix,
+            TtsRoute::Local
+        ));
+        assert!(!voice_readiness_needs_ominix(
+            true,
+            &ominix,
+            TtsRoute::Cloud
+        ));
+        assert!(voice_readiness_needs_ominix(true, &ominix, TtsRoute::Local));
     }
 
     async fn external_asr_health_server(status: &str) -> String {
@@ -4502,19 +4626,21 @@ mod tests {
         std::fs::create_dir_all(&clone_dir).unwrap();
         let clone_path = clone_dir.join("mine.wav");
         std::fs::write(&clone_path, b"fake").unwrap();
-        let json = format!(
-            r#"{{
-              "default_voice": "doubao",
-              "models_base_path": "{base}",
-              "voices": {{
-                "doubao": {{ "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] }},
-                "ghost":  {{ "ref_audio": "ref_audios/ghost_ref.wav", "ref_text": "y", "aliases": [] }},
-                "other-clone": {{ "ref_audio": "{clone}", "ref_text": "z", "aliases": [] }}
-              }}
-            }}"#,
-            base = dir.to_string_lossy(),
-            clone = clone_path.to_string_lossy()
-        );
+        // Built with `json!`, not `format!`: the two paths are interpolated into
+        // JSON strings, and on Windows they are `C:\Users\...\Temp\...`.
+        // Pasted raw, `\U`, `\T` and friends are invalid JSON escapes, so the
+        // parse below panicked on every Windows run while forward-slash paths on
+        // Linux and macOS parsed fine. `json!` escapes the backslashes.
+        let json = serde_json::json!({
+            "default_voice": "doubao",
+            "models_base_path": dir.to_string_lossy(),
+            "voices": {
+                "doubao": { "ref_audio": "ref_audios/doubao_ref.wav", "ref_text": "x", "aliases": ["vivian"] },
+                "ghost":  { "ref_audio": "ref_audios/ghost_ref.wav", "ref_text": "y", "aliases": [] },
+                "other-clone": { "ref_audio": clone_path.to_string_lossy(), "ref_text": "z", "aliases": [] }
+            }
+        })
+        .to_string();
         octos_llm::ominix::VoicesRegistry::parse(&json).unwrap()
     }
 
@@ -4586,6 +4712,11 @@ mod tests {
                 model_hints: None,
                 cost_per_m: None,
                 strong: None,
+                // #2166 typed inference defaults (unset here).
+                temperature: None,
+                top_p: None,
+                reasoning_effort: None,
+                context_window: None,
             }),
             fallbacks: vec![],
         });
@@ -5731,6 +5862,512 @@ mod tests {
         assert_eq!(home["events"][0]["title"], "Dinner");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    #[ignore = "requires built learning-coach and an explicitly supplied Gemini test key"]
+    async fn profile_model_real_coach_acceptance() {
+        use std::os::unix::fs::PermissionsExt;
+        let coach = std::path::PathBuf::from(std::env::var("OCTOS_TEST_COACH_ROOT").unwrap());
+        let key = std::env::var("OCTOS_TEST_LESSON_KEY").unwrap();
+        let (_dir, mut state, _, store) = temp_app_state();
+        state.deployment_mode = crate::config::DeploymentMode::Cloud;
+        state.solo_login_enabled = false;
+        let state = Arc::new(state);
+        let profile = make_user_profile("lesson-test", "Lesson Test");
+        store.save(&profile).unwrap();
+        let data = store.resolve_data_dir(&profile);
+        let skill = data.join("skills/learning-coach");
+        std::fs::create_dir_all(&skill).unwrap();
+        for name in ["main", "lesson-plan.js", "manifest.json"] {
+            std::fs::copy(coach.join(name), skill.join(name)).unwrap();
+        }
+        std::fs::set_permissions(skill.join("main"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let identity = || {
+            axum::Extension(AuthIdentity::User {
+                id: "lesson-test".into(),
+                role: UserRole::User,
+            })
+        };
+        let patch = |model: &str| {
+            serde_json::json!({"config":{
+                "llm":{"primary":{"family_id":"google","model_id":model},"fallbacks":[]},
+                "env_vars":{"GEMINI_API_KEY":key}
+            }})
+            .to_string()
+        };
+        let _ = update_my_profile(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity(),
+            patch("gemini-3.6-flash"),
+        )
+        .await
+        .unwrap();
+        assert!(state.profiles.is_empty());
+        let old = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("lesson-test"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let tool = old.tool_specs.get("oll_generate_lesson").unwrap().clone();
+        let running = tokio::spawn(async move {
+            tool.execute(&serde_json::json!({
+            "turn_id":"real-m1", "learner_request":"解释一次函数 y=2x+1 的斜率和截距。", "request_source":"self_contained", "language":"zh-CN"
+        })).await.unwrap()
+        });
+        let trace_path = data.join("skill-output/study/oll/real-m1.generation-trace.jsonl");
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if std::fs::read_to_string(&trace_path)
+                    .unwrap_or_default()
+                    .contains("model-call")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = update_my_profile(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity(),
+            patch("gemini-3.5-flash"),
+        )
+        .await
+        .unwrap();
+        let first = running.await.unwrap();
+        assert!(
+            first.success,
+            "M1 real course failed: {:?}",
+            first.structured_metadata
+        );
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&trace_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for event in events.iter().filter(|event| event["stage"] == "model-call") {
+            assert_eq!(event["model"], "gemini-3.6-flash");
+            assert_eq!(event["route_source"], "profile");
+        }
+        drop(old);
+        let new = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("lesson-test"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let second = new.tool_specs.get("oll_generate_lesson").unwrap().execute(&serde_json::json!({
+            "turn_id":"real-m2", "learner_request":"解释一次函数 y=2x+1 的斜率和截距。", "request_source":"self_contained", "language":"zh-CN"
+        })).await.unwrap();
+        assert!(
+            second.success,
+            "M2 real course failed: {:?}",
+            second.structured_metadata
+        );
+        let trace = std::fs::read_to_string(
+            data.join("skill-output/study/oll/real-m2.generation-trace.jsonl"),
+        )
+        .unwrap();
+        for event in trace
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["stage"] == "model-call")
+        {
+            assert_eq!(event["model"], "gemini-3.5-flash");
+            assert_eq!(event["route_source"], "profile");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn profile_model_dynamic_skill_acceptance() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, mut state, _, store) = temp_app_state();
+        state.deployment_mode = crate::config::DeploymentMode::Cloud;
+        state.solo_login_enabled = false;
+        let state = Arc::new(state);
+        let patch = |model: &str, key: &str| {
+            serde_json::json!({"config":{
+                "llm":{"primary":{"family_id":"google","model_id":model},"fallbacks":[]},
+                "env_vars":{"GEMINI_API_KEY":key}
+            }})
+            .to_string()
+        };
+        let identity = |id: &str| {
+            axum::Extension(AuthIdentity::User {
+                id: id.into(),
+                role: UserRole::User,
+            })
+        };
+        for id in ["user-a", "user-b"] {
+            let profile = make_user_profile(id, id);
+            store.save(&profile).unwrap();
+            let skill = store.resolve_data_dir(&profile).join("skills/env-probe");
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(skill.join("manifest.json"), r#"{"name":"env-probe","version":"1.0","tools":[{"name":"env_probe","description":"fixture","input_schema":{"type":"object"},"env":["GEMINI_API_KEY","OCTOS_PROFILE_ID","OCTOS_DATA_DIR","OCTOS_PROFILE_LLM_MODEL","OCTOS_PROFILE_LLM_CONFIG_REVISION"]}]}"#).unwrap();
+            let binary = skill.join("env-probe");
+            std::fs::write(&binary, r#"#!/bin/sh
+read INPUT || true
+ok=false
+if [ "$GEMINI_API_KEY" = "fixture-$OCTOS_PROFILE_ID" ]; then ok=true; fi
+if [ -f "$OCTOS_DATA_DIR/hold" ]; then
+  touch "$OCTOS_DATA_DIR/started"
+  while [ -f "$OCTOS_DATA_DIR/hold" ]; do sleep 0.02; done
+fi
+printf '{"success":%s,"output":"%s","structured_metadata":{"revision":"%s"}}\n' "$ok" "$OCTOS_PROFILE_LLM_MODEL" "$OCTOS_PROFILE_LLM_CONFIG_REVISION"
+"#).unwrap();
+            std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let Json(response) = update_my_profile(
+                State(state.clone()),
+                HeaderMap::new(),
+                identity(id),
+                patch("gemini-m1", &format!("fixture-{id}")),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.runtime.unwrap().runtime_disposition, "reloaded");
+        }
+        assert!(
+            state.profiles.is_empty(),
+            "acceptance must use dynamic profiles"
+        );
+        let old = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("user-a"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let other = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("user-b"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let old_revision = old
+            .plugin_env_template
+            .iter()
+            .find(|(k, _)| k == "OCTOS_PROFILE_LLM_CONFIG_REVISION")
+            .unwrap()
+            .1
+            .clone();
+        let data = store.resolve_data_dir(&store.get("user-a").unwrap().unwrap());
+        std::fs::write(data.join("hold"), "hold").unwrap();
+        let old_tool = old.tool_specs.get("env_probe").unwrap().clone();
+        let running =
+            tokio::spawn(async move { old_tool.execute(&serde_json::json!({})).await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !data.join("started").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let Json(saved) = update_my_profile(
+            State(state.clone()),
+            HeaderMap::new(),
+            identity("user-a"),
+            patch("gemini-m2", "fixture-user-a"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            saved.runtime.as_ref().unwrap().runtime_disposition,
+            "restart_required"
+        );
+        let b_result = other
+            .tool_specs
+            .get("env_probe")
+            .unwrap()
+            .execute(&serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(b_result.success, "user B must retain its own key");
+        assert_eq!(b_result.output, "gemini-m1");
+        std::fs::remove_file(data.join("hold")).unwrap();
+        let old_result = running.await.unwrap();
+        assert!(
+            old_result.success,
+            "in-flight user A must retain its own key"
+        );
+        assert_eq!(old_result.output, "gemini-m1");
+        assert_eq!(
+            old_result.structured_metadata.as_ref().unwrap()["revision"],
+            old_revision
+        );
+        drop(old);
+        let new = crate::api::ui_protocol_transport::ensure_session_profile_runtime(
+            &state,
+            Some("user-a"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let result = new
+            .tool_specs
+            .get("env_probe")
+            .unwrap()
+            .execute(&serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output, "gemini-m2");
+        assert_ne!(
+            result.structured_metadata.as_ref().unwrap()["revision"],
+            old_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn my_profile_runtime_response_reports_all_save_outcomes() {
+        for outcome in [
+            "reloaded",
+            "restart_required",
+            "persisted_but_not_live",
+            "save_failed",
+        ] {
+            let (dir, state, _, store) = temp_app_state();
+            let profile = make_user_profile("tenant", "Tenant");
+            store.save(&profile).unwrap();
+            let mut state = Arc::new(state);
+            let patch = serde_json::json!({"config":{
+                "llm":{"primary":{"family_id":"openai","model_id":"gpt-4o-mini",
+                    "route":{"api_key_env":"OCTOS_TEST_REST_RUNTIME_KEY"}},"fallbacks":[]},
+                "env_vars":{"OCTOS_TEST_REST_RUNTIME_KEY":"fixture"}
+            }})
+            .to_string();
+            let identity = || {
+                axum::Extension(AuthIdentity::User {
+                    id: "tenant".into(),
+                    role: UserRole::User,
+                })
+            };
+            let _ = update_my_profile(
+                State(state.clone()),
+                HeaderMap::new(),
+                identity(),
+                patch.clone(),
+            )
+            .await
+            .unwrap();
+            let original = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+                &state,
+                Some("tenant"),
+            )
+            .unwrap();
+            match outcome {
+                "restart_required" => {
+                    let mut owned = Arc::try_unwrap(state).ok().unwrap();
+                    owned.profiles.insert("tenant".into(), original.clone());
+                    state = Arc::new(owned);
+                }
+                "persisted_but_not_live" => {
+                    let blocker = dir.path().join("blocked-data");
+                    std::fs::write(&blocker, "not a directory").unwrap();
+                    let mut saved = store.get("tenant").unwrap().unwrap();
+                    saved.data_dir = Some(blocker.to_string_lossy().into_owned());
+                    store.save(&saved).unwrap();
+                }
+                "save_failed" => {
+                    std::fs::create_dir(store.profile_path("tenant").with_extension("json.tmp"))
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let original = if outcome == "save_failed" {
+                Some(original)
+            } else {
+                drop(original);
+                None
+            };
+            let result =
+                update_my_profile(State(state.clone()), HeaderMap::new(), identity(), patch).await;
+            if outcome == "save_failed" {
+                assert!(result.is_err());
+                let current = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+                    &state,
+                    Some("tenant"),
+                )
+                .unwrap();
+                assert!(
+                    Arc::ptr_eq(original.as_ref().unwrap(), &current),
+                    "failed save must not invalidate runtime"
+                );
+                continue;
+            }
+            let response = serde_json::to_value(result.ok().unwrap().0).unwrap();
+            assert_eq!(response["runtime_disposition"], outcome);
+            assert_eq!(response["restart_required"], outcome == "restart_required");
+            assert_eq!(
+                chrono::DateTime::parse_from_rfc3339(response["config_revision"].as_str().unwrap())
+                    .unwrap(),
+                chrono::DateTime::parse_from_rfc3339(response["updated_at"].as_str().unwrap())
+                    .unwrap()
+            );
+            assert_eq!(response["effective_from"], "next_turn");
+            assert_eq!(
+                response.get("runtime_error").is_some(),
+                outcome == "persisted_but_not_live"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn my_profile_llm_patch_bootstraps_on_demand_appui_runtime() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.enabled = false;
+        profile_store.save(&profile).unwrap();
+        let state = Arc::new(state);
+
+        let _ = update_my_profile(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": {
+                    "llm": {
+                        "primary": {
+                            "family_id": "openai",
+                            "model_id": "gpt-4o-mini",
+                            "route": {
+                                "api_key_env": "OCTOS_TEST_MY_PROFILE_LLM_KEY"
+                            }
+                        },
+                        "fallbacks": []
+                    },
+                    "env_vars": {
+                        "OCTOS_TEST_MY_PROFILE_LLM_KEY": "test-key"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("profile update");
+
+        let runtime = crate::api::ui_protocol_transport::resolve_session_profile_runtime(
+            &state,
+            Some("tenant"),
+        )
+        .expect("profile update should make the runtime live");
+        assert_eq!(runtime.primary_model_id, "gpt-4o-mini");
+    }
+
+    // #1470: the strict `config: Option<ProfileConfig>` parse ran before the
+    // raw body merge, so a partial nested-section patch for a section with
+    // required fields (e.g. `email.provider`) 400'd before the merge could
+    // preserve the stored values.
+    #[tokio::test]
+    async fn my_profile_config_patch_accepts_partial_nested_email() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.config.email = Some(crate::profiles::EmailSettings {
+            provider: "smtp".into(),
+            smtp_host: Some("smtp1.example.org".into()),
+            smtp_port: Some(587),
+            username: None,
+            password_env: None,
+            password: None,
+            from_address: Some("bot@example.org".into()),
+            feishu_app_id: None,
+            feishu_app_secret_env: None,
+            feishu_app_secret: None,
+            feishu_from_address: None,
+            feishu_region: None,
+        });
+        profile_store.save(&profile).unwrap();
+
+        let Json(resp) = update_my_profile(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": {
+                    "email": {
+                        "smtp_host": "smtp2.example.org"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let email = resp.profile.config.email.expect("email config");
+        assert_eq!(email.provider, "smtp");
+        assert_eq!(email.smtp_host.as_deref(), Some("smtp2.example.org"));
+        assert_eq!(email.smtp_port, Some(587));
+        assert_eq!(email.from_address.as_deref(), Some("bot@example.org"));
+    }
+
+    // The flip side of accepting partial nested patches: a patch that merges
+    // to an INVALID config (here a wrong-typed `smtp_port`) must 400 and
+    // leave the stored config untouched — the post-merge validation error
+    // must not be silently swallowed.
+    #[tokio::test]
+    async fn my_profile_config_patch_rejects_invalid_merged_config() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut profile = make_user_profile("tenant", "Tenant Owner");
+        profile.config.email = Some(crate::profiles::EmailSettings {
+            provider: "smtp".into(),
+            smtp_host: Some("smtp1.example.org".into()),
+            smtp_port: Some(587),
+            username: None,
+            password_env: None,
+            password: None,
+            from_address: None,
+            feishu_app_id: None,
+            feishu_app_secret_env: None,
+            feishu_app_secret: None,
+            feishu_from_address: None,
+            feishu_region: None,
+        });
+        profile_store.save(&profile).unwrap();
+
+        let err = update_my_profile(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "config": {
+                    "email": {
+                        "smtp_port": "not-a-port"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await;
+        let err = match err {
+            Ok(_) => panic!("invalid merged config unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let stored = profile_store.get("tenant").unwrap().expect("profile");
+        let email = stored.config.email.expect("email config");
+        assert_eq!(email.smtp_host.as_deref(), Some("smtp1.example.org"));
+        assert_eq!(email.smtp_port, Some(587));
+    }
+
     // The config merge preserves sections the client omits (above), but a
     // provided `env_vars` map must still be able to DROP keys and clear the set
     // — otherwise secrets could never be removed via self-service. `env_vars` is
@@ -5841,16 +6478,28 @@ mod tests {
         );
     }
 
+    // No native Keychain writes without an isolated macOS integration fixture.
+    // Linux-only for now: the injected test store root is cfg(linux), and on
+    // Windows (no backend, no injection) relocation fails before the profile
+    // save, so the env slot the assertions below read never exists.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn my_profile_rejects_service_account_json_under_custom_env_off_macos() {
         // Regression for the dashboard "Custom" bypass: a raw Vertex SA JSON
         // pasted under a CUSTOM env name (VERTEX_API_KEY, not the whitelisted
         // VERTEX_SA_JSON) via PUT /api/my/profile must never reach plaintext
-        // config. Off macOS it's rejected; on macOS it would be relocated to the
-        // keychain instead (skip — that hits the real keychain).
-        if cfg!(target_os = "macos") {
-            return;
-        }
+        // config.
+        //
+        // #2234/45a contract (same shape as the admin.rs twin): the
+        // availability predicate is `keychain::is_available()`, NOT
+        // `cfg!(macos)`. On a store-backed host (linux file backend with an
+        // INJECTED temp root — never the real keychain) the JSON is
+        // legitimately relocated: the call succeeds and the slot becomes a
+        // keychain marker, never the raw value. Hosts with NO backend keep
+        // the rejection.
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root =
+            crate::auth::keychain::test_override_secrets_root(secrets.path().to_path_buf());
         let (_dir, state, _user_store, profile_store) = temp_app_state();
         profile_store
             .save(&make_user_profile("tenant", "Tenant Owner"))
@@ -5872,15 +6521,35 @@ mod tests {
         )
         .await;
 
-        assert!(
-            res.is_err(),
-            "raw SA JSON under a custom env name must be rejected off macOS"
-        );
         let stored = profile_store.get("tenant").unwrap().expect("profile");
-        assert!(
-            !stored.config.env_vars.contains_key("VERTEX_API_KEY"),
-            "the private key must never be persisted to plaintext config"
-        );
+        let slot = stored
+            .config
+            .env_vars
+            .get("VERTEX_API_KEY")
+            .expect("slot present after either path");
+        if crate::auth::keychain::is_available() {
+            // Store-backed host: relocation succeeded, plaintext replaced by
+            // a keychain marker.
+            assert!(res.is_ok(), "store-backed host relocates the raw SA JSON");
+            assert!(
+                crate::auth::keychain::is_marker(slot),
+                "slot must be a keychain marker, got: {slot}"
+            );
+            assert!(
+                !slot.contains("private_key"),
+                "the raw private key must never persist"
+            );
+        } else {
+            // No backend: rejected, slot untouched (raw value not persisted).
+            assert!(
+                res.is_err(),
+                "raw SA JSON under a custom env name must be rejected with no store"
+            );
+            assert!(
+                !slot.contains("private_key"),
+                "the private key must never be persisted to plaintext config"
+            );
+        }
     }
 
     // Replacing `env_vars` wholesale must NOT clobber a real secret when the UI
@@ -6020,6 +6689,169 @@ mod tests {
         assert_eq!(home["events"][0]["title"], "School pickup");
     }
 
+    // #1472 wiring: the self-service create path routes env vars through the
+    // same shared helper as the admin path — benign vars (nothing to
+    // relocate) land on the saved sub-account.
+    #[tokio::test]
+    async fn should_create_my_sub_account_with_env_vars_via_my_handler() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let state = AppState {
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..state
+        };
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+
+        let (status, Json(resp)) = create_my_sub_account(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            axum::Json(crate::api::admin::CreateSubAccountRequest {
+                sub_account_id: "sub1".into(),
+                name: "Sub".into(),
+                public_subdomain: "sub1".into(),
+                email: None,
+                channels: vec![],
+                gateway: None,
+                env_vars: std::collections::HashMap::from([(
+                    "DEPLOY_ENV".to_string(),
+                    "production".to_string(),
+                )]),
+            }),
+        )
+        .await
+        .expect("creation succeeds");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(resp.profile.id, "tenant--sub1");
+        let saved = profile_store
+            .get("tenant--sub1")
+            .unwrap()
+            .expect("sub-account persisted");
+        assert_eq!(
+            saved.config.env_vars.get("DEPLOY_ENV").map(String::as_str),
+            Some("production")
+        );
+    }
+
+    // #2316 wiring: the self-service create path shares the rollback helper —
+    // an email conflict after the profile store has persisted rolls the
+    // fresh sub-account back, so the same id stays retryable.
+    #[tokio::test]
+    async fn should_roll_back_my_sub_account_when_email_conflicts() {
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        let state = AppState {
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..state
+        };
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        user_store
+            .save(&User {
+                id: "other".into(),
+                email: "taken@example.com".into(),
+                name: "Other".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let err = create_my_sub_account(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            axum::Json(crate::api::admin::CreateSubAccountRequest {
+                sub_account_id: "sub1".into(),
+                name: "Sub".into(),
+                public_subdomain: "sub1".into(),
+                email: Some("taken@example.com".into()),
+                channels: vec![],
+                gateway: None,
+                env_vars: std::collections::HashMap::new(),
+            }),
+        )
+        .await
+        .err()
+        .expect("creation must fail");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            profile_store.get("tenant--sub1").unwrap().is_none(),
+            "failed creation must not strand the sub-account"
+        );
+    }
+
+    // #1470: same partial nested-section patch as above, but through the
+    // parent-managed sub-account endpoint.
+    #[tokio::test]
+    async fn managed_sub_account_config_patch_accepts_partial_nested_email() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let state = AppState {
+            process_manager: Some(Arc::new(crate::process_manager::ProcessManager::new(
+                profile_store.clone(),
+            ))),
+            ..state
+        };
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
+        child.config.email = Some(crate::profiles::EmailSettings {
+            provider: "smtp".into(),
+            smtp_host: Some("smtp1.example.org".into()),
+            smtp_port: None,
+            username: None,
+            password_env: None,
+            password: None,
+            from_address: None,
+            feishu_app_id: None,
+            feishu_app_secret_env: None,
+            feishu_app_secret: None,
+            feishu_from_address: None,
+            feishu_region: None,
+        });
+        profile_store.save(&child).unwrap();
+
+        let Json(resp) = update_my_sub_account(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            Path("tenant--assistant".into()),
+            serde_json::json!({
+                "config": {
+                    "email": {
+                        "smtp_host": "smtp2.example.org"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let email = resp.profile.config.email.expect("email config");
+        assert_eq!(email.provider, "smtp");
+        assert_eq!(email.smtp_host.as_deref(), Some("smtp2.example.org"));
+    }
+
     #[tokio::test]
     async fn my_profile_skills_lists_current_user_skills() {
         let (_dir, state, _user_store, profile_store) = temp_app_state();
@@ -6095,8 +6927,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_send_code_rejects_wrong_email() {
+    async fn scoped_send_code_hides_whether_email_is_registered() {
         let (_dir, state, user_store, profile_store) = temp_app_state();
+        let auth_mgr = state.auth_manager.as_ref().unwrap().clone();
         let mut child = make_user_profile("tenant--assistant", "Assistant");
         child.parent_id = Some("tenant".into());
         child.public_subdomain = Some("assistant".into());
@@ -6122,11 +6955,47 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!resp.ok);
+        assert!(resp.ok);
         assert_eq!(
             resp.message.as_deref(),
-            Some("This email is not registered for this account")
+            Some("Verification code sent to your email")
         );
+        assert!(
+            auth_mgr
+                .test_pending_code("wrong@example.com", Some("tenant--assistant"))
+                .await
+                .is_none()
+        );
+        assert!(auth_mgr.test_sent_emails().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn root_send_code_hides_whether_email_is_invited() {
+        let (_dir, state, _user_store, _profile_store) = temp_app_state();
+        let auth_mgr = state.auth_manager.as_ref().unwrap().clone();
+
+        let Json(resp) = send_code(
+            State(Arc::new(state)),
+            HeaderMap::new(),
+            Json(SendCodeRequest {
+                email: "not-invited@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(resp.ok);
+        assert_eq!(
+            resp.message.as_deref(),
+            Some("Verification code sent to your email")
+        );
+        assert!(
+            auth_mgr
+                .test_pending_code("not-invited@example.com", None)
+                .await
+                .is_none()
+        );
+        assert!(auth_mgr.test_sent_emails().await.is_empty());
     }
 
     #[tokio::test]
@@ -6569,5 +7438,90 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(extract_bearer_token(&req), Some(String::new()));
+    }
+
+    fn wechat_test_profile(id: &str) -> UserProfile {
+        UserProfile {
+            id: id.into(),
+            name: id.into(),
+            public_subdomain: None,
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn wechat_channel_count(profile: &UserProfile) -> usize {
+        profile
+            .config
+            .channels
+            .iter()
+            .filter(|c| matches!(c, crate::profiles::ChannelCredentials::WeChat { .. }))
+            .count()
+    }
+
+    #[test]
+    fn persist_wechat_bot_token_targets_the_named_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = ProfileStore::open_unified(dir.path()).unwrap();
+        ps.save(&wechat_test_profile("prof-a")).unwrap();
+        ps.save(&wechat_test_profile("prof-b")).unwrap();
+
+        persist_wechat_bot_token(&ps, "prof-a", "token-1");
+
+        // The named profile gains the channel and the token…
+        let saved = ps.get("prof-a").unwrap().unwrap();
+        assert_eq!(wechat_channel_count(&saved), 1);
+        assert_eq!(
+            saved
+                .config
+                .env_vars
+                .get("WECHAT_BOT_TOKEN")
+                .map(String::as_str),
+            Some("token-1")
+        );
+        // …and no other profile is touched.
+        let other = ps.get("prof-b").unwrap().unwrap();
+        assert_eq!(wechat_channel_count(&other), 0);
+        assert!(!other.config.env_vars.contains_key("WECHAT_BOT_TOKEN"));
+    }
+
+    #[test]
+    fn persist_wechat_bot_token_repeat_confirm_does_not_stack_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = ProfileStore::open_unified(dir.path()).unwrap();
+        ps.save(&wechat_test_profile("prof-a")).unwrap();
+
+        persist_wechat_bot_token(&ps, "prof-a", "token-1");
+        persist_wechat_bot_token(&ps, "prof-a", "token-2");
+
+        let saved = ps.get("prof-a").unwrap().unwrap();
+        assert_eq!(wechat_channel_count(&saved), 1);
+        assert_eq!(
+            saved
+                .config
+                .env_vars
+                .get("WECHAT_BOT_TOKEN")
+                .map(String::as_str),
+            Some("token-2")
+        );
+    }
+
+    #[test]
+    fn persist_wechat_bot_token_noops_on_empty_token_and_unknown_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = ProfileStore::open_unified(dir.path()).unwrap();
+        ps.save(&wechat_test_profile("prof-a")).unwrap();
+
+        persist_wechat_bot_token(&ps, "prof-a", "");
+        let saved = ps.get("prof-a").unwrap().unwrap();
+        assert_eq!(wechat_channel_count(&saved), 0);
+        assert!(!saved.config.env_vars.contains_key("WECHAT_BOT_TOKEN"));
+
+        persist_wechat_bot_token(&ps, "no-such-profile", "token-1");
+        assert!(ps.get("no-such-profile").unwrap().is_none());
     }
 }

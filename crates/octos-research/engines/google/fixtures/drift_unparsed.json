@@ -1,0 +1,21 @@
+{
+  "body_file": "drift_unparsed.body",
+  "http": {
+    "headers": {},
+    "method": "GET",
+    "url": "https://www.google.com/wml/search?q=omarchy+linux&sca_esv=1&hl=en&lr=lang_en&ie=utf8&oe=utf8"
+  },
+  "recorded": "derived from results_en.body with every result link changed, as when Google changes the page beyond the parser: an error (and backoff), never a healthy empty",
+  "request": {
+    "category": "general",
+    "count": 10,
+    "langs": [
+      "en"
+    ],
+    "now": "2026-09-28T23:30:00Z",
+    "query": "omarchy linux",
+    "since": null
+  },
+  "expect_status": "error",
+  "expect": []
+}

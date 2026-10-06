@@ -253,7 +253,7 @@ pub struct CreateParams {
 
 | 提供商 | 别名 | 基础 URL | 默认模型 | API 密钥环境变量 |
 |----------|---------|----------|---------------|-------------|
-| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5-turbo | ZAI_API_KEY |
+| Z.AI | zai, z.ai | api.z.ai/api/paas/v4 | glm-5-turbo | ZAI_API_KEY |
 
 ### ModelHints（OpenAI 提供商）
 
@@ -411,7 +411,7 @@ pub trait EmbeddingProvider: Send + Sync {
 
 ### 语音转文字
 
-**GroqTranscriber**：通过 `https://api.groq.com/openai/v1/audio/transcriptions` 使用 Whisper `whisper-large-v3`。Multipart 表单。60 秒超时。MIME 类型检测：ogg/opus→audio/ogg、mp3→audio/mpeg、m4a→audio/mp4、wav→audio/wav。
+**语音平台技能（voice platform skill）**——语音转文字发生在网关层，而非 `octos-llm`。网关以 `voice_transcribe` 子命令调用已安装的 `voice` 平台技能二进制（gateway home 下的 `platform-skills/voice/main`：有 `--octos-home` 用之，否则 `<cwd>/.octos`），stdin 传入 `{"audio_path", "language"?}` JSON，stdout 返回 `{"success", "output"}` JSON；超时 120 秒。转写文本合并进入站消息内容（`voice_transcript` 元数据），全部转写被拒的纯音频消息会跳过 Agent 分发，按 profile 的 ASR 语言覆盖逐条消息重新解析（`octos-cli/src/commands/gateway/message_preprocessing.rs:515`，接线在 `octos-cli/src/commands/gateway/gateway_runtime.rs:613`）。
 
 ### 视觉
 
@@ -973,10 +973,10 @@ pub struct ConsoleReporter {
 
 **持续时间格式化**：>1s → `{:.1}s`，≤1s → `{N}ms`。
 
-**SseBroadcaster**（REST API，feature：`api`）— 将事件转换为 JSON 并通过 `tokio::sync::broadcast` 频道广播：
+**EventBroadcaster**（feature：`api`，`octos-cli/src/api/events.rs:32`）— 进程级广播器，将进度事件转换为 JSON 并发布到 `tokio::sync::broadcast` 频道。聊天传输层已无任何 SSE 线路；JSON 帧供 harness/admin `/api/events/harness` 端点、swarm 事件发布器以及 UI Protocol v1 WS 桥接消费：
 
 ```rust
-pub struct SseBroadcaster {
+pub struct EventBroadcaster {
     tx: broadcast::Sender<String>,  // JSON-serialized events
 }
 ```
@@ -990,9 +990,8 @@ pub struct SseBroadcaster {
 | CostUpdate | `"cost_update"` | `input_tokens`、`output_tokens`、`session_cost` |
 | Thinking | `"thinking"` | `iteration` |
 | Response | `"response"` | `iteration` |
-| （其他） | `"other"` | —（debug 级别记录） |
 
-订阅者通过 `SseBroadcaster::subscribe() -> broadcast::Receiver<String>` 接收事件。发送错误（无订阅者）静默忽略。
+订阅者通过 `EventBroadcaster::subscribe() -> broadcast::Receiver<String>` 接收事件。发送错误（无订阅者）静默忽略。
 
 ### 执行环境（`exec_env.rs`）
 
@@ -1004,7 +1003,7 @@ pub struct SseBroadcaster {
 
 ### 类型化回合（`turn.rs`）
 
-`Turn` 用 `TurnKind`（UserInput、AgentReply、ToolCall、ToolResult、System）和迭代次数包装 `Message`。`turns_to_messages()` 转换回 `Vec<Message>` 用于 LLM 调用。支持对对话历史的语义分析。
+`Turn` 用 `TurnKind`（UserInput、AssistantResponse、ToolResult、SteeringFollowUp、SystemReminder、RetrievedContext）和迭代次数包装 `Message`。`turns_to_messages()` 转换回 `Vec<Message>` 用于 LLM 调用。支持对对话历史的语义分析。
 
 ### 事件总线（`event_bus.rs`）
 
@@ -1035,8 +1034,11 @@ pub struct SseBroadcaster {
 `create_bus() -> (AgentHandle, BusPublisher)` 通过 mpsc 通道连接（容量 256）。AgentHandle 接收 InboundMessage；BusPublisher 分发 OutboundMessage。
 
 **队列模式**（通过 `gateway.queue_mode` 配置）：
-- `Followup`（默认）：FIFO — 逐条处理排队消息
-- `Collect`：按会话合并排队消息，拼接内容后再处理
+- `Followup`：FIFO — 逐条处理排队消息
+- `Collect`（默认）：按会话合并排队消息，拼接内容后再处理
+- `Latest`：仅保留最新一条排队消息，丢弃更早的消息（由 `Steer` 改名；`steer` serde 别名保持旧配置可解析）
+- `Interrupt`：取消进行中的回合，立即处理新消息
+- `Speculative`：在当前回合未结束时，为新消息并行发起一个投机回合
 
 ### 频道 Trait
 
@@ -1073,7 +1075,7 @@ pub trait Channel: Send + Sync {
 
 **媒体**：`download_media()` 辅助函数将照片/语音/音频/文档下载到 `.octos/media/`。
 
-**语音转文字**：语音/音频在 Agent 处理前自动通过 GroqTranscriber 转录。
+**语音转文字**：语音/音频在 Agent 处理前由语音平台技能自动转录（见「语音转文字」）。
 
 ### 消息合并
 
@@ -1095,7 +1097,7 @@ JSONL 持久化位于 `.octos/sessions/{key}.jsonl`。
 
 - **内存缓存**：LRU + 写入时同步到磁盘
 - **文件名**：百分号编码的 SessionKey，截断到 183 字符，截断时添加 `_{hash:016X}` 后缀防止冲突
-- **文件大小限制**：最大 10MB（`MAX_SESSION_FILE_SIZE`）；加载时跳过超大文件
+- **滚动分段**：文件在 `OCTOS_SESSION_SEGMENT_BYTES`（8 MiB）时滚入 `<name>.segments/NNNNNN.jsonl`；普通加载读取活跃文件，并按新到旧纳入不超过 `OCTOS_SESSION_LOAD_BUDGET_BYTES`（32 MiB，0 = 不限）的封存分段
 - **崩溃安全**：原子写入-重命名
 - **分支**：`fork()` 创建带 `parent_key` 追踪的子会话，复制最后 N 条消息
 
@@ -1247,7 +1249,7 @@ JSON 持久化位于 `.octos/cron.json`。
 ### 网关模式
 
 ```
-频道 → InboundMessage → MessageBus → [转录音频] → [加载会话]
+频道 → InboundMessage → AgentHandle → [转录音频] → [加载会话]
                                               │
                                     Agent.process_message()
                                               │
@@ -1382,7 +1384,7 @@ crates/
 - 工具输出清理（`sanitize.rs`）：剥离 base64 数据 URI、长十六进制字符串（64+ 字符），以及**凭据脱敏** — 7 个正则表达式覆盖 OpenAI（`sk-...`）、Anthropic（`sk-ant-...`）、AWS（`AKIA...`）、GitHub（`ghp_/gho_/ghs_/ghr_/github_pat_...`）、GitLab（`glpat-...`）、Bearer token 和通用 `password`/`api_key` 赋值
 - 通过 `truncate_utf8()` 在所有工具输出和邮件正文中实现 UTF-8 安全截断
 - 通过百分号编码文件名 + 截断时的哈希后缀防止会话文件冲突
-- 会话文件大小限制：最大 10MB 防止损坏文件导致 OOM
+- 会话文件按 8 MiB 滚动分段，加载上限为 `OCTOS_SESSION_LOAD_BUDGET_BYTES`（32 MiB），防止超大历史导致 OOM
 - 原子写入-重命名用于会话持久化（崩溃安全）
 - API 服务器默认绑定到 127.0.0.1（非 0.0.0.0）
 - 通过 `allowed_senders` 列表进行频道访问控制
@@ -1488,10 +1490,10 @@ Dashboard (octos serve)
 - **单元测试**：类型 serde 往返、工具参数解析、配置验证、提供商检测、工具策略、压缩、合并、BM25 评分、L2 归一化、SSE 解析
 - **自适应路由**：Off/Hedge/Lane 模式、熔断器、故障转移、评分、指标、提供商竞速（19 个测试）
 - **响应性**：基线学习、劣化检测、恢复、阈值边界（8 个测试）
-- **队列模式**：Followup、Collect、Steer、Speculative 溢出、自动升级/降级（9 个测试）
+- **队列模式**：Followup、Collect、Latest、Interrupt、Speculative 溢出、自动升级/降级（9 个测试）
 - **会话持久化**：JSONL 存储、LRU 淘汰、分支、重写、时间戳排序、并发访问（28 个测试）
 - **集成测试**：CLI 命令、文件工具、定时任务、会话分支、插件加载
-- **安全测试**：沙箱路径注入、环境清理、SSRF 阻断、符号链接拒绝（O_NOFOLLOW）、私有 IP 检测、去重溢出、工具参数大小限制、会话文件大小限制、熔断器阈值边界、MCP schema 验证
+- **安全测试**：沙箱路径注入、环境清理、SSRF 阻断、符号链接拒绝（O_NOFOLLOW）、私有 IP 检测、去重溢出、工具参数大小限制、会话分段滚动与加载预算、熔断器阈值边界、MCP schema 验证
 - **频道测试**：allowed_senders、消息解析、去重逻辑、邮件地址提取
 
 本地 CI：`./scripts/ci.sh`（与 GitHub Actions 一致 + 针对性子系统测试）。见 [TESTING.md](./TESTING.md)。

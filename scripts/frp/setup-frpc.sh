@@ -11,7 +11,7 @@
 #                 written into metadatas.token — not a host-wide shared token)
 #
 # Options:
-#   --server <addr>       frps server address (default: 163.192.33.32)
+#   --server <addr>       frps relay server address (required; or set FRPS_SERVER)
 #   --port <port>         frps control port (default: 7000)
 #   --local-port <port>   Local octos serve port (default: 8080)
 #   --ssh-port <port>     SSH tunnel remote port (default: 6001)
@@ -25,7 +25,7 @@ if [ $# -lt 2 ]; then
     echo "Usage: $0 <subdomain> <tunnel-token> [options]"
     echo ""
     echo "Options:"
-    echo "  --server <addr>       frps server (default: 163.192.33.32)"
+    echo "  --server <addr>       frps relay server (required; or set FRPS_SERVER)"
     echo "  --port <port>         frps port (default: 7000)"
     echo "  --local-port <port>   Local octos port (default: 8080)"
     echo "  --ssh-port <port>     SSH tunnel port (default: 6001)"
@@ -38,7 +38,7 @@ FRPS_TOKEN="$2"
 shift 2
 
 # Defaults
-FRPS_SERVER="163.192.33.32"
+FRPS_SERVER="${FRPS_SERVER:-}"
 FRPS_PORT=7000
 LOCAL_PORT=8080
 SSH_PORT=6001
@@ -57,6 +57,11 @@ while [ $# -gt 0 ]; do
         *)            echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+if [ -z "$FRPS_SERVER" ]; then
+    echo "ERROR: no frps relay server given; pass --server <addr> or set FRPS_SERVER"
+    exit 1
+fi
 
 echo "==> Setting up frpc tunnel for ${SUBDOMAIN}.${TUNNEL_DOMAIN}"
 

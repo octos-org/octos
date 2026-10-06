@@ -14,6 +14,26 @@ pub enum CronSchedule {
     Cron { expr: String },
 }
 
+/// What a cron job does when it fires.
+///
+/// Defaults to [`CronMode::Agent`], which is the behaviour every job had before
+/// this existed: the message is pushed onto the bus as an `InboundMessage` and
+/// the gateway answers it with a full model turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CronMode {
+    /// Hand the message to the agent and let it answer. One model turn per fire.
+    #[default]
+    Agent,
+    /// Deliver the message text verbatim. No model, no tokens, no cost.
+    ///
+    /// For jobs whose whole purpose is to say a fixed thing on a schedule.
+    /// A "println hello" reminder firing every 60s does not need a model to
+    /// decide what "println hello" means, but before this it got one anyway —
+    /// 1440 turns a day for a string the job already knew.
+    Notify,
+}
+
 /// What a cron job delivers when it fires.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronPayload {
@@ -22,6 +42,46 @@ pub struct CronPayload {
     pub deliver: bool,
     pub channel: Option<String>,
     pub chat_id: Option<String>,
+    /// Whether firing runs a model turn or just delivers `message`.
+    ///
+    /// `#[serde(default)]` rather than `Option`: a job written before this field
+    /// existed loads as `Agent`, which is exactly what it did yesterday. No
+    /// migration, and no silent behaviour change on upgrade.
+    #[serde(default)]
+    pub mode: CronMode,
+}
+
+/// What created a cron job.
+///
+/// Cron jobs are user-level objects with their own lifecycle — one you asked for
+/// deliberately should outlive the conversation that created it. But a job
+/// created *by* an autonomous loop is different: when the loop is deleted,
+/// nothing is left that wants the job, and nothing was recording the connection,
+/// so it kept firing. Six such jobs on 5s schedules once produced 55,122
+/// executions and 29,490 failed deliveries in a single day, and the only way to
+/// find them was to read `cron.json` by hand.
+///
+/// Every field is optional and skipped when empty, so this is invisible in the
+/// stored JSON for jobs that have no origin to record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronOrigin {
+    /// Session the creating tool call ran in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Autonomous loop whose turn created this job, when there was one.
+    /// This is the key `loop/delete` reaps by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_id: Option<String>,
+    /// Profile the creating session belonged to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+impl CronOrigin {
+    /// True when nothing was recorded — the shape a hand-made job has.
+    pub fn is_empty(&self) -> bool {
+        self.session_id.is_none() && self.loop_id.is_none() && self.profile_id.is_none()
+    }
 }
 
 /// Runtime state of a cron job.
@@ -47,6 +107,22 @@ pub struct CronJob {
     /// If None, defaults to UTC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+    /// What created this job. Empty for jobs created before this field existed
+    /// and for jobs a user made directly.
+    #[serde(default, skip_serializing_if = "CronOrigin::is_empty")]
+    pub origin: CronOrigin,
+}
+
+impl CronJob {
+    /// True when this job was created by `loop_id`'s turn.
+    ///
+    /// Matched on the recorded id, never on `name`. Names are derived from the
+    /// message text, so a job called `loop_03_hi` may have nothing to do with
+    /// `loop_03` — reaping on a name would delete whatever a user happened to
+    /// mention in a message.
+    pub fn belongs_to_loop(&self, loop_id: &str) -> bool {
+        self.origin.loop_id.as_deref() == Some(loop_id)
+    }
 }
 
 /// Persistent store format for all cron jobs.
@@ -134,11 +210,13 @@ mod tests {
                 deliver: false,
                 channel: None,
                 chat_id: None,
+                mode: Default::default(),
             },
             state: CronJobState::default(),
             created_at_ms: 1000,
             delete_after_run: false,
             timezone: None,
+            origin: Default::default(),
         }
     }
 
@@ -153,10 +231,12 @@ mod tests {
                 deliver: true,
                 channel: Some("telegram".into()),
                 chat_id: None,
+                mode: Default::default(),
             },
             state: CronJobState::default(),
             created_at_ms: 1000,
             delete_after_run: true,
+            origin: Default::default(),
             timezone: None,
         }
     }
@@ -212,11 +292,14 @@ mod tests {
                 deliver: false,
                 channel: None,
                 chat_id: None,
+                mode: Default::default(),
             },
             state: CronJobState::default(),
             created_at_ms: 1000,
             delete_after_run: false,
             timezone: None,
+
+            origin: Default::default(),
         };
         job.compute_next_run(0);
         assert!(job.state.next_run_at_ms.is_some());

@@ -7,15 +7,30 @@ name: Publish Packages
 # its own Homebrew tap — `brew tap octos-org/octos https://github.com/octos-org/octos`).
 # On a stable release the homebrew job re-renders Formula/octos.rb from the
 # built bundles and opens a PR to update it (main is branch-protected, so it
-# cannot push directly). npm publishing is unchanged.
+# cannot push directly). Prereleases do not update the stable formula.
 #
 # Gated behind the repo variable PUBLISH_PACKAGES so it no-ops until the
 # maintainer opts in (avoids failing on missing tokens). To go live, set:
 #   - repo variable PUBLISH_PACKAGES = true
 #   - secret NPM_TOKEN           (npm automation token for @octos-org)
-# (No tap PAT needed anymore — the formula update uses the built-in GITHUB_TOKEN.)
+#   - secret HOMEBREW_TAP_TOKEN  (bot/PAT token that can open formula PRs)
+# The Homebrew token is optional at the workflow boundary so manual diagnostics
+# still start, but it is required while the org forbids GITHUB_TOKEN-created PRs.
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to publish'
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        description: 'Bot/PAT token that can push branches and open formula PRs'
+        required: false
+      NPM_TOKEN:
+        description: 'npm automation token for @octos-org'
+        required: false
   release:
     types: [published]
   workflow_dispatch:
@@ -30,20 +45,24 @@ permissions:
 
 jobs:
   homebrew:
-    if: ${{ vars.PUBLISH_PACKAGES == 'true' }}
+    if: ${{ vars.PUBLISH_PACKAGES == 'true' && !contains(inputs.tag || github.event.release.tag_name, '-') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write        # push the formula-update branch
       pull-requests: write   # open the PR that bumps Formula/octos.rb
     env:
       TAG: ${{ inputs.tag || github.event.release.tag_name }}
-      GH_TOKEN: ${{ github.token }}
+      # A bot/PAT token makes the formula PR trigger CI. Fall back for repos
+      # whose organization explicitly permits GITHUB_TOKEN-created PRs.
+      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN || github.token }}
     steps:
       # Base the formula-bump branch on main (a release event otherwise checks
       # out the tag commit, which would make the PR diff/auto-merge messy).
       - uses: actions/checkout@v6
         with:
           ref: main
+          token: ${{ github.token }}
+          persist-credentials: false
 
       - name: Download unix bundles for the tag
         run: |
@@ -90,12 +109,7 @@ jobs:
           echo "----- rendered Formula/octos.rb -----"
           cat Formula/octos.rb
 
-      - name: Skip formula update for prereleases
-        if: ${{ contains(env.TAG, '-') }}
-        run: echo "::notice::${TAG} is a prerelease — formula rendered + validated above, but NOT committed (Formula/octos.rb tracks stable only)."
-
       - name: Open PR to update in-repo formula
-        if: ${{ !contains(env.TAG, '-') }}
         run: |
           set -euo pipefail
           # Formula/octos.rb lives in this repo (this repo is its own tap). main
@@ -110,6 +124,8 @@ jobs:
           git checkout -b "$branch"
           git add Formula/octos.rb
           git commit -m "octos ${TAG}: update Homebrew formula"
+          # Authenticate the push with the bot/PAT token so the PR triggers CI.
+          gh auth setup-git
           git push -f origin "$branch"
           # Create the PR if one isn't already open for this branch, then enable
           # auto-merge so a green formula-only change lands without babysitting.
@@ -122,8 +138,18 @@ jobs:
               --title "octos ${TAG}: update Homebrew formula" \
               --body "Automated Homebrew formula bump for ${TAG}."
           fi
-          gh pr merge "$branch" --squash --auto 2>/dev/null \
-            || echo "::notice::auto-merge unavailable; merge the formula PR manually."
+          gh pr merge "$branch" --squash --auto
+          for attempt in $(seq 1 60); do
+            state=$(gh pr view "$branch" --json state --jq .state)
+            if [ "$state" = "MERGED" ]; then
+              echo "Formula PR merged."
+              exit 0
+            fi
+            echo "attempt $attempt/60: waiting for formula PR checks and merge"
+            sleep 10
+          done
+          echo "::error::formula PR did not merge within 10 minutes"
+          exit 1
 
   npm:
     if: ${{ vars.PUBLISH_PACKAGES == 'true' }}
@@ -152,6 +178,10 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN is not configured for this repository"
+            exit 1
+          fi
           version="${TAG#v}"
           # Prerelease versions (1.1.0-alpha.1, -rc.2, …) MUST NOT publish under
           # the `latest` dist-tag, or `npm i -g @octos-org/octos` would install a
@@ -163,3 +193,20 @@ jobs:
           esac
           echo "npm publish @octos-org/octos@${version} --tag ${dist_tag}"
           npm publish --access public --tag "$dist_tag"
+
+      - name: Verify npm publication
+        working-directory: packaging/npm
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          for attempt in $(seq 1 18); do
+            published=$(npm view "@octos-org/octos@${version}" version 2>/dev/null || true)
+            if [ "$published" = "$version" ]; then
+              echo "Verified @octos-org/octos@${version} on npm."
+              exit 0
+            fi
+            echo "attempt $attempt/18: waiting for npm registry visibility"
+            sleep 10
+          done
+          echo "::error::@octos-org/octos@${version} is not visible on npm"
+          exit 1

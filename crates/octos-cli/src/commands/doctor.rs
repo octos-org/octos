@@ -39,10 +39,10 @@
 //! - `Skills` / `MCP` / `Channels`: discovered skill manifests, MCP stdio
 //!   command PATH-resolution, configured gateway channels.
 //! - `Sessions` (Stage 4): a CONTENT-FREE inventory per store — counts,
-//!   total size, newest/oldest age, transcripts near octos-bus's 10 MiB
-//!   write cap, and transcripts whose final line no longer parses (the
-//!   crash-mid-write signature that breaks resume). The tail probe parses
-//!   and immediately discards; no transcript content reaches the report.
+//!   total size, newest/oldest age, and transcripts whose final line no
+//!   longer parses (the crash-mid-write signature that breaks resume). The
+//!   tail probe parses and immediately discards; no transcript content
+//!   reaches the report.
 //!
 //! Stage-3 contract: octos state is never created, migrated, or modified, and
 //! no secret value reaches the report or the JSON bundle (env var NAMES only;
@@ -63,8 +63,8 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use eyre::Result;
 use octos_core::ui_protocol::{
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_V1,
-    UiProtocolCapabilities,
+    UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+    UI_PROTOCOL_KNOWN_FEATURES, UI_PROTOCOL_V1, UiProtocolCapabilities,
 };
 use octos_diagnostics::{
     Check, CheckStatus, InstallMethod, LocatedBinaries, ProductSpec, Reachability, Report,
@@ -96,9 +96,6 @@ const DISK_WARN_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 /// Hard cap on filesystem entries visited by the disk-usage walk so a
 /// pathological tree cannot stall doctor.
 const DISK_WALK_MAX_ENTRIES: usize = 100_000;
-/// Sessions at ≥80% of `octos-bus`'s `MAX_SESSION_FILE_SIZE` (10 MiB) get
-/// flagged before writes start failing at the cap.
-const SESSION_NEAR_CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// Bytes read from a transcript's TAIL for the content-free integrity probe
 /// (parse the final line, discard it). Bounds I/O per session file.
 const SESSION_TAIL_PROBE_BYTES: u64 = 64 * 1024;
@@ -242,6 +239,14 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     ));
     report.push(shadow_check(&located, &method, &spec));
 
+    // --- Embedded web UI bundles --------------------------------------------
+    // What this binary can actually serve at /app, /admin, and /swarm. The
+    // SPAs are embedded from gitignored static/ trees, so a source-clone
+    // build without the scripts/build-*.sh step 503s at every UI route
+    // (#2384) — surface that before the first serve.
+    #[cfg(feature = "api")]
+    report.push(ui_bundles_check());
+
     // --- Installations (every octos + octoscode copy, with versions) --------
     // Parity with `octoscode doctor`'s Installations section: enumerate BOTH
     // binaries across PATH + the known install dirs so duplicate / mismatched
@@ -286,6 +291,7 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
         report.extend(session_checks(&ctx.data_dir, &profiles));
         // --- Stage 3: Skills / MCP / Channels ----------------------------------
         report.push(skills_check(&ctx.data_dir));
+        report.push(embedder_check(&ctx.data_dir));
         report.extend(mcp_checks(config));
         report.push(channels_check(config));
     }
@@ -313,9 +319,11 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
     // --- Backend / protocol skew ------------------------------------------
     // The server's own compiled-in capabilities are authoritative for the
     // structural skew check. `first_server_slice()` advertises the protocol's
-    // no-header compatibility baseline. `projection.envelope.v2` is known but
-    // strictly opt-in, so exclude it here; otherwise doctor would mistake the
-    // deliberately absent default advertisement for protocol skew.
+    // no-header compatibility baseline. `projection.envelope.v2` and
+    // `context.semantic_cache.v1` are known but strictly opt-in (advertised
+    // only after explicit client negotiation, UPCR-2026-029), so exclude them
+    // here; otherwise doctor would mistake the deliberately absent default
+    // advertisement for protocol skew.
     // TODO Stage 2.5: replace the compiled-in caps with a LIVE WS
     // `config/capabilities/list` probe against a configured/running server (it
     // needs a client WS connection, deliberately out of Stage 2 scope). Until
@@ -326,10 +334,80 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
         UI_PROTOCOL_KNOWN_FEATURES
             .iter()
             .copied()
-            .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
+            .filter(|feature| *feature != UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2)
+            .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1)
+            // `context.state.v1` is the same kind of strict opt-in: it adds
+            // a notification legacy clients cannot decode, so the baseline
+            // never claims it.
+            .filter(|feature| {
+                *feature != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
+            }),
     ));
 
     Ok(report)
+}
+
+/// What this binary can serve at the embedded UI routes (#2384): pass with
+/// the available bundles, warn naming the missing ones' build scripts.
+#[cfg(feature = "api")]
+fn ui_bundles_check() -> Check {
+    ui_bundles_check_from(
+        &crate::api::static_files::embedded_ui_bundles(),
+        cfg!(debug_assertions),
+    )
+}
+
+#[cfg(feature = "api")]
+fn ui_bundles_check_from(
+    bundles: &[crate::api::static_files::UiBundleStatus],
+    reads_static_from_disk: bool,
+) -> Check {
+    let missing: Vec<&crate::api::static_files::UiBundleStatus> =
+        bundles.iter().filter(|bundle| !bundle.embedded).collect();
+    if missing.is_empty() {
+        let present: Vec<&str> = bundles
+            .iter()
+            .filter(|bundle| bundle.embedded)
+            .map(|bundle| bundle.label)
+            .collect();
+        return Check::pass(CAT_BINARY, "web UI bundles", present.join(", "))
+            .with_value(embed_mode_value(reads_static_from_disk));
+    }
+    let scripts = missing
+        .iter()
+        .map(|bundle| bundle.build_script)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rebuild = if reads_static_from_disk {
+        // A debug binary reads `static/` from disk at serve time — the
+        // scripts' output is picked up without recompiling.
+        " (debug build reads static/ from disk; no rebuild needed)"
+    } else {
+        ", then rebuild octos-cli"
+    };
+    Check::warn(
+        CAT_BINARY,
+        "web UI bundles",
+        format!(
+            "not available: {} — those UI routes serve 503",
+            missing
+                .iter()
+                .map(|bundle| bundle.label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        format!("run {scripts}{rebuild}"),
+    )
+    .with_value(embed_mode_value(reads_static_from_disk))
+}
+
+#[cfg(feature = "api")]
+fn embed_mode_value(reads_static_from_disk: bool) -> &'static str {
+    if reads_static_from_disk {
+        "debug build: static/ read from disk at runtime"
+    } else {
+        "release build: bundles compiled in"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -688,11 +766,29 @@ fn provider_checks(config: &crate::config::Config, with_network: bool) -> Vec<Ch
     // echoes the env var name it looked up (live-caught residual).
     let env_redacted = env_name != raw_env;
     if entry.is_some() && registry_env.is_none() && config.api_key_env.is_none() {
-        checks.push(Check::pass(
-            CAT_PROVIDER,
-            "API key",
-            format!("{canonical} is a local provider — no API key required"),
-        ));
+        // Keyless family — but the runtime still opportunistically resolves
+        // the derived `{NAME}_API_KEY` chain and sends whatever it finds as a
+        // Bearer token (chat.rs provider factory). An ambient credential going
+        // out silently while doctor says "no key" is exactly the kind of
+        // contradiction doctor exists to surface — disclose it.
+        match config.get_api_key_with_env(canonical, None) {
+            Ok(_) => checks.push(
+                Check::pass(
+                    CAT_PROVIDER,
+                    "API key",
+                    format!(
+                        "{canonical} needs no API key, but a credential resolves via {env_name} \
+                         and WILL be sent as a Bearer token"
+                    ),
+                )
+                .with_value(env_name.clone()),
+            ),
+            Err(_) => checks.push(Check::pass(
+                CAT_PROVIDER,
+                "API key",
+                format!("{canonical} is a local provider — no API key required"),
+            )),
+        }
     } else {
         // Resolve exactly as the runtime does: pass the user's OWN
         // `api_key_env` config (None → the full chain INCLUDING the auth
@@ -736,10 +832,10 @@ fn provider_checks(config: &crate::config::Config, with_network: bool) -> Vec<Ch
 
     // Endpoint reachability (advisory; skipped offline/tests).
     if with_network {
-        match endpoint {
+        match endpoint.as_deref() {
             Some(url) => {
                 let display = endpoint_display.unwrap_or_else(|| "(unparseable URL)".into());
-                match probe_endpoint(&url) {
+                match probe_endpoint(url) {
                     Ok(status) => checks.push(
                         Check::pass(
                             CAT_PROVIDER,
@@ -767,9 +863,226 @@ fn provider_checks(config: &crate::config::Config, with_network: bool) -> Vec<Ch
                 ),
             )),
         }
+
+        // Local model servers all answer the OpenAI `GET /v1/models` shape —
+        // one request verifies the server AND surfaces the loaded model ids.
+        if is_local_server_family(canonical) {
+            // Authenticate exactly as the runtime would (auth store → env
+            // chain): a `llama-server --api-key` deployment must list models
+            // instead of false-alarming with 401 (codex + adversarial pass).
+            let api_key = config
+                .get_api_key_with_env(canonical, config.api_key_env.as_deref())
+                .ok();
+            checks.extend(local_server_checks(
+                canonical,
+                endpoint.as_deref(),
+                config.model.as_deref(),
+                api_key.as_deref(),
+            ));
+        }
     }
 
     checks
+}
+
+/// Families that are a local OpenAI-compatible server (unified `local` plus
+/// the engine-branded `ollama`/`vllm`), where `/models` discovery applies.
+fn is_local_server_family(canonical: &str) -> bool {
+    matches!(canonical, "local" | "ollama" | "vllm")
+}
+
+/// `/models` discovery for a local server: reachability with a model list on
+/// success, and a cross-check that the configured model is actually loaded
+/// (on Ollama-style servers the `model` field selects the model, so a
+/// mismatch means every request would 404).
+fn local_server_checks(
+    canonical: &str,
+    endpoint: Option<&str>,
+    configured_model: Option<&str>,
+    api_key: Option<&str>,
+) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let Some(base) = endpoint else {
+        return checks;
+    };
+    match probe_models(base, api_key) {
+        Ok(Some(models)) if !models.is_empty() => {
+            const SHOWN: usize = 5;
+            let mut shown: Vec<String> =
+                models.iter().take(SHOWN).map(|id| sanitize_display_id(id)).collect();
+            let rest = models.len().saturating_sub(SHOWN);
+            if rest > 0 {
+                shown.push(format!("… +{rest} more"));
+            }
+            checks.push(
+                Check::pass(
+                    CAT_PROVIDER,
+                    "local models",
+                    format!("server lists {} model(s)", models.len()),
+                )
+                .with_value(shown.join(", ")),
+            );
+            // The unified family's placeholder stands for "single-model server
+            // that ignores the field" — never flag it.
+            if let Some(model) = configured_model
+                .filter(|m| *m != octos_llm::local_discovery::PLACEHOLDER_MODEL)
+            {
+                let loaded = models.iter().any(|id| local_model_matches(model, id));
+                if !loaded {
+                    checks.push(Check::warn(
+                        CAT_PROVIDER,
+                        "local model configured",
+                        format!("\"{model}\" is not among the server's listed models"),
+                        "set \"model\" to one of the listed ids (or leave it unset for single-model servers)",
+                    ));
+                }
+            }
+        }
+        Ok(Some(_)) => checks.push(Check::warn(
+            CAT_PROVIDER,
+            "local models",
+            "server answered /models but listed none",
+            "load a model first (llama.cpp: `llama-server -m model.gguf`; ollama: `ollama pull <model>`)",
+        )),
+        // Answered 2xx, but not the OpenAI list-models shape: most likely an
+        // unrelated app owns the port — "load a model" would be wrong advice.
+        Ok(None) => checks.push(Check::warn(
+            CAT_PROVIDER,
+            "local models",
+            "the endpoint answered, but not with an OpenAI-compatible model list — is something else running on this port?",
+            "point \"base_url\" at the model server's /v1 endpoint (llama.cpp default: http://127.0.0.1:8080/v1)",
+        )),
+        Err(error) => {
+            // A 401/403 means the server IS there and wants its key — "is the
+            // server running?" would be false advice (codex P2).
+            let auth_rejected = error.contains("HTTP 401") || error.contains("HTTP 403");
+            checks.push(if auth_rejected {
+                Check::warn(
+                    CAT_PROVIDER,
+                    "local models",
+                    format!(
+                        "server rejected the request as unauthorized ({error}) — model listing skipped"
+                    ),
+                    if api_key.is_some() {
+                        "the resolved API key was rejected — check it matches the server's --api-key"
+                    } else {
+                        "the server requires its API key — set \"api_key_env\" to the env var holding it"
+                    },
+                )
+            } else {
+                Check::warn(
+                    CAT_PROVIDER,
+                    "local models",
+                    format!("could not list models: {error}"),
+                    format!(
+                        "is the server running? common local endpoints: {}",
+                        octos_llm::local_discovery::CANDIDATE_BASE_URLS.join(", ")
+                    ),
+                )
+            });
+        }
+    }
+    // Agent use depends on tool calling, which local servers only provide
+    // with a tool-capable model + chat template — a connect-fine/tools-broken
+    // setup otherwise looks like an octos bug. Named "(advisory)" because
+    // nothing is verified here; a bare pass would read as a checked result.
+    if canonical == "local" {
+        checks.push(Check::pass(
+            CAT_PROVIDER,
+            "tool calling (advisory)",
+            "agent tools need a tool-capable model and chat template (llama.cpp: start llama-server with --jinja)",
+        ));
+    }
+    checks
+}
+
+/// Whether a configured model name refers to a server-listed id, with
+/// Ollama's tag semantics: comparison is case-insensitive, and a bare `name`
+/// is equivalent to `name:latest` — in BOTH directions, and ONLY for the
+/// `latest` tag. A bare `qwen2.5` does NOT match `qwen2.5:7b`: Ollama would
+/// resolve it to the absent `qwen2.5:latest`, so the request would fail and
+/// the warning is correct (codex P2 + adversarial pass, opposite directions).
+fn local_model_matches(configured: &str, listed: &str) -> bool {
+    fn canon(id: &str) -> String {
+        let lower = id.to_lowercase();
+        lower
+            .strip_suffix(":latest")
+            .map(str::to_owned)
+            .unwrap_or(lower)
+    }
+    canon(configured) == canon(listed)
+}
+
+/// One server-supplied string, made safe for terminal display: control
+/// characters (ANSI/OSC escapes included) become U+FFFD and the id is capped,
+/// so a squatted port cannot rewrite doctor's report (multi-model finding).
+/// Mirrors the `display_env_name` guard for the other untrusted-value path.
+fn sanitize_display_id(id: &str) -> String {
+    const MAX_ID_CHARS: usize = 96;
+    let mut out: String = id
+        .chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .take(MAX_ID_CHARS)
+        .collect();
+    if id.chars().count() > MAX_ID_CHARS {
+        out.push('…');
+    }
+    out
+}
+
+/// Shared short-timeout, no-redirect blocking client for doctor's endpoint
+/// probes — one place for the hardening rules so `probe_endpoint` and
+/// `probe_models` cannot drift (maintainability pass).
+fn probe_client() -> std::result::Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        // No redirect following: a redirect target could carry credentials
+        // that would then be echoed through the error path (codex r2).
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+/// GET `{base}/models` (same credential-stripping and no-redirect rules as
+/// [`probe_endpoint`], via [`probe_client`]) and parse the OpenAI list-models
+/// body. The path segment is appended AFTER URL parsing so a base_url carrying
+/// a query/fragment cannot silently redirect the probe to the wrong path.
+/// Returns Ok(None) when the body is not the list-models shape. Body reads
+/// are capped; a body exceeding the cap is an explicit error, not a silent
+/// mis-parse of truncated JSON.
+fn probe_models(
+    base: &str,
+    api_key: Option<&str>,
+) -> std::result::Result<Option<Vec<String>>, String> {
+    use std::io::Read as _;
+    const MAX_BODY_BYTES: u64 = 256 * 1024;
+    let mut url = sanitized_http_url(base)?;
+    url.path_segments_mut()
+        .map_err(|_| "base_url cannot take a path".to_string())?
+        .pop_if_empty()
+        .push("models");
+    let client = probe_client()?;
+    let mut request = client.get(url);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().map_err(|error| error.to_string())?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP {status}"));
+    }
+    let mut body = String::new();
+    response
+        .take(MAX_BODY_BYTES + 1)
+        .read_to_string(&mut body)
+        .map_err(|error| error.to_string())?;
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return Err(format!(
+            "response larger than {}KB — not a model list",
+            MAX_BODY_BYTES / 1024
+        ));
+    }
+    Ok(octos_llm::local_discovery::parse_models_response(&body))
 }
 
 /// Guard an env-var NAME before it is echoed into report values / fix lines:
@@ -866,14 +1179,7 @@ fn sanitized_http_url(raw: &str) -> std::result::Result<reqwest::Url, String> {
 /// errors.
 fn probe_endpoint(url: &str) -> std::result::Result<u16, String> {
     let parsed = sanitized_http_url(url)?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(4))
-        // No redirect following: a redirect target could carry credentials
-        // that would then be echoed through the error path (codex r2).
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| error.to_string())?;
-    client
+    probe_client()?
         .get(parsed)
         .send()
         .map(|response| response.status().as_u16())
@@ -1185,9 +1491,6 @@ struct SessionInventory {
     bytes: u64,
     newest_age_secs: Option<u64>,
     oldest_age_secs: Option<u64>,
-    /// Session keys (file stems) whose size is ≥ [`SESSION_NEAR_CAP_BYTES`]
-    /// — writes fail outright at octos-bus's 10 MiB cap.
-    near_cap: Vec<String>,
     /// Session keys whose final line does not parse as JSON (a truncated /
     /// corrupt tail — the usual crash-mid-write signature).
     corrupt_tail: Vec<String>,
@@ -1256,9 +1559,8 @@ fn scan_session_dir(dir: &Path, inventory: &mut SessionInventory) {
         // Skip SIDECARS (`<key>.tasks.jsonl` task ledgers, and any future
         // dotted suffix): session keys are fully percent-encoded
         // (`encode_path_component` encodes `.` as %2E), so a literal dot in
-        // the stem can only be a sidecar — not a transcript, not governed by
-        // the 10 MiB session cap, and it must not consume the scan budget or
-        // trigger resume/fork advice (codex r2).
+        // the stem can only be a sidecar — not a transcript, and it must not
+        // consume the scan budget or trigger resume advice (codex r2).
         if path
             .file_stem()
             .is_some_and(|stem| stem.to_string_lossy().contains('.'))
@@ -1297,9 +1599,6 @@ fn scan_session_dir(dir: &Path, inventory: &mut SessionInventory) {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if meta.len() >= SESSION_NEAR_CAP_BYTES {
-            inventory.near_cap.push(stem.clone());
-        }
         if meta.len() > 0 && session_tail_parses(&path, meta.len()) == Some(false) {
             inventory.corrupt_tail.push(stem);
         }
@@ -1390,8 +1689,8 @@ fn humanize_age(secs: u64) -> String {
 /// One inventory row per session store: the serve-level store at the data-dir
 /// root plus each profile's store (same roots the disk-usage walk covers;
 /// per-project `sessions_in_cwd` stores live in unknown project dirs and stay
-/// out of scope). Rows are informational; unparseable tails and near-cap
-/// transcripts WARN with the offending session keys (bounded).
+/// out of scope). Rows are informational; unparseable tails WARN with the
+/// offending session keys (bounded).
 fn session_checks(data_dir: &Path, profiles: &[DiscoveredProfile]) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut stores: Vec<(String, PathBuf)> = vec![("server".to_string(), data_dir.to_path_buf())];
@@ -1449,7 +1748,7 @@ fn session_checks(data_dir: &Path, profiles: &[DiscoveredProfile]) -> Vec<Check>
             inventory.files,
             human_bytes(inventory.bytes)
         );
-        if inventory.corrupt_tail.is_empty() && inventory.near_cap.is_empty() {
+        if inventory.corrupt_tail.is_empty() {
             checks.push(Check::pass(
                 CAT_SESSIONS,
                 format!("sessions ({label})"),
@@ -1469,13 +1768,6 @@ fn session_checks(data_dir: &Path, profiles: &[DiscoveredProfile]) -> Vec<Check>
                     names.join(", ")
                 ));
                 fixes.push("unparseable tails break resume — back up + remove those files");
-            }
-            if !inventory.near_cap.is_empty() {
-                problems.push(format!(
-                    "{} near the 10 MiB session cap",
-                    inventory.near_cap.len()
-                ));
-                fixes.push("fork near-cap sessions (`/new`) before writes start failing");
             }
             checks.push(Check::warn(
                 CAT_SESSIONS,
@@ -1606,13 +1898,54 @@ fn sandbox_check() -> Check {
             CAT_SANDBOX,
             "sandbox backend",
             format!("Auto → {kind}"),
-            "install a backend (macOS: sandbox-exec · Linux: bubblewrap · any: Docker)",
+            "install a backend (macOS: sandbox-exec · Linux: bubblewrap · Windows: the \
+             octos-sandbox helper · any: Docker), or set sandbox.fail_closed=true to \
+             refuse instead of running unconfined",
         )
     }
 }
 
 /// Installed skills: count manifests under `<data_dir>/skills/*/manifest.json`
 /// and flag unparseable ones. Read-only — no gating probes, no spawning.
+/// The bundled embedding model (docs/THIRD_PARTY_MODELS.md): present and
+/// complete, absent-but-fetchable, or disabled.
+fn embedder_check(data_dir: &Path) -> Check {
+    use crate::embed_model as em;
+    if !cfg!(feature = "embed-llama") {
+        return Check::warn(
+            CAT_STORES,
+            "embedding model",
+            "this build has no in-process embedder (feature embed-llama); memory search is keyword-only",
+            "rebuild with the default features (embed-llama) or configure a remote `embedding` provider",
+        );
+    }
+    let status = em::model_status(data_dir);
+    if status.complete {
+        return Check::pass(
+            CAT_STORES,
+            "embedding model",
+            format!("EmbeddingGemma-300M ready at {}", status.path.display()),
+        );
+    }
+    if em::downloads_allowed(None) {
+        Check::pass(
+            CAT_STORES,
+            "embedding model",
+            format!(
+                "EmbeddingGemma-300M not downloaded yet ({} MB, fetched on first use; `octos memory embedder --fetch` to do it now)",
+                em::DEFAULT_MODEL_BYTES / (1024 * 1024)
+            ),
+        )
+    } else {
+        Check::warn(
+            CAT_STORES,
+            "embedding model",
+            "absent and automatic download is disabled — memory search is keyword-only",
+            "run `octos memory embedder --fetch`, or unset OCTOS_NO_MODEL_DOWNLOAD / embedding.auto_download",
+        )
+    }
+}
+
 fn skills_check(data_dir: &Path) -> Check {
     let dir = data_dir.join("skills");
     if !dir.exists() {
@@ -1870,6 +2203,17 @@ mod tests {
         assert_eq!(skew.status, octos_diagnostics::CheckStatus::Pass);
         // Glyphs are present in the rendered output.
         assert!(text.contains("[✓]"));
+        // The #2384 bundle check is wired into the report — asserted for
+        // presence only, since the status depends on the checkout's
+        // (gitignored) static/ tree. The wiring is `#[cfg(feature = "api")]`
+        // (a no-api binary serves no UI routes), so the presence guarantee
+        // only holds in api builds; the oup-minimal lane runs this suite
+        // with --no-default-features.
+        #[cfg(feature = "api")]
+        assert!(
+            report.checks.iter().any(|c| c.name == "web UI bundles"),
+            "embedded web UI bundle check must be part of the report"
+        );
     }
 
     // ---- Stage 3 ----
@@ -1963,7 +2307,7 @@ mod tests {
             .expect("key check present");
         assert_eq!(key.status, CheckStatus::Pass);
         assert!(
-            !format!("{:?}", key).contains("sekrit-value"),
+            !format!("{key:?}").contains("sekrit-value"),
             "the key value must never appear in the check"
         );
 
@@ -2288,7 +2632,9 @@ mod tests {
     }
 
     #[test]
-    fn should_flag_sessions_near_the_write_cap() {
+    fn should_not_flag_a_large_session_now_that_files_roll_into_segments() {
+        // Session files used to hit a hard 10 MiB cap; they now roll into
+        // segments, so size alone is not a problem worth a warning.
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().to_path_buf();
         let dir = data_dir.join("sessions");
@@ -2308,12 +2654,8 @@ mod tests {
 
         let checks = session_checks(&data_dir, &[]);
         let row = &checks[0];
-        assert_eq!(row.status, CheckStatus::Warn);
-        assert!(
-            row.detail.contains("1 near the 10 MiB session cap"),
-            "{}",
-            row.detail
-        );
+        assert_eq!(row.status, CheckStatus::Pass, "{}", row.detail);
+        assert!(!row.detail.contains("cap"), "{}", row.detail);
     }
 
     #[test]
@@ -2406,7 +2748,7 @@ mod tests {
     #[test]
     fn should_skip_task_ledger_sidecars() {
         // `<key>.tasks.jsonl` sidecars are task ledgers, not transcripts —
-        // they must not count, consume budget, or trigger resume/fork advice
+        // they must not count, consume budget, or trigger resume advice
         // (session keys are percent-encoded, so a dotted stem = sidecar).
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("sessions");
@@ -2468,6 +2810,371 @@ mod tests {
         assert!(
             !notes.contains("fine — ok"),
             "passing rows stay out of notes"
+        );
+    }
+
+    /// One-shot localhost HTTP stub: answers a single request with `status`
+    /// and `body`, sends the captured request head to `request_tx`, and
+    /// returns the base URL to point checks at.
+    fn serve_one_status(
+        status: &'static str,
+        body: String,
+        request_tx: Option<std::sync::mpsc::Sender<String>>,
+    ) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if let Some(tx) = request_tx {
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn serve_one_response(body: &'static str) -> String {
+        serve_one_status("200 OK", body.to_string(), None)
+    }
+
+    /// Deterministically unreachable "server": accepts the connection and
+    /// closes it immediately, so the probe fails with a transport error
+    /// without depending on an ephemeral port staying unbound (the old
+    /// bind-then-drop stub was a TOCTOU flake — testing + adversarial pass).
+    fn serve_connection_reset() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        format!("http://{addr}/v1")
+    }
+
+    #[test]
+    fn should_list_models_and_pass_when_local_server_answers() {
+        let base = serve_one_response(r#"{"object":"list","data":[{"id":"llama3.2"}]}"#);
+        let checks = local_server_checks("local", Some(&base), None, None);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "local models" && c.detail.contains("1 model(s)")),
+            "model list surfaces: {checks:?}"
+        );
+        // The unified family always carries the tool-calling advisory —
+        // labeled as such so it cannot read as a verified result.
+        assert!(checks.iter().any(|c| c.name == "tool calling (advisory)"));
+    }
+
+    /// The advisory is scoped to the unified family — engine-branded
+    /// families must not receive it.
+    #[test]
+    fn should_not_emit_tool_calling_advisory_for_engine_branded_families() {
+        let base = serve_one_response(r#"{"data":[{"id":"llama3.2:latest"}]}"#);
+        let checks = local_server_checks("ollama", Some(&base), None, None);
+        assert!(!checks.iter().any(|c| c.name.starts_with("tool calling")));
+    }
+
+    #[test]
+    fn should_warn_when_configured_model_is_not_loaded() {
+        let base = serve_one_response(r#"{"data":[{"id":"qwen2.5-coder:7b"}]}"#);
+        let checks = local_server_checks("ollama", Some(&base), Some("llama3.2"), None);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.name == "local model configured" && c.detail.contains("llama3.2")),
+            "mismatch warns: {checks:?}"
+        );
+    }
+
+    /// Ollama tag semantics, all four directions: bare ≡ :latest (both ways),
+    /// bare does NOT cover an arbitrary tag (Ollama would resolve it to the
+    /// absent `:latest`), and comparison is case-insensitive.
+    #[test]
+    fn should_match_models_with_ollama_latest_tag_semantics() {
+        assert!(local_model_matches("llama3.2", "llama3.2"));
+        assert!(local_model_matches("llama3.2", "llama3.2:latest"));
+        assert!(local_model_matches("llama3.2:latest", "llama3.2"));
+        assert!(local_model_matches("Qwen2.5-Coder:7B", "qwen2.5-coder:7b"));
+        assert!(!local_model_matches("qwen2.5", "qwen2.5:7b"));
+        assert!(!local_model_matches("qwen2.5:7b", "qwen2.5"));
+    }
+
+    /// The namespaced placeholder is never flagged against the server list.
+    #[test]
+    fn should_never_flag_the_placeholder_model() {
+        let base = serve_one_response(r#"{"data":[{"id":"whatever.gguf"}]}"#);
+        let checks = local_server_checks(
+            "local",
+            Some(&base),
+            Some(octos_llm::local_discovery::PLACEHOLDER_MODEL),
+            None,
+        );
+        assert!(!checks.iter().any(|c| c.name == "local model configured"));
+    }
+
+    /// Server-supplied ids are sanitized before terminal display: control
+    /// characters (ANSI/OSC escapes) never reach the report, and huge ids are
+    /// capped (security + adversarial pass).
+    #[test]
+    fn should_sanitize_server_supplied_ids_before_display() {
+        let base = serve_one_response(
+            "{\"data\":[{\"id\":\"\\u001b]0;pwned\\u0007\\u001b[32mfake-pass\"}]}",
+        );
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let value = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .and_then(|c| c.value.as_deref())
+            .expect("models check carries a value");
+        assert!(
+            !value.chars().any(|c| c.is_control()),
+            "no control chars may survive: {value:?}"
+        );
+        assert!(
+            value.contains("fake-pass"),
+            "printable content kept: {value:?}"
+        );
+
+        let long = sanitize_display_id(&"x".repeat(500));
+        assert!(
+            long.chars().count() <= 97,
+            "long ids are capped: {}",
+            long.len()
+        );
+    }
+
+    /// The probe authenticates exactly like the runtime: the resolved key
+    /// goes out as a Bearer header (codex P2 — llama-server --api-key setups
+    /// must list models instead of false-alarming with 401).
+    #[test]
+    fn should_send_bearer_header_when_key_resolves() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = serve_one_status("200 OK", r#"{"data":[{"id":"m"}]}"#.to_string(), Some(tx));
+        let checks = local_server_checks("local", Some(&base), None, Some("sekrit"));
+        assert!(checks.iter().any(|c| c.name == "local models"));
+        let request = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            request.contains("authorization: Bearer sekrit")
+                || request.contains("Authorization: Bearer sekrit"),
+            "probe carries the resolved key: {request:?}"
+        );
+    }
+
+    /// 401/403 is "server wants its key", not "server down" — the fix line
+    /// must not send the user chasing a dead server.
+    #[test]
+    fn should_diagnose_auth_rejection_distinctly() {
+        let base = serve_one_status("401 Unauthorized", "{}".to_string(), None);
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .expect("models check present");
+        assert!(warn.detail.contains("unauthorized"), "{checks:?}");
+        assert!(
+            warn.fix.as_deref().unwrap_or("").contains("api_key_env"),
+            "fix points at the key config: {checks:?}"
+        );
+    }
+
+    /// A 2xx that is not the list-models shape (an unrelated app owns the
+    /// port) is diagnosed as such — not as "no models loaded".
+    #[test]
+    fn should_diagnose_non_model_server_distinctly() {
+        let base = serve_one_status("200 OK", "<html>hello</html>".to_string(), None);
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .expect("models check present");
+        assert!(
+            warn.detail
+                .contains("not with an OpenAI-compatible model list"),
+            "{checks:?}"
+        );
+    }
+
+    /// A list-shaped body with zero models keeps the "load a model first" fix.
+    #[test]
+    fn should_warn_when_server_lists_no_models() {
+        let base = serve_one_response(r#"{"object":"list","data":[]}"#);
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .expect("models check present");
+        assert!(warn.detail.contains("listed none"), "{checks:?}");
+    }
+
+    /// Oversized bodies are an explicit error, not a silent mis-parse of
+    /// truncated JSON (adversarial pass).
+    #[test]
+    fn should_reject_oversized_models_response() {
+        let big = format!(r#"{{"data":[{{"id":"{}"}}]}}"#, "x".repeat(300 * 1024));
+        let base = serve_one_status("200 OK", big, None);
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .expect("models check present");
+        assert!(warn.detail.contains("larger than"), "{checks:?}");
+    }
+
+    /// A base_url carrying a query string must not derail the /models path —
+    /// the segment is appended after parsing (adversarial pass: string concat
+    /// put "/models" inside the query, silently probing the wrong URL).
+    #[test]
+    fn should_append_models_segment_after_url_parsing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = serve_one_status("200 OK", r#"{"data":[]}"#.to_string(), Some(tx));
+        let with_query = format!("{base}?key=x");
+        let _ = local_server_checks("local", Some(&with_query), None, None);
+        let request = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(
+            request.starts_with("GET /v1/models "),
+            "path is /v1/models with the query stripped: {request:?}"
+        );
+    }
+
+    #[test]
+    fn should_warn_with_candidate_endpoints_when_server_is_down() {
+        let base = serve_connection_reset();
+        let checks = local_server_checks("local", Some(&base), None, None);
+        let warn = checks
+            .iter()
+            .find(|c| c.name == "local models")
+            .expect("down server still yields a models check");
+        assert!(
+            warn.fix.as_deref().unwrap_or("").contains("11434"),
+            "fix line lists candidate ports: {checks:?}"
+        );
+    }
+
+    #[test]
+    fn should_skip_local_checks_without_an_endpoint() {
+        assert!(local_server_checks("local", None, None, None).is_empty());
+    }
+
+    #[test]
+    fn should_gate_local_discovery_to_local_families() {
+        assert!(is_local_server_family("local"));
+        assert!(is_local_server_family("ollama"));
+        assert!(is_local_server_family("vllm"));
+        assert!(!is_local_server_family("anthropic"));
+        assert!(!is_local_server_family("openai"));
+    }
+
+    #[cfg(feature = "api")]
+    fn ui_bundle(
+        label: &'static str,
+        script: &'static str,
+        embedded: bool,
+    ) -> crate::api::static_files::UiBundleStatus {
+        crate::api::static_files::UiBundleStatus {
+            label,
+            build_script: script,
+            embedded,
+        }
+    }
+
+    /// #2384: a fresh-clone build has none of the gitignored SPA bundles;
+    /// the check must warn and hand out every missing bundle's build script.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_warn_with_build_scripts_when_no_ui_bundle_is_embedded() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", false),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", false),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", false),
+            ],
+            false,
+        );
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.name, "web UI bundles");
+        assert!(check.detail.contains("web (/app)"), "{}", check.detail);
+        assert!(check.detail.contains("admin (/admin)"), "{}", check.detail);
+        assert!(check.detail.contains("swarm (/swarm)"), "{}", check.detail);
+        let fix = check.fix.as_deref().unwrap_or_default();
+        assert!(fix.contains("build-web-app.sh"), "{fix}");
+        assert!(fix.contains("build-dashboard.sh"), "{fix}");
+        assert!(fix.contains("build-swarm-app.sh"), "{fix}");
+        assert!(fix.contains(", then rebuild octos-cli"), "{fix}");
+        assert_eq!(
+            check.value.as_deref(),
+            Some("release build: bundles compiled in")
+        );
+    }
+
+    /// A build that ran some (not all) bundle scripts warns only about the
+    /// missing ones — the available bundles must not be reported as absent.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_warn_only_for_missing_bundles_when_partially_embedded() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", true),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", true),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", false),
+            ],
+            false,
+        );
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(!check.detail.contains("web (/app)"), "{}", check.detail);
+        assert!(!check.detail.contains("admin (/admin)"), "{}", check.detail);
+        assert!(check.detail.contains("swarm (/swarm)"), "{}", check.detail);
+        assert_eq!(
+            check.fix.as_deref(),
+            Some("run ./scripts/build-swarm-app.sh, then rebuild octos-cli")
+        );
+    }
+
+    /// A fully bundled binary passes with the embedded routes and no fix line.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_pass_when_every_ui_bundle_is_embedded() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", true),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", true),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", true),
+            ],
+            false,
+        );
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.detail, "web (/app), admin (/admin), swarm (/swarm)");
+        assert!(check.fix.is_none());
+    }
+
+    /// A debug binary reads `static/` from disk at serve time, so the fix
+    /// line must not send the operator through a rebuild — and the report
+    /// must disclose which embed mode produced the verdict.
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_skip_rebuild_in_fix_and_disclose_mode_for_debug_builds() {
+        let check = ui_bundles_check_from(
+            &[
+                ui_bundle("web (/app)", "./scripts/build-web-app.sh", false),
+                ui_bundle("admin (/admin)", "./scripts/build-dashboard.sh", false),
+                ui_bundle("swarm (/swarm)", "./scripts/build-swarm-app.sh", false),
+            ],
+            true,
+        );
+        let fix = check.fix.as_deref().unwrap_or_default();
+        assert!(fix.contains("no rebuild needed"), "{fix}");
+        assert!(!fix.contains("rebuild octos-cli"), "{fix}");
+        assert_eq!(
+            check.value.as_deref(),
+            Some("debug build: static/ read from disk at runtime")
         );
     }
 }

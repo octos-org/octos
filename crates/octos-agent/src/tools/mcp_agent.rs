@@ -416,6 +416,16 @@ pub trait McpAgentBackend: Send + Sync {
     /// Human-readable endpoint identifier (command, URL, ...).
     fn endpoint_label(&self) -> String;
 
+    /// Env keys this backend is configured to set on the spawned
+    /// child. The dispatch-policy gate inspects them against its env
+    /// allowlist / denylist (#1601): no dispatch payload ever carries
+    /// an `env` object, so payload-only inspection left the gate
+    /// without live input. Backends that spawn no local process
+    /// (remote HTTP) keep the default empty set.
+    fn configured_env_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Dispatch `request` to the remote agent and await the final
     /// response. Returns a [`DispatchResponse`] even for failure modes —
     /// callers inspect [`DispatchResponse::outcome`] to pick the right
@@ -558,6 +568,10 @@ impl McpAgentBackend for StdioMcpAgent {
 
     fn endpoint_label(&self) -> String {
         self.cmd.clone()
+    }
+
+    fn configured_env_keys(&self) -> Vec<String> {
+        self.env.keys().cloned().collect()
     }
 
     async fn dispatch(&self, request: DispatchRequest) -> DispatchResponse {
@@ -783,6 +797,10 @@ impl McpAgentBackend for CliAgentBackend {
 
     fn endpoint_label(&self) -> String {
         self.cmd.clone()
+    }
+
+    fn configured_env_keys(&self) -> Vec<String> {
+        self.env.keys().cloned().collect()
     }
 
     async fn dispatch(&self, request: DispatchRequest) -> DispatchResponse {

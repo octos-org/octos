@@ -261,3 +261,72 @@ async fn dispatch_to_mcp_agent_helper_respects_dispatch_policy_per_714() {
         "backend must NOT be touched when the policy gate denies the helper dispatch"
     );
 }
+
+/// #1601: the env denylist must also inspect the env keys the backend
+/// itself is configured to set. No dispatch payload ever carries an
+/// `env` object, so pre-fix the gate had no live input and a backend
+/// configured with `LD_PRELOAD` sailed through — the child only lost
+/// the variable to the backend's own `BLOCKED_ENV_VARS` scrub while
+/// the dispatch itself was allowed. Here a real [`StdioMcpAgent`] is
+/// configured with `LD_PRELOAD` and a marker-writing command: the
+/// gate must reject the dispatch before the child process is ever
+/// spawned.
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_mcp_spawn_fails_closed_on_backend_configured_injection_env_per_1601() {
+    use octos_agent::tools::mcp_agent::{McpAgentBackendConfig, StdioMcpAgent};
+
+    let dir = TempDir::new().unwrap();
+    let memory = memory(&dir).await;
+    let (tx, _rx) = tokio::sync::mpsc::channel::<InboundMessage>(8);
+
+    let marker = dir.path().join("child-spawned.marker");
+    let backend: SharedBackend = Arc::new(
+        StdioMcpAgent::from_config(&McpAgentBackendConfig::Local {
+            cmd: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("touch '{}'; sleep 30", marker.display()),
+            ],
+            env: std::collections::HashMap::from([(
+                "LD_PRELOAD".to_string(),
+                "/tmp/evil.so".to_string(),
+            )]),
+            dispatch_timeout_secs: Some(1),
+        })
+        .unwrap(),
+    );
+
+    // The exact constructor `octos serve` wires in production.
+    let policy = DispatchPolicy::from_agent_gates(None, true);
+
+    let llm: Arc<dyn LlmProvider> = Arc::new(NullLlm);
+    let spawn = SpawnTool::new(llm, memory, PathBuf::from(dir.path()), tx)
+        .with_mcp_agent_backend(backend, Some("run_task".to_string()))
+        .with_dispatch_policy(policy);
+
+    let result = spawn
+        .execute(&serde_json::json!({
+            "task": "noop",
+            "mode": "sync",
+            "backend": "agent_mcp",
+            "label": "env-gate-1601",
+        }))
+        .await
+        .unwrap();
+
+    assert!(
+        !result.success,
+        "dispatch with backend-configured LD_PRELOAD must be rejected; got success=true, output=`{}`",
+        result.output
+    );
+    assert!(
+        result.output.contains("env_forbidden") || result.output.contains("deny"),
+        "rejection must name the env gate; got `{}`",
+        result.output
+    );
+    assert!(
+        !marker.exists(),
+        "policy denial must happen before the backend spawns the child, but the marker file exists"
+    );
+}

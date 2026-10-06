@@ -2,8 +2,8 @@
  * Round-14/15 fleet slides validation spec.
  *
  * Per-host probe (mini1/2/3/5) of the slides flow on `dspfac.<host>`:
- *   1. Was `mofa_slides` actually invoked? (WS frame `tool/started` with name
- *      matching mofa_slides; also surface model_id picked for RFC-3 evidence)
+ *   1. Was `mofa_slides` actually invoked? (WS `tool_start` projection
+ *      envelope payload with name matching mofa_slides)
  *   2. Did the file/attached envelope fire? (WS frame method
  *      `file/attached` with a .pptx in payload.media)
  *   3. Was a pptx attachment surfaced in the chat? (regex over WS frame
@@ -33,12 +33,12 @@
  * bot, octos, ocean).
  *
  * Run:
- *   cd /Users/yuechen/home/octos/e2e
+ *   cd ~/home/octos/e2e
  *   OCTOS_AUTH_TOKEN=octos-admin-2026 OCTOS_PROFILE=dspfac \
  *     npx playwright test tests/round12-fleet-slides-validation.spec.ts \
  *     --reporter=json --workers=4
  *
- * SSH disk-check requires key-based SSH to cloud@69.194.3.{128,129,203,19}
+ * SSH disk-check requires key-based SSH to cloud@<mini1,2,3,5 addresses>
  * (see fleet-host-keys table in MEMORY). Failures degrade gracefully —
  * `pptxOnDisk: null`, `diskErr: <stderr>` — so a broken SSH never
  * blocks the test run.
@@ -65,33 +65,46 @@ interface HostTrial {
   sshHost: string;
 }
 
-// IP/SSH mapping mirrors HOST_MAP in m8-runtime-invariants-live.spec.ts and
-// scripts/register-fleet-voices.sh. river/.66 uses key auth; the rest use
+// SSH targets come from OCTOS_FLEET_SSH_MAP (same format as in
+// m8-runtime-invariants-live.spec.ts). river uses key auth; the rest use
 // the project SSH config (~/.ssh/config) and ControlMaster.
+// SSH targets per fleet host come from the environment so no host
+// addresses live in the repo, e.g.
+//   OCTOS_FLEET_SSH_MAP='dspfac.crew.ominix.io=cloud@<host>,dspfac.bot.ominix.io=cloud@<host>'
+const SSH_MAP: Record<string, string> = Object.fromEntries(
+  (process.env.OCTOS_FLEET_SSH_MAP || '')
+    .split(',')
+    .map((pair): [string, string] => {
+      const [k = '', v = ''] = pair.trim().split('=');
+      return [k, v];
+    })
+    .filter(([k, v]) => k !== '' && v !== ''),
+);
+
 const HOSTS: HostTrial[] = [
   {
     short: 'crew',
     host: 'crew.ominix.io',
     baseUrl: 'https://dspfac.crew.ominix.io',
-    sshHost: 'cloud@69.194.3.128',
+    sshHost: SSH_MAP['dspfac.crew.ominix.io'] || '',
   },
   {
     short: 'bot',
     host: 'bot.ominix.io',
     baseUrl: 'https://dspfac.bot.ominix.io',
-    sshHost: 'cloud@69.194.3.129',
+    sshHost: SSH_MAP['dspfac.bot.ominix.io'] || '',
   },
   {
     short: 'octos',
     host: 'octos.ominix.io',
     baseUrl: 'https://dspfac.octos.ominix.io',
-    sshHost: 'cloud@69.194.3.203',
+    sshHost: SSH_MAP['dspfac.octos.ominix.io'] || '',
   },
   {
     short: 'ocean',
     host: 'ocean.ominix.io',
     baseUrl: 'https://dspfac.ocean.ominix.io',
-    sshHost: 'cloud@69.194.3.19',
+    sshHost: SSH_MAP['dspfac.ocean.ominix.io'] || '',
   },
 ];
 
@@ -129,6 +142,9 @@ interface WsCapture {
   toolCallsSeen: Set<string>;
   /** First session_id observed on a WS frame (form `web-<ts>-<rand>#…`). */
   sessionId: string | null;
+  /** tool_call_id -> tool name from `tool_start` payloads, so a `tool_end`
+   *  (which carries only the id) can still credit the tool name. */
+  toolNamesByCallId: Map<string, string>;
   toolStartedFrames: Array<{
     name?: string;
     model_id?: string;
@@ -143,7 +159,10 @@ interface WsCapture {
   }>;
   fileAttachedEvents: number;
   pptxAttachedPath: string | null;
+  /** @deprecated the envelope lane carries no model/lane fields (see
+   *  recordFrame); retained for result.json shape — always empty. */
   modelIdsForSlides: string[];
+  /** @deprecated see modelIdsForSlides. */
   lanesForSlides: string[];
   errors: string[];
 }
@@ -154,6 +173,7 @@ function newCapture(): WsCapture {
     uniqueMethodsSeen: new Set(),
     toolCallsSeen: new Set(),
     sessionId: null,
+    toolNamesByCallId: new Map(),
     toolStartedFrames: [],
     fileAttachedFrames: [],
     fileAttachedEvents: 0,
@@ -189,65 +209,40 @@ function recordFrame(cap: WsCapture, raw: string) {
     cap.sessionId = params.session_id;
   }
 
-  // tool/started — capture tool name + model picked for RFC-3 evidence.
-  // Round-14 fix: the server emits `params.tool_name` (per envelope spec).
-  // The old `params.tool` reader silently missed every tool name on the
-  // wire, including `mofa_slides` — which is why the round-14 results
-  // showed `mofaSlidesInvoked: false` despite the WS frames containing it.
-  if (method === 'tool/started' || method === 'tool/start') {
-    const name =
-      typeof params.tool_name === 'string'
-        ? params.tool_name
-        : typeof params.tool === 'string'
-          ? params.tool
-          : typeof params.name === 'string'
-            ? params.name
-            : undefined;
-    const model_id =
-      typeof params.model_id === 'string'
-        ? params.model_id
-        : typeof obj.model_id === 'string'
-          ? obj.model_id
+  // Canonical v2 envelope lane (#2318 cutover): the raw `tool/started` /
+  // `tool/completed` frames are suppressed for every connection, so tool
+  // names ride `projection/envelope` `tool_start` / `tool_end` payloads.
+  // `tool_end` carries only `tool_call_id` — resolve the name through the
+  // matching `tool_start`. The envelope lane carries no model/lane fields,
+  // so the RFC-3 model evidence collected here stays empty.
+  if (method === 'projection/envelope') {
+    const payload = params.payload;
+    if (!payload || typeof payload.type !== 'string') return;
+    const data = (payload.data ?? {}) as Record<string, unknown>;
+    if (payload.type === 'tool_start') {
+      const name = typeof data.name === 'string' ? data.name : undefined;
+      if (typeof data.tool_call_id === 'string' && name) {
+        cap.toolNamesByCallId.set(data.tool_call_id, name);
+      }
+      if (name) cap.toolCallsSeen.add(name);
+      cap.toolStartedFrames.push({
+        name,
+        raw: raw.slice(0, 600),
+      });
+    } else if (payload.type === 'tool_end') {
+      const name =
+        typeof data.tool_call_id === 'string'
+          ? cap.toolNamesByCallId.get(data.tool_call_id)
           : undefined;
-    const model =
-      typeof params.model === 'string'
-        ? params.model
-        : typeof obj.model === 'string'
-          ? obj.model
-          : undefined;
-    const lane =
-      typeof params.lane === 'string'
-        ? params.lane
-        : typeof obj.lane === 'string'
-          ? obj.lane
-          : undefined;
-    if (name) cap.toolCallsSeen.add(name);
-    cap.toolStartedFrames.push({
-      name,
-      model_id,
-      model,
-      lane,
-      raw: raw.slice(0, 600),
-    });
-    if (name && /mofa[_-]?slides|slides/i.test(name)) {
-      if (model_id) cap.modelIdsForSlides.push(model_id);
-      if (model) cap.modelIdsForSlides.push(model);
-      if (lane) cap.lanesForSlides.push(lane);
+      if (name) cap.toolCallsSeen.add(name);
+      else {
+        cap.errors.push(
+          `tool_end envelope without a matching tool_start (tool_call_id=${String(data.tool_call_id)})`,
+        );
+      }
     }
-  }
-
-  // tool/completed — record name too in case `tool/started` was filtered.
-  // Same `tool_name` envelope as tool/started above.
-  if (method === 'tool/completed' || method === 'tool/complete') {
-    const name =
-      typeof params.tool_name === 'string'
-        ? params.tool_name
-        : typeof params.tool === 'string'
-          ? params.tool
-          : typeof params.name === 'string'
-            ? params.name
-            : undefined;
-    if (name) cap.toolCallsSeen.add(name);
+    // Fall through: the `.pptx` text scan below also applies to envelope
+    // frames (assistant_persisted payloads carry artefact paths in text).
   }
 
   // file/attached — the canonical envelope from PR #1267/#1287.

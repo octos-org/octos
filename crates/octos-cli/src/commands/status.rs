@@ -7,6 +7,7 @@ use colored::Colorize;
 use eyre::{Result, WrapErr};
 
 use super::Executable;
+use crate::auth::keychain;
 use crate::config::Config;
 
 /// Show system status.
@@ -38,6 +39,8 @@ const PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("Moonshot", "KIMI_API_KEY"),
     ("DashScope", "DASHSCOPE_API_KEY"),
     ("MiniMax", "MINIMAX_API_KEY"),
+    // Label lowercases to the registry family id for the key-alias fallback.
+    ("MiniMax-CN", "MINIMAX_CN_API_KEY"),
     ("Zhipu", "ZHIPU_API_KEY"),
 ];
 
@@ -122,6 +125,19 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
     println!("{}", "API Keys".cyan().bold());
     println!("{}", "─".repeat(50).dimmed());
 
+    // #2415 — where `octos auth set-key` writes on this platform; the same
+    // backend name `octos auth keys` prints, so both surfaces agree.
+    println!(
+        "  {}: {} ({})",
+        "Secret store".dimmed(),
+        keychain::backend_name(),
+        if keychain::is_available() {
+            "available"
+        } else {
+            "unavailable"
+        }
+    );
+
     for (label, env_var) in PROVIDER_ENV_VARS {
         // A provider may accept more than one key env var (e.g. Moonshot declares
         // KIMI_API_KEY in `key_env_aliases` alongside MOONSHOT_API_KEY). Treat it
@@ -155,7 +171,7 @@ fn show_system_status(cwd: &std::path::Path) -> Result<()> {
         } else {
             "missing".dimmed().to_string()
         };
-        println!("  {:<16} {}", name, status);
+        println!("  {name:<16} {status}");
     }
 
     // Gateway config

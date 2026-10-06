@@ -379,7 +379,7 @@ fn main() {
             "output": format!("Failed to read stdin: {e}"),
             "success": false
         });
-        println!("{}", output);
+        println!("{output}");
         process::exit(1);
     }
 
@@ -390,7 +390,7 @@ fn main() {
                 "output": format!("Invalid JSON input: {e}"),
                 "success": false
             });
-            println!("{}", output);
+            println!("{output}");
             process::exit(1);
         }
     };
@@ -401,7 +401,7 @@ fn main() {
             "output": "Error: 'to' must contain a non-empty email address.",
             "success": false
         });
-        println!("{}", output);
+        println!("{output}");
         process::exit(1);
     }
 
@@ -413,7 +413,7 @@ fn main() {
                 "output": format!("Provider detection failed: {e}"),
                 "success": false
             });
-            println!("{}", output);
+            println!("{output}");
             process::exit(1);
         }
     };
@@ -431,14 +431,14 @@ fn main() {
                 "output": format!("Email sent to {}", input.to),
                 "success": true
             });
-            println!("{}", output);
+            println!("{output}");
         }
         Err(e) => {
             let output = json!({
                 "output": format!("Failed to send email: {e}"),
                 "success": false
             });
-            println!("{}", output);
+            println!("{output}");
             process::exit(1);
         }
     }

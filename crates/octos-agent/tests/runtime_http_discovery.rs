@@ -227,7 +227,7 @@ async fn startup_pass_hard_fails_when_http_bridge_unreachable() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr: SocketAddr = listener.local_addr().unwrap();
     drop(listener);
-    let dead_base_url = format!("http://{}", addr);
+    let dead_base_url = format!("http://{addr}");
 
     let dir = tempdir().unwrap();
     let skill_dir = dir.path().join("offline-bridge-robot");
