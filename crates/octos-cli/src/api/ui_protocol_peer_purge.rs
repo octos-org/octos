@@ -263,6 +263,11 @@ pub(super) async fn raw_peer_purge(
                         "purged": false,
                         "already_purged": true,
                         "purged_at": tombstone.purged_at,
+                        // Surface any residue the original purge recorded
+                        // (#2659): the retry is the caller's chance to
+                        // finish or escalate the partial erase.
+                        "partial": !tombstone.errors.is_empty(),
+                        "residual_errors": tombstone.errors,
                     }));
                 }
             }
@@ -498,6 +503,10 @@ pub(super) async fn raw_peer_purge(
             originator: originator.0.clone(),
             memory_namespace: binding.memory_namespace.clone(),
             purged_at: purged_at.clone(),
+            // Record partial failures on the tombstone itself: a retry
+            // answers `already_purged` with this list, so residue is never
+            // silent (#2659).
+            errors: errors.clone(),
         },
     )
     .map_err(|error| RpcError::internal_error(format!("failed to record the purge: {error}")))?;
@@ -516,6 +525,7 @@ pub(super) async fn raw_peer_purge(
         "slug": slug,
         "name": name,
         "purged": true,
+        "partial": !errors.is_empty(),
         "already_purged": false,
         "purged_at": purged_at,
         "was_open": was_open,
