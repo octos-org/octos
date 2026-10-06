@@ -546,6 +546,13 @@ impl octos_bus::BotManager for GatewayBotManager {
             )));
         }
 
+        // Released only once deletion is final: the failure path above
+        // restores the profile, which would then point at a released item.
+        crate::profiles::release_deleted_profiles_keychain_items(
+            &self.store,
+            std::iter::once(&profile),
+        );
+
         Ok(format!(
             "Bot `{matrix_user_id}` deleted (profile `{profile_id}` removed)."
         ))

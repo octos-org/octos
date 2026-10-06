@@ -113,11 +113,18 @@ pub async fn handle_account_command(
             if sub_id.is_empty() {
                 return "Usage: /account delete <sub-id>".to_string();
             }
-            if let Err(msg) = verify_sub_account(store, sub_id, parent_id) {
-                return msg;
-            }
+            let profile = match verify_sub_account(store, sub_id, parent_id) {
+                Ok(profile) => profile,
+                Err(msg) => return msg,
+            };
             match store.delete(sub_id) {
-                Ok(true) => format!("Deleted sub-account: {sub_id}"),
+                Ok(true) => {
+                    crate::profiles::release_deleted_profiles_keychain_items(
+                        store,
+                        std::iter::once(&profile),
+                    );
+                    format!("Deleted sub-account: {sub_id}")
+                }
                 Ok(false) => format!("Sub-account '{sub_id}' not found"),
                 Err(e) => format!("Error: {e}"),
             }
@@ -498,6 +505,72 @@ mod tests {
 
         assert!(
             response.contains("Valid modes: auto, macos, docker, bwrap, landlock, appcontainer")
+        );
+    }
+
+    // #2702: `/account delete` must release the keychain items the deleted
+    // sub-account's markers point at; a bare account a sibling sub-account
+    // still references stays (the remove-key shared-account contract, #2261).
+    #[tokio::test]
+    async fn account_delete_releases_keychain_items_but_keeps_shared_ones() {
+        use crate::auth::keychain;
+
+        let (_dir, store, sub_id) = create_store_with_sub_account();
+        let secrets = tempfile::tempdir().unwrap();
+        let _secrets_root = keychain::test_override_secrets_root(secrets.path().to_path_buf());
+
+        let mut sub = store.get(&sub_id).unwrap().unwrap();
+        sub.config.env_vars.insert(
+            "VERTEX_SA_JSON".into(),
+            keychain::marker_for(&keychain::scoped_account("VERTEX_SA_JSON", &sub_id)),
+        );
+        store.save(&sub).unwrap();
+
+        let mut sibling = store
+            .create_sub_account(
+                "parent",
+                "sibling",
+                "sibling",
+                "Sibling",
+                vec![],
+                GatewaySettings::default(),
+            )
+            .unwrap();
+        sibling
+            .config
+            .env_vars
+            .insert("ZAI_API_KEY".into(), keychain::marker_for("ZAI_API_KEY"));
+        store.save(&sibling).unwrap();
+
+        keychain::set_secret(
+            &keychain::scoped_account("VERTEX_SA_JSON", &sub_id),
+            "sa-json",
+        )
+        .unwrap();
+        keychain::set_secret("ZAI_API_KEY", "shared-key").unwrap();
+
+        let profile_store = Some(store.clone());
+        let response =
+            handle_account_command(&format!("delete {sub_id}"), Some("parent"), &profile_store)
+                .await;
+
+        assert!(
+            response.contains("Deleted sub-account"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            store.get(&sub_id).unwrap().is_none(),
+            "the sub-account itself must be gone"
+        );
+        assert_eq!(
+            keychain::get_secret(&keychain::scoped_account("VERTEX_SA_JSON", &sub_id)).unwrap(),
+            None,
+            "the deleted sub-account's scoped keychain item must be released"
+        );
+        assert_eq!(
+            keychain::get_secret("ZAI_API_KEY").unwrap().as_deref(),
+            Some("shared-key"),
+            "a bare keychain account a sibling still references must be kept"
         );
     }
 }
