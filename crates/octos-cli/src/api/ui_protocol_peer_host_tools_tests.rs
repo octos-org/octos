@@ -7013,6 +7013,79 @@ async fn should_not_finalize_a_purge_when_the_erase_partially_fails_and_a_retry_
     assert_eq!(again["already_purged"], true);
 }
 
+/// The same for the `peers/<slug>/` removal itself (#2696): the dir is made
+/// unremovable, so the erase steps are clean but the dir cannot go away. The
+/// token tombstone — the record that answers a retry `already_purged` — must
+/// not go down, while the slug tombstone already has (the stale-session
+/// refusal hands over from the close marker without a gap); a retry with the
+/// dir writable again finishes the job. The peer is closed up front and its
+/// whole dir made read-only, so the first unlink fails and every control
+/// file the retry's authorization reads survives.
+#[cfg(unix)]
+#[tokio::test]
+async fn should_not_finalize_a_purge_when_the_peer_dir_removal_fails_and_a_retry_finishes_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let session = peer_key(&fx);
+    // Close the peer up front (the purge would then skip the close), and
+    // make the whole peer dir unremovable.
+    let peer_dir = peers_root(&fx).join("news");
+    std::fs::write(peer_dir.join("closed"), "").unwrap();
+    std::fs::set_permissions(&peer_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let (ws, _rx) = ws_connection_for_test(8);
+    let error = purge(&fx.state, &ws, &fx.system, "news", &token)
+        .await
+        .unwrap_err();
+    let data = error.data.unwrap();
+    assert_eq!(data["kind"], "peer_purge_incomplete");
+    let errors = data["errors"].as_array().unwrap();
+    assert!(
+        errors
+            .iter()
+            .any(|entry| entry.as_str().unwrap().contains("peer directory")),
+        "the failing entry is the peer dir itself: {data}"
+    );
+    // Nothing answers a retry `already_purged` yet.
+    assert!(
+        crate::peers::purge::tombstone_for_token(&peers_root(&fx), &token).is_none(),
+        "the token tombstone must wait for a clean removal"
+    );
+    // The stale-session refusal is already durable on the slug tombstone.
+    assert!(
+        fx.data_dir
+            .join(crate::peers::purge::PEER_PURGES_DIR)
+            .join("slugs/news")
+            .exists()
+    );
+    assert!(matches!(
+        crate::peers::app_binding::resolve_session_app_binding(&peers_root(&fx), &session),
+        crate::peers::app_binding::SessionAppBinding::Refused(_)
+    ));
+    // The failed attempt is audited.
+    let audit =
+        std::fs::read_to_string(fx.data_dir.join(crate::peers::purge::PEER_PURGE_AUDIT_LEAF))
+            .unwrap();
+    assert!(audit.contains("\"event\":\"peer_purge_incomplete\""));
+
+    // The dir is writable again: the retry finishes the purge.
+    std::fs::set_permissions(&peer_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let result = purge(&fx.state, &ws, &fx.system, "news", &token)
+        .await
+        .expect("the retry finishes the purge");
+    assert_eq!(result["purged"], true);
+    assert_eq!(result["already_purged"], false);
+    assert_eq!(result["errors"], json!([]), "{result}");
+    assert!(!peers_root(&fx).join("news").exists());
+    // Only now is the retry answered `already_purged`.
+    let again = purge(&fx.state, &ws, &fx.system, "news", &token)
+        .await
+        .unwrap();
+    assert_eq!(again["already_purged"], true);
+}
+
 /// The same for a peer whose workspace the kernel provisioned (what a peer
 /// staged without `cwd` gets): attempt one erases the workspace before the
 /// purge stops, so the retry must treat the gone workspace as already

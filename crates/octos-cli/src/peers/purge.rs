@@ -67,9 +67,31 @@ fn digest_is_hex(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Record the tombstones of a purged peer: under its host token's digest and
-/// under its slug.
-pub(crate) fn write_tombstone(
+/// Record the slug tombstone of a purged peer: while no peer is staged under
+/// `<slug>` again, a `#peer-<slug>` session is refused. `peer/purge` writes
+/// it while the peer dir still exists, so the refusal hands over from the
+/// close marker to this tombstone without a gap.
+pub(crate) fn write_slug_tombstone(
+    peers_root: &Path,
+    slug: &str,
+    purged_at: &str,
+) -> std::io::Result<()> {
+    let Some(dir) = purges_dir(peers_root) else {
+        return Err(std::io::Error::other("peers root has no parent"));
+    };
+    if !super::peer_slug_is_safe(slug) {
+        return Err(std::io::Error::other("unsafe peer slug"));
+    }
+    let slugs = dir.join("slugs");
+    std::fs::create_dir_all(&slugs)?;
+    peer_io::write_peer_file_durable(&slugs, slug, purged_at)
+}
+
+/// Record the tombstone under the host token's digest: the record that
+/// answers a retried `peer/purge` with the same credential `already_purged`.
+/// Written only once nothing of the peer is left, so a purge with residue
+/// never finalizes.
+pub(crate) fn write_token_tombstone(
     peers_root: &Path,
     token_sha256: &str,
     tombstone: &PurgeTombstone,
@@ -77,12 +99,6 @@ pub(crate) fn write_tombstone(
     let Some(dir) = purges_dir(peers_root) else {
         return Err(std::io::Error::other("peers root has no parent"));
     };
-    if !super::peer_slug_is_safe(&tombstone.slug) {
-        return Err(std::io::Error::other("unsafe peer slug"));
-    }
-    let slugs = dir.join("slugs");
-    std::fs::create_dir_all(&slugs)?;
-    peer_io::write_peer_file_durable(&slugs, &tombstone.slug, &tombstone.purged_at)?;
     if digest_is_hex(token_sha256) {
         let tokens = dir.join("tokens");
         std::fs::create_dir_all(&tokens)?;
@@ -247,7 +263,9 @@ mod tests {
         let peers_root = tmp.path().join("peers");
         std::fs::create_dir_all(&peers_root).unwrap();
         let (token, digest) = super::super::app_binding::mint_host_token().unwrap();
-        write_tombstone(&peers_root, &digest, &tombstone("news")).unwrap();
+        let record = tombstone("news");
+        write_slug_tombstone(&peers_root, "news", &record.purged_at).unwrap();
+        write_token_tombstone(&peers_root, &digest, &record).unwrap();
         let found = tombstone_for_token(&peers_root, &token).unwrap();
         assert!(found.names("news") && found.names("NEWS") && !found.names("mail"));
         assert!(tombstone_for_token(&peers_root, "other-token").is_none());
@@ -260,7 +278,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let peers_root = tmp.path().join("peers");
         std::fs::create_dir_all(peers_root.join("news")).unwrap();
-        write_tombstone(&peers_root, "", &tombstone("news")).unwrap();
+        let record = tombstone("news");
+        write_slug_tombstone(&peers_root, "news", &record.purged_at).unwrap();
+        // No digest: only the slug tombstone exists, no token record.
+        write_token_tombstone(&peers_root, "", &record).unwrap();
         assert!(slug_is_purged(&peers_root, "news"));
         std::fs::write(peers_root.join("news/brief.md"), "again").unwrap();
         assert!(!slug_is_purged(&peers_root, "news"));
