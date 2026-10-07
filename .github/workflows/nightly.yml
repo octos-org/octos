@@ -79,7 +79,7 @@ jobs:
       # parallelism; ci.yml runs them in a dedicated serial step (see the #21
       # outer-loop ruling there).
       - name: Test the workspace
-        run: cargo test --workspace --locked -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
+        run: cargo test --workspace --locked --no-fail-fast -- --skip serve_sigterm --skip serve_ws_liveness --skip serve_solo_gateway_guard --skip serve_host_managed
 
   check-windows:
     name: Windows workspace tests
@@ -98,7 +98,7 @@ jobs:
       - name: Check the all-feature CLI surface
         run: cargo check -p octos-cli --features "${{ env.FEATURES }}" --locked
       - name: Test the workspace
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
   protocol-e2e:
     name: AppUI protocol fixture E2E
