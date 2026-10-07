@@ -77,6 +77,30 @@ CLI flags override config, which overrides the built-in default. The **API key i
 
 ### Auth Store
 
+Native deep research uses the Rust `search` app skill (including OctoScript
+metasearch engines) and `deep_crawl` for rendered site crawling. Deploy the
+`deep-search` and `deep_crawl` executables beside `octos` so startup can install
+these bundled tools. It does not require a DOT graph or `run_pipeline`.
+The host injects the saved `strong` lane into native research's synthesis;
+without that lane it uses the chat provider. Search engines and crawling do
+not need a separate LLM lane. `run_pipeline` and DOT execution are removed
+from the CLI/server runtime, including child agents. Existing graph files on
+disk are not loaded or executed.
+
+Native research synthesis can use the named `strong` entry in `sub_providers`. In the server and gateway, leave a research lane's `api_key_env`,
+`base_url`, and `api_type` unset to reuse the matching provider in the profile's
+chat configuration (primary or fallback). An exact model match takes precedence
+when multiple saved routes use the same provider. Explicit lane overrides still
+win; a different endpoint does not inherit a saved route's custom credential.
+An unmatched provider uses its own defaults, never another provider's key.
+
+The credentials remain in the shared profile environment/auth store. Updating
+the saved provider credential therefore applies to both chat and research when
+the profile runtime reloads. Separate model lanes retain independent runtime
+state; sharing a credential does not switch the active chat model. A rejected
+credential still needs replacement: HTTP 401 is an authentication failure, not
+a missing research tool or a reason to repeatedly retry the same key.
+
 Instead of environment variables, you can store API keys through the auth CLI:
 
 ```bash

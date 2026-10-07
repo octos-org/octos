@@ -72,8 +72,12 @@ The Rust workspace lets you compose the parts your application needs:
 | [`octos-memory`](crates/octos-memory) | Persistent memory, episodes, and retrieval |
 | [`octos-llm`](crates/octos-llm) | Provider interfaces, model routing, retries, and failover |
 | [`octos-plugin`](crates/octos-plugin) | Skill and plugin integration |
-| [`octos-pipeline`](crates/octos-pipeline) / [`octos-swarm`](crates/octos-swarm) | Workflow graphs, parallel workers, validation, and result aggregation |
+| [`octos-workflows`](crates/octos-workflows) / [`octos-swarm`](crates/octos-swarm) | Native workflow definitions, parallel workers, validation, and result aggregation |
 | [`octos-bus`](crates/octos-bus) / [`octos-cli`](crates/octos-cli) | Session infrastructure, runtime composition, and OUP hosting/adapters |
+
+The CLI/server uses native `search` and `deep_crawl` for research. `run_pipeline`
+and the DOT engine are retired from the runtime; the `octos-pipeline` source
+remains a standalone development crate and is not a runtime dependency.
 
 From a checkout, build the native agent library or a library for a non-Rust host:
 

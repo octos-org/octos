@@ -5,7 +5,7 @@
 //! the profile's own LLM stack, tool registry, skills, and system prompt.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
@@ -578,6 +578,21 @@ pub(crate) fn build_plugin_env(
 ///   2. We can't determine an OpenAI-compatible base URL for the provider.
 ///
 /// Tokens MUST NOT be logged. We log only the provider name on success.
+pub(crate) fn build_research_synthesis_config(
+    config: &crate::config::Config,
+) -> Option<octos_agent::SynthesisConfig> {
+    // Native research has one synthesis model. Reuse the saved strong lane
+    // when present, including its inherited chat-provider credentials.
+    let resolved = config
+        .sub_providers
+        .iter()
+        .find(|lane| lane.key == "strong")
+        .map(|lane| config.for_sub_provider(lane))
+        .unwrap_or_else(|| config.clone());
+    let provider = crate::runtime::profile::configured_provider_name(&resolved)?;
+    build_synthesis_config(&resolved, &provider)
+}
+
 pub(crate) fn build_synthesis_config(
     config: &crate::config::Config,
     provider_name: &str,
@@ -633,17 +648,7 @@ pub(crate) fn build_synthesis_config(
 pub(super) struct ProfileActorFactoryBuilder {
     pub(super) profile_store: Arc<crate::profiles::ProfileStore>,
     pub(super) project_dir: PathBuf,
-    /// Gap 4.1 BLOCKER 1: the effective octos root the gateway bootstraps
-    /// bundled pipelines into (`--octos-home` > `data_dir`). The child-profile
-    /// `run_pipeline` tool is built `with_octos_home(effective_octos_home)` so
-    /// its discovery searches the EXACT dir bootstrap wrote into
-    /// (bootstrap-dir == search-dir). Previously the child factory reused
-    /// `project_dir` (= `cwd/.octos` on the standalone path where
-    /// `--octos-home` is absent), so discovery searched a dir bootstrap never
-    /// wrote — letting the embedded fallback beat an installed global
-    /// pipeline. In production `--octos-home` is always passed so
-    /// `effective_octos_home == project_dir`, but the standalone/default path
-    /// must also be correct.
+    /// Resolved host data root for profile isolation and plugin routing.
     pub(super) effective_octos_home: PathBuf,
     pub(super) tool_config: Arc<octos_agent::ToolConfigStore>,
     pub(super) memory: Arc<EpisodeStore>,
@@ -688,16 +693,6 @@ pub(super) struct ProfileActorFactoryBuilder {
 }
 
 impl ProfileActorFactoryBuilder {
-    /// Gap 4.1 BLOCKER 1: the octos root a child-profile `run_pipeline` tool
-    /// must search. It is the effective octos home (`--octos-home` > data_dir)
-    /// the gateway bootstrapped the bundled pipelines into — NOT `project_dir`
-    /// (= `cwd/.octos` on the standalone path), which bootstrap never wrote.
-    /// Keeping these identical preserves bootstrap-dir == search-dir, so an
-    /// installed global pipeline always wins over the bundled fallback.
-    pub(super) fn child_pipeline_octos_home(&self) -> &Path {
-        &self.effective_octos_home
-    }
-
     pub(super) async fn build(&self, profile_id: &str) -> Result<ActorFactory> {
         let profile = self
             .profile_store
@@ -845,7 +840,7 @@ impl ProfileActorFactoryBuilder {
             if !plugin_dirs.is_empty() {
                 // S2 plumbing: pass profile-scoped synthesis config so per-tenant
                 // routing of synthesis credentials works.
-                let synthesis_config = build_synthesis_config(&profile_config, &provider_name);
+                let synthesis_config = build_research_synthesis_config(&profile_config);
                 match octos_agent::PluginLoader::load_into_with_options_and_filter(
                     &mut tools,
                     &plugin_dirs,
@@ -1021,80 +1016,8 @@ impl ProfileActorFactoryBuilder {
                 tools.apply_policy(policy);
             }
 
-            struct ChildPipelineToolFactory {
-                llm: Arc<dyn LlmProvider>,
-                memory: Arc<octos_memory::EpisodeStore>,
-                data_dir: PathBuf,
-                policy: Option<octos_agent::ToolPolicy>,
-                plugin_dirs: Vec<PathBuf>,
-                router: Option<Arc<ProviderRouter>>,
-                octos_home: PathBuf,
-                plugin_require_signed: bool,
-                /// NEW-06 fix: forwarded to every worker `Agent` via
-                /// `RunPipelineTool::with_embedder` so pipeline-spawned
-                /// agents inherit hybrid scored + filtered memory
-                /// recall instead of the cwd-only unfiltered fallback.
-                embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
-            }
-
-            impl crate::session_actor::PipelineToolFactory for ChildPipelineToolFactory {
-                fn create(
-                    &self,
-                    sandbox: &octos_agent::SandboxConfig,
-                ) -> Arc<dyn octos_agent::Tool> {
-                    let mut pt = octos_pipeline::RunPipelineTool::new(
-                        self.llm.clone(),
-                        self.memory.clone(),
-                        self.data_dir.clone(),
-                        self.data_dir.clone(),
-                    )
-                    .with_provider_policy(self.policy.clone())
-                    .with_plugin_dirs(self.plugin_dirs.clone())
-                    .with_plugin_require_signed(self.plugin_require_signed)
-                    // #1607 (codex round 4): confine pipeline command validators
-                    // to the SESSION-effective sandbox handed in by the actor
-                    // factory.
-                    .with_sandbox(sandbox.clone())
-                    .with_octos_home(self.octos_home.clone());
-                    if let Some(ref router) = self.router {
-                        pt = pt.with_provider_router(router.clone());
-                    }
-                    if let Some(ref embedder) = self.embedder {
-                        pt = pt.with_embedder(embedder.clone());
-                    }
-                    Arc::new(pt)
-                }
-            }
-
-            // NEW-06 fix: the parent ActorFactory's session agent gets
-            // its embedder from the shared single resolve below; hand the
-            // same handle here so child-profile pipeline workers run on
-            // the same contamination-safe hybrid memory path.
-            let child_pipeline_embedder = profile_embedder.clone();
-
-            pipeline_factory = Some(Arc::new(ChildPipelineToolFactory {
-                llm: llm.clone(),
-                memory: self.memory.clone(),
-                data_dir: profile_data_dir.clone(),
-                policy: provider_policy.clone(),
-                plugin_dirs: plugin_dirs.clone(),
-                router: provider_router.clone(),
-                // Gap 4.1 BLOCKER 1: the child-profile pipeline root MUST be
-                // the same `effective_octos_home` the gateway bootstrapped the
-                // bundled pipelines into — NOT `project_dir` (= `cwd/.octos`
-                // on the standalone path). bootstrap-dir == search-dir, so an
-                // installed global pipeline wins over the bundled fallback on
-                // every path, including standalone `octos gateway`.
-                octos_home: self.child_pipeline_octos_home().to_path_buf(),
-                // Section B (codex review follow-up): propagate the
-                // profile's strict-signing policy.
-                plugin_require_signed: profile_config.plugins.require_signed,
-                embedder: child_pipeline_embedder,
-                // #1607 (codex round 4): the session sandbox is now handed to
-                // `create()` by the actor factory (`self.sandbox_config`), so no
-                // per-factory field is needed.
-            })
-                as Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>);
+            // Child profiles must not bring back retired DOT execution.
+            pipeline_factory = None;
 
             Arc::new(SnapshotToolRegistryFactory::new(tools))
         };
@@ -1563,6 +1486,37 @@ mod tests {
     }
 
     #[test]
+    fn native_research_synthesis_uses_shared_strong_route() {
+        let mut config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "provider":"openai", "model":"chat-model", "api_key_env":"PRIMARY_KEY",
+            "env_vars":{"PRIMARY_KEY":"primary-test-key", "CODING_KEY":"coding-test-key"},
+            "fallback_models":[{"provider":"moonshot-coding", "model":"k3", "base_url":"https://api.kimi.com/coding/v1", "api_key_env":"CODING_KEY", "api_type":"openai"}],
+            "sub_providers":[{"key":"strong", "provider":"moonshot-coding", "model":"k3"}]
+        })).unwrap();
+        config.bypass_auth_store = true;
+        let synthesis = build_research_synthesis_config(&config).unwrap();
+        assert_eq!(synthesis.provider, "moonshot-coding");
+        assert_eq!(synthesis.model, "k3");
+        assert_eq!(synthesis.endpoint, "https://api.kimi.com/coding/v1");
+        assert_eq!(synthesis.api_key, "coding-test-key");
+    }
+
+    #[test]
+    fn native_research_synthesis_defaults_to_chat_route() {
+        let mut config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "provider":"deepseek", "model":"deepseek-v4-flash",
+            "base_url":"https://api.deepseek.com/v1", "api_key_env":"SHARED_KEY",
+            "env_vars":{"SHARED_KEY":"shared-test-key"}
+        }))
+        .unwrap();
+        config.bypass_auth_store = true;
+        let synthesis = build_research_synthesis_config(&config).unwrap();
+        assert_eq!(synthesis.model, "deepseek-v4-flash");
+        assert_eq!(synthesis.api_key, "shared-test-key");
+        assert_eq!(synthesis.endpoint, "https://api.deepseek.com/v1");
+    }
+
+    #[test]
     #[allow(unsafe_code)]
     fn build_synthesis_config_returns_full_struct_when_all_pieces_resolve() {
         let _guard = synthesis_env_lock().lock().unwrap();
@@ -1638,115 +1592,6 @@ mod tests {
         assert!(
             !env.iter().any(|(k, _)| k.ends_with("_API_KEY")),
             "Vertex SA JSON must not be forwarded to plugins as an API key: {env:?}"
-        );
-    }
-
-    /// Gap 4.1 BLOCKER 1 (standalone gateway child-profile uses the wrong
-    /// pipeline root) — on the standalone path `project_dir` (= `cwd/.octos`)
-    /// and `effective_octos_home` (= `data_dir`) DIFFER, and the gateway
-    /// bootstraps bundled pipelines into `effective_octos_home`. The
-    /// child-profile `run_pipeline` factory MUST be rooted at
-    /// `effective_octos_home` (bootstrap-dir == search-dir), NOT `project_dir`.
-    ///
-    /// RED on 344d0df1: the builder had no `effective_octos_home` field and the
-    /// child factory was rooted at `self.project_dir` — so this test could not
-    /// even be written (the field/helper did not exist), and a global pipeline
-    /// installed under `effective_octos_home` was invisible to child sessions.
-    #[tokio::test]
-    async fn child_pipeline_root_is_effective_octos_home_not_project_dir() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize};
-
-        let tmp = tempfile::tempdir().unwrap();
-        // Standalone layout: these two dirs are DISTINCT.
-        let project_dir = tmp.path().join("cwd").join(".octos");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        let effective_octos_home = tmp.path().join("data");
-        std::fs::create_dir_all(&effective_octos_home).unwrap();
-        assert_ne!(
-            project_dir, effective_octos_home,
-            "test precondition: standalone roots must differ"
-        );
-
-        let store = Arc::new(crate::profiles::ProfileStore::open_unified(tmp.path()).unwrap());
-        let tool_config = Arc::new(
-            octos_agent::ToolConfigStore::open(&effective_octos_home)
-                .await
-                .unwrap(),
-        );
-        let memory = Arc::new(EpisodeStore::open(&effective_octos_home).await.unwrap());
-        let memory_store = Arc::new(MemoryStore::open(&effective_octos_home).await.unwrap());
-        let recall = Arc::new(
-            octos_memory::RecallStore::open(
-                &effective_octos_home,
-                octos_memory::RecallConfig::default(),
-            )
-            .unwrap(),
-        );
-        let session_mgr = Arc::new(Mutex::new(
-            SessionManager::open(&effective_octos_home).unwrap(),
-        ));
-        let active_sessions = Arc::new(RwLock::new(
-            ActiveSessionStore::open(&effective_octos_home).unwrap(),
-        ));
-        let pending_messages: crate::session_actor::PendingMessages =
-            Arc::new(Mutex::new(HashMap::new()));
-        let (out_tx, _out_rx) = mpsc::channel(4);
-        let (spawn_inbound_tx, _spawn_inbound_rx) = mpsc::channel(4);
-        let (cron_in_tx, _cron_in_rx) = mpsc::channel(1);
-        let cron_service = Arc::new(CronService::new(
-            effective_octos_home.join("cron"),
-            cron_in_tx,
-        ));
-
-        let builder = ProfileActorFactoryBuilder {
-            profile_store: store,
-            project_dir: project_dir.clone(),
-            effective_octos_home: effective_octos_home.clone(),
-            tool_config,
-            memory,
-            memory_store,
-            recall,
-            agent_config: AgentConfig::default(),
-            session_mgr,
-            out_tx,
-            spawn_inbound_tx,
-            cron_service,
-            tool_registry_factory: Arc::new(SnapshotToolRegistryFactory::new(ToolRegistry::new())),
-            pipeline_factory: None,
-            max_history: Arc::new(AtomicUsize::new(50)),
-            session_timeout_secs: octos_agent::DEFAULT_SESSION_TIMEOUT_SECS,
-            shutdown: Arc::new(AtomicBool::new(false)),
-            cwd: project_dir.clone(),
-            provider_policy: None,
-            worker_prompt: None,
-            provider_router: None,
-            active_sessions,
-            pending_messages,
-            queue_mode: crate::config::QueueMode::Followup,
-            plugin_prompt_fragments: vec![],
-            no_retry: false,
-            sandbox_config: octos_agent::SandboxConfig::default(),
-            task_query_store: crate::session_actor::SessionTaskQueryStore::default(),
-            subagent_output_router: Arc::new(octos_agent::SubAgentOutputRouter::new(
-                effective_octos_home.join("subagent-out"),
-            )),
-            host_plugins: Default::default(),
-            host_memory: None,
-        };
-
-        // The child-profile pipeline root MUST be effective_octos_home — the
-        // dir the gateway bootstraps bundled pipelines into — so bootstrap-dir
-        // == search-dir and an installed global pipeline wins over the bundle.
-        assert_eq!(
-            builder.child_pipeline_octos_home(),
-            effective_octos_home.as_path(),
-            "child-profile pipeline root must be effective_octos_home (bootstrap dir)"
-        );
-        assert_ne!(
-            builder.child_pipeline_octos_home(),
-            project_dir.as_path(),
-            "child-profile pipeline root must NOT be project_dir (cwd/.octos), which \
-             bootstrap never wrote — the 344d0df1 defect"
         );
     }
 }

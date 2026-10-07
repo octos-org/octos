@@ -195,7 +195,7 @@ impl MemoryRefreshService {
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = shutdown.clone();
         let task = tokio::spawn(async move {
-            // The lock fd lives here for the task's lifetime.
+            // The lock guard lives here for the task's lifetime.
             let _lock = lock_file;
             let mut consecutive_failures: u32 = 0;
             let mut backoff_until: Option<tokio::time::Instant> = None;
@@ -294,8 +294,25 @@ impl MemoryRefreshService {
     }
 }
 
+/// Release ownership explicitly when the sweep stops. A concurrently forked
+/// child can retain this open file description until exec, so closing only
+/// our descriptor would leave flock held and make an immediate replacement
+/// skip the refresh service. Unlocking releases that shared description's
+/// lock even while the child still has its copy.
+struct RefreshLock {
+    file: std::fs::File,
+}
+
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.file) {
+            tracing::warn!(%error, "failed to release memory refresh lock");
+        }
+    }
+}
+
 /// Open + `flock` the profile refresh lock. `Ok(None)` = held elsewhere.
-fn acquire_refresh_lock(data_dir: &Path) -> Result<Option<std::fs::File>> {
+fn acquire_refresh_lock(data_dir: &Path) -> Result<Option<RefreshLock>> {
     use std::io::Write;
     let memory_dir = data_dir.join("memory");
     std::fs::create_dir_all(&memory_dir)?;
@@ -316,7 +333,7 @@ fn acquire_refresh_lock(data_dir: &Path) -> Result<Option<std::fs::File>> {
                 std::process::id(),
                 chrono::Utc::now().to_rfc3339()
             );
-            Ok(Some(file))
+            Ok(Some(RefreshLock { file }))
         }
         // Only genuine contention means "held elsewhere"; any other error
         // (EINTR under load, fd pressure) must surface, not masquerade as
@@ -1254,43 +1271,58 @@ mod tests {
         assert!(acquire_refresh_lock(dir.path()).unwrap().is_none());
         first.shutdown().await;
         first.shutdown().await; // idempotent
-        let mut replacement = None;
-        for _ in 0..40 {
-            replacement = MemoryRefreshService::try_start(
-                dir.path().to_path_buf(),
-                store.clone(),
-                provider(),
-                provider(),
-                knobs_for_test(),
-            );
-            if replacement.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let replacement = MemoryRefreshService::try_start(
+            dir.path().to_path_buf(),
+            store.clone(),
+            provider(),
+            provider(),
+            knobs_for_test(),
+        );
         assert!(replacement.is_some(), "replacement must own the sweep");
         drop(first);
     }
 
-    #[tokio::test]
-    async fn should_deny_second_lock_holder_when_service_running() {
+    #[cfg(unix)]
+    #[test]
+    fn should_release_lock_on_drop_while_a_child_holds_an_inherited_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_refresh_lock(dir.path()).unwrap().unwrap();
+        assert!(acquire_refresh_lock(dir.path()).unwrap().is_none());
+
+        // Hold the fork-inherited open file description across exec so the
+        // normally brief fork/exec race is deterministic. Closing only the
+        // parent's descriptor cannot release flock while this child lives.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::from(first.file.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let child_running = child.try_wait().unwrap().is_none();
+        drop(first);
+        let replacement = acquire_refresh_lock(dir.path()).unwrap();
+        let _ = child.kill();
+        child.wait().unwrap();
+
+        assert!(child_running, "the child must still hold the inherited fd");
+        assert!(
+            replacement.is_some(),
+            "refresh ownership must transfer without waiting for unrelated child processes"
+        );
+        assert!(
+            acquire_refresh_lock(dir.path()).unwrap().is_none(),
+            "the replacement must retain exclusive ownership after the child exits"
+        );
+    }
+
+    #[test]
+    fn should_deny_second_lock_holder_when_service_running() {
         let dir = tempfile::tempdir().unwrap();
         let first = acquire_refresh_lock(dir.path()).unwrap();
         assert!(first.is_some());
         let second = acquire_refresh_lock(dir.path()).unwrap();
         assert!(second.is_none(), "flock must be exclusive");
         drop(first);
-        // Release rides the fd close; under a heavily parallel test run the
-        // kernel-visible release can lag a beat — poll briefly rather than
-        // flake, while still failing hard if the lock never frees.
-        let mut third = None;
-        for _ in 0..40 {
-            third = acquire_refresh_lock(dir.path()).unwrap();
-            if third.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let third = acquire_refresh_lock(dir.path()).unwrap();
         assert!(third.is_some(), "lock must release on drop");
     }
 

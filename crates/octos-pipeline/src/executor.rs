@@ -1356,6 +1356,8 @@ fn collect_completed_files(completed: &HashMap<String, NodeOutcome>) -> Vec<Path
 /// Aggregate outcome of a fan-out's worker futures.
 struct WorkerResults {
     merged_content: String,
+    /// Bounded, redacted diagnostics retained when the entire fan-out fails.
+    failure_details: String,
     /// At least one worker returned an `Error` outcome (or its future failed,
     /// e.g. exceeded the per-worker deadline).
     any_error: bool,
@@ -1453,8 +1455,31 @@ fn process_worker_results(
     // content. This ensures the converge node gets actual data, not just paths.
     let merged_content = resolve_search_result_files(&merged_content, working_dir);
 
+    // The all-failed return paths bypass convergence, which otherwise receives
+    // merged_content. Preserve the actual cause there too: a bare worker count
+    // made authentication errors look like unexplained model-routing failures.
+    let mut failures = Vec::new();
+    for ((id, outcome), summary) in outcomes.iter().zip(&summaries) {
+        if outcome.status == OutcomeStatus::Error && failures.len() < 8 {
+            let detail = format!(
+                "{id} (model={}): {}",
+                summary.model.as_deref().unwrap_or("default"),
+                outcome.content.trim()
+            );
+            let redacted = octos_core::secret_redaction::redact_secrets_in_text(&detail);
+            failures
+                .push(crate::fidelity::FidelityMode::Truncate { max_chars: 768 }.apply(&redacted));
+        }
+    }
+    let failure_details = if failures.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nWorker errors (up to 8):\n{}", failures.join("\n"))
+    };
+
     WorkerResults {
         merged_content,
+        failure_details,
         any_error,
         any_pass,
         summaries,
@@ -3018,6 +3043,7 @@ impl PipelineExecutor {
 
                 let WorkerResults {
                     merged_content,
+                    failure_details,
                     any_error,
                     any_pass,
                     summaries: worker_summaries,
@@ -3102,7 +3128,7 @@ impl PipelineExecutor {
                     );
                     return Ok(PipelineResult {
                         output: format!(
-                            "Pipeline failed at fan-out node '{}': all {} workers failed",
+                            "Pipeline failed at fan-out node '{}': all {} workers failed{failure_details}",
                             node.id,
                             targets.len()
                         ),
@@ -3540,6 +3566,7 @@ impl PipelineExecutor {
 
                 let WorkerResults {
                     merged_content,
+                    failure_details,
                     any_error,
                     any_pass,
                     summaries: worker_summaries,
@@ -3626,7 +3653,7 @@ impl PipelineExecutor {
                     );
                     return Ok(PipelineResult {
                         output: format!(
-                            "Pipeline failed at dynamic_parallel node '{}': all {} workers failed",
+                            "Pipeline failed at dynamic_parallel node '{}': all {} workers failed{failure_details}",
                             node.id,
                             tasks.len()
                         ),

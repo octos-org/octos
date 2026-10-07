@@ -634,7 +634,8 @@ pub struct SubProviderConfig {
     #[serde(default)]
     pub model: Option<String>,
     /// Environment variable name holding the API key for this sub-provider.
-    /// If not set, falls back to the default for the provider (e.g. OPENAI_API_KEY).
+    /// Research lanes inherit the matching chat provider's credential reference
+    /// when omitted, then fall back to the provider default (e.g. OPENAI_API_KEY).
     #[serde(default)]
     pub api_key_env: Option<String>,
     /// Custom base URL for this sub-provider.
@@ -1350,6 +1351,67 @@ fn monitor_default_max_restart() -> u32 {
 }
 
 impl Config {
+    /// Resolve a research/subagent lane against the profile's saved chat routes.
+    /// Explicit lane fields win. Otherwise reuse the matching provider's route
+    /// and credential reference, never an unrelated primary provider's key.
+    pub(crate) fn for_sub_provider(&self, lane: &SubProviderConfig) -> Self {
+        let matches_route = |provider: &str, base_url: Option<&str>| {
+            let same_provider = provider.eq_ignore_ascii_case(&lane.provider)
+                || matches!(
+                    (octos_llm::registry::lookup(provider), octos_llm::registry::lookup(&lane.provider)),
+                    (Some(a), Some(b)) if a.name == b.name
+                );
+            same_provider
+                && lane.base_url.as_deref().is_none_or(|requested| {
+                    // An explicitly different endpoint is a separate route: do not
+                    // send a chat route's custom credential to that endpoint.
+                    base_url
+                        .or_else(|| {
+                            octos_llm::registry::lookup(provider).and_then(|p| p.default_base_url)
+                        })
+                        .is_some_and(|saved| {
+                            saved.trim_end_matches('/') == requested.trim_end_matches('/')
+                        })
+                })
+        };
+        let primary_matches = self
+            .provider
+            .as_deref()
+            .is_some_and(|provider| matches_route(provider, self.base_url.as_deref()));
+        let exact_fallback = self.fallback_models.iter().find(|fb| {
+            matches_route(&fb.provider, fb.base_url.as_deref())
+                && lane.model.is_some()
+                && fb.model == lane.model
+        });
+        let (key_env, base_url, api_type) =
+            if primary_matches && (self.model == lane.model || exact_fallback.is_none()) {
+                (
+                    self.api_key_env.clone(),
+                    self.base_url.clone(),
+                    self.api_type.clone(),
+                )
+            } else if let Some(fb) = exact_fallback.or_else(|| {
+                self.fallback_models
+                    .iter()
+                    .find(|fb| matches_route(&fb.provider, fb.base_url.as_deref()))
+            }) {
+                (
+                    fb.api_key_env.clone(),
+                    fb.base_url.clone(),
+                    fb.api_type.clone(),
+                )
+            } else {
+                (None, None, None)
+            };
+        let mut resolved = self.clone();
+        resolved.api_key_env = lane.api_key_env.clone().or(key_env);
+        resolved.provider = Some(lane.provider.clone());
+        resolved.model = lane.model.clone();
+        resolved.base_url = lane.base_url.clone().or(base_url);
+        resolved.api_type = lane.api_type.clone().or(api_type);
+        resolved
+    }
+
     /// Directories to scan for plugins and skill packages with tools.
     ///
     /// Scans deployment-scoped dirs under `project_dir` (typically `octos_home`)
@@ -2256,6 +2318,81 @@ pub fn detect_provider(model: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    fn research_lane_config() -> Config {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "provider": "openai", "model": "chat-model",
+            "api_key_env": "CHAT_OPENAI_KEY", "base_url": "https://chat.example/v1",
+            "api_type": "responses",
+            "env_vars": {"CHAT_OPENAI_KEY":"chat-key", "SHARED_DEEPSEEK_KEY":"research-key", "LANE_KEY":"lane-key"},
+            "fallback_models": [{
+                "provider":"deepseek", "model":"deepseek-v4-flash",
+                "api_key_env":"SHARED_DEEPSEEK_KEY", "base_url":"https://deepseek.example/v1", "api_type":"openai"
+            }]
+        })).unwrap();
+        config.bypass_auth_store = true;
+        config
+    }
+
+    fn research_lane(provider: &str) -> SubProviderConfig {
+        serde_json::from_value(
+            serde_json::json!({"key":"cheap", "provider":provider, "model":"deepseek-v4-flash"}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn research_lane_inherits_matching_chat_fallback_credentials_and_route() {
+        let config = research_lane_config();
+        let lane = config.for_sub_provider(&research_lane("deepseek"));
+        assert_eq!(lane.get_api_key("deepseek").unwrap(), "research-key");
+        assert_eq!(
+            lane.base_url.as_deref(),
+            Some("https://deepseek.example/v1")
+        );
+        assert_eq!(lane.api_type.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn research_lane_inherits_same_provider_primary_route() {
+        let config = research_lane_config();
+        let lane = config.for_sub_provider(&research_lane("openai"));
+        assert_eq!(lane.get_api_key("openai").unwrap(), "chat-key");
+        assert_eq!(lane.base_url, config.base_url);
+        assert_eq!(lane.api_type, config.api_type);
+    }
+
+    #[test]
+    fn research_lane_never_borrows_an_unrelated_primary_key() {
+        let config = research_lane_config();
+        let lane = config.for_sub_provider(&research_lane("gemini"));
+        assert_eq!(lane.api_key_env, None);
+        assert_eq!(lane.base_url, None);
+        assert_eq!(lane.api_type, None);
+    }
+
+    #[test]
+    fn research_lane_explicit_overrides_remain_authoritative() {
+        let config = research_lane_config();
+        let mut lane = research_lane("deepseek");
+        lane.api_key_env = Some("LANE_KEY".into());
+        lane.base_url = Some("https://other.example/v1".into());
+        lane.api_type = Some("anthropic".into());
+        let resolved = config.for_sub_provider(&lane);
+        assert_eq!(resolved.get_api_key("deepseek").unwrap(), "lane-key");
+        assert_eq!(resolved.base_url, lane.base_url);
+        assert_eq!(resolved.api_type, lane.api_type);
+    }
+
+    #[test]
+    fn research_lane_changed_endpoint_does_not_inherit_a_custom_chat_key() {
+        let config = research_lane_config();
+        let mut lane = research_lane("deepseek");
+        lane.base_url = Some("https://other.example/v1".into());
+        let resolved = config.for_sub_provider(&lane);
+        assert_eq!(resolved.api_key_env, None);
+        assert_eq!(resolved.api_type, None);
+    }
+
     /// `QueueMode::Latest` was renamed from `steer` (the word collides with
     /// `turn/steer`, which injects rather than discards). Existing configs
     /// and `/queue steer` must keep working; new ones use `latest`.

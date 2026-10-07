@@ -915,9 +915,8 @@ async fn run_deep_search(
             .collect(),
     };
 
-    let (synthesis, diagnostics) =
+    let (synthesis, diagnostics, partial) =
         synthesis_diagnostics(synthesize(client, &synthesis_input, synthesis_config).await);
-    let partial = synthesis.as_ref().is_some_and(|s| s.truncated.is_some());
 
     progress_simple(ProgressPhase::ReportBuild, "Building report...");
     emit_v2_progress(
@@ -994,7 +993,7 @@ async fn run_deep_search(
         })
         .collect();
     let headline = if partial {
-        format!("Incomplete report on '{query}': the synthesis was cut off")
+        format!("Incomplete report on '{query}': synthesis did not finish successfully")
     } else {
         synthesis
             .as_ref()
@@ -1036,11 +1035,15 @@ async fn run_deep_search(
 
 /// Split a synthesis outcome into the usable result and the diagnostics a
 /// caller must see (failed call, cut-off reply, uncited sentences).
-fn synthesis_diagnostics(outcome: SynthesisOutcome) -> (Option<SynthesisResult>, Vec<String>) {
+fn synthesis_diagnostics(
+    outcome: SynthesisOutcome,
+) -> (Option<SynthesisResult>, Vec<String>, bool) {
     let mut diagnostics = Vec::new();
+    let mut partial = false;
     let synthesis = match outcome {
         SynthesisOutcome::NotConfigured => None,
         SynthesisOutcome::Failed(reason) => {
+            partial = true;
             diagnostics.push(format!(
                 "Synthesis failed ({reason}); the report lists the sources without a synthesized answer."
             ));
@@ -1050,6 +1053,7 @@ fn synthesis_diagnostics(outcome: SynthesisOutcome) -> (Option<SynthesisResult>,
     };
     if let Some(s) = &synthesis {
         if let Some(reason) = &s.truncated {
+            partial = true;
             diagnostics.push(format!(
                 "Synthesis incomplete: {reason} (after {} attempt(s)). The report's synthesis is cut off; do not treat it as a complete answer.",
                 s.attempts
@@ -1062,7 +1066,7 @@ fn synthesis_diagnostics(outcome: SynthesisOutcome) -> (Option<SynthesisResult>,
             ));
         }
     }
-    (synthesis, diagnostics)
+    (synthesis, diagnostics, partial)
 }
 
 /// Final plugin result. An incomplete synthesis (`partial`) is never
@@ -2317,7 +2321,8 @@ fn synthesis_max_tokens() -> Option<u32> {
 }
 
 /// OpenAI-compatible chat request. `max_tokens` is sent only when an
-/// operator configured one.
+/// operator configured one. Leave temperature at the provider default: some
+/// coding/reasoning models reject any caller-specified non-default value.
 fn synthesis_request_body(model: &str, prompt: &str, max_tokens: Option<u32>) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -2325,7 +2330,6 @@ fn synthesis_request_body(model: &str, prompt: &str, max_tokens: Option<u32>) ->
             {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.3,
     });
     if let Some(n) = max_tokens {
         body["max_tokens"] = serde_json::json!(n);
@@ -4231,6 +4235,39 @@ A second paragraph elaborates on alternatives [2]."
         assert_eq!(body["max_tokens"], 4000, "operator opt-in still works");
     }
 
+    #[test]
+    fn synthesis_request_uses_provider_default_temperature() {
+        for model in ["k3", "deepseek-v4-flash"] {
+            let body = synthesis_request_body(model, "p", None);
+            assert!(body.get("temperature").is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn failed_synthesis_is_partial_and_not_auto_delivered() {
+        let (synthesis, diagnostics, partial) =
+            synthesis_diagnostics(SynthesisOutcome::Failed("LLM HTTP 400 Bad Request".into()));
+        assert!(synthesis.is_none());
+        assert!(partial);
+        let out = assemble_output(
+            "source-only report".into(),
+            &diagnostics,
+            partial,
+            ResultSummary::default(),
+            None,
+            Path::new("/tmp/r.md"),
+        );
+        assert!(!out.success);
+        assert!(out.files_to_send.is_empty());
+        assert!(out.output.contains("Synthesis failed"));
+
+        // An intentionally unconfigured standalone run still supports a raw
+        // source report; only an attempted synthesis failure makes it partial.
+        let (_, diagnostics, partial) = synthesis_diagnostics(SynthesisOutcome::NotConfigured);
+        assert!(!partial);
+        assert!(diagnostics.is_empty());
+    }
+
     #[tokio::test]
     async fn length_cut_off_reply_is_retried_and_never_success() {
         let (endpoint, bodies) = fake_model(vec![
@@ -4267,7 +4304,8 @@ A second paragraph elaborates on alternatives [2]."
         assert!(retry_prompt.contains("was cut off"), "{retry_prompt}");
 
         // The run result built from it is partial, not success.
-        let (synthesis, diagnostics) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        let (synthesis, diagnostics, partial) =
+            synthesis_diagnostics(SynthesisOutcome::Done(result));
         let syn = synthesis.unwrap();
         assert!(diagnostics
             .iter()
@@ -4275,7 +4313,7 @@ A second paragraph elaborates on alternatives [2]."
         let out = assemble_output(
             "report".to_string(),
             &diagnostics,
-            syn.truncated.is_some(),
+            partial,
             ResultSummary::default(),
             None,
             Path::new("/tmp/r.md"),
@@ -4314,7 +4352,8 @@ A second paragraph elaborates on alternatives [2]."
         assert!(result.truncated.is_none(), "{:?}", result.truncated);
         assert!(result.synthesis.ends_with("Gaps: fines imposed so far."));
         assert_eq!(result.uncited_flagged, 0);
-        let (_, diagnostics) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        let (_, diagnostics, partial) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        assert!(!partial);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
@@ -4349,7 +4388,8 @@ A second paragraph elaborates on alternatives [2]."
         assert!(result
             .synthesis
             .contains("two years of protest. [citation needed]"));
-        let (_, diagnostics) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        let (_, diagnostics, partial) = synthesis_diagnostics(SynthesisOutcome::Done(result));
+        assert!(!partial);
         assert!(diagnostics[0].contains("[citation needed]"));
     }
 

@@ -1,14 +1,7 @@
 //! Site-delivery workflow definition.
 //!
-//! Pipeline-contract enforcement (coding-blue FA-7): the
-//! `workspace_policy_for_template_kind` helper below returns a typed
-//! [`WorkspacePolicy`] with `validation.on_completion` declaring the
-//! built `index.html` as a required artifact. When the session's
-//! working directory is initialised with `write_workspace_policy`,
-//! [`octos_pipeline::RunPipelineTool::build_workspace_context`] reads
-//! that policy on every `run_pipeline` invocation and propagates the
-//! validator block to the pipeline executor. Pipeline completion fails
-//! if the built site entrypoint is missing — no new opt-in needed.
+//! Declares the expected workspace artifacts and completion validators for
+//! the native delivery workflow. DOT execution is not part of this runtime.
 use crate::workflow_runtime::workflow_families::SiteTemplate;
 use crate::workflow_runtime::{
     WorkflowInstance, WorkflowKind, WorkflowLimits, WorkflowPhase, WorkflowTerminalOutput,

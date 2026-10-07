@@ -18,7 +18,6 @@ pub mod bootstrap;
 pub mod bridge;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
-pub mod bundled_pipelines;
 pub mod compaction;
 pub mod compaction_tiered;
 pub mod cost_ledger;

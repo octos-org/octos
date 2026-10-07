@@ -159,6 +159,7 @@ impl RetiredProfileRuntime {
 /// before. Mirrors the gateway's sub-provider registration
 /// (`gateway_runtime.rs`) but deliberately omits the primary/fallback
 /// auto-registration to keep the research lane isolated.
+#[cfg(test)]
 fn build_sub_provider_router(config: &Config) -> Option<Arc<octos_llm::ProviderRouter>> {
     if config.sub_providers.is_empty() {
         return None;
@@ -166,22 +167,15 @@ fn build_sub_provider_router(config: &Config) -> Option<Arc<octos_llm::ProviderR
     let router = Arc::new(octos_llm::ProviderRouter::new());
     let mut registered = 0usize;
     for sp in &config.sub_providers {
-        // Per-sub-provider key override, matching the gateway path: an explicit
-        // `api_key_env` selects a distinct credential; otherwise inherit the
-        // profile's default for the provider.
-        let sp_config = if sp.api_key_env.is_some() {
-            let mut c = config.clone();
-            c.api_key_env = sp.api_key_env.clone();
-            c
-        } else {
-            config.clone()
-        };
+        // Share the matching chat provider's saved route/credential unless
+        // this lane explicitly overrides it. Circuit breakers remain isolated.
+        let sp_config = config.for_sub_provider(sp);
         match chat::create_provider_with_api_type(
             &sp.provider,
             &sp_config,
             sp.model.clone(),
-            sp.base_url.clone(),
-            sp.api_type.as_deref(),
+            sp_config.base_url.clone(),
+            sp_config.api_type.as_deref(),
         ) {
             Ok(p) => {
                 router.register_with_full_meta(
@@ -607,35 +601,7 @@ pub struct ProfileRuntime {
     /// Shared shutdown owner retained across replacement runtimes.
     pub runtime_lifecycle: Option<Arc<ProfileRuntimeLifecycle>>,
 
-    /// Per-spawn `RunPipelineTool` factory (NEW-07 fix).
-    ///
-    /// Gateway-path parity: when a session LLM calls `spawn(allowed_tools =
-    /// ["run_pipeline", ...])`, the spawned child's
-    /// [`octos_agent::ToolRegistry`] must contain `run_pipeline` so the
-    /// spawn preflight ([`octos_agent::tools::spawn::
-    /// ensure_subagent_tools_available`]) succeeds. The gateway path threads
-    /// a [`crate::session_actor::PipelineToolFactory`] through
-    /// [`crate::session_actor::SessionActor::build_session_tools`] (see
-    /// `session_actor.rs:2744-2748`); the WS / UI Protocol path needs the
-    /// same factory but had no place to read it from — the
-    /// `RunPipelineTool` registered on [`Self::tool_specs`] is shared (one
-    /// instance, used by the parent registry) and cannot be re-handed to
-    /// every spawn child without violating ownership.
-    ///
-    /// `None` when no LLM provider is configured (the same precondition
-    /// that prevents parent registration; bootstrap returns `Err` long
-    /// before this point in that case). A second `None` slot exists for
-    /// upstream tests that build a minimal `ProfileRuntime` by hand
-    /// without an LLM provider chain.
-    ///
-    /// Production effect: round-7 soak NEW-07 reproducer was mini1
-    /// `deep_research` stalling 900s when the LLM wrapped `run_pipeline`
-    /// in `spawn(allowed_tools=[run_pipeline])` — the WS path child
-    /// registry only had `send_file` + base tools, so preflight failed
-    /// with `required tool(s) not available on this host: run_pipeline`
-    /// at `spawn.rs:1476`. Phase 2-A (PR #1203) plumbed scope through
-    /// `RunPipelineTool` but left this child-registry wiring gap on the
-    /// WS path. This field closes it.
+    /// Reserved host extension hook. Octos does not register a DOT engine.
     pub pipeline_factory: Option<Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>>,
 
     /// Pre-built lifecycle hook executor (M11-F regression fix REG-3).
@@ -1410,7 +1376,8 @@ impl ProfileRuntime {
             plugin_dirs: plugin_dirs.clone(),
             plugin_env: plugin_env_template.clone(),
             work_dir: plugin_work_dir,
-            synthesis_config: None,
+            synthesis_config:
+                crate::commands::gateway::profile_factory::build_research_synthesis_config(&config),
             require_signed: config.plugins.require_signed,
             verified_cache_dir: effective_octos_home.join("cache").join("verified"),
             tool_policy: config.tool_policy.clone(),
@@ -1446,160 +1413,9 @@ impl ProfileRuntime {
             tools.register(octos_agent::MemoryNoteTool::new(memory_store.clone()));
         }
 
-        // REG-7 follow-up: register `run_pipeline` at profile scope so
-        // the serve path (`/api/sessions/*`, UI Protocol WS) exposes
-        // it just like the gateway path does at
-        // `crates/octos-cli/src/session_actor.rs:2283-2305`. The serve
-        // path is the one `octos serve` mounts for web clients; prior
-        // to this, only the gateway (octos chat / bus channels)
-        // registered `run_pipeline`, so the LLM in serve mode received
-        // `"No tools matched"` when it tried `activate_tools(["run_pipeline"])`
-        // for `深度研究X` queries (per PR #930's ACT-DIRECTLY rule).
-        //
-        // The original M11-D split-out at `e01a07e4` (PR #764) called
-        // this gap out as a follow-up but never landed; PR #903
-        // restored 6 of 10 regressions and explicitly deferred this
-        // one. PR #930's prompt rewrite — which makes the LLM call
-        // `run_pipeline` directly rather than wrapping it in `spawn`
-        // — turned the latent gap into an observable production
-        // failure on the dspfac profile (May 13 2026).
-        //
-        // Profile scope is sufficient: `RunPipelineTool` only captures
-        // `llm` / `memory` / `data_dir` / `plugin_dirs` / optional
-        // `adaptive_router` / `provider_policy`, all of which are
-        // profile-level. Per-session workspace context is threaded
-        // separately via `PipelineHostContext` at execute time (see
-        // `crates/octos-pipeline/src/tool.rs::execute`).
-        //
-        // `mark_spawn_only` keeps the tool out of LRU eviction and
-        // tells the execution loop to background the call so the chat
-        // bubble doesn't block on the long-running pipeline. The
-        // message text mirrors session_actor.rs:2287-2291 verbatim.
-        // `RunPipelineTool::with_provider_router` takes
-        // `octos_llm::ProviderRouter` (a sub-provider routing
-        // registry assembled from `config.sub_providers` in the
-        // gateway path). The serve path doesn't build that table
-        // — the adaptive router that lives on `ProfileRuntime`
-        // is `AdaptiveRouter`, a distinct concrete type for
-        // top-level multi-provider QoS routing. Skipping
-        // `with_provider_router` here is correct; the
-        // `default_provider` we hand in (`llm`) is already wrapped
-        // by `RetryProvider` → `ProviderChain` → `AdaptiveRouter`
-        // when adaptive is configured, so per-node calls still
-        // fan out through the adaptive layer.
-        //
-        // The profile's embedding provider was resolved ONCE back in Step 4
-        // (the episodic index has to be sized from it). The same handle feeds
-        // the pipeline factory below AND rides on the returned ProfileRuntime
-        // so the serve spawn/delegate wiring hands every worker the exact same
-        // embed-on-save + hybrid-recall behaviour.
-
-        // NEW-07: hoist the per-instance `RunPipelineTool` builder
-        // into a [`crate::session_actor::PipelineToolFactory`] impl
-        // so the WS / UI Protocol spawn-wiring site can hand a fresh
-        // `run_pipeline` instance to every spawned child registry
-        // (mirroring the gateway path at `session_actor.rs:2744-2748`).
-        // Without this, an LLM emitting
-        // `spawn(allowed_tools=["run_pipeline"])` on the WS path
-        // failed the spawn preflight
-        // (`spawn.rs::ensure_subagent_tools_available`) with
-        // `"required tool(s) not available on this host: run_pipeline"`
-        // — reproduced by mini1 `deep_research` round-7 soak (binary
-        // `5cfd85f3`).
-        let pipeline_factory: Option<
-            Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>,
-        > = {
-            #[derive(Clone)]
-            struct AppUiPipelineToolFactory {
-                llm: Arc<dyn LlmProvider>,
-                memory: Arc<EpisodeStore>,
-                data_dir: PathBuf,
-                policy: Option<ToolPolicy>,
-                plugin_dirs: Vec<PathBuf>,
-                octos_home: PathBuf,
-                plugin_require_signed: bool,
-                /// NEW-06 fix: forwarded to every worker `Agent` via
-                /// `RunPipelineTool::with_embedder` so pipeline-spawned
-                /// agents inherit the contamination-safe hybrid scored
-                /// + filtered memory recall path.
-                embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
-                /// Isolated per-node model router built from the profile's
-                /// `sub_providers` (e.g. `deep_research`'s `cheap`/`strong`
-                /// nodes). Registers ONLY sub-providers, so per-node failover
-                /// trips its own breakers and never disturbs the coding
-                /// provider/cache. `None` ⇒ nodes use the shared coding `llm`.
-                provider_router: Option<Arc<octos_llm::ProviderRouter>>,
-            }
-
-            impl crate::session_actor::PipelineToolFactory for AppUiPipelineToolFactory {
-                fn with_plugin_dirs(
-                    &self,
-                    plugin_dirs: Vec<PathBuf>,
-                ) -> Option<Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync>>
-                {
-                    let mut factory = self.clone();
-                    factory.plugin_dirs = plugin_dirs;
-                    Some(Arc::new(factory))
-                }
-
-                fn create(&self, sandbox: &SandboxConfig) -> Arc<dyn octos_agent::tools::Tool> {
-                    let mut pt = octos_pipeline::RunPipelineTool::new(
-                        self.llm.clone(),
-                        self.memory.clone(),
-                        self.data_dir.clone(),
-                        self.data_dir.clone(),
-                    )
-                    .with_provider_policy(self.policy.clone())
-                    .with_plugin_dirs(self.plugin_dirs.clone())
-                    .with_plugin_require_signed(self.plugin_require_signed)
-                    // #1607 (codex round 4): confine pipeline command
-                    // validators to the SESSION-effective sandbox passed in by
-                    // the caller (`SessionRuntime`/`ActorFactory`), NOT a
-                    // profile-time default captured at factory-build time — a
-                    // read-only session's validators must not regain removed
-                    // writes/network.
-                    .with_sandbox(sandbox.clone())
-                    .with_octos_home(self.octos_home.clone());
-                    if let Some(ref embedder) = self.embedder {
-                        pt = pt.with_embedder(embedder.clone());
-                    }
-                    if let Some(ref router) = self.provider_router {
-                        pt = pt.with_provider_router(router.clone());
-                    }
-                    Arc::new(pt)
-                }
-            }
-
-            let factory: Arc<dyn crate::session_actor::PipelineToolFactory + Send + Sync> =
-                Arc::new(AppUiPipelineToolFactory {
-                    llm: llm.clone(),
-                    memory: memory.clone(),
-                    data_dir: data_dir.to_path_buf(),
-                    policy: config.tool_policy.clone(),
-                    plugin_dirs: plugin_dirs.clone(),
-                    octos_home: effective_octos_home.clone(),
-                    plugin_require_signed: config.plugins.require_signed,
-                    embedder: embedder.clone(),
-                    provider_router: build_sub_provider_router(&config),
-                });
-
-            // Register the parent `run_pipeline` via the same factory so the
-            // parent registry and every spawn-child registry observe
-            // byte-identical config. This profile-scope registration uses the
-            // profile default sandbox; `SessionRuntime::bootstrap_*` re-registers
-            // it with the SESSION-effective sandbox (which `rebind_cwd` does not
-            // touch, since `run_pipeline` is not a CWD-bound tool).
-            tools.register_arc(factory.create(&sandbox_config));
-            tools.mark_spawn_only(
-                "run_pipeline",
-                Some(
-                    "Pipeline started in background. The final result and any artifacts will be sent here when complete. You can keep chatting in the meantime."
-                        .to_string(),
-                ),
-            );
-
-            Some(factory)
-        };
+        // DOT graph execution is retired from Octos. Leave the host extension
+        // hook empty, including for spawned agents and plugin reloads.
+        let pipeline_factory = None;
 
         // M11-F regression fix REG-2: restore the CronTool registration.
         //
@@ -3319,62 +3135,111 @@ mod tests {
         );
     }
 
-    /// NEW-07 regression: `ProfileRuntime::bootstrap` must populate
-    /// `pipeline_factory` so the WS / UI Protocol spawn-wiring site can
-    /// attach a fresh `run_pipeline` instance to every spawn-child
-    /// registry. Pre-fix the field did not exist and the WS path's
-    /// SpawnTool only carried a `send_file` child factory — so a child
-    /// agent declaring `allowed_tools=["run_pipeline"]` hit
-    /// `ensure_subagent_tools_available`'s missing-tool branch and the
-    /// spawn was rejected with
-    /// `required tool(s) not available on this host: run_pipeline`.
-    /// Round-7 soak (binary `5cfd85f3`) caught the regression on mini1
-    /// `deep_research`; this test pins it.
-    ///
-    /// We exercise the factory by:
-    ///   1. Bootstrapping a profile with a valid LLM env var.
-    ///   2. Asserting `pipeline_factory.is_some()`.
-    ///   3. Building a `ToolRegistry` with the factory's tool and the
-    ///      `octos_agent` builtins, then asserting the registry's
-    ///      `get("run_pipeline")` returns `Some` — the same predicate
-    ///      `ensure_subagent_tools_available` uses (see
-    ///      `crates/octos-agent/src/tools/spawn.rs::ensure_subagent_tools_available`).
+    /// The removed DOT tool must stay absent across profile/session bootstrap
+    /// and plugin reload, even if old pipeline files remain on disk.
     #[tokio::test]
-    async fn profile_runtime_bootstrap_populates_pipeline_factory_for_spawn_children() {
+    async fn profile_runtime_does_not_expose_dot_pipeline() {
         let _key = ScopedEnvKey::set("OCTOS_NEW07_PIPELINE_FACTORY_KEY");
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("profile-data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
+        // A leftover legacy graph must not restore the retired tool.
+        let graphs = data_dir.join("pipelines");
+        std::fs::create_dir_all(&graphs).unwrap();
+        std::fs::write(graphs.join("deep_research.dot"), "digraph deep_research {}").unwrap();
         let profile = fixture_profile("new07", "OCTOS_NEW07_PIPELINE_FACTORY_KEY");
         let rt = ProfileRuntime::bootstrap(&profile, &data_dir, None, BootstrapRole::Serve)
             .await
             .expect("bootstrap should succeed");
 
-        let factory = rt
-            .pipeline_factory
-            .as_ref()
-            .expect("pipeline_factory must be Some after a successful bootstrap");
-        let pt = factory.create(&octos_agent::SandboxConfig::default());
-        assert_eq!(
-            pt.name(),
-            "run_pipeline",
-            "factory must produce the `run_pipeline` tool by name",
-        );
-
-        // Mirror the gateway's `with_child_tool_factory` consumer: clone
-        // the `Arc` and hand the child a fresh registry that mounts the
-        // factory output. This is exactly what `ui_protocol.rs` does at
-        // spawn-tool wiring time (see the NEW-07 comment block in the
-        // SpawnTool wiring), so success here proves the
-        // `ensure_subagent_tools_available` preflight will pass for
-        // `allowed_tools=["run_pipeline"]`.
-        let mut child_registry = octos_agent::ToolRegistry::with_builtins(&data_dir);
-        child_registry.register_arc(factory.create(&octos_agent::SandboxConfig::default()));
         assert!(
-            child_registry.get("run_pipeline").is_some(),
-            "spawned child registry must carry `run_pipeline` so the spawn preflight succeeds",
+            rt.pipeline_factory.is_none(),
+            "DOT factory must not be installed"
         );
+        assert!(rt.tool_specs.get("run_pipeline").is_none());
+        assert!(
+            !rt.tool_specs
+                .specs()
+                .iter()
+                .any(|tool| tool.name == "run_pipeline")
+        );
+        let reloaded = rt.rebuild_plugin_layer().await.unwrap();
+        assert!(reloaded.pipeline_factory.is_none());
+        assert!(reloaded.tool_specs.get("run_pipeline").is_none());
+        let session = super::super::SessionRuntime::bootstrap(
+            &reloaded,
+            octos_core::SessionKey::new("api", "no-dot"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(session.tools.get("run_pipeline").is_none());
+    }
+
+    #[tokio::test]
+    async fn native_research_synthesis_is_retained_for_plugin_reload() {
+        let _key = ScopedEnvKey::set("OCTOS_NATIVE_RESEARCH_KEY");
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = fixture_profile("native-research", "OCTOS_NATIVE_RESEARCH_KEY");
+        let rt = ProfileRuntime::bootstrap(&profile, tmp.path(), None, BootstrapRole::Serve)
+            .await
+            .unwrap();
+        let config = rt
+            .plugin_reload
+            .as_ref()
+            .unwrap()
+            .synthesis_config
+            .as_ref()
+            .expect(
+                "serve must inject the current route into native research, including skill reloads",
+            );
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.model, "gpt-4o-mini");
+        assert_eq!(
+            config.api_key,
+            std::env::var("OCTOS_NATIVE_RESEARCH_KEY").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn research_lane_router_sends_the_matching_chat_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let capture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 16384];
+            let n = socket.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..n]).to_string();
+            let body = r#"{"id":"test","object":"chat.completion","model":"deepseek-v4-flash","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            request
+        });
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "provider":"openai", "api_key_env":"CHAT_KEY",
+            "env_vars":{"CHAT_KEY":"wrong-primary-key", "SHARED_KEY":"matching-chat-key"},
+            "fallback_models":[{"provider":"deepseek", "model":"deepseek-v4-flash", "base_url":url, "api_key_env":"SHARED_KEY", "api_type":"openai"}],
+            "sub_providers":[{"key":"cheap", "provider":"deepseek", "model":"deepseek-v4-flash", "base_url":url}]
+        })).unwrap();
+        config.bypass_auth_store = true;
+        let router = build_sub_provider_router(&config).unwrap();
+        let provider = router.resolve("cheap").unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.chat(
+                &[octos_core::Message::user("Reply OK")],
+                &[],
+                &octos_llm::ChatConfig::default(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.content.as_deref(), Some("OK"));
+        let request = capture.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer matching-chat-key"));
+        assert!(!request.contains("wrong-primary-key"));
     }
 
     /// #1935 — a `sub_providers` entry keyed [`GOAL_VERIFIER_LANE_KEY`]
