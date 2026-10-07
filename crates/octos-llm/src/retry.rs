@@ -1040,7 +1040,11 @@ mod tests {
         use tokio::io::AsyncReadExt;
         use tokio::net::TcpListener;
 
-        let client = crate::provider::build_http_client(5, 5);
+        // Budgets sit far above the platform's loopback-refusal latency:
+        // Windows typically answers a connect to a just-closed port only
+        // after ~2s (occasionally slower), and the assertions below
+        // require the error to not be a timeout.
+        let client = crate::provider::build_http_client(30, 30);
 
         if kind == "refused" {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

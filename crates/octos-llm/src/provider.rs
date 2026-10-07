@@ -634,9 +634,19 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
+        // Windows typically answers a loopback connect to a just-closed
+        // port only on the SYN retransmit (~2.05s, vs instant on unix, and
+        // occasionally slower still), so this budget sits far above the
+        // platform's refusal latency: at 2s the refusal never landed
+        // inside the budget on the Windows CI runner and the error came
+        // back as a connect timeout. The budgets are not under test; the
+        // classification is.
         let error = reqwest::Client::builder()
             .no_proxy()
-            .connect_timeout(std::time::Duration::from_secs(2))
+            // Bounds a stall that would otherwise hang the whole job (a
+            // stolen port answering nothing has no other deadline).
+            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap()
             .post(format!(
