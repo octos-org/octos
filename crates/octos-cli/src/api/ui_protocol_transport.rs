@@ -16410,6 +16410,19 @@ fn raw_peer_tools_unregister(
             format!("peer '{slug}' is not a host-owned app peer"),
         ));
     }
+    // Route-ownership gate (#2660): only the owning connection may release
+    // the route — a shared host token cannot unregister another
+    // connection's route out from under it.
+    if let Some(owner) = crate::peers::host_tools::host_route_connection(&peers_root, &slug) {
+        if owner != ws.connection_id.0 {
+            return Err(host_peer_error(
+                "peer_route_not_owner",
+                format!(
+                    "peer '{slug}' is routed to another connection of its host; unregister it there"
+                ),
+            ));
+        }
+    }
     let unregistered = crate::peers::host_tools::unregister_peer_route(&peers_root, &slug);
     Ok(json!({
         "slug": slug,
@@ -16534,6 +16547,23 @@ fn raw_session_tools_register(
         params.host_token.as_deref(),
         host_connection,
     )?;
+    // Route-ownership gate (#2660): the session's tool route belongs to the
+    // connection that registered it — another live connection registering
+    // would silently take over the session's kernel-tool surface (the same
+    // gate session/tool_list/set carries).
+    if let Some(owner) =
+        crate::peers::host_tools::session_set_connection(peers_root, &params.session_id)
+    {
+        if owner != ws.connection_id.0 {
+            return Err(host_peer_error(
+                "peer_route_not_owner",
+                format!(
+                    "session '{}' has its tool route on another connection of its host",
+                    params.session_id
+                ),
+            ));
+        }
+    }
     let set = build_tool_set(params.tools, params.generic_tools, params.options)
         .map_err(|err| host_peer_error("peer_tools_invalid", err))?;
     let route_ws = ws.clone();
