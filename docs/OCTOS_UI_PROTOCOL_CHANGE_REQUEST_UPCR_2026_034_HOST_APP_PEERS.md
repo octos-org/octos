@@ -536,15 +536,23 @@ In order, the kernel:
    does not fail the retry.
    **A failed entry finalizes nothing**: the purge stops with
    `peer_purge_incomplete` (the failing entries in `data.errors`), the peer
-   stays closed and staged — no tombstone, `peers/<slug>/` kept — and the
-   attempt is audited (`event: "peer_purge_incomplete"`, the same row shape
-   as a completed purge); a retry runs the whole idempotent erase again.
+   stays closed and staged and the attempt is audited (`event:
+   "peer_purge_incomplete"`, the same row shape as a completed purge); a
+   retry runs the whole idempotent erase again. The `peers/<slug>/` removal
+   is one of those entries (#2696): of the records below, the slug record is
+   written while the dir is still there, and nothing answers a retry
+   `already_purged` until the dir is verifiably gone.
 5. **Records** a tombstone and an audit row outside `peers/`:
    `<data_dir>/peer-purges/tokens/<sha256(host token)>.json`,
    `<data_dir>/peer-purges/slugs/<slug>` and a row in
    `<data_dir>/peer_purge_audit.jsonl` (profile, originator, slug, name,
    namespace, workspace, connection, what was stopped and erased, errors;
-   never the token).
+   never the token). The slug record goes down while `peers/<slug>/` still
+   exists — the stale-`#peer-<slug>`-session refusal hands over from the
+   `closed` marker to it without a gap — and the token record and the audit
+   row only go down once the dir is verifiably gone, so a failed removal
+   stays retryable instead of stranding its residue behind
+   `already_purged` (#2696).
 
 Afterwards `peer/prepare` with the same (app, account) binding creates a
 **new** peer (`resumed: false`, a new host token); the slug and name may be
