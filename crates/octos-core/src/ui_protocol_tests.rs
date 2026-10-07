@@ -7261,6 +7261,20 @@ fn spec_section_10_carries_no_numeric_code_outside_rpc_error_codes() {
 #[test]
 fn spec_v2_projection_examples_match_rust_wire_types() {
     let spec = include_str!("../../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md");
+    assert_spec_v2_projection_examples_match_rust_wire_types(spec);
+}
+
+#[test]
+fn spec_v2_projection_examples_accept_windows_line_endings() {
+    let spec = include_str!("../../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md")
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
+    assert_spec_v2_projection_examples_match_rust_wire_types(&spec);
+}
+
+fn assert_spec_v2_projection_examples_match_rust_wire_types(spec: &str) {
+    // Git can check the Markdown out with CRLF on Windows.
+    let spec = spec.replace("\r\n", "\n");
     let section = spec
         .split_once("## 14. Canonical v2 Projection Envelope\n")
         .expect("canonical projection section")

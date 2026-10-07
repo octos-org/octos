@@ -318,17 +318,24 @@ describe('canonical v2 contract', () => {
   });
 });
 
-it('decodes every published canonical v2 spec example', () => {
-  const spec = readFileSync(new URL('../../../../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md', import.meta.url), 'utf8');
+function publishedProjectionExamples(spec: string): unknown[] {
+  // Match Rust's fixture reader, including Git's Windows CRLF checkout mode.
+  spec = spec.replace(/\r\n/g, '\n');
   const section = spec.split('## 14. Canonical v2 Projection Envelope\n')[1]?.split('\n## 15.')[0];
   expect(section).toBeDefined();
-  const examples = [...section!.matchAll(/```json\n([\s\S]*?)\n```/g)].map(match => JSON.parse(match[1]));
+  return [...section!.matchAll(/```json\n([\s\S]*?)\n```/g)].map(match => JSON.parse(match[1]));
+}
+
+it.each(['\n', '\r\n'])('decodes every published canonical v2 spec example with %j line endings', lineEnding => {
+  const spec = readFileSync(new URL('../../../../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md', import.meta.url), 'utf8')
+    .replace(/\r\n/g, '\n').replace(/\n/g, lineEnding);
+  const examples = publishedProjectionExamples(spec);
   expect(examples).toHaveLength(11);
   const bridge = new ProjectionEnvelopeBridge(silentLogger());
   const seen: unknown[] = [];
   bridge.onEnvelope(value => seen.push(value));
   examples.forEach((example, index) => {
-    const envelope = example.payload ? example : {
+    const envelope = typeof example === 'object' && example !== null && 'payload' in example ? example : {
       thread_id: `example-${index}`, turn_id: `turn-${index}`, seq: 1, payload: example,
     };
     bridge.handle(PROJECTION_ENVELOPE_METHOD, envelope);
