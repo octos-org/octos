@@ -15,8 +15,8 @@
 use super::*;
 
 use crate::peers::purge::{
-    PurgeTombstone, append_audit, is_real_path, remove_tree_within, tombstone_for_token,
-    write_slug_tombstone, write_token_tombstone,
+    PurgeTombstone, append_audit, finalize_slug_tombstone, is_real_path, remove_tree_within,
+    tombstone_for_token, write_slug_tombstone, write_token_tombstone,
 };
 
 /// `approval/cancelled` reason of a prompt cancelled by `peer/purge`.
@@ -575,6 +575,12 @@ pub(super) async fn raw_peer_purge(
         },
     )
     .map_err(|error| RpcError::internal_error(format!("failed to record the purge: {error}")))?;
+    // The purge is complete, so the slug record reads as completed too: a
+    // peer staged under the slug again is never mistaken for this purge's
+    // debris (#2712).
+    finalize_slug_tombstone(&peers_root, &slug, &purged_at).map_err(|error| {
+        RpcError::internal_error(format!("failed to record the purge: {error}"))
+    })?;
     for session in &all_sessions {
         state.session_cache.invalidate_session(session).await;
     }
