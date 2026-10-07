@@ -453,6 +453,9 @@ const APPUI_METHOD_PEER_TOOLS_UNREGISTER: &str = "peer/tools/unregister";
 /// `NoActiveTurn` fallback). Steering is NOT an interrupt — the in-flight
 /// round always completes; `turn/interrupt` stays a separate op.
 const APPUI_METHOD_TURN_STEER: &str = "turn/steer";
+#[path = "session_history.rs"]
+mod session_history;
+const APPUI_METHOD_SESSION_HISTORY_LIST: &str = "session/history/list";
 const APPUI_METHOD_PROFILE_SKILLS_LIST: &str = "profile/skills/list";
 const APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH: &str = "profile/skills/registry/search";
 const APPUI_METHOD_PROFILE_SKILLS_INSTALL: &str = "profile/skills/install";
@@ -561,6 +564,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PEER_PURGE,
     APPUI_METHOD_PEER_TOOLS_UNREGISTER,
     APPUI_METHOD_TURN_STEER,
+    APPUI_METHOD_SESSION_HISTORY_LIST,
     APPUI_METHOD_PROFILE_SKILLS_LIST,
     APPUI_METHOD_PROFILE_SKILLS_REGISTRY_SEARCH,
     APPUI_METHOD_PROFILE_SKILLS_INSTALL,
@@ -15129,32 +15133,69 @@ struct RawPeerPrepareParams {
     host_token: Option<String>,
 }
 
-/// UPCR-2026-034 — the profile's configured model lanes, from the
-/// bootstrapped runtime when there is one (what turns actually resolve
-/// against) and otherwise from the stored profile.
-fn profile_model_lanes(
+/// UPCR-2026-034 — the profile's peer-model view, resolved as ONE read so the
+/// lanes and the primary identity (#2674) cannot straddle a concurrent
+/// profile commit: from the bootstrapped runtime when there is one (what
+/// turns actually resolve against) and otherwise from the stored profile.
+/// The lanes deliberately stay the profile's OWN `sub_providers` (never
+/// inherited); the primary identity goes through the store's resolution so a
+/// sub-account reports the primary it actually runs on. `None` identity when
+/// nothing names a primary, so legacy env-only profiles keep the bare
+/// `{"lane": "primary"}` wire shape.
+fn profile_peer_model_view(
     state: &AppState,
     profile_id: &str,
-) -> Vec<crate::config::SubProviderConfig> {
+) -> (
+    Vec<crate::config::SubProviderConfig>,
+    Option<(String, String)>,
+) {
     if let Some(runtime) = resolve_session_profile_runtime(state, Some(profile_id)) {
-        return runtime.config.sub_providers.clone();
+        return (
+            runtime.config.sub_providers.clone(),
+            Some((
+                runtime.provider_name.clone(),
+                runtime.primary_model_id.clone(),
+            )),
+        );
     }
     profile_store(state)
         .ok()
-        .and_then(|store| store.get(profile_id).ok().flatten())
-        .map(|profile| profile.config.sub_providers.clone())
+        .and_then(|store| {
+            store.get(profile_id).ok().flatten().map(|profile| {
+                let lanes = profile.config.sub_providers.clone();
+                let primary =
+                    primary_model_identity(&store.resolve_runtime_profile(&profile).config);
+                (lanes, primary)
+            })
+        })
         .unwrap_or_default()
 }
 
+/// #2674 — the display identity of a profile's primary model (provider
+/// family + model id, never credentials). `None` unless both halves are
+/// configured.
+fn primary_model_identity(config: &crate::profiles::ProfileConfig) -> Option<(String, String)> {
+    let provider = config.primary_provider()?.to_owned();
+    let model = config.primary_model()?.to_owned();
+    Some((provider, model))
+}
+
 /// UPCR-2026-034 — the effective model of a peer: its recorded lane's
-/// provider/model, or `{"lane": "primary"}`. Never carries credentials.
+/// provider/model, or the profile's primary identity (`{"lane": "primary"}`
+/// alone when no primary is resolvable, #2674). Never carries credentials.
 fn peer_effective_model_json(
     lanes: &[crate::config::SubProviderConfig],
     lane: Option<&str>,
+    primary: Option<&(String, String)>,
 ) -> Value {
     match lane.and_then(|lane| lanes.iter().rev().find(|sp| sp.key == lane)) {
         Some(sp) => json!({ "lane": sp.key, "provider": sp.provider, "model": sp.model }),
-        None => json!({ "lane": "primary" }),
+        None => match primary {
+            Some((provider, model)) => {
+                json!({ "lane": "primary", "provider": provider, "model": model })
+            }
+            None => json!({ "lane": "primary" }),
+        },
     }
 }
 
@@ -15206,6 +15247,7 @@ fn resume_host_peer(
     workspace_root: &Path,
     requested_model: Option<&str>,
     lanes: &[crate::config::SubProviderConfig],
+    primary: Option<(String, String)>,
     profile_id: &str,
     host_token: Option<&str>,
 ) -> Result<Value, RpcError> {
@@ -15254,7 +15296,7 @@ fn resume_host_peer(
         "worktree_branch": Value::Null,
         "profile_id": profile_id,
         "token_budget": Value::Null,
-        "model": peer_effective_model_json(lanes, lane.as_deref()),
+        "model": peer_effective_model_json(lanes, lane.as_deref(), primary.as_ref()),
         "model_note": model_note,
         "memory_namespace": binding.memory_namespace,
         "resumed": true,
@@ -15323,7 +15365,7 @@ async fn raw_peer_prepare(
             ));
         }
     }
-    let model_lanes = profile_model_lanes(state, &profile_id);
+    let (model_lanes, model_primary) = profile_peer_model_view(state, &profile_id);
     let model_lane_keys: Vec<String> = model_lanes.iter().map(|sp| sp.key.clone()).collect();
 
     // Workspace root: explicit cwd (validated like a session open) beats the
@@ -15463,6 +15505,7 @@ async fn raw_peer_prepare(
                 &workspace_root,
                 params.model.as_deref(),
                 &model_lanes,
+                model_primary.clone(),
                 &profile_id,
                 params.host_token.as_deref(),
             );
@@ -15591,7 +15634,11 @@ async fn raw_peer_prepare(
             "worktree_branch": member.worktree_branch,
             "profile_id": profile_id.clone(),
             "token_budget": member_token_budget,
-            "model": peer_effective_model_json(&model_lanes, lane.as_deref()),
+            "model": peer_effective_model_json(
+                &model_lanes,
+                lane.as_deref(),
+                model_primary.as_ref(),
+            ),
             "model_note": model_note,
             "memory_namespace": host_namespace.clone(),
             "resumed": false,
@@ -15705,7 +15752,7 @@ fn raw_peer_model_set(
             format!("peer '{slug}' is closed"),
         ));
     }
-    let lanes = profile_model_lanes(state, &profile_id);
+    let (lanes, primary) = profile_peer_model_view(state, &profile_id);
     let requested = params
         .model
         .as_deref()
@@ -15736,7 +15783,7 @@ fn raw_peer_model_set(
     Ok(json!({
         "slug": slug,
         "profile_id": profile_id,
-        "model": peer_effective_model_json(&lanes, lane.as_deref()),
+        "model": peer_effective_model_json(&lanes, lane.as_deref(), primary.as_ref()),
         "applies": "next_turn",
     }))
 }
@@ -16011,7 +16058,7 @@ fn raw_peer_context_open_from(
         RpcError::internal_error("request context binding vanished after it was written")
     })?;
     let session_id = context_session_key(&params.session_id, &slug, &context_id);
-    let lanes = profile_model_lanes(state, &profile_id);
+    let (lanes, primary) = profile_peer_model_view(state, &profile_id);
     let lane = read_peer_model_lane(&peers_root, &slug);
     Ok(json!({
         "session_id": session_id,
@@ -16020,7 +16067,7 @@ fn raw_peer_context_open_from(
         "context_id": context_id,
         "cwd": binding.cwd.to_string_lossy(),
         "memory_namespace": binding.memory_namespace,
-        "model": peer_effective_model_json(&lanes, lane.as_deref()),
+        "model": peer_effective_model_json(&lanes, lane.as_deref(), primary.as_ref()),
         "profile_id": profile_id,
         "created": created,
         "share_history": binding.share_history,
@@ -21288,6 +21335,9 @@ async fn handle_raw_appui_rpc(
             ))
             .await
         }
+        APPUI_METHOD_SESSION_HISTORY_LIST => {
+            session_history::list(state, request, connection_profile_id).await
+        }
         APPUI_METHOD_PROFILE_SKILLS_LIST => {
             raw_profile_skills_list(state, request, connection_profile_id)
         }
@@ -21712,6 +21762,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST
             | APPUI_METHOD_SERVER_SHUTDOWN
             | APPUI_METHOD_SESSION_STATUS_READ
+            | APPUI_METHOD_SESSION_HISTORY_LIST
             | APPUI_METHOD_PROFILE_LLM_CATALOG
             | APPUI_METHOD_PROFILE_LLM_LIST
             | APPUI_METHOD_PROFILE_LLM_UPSERT

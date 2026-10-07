@@ -61,6 +61,7 @@ pub mod memory_namespace;
 pub mod profile;
 pub mod session;
 pub(crate) mod turn_policy;
+pub(crate) mod workspace_history;
 
 pub use cache::SessionRuntimeCache;
 pub use profile::{BootstrapRole, ProfileRuntime};
