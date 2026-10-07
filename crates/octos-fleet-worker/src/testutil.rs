@@ -310,6 +310,13 @@ impl Sandbox for MarkerSandbox {
         true
     }
 
+    fn runs_posix_sh(&self) -> bool {
+        // Honest to the [`NoSandbox`] delegation below: it runs the worktree
+        // flow's POSIX sh strings exactly where the platform shell can
+        // (`sh -c` off Windows, `cmd /C` on it).
+        !cfg!(windows)
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         NoSandbox.wrap_command(shell_command, cwd)
     }
@@ -323,6 +330,11 @@ pub struct RestrictedSandbox;
 
 impl Sandbox for RestrictedSandbox {
     // Inherits the default `supports_repo_git_write() == false`.
+    fn runs_posix_sh(&self) -> bool {
+        // Honest to the [`NoSandbox`] delegation below, like [`MarkerSandbox`].
+        !cfg!(windows)
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         NoSandbox.wrap_command(shell_command, cwd)
     }
@@ -332,6 +344,33 @@ impl Sandbox for RestrictedSandbox {
 /// (codex fix #2b). Threads a [`RestrictedSandbox`].
 pub fn restricted_sandbox_factory() -> crate::SandboxFactory {
     Arc::new(|_, _| Arc::new(RestrictedSandbox) as Arc<dyn Sandbox>)
+}
+
+/// A test double for the latent worktree-flow combination (#2707): it reports
+/// `supports_repo_git_write() == true` (so a worktree IS allocated) while
+/// inheriting the default `runs_posix_sh() == false` — a full-FS backend whose
+/// shell cannot run the flow's POSIX sh strings (e.g. a future Windows backend
+/// wrapping via `cmd /C`). Used to prove the attempt-time sh gate terminates
+/// such an attempt instead of silently degrading it into empty-branch
+/// rejections.
+pub struct NoPosixShSandbox;
+
+impl Sandbox for NoPosixShSandbox {
+    fn supports_repo_git_write(&self) -> bool {
+        true
+    }
+
+    // Inherits the default `runs_posix_sh() == false`.
+
+    fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
+        NoSandbox.wrap_command(shell_command, cwd)
+    }
+}
+
+/// A [`SandboxFactory`] whose backend reports full-FS write but no POSIX sh
+/// (the #2707 combination). Threads a [`NoPosixShSandbox`].
+pub fn no_posix_sh_sandbox_factory() -> crate::SandboxFactory {
+    Arc::new(|_, _| Arc::new(NoPosixShSandbox) as Arc<dyn Sandbox>)
 }
 
 /// Plants a hanging `filter.*.clean` (a `sleep`) via `.gitattributes` +

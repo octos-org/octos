@@ -77,20 +77,23 @@ fn fleet_sandbox_is_isolating(sandbox_cfg: &octos_agent::sandbox::SandboxConfig)
     !sandbox.is_noop() && sandbox.refusal().is_none()
 }
 
-/// Whether the resolved sandbox backend can grant a `FsGrant::Host` worker FULL
-/// daemon-user FS write together with the reads git needs — the third gate
-/// condition for the fleet WORKTREE flow (§5). Computed at serve boot (mirrors
-/// [`fleet_sandbox_is_isolating`]) from the base sandbox's
-/// `supports_repo_git_write()`: `true` for bwrap and unrestricted-read macOS,
-/// `false` for docker, restricted-read macOS, Landlock, AppContainer, and no
-/// sandbox. When `false`, the pool falls back to a scratch workspace for every
+/// Whether the resolved sandbox backend can run the fleet WORKTREE flow (§5):
+/// grant a `FsGrant::Host` worker FULL daemon-user FS write together with the
+/// reads git needs, AND run the POSIX sh strings the flow feeds the worker.
+/// Computed at serve boot (mirrors [`fleet_sandbox_is_isolating`]) from the
+/// base sandbox's `supports_repo_git_write()` AND `runs_posix_sh()`: the write
+/// capability is `true` for bwrap and unrestricted-read macOS, `false` for
+/// docker, restricted-read macOS, Landlock, AppContainer, and no sandbox; the
+/// sh capability keeps a future full-FS backend that wraps `cmd /C` from
+/// degrading every worktree attempt into empty-branch rejections (#2707 — the
+/// populate/commit commands are POSIX sh, see `octos-core`'s `git_worktree`).
+/// When either is `false`, the pool falls back to a scratch workspace for every
 /// task (a worktree worker whose `git commit` can't reach `<repo>/.git` would
 /// lose its deliverable when the checkout is removed). Threaded into
 /// `PoolConfig.repo_git_write_supported`.
-fn fleet_sandbox_supports_repo_git_write(
-    sandbox_cfg: &octos_agent::sandbox::SandboxConfig,
-) -> bool {
-    octos_agent::sandbox::create_sandbox(sandbox_cfg).supports_repo_git_write()
+fn fleet_sandbox_supports_worktree(sandbox_cfg: &octos_agent::sandbox::SandboxConfig) -> bool {
+    let sandbox = octos_agent::sandbox::create_sandbox(sandbox_cfg);
+    sandbox.supports_repo_git_write() && sandbox.runs_posix_sh()
 }
 
 /// #1857 PR 5a fix (HIGH 2) — reconcile the fleet store at boot with a bounded
@@ -1349,7 +1352,7 @@ impl ServeCommand {
                         // in (the closure needs the whole config; the pool only
                         // needs the bool).
                         let repo_git_write_supported =
-                            fleet_sandbox_supports_repo_git_write(&sandbox_cfg);
+                            fleet_sandbox_supports_worktree(&sandbox_cfg);
                         // The SandboxFactory folds the per-attempt SandboxGrant
                         // (derived from the task's WorkerGrant) onto the base
                         // network-isolated sandbox: `allow_network` from the
@@ -1430,9 +1433,10 @@ impl ServeCommand {
                             keeper_profile_id: rt.profile_id.clone(),
                             // §5 gate condition 3: only take the worktree flow when
                             // the resolved backend supports full-FS write (bwrap /
-                            // full-read macOS). Otherwise every task falls back to a
-                            // scratch workspace so a non-supporting backend never
-                            // loses a deliverable.
+                            // full-read macOS) AND runs the POSIX sh the worker-side
+                            // commands are written in (#2707). Otherwise every task
+                            // falls back to a scratch workspace so a non-supporting
+                            // backend never loses a deliverable.
                             repo_git_write_supported,
                         };
                         let pool = octos_fleet_worker::FleetWorkerPool::new(

@@ -551,6 +551,21 @@ pub trait Sandbox: Send + Sync {
     fn supports_repo_git_write(&self) -> bool {
         false
     }
+
+    /// Whether [`Self::wrap_command`] runs the shell string under a POSIX `sh`
+    /// — the capability the fleet worktree flow needs ON TOP of
+    /// [`Self::supports_repo_git_write`]: its worker-side commands
+    /// (`worktree_populate_command` / `deliverable_commit_command`, octos-core
+    /// `git_worktree`) are POSIX `sh` strings, and a full-FS backend that wraps
+    /// them with a non-POSIX shell would degrade every worktree attempt into
+    /// empty-branch rejections (the commit string fails to parse; the
+    /// branch-advance check downgrades the attempt). bwrap, Landlock, Docker
+    /// (in-container `sh -c`), and macOS wrap POSIX `sh`; [`NoSandbox`] is
+    /// platform-dependent (`sh -c` off Windows, `cmd /C` on it); AppContainer
+    /// cannot, so it inherits `false`.
+    fn runs_posix_sh(&self) -> bool {
+        false
+    }
 }
 
 /// No-op sandbox: executes commands directly.
@@ -559,6 +574,11 @@ pub struct NoSandbox;
 impl Sandbox for NoSandbox {
     fn is_noop(&self) -> bool {
         true
+    }
+
+    fn runs_posix_sh(&self) -> bool {
+        // `sh -c` off Windows, `cmd /C` on it (see `wrap_command`).
+        !cfg!(windows)
     }
 
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {

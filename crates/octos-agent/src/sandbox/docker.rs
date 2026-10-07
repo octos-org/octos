@@ -38,6 +38,12 @@ impl Sandbox for DockerSandbox {
         true
     }
 
+    fn runs_posix_sh(&self) -> bool {
+        // `wrap_command` terminates in an in-container `sh -c` (Linux image),
+        // regardless of the host OS.
+        true
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         self.wrap_with_slot(shell_command, cwd, None)
     }

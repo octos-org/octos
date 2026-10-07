@@ -241,6 +241,12 @@ impl Sandbox for MacosSandbox {
         self.read_allow_paths.is_empty()
     }
 
+    fn runs_posix_sh(&self) -> bool {
+        // `wrap_command` runs the shell string under sandbox-exec's `sh -c`,
+        // as does its fail-closed error command.
+        true
+    }
+
     fn wrap_command_with_build_cache_slot(
         &self,
         shell_command: &str,
