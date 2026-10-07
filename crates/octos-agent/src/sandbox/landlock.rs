@@ -25,6 +25,12 @@ pub struct LinuxContainerSandbox {
 }
 
 impl Sandbox for LinuxContainerSandbox {
+    fn runs_posix_sh(&self) -> bool {
+        // The helper terminates in `sh -c` (Linux), as does its fail-closed
+        // error command.
+        true
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         let Some(helper_path) = find_sandbox_helper_path() else {
             tracing::error!("octos-sandbox helper not found, refusing unsandboxed Linux command");

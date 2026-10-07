@@ -36,6 +36,11 @@ impl Sandbox for BwrapSandbox {
         true
     }
 
+    fn runs_posix_sh(&self) -> bool {
+        // `wrap_command` terminates in `sh -c` (Linux).
+        true
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         let mut cmd = Command::new("bwrap");
 
