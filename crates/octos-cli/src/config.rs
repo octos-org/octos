@@ -2973,10 +2973,10 @@ mod tests {
             "legacy root must NOT follow the injected $HOME on Windows"
         );
         assert_eq!(
-            resolved.as_deref(),
-            dirs::home_dir().as_deref(),
-            "legacy root must be the OS profile dir — the same definition \
-             the resolver and run_migrations use"
+            resolved,
+            dirs::home_dir().map(|home| home.join(".octos")),
+            "legacy root must be the OS profile dir + \".octos\" — the same \
+             definition the resolver and run_migrations use"
         );
     }
 
