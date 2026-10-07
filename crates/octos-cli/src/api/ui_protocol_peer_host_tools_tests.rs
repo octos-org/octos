@@ -6894,6 +6894,40 @@ async fn should_answer_already_purged_when_a_purge_is_retried() {
     drop(new_token);
 }
 
+// #2712 — a purge whose `peers/<slug>/` removal dies part way can leave the
+// dir staged (`brief.md` survived) with its host binding leaf torn out and
+// the slug tombstone already down. A stale client's `#peer-<slug>` session
+// must be refused, never run on as an ordinary profile session with the
+// profile's memory.
+#[tokio::test]
+async fn should_refuse_a_stale_peer_session_when_a_purge_leaves_torn_debris() {
+    let fx = fixture().await;
+    let token = prepare_news(&fx).await;
+    let session = peer_key(&fx);
+    assert!(matches!(
+        crate::peers::app_binding::resolve_session_app_binding(&peers_root(&fx), &session),
+        crate::peers::app_binding::SessionAppBinding::Bound { .. }
+    ));
+    let (ws, _rx) = ws_connection_for_test(32);
+    purge(&fx.state, &ws, &fx.system, "news", &token)
+        .await
+        .expect("the host purges its peer");
+    // Tear the removal the way a failed `remove_dir_all` leaves it: the
+    // binding leaf (readdir order arbitrary) is gone while `brief.md` and
+    // the slug record the purge wrote before touching the dir survive. The
+    // completed purge left a finalized record; reset it to the initial
+    // (unfinalized) form the purge writes before erasing the dir — the
+    // state a torn erase is stuck in.
+    crate::peers::purge::write_slug_tombstone(&peers_root(&fx), "news", "2026-10-07T00:00:00Z")
+        .unwrap();
+    std::fs::create_dir_all(peers_root(&fx).join("news")).unwrap();
+    std::fs::write(peers_root(&fx).join("news/brief.md"), "stale brief").unwrap();
+    assert!(matches!(
+        crate::peers::app_binding::resolve_session_app_binding(&peers_root(&fx), &session),
+        crate::peers::app_binding::SessionAppBinding::Refused(_)
+    ));
+}
+
 #[tokio::test]
 async fn should_refuse_a_purge_when_the_caller_is_not_the_peers_host() {
     let fx = fixture().await;

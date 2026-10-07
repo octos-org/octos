@@ -558,7 +558,12 @@ Afterwards `peer/prepare` with the same (app, account) binding creates a
 **new** peer (`resumed: false`, a new host token); the slug and name may be
 reused. Until a peer is staged under the slug again, a `#peer-<slug>`
 session is refused ("peer '<slug>' was purged"), so a stale client of the
-erased peer cannot run on as an ordinary profile session.
+erased peer cannot run on as an ordinary profile session. The slug record
+starts unfinalized and is finalized once the purge has erased the dir for
+good; a `#peer-<slug>` session over a staged dir that has lost its host
+binding while the record is still unfinalized — an erase torn after the
+record went down but before the dir did (#2712) — is refused as purge
+residue.
 
 **Idempotent.** A purge retried with the same token after it completed
 returns `{session_id, profile_id, slug, purged: false, already_purged: true,

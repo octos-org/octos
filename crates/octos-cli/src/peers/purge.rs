@@ -71,12 +71,38 @@ fn digest_is_hex(digest: &str) -> bool {
 /// Record the slug tombstone of a purged peer: while no peer is staged under
 /// `<slug>` again, a `#peer-<slug>` session is refused. `peer/purge` writes
 /// it while the peer dir still exists, so the refusal hands over from the
-/// close marker to this tombstone without a gap.
+/// close marker to this tombstone without a gap. The record starts
+/// UNFINALIZED ([`slug_tombstone_is_finalized`]); [`finalize_slug_tombstone`]
+/// completes it once nothing of the peer is left.
 pub(crate) fn write_slug_tombstone(
     peers_root: &Path,
     slug: &str,
     purged_at: &str,
 ) -> std::io::Result<()> {
+    write_slug_record(
+        peers_root,
+        slug,
+        &serde_json::json!({ "purged_at": purged_at }).to_string(),
+    )
+}
+
+/// Mark the slug tombstone of `slug` as complete: the purge erased the peer
+/// dir for good, so a staged, unbound dir under this slug from now on can
+/// only be a peer staged under the slug again — never debris of this purge
+/// (#2712).
+pub(crate) fn finalize_slug_tombstone(
+    peers_root: &Path,
+    slug: &str,
+    purged_at: &str,
+) -> std::io::Result<()> {
+    write_slug_record(
+        peers_root,
+        slug,
+        &serde_json::json!({ "purged_at": purged_at, "finalized": true }).to_string(),
+    )
+}
+
+fn write_slug_record(peers_root: &Path, slug: &str, body: &str) -> std::io::Result<()> {
     let Some(dir) = purges_dir(peers_root) else {
         return Err(std::io::Error::other("peers root has no parent"));
     };
@@ -85,7 +111,7 @@ pub(crate) fn write_slug_tombstone(
     }
     let slugs = dir.join("slugs");
     std::fs::create_dir_all(&slugs)?;
-    peer_io::write_peer_file_durable(&slugs, slug, purged_at)
+    peer_io::write_peer_file_durable(&slugs, slug, body)
 }
 
 /// Record the tombstone under the host token's digest: the record that
@@ -126,9 +152,46 @@ pub(crate) fn slug_is_purged(peers_root: &Path, slug: &str) -> bool {
     if !super::peer_slug_is_safe(slug) || super::staged_peer_dir(peers_root, slug).is_some() {
         return false;
     }
+    slug_tombstone_exists(peers_root, slug)
+}
+
+/// Whether a purge left its slug tombstone for `slug` — regardless of any
+/// later re-staging under the slug ([`slug_is_purged`] additionally requires
+/// the slug to be unstaged).
+pub(crate) fn slug_tombstone_exists(peers_root: &Path, slug: &str) -> bool {
+    if !super::peer_slug_is_safe(slug) {
+        return false;
+    }
     purges_dir(peers_root).is_some_and(|dir| {
         std::fs::symlink_metadata(dir.join("slugs").join(slug)).is_ok_and(|m| m.is_file())
     })
+}
+
+/// Whether the slug tombstone of `slug` records a COMPLETED purge: one whose
+/// `peers/<slug>/` removal is done, so a staged, unbound dir under the slug
+/// now reads as a peer staged again, not as this purge's debris (#2712).
+/// An unfinalized record is the initial state `write_slug_tombstone` leaves;
+/// only `finalize_slug_tombstone` completes it. A record written before the
+/// unfinalized form existed (a bare timestamp, pre-#2712) reads as
+/// finalized: it can only come from a purge that predates the debris check,
+/// and reading it as debris would strand peers staged under the slug since.
+pub(crate) fn slug_tombstone_is_finalized(peers_root: &Path, slug: &str) -> bool {
+    if !slug_tombstone_exists(peers_root, slug) {
+        return false;
+    }
+    let Some(dir) = purges_dir(peers_root) else {
+        return false;
+    };
+    let Some(body) =
+        peer_io::read_peer_file(&dir.join("slugs"), slug, peer_io::PEER_FILE_READ_CAP_SMALL)
+    else {
+        return false;
+    };
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(record) => record["finalized"] == serde_json::json!(true),
+        // A bare timestamp: an older kernel's completed purge.
+        Err(_) => true,
+    }
 }
 
 /// Append one row to the profile's purge audit log (never inside `peers/`,
@@ -286,5 +349,29 @@ mod tests {
         assert!(slug_is_purged(&peers_root, "news"));
         std::fs::write(peers_root.join("news/brief.md"), "again").unwrap();
         assert!(!slug_is_purged(&peers_root, "news"));
+    }
+
+    #[test]
+    fn should_finalize_a_slug_tombstone_only_when_the_purge_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peers_root = tmp.path().join("peers");
+        std::fs::create_dir_all(&peers_root).unwrap();
+        let record = tombstone("news");
+        // The initial record stays unfinalized: the erase has not completed,
+        // so a staged, unbound dir under the slug must read as debris.
+        write_slug_tombstone(&peers_root, "news", &record.purged_at).unwrap();
+        assert!(slug_tombstone_exists(&peers_root, "news"));
+        assert!(!slug_tombstone_is_finalized(&peers_root, "news"));
+        // Finalizing completes it, and the stale-session refusal (`slug_is_purged`)
+        // keeps reading the record regardless of its state.
+        finalize_slug_tombstone(&peers_root, "news", &record.purged_at).unwrap();
+        assert!(slug_tombstone_is_finalized(&peers_root, "news"));
+        assert!(slug_is_purged(&peers_root, "news"));
+        // A record left by an older kernel (a bare timestamp) reads as
+        // finalized: it predates the debris check.
+        let record = tombstone("mail");
+        write_slug_record(&peers_root, "mail", &record.purged_at).unwrap();
+        assert!(slug_tombstone_is_finalized(&peers_root, "mail"));
+        assert!(!slug_tombstone_is_finalized(&peers_root, "never-purged"));
     }
 }
