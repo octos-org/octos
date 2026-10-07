@@ -2940,9 +2940,8 @@ mod tests {
     /// #2722 convergence: the legacy root is the shared `legacy_data_dir()`,
     /// which on Windows resolves the OS profile known-folder and must NOT
     /// follow an injected `$HOME` — the same definition the resolver's default
-    /// `data_dir` and `run_migrations`' `legacy_root` use. (Executed
-    /// authoritatively on the Windows lane; type-checked everywhere via the
-    /// same bodies.)
+    /// `data_dir` and `run_migrations`' `legacy_root` use. Runs on the Windows
+    /// lane.
     #[cfg(windows)]
     #[test]
     #[allow(unsafe_code)]
