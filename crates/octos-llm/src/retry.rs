@@ -1041,9 +1041,9 @@ mod tests {
         use tokio::net::TcpListener;
 
         // Budgets sit far above the platform's loopback-refusal latency:
-        // Windows answers a connect to a just-closed port only after ~2s
-        // (occasionally slower), and the assertions below require the
-        // error to not be a timeout.
+        // Windows typically answers a connect to a just-closed port only
+        // after ~2s (occasionally slower), and the assertions below
+        // require the error to not be a timeout.
         let client = crate::provider::build_http_client(30, 30);
 
         if kind == "refused" {
