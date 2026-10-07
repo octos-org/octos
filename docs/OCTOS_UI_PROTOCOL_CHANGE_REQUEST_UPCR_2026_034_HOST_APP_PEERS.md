@@ -15,7 +15,9 @@
   shared history, amended 2026-09-29); an additive `peer/context/open`
   `read_parent` (a read-only view of the peer's folder, amended 2026-09-30,
   #2603); an additive raw AppUI method `peer/purge` (erase a host-owned app
-  peer, amended 2026-09-30, #2604)
+  peer, amended 2026-09-30, #2604); the result `model` of a laneless peer
+  reports the profile's primary identity (provider family + model id,
+  amended 2026-10-07, #2674)
 - Origin: Rinx ADR 0007, "Host-owned Octos app peers and Rinx deployment
   modes" (OctoSense shells host apps such as Rinx on one shared kernel)
 
@@ -59,7 +61,10 @@ scoped like `peer/prepare`.
 | `host_token?` | The credential returned when the host-owned app peer was created. Required to resume it. |
 
 Result entries add `model` (`{lane, provider?, model?}` — the effective
-model; `{lane: "primary"}` otherwise; never provider credentials),
+model; a laneless peer reports the profile's primary
+(`{"lane": "primary", "provider", "model"}`) so hosts have a non-secret
+display value; the bare `{lane: "primary"}` remains when no primary
+identity is resolvable from the profile; never provider credentials),
 `model_note`, `memory_namespace`, `resumed`, and `host_token`. `host_token` is
 a 256-bit random credential, returned only when a host-owned app peer is
 created. Only its SHA-256 is stored.
