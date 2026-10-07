@@ -863,6 +863,39 @@ pub(crate) mod peer_io {
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    /// A cancelled host-tool task may still append its audit after the turn
+    /// reports a terminal. Serialize leaf mutations with final directory
+    /// removal: neither an append nor an atomic writer's temporary file may
+    /// appear while `peer/purge` is enumerating and deleting the directory.
+    /// This is separate from the round-publication lock (whose holders call
+    /// these helpers). Idle entries retain only weak references and are reaped.
+    pub(crate) fn mutation_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+        use std::{
+            collections::HashMap,
+            path::PathBuf,
+            sync::{Arc, Mutex, OnceLock, Weak},
+        };
+        static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+        // Normalize parent aliases without following a replaced final leaf.
+        // The actual I/O still performs its own fd-anchored no-follow checks.
+        let key = path
+            .parent()
+            .zip(path.file_name())
+            .and_then(|(parent, leaf)| dunce::canonicalize(parent).ok().map(|p| p.join(leaf)))
+            .unwrap_or_else(|| path.to_owned());
+        let mut locks = LOCKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
     /// Read cap for the large peer files (`brief.md`, `result.md`). Over-cap
     /// content reads as absent (`None`) rather than a truncated prefix, matching
     /// `memory_panel`'s over-cap posture. 1 MiB is far above any legitimate
@@ -963,6 +996,8 @@ pub(crate) mod peer_io {
         leaf: &str,
         content: &str,
     ) -> std::io::Result<()> {
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
         imp::write_peer_file_atomic(peer_dir, leaf, content, false)
     }
 
@@ -978,6 +1013,8 @@ pub(crate) mod peer_io {
         leaf: &str,
         content: &str,
     ) -> std::io::Result<()> {
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
         imp::write_peer_file_atomic(peer_dir, leaf, content, true)
     }
 
@@ -987,7 +1024,48 @@ pub(crate) mod peer_io {
     /// planted FIFO fails fast instead of parking the writer on the missing
     /// reader.
     pub(crate) fn append_peer_line(peer_dir: &Path, leaf: &str, line: &str) -> std::io::Result<()> {
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
+        #[cfg(test)]
+        mutation_test_hook::before_append(peer_dir);
         imp::append_peer_line(peer_dir, leaf, line, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) mod mutation_test_hook {
+        use std::{
+            collections::HashMap,
+            path::{Path, PathBuf},
+            sync::{Mutex, OnceLock, mpsc},
+        };
+
+        type Pause = (mpsc::Sender<()>, mpsc::Receiver<()>);
+        static PAUSES: OnceLock<Mutex<HashMap<PathBuf, Pause>>> = OnceLock::new();
+
+        pub(crate) fn pause_append(path: &Path) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            PAUSES
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), (started_tx, release_rx));
+            (started_rx, release_tx)
+        }
+
+        pub(super) fn before_append(path: &Path) {
+            let pause = PAUSES
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .remove(path);
+            if let Some((started, release)) = pause {
+                let _ = started.send(());
+                release
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("release held append");
+            }
+        }
     }
 
     /// Append and sync a control record before another turn may be admitted.
@@ -998,6 +1076,8 @@ pub(crate) mod peer_io {
         leaf: &str,
         line: &str,
     ) -> std::io::Result<()> {
+        let lock = mutation_lock(peer_dir);
+        let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
         imp::append_peer_line(peer_dir, leaf, line, true)
     }
 
