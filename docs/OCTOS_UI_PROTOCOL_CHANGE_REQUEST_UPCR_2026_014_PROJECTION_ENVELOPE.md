@@ -1,5 +1,21 @@
 # Octos UI Protocol Change Request: M9-γ Projection Envelope
 
+## Current implementation clarification — 2026-10-07
+
+The original v1 proposal below is historical. The shipped server uses
+`EnvelopeV2` / `PayloadV2` and delivers canonical v2 on every connection.
+The current contract, executable JSON examples, replay-field negotiation,
+segment ownership, and foreground/child terminal semantics are in
+[API spec §14](../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md#14-canonical-v2-projection-envelope).
+
+This audit corrects stale documentation and the in-repo TypeScript bridge to
+match the already-shipped Rust wire. It adds no server method, field, feature,
+or version. Rust round-trip tests and TypeScript decode tests consume the same
+published examples; existing server tests cover unconditional v2 delivery,
+legacy-source suppression, hydration, and terminal replay.
+The web fixture workflow also runs for spec-only changes and the split Rust
+protocol modules, so a documentation edit cannot bypass the shared examples.
+
 ## Header
 
 - Request id: `UPCR-2026-014`

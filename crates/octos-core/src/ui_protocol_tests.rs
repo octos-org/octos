@@ -7255,3 +7255,55 @@ fn spec_section_10_carries_no_numeric_code_outside_rpc_error_codes() {
         "spec §10 carries numeric codes that rpc_error_codes does not declare: {orphans:?}"
     );
 }
+
+// Treat the published v2 JSON examples as executable wire fixtures. Round trips
+// catch forgotten required fields AND examples whose fields serde would ignore.
+#[test]
+fn spec_v2_projection_examples_match_rust_wire_types() {
+    let spec = include_str!("../../../api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md");
+    let section = spec
+        .split_once("## 14. Canonical v2 Projection Envelope\n")
+        .expect("canonical projection section")
+        .1
+        .split_once("\n## 15.")
+        .expect("bounded projection section")
+        .0;
+    let mut tags = std::collections::BTreeSet::new();
+    let mut envelope_count = 0;
+    for block in section.split("```json\n").skip(1) {
+        let value: Value = serde_json::from_str(block.split_once("\n```").unwrap().0)
+            .expect("valid JSON in projection spec");
+        let serialized = if value.get("payload").is_some() {
+            envelope_count += 1;
+            let envelope: EnvelopeWireV2 = serde_json::from_value(value.clone())
+                .expect("spec envelope matches flattened wire DTO");
+            serde_json::to_value(envelope).unwrap()
+        } else {
+            let payload: PayloadV2 = serde_json::from_value(value.clone())
+                .expect("spec payload matches Rust tagged union");
+            tags.insert(value["type"].as_str().unwrap().to_owned());
+            serde_json::to_value(payload).unwrap()
+        };
+        assert_eq!(
+            serialized, value,
+            "spec example loses fields or changes defaults"
+        );
+    }
+    assert_eq!(envelope_count, 1);
+    assert_eq!(
+        tags.into_iter().collect::<Vec<_>>(),
+        vec![
+            "assistant_delta",
+            "assistant_persisted",
+            "background/spawn_complete",
+            "file_attached",
+            "reasoning_delta",
+            "tool_end",
+            "tool_progress",
+            "tool_start",
+            "turn_terminal",
+            "user_message",
+        ],
+        "publish every current payload tag exactly as serialized"
+    );
+}

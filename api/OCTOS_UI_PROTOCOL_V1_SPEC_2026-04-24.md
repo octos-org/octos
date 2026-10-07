@@ -1,14 +1,18 @@
 # Octos UI Protocol v1 Spec — 2026-04-24
 
-Status: draft spec for `M9.1`.
+Status: current shipped `octos-ui/v1alpha1` contract, audited 2026-10-07.
+The historical filename is retained for links; §14 describes canonical v2
+projection payloads within this protocol version.
 
 Sprint: `coding-green`
 
-This is the first protocol document for the M9 control-plane layer. It is intentionally narrower than the eventual end-state. The goal is to define one client/runtime boundary that both `octoscode` and future server work can target without baking unresolved M8 runtime defects into the contract.
+This document describes the shared client/runtime boundary used by Octos
+clients. Historical milestone notes remain for context; the current wire
+contract is defined by the sections below and their referenced amendments.
 
-Code sketch:
+Protocol types:
 
-- draft Rust types live in [crates/octos-core/src/ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs)
+- Rust types live in [crates/octos-core/src/ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs)
 
 Related planning:
 
@@ -262,20 +266,11 @@ Current M9 sandbox-parity decision:
   [UPCR-2026-011](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_011_TURN_STATE_GET.md),
   gated behind `state.turn_state_get.v1`. Returns `state: "unknown"`
   rather than an error for missing turns.
-- The additive `message/persisted` notification (durable-commit
-  confirmation per session row, fired AFTER `add_message_with_seq`'s
-  fsync) is governed by accepted
-  [UPCR-2026-012](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_012_MESSAGE_PERSISTED.md),
-  gated behind `event.message_persisted.v1`. Strict-ordered per session.
-- The additive M9-γ projection `Envelope` shape (canonical
-  `(thread_id, seq, client_message_id?, payload)` tuple consumed by the
-  deterministic web client projection) is governed by accepted
-  [UPCR-2026-014](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_014_PROJECTION_ENVELOPE.md),
-  gated behind `projection.envelope.v1`. The shape is documented in § 14
-  "M9-γ Envelope" of this spec; legacy `message/delta`,
-  `message/persisted`, `tool/*`, and `turn/completed` notifications
-  continue to flow on connections that do not negotiate this feature
-  until `M9-γ-3` deletes them.
+- `message/persisted` (UPCR-2026-012) and the original v1 projection
+  (UPCR-2026-014) are historical contracts. The shipped server delivers
+  canonical `projection/envelope` v2 on every connection, suppressing raw
+  source lifecycle notifications. See §14 for payloads, terminal semantics,
+  and the remaining v2 hydration capability.
 - The additive stdio AppUI transport is governed by accepted
   [UPCR-2026-016](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_016_STDIO_TRANSPORT.md).
   It changes only framing and process launch. Method names, params, results,
@@ -387,26 +382,16 @@ These ids need to be stable and client-visible:
 - `event_cursor`
   A resumable position in the ordered protocol event stream.
 
-Current draft Rust types for `turn_id`, `approval_id`, `preview_id`, `output_cursor`, and `event_cursor` live in [ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs).
+Current Rust types for `turn_id`, `approval_id`, `preview_id`, `output_cursor`, and `event_cursor` live in [ui_protocol.rs](../crates/octos-core/src/ui_protocol.rs).
 
 ### 5.1 M9-γ projection identity (UPCR-2026-014)
 
-Under the M9-γ deterministic projection model (§ 14), envelope identity
-collapses to the per-thread `seq`. Specifically:
-
-- The canonical projection key is `(thread_id, seq)` — see `Envelope`
-  in § 14.
-- `client_message_id` rides on user-message-rooted envelopes ONLY for
-  the optimistic `<GhostBubble>` overlay's match-and-unmount logic;
-  the projection itself MUST NOT consult it.
-- The legacy per-row `message_id` (carried, for example, on
-  `MessagePersistedEvent.message_id`) is **deprecated for projection
-  identity** as of UPCR-2026-014. It survives in
-  `Envelope.payload` (e.g. `assistant_persisted.meta.message_id`) for
-  audit/render display, but the projection uses `seq` as the sole key.
-  The field is retained — not deleted — so legacy
-  `appendCompletionBubble` / `message/persisted` consumers continue to
-  work until `M9-γ-3` removes them.
+Canonical projection identity is `(thread_id, seq)` within a routed session.
+`turn_id` correlates the foreground turn; a background child names its parent
+in the payload. `client_message_id` reconciles optimistic user messages.
+Durable `message_id` coalesces hydrated transcript rows with persisted
+assistant/background envelopes. The session ledger `cursor` is a separate
+resume position. See §14 for their exact shapes and lifetimes.
 
 ## 6. Envelope Model
 
@@ -414,12 +399,24 @@ Client commands are JSON-RPC requests.
 
 Server notifications are JSON-RPC notifications.
 
+The shared [frame codec](../crates/octos-core/src/app_ui_codec.rs) accepts
+one compact, single-line JSON object per frame, with `jsonrpc: "2.0"`.
+Batch arrays and embedded literal line breaks are not supported. Stdio strips
+one trailing LF or CRLF before applying the same validation. The text-frame
+limit is 1 MiB (`MAX_TEXT_FRAME_BYTES`).
+
+Request and success-response `id` values must be strings; numeric and null
+request ids are rejected. Notifications omit `id`. Error responses carry a
+string id, or null when no request id can be associated with the failure.
+The shipped codec reports JSON/framing/id/shape errors as `parse_error` and
+an absent or unsupported `jsonrpc` version as `invalid_request` (see §10).
+
 The logical command/event names below mirror the current wire inventory:
 
 - command source of truth:
   `crates/octos-core/src/ui_protocol.rs::UI_PROTOCOL_COMMAND_METHODS`,
   `UI_PROTOCOL_FIRST_SERVER_METHODS`, and
-  `crates/octos-cli/src/api/ui_protocol.rs::APPUI_EXTRA_METHODS`
+  `crates/octos-cli/src/api/ui_protocol_transport.rs::APPUI_EXTRA_METHODS`
 - notification source of truth:
   `crates/octos-core/src/ui_protocol.rs::UI_PROTOCOL_NOTIFICATION_METHODS`
 - executable route inventory:
@@ -761,7 +758,7 @@ Session (server-pushed open-state echo for reconnect/replay):
 - `session/open` (same method name as the §7 command; emitted as
   `UiNotification::SessionOpened` and replayed from the durable ledger)
 
-Turn, message, and tool lifecycle:
+Turn, message, and tool lifecycle (raw source records are projected as v2; §14):
 
 - `turn/started`, `turn/completed`, `turn/error`
 - `turn/steer_dropped` (accepted `UPCR-2026-033`) — returned unconsumed steer
@@ -776,8 +773,8 @@ Turn, message, and tool lifecycle:
 - `message/delta`
 - `message/reasoning_delta` (live LLM reasoning/thinking stream, sibling of
   `message/delta`; #1502)
-- `message/persisted` (accepted `UPCR-2026-012`)
-- `turn/spawn_complete` (gate `event.spawn_complete.v1`; M10 background-tool completion envelope)
+- `message/persisted` (retired historical notification, `UPCR-2026-012`)
+- `turn/spawn_complete` (historical source for v2 `background/spawn_complete`)
 - `tool/started`, `tool/progress`, `tool/completed`
 
 Approval lifecycle:
@@ -806,8 +803,8 @@ Task and progress:
 
 Projection and session bridging (accepted `UPCR-2026-014`):
 
-- `projection/envelope` — wire `params` carries the bare `Envelope`
-  fields FLATTENED with the routing keys `session_id` (bare base key) +
+- `projection/envelope` — wire `params` carries the bare `EnvelopeV2`
+  fields FLATTENED with the routing keys `session_id` (preserved session key) +
   optional `topic`, so a multi-session client can route each envelope
   (`feat(envelope-wire-routing)`); see § 14.1.
 - `file/attached`
@@ -821,17 +818,17 @@ Voice rich-output visual lifecycle (#1477, ungated; accepted
   infographic) produced by a voice turn. Emitted on the same
   ledger-backed live path as `file/attached`, but kept distinct from it:
   `file/attached` stays a pure artifact-delivery signal while these carry
-  the placeholder lifecycle, so the split survives a future
-  `projection.envelope.v1` cutover. See § 8.
+  the placeholder lifecycle. Artifact delivery uses the canonical v2
+  `file_attached` payload. See § 8.
 
 Voice reply-audio streaming (gate `event.voice_audio.v1`; #1504):
 
 - `voice/audio_chunk` — streamed reply-audio frames (base64) for a voice turn.
   Delivery is gated by the `event.voice_audio.v1` capability: a client that did
   not negotiate it is filtered off the chunk stream and instead receives the
-  whole-file audio as a `file/attached` envelope, which is itself gated by
-  `event.file_attached.v1` (the reply audio has no other carrier — a client
-  that negotiated neither capability receives no playable reply audio).
+  whole-file audio as a canonical v2 `file_attached` payload when the
+  artifact is produced. That canonical payload does not require the
+  historical `event.file_attached.v1` token.
 
 Voice exit intent (ungated; accepted `UPCR-2026-025`):
 
@@ -1148,8 +1145,10 @@ Optional params (among others):
 Behavior:
 
 - server emits `turn/started`
-- server may emit zero or more `message/delta`, `tool/*`, `task/updated`, `warning`
-- server finishes with `turn/completed` or `turn/error`
+- server emits canonical `projection/envelope` v2 payloads for assistant/tool
+  output, alongside applicable `task/updated`, `warning`, and control events
+- server finishes the foreground projection with `turn_terminal`; its outcome
+  distinguishes completion, error, interruption, and rate limiting (§14)
 - one turn per session: a start while a turn runs is refused with
   `data.kind: "turn_in_progress"`; the kernel does not queue
 
@@ -1534,8 +1533,9 @@ Clients must use that method list to enable or disable slash commands.
 - servers that support server-owned permission inspection advertise
   `permission.profile.v1`; servers that expose the extended runtime policy
   stamp advertise `runtime.policy_stamp.v1`
-- unauthenticated stdio servers must omit `auth/me`, `content/list`, and
-  `content/delete` from `supported_methods` and list them under
+- unauthenticated stdio servers must omit `auth/me`, `auth/logout`,
+  `content/list`, `content/delete`, `content/bulk_delete`, `memory/*`,
+  `cron/*`, and `smart_home/*` from `supported_methods` and list them under
   `unsupported` with a reason; direct calls to those methods still return the
   typed `auth_unavailable` error with code `-32120`
 
@@ -2328,6 +2328,13 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 
 ## 8. Event Semantics
 
+The lifecycle source names below also describe retained ledger records.
+Current WebSocket/stdio output projects `message/delta`,
+`message/reasoning_delta`, `tool/*`, `file/attached`, `turn/completed`,
+`turn/error`, and `turn/spawn_complete` into canonical v2 (§14); it does not
+send these raw records alongside the projection. `turn/started`, approvals,
+questions, task/progress, and other control notifications remain separate.
+
 ### `turn/started`
 
 Marks the start of one client-visible turn. This creates the turn lifecycle boundary for the UI.
@@ -2408,7 +2415,7 @@ Optional typed fields from accepted `UPCR-2026-001`:
 - `typed_details`
   Tagged object whose `kind` should match `approval_kind` when both are present.
   Known detail groups are `command`, `sandbox`, `diff`, `filesystem`,
-  `network`, and `sandbox_escalation`.
+  `network`, `sandbox_escalation`, and `host_tool`.
 - `render_hints`
   Optional display hints such as labels, default decision, danger state, and
   monospace fields.
@@ -2633,9 +2640,9 @@ the originating user prompt's `client_message_id` under
 bubble under the correct user prompt without splice-merging into the existing
 spawn-acknowledgement bubble.
 
-Capability gate: `event.spawn_complete.v1`. When the capability is not
-negotiated, the same durable row appears as `message/persisted` instead — the
-ledger commit is unchanged, only the wire kind flips.
+Historical source feature: `event.spawn_complete.v1`. Current delivery uses
+`background/spawn_complete` on a canonical v2 child stream for all connections;
+there is no `message/persisted` fallback.
 
 Required fields: `session_id`, `task_id`, `seq`, `message_id`, `source`,
 `cursor`, `persisted_at`, `content`. Optional fields: `topic`, `turn_id`,
@@ -2874,10 +2881,13 @@ its supported-table and capability gates in
 
 JSON-RPC reserved range:
 
-- `-32700` (`parse_error`) — JSON-RPC reserved: the frame is not valid JSON.
-  Raised by the frame codec before any method dispatch.
-- `-32600` (`invalid_request`) — JSON-RPC reserved: valid JSON that is not a
-  valid JSON-RPC 2.0 request envelope.
+- `-32700` (`parse_error`) — raised by the shared frame codec before method
+  dispatch for invalid JSON, unsupported framing, invalid ids, and envelope
+  shape errors (including batch arrays or conflicting `method`/`result`/`error`
+  fields). This describes the shipped codec's broader use of the reserved code.
+- `-32600` (`invalid_request`) — the codec uses this for an absent, non-string,
+  or unsupported `jsonrpc` version. Handlers also use it for requests that are
+  invalid in the addressed runtime context, such as steering a non-steerable turn.
 - `-32601` (`method_not_found`) — JSON-RPC reserved. Emitted by the core
   `UiCommand` parser when the method falls outside the protocol's method
   table. The serve dispatcher answers unknown methods with `-32004`
@@ -2999,11 +3009,10 @@ Original migration-era split (historical):
 - protocol: turn lifecycle, approvals, diff preview, task output, live
   progress, resumable event flow
 
-## 12. M8 Gate
+## 12. Historical M8 Gate
 
-This spec should not freeze over known M8 runtime defects.
-
-Before productionizing protocol features that depend on runtime truth, the following M8 areas need to be repaired:
+The original rollout depended on repairing the following M8 runtime areas.
+This historical checklist is not a statement that these defects remain open:
 
 - `ToolContext` propagation
 - resume sanitizer correctness
@@ -3014,374 +3023,235 @@ Before productionizing protocol features that depend on runtime truth, the follo
 
 See [OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24.md](../docs/OCTOS_M8_FIX_FIRST_CHECKLIST_2026-04-24.md).
 
-## 13. Immediate Next Steps
+## 13. Validation
 
-1. Keep the shared Rust types in `octos-core` aligned with this doc.
-2. Build the mock `octoscode` scaffold against these draft types.
-3. When M8 fixes land, start server-side `M9.1` transport wiring against the same shapes.
+The wire inventory and §6 catalog guards check registered method coverage.
+Rust protocol tests pin error codes and serialization. Server API tests exercise
+capability gates, transport dispatch, session scope, replay, and lifecycle
+semantics. The §14 JSON examples are shared executable fixtures for Rust and
+the in-repo TypeScript bridge; changes must keep both consumers passing.
 
-## 14. M9-γ Envelope
+## 14. Canonical v2 Projection Envelope
 
-Status: **additive**, governed by accepted `UPCR-2026-014`. Capability-gated
-behind `projection.envelope.v1`. Legacy `message/delta`, `tool/*`, and
-`turn/completed` notifications continue to flow on connections
-that do not negotiate this feature, until `M9-γ-3` deletes them. The
-`message/persisted` notification has since been **retired** (see the v2
-note at the end of this section): the ledger skips replaying its records
-and `projection/envelope` is its sole successor.
+Status: shipped. `projection/envelope` carries `EnvelopeV2` / `PayloadV2`
+from [octos-core](../crates/octos-core/src/ui_protocol.rs). The outer protocol
+identifier remains `octos-ui/v1alpha1`; envelope v2 is a payload format, not
+another transport version. This section supersedes the historical v1
+projection description in UPCR-2026-014.
 
-ADR: [`docs/M9-GAMMA-SERVER-PROJECTION-ADR.md`](../docs/M9-GAMMA-SERVER-PROJECTION-ADR.md).
-
-This section defines the canonical envelope shape that the M9-γ
-deterministic projection consumes. The web client maintains an
-append-only `Vec<Envelope>` indexed by `(thread_id, seq)` and the
-projection function `(committed_log) → ChatViewModel` is pure,
-deterministic, and side-effect free. Identity collapses to `seq`;
-`client_message_id` lives ONLY on `user_message` envelopes (see
-§ 14.2) for the optimistic `<GhostBubble>` overlay's match-and-unmount
-path (the projection MUST NOT consult it).
-
-**Turn shape** (locked by § 14.2): every chat turn begins with exactly
-one `user_message` envelope (server-mirrored from the client's send),
-followed by zero or more `assistant_delta` / `tool_*` / `file_attached`
-/ `assistant_persisted` envelopes, terminated by exactly one
-`turn_completed` envelope. A refresh-only projection reconstructs the
-`UserView` for the chat exclusively from `user_message` envelopes —
-`assistant_delta` and `assistant_persisted` alone are insufficient.
+Every connection receives canonical v2 live and replay notifications, including
+connections that send no feature token. Raw `message/delta`,
+`message/reasoning_delta`, `tool/started`, `tool/progress`, `tool/completed`,
+`file/attached`, `turn/completed`, `turn/error`, and `turn/spawn_complete`
+records are internal/legacy source records: their canonical projections are
+sent instead. `message/persisted` is retired. These names remain in the
+historical catalog and ledger decoder; their presence is not a promise of a
+second live stream. `turn/started` and unrelated control notifications retain
+their own contracts.
 
 ### 14.1 Envelope
 
-Wire shape (JSON):
+The JSON-RPC notification method is `projection/envelope`. Its `params` is
+flattened as below; the durable ledger wrapper remains nested as
+`{session_id, topic?, envelope}`.
 
 ```json
 {
+  "session_id": "dev:local:demo#coding",
+  "topic": "coding",
   "thread_id": "thread-1",
-  "seq": 18,
-  "client_message_id": "01900000-0000-7000-8000-000000000001",
-  "payload": { "type": "...", "data": { ... } },
-  "session_id": "local:demo",
-  "topic": "planning"
+  "turn_id": "01900000-0000-7000-8000-000000000001",
+  "seq": 1,
+  "cursor": { "stream": "dev:local:demo#coding", "seq": 18 },
+  "client_message_id": "prompt-1",
+  "payload": { "type": "user_message", "data": { "text": "Hello" } }
 }
 ```
 
-The `projection/envelope` notification's JSON-RPC `params` is the bare
-`Envelope` fields (`thread_id`, `seq`, `client_message_id?`, `payload`)
-FLATTENED with the routing keys `session_id` and optional `topic`. The
-routing keys let a multi-session client (e.g. the TUI, which holds
-several sessions on one connection) route each envelope to the correct
-session and topic-scoped pane. The bare `Envelope` keys remain at the
-top level, so a client that reads `thread_id`/`seq`/`payload` top-level
-and ignores unknown keys decodes the frame unchanged — the routing
-addition is backward-compatible. A decoder that receives an OLD frame
-lacking `session_id`/`topic` defaults `session_id` to the empty key and
-`topic` to absent, and falls back to its ambient connection context for
-routing.
+- `thread_id` and `turn_id` are required strings. A foreground projection
+  thread is one turn's stream, not a reusable multi-turn conversation. A
+  background result uses its own child stream; its payload names the parent.
+- `seq` is the positive, increasing per-thread sequence. Projection identity
+  is `(thread_id, seq)` within the routed session. Do not confuse it with a
+  transcript row's sequence or `cursor.seq`.
+- `cursor` is the durable session-ledger position `{stream, seq}`. Current
+  server emissions stamp it; decoders permit it to be absent for old fixtures.
+  Resume with this cursor, not the per-thread sequence.
+- `client_message_id` is optional and belongs only on `user_message`. Use it
+  to reconcile an optimistic user message with its server reflection.
+- `session_id` and optional `topic` route the notification. Preserve the
+  emitted session key, including any topic suffix; do not assume it is a bare
+  key. Old cursor/routing-less fixtures may omit routing; only those require
+  the connection's ambient session context.
+- `payload` uses the tagged union below. Unknown additive fields are ignored.
 
-**v2 form (audit 2026-08-21):** the same `projection/envelope` method name
-also carries an `EnvelopeV2`-shaped frame. An `EnvelopeV2` flattens
-`thread_id`, `seq`, `cursor?`, `turn_id`, `client_message_id?`, `payload`
-with the same routing keys (`session_id`, `topic?`). Key differences from
-v1: an explicit `turn_id` on every envelope (for background child streams
-this is the child stream identity and the payload carries `parent_turn_id`),
-and an optional `cursor` (`UiCursor`).
+### 14.2 Payload
 
-Delivery semantics:
-
-- canonical v2 envelopes on the live stream are delivered **regardless of
-  negotiation** — the server never capability-filters canonical v2 frames
-- the `projection.envelope.v2` capability primarily controls projection of
-  **historical** (ledger-replayed) records into v2 form
-- a connection that negotiated v2 has the corresponding v1/source events
-  (`message/delta`, `tool/*`, `turn/completed`, legacy `message/persisted`)
-  **filtered out** on that connection — v2 clients do NOT decode both forms
-- `message/persisted` (UPCR-2026-012) is retired as a live notification:
-  the ledger explicitly skips replaying old `message/persisted` records, and
-  `projection/envelope` (v1 or v2 per connection negotiation) is its sole
-  successor
-
-> History: an earlier revision (UPCR-2026-014 + codex #1336 round-2
-> BLOCKER 4) stripped `session_id`/`topic` from the wire and kept them
-> only on the durable ledger's on-disk record. That left a multi-session
-> consumer with an unroutable empty `session_id`. The wire is now
-> un-stripped (`feat(envelope-wire-routing)`); the **disk** record shape
-> — a NESTED `{ session_id, topic, envelope }` object via the
-> `EnvelopeNotification` derive — is UNCHANGED, so post-restart
-> topic-scoped replay still routes (BLOCKER 4's actual invariant holds).
-
-Field contract:
-
-- `thread_id` (`string`, required) — Multi-turn cluster identity. All
-  envelopes for one logical conversation share a `thread_id`.
-- `seq` (`u64`, required) — Server-assigned strict total order WITHIN
-  this `thread_id`. Strictly monotonic; gaps are an error and trigger
-  rehydration. Identity for the projection.
-- `client_message_id` (`string`, optional) — Populated ONLY on
-  `user_message` envelopes (the optimistic `<GhostBubble>` overlay
-  matches its server reflection here). Absent on every other variant
-  (`assistant_delta`, `assistant_persisted`, `tool_*`, `file_attached`,
-  `turn_completed`). The projection MUST NOT consult this field. A
-  server emitting `client_message_id` on a non-`user_message` envelope
-  is a wire contract violation.
-- `payload` (object, required) — Sealed tagged union; see § 14.2.
-- `session_id` (`string`, optional on the wire for backward-compat,
-  always emitted by current servers) — The bare base session key for
-  client-side routing. A multi-session client routes the envelope to
-  this session; the projection itself does not consult it.
-- `topic` (`string`, optional) — Topic suffix for topic-scoped routing.
-  Omitted when the envelope is not topic-scoped.
-
-Rust source: [`Envelope`](../crates/octos-core/src/ui_protocol.rs)
-in `octos-core::ui_protocol`. TS source: `Envelope` in
-[`crates/octos-web/src/runtime/ui-protocol-types.ts`](../crates/octos-web/src/runtime/ui-protocol-types.ts).
-
-### 14.2 Payload (sealed tagged union)
-
-Wire form: JSON with `"type"` discriminator and content under `"data"`
-(matches Rust `serde(tag = "type", content = "data", rename_all = "snake_case")`).
-Variants:
+The JSON examples in this section are exercised against Rust serialization
+and the TypeScript bridge. All ten current payload tags are represented.
+Optional fields are omitted unless otherwise stated; nullable optional fields
+also accept JSON null on input.
 
 #### `user_message`
-User-message turn root — server-mirrored from the client's send. Every
-chat turn begins with exactly one `user_message` envelope. The
-projection's `UserView` is reconstructed from these envelopes alone —
-a refresh-only projection cannot recover user bubbles from
-`assistant_delta` / `assistant_persisted`. The carrying envelope's
-`client_message_id` is populated here (and ONLY here) so the
-optimistic `<GhostBubble>` overlay can match its server reflection.
+
+The user-message root of a foreground turn. `files` defaults to an empty
+array and is omitted when empty. Background child streams have no user root.
 
 ```json
-{ "type": "user_message",
-  "data": {
-    "text": "<user prompt>",
-    "files": [
-      { "path": "/tmp/upload.png", "mime": "image/png", "size_bytes": 2048 }
-    ]
-  } }
+{ "type": "user_message", "data": { "text": "Read this", "files": [{ "path": "/tmp/input.txt", "mime": "text/plain", "size_bytes": 12 }] } }
 ```
 
-`files` is an array of [`FileRef`](#145-fileref) entries; omitted on
-the wire when empty.
-
 #### `assistant_delta`
-One streamed assistant text fragment. Multiple `assistant_delta`
-envelopes for the same `thread_id` accumulate (concatenate by `seq`
-order) into the live assistant bubble.
 
-**Reconciliation rule** — `assistant_delta.text` events APPEND
-(concatenate by ascending `seq`). When an `assistant_persisted`
-envelope arrives for the same `thread_id`, its `text` field REPLACES
-the accumulated streamed text (the persisted form is canonical). This
-avoids double-rendering the final body when both delta and persisted
-events project into the same view.
+Append `text` to the specified `assistant_segment_id`. A turn can contain
+multiple assistant iterations, each with a distinct segment id.
 
 ```json
-{ "type": "assistant_delta", "data": { "text": "<fragment>" } }
+{ "type": "assistant_delta", "data": { "text": "Working", "assistant_segment_id": "turn-1:assistant:1" } }
+```
+
+#### `reasoning_delta`
+
+A reasoning fragment for the carrying turn, separate from visible answer text.
+
+```json
+{ "type": "reasoning_delta", "data": { "text": "Checking the input" } }
 ```
 
 #### `assistant_persisted`
-Final assistant text persisted to the ledger after streaming completes.
-Carries durable [`MessageMeta`](#143-messagemeta) so the projection can
-finalize the bubble's identity and surface attachments. Per the
-`assistant_delta` reconciliation rule above, `text` REPLACES the
-concatenated streamed deltas for the same thread (canonical final
-form).
+
+The canonical persisted text replaces streamed text for the SAME segment,
+not every assistant segment in the thread. `meta.message_id` also matches
+that row's hydrated identity, enabling transcript/replay deduplication.
 
 ```json
-{ "type": "assistant_persisted",
-  "data": {
-    "text": "<full text>",
-    "meta": {
-      "message_id": "01900000-0000-7000-8000-000000000018",
-      "persisted_at": "2026-05-09T18:30:01Z",
-      "media": ["report.md"]
-    }
-  } }
+{ "type": "assistant_persisted", "data": { "text": "Done", "assistant_segment_id": "turn-1:assistant:1", "meta": { "message_id": "message-1", "persisted_at": "2026-10-07T00:00:00Z", "media": ["report.md"] } } }
 ```
 
 #### `tool_start`
-Tool invocation begun. The projection opens a tool-call card keyed on
-`tool_call_id`. `arguments_preview` (optional) is a compact
-`key: value` echo of the call arguments, server-bounded to 700 chars
-(UTF-8-safe) — display fidelity for the card, not a replayable
-argument record. Omitted for argument-less calls and for envelopes
-persisted before the field existed.
+
+Open the tool card identified by `tool_call_id`. Optional
+`arguments_preview` is bounded to 700 characters and is not replayable input.
 
 ```json
-{ "type": "tool_start",
-  "data": { "tool_call_id": "tc-1", "name": "shell",
-            "arguments_preview": "command: \"cargo test\"" } }
+{ "type": "tool_start", "data": { "tool_call_id": "tc-1", "name": "read_file", "arguments_preview": "path: input.txt" } }
 ```
 
 #### `tool_progress`
-Tool emitted a progress message. Idempotent per `(tool_call_id, seq)`;
-the projection appends in `seq` order.
+
+Append progress for the identified tool call in sequence order.
 
 ```json
-{ "type": "tool_progress",
-  "data": { "tool_call_id": "tc-1", "message": "running…" } }
+{ "type": "tool_progress", "data": { "tool_call_id": "tc-1", "message": "Reading" } }
 ```
 
 #### `tool_end`
-Tool invocation finished. `error` is set iff `status === "error"`;
-omitted on the wire when null. `reason` is an optional human-readable
-detail field, primarily populated for `skipped` and `aborted` outcomes
-(see below); omitted on the wire when null. `output_preview` (optional)
-carries the first lines of the tool result, server-bounded to
-2048 chars (UTF-8-safe) — the result excerpt under the tool card; the
-`error` field is bounded the same way. `duration_ms` (optional) is the
-call's wall-clock duration. Both are omitted for envelopes persisted
-before the fields existed.
+
+`status` is `complete`, `error`, `skipped`, or `aborted`. Optional `error`
+and `reason` describe failures or non-execution; `output_preview` and `error`
+are bounded to 2048 characters. Optional `duration_ms` is elapsed time.
 
 ```json
-{ "type": "tool_end",
-  "data": { "tool_call_id": "tc-1", "status": "complete",
-            "output_preview": "test result: ok. 815 passed",
-            "duration_ms": 4321 } }
+{ "type": "tool_end", "data": { "tool_call_id": "tc-1", "status": "complete", "output_preview": "Read 12 bytes", "duration_ms": 10 } }
 ```
-
-```json
-{ "type": "tool_end",
-  "data": { "tool_call_id": "tc-2", "status": "error", "error": "…" } }
-```
-
-```json
-{ "type": "tool_end",
-  "data": { "tool_call_id": "tc-3", "status": "skipped",
-            "reason": "deadline elapsed before tool started" } }
-```
-
-```json
-{ "type": "tool_end",
-  "data": { "tool_call_id": "tc-4", "status": "aborted",
-            "reason": "user issued turn/interrupt" } }
-```
-
-`status` is a closed snake_case enum:
-
-- `complete` — tool ran to natural completion.
-- `error` — tool surfaced a failure (`error` carries the message).
-- `skipped` — tool was intentionally not run (deadline-skip,
-  pre-condition unmet). `reason` explains why.
-- `aborted` — tool execution was interrupted by an external signal
-  (user `turn/interrupt`, system cancellation). `reason` carries
-  detail.
-
-Future values require a follow-up UPCR.
 
 #### `file_attached`
-File attached to the current thread (e.g. `.md` report from
-`deep_search` or `.mp3` from `fm_tts`). The projection adds the
-attachment to the most-recent assistant bubble in `thread_id`.
+
+Carries the file plus a required `attachment_owner` object with optional
+`assistant_segment_id` and `tool_call_id`. Use the explicit owner rather than
+attaching to whichever bubble arrived most recently. An empty owner object is
+valid when neither identity could be recovered.
 
 ```json
-{ "type": "file_attached",
-  "data": { "path": "/tmp/report.md",
-            "mime": "text/markdown",
-            "size_bytes": 4096 } }
+{ "type": "file_attached", "data": { "path": "/tmp/report.md", "mime": "text/markdown", "size_bytes": 42, "attachment_owner": { "assistant_segment_id": "turn-1:assistant:1", "tool_call_id": "tc-1" } } }
 ```
 
-#### `turn_completed`
-**Hard barrier** — terminal payload for a turn within `thread_id`. Per
-the M9-γ ADR and § 14.6 below, any envelope arriving on the same
-`thread_id` AFTER this one is DROPPED by the projection (and counted
-in `octos_projection_post_completion_drop_total`). Threads are NOT
-reused — a new turn must use a NEW `thread_id`. Carries
-[`EnvelopeTokenUsage`](#144-envelopetokenusage); zero-valued fields are
-omitted on the wire.
+#### `turn_terminal`
+
+The foreground terminal payload. Required `outcome` is `completed`,
+`errored`, `interrupted`, or `rate_limited`; it replaces v1 `turn_completed`.
+Optional `error` is `{code, message, data?}`. Optional `token_usage` contains
+exact turn usage, not cumulative session usage. An absent total is unknown.
+For output truncation, `error.data.partial_result.session_result` preserves
+an actual fragment's identity; explicit null means no final fragment, while
+an absent `partial_result` means legacy/unknown identity (UPCR-2026-030).
 
 ```json
-{ "type": "turn_completed",
-  "data": { "token_usage": { "input_tokens": 100, "output_tokens": 250 } } }
+{ "type": "turn_terminal", "data": { "outcome": "errored", "error": { "code": "output_truncated", "message": "Output limit reached", "data": { "partial_result": { "session_result": null } } }, "token_usage": { "input_tokens": 100, "output_tokens": 250 } } }
+```
+
+#### `background/spawn_complete`
+
+A late task result closes its own child stream, leaving the foreground's
+terminal intact. The envelope's `turn_id` is the child identity;
+`parent_turn_id` links the result to the initiating foreground turn.
+`response_to_client_message_id`, `tool_call_id`, and `media` are optional;
+empty `media` is omitted. `message_id` is the durable transcript identity.
+
+```json
+{ "type": "background/spawn_complete", "data": { "parent_turn_id": "turn-1", "response_to_client_message_id": "prompt-1", "task_id": "task-1", "content": "Research finished", "tool_call_id": "tc-2", "message_id": "message-2", "source": "background", "persisted_at": "2026-10-07T00:00:01Z", "media": ["research.md"] } }
 ```
 
 ### 14.3 `MessageMeta`
 
-```json
-{
-  "message_id": "01900000-0000-7000-8000-000000000018",
-  "persisted_at": "2026-05-09T18:30:01Z",
-  "media": ["report.md"]
-}
-```
-
-- `message_id` (`string`, required) — Server-assigned UUID of the
-  durable row. Stable across replays. Mirrors
-  `MessagePersistedEvent.message_id`. **Note**: `message_id` is retained
-  here for audit/render display only; the projection uses `seq` as the
-  sole identity key (see § 5.1).
-- `persisted_at` (RFC 3339, required) — Wall-clock commit time.
-- `media` (`string[]`, optional) — File attachments persisted with the
-  message. Empty for assistant rows that carry only text. Omitted on
-  the wire when empty.
+Required `message_id` is an opaque stable row identifier, not necessarily a
+UUID. Required `persisted_at` is RFC 3339. Optional `media` defaults to an
+empty string array and is omitted when empty. The row identifier coalesces
+hydrated messages with canonical projection records; it does not replace
+per-thread envelope sequence identity.
 
 ### 14.4 `EnvelopeTokenUsage`
 
-```json
-{ "input_tokens": 100, "output_tokens": 250 }
-```
-
-Open object — all five fields default to zero and are omitted on the
-wire when zero (Rust `serde(skip_serializing_if = "is_zero_u64")`):
-
-- `input_tokens` (`u64`)
-- `output_tokens` (`u64`)
-- `reasoning_tokens` (`u64`)
-- `cache_read_tokens` (`u64`)
-- `cache_write_tokens` (`u64`)
-
-Future fields require a follow-up UPCR.
+All five unsigned integer counters default to zero and are omitted when zero:
+`input_tokens`, `output_tokens`, `reasoning_tokens`, `cache_read_tokens`, and
+`cache_write_tokens`. A missing terminal `token_usage` object means the total
+is unknown; it is distinct from an explicitly empty object (known zero).
 
 ### 14.5 `FileRef`
 
-```json
-{ "path": "/tmp/upload.png", "mime": "image/png", "size_bytes": 2048 }
-```
-
-Wire-form file reference carried on `user_message` envelopes (and
-reused as the canonical attachment shape elsewhere — `file_attached`
-embeds the same triple inline). All three fields are required:
-
-- `path` (`string`) — Absolute path the server resolved for the file.
-- `mime` (`string`) — IANA media type (e.g. `image/png`,
-  `text/markdown`).
-- `size_bytes` (`u64`) — Byte size at upload/persist time.
+A user-message file has required `path` (string), `mime` (string), and
+`size_bytes` (unsigned integer). A v2 `file_attached` payload adds its required
+`attachment_owner` object to these fields.
 
 ### 14.6 Hard barrier semantics
 
-Per the M9-γ ADR and the `Envelope` Rust doc-comment, the server MUST
-emit at most one `turn_completed` envelope per `(thread_id, turn)`.
-After that envelope, the projection enforces the barrier with a single
-deterministic rule:
+A `turn_terminal` closes the carrying foreground thread, for EVERY outcome.
+A `background/spawn_complete` closes its own child thread. Further envelopes
+on a closed thread are duplicates or invalid post-terminal output, and must
+not create more assistant/tool content. A new foreground turn uses a new
+thread id. A late task result belongs to its separate child thread, never
+reopens the parent's thread, and does not require another `turn_terminal`.
 
-> After `turn_completed` for `thread_id` T, any subsequent envelope
-> with the same `thread_id` is **DROPPED** by the projection. The
-> projection records the drop in the
-> `octos_projection_post_completion_drop_total` metric. Threads are
-> **NOT reused** — a new turn MUST use a NEW `thread_id`.
+Within an open thread, a missing or non-monotonic sequence is a recovery
+signal. Recover via `session/hydrate` / ledger cursor; a cursor sequence and a
+per-thread sequence are not interchangeable. Retained hydrate replay may be
+compacted; use its `projection_thread_sequences` checkpoints as documented
+below instead of treating a compacted prefix as a fresh complete stream.
 
-This is the canonical wire-level enforcement of the "phantom bubble"
-elimination that motivated M9-γ. The drop is silent at the projection
-layer (the metric is the operational signal); clients do NOT
-rehydrate, restart, or treat the situation as a desync. The same
-behaviour is implemented by the M9-γ-2 projection
-([`octos-web` PR #93](https://github.com/octos-org/octos-web/pull/93)).
+### 14.7 Capability negotiation and hydration
 
-A server that needs to emit a follow-up assistant or tool event
-belonging to a logically separate turn MUST mint a new `thread_id` for
-that turn — the projection treats the new `thread_id` as a brand-new
-chat thread and projects it independently.
+`projection.envelope.v1` is retired. Live and `session/open` replay delivery
+of canonical v2 does not require a projection feature token. Negotiating
+`projection.envelope.v2` still requests the richer `session/hydrate`
+projection fields when its `messages` section is included:
 
-### 14.7 Capability negotiation
+- `replayed_envelopes`: retained background-child envelopes.
+- `replayed_tool_envelopes`: retained tool-card projection envelopes.
+- `replayed_projection_envelopes`: bounded canonical replay through the
+  result cursor. Complete retained threads keep their sequence; compacted
+  threads retain terminals and reconstruct visible content from messages and
+  tool replay.
+- `projection_thread_sequences`: highest included sequence per thread in the
+  atomic ledger snapshot, used to resume live delivery after reconstruction.
+- hydrated message `message_id` / `source`: identity and background provenance
+  derived from retained projection evidence where available.
 
-Clients request `projection.envelope.v1` via the `X-Octos-Ui-Features`
-header at `session/open` time. Servers advertise it through
-`UiProtocolCapabilities.supported_features` (UPCR-2026-007) when they
-emit canonical envelopes; pre-existing connections (TUI, octos-app
-legacy) continue to receive only the legacy notification surface they
-negotiated.
-
-The capability schema version remains `2`; this is an additive feature
-flag and does not bump the schema version.
+These replay arrays contain bare `EnvelopeV2` objects (the result's
+`session_id` supplies routing), not JSON-RPC notifications. The same record
+may occur in multiple arrays; coalesce by `(thread_id, seq)` rather than
+appending duplicate cards. Omitting `messages` or the v2 token omits these
+optional replay fields. Hydrate is bounded by retention and frame limits,
+not an unlimited copy of the event ledger. Capability schema version stays 2.
 
 ## 15. Wave4-A — Adaptive Router + Queue Surface
 
