@@ -439,6 +439,22 @@ mod tests {
         unsafe { std::env::set_var(key, val) };
     }
 
+    /// The legacy default data dir the resolver must produce on this platform,
+    /// given the test's pivot home. On Unix the pivot works — `dirs::home_dir()`
+    /// reads `$HOME`, so the expectation anchors to the pivot dir. On Windows
+    /// `dirs::home_dir()` reads the profile known folder and ignores `$HOME`,
+    /// so the pivot cannot move it and the honest expectation is the real
+    /// profile dir (the `.octos` suffix stays the pinned contract).
+    fn expected_legacy_data_dir(pivot_home: &Path) -> PathBuf {
+        if cfg!(windows) {
+            dirs::home_dir()
+                .map(|h| h.join(".octos"))
+                .unwrap_or_else(|| PathBuf::from(".octos"))
+        } else {
+            pivot_home.join(".octos")
+        }
+    }
+
     /// Gate 4 + 10: `OCTOS_HOME == ~/.octos` (and the empty-string case) are
     /// treated as the default — no split-brain, config_home is XDG.
     #[test]
@@ -449,7 +465,10 @@ mod tests {
         let _env = EnvGuard::pivot(home);
 
         // OCTOS_HOME explicitly set to the default location.
-        set_env("OCTOS_HOME", home.join(".octos").to_str().unwrap());
+        set_env(
+            "OCTOS_HOME",
+            expected_legacy_data_dir(home).to_str().unwrap(),
+        );
         let ctx = resolve_config_context(None);
         assert!(ctx.is_default, "OCTOS_HOME==~/.octos must be is_default");
         assert_eq!(
@@ -457,7 +476,7 @@ mod tests {
             xdg_config_home(),
             "OCTOS_HOME==~/.octos must resolve config_home to XDG (no split-brain)"
         );
-        assert_eq!(ctx.data_dir, home.join(".octos"));
+        assert_eq!(ctx.data_dir, expected_legacy_data_dir(home));
     }
 
     /// Gate 10: empty-string OCTOS_HOME is treated as unset → default.
@@ -469,7 +488,7 @@ mod tests {
         set_env("OCTOS_HOME", "");
         let ctx = resolve_config_context(None);
         assert!(ctx.is_default);
-        assert_eq!(ctx.data_dir, tmp.path().join(".octos"));
+        assert_eq!(ctx.data_dir, expected_legacy_data_dir(tmp.path()));
         assert_eq!(ctx.config_home, xdg_config_home());
     }
 
@@ -562,7 +581,7 @@ mod tests {
         let _env = EnvGuard::pivot(tmp.path());
         let ctx = resolve_config_context(None);
         assert!(ctx.is_default);
-        assert_eq!(ctx.data_dir, tmp.path().join(".octos"));
+        assert_eq!(ctx.data_dir, expected_legacy_data_dir(tmp.path()));
         assert_eq!(ctx.config_home, xdg_config_home());
         assert_eq!(ctx.auth_home, xdg_config_home());
     }
@@ -624,6 +643,13 @@ mod tests {
 
     /// Gate 9: default install + legacy ~/.octos/config.json + no XDG →
     /// XDG config created, legacy left intact.
+    ///
+    /// Unix-only: staging the legacy file relies on the env-pivotable `$HOME` —
+    /// on Windows `dirs::home_dir()` reads the profile known folder, so
+    /// `run_migrations` would read the real profile dir and the test would have
+    /// to write there. The copy logic is platform-neutral; the Windows legacy
+    /// location is pinned by the resolution tests above.
+    #[cfg(unix)]
     #[test]
     fn config_migration_copies_legacy_to_xdg_and_leaves_legacy_intact() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -673,6 +699,12 @@ mod tests {
 
     /// Gate 8 (tenant): OCTOS_CONFIG_DIR set → host auth is NOT migrated into
     /// the tenant dir.
+    ///
+    /// Unix-only for the same reason as the config sibling above: the staged
+    /// legacy file lives under the env-pivotable `$HOME`, which Windows'
+    /// `dirs::home_dir()` ignores — without the gate the test would pass
+    /// vacuously there (nothing ever reads the staged file).
+    #[cfg(unix)]
     #[test]
     fn auth_migration_does_not_touch_tenant_config_dir() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
