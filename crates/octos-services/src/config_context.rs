@@ -103,11 +103,22 @@ fn expand_tilde(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// The legacy `~/.octos` root — the one definition of where legacy state
+/// lives, shared by `run_migrations` here and the loader's back-compat
+/// fallback in octos-cli. On Unix `dirs::home_dir()` consults `$HOME` (falling
+/// back to the passwd entry); on Windows it resolves the `{FOLDERID_Profile}`
+/// known folder and reads no environment variables, so load and migrate can
+/// never disagree about the legacy root (#2722).
+pub fn legacy_data_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".octos"))
+}
+
 /// The default runtime data dir: `~/.octos`.
+///
+/// Only a no-home fallback wrapper around [`legacy_data_dir`]; resolve the
+/// legacy root itself through that helper, not here.
 fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".octos"))
-        .unwrap_or_else(|| PathBuf::from(".octos"))
+    legacy_data_dir().unwrap_or_else(|| PathBuf::from(".octos"))
 }
 
 /// The default config home for octos:
