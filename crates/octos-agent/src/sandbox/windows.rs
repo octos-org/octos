@@ -59,6 +59,13 @@ impl Sandbox for AppContainerSandbox {
     // [`Self::wrap_command`]'s refusal. (Matches `LinuxContainerSandbox`,
     // which never overrode `is_noop` and refuses at wrap time.)
 
+    fn workspace_scratch_writable(&self) -> bool {
+        // A #1976 fence already degraded `workspace_write` to `false` at
+        // construction (`fence_degraded_workspace_write`), so this single
+        // flag covers both the read-only profile and the fenced one.
+        self.workspace_write
+    }
+
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         // Find the helper binary next to our own executable
         let helper = find_sandbox_helper();
