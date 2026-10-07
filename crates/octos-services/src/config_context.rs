@@ -114,6 +114,9 @@ pub fn legacy_data_dir() -> Option<PathBuf> {
 }
 
 /// The default runtime data dir: `~/.octos`.
+///
+/// Only a no-home fallback wrapper around [`legacy_data_dir`]; resolve the
+/// legacy root itself through that helper, not here.
 fn default_data_dir() -> PathBuf {
     legacy_data_dir().unwrap_or_else(|| PathBuf::from(".octos"))
 }

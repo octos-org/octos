@@ -2980,6 +2980,49 @@ mod tests {
         );
     }
 
+    /// `resolve_config_file_path` mirrors `load_resolved`'s precedence, so its
+    /// legacy branch must surface the same seeded file the loader would load.
+    ///
+    /// Unix-only, same rationale as the loader gates above.
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn resolve_config_file_path_finds_seeded_legacy_config() {
+        let _g = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_home = tmp.path();
+        let cwd = fake_home.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let legacy = fake_home.join(".octos").join("config.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, r#"{"provider":"gemini"}"#).unwrap();
+
+        let ctx = crate::config_context::ConfigContext {
+            config_home: fake_home.join("empty-xdg"),
+            auth_home: fake_home.join("empty-auth"),
+            data_dir: fake_home.join("empty-data"),
+            is_default: true,
+        };
+
+        let original_home = std::env::var_os("HOME");
+        // SAFETY: single-threaded inside LOCK; restored below.
+        unsafe { std::env::set_var("HOME", fake_home) };
+
+        let resolved = resolve_config_file_path(&cwd, &ctx, None);
+
+        match original_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert_eq!(
+            resolved, legacy,
+            "resolve_config_file_path must target the legacy file the loader reads"
+        );
+    }
+
     /// Gate 3 (tenant isolation): explicit context (is_default == false) with
     /// an empty config_home MUST NOT fall through to the host's legacy
     /// ~/.octos/config.json — it loads defaults instead.
