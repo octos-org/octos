@@ -16,7 +16,7 @@ use super::*;
 
 use crate::peers::purge::{
     PurgeTombstone, append_audit, is_real_path, remove_tree_within, tombstone_for_token,
-    write_tombstone,
+    write_slug_tombstone, write_token_tombstone,
 };
 
 /// `approval/cancelled` reason of a prompt cancelled by `peer/purge`.
@@ -497,6 +497,25 @@ pub(super) async fn raw_peer_purge(
         }
         "kept"
     };
+    // The slug tombstone goes down while the peer dir is still there, and
+    // the dir goes down before the token tombstone: while the peer is
+    // staged, its closed marker refuses a stale client's `#peer-<slug>`
+    // session, and the moment the dir is gone the slug tombstone does — the
+    // refusal never has a gap. The token tombstone, which is what answers a
+    // retry `already_purged`, is only written once nothing of the peer is
+    // left: a failed removal stays retryable instead of stranding its
+    // residue behind `already_purged` (#2696).
+    let purged_at = Utc::now().to_rfc3339();
+    if errors.is_empty() {
+        write_slug_tombstone(&peers_root, &slug, &purged_at).map_err(|error| {
+            RpcError::internal_error(format!("failed to record the purge: {error}"))
+        })?;
+        // The blackboard and every control file; frees the name, the slug,
+        // the namespace and the workspace reservation.
+        if let Err(error) = remove_tree_within(&peers_root, &peer_dir) {
+            errors.push(format!("peer directory: {error}"));
+        }
+    }
     // A partially-failed erase must not finalize: the tombstone would answer
     // every retry `already_purged`, and the leftovers — files the account
     // still owns — would never be erased. The peer stays closed and staged,
@@ -541,11 +560,9 @@ pub(super) async fn raw_peer_purge(
             "errors": errors,
         })));
     }
-    // The tombstones go down BEFORE the peer dir: from here on a retry with
-    // the same token is answered `already_purged`, and a stale client's
-    // `#peer-<slug>` session is refused.
-    let purged_at = Utc::now().to_rfc3339();
-    write_tombstone(
+    // Nothing of the peer is left: the purge is complete, so the record that
+    // answers every retry `already_purged` goes down.
+    write_token_tombstone(
         &peers_root,
         &binding.token_sha256,
         &PurgeTombstone {
@@ -554,18 +571,10 @@ pub(super) async fn raw_peer_purge(
             originator: originator.0.clone(),
             memory_namespace: binding.memory_namespace.clone(),
             purged_at: purged_at.clone(),
-            // Record partial failures on the tombstone itself: a retry
-            // answers `already_purged` with this list, so residue is never
-            // silent (#2659).
-            errors: errors.clone(),
+            errors: Vec::new(),
         },
     )
     .map_err(|error| RpcError::internal_error(format!("failed to record the purge: {error}")))?;
-    // The blackboard and every control file; frees the name, the slug, the
-    // namespace and the workspace reservation.
-    if let Err(error) = remove_tree_within(&peers_root, &peer_dir) {
-        errors.push(format!("peer directory: {error}"));
-    }
     for session in &all_sessions {
         state.session_cache.invalidate_session(session).await;
     }
