@@ -3277,11 +3277,12 @@ async fn should_carry_the_owning_app_and_the_caller_when_a_cross_app_tool_is_cal
     let rows = audit_rows(&fx);
     assert_eq!(rows[0]["app"], "calendar");
 
-    // An owning app id must be well formed.
+    // An owning app id must be well formed. The re-registration comes from
+    // the owning connection — a different connection would be refused by
+    // the route-ownership gate before validation ever runs (UPCR-2026-041).
     let mut bad = news_list();
     bad["app"] = json!("Calendar App");
-    let (ws2, _rx2) = ws_connection_for_test(8);
-    let error = register(&fx, &ws2, &token, json!({ "tools": [bad] })).unwrap_err();
+    let error = register(&fx, &ws, &token, json!({ "tools": [bad] })).unwrap_err();
     assert_eq!(error.data.unwrap()["kind"], "peer_tools_invalid");
 }
 
@@ -4033,10 +4034,12 @@ async fn should_give_the_system_agent_the_app_tools_the_host_registers_on_its_se
     // The host's kernel tool list for the session narrows every turn on it:
     // the host's, other clients', kernel wake-ups; another session of the
     // profile is unaffected.
-    let (list_ws, _list_rx) = ws_connection_for_test(8);
+    // The narrowing re-declaration comes from the owning connection — a
+    // different connection would be refused by the route-ownership gate
+    // (UPCR-2026-041).
     register_on_session(
         &fx,
-        &list_ws,
+        &ws,
         Some(&token),
         &fx.system,
         json!({ "tools": [calendar_today()], "generic_tools": ["read_file", "ask_user_question"] }),
