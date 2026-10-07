@@ -214,6 +214,57 @@ pub fn transport_error_message(
     )
 }
 
+/// Android child processes can fail before receiving any HTTP response. Keep
+/// diagnostics useful without logging an endpoint, credential, request or raw
+/// error chain. The original error still propagates unchanged to the caller.
+pub(crate) fn log_android_transport_failure(error: &reqwest::Error, streaming: bool) {
+    #[cfg(any(target_os = "android", test))]
+    {
+        let diagnostic = transport_diagnostic(error);
+        tracing::warn!(
+            target: "octos::llm::transport",
+            streaming,
+            timeout = diagnostic.timeout,
+            connect = diagnostic.connect,
+            io_kind = ?diagnostic.io_kind,
+            raw_os_error = ?diagnostic.raw_os_error,
+            "HTTP transport failed"
+        );
+    }
+    #[cfg(not(any(target_os = "android", test)))]
+    let _ = (error, streaming);
+}
+
+#[cfg(any(target_os = "android", test))]
+struct TransportDiagnostic {
+    timeout: bool,
+    connect: bool,
+    io_kind: Option<std::io::ErrorKind>,
+    raw_os_error: Option<i32>,
+}
+
+#[cfg(any(target_os = "android", test))]
+fn transport_diagnostic(error: &reqwest::Error) -> TransportDiagnostic {
+    use std::error::Error;
+
+    let mut diagnostic = TransportDiagnostic {
+        timeout: error.is_timeout(),
+        connect: error.is_connect(),
+        io_kind: None,
+        raw_os_error: None,
+    };
+    let mut cause = error.source();
+    while let Some(current) = cause {
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            diagnostic.io_kind = Some(io.kind());
+            diagnostic.raw_os_error = io.raw_os_error();
+            break;
+        }
+        cause = current.source();
+    }
+    diagnostic
+}
+
 /// Operational stages an adapter can fail at once the request left the
 /// builder; rendered by [`operational_error_message`] with the same lane
 /// label as transport errors.
@@ -577,6 +628,84 @@ pub(crate) mod test_lanes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn android_transport_diagnostic_reports_connect_without_request_data() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .post(format!(
+                "http://{address}/private-path?key=fixture-query-secret"
+            ))
+            .header("Authorization", "Bearer fixture-header-secret")
+            .body("fixture-body-secret")
+            .send()
+            .await
+            .unwrap_err();
+        let diagnostic = transport_diagnostic(&error);
+        assert!(diagnostic.connect);
+        assert!(!diagnostic.timeout);
+        assert_eq!(
+            diagnostic.io_kind,
+            Some(std::io::ErrorKind::ConnectionRefused)
+        );
+        assert!(diagnostic.raw_os_error.is_some());
+
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(std::sync::Mutex::new(output.reopen().unwrap()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_android_transport_failure(&error, true);
+        });
+        let log = std::fs::read_to_string(output.path()).unwrap();
+        assert!(log.contains("HTTP transport failed"));
+        assert!(log.contains("connect=true"));
+        assert!(log.contains("timeout=false"));
+        assert!(log.contains("ConnectionRefused"));
+        for private in [
+            "127.0.0.1",
+            "private-path",
+            "fixture-query-secret",
+            "Authorization",
+            "fixture-header-secret",
+            "fixture-body-secret",
+        ] {
+            assert!(
+                !log.contains(private),
+                "request data must not enter diagnostics"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn android_transport_diagnostic_distinguishes_response_timeout() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(50))
+            .build()
+            .unwrap()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap_err();
+        let diagnostic = transport_diagnostic(&error);
+        assert!(diagnostic.timeout);
+        assert!(!diagnostic.connect);
+    }
 
     #[test]
     fn test_truncate_error_body_short() {
