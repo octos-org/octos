@@ -7030,10 +7030,18 @@ async fn should_not_finalize_a_purge_when_the_peer_dir_removal_fails_and_a_retry
     let token = prepare_news(&fx).await;
     let session = peer_key(&fx);
     // Close the peer up front (the purge would then skip the close), and
-    // make the whole peer dir unremovable.
+    // make the whole peer dir unremovable. Root shrugs the read-only bit
+    // off (CAP_DAC_OVERRIDE): probe once, and skip the injection when it
+    // cannot bite (a root runner).
     let peer_dir = peers_root(&fx).join("news");
     std::fs::write(peer_dir.join("closed"), "").unwrap();
+    let probe = peer_dir.join("removal-probe");
+    std::fs::write(&probe, "").unwrap();
     std::fs::set_permissions(&peer_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::remove_file(&probe).is_ok() {
+        std::fs::set_permissions(&peer_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
 
     let (ws, _rx) = ws_connection_for_test(8);
     let error = purge(&fx.state, &ws, &fx.system, "news", &token)
@@ -7053,7 +7061,10 @@ async fn should_not_finalize_a_purge_when_the_peer_dir_removal_fails_and_a_retry
         crate::peers::purge::tombstone_for_token(&peers_root(&fx), &token).is_none(),
         "the token tombstone must wait for a clean removal"
     );
-    // The stale-session refusal is already durable on the slug tombstone.
+    // The handover record is already durable: while the dir is staged the
+    // `closed` marker answers (the assert below, binding found → closed),
+    // and the slug tombstone takes over the moment the dir is gone (the
+    // slug-tombstone branch is asserted in the full-purge e2e test).
     assert!(
         fx.data_dir
             .join(crate::peers::purge::PEER_PURGES_DIR)

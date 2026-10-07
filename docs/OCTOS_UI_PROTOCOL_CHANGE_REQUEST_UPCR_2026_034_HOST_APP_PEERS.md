@@ -563,7 +563,11 @@ erased peer cannot run on as an ordinary profile session.
 **Idempotent.** A purge retried with the same token after it completed
 returns `{session_id, profile_id, slug, purged: false, already_purged: true,
 purged_at}`, also after a new peer took the name (the new peer is not
-touched: its token differs). A purge that failed part-way is retried the
+touched: its token differs). A stop between the dir removal and the token
+record (a crash, a failed write) is the one state where nothing answers
+`already_purged`: the retry is refused `peer_not_found` — nothing is left
+to erase, and the slug record still refuses the stale sessions. A purge
+that failed part-way is retried the
 ordinary way (the peer is still staged) — a partially-failed erase
 (`peer_purge_incomplete`) is one of those: nothing was finalized, so the
 retry erases from the top. Two purges of one peer at once:

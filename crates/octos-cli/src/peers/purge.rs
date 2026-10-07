@@ -39,9 +39,10 @@ pub(crate) struct PurgeTombstone {
     pub(crate) memory_namespace: String,
     /// RFC 3339.
     pub(crate) purged_at: String,
-    /// The erase steps that failed, if any: a purge with residue records
-    /// them here so retries and audits can see the job was partial
-    /// (#2659) instead of presenting an unconditional `already_purged`.
+    /// Erase steps that failed, on records left by older kernels: since
+    /// #2696 a purge with residue never finalizes, so only earlier
+    /// tombstones carry these; the retry path and `residual_errors` keep
+    /// surfacing them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) errors: Vec<String>,
 }
