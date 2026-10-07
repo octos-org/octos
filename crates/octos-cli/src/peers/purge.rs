@@ -191,7 +191,15 @@ pub(crate) fn remove_tree_within(root: &Path, path: &Path) -> std::io::Result<bo
             root.display()
         )));
     }
-    remove_tree(&real_parent.join(leaf))
+    let path = real_parent.join(leaf);
+    // The turn's terminal and its bounded settle delay do not join detached
+    // host-tool audit writers. Wait for any in-flight leaf mutation and keep
+    // subsequent writes outside the entire directory enumeration/removal.
+    // After removal those writers' no-follow directory open fails; no retry
+    // hides a real removal error or allows a token tombstone before success.
+    let lock = peer_io::mutation_lock(&path);
+    let _mutation = lock.lock().unwrap_or_else(|p| p.into_inner());
+    remove_tree(&path)
 }
 
 /// Whether `path` is its own canonical form (no symlink re-roots it).
@@ -202,6 +210,64 @@ pub(crate) fn is_real_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_finish_an_in_flight_peer_write_before_removing_its_directory() {
+        use std::{sync::mpsc, time::Duration};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("peers");
+        let peer = root.join("news");
+        let sibling = root.join("mail");
+        std::fs::create_dir_all(&peer).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(peer.join("brief.md"), "fictional peer").unwrap();
+        let (started, release) = peer_io::mutation_test_hook::pause_append(&peer);
+        let writer_path = peer.clone();
+        let writer = std::thread::spawn(move || {
+            peer_io::append_peer_line(&writer_path, "tool_audit.jsonl", "cancelled\n")
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (removed_tx, removed_rx) = mpsc::channel();
+        let removal_path = peer.clone();
+        let remover = std::thread::spawn(move || {
+            let result = remove_tree_within(&root, &removal_path);
+            removed_tx.send(result).unwrap();
+        });
+        let early_removal = removed_rx.recv_timeout(Duration::from_millis(100));
+        // A different peer remains writable while this peer is held.
+        let sibling_result = peer_io::append_peer_line(&sibling, "tool_audit.jsonl", "kept\n");
+        release.send(()).unwrap();
+        let write_result = writer.join().unwrap();
+        remover.join().unwrap();
+        assert!(
+            early_removal.is_err(),
+            "purge raced an in-flight peer file mutation"
+        );
+        write_result.expect("the admitted write finishes before removal");
+        assert!(
+            removed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+        );
+        sibling_result.unwrap();
+        assert!(
+            !peer.exists(),
+            "no leaf or temporary file survives deletion"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sibling.join("tool_audit.jsonl")).unwrap(),
+            "kept\n"
+        );
+        assert_eq!(
+            peer_io::append_peer_line(&peer, "tool_audit.jsonl", "late\n")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "a late cancelled tool must not recreate the erased peer",
+        );
+    }
 
     #[cfg(unix)]
     #[test]

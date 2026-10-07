@@ -431,6 +431,7 @@ impl OpenAIProvider {
             .json(request)
             .send()
             .await
+            .inspect_err(|error| crate::provider::log_android_transport_failure(error, false))
             .wrap_err_with(|| {
                 crate::provider::transport_error_message(
                     false,
@@ -470,6 +471,7 @@ impl OpenAIProvider {
             .json(&body)
             .send()
             .await
+            .inspect_err(|error| crate::provider::log_android_transport_failure(error, true))
             .wrap_err_with(|| {
                 crate::provider::transport_error_message(
                     true,
