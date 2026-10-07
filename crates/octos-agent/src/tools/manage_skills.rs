@@ -288,6 +288,19 @@ fn do_install(skills_dir: &std::path::Path, input: &Input) -> Result<ToolResult>
     if let Some(ref sub) = subdir {
         // Single skill install
         let src = clone_dir.join(sub);
+        // Containment: the subdir must resolve inside the clone — `..`
+        // segments would escape it and copy arbitrary local directories
+        // into the skills dir (#2680).
+        let src_canonical = src.canonicalize()?;
+        let clone_canonical = clone_dir.canonicalize()?;
+        if !src_canonical.starts_with(&clone_canonical) {
+            return Ok(ToolResult {
+                output: format!("Subdirectory '{sub}' escapes the cloned repository"),
+                success: false,
+                ..Default::default()
+            });
+        }
+        let src = src_canonical;
         if !src.is_dir() {
             return Ok(ToolResult {
                 output: format!(
@@ -645,6 +658,15 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
             continue;
         }
         let src_path = entry.path();
+        // Refuse symlinked entries: a crafted repo can point one at any
+        // local directory or file outside the clone (#2680).
+        if std::fs::symlink_metadata(&src_path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            tracing::info!("skill install: skipping symlink {name_str}");
+            continue;
+        }
         let dst_path = dst.join(&name);
         if src_path.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
@@ -656,7 +678,20 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 }
 
 fn maybe_npm_install(dir: &std::path::Path) {
+    let opted_in = std::env::var("OCTOS_SKILLS_NPM_INSTALL").as_deref() == Ok("1");
+    maybe_npm_install_with(dir, opted_in);
+}
+
+fn maybe_npm_install_with(dir: &std::path::Path, opted_in: bool) {
     if !dir.join("package.json").exists() || dir.join("node_modules").exists() {
+        return;
+    }
+    // Installing dependencies executes arbitrary postinstall scripts —
+    // an operator opt-in (the #2665 env-pattern; #2680).
+    if !opted_in {
+        tracing::info!(
+            "skill ships package.json but OCTOS_SKILLS_NPM_INSTALL != 1; skipping npm install"
+        );
         return;
     }
     let _ = std::process::Command::new("npm")
@@ -947,6 +982,42 @@ fn write_source_info(dir: &std::path::Path, repo: &str, subdir: Option<&str>, br
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn copy_dir_recursive_skips_symlinked_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secret = tempfile::tempdir().unwrap();
+        std::fs::write(secret.path().join("secret.txt"), "outside").unwrap();
+        let src = tmp.path().join("skill");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("ok.txt"), "inside").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(secret.path(), src.join("sub/escape")).unwrap();
+        let dst = tmp.path().join("installed");
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert!(dst.join("ok.txt").exists());
+        assert!(
+            !dst.join("sub/escape").exists(),
+            "symlinked entries must not be followed into the install (#2680)"
+        );
+        assert!(
+            !std::fs::read_to_string(dst.join("sub/escape/secret.txt"))
+                .map(|c| c.contains("outside"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn maybe_npm_install_is_gated_behind_the_operator_opt_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
+        // The opt-in must be explicit: without it the gate returns before
+        // spawning npm (a postinstall would run arbitrary code otherwise).
+        maybe_npm_install_with(tmp.path(), false);
+        // Without the opt-in the node_modules dir is not created and no npm
+        // process was spawned (the gate returns before the Command).
+        assert!(!tmp.path().join("node_modules").exists());
+    }
     use super::*;
 
     #[test]
