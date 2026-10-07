@@ -4921,7 +4921,10 @@ pub async fn register_setup_script_public(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "tenant not found".into()))?;
 
-    if tenant.auth_token != auth_token {
+    // Constant-time: the auth token gates the tenant's setup script (the
+    // #2344 face — a plaintext compare leaks the token byte-by-byte
+    // through response timing).
+    if !crate::api::router::constant_time_eq(tenant.auth_token.as_bytes(), auth_token.as_bytes()) {
         return Err((StatusCode::UNAUTHORIZED, "invalid auth token".into()));
     }
 
