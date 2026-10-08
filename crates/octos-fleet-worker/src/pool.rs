@@ -1548,6 +1548,12 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: interrupting a RUNNING attempt needs the attempt to
+    // start, but the attempt-time gate terminates a worktree attempt whose
+    // sandbox cannot run POSIX sh before the agent does — and on Windows
+    // `MarkerSandbox` honestly reports `!cfg!(windows)`. That terminated path
+    // is covered by `worktree_terminated_when_backend_cannot_run_posix_sh`.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interrupted_worktree_attempt_removes_checkout_keeps_branch() {
         // An interrupted worktree attempt: the LaunchGuard settles it terminal
@@ -1668,6 +1674,12 @@ mod tests {
         );
     }
 
+    // POSIX-sh contract: the empty-branch downgrade needs the attempt to run,
+    // but the attempt-time gate terminates a worktree attempt whose sandbox
+    // cannot run POSIX sh before the agent does — and on Windows
+    // `MarkerSandbox` honestly reports `!cfg!(windows)`. That terminated path
+    // is covered by `worktree_terminated_when_backend_cannot_run_posix_sh`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn worktree_empty_branch_is_not_marked_succeeded() {
         // A worktree task whose worker produced NOTHING must not be recorded
