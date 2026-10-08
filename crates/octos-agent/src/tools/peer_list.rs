@@ -63,7 +63,7 @@ impl Tool for PeerListTool {
          turns it has run, and whether it has its own worktree. Use this to \
          see WHAT peers exist and which have finished; then use peer_gather \
          to read a specific peer's actual brief and result. Takes no \
-         arguments — it always lists every peer you have staged."
+         arguments — includes your automatic workspace team and staged peers."
     }
 
     fn tags(&self) -> &[&str] {

@@ -256,6 +256,9 @@ impl RunIdCache {
 /// independent in-process applications do not.
 #[derive(Default)]
 pub struct UiProtocolRuntimeResources {
+    pub(crate) workspace_teams: Arc<crate::peers::workspace_team::WorkspaceTeams>,
+    pub(crate) shared_instance: std::sync::OnceLock<serde_json::Value>,
+    pub(crate) shared_instance_token: std::sync::OnceLock<String>,
     ledger: std::sync::OnceLock<Arc<ui_protocol_ledger::UiProtocolLedger>>,
     commit_observer: std::sync::OnceLock<octos_bus::MessageCommitObserver>,
 }

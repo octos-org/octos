@@ -55,6 +55,7 @@ mod recovery;
 pub(crate) mod session_tool_list;
 pub(crate) mod shared_history;
 pub(crate) mod turn_origin;
+pub(crate) mod workspace_team;
 pub(crate) use recovery::*;
 // task-evo-peer-turn-status — the typed lifetime projection lives in
 // `recovery` (next to its writers); the derivation below uses both.
