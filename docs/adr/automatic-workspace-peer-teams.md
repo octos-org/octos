@@ -161,7 +161,7 @@ Validation on macOS (2026-10-08):
 | OUP advertised-method catalog guard | Passed |
 | `serve_workspace_team_shared_identity_two_clients_message_and_disconnect` | Passed against a real server and local model stub: concurrent same-folder turns with the same TUI base identity, leader transfer, duplicate delivery receipt, recipient completion after sender disconnect |
 | TUI `shared_discovery_two_cold_launches_start_one_real_server` | Explicitly run and passed with `OCTOS_WORKSPACE_TEST_BINARY` pointing at the matching backend; one real server owns both launches |
-| TUI unit suite | 2,111 passed; existing ignored test left ignored |
+| TUI unit suite (including native-validation follow-up) | 2,112 passed; two explicitly ignored tests |
 | TUI `cargo test --all-targets --offline --no-fail-fast` | Ran; six existing shell integration targets fail because this Mac lacks GNU `flock`, `stat -c`, and `realpath -m`; other targets completed |
 | Clippy (`-D warnings`) | Backend/agent libraries and all TUI targets passed |
 | Formatting and whitespace checks | Passed |
@@ -170,6 +170,41 @@ The six platform-dependent TUI targets are `olp_evo_harvest`, `olp_evo_replay`,
 `olp_evo_retro`, `olp_evo_skeleton`, `olp_watch_board`, and `verify_environment`.
 Linux CI remains necessary before a release. The real-server tests use only
 fixture credentials and a local deterministic model; no paid model is needed.
+
+## Native app and terminal validation follow-up
+
+A real standalone OctosCode app and Octoscode TUI were launched against the
+same shared server and canonical workspace on macOS. Makepad's authenticated
+remote instrumentation drove the hidden native window, including composer
+clicks, text entry and submission. A PTY drove the actual TUI and its `/agents`
+picker. The backend used a local deterministic streaming model fixture.
+
+Both conversations ran concurrently. The TUI discovered the native session,
+transferred coordination to it, and delivered a peer message that appeared in
+the native transcript. A native composer request invoked `peer_send_input` and
+the recipient's result appeared in the TUI. Closing the app preserved the
+coordinator and server; a message to its detached session completed, and
+reopening the app restored both delivered results without adding a team member.
+The app's sidebar listed both independent conversation histories. Twelve
+assertions over the saved UI snapshots, terminal captures and model-request
+timing passed. The restored transcript was scrolled through Makepad input to
+verify the new detached-session result below the initially visible rows.
+
+This exercise also exposed a missed TUI route: two simultaneous first-use
+activation confirmations used the legacy `#coding` identity. Activation and
+cross-profile menus now share the per-client launch topic already used by the
+normal launch path; switching profiles retains that client's topic. Regression
+coverage exercises the actual menu acceptance path, not just the session helper.
+The rebuilt TUI passed the two-terminal activation reproduction with distinct
+session IDs, and the native/TUI collaboration checks were repeated successfully.
+The fix is Octoscode commit `099a2bc`; all-target Clippy and formatting passed.
+The full all-target test run completed with the same six macOS GNU-tool failures
+listed above and no failed unit tests.
+
+The installed native app has a separate path-alias defect: it rejects a fresh
+`session/open` when the requested `/tmp/...` is returned canonically as
+`/private/tmp/...`. The collaboration checks use the canonical path. This
+native defect remains open; backend directory canonicalization is not changed.
 
 ## Delivery limits
 
