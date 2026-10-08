@@ -2664,15 +2664,16 @@ async fn handle_admin_shell(
     };
 
     if !is_admin {
-        // Debug: return what we tried to match against
-        let debug = format!(
-            "token_len={} expected_len={} data_dir={} home={}",
-            token.len(),
-            expected_token.as_ref().map(|t| t.len()).unwrap_or(0),
-            std::env::var("OCTOS_DATA_DIR").unwrap_or_else(|_| "unset".into()),
-            std::env::var("HOME").unwrap_or_else(|_| "unset".into()),
+        // Generic 401 body: the debug response that used to live here leaked
+        // expected token length and HOME/OCTOS_DATA_DIR paths to any caller
+        // probing /admin/shell (#2729). The compare above is already
+        // constant-time (#2705); diagnostics belong in server-side logs only.
+        tracing::debug!(
+            provided_len = token.len(),
+            expected_len = expected_token.as_ref().map(|t| t.len()).unwrap_or(0),
+            "admin shell: invalid auth token"
         );
-        return (StatusCode::UNAUTHORIZED, debug).into_response();
+        return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
     }
 
     if req.command.is_empty() {
