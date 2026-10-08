@@ -34,7 +34,8 @@ for turn rows.
 Params (`SessionAppendMessageParams`):
 
 - `session_id: string` (required) — addressed session. Created implicitly
-  when no candidate store knows it, mirroring `turn/start`.
+  in the store the connection resolves to when it does not exist yet,
+  mirroring `turn/start`.
 - `role: "user" | "assistant" | "system"` (required) — `tool` is rejected:
   tool rows are turn machinery, not conversational records.
 - `content: string` (required, non-blank, ≤ 1,000,000 chars).
@@ -48,7 +49,13 @@ Params (`SessionAppendMessageParams`):
   idempotent retry: nothing is appended and the EXISTING row's seq is
   returned. The existence scan runs inside the same per-key persist lock as
   the append (the `persist_system_note_once` pattern), so a retry racing the
-  original can never double-append.
+  original can never double-append. Two honest scopes on this guarantee:
+  the scan sees the session's LOADED window, so a retry of a row sealed
+  beyond the load budget appends a duplicate; and the namespace is shared
+  with turn-written rows, so a caller reusing a turn's `client_message_id`
+  gets the turn row's seq back with nothing appended — mint distinct ids per
+  producer. Assistant retries whose deriving user row is no longer visible
+  should carry `thread_id` explicitly (see below).
 - `thread_id: string` (optional) — only valid with `role: "assistant"`;
   caller-supplied value wins (same rule as the turn path). When omitted, an
   assistant record binds to the most recent user row's thread and is
@@ -62,6 +69,16 @@ Params (`SessionAppendMessageParams`):
 Result (`SessionAppendMessageResult`): `{ session_id, seq, thread_id }` —
 `thread_id` echoes the resolved binding so callers can correlate without a
 follow-up read.
+
+Mid-turn appends are allowed and deliberate: the record-only write adds
+history, it does not rewrite it, so — unlike `session/rollback` — there is
+no turn-in-progress refusal. The in-flight turn does not see the row (its
+prompt was already built); the per-key persist lock serializes the row
+between the turn's own writes. The assistant thread fallback reads the
+loaded history outside that lock, so under a concurrent writer it can bind
+to a user row that is no longer the newest by commit time — a caller
+writing into a concurrently active session should pass `thread_id`
+explicitly.
 
 Live projection reuses the existing post-commit observer: user and assistant
 records emit the canonical v2 envelopes (`UserMessage` /
@@ -81,10 +98,15 @@ transcript hash, and token estimates stay consistent with durable history.
 Capability gating: none — `session/rollback`, `session/fork`, and
 `session/btw` all ship ungated and this method is their family member. It is
 NOT added to the external-client allowlist (UPCR-2026-036): external
-connections keep read-only history access plus turn execution. Gateway-
-attached deployments where the addressed session lives only in the gateway
-are out of scope for this UPCR; the method writes the serve-resolved stores
-and reports `unknown_session` when no store knows the session.
+connections keep read-only history access plus turn execution. Host-owned
+app-peer sessions (UPCR-2026-035) treat it as a write: the
+`HOST_PEER_SESSION_WRITE_METHODS` gate confines it to the peer's host
+connection, exactly like `turn/start` and `session/rollback`, because an
+appended record lands in the peer's next turn's prompt. Gateway-attached
+deployments where the addressed session lives only in the gateway are out
+of scope for this UPCR: the method writes the serve-resolved stores, and a
+session that no serve store knows is simply created there (the write never
+proxies to the gateway).
 
 Wire changes are strictly additive: one new command constant, one
 `UiCommand` variant, two DTOs, and one optional `serde(default,
@@ -99,8 +121,13 @@ skip_serializing_if)` field on `Message`. Legacy JSONL rows parse unchanged
 - octos-bus: idempotent retry returns the original seq without a second
   row; user/assistant/system thread-binding rules; source persists to the
   JSONL row.
-- octos-cli: handler validation matrix (role/content/source/thread_id
-  rules); context-manager recording for open and closed sessions.
+- octos-cli: handler validation matrix (role/content/source/media/
+  thread_id rules, including the whitespace forms); idempotent retry
+  through the handler; user-row thread rooting; assistant unbound-thread
+  refusal and explicit-binding rescue; context-manager recording of
+  assistant records for the live-manager and durable-snapshot branches
+  (the recording path skips system rows, matching the background-row
+  path); host-peer write-gate confinement.
 - e2e (model-independent lane): live serve with NO provider configured —
   `session/append_message` persists user + assistant records, a
   `session/messages_page` read sees them with `source`, a retry returns the

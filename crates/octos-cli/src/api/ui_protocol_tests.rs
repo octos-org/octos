@@ -49744,7 +49744,7 @@ async fn session_append_message_rejects_invalid_params_with_typed_kinds() {
         (
             "invalid_session_id",
             SessionAppendMessageParams {
-                session_id: SessionKey(String::new()),
+                session_id: SessionKey("   ".into()),
                 ..base.clone()
             },
         ),
@@ -49780,7 +49780,7 @@ async fn session_append_message_rejects_invalid_params_with_typed_kinds() {
         (
             "invalid_media",
             SessionAppendMessageParams {
-                media: vec!["".into()],
+                media: vec!["  ".into()],
                 ..base
             },
         ),
@@ -49845,4 +49845,90 @@ async fn session_append_message_rejects_invalid_params_with_typed_kinds() {
     let frame = recv_rpc_json(&mut rx).await;
     assert_eq!(frame["result"]["seq"], 0, "{frame}");
     assert_eq!(frame["result"]["thread_id"], "imported-thread");
+}
+
+// ===== UPCR-2026-041 `session/append_message` context recording =====
+
+/// An out-of-band record merges into the session's context view wherever it
+/// exists: the live manager directly, otherwise the durable snapshot
+/// (loaded, merged, persisted). The row carries the `external_record` source
+/// kind and its committed seq either way.
+#[test]
+fn external_record_row_merges_into_live_and_snapshot_context_views() {
+    let session_id = SessionKey::new("api", "context-external-record");
+    let history = vec![test_message(MessageRole::User, "what is the capital?")];
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut record = test_message(MessageRole::Assistant, "Kyoto.");
+    record.source = Some("external_record:whiteboard".to_owned());
+
+    // Live branch.
+    let live = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let registration = register_appui_session_context_manager(&session_id, &live);
+    record_appui_context_manager_external_record(dir.path(), &session_id, &record, 1);
+    let merged = live
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let item = merged
+        .ledger_items()
+        .iter()
+        .find(|item| {
+            matches!(
+                &item.kind,
+                crate::context_manager::TranscriptItemKind::AssistantFinal { content }
+                    if content == "Kyoto."
+            )
+        })
+        .expect("external record merged into the live manager");
+    assert_eq!(
+        item.source_ref
+            .as_ref()
+            .and_then(|source| source.source_seq),
+        Some(1)
+    );
+    assert_eq!(
+        item.source_ref
+            .as_ref()
+            .map(|source| source.source_event_kind.as_str()),
+        Some("external_record")
+    );
+    drop(registration);
+    // Release the test's own strong reference too — the registry holds the
+    // manager as a Weak, so `live` here would still upgrade and route the
+    // second record into the LIVE branch instead of the snapshot one.
+    drop(live);
+
+    // Snapshot branch: no live manager, but the live-branch call persisted a
+    // durable snapshot — a second record must load-merge-persist it.
+    let mut second = test_message(MessageRole::Assistant, "importer note");
+    second.source = Some("external_record:import".to_owned());
+    record_appui_context_manager_external_record(dir.path(), &session_id, &second, 2);
+    let reloaded = load_context_manager_snapshot(dir.path(), &session_id.to_string())
+        .unwrap()
+        .expect("snapshot survived the snapshot-branch merge");
+    assert!(
+        reloaded.ledger_items().iter().any(|item| {
+            matches!(
+                &item.kind,
+                crate::context_manager::TranscriptItemKind::AssistantFinal { content }
+                    if content == "Kyoto."
+            )
+        }),
+        "the first record is still in the reloaded snapshot"
+    );
+    assert!(
+        reloaded.ledger_items().iter().any(|item| {
+            matches!(
+                &item.kind,
+                crate::context_manager::TranscriptItemKind::AssistantFinal { content }
+                    if content == "importer note"
+            )
+        }),
+        "the snapshot-branch record landed in the durable snapshot"
+    );
 }

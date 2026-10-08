@@ -180,7 +180,10 @@ test.describe("M9 protocol — session/append_message", () => {
         client_message_id: `cmid-${sid}-live`,
       });
       const envelope = await observer.waitForEnvelopePayload("user_message");
-      expect(envelope.params).toBeTruthy();
+      // The envelope carries THIS record, not just any user row.
+      expect(envelope.params.session_id).toBe(sid);
+      expect(envelope.params.payload.data.text).toBe("live projection probe");
+      expect(envelope.params.client_message_id).toBe(`cmid-${sid}-live`);
       const appended = await appendPromise;
       expect(appended.seq).toBe(0);
     } finally {

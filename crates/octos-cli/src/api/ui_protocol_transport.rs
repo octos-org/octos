@@ -28497,6 +28497,9 @@ const HOST_PEER_SESSION_WRITE_METHODS: &[&str] = &[
     "turn/steer",
     "turn/interrupt",
     "session/rollback",
+    // UPCR-2026-041: a record-only append still lands in the peer's next
+    // turn's prompt — the same injection surface as the writes above.
+    "session/append_message",
     "session/goal/set",
     "session/goal/clear",
     "session/goal/operator_transition",
@@ -30729,7 +30732,7 @@ async fn handle_session_append_message(
     // An empty key would otherwise be auto-created as a session — append is
     // the one history mutator that creates implicitly, so it must refuse the
     // unaddressable form explicitly.
-    if params.session_id.0.is_empty() {
+    if params.session_id.0.trim().is_empty() {
         let _ = send_rpc_error(
             ws,
             Some(id),
@@ -30796,7 +30799,7 @@ async fn handle_session_append_message(
         );
         return;
     }
-    if params.media.iter().any(String::is_empty) {
+    if params.media.iter().any(|entry| entry.trim().is_empty()) {
         let _ = send_rpc_error(
             ws,
             Some(id),
