@@ -2482,11 +2482,15 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - 8009:8009     # 应用服务监听（接收 Palpo 推送的事件）
+      # 8009 刻意不发布到主机：Palpo 通过 internal 桥接网络直连应用服务监听
+      # （http://octos:8009），监听只靠 hs_token 认证，不应暴露到 compose
+      # 网络之外。
       - 8010:8080     # Octos 仪表盘 / 管理 API
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       RUST_LOG: octos=debug,info
+      # 应用服务监听默认只绑回环地址；跨容器的 homeserver 推送需要显式放开。
+      OCTOS_MATRIX_APPSERVICE_BIND: 0.0.0.0:8009
     volumes:
       - ./data/octos:/root/.octos
       - ./config/botfather.json:/root/.octos/profiles/botfather.json:ro

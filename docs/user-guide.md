@@ -2606,11 +2606,17 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - 8009:8009     # Appservice listener (receives events from Palpo)
+      # 8009 is intentionally NOT published: Palpo reaches the appservice
+      # listener over the internal bridge (http://octos:8009), and the
+      # listener authenticates with the hs_token alone, so it should not be
+      # reachable from outside the compose network.
       - 8010:8080     # Octos dashboard / admin API
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       RUST_LOG: octos=debug,info
+      # The appservice listener binds loopback by default; cross-container
+      # homeserver pushes need an explicit opt-out.
+      OCTOS_MATRIX_APPSERVICE_BIND: 0.0.0.0:8009
     volumes:
       - ./data/octos:/root/.octos
       - ./config/botfather.json:/root/.octos/profiles/botfather.json:ro
