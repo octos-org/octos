@@ -4630,10 +4630,7 @@ async fn add_message_once_dedupes_retry_by_client_message_id() {
     let second = record(MessageRole::Assistant, "hi back", Some("cmid-2"));
     let mut second = second;
     second.thread_id = Some("cmid-1".to_owned());
-    let (seq, appended) = mgr
-        .add_message_once_with_seq(&key, second)
-        .await
-        .unwrap();
+    let (seq, appended) = mgr.add_message_once_with_seq(&key, second).await.unwrap();
     assert_eq!((seq, appended), (1, true));
 
     let session = mgr.load(&key).await.unwrap();
@@ -4671,7 +4668,9 @@ async fn add_message_once_persists_source_and_thread_binding() {
     {
         let mut mgr = SessionManager::open(tmp.path()).unwrap();
         mgr.add_message_once_with_seq(&key, user).await.unwrap();
-        mgr.add_message_once_with_seq(&key, assistant).await.unwrap();
+        mgr.add_message_once_with_seq(&key, assistant)
+            .await
+            .unwrap();
     }
 
     // A fresh manager reads the same rows back with source + thread intact —

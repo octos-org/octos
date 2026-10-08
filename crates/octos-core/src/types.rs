@@ -826,9 +826,10 @@ mod tests {
         let parsed: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.source.as_deref(), Some("external_record:whiteboard"));
 
-        let legacy: Message =
-            serde_json::from_str(r#"{"role":"assistant","content":"hi","timestamp":"2026-04-24T00:00:00Z"}"#)
-                .unwrap();
+        let legacy: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":"hi","timestamp":"2026-04-24T00:00:00Z"}"#,
+        )
+        .unwrap();
         assert!(legacy.source.is_none());
     }
 

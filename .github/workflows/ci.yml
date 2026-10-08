@@ -1507,7 +1507,7 @@ jobs:
       # nightly.yml.
       - name: Run m9 protocol conformance (model-independent)
         working-directory: e2e
-        run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/m9-protocol-session-open.spec.ts tests/m9-protocol-diff-preview.spec.ts
+        run: OCTOS_TEST_URL=http://localhost:3000 OCTOS_AUTH_TOKEN=ci-test-token npx playwright test --reporter=line tests/m9-protocol-session-open.spec.ts tests/m9-protocol-diff-preview.spec.ts tests/m9-protocol-session-append.spec.ts
 
       - name: Stop octos serve
         if: always()

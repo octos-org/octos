@@ -3736,6 +3736,12 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         }),
         methods::SESSION_HYDRATE => json!({ "session_id": session_id }),
         methods::SESSION_ROLLBACK => json!({ "session_id": session_id, "num_turns": 1 }),
+        methods::SESSION_APPEND_MESSAGE => json!({
+            "session_id": session_id,
+            "role": "system",
+            "content": "dispatch probe record",
+            "source": "probe",
+        }),
         methods::THREAD_GRAPH_GET => json!({ "session_id": session_id }),
         methods::TURN_STATE_GET => json!({
             "session_id": session_id,
@@ -49568,3 +49574,275 @@ async fn should_replay_an_external_prompt_to_its_owner_after_the_side_table_forg
 }
 #[path = "session_history_tests.rs"]
 mod session_history_tests;
+
+// ===== UPCR-2026-041 `session/append_message` handler =====
+
+/// Disk-backed state with one persisted user row so assistant records have a
+/// thread to derive from. Mirrors `prg_state_with_persisted_turns`'s shape.
+async fn append_state_with_user_row(session_id: &SessionKey) -> (Arc<AppState>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager = octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+    let manager = Arc::new(tokio::sync::Mutex::new(manager));
+    {
+        let mut guard = manager.lock().await;
+        let user = Message {
+            role: MessageRole::User,
+            content: "what is the capital?".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: Some("cmid-user-1".into()),
+            thread_id: Some("cmid-user-1".into()),
+            timestamp: Utc::now(),
+            source: None,
+        };
+        guard
+            .add_message(session_id, user)
+            .await
+            .expect("persist user");
+    }
+    let state = Arc::new(AppState {
+        sessions: Some(manager),
+        ..AppState::empty_for_tests()
+    });
+    (state, tmp)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_append_message_persists_records_without_a_turn() {
+    let session_id = SessionKey("local:append-1".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+
+    handle_session_append_message(
+        &ws,
+        &state,
+        None,
+        None,
+        "am1".into(),
+        SessionAppendMessageParams {
+            session_id: session_id.clone(),
+            role: "assistant".into(),
+            content: "The capital is Kyoto.".into(),
+            media: vec!["uploads/map.png".into()],
+            source: "external_record:whiteboard".into(),
+            client_message_id: Some("cmid-answer-1".into()),
+            thread_id: None,
+        },
+    )
+    .await;
+
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["id"], "am1");
+    let result = &frame["result"];
+    assert_eq!(result["session_id"], session_id.to_string());
+    assert_eq!(result["seq"], 1);
+    // The assistant record derived its thread from the session's user row.
+    assert_eq!(result["thread_id"], "cmid-user-1");
+
+    // The row is durable with its provenance tag — a fresh manager reads it
+    // back from the JSONL.
+    let sessions = state.sessions.as_ref().unwrap();
+    let guard = sessions.lock().await;
+    let session = guard.load(&session_id).await.expect("session");
+    assert_eq!(session.messages.len(), 2);
+    let assistant = session.messages.last().unwrap();
+    assert_eq!(assistant.content, "The capital is Kyoto.");
+    assert_eq!(
+        assistant.source.as_deref(),
+        Some("external_record:whiteboard")
+    );
+    assert_eq!(assistant.thread_id.as_deref(), Some("cmid-user-1"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_append_message_retry_returns_existing_seq_without_a_second_row() {
+    let session_id = SessionKey("local:append-retry".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+
+    let params = |content: &str| SessionAppendMessageParams {
+        session_id: session_id.clone(),
+        role: "assistant".into(),
+        content: content.into(),
+        media: vec![],
+        source: "external_record:whiteboard".into(),
+        client_message_id: Some("cmid-answer-1".into()),
+        thread_id: None,
+    };
+
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(&ws, &state, None, None, "am-a".into(), params("first")).await;
+    let first = recv_rpc_json(&mut rx).await;
+    assert_eq!(first["result"]["seq"], 1);
+
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(&ws, &state, None, None, "am-b".into(), params("retried")).await;
+    let retry = recv_rpc_json(&mut rx).await;
+    assert_eq!(retry["result"]["seq"], 1, "retry returns the original seq");
+
+    let sessions = state.sessions.as_ref().unwrap();
+    let guard = sessions.lock().await;
+    let session = guard.load(&session_id).await.expect("session");
+    assert_eq!(session.messages.len(), 2, "retry must not double-append");
+    assert_eq!(session.messages.last().unwrap().content, "first");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_append_message_user_record_roots_its_own_thread() {
+    let session_id = SessionKey("local:append-user".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+
+    handle_session_append_message(
+        &ws,
+        &state,
+        None,
+        None,
+        "am2".into(),
+        SessionAppendMessageParams {
+            session_id: session_id.clone(),
+            role: "user".into(),
+            content: "and the old one?".into(),
+            media: vec![],
+            source: "external_record:whiteboard".into(),
+            client_message_id: Some("cmid-user-2".into()),
+            thread_id: None,
+        },
+    )
+    .await;
+
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["seq"], 1);
+    assert_eq!(frame["result"]["thread_id"], "cmid-user-2");
+
+    let sessions = state.sessions.as_ref().unwrap();
+    let guard = sessions.lock().await;
+    let session = guard.load(&session_id).await.expect("session");
+    assert_eq!(
+        session.messages.last().unwrap().thread_id.as_deref(),
+        Some("cmid-user-2")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_append_message_rejects_invalid_params_with_typed_kinds() {
+    let session_id = SessionKey("local:append-invalid".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+
+    let base = SessionAppendMessageParams {
+        session_id: session_id.clone(),
+        role: "assistant".into(),
+        content: "ok".into(),
+        media: vec![],
+        source: "external_record:test".into(),
+        client_message_id: None,
+        thread_id: None,
+    };
+
+    let cases: Vec<(&str, SessionAppendMessageParams)> = vec![
+        (
+            "invalid_session_id",
+            SessionAppendMessageParams {
+                session_id: SessionKey(String::new()),
+                ..base.clone()
+            },
+        ),
+        (
+            "invalid_role",
+            SessionAppendMessageParams {
+                role: "tool".into(),
+                ..base.clone()
+            },
+        ),
+        (
+            "invalid_content",
+            SessionAppendMessageParams {
+                content: "   ".into(),
+                ..base.clone()
+            },
+        ),
+        (
+            "invalid_source",
+            SessionAppendMessageParams {
+                source: "  ".into(),
+                ..base.clone()
+            },
+        ),
+        (
+            "invalid_thread_id",
+            SessionAppendMessageParams {
+                role: "user".into(),
+                thread_id: Some("t1".into()),
+                ..base.clone()
+            },
+        ),
+        (
+            "invalid_media",
+            SessionAppendMessageParams {
+                media: vec!["".into()],
+                ..base
+            },
+        ),
+    ];
+    for (kind, params) in cases {
+        let (ws, mut rx) = ws_connection_for_test(8);
+        handle_session_append_message(&ws, &state, None, None, "amx".into(), params).await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["error"]["code"], -32602, "case {kind}: {frame}");
+        assert_eq!(frame["error"]["data"]["kind"], kind, "case {kind}: {frame}");
+    }
+
+    // Assistant record into a session whose only row is... a user row — the
+    // derivation succeeds, so exercise the unbound-thread refusal with a
+    // session that has NO user row.
+    let fresh = SessionKey("local:append-empty".into());
+    let tmp2 = tempfile::tempdir().expect("tempdir");
+    let manager = octos_bus::SessionManager::open(tmp2.path()).expect("open");
+    let state2 = Arc::new(AppState {
+        sessions: Some(Arc::new(tokio::sync::Mutex::new(manager))),
+        ..AppState::empty_for_tests()
+    });
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(
+        &ws,
+        &state2,
+        None,
+        None,
+        "am3".into(),
+        SessionAppendMessageParams {
+            session_id: fresh.clone(),
+            role: "assistant".into(),
+            content: "orphan answer".into(),
+            media: vec![],
+            source: "external_record:test".into(),
+            client_message_id: None,
+            thread_id: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["error"]["data"]["kind"], "unbound_thread", "{frame}");
+    // ...and an explicit thread_id rescues it (caller-supplied binding wins).
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(
+        &ws,
+        &state2,
+        None,
+        None,
+        "am4".into(),
+        SessionAppendMessageParams {
+            session_id: fresh.clone(),
+            role: "assistant".into(),
+            content: "orphan answer".into(),
+            media: vec![],
+            source: "external_record:test".into(),
+            client_message_id: None,
+            thread_id: Some("imported-thread".into()),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["seq"], 0, "{frame}");
+    assert_eq!(frame["result"]["thread_id"], "imported-thread");
+}

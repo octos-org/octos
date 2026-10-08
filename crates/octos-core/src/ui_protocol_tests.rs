@@ -4893,7 +4893,12 @@ fn upcr_041_append_message_round_trips_through_rpc_envelope() {
     let json = serde_json::to_value(&bare).expect("params json");
     assert!(json.get("client_message_id").is_none());
     assert!(json.get("thread_id").is_none());
-    assert!(!json.get("media").map(|m| !m.as_array().unwrap().is_empty()).unwrap_or(false));
+    assert!(
+        !json
+            .get("media")
+            .map(|m| !m.as_array().unwrap().is_empty())
+            .unwrap_or(false)
+    );
 
     // Result DTO round-trip.
     let result = SessionAppendMessageResult {
