@@ -4209,3 +4209,63 @@ async fn send_raw_sse_bound_overwrites_stale_thread_id_in_payload() {
         "send_raw_sse_bound must overwrite stale payload thread_id with bound id. event: {parsed}"
     );
 }
+
+/// #2729: the admin shell auth failure must not disclose configuration to
+/// the unauthenticated caller. The failure body stays the same generic
+/// string as the channel's other auth guards — the presented/expected
+/// token lengths and the local data-dir paths stay server-side.
+#[tokio::test]
+async fn admin_shell_auth_failure_body_discloses_no_configuration() {
+    let expected = "octos-admin-e2e-secret-token";
+    let app = Router::new()
+        .route("/admin/shell", post(handle_admin_shell))
+        .with_state(ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: Some(expected.to_string()),
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions: test_sessions(),
+            task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+            event_seq: Arc::new(StdMutex::new(HashMap::new())),
+        });
+
+    async fn probe(app: Router, token: Option<&str>, body: &str) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/admin/shell")
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    // A wrong token (different length than expected) and no token at all
+    // both get the generic guard body — never a debug echo of what the
+    // server tried to match against. The probes post an empty command so
+    // even a fail-open auth regression can never spawn a shell here.
+    for presented in [Some("short"), None] {
+        let (status, body) = probe(app.clone(), presented, r#"{"command":""}"#).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, "invalid auth token", "leaky body: {body}");
+    }
+
+    // The correct token passes the auth gate: the empty command surfaces
+    // the next validation error.
+    let (status, body) = probe(app, Some(expected), r#"{"command":""}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "command is required");
+}

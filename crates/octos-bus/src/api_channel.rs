@@ -2664,15 +2664,17 @@ async fn handle_admin_shell(
     };
 
     if !is_admin {
-        // Debug: return what we tried to match against
-        let debug = format!(
-            "token_len={} expected_len={} data_dir={} home={}",
-            token.len(),
-            expected_token.as_ref().map(|t| t.len()).unwrap_or(0),
-            std::env::var("OCTOS_DATA_DIR").unwrap_or_else(|_| "unset".into()),
-            std::env::var("HOME").unwrap_or_else(|_| "unset".into()),
+        // Details stay server-side: echoing the expected token length and
+        // the local data-dir paths back to an unauthenticated caller is a
+        // token-format oracle plus a configuration disclosure.
+        warn!(
+            presented_len = token.len(),
+            expected_len = expected_token.as_ref().map(|t| t.len()).unwrap_or(0),
+            data_dir = std::env::var("OCTOS_DATA_DIR").unwrap_or_else(|_| "unset".into()),
+            home = std::env::var("HOME").unwrap_or_else(|_| "unset".into()),
+            "admin shell auth failed"
         );
-        return (StatusCode::UNAUTHORIZED, debug).into_response();
+        return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
     }
 
     if req.command.is_empty() {
