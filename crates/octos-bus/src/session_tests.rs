@@ -4600,3 +4600,93 @@ async fn torn_tail_does_not_eat_rollback_marker_in_per_user_layout() {
         "rollback marker on the per-user file must survive a torn tail"
     );
 }
+
+// ----- UPCR-2026-041 `session/append_message` primitives -----
+
+fn record(role: MessageRole, content: &str, cmid: Option<&str>) -> Message {
+    let mut message = make_message(role, content);
+    message.client_message_id = cmid.map(str::to_owned);
+    message
+}
+
+#[tokio::test]
+async fn add_message_once_dedupes_retry_by_client_message_id() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("api", "append-once");
+
+    let first = record(MessageRole::User, "hello", Some("cmid-1"));
+    let (seq, appended) = mgr.add_message_once_with_seq(&key, first).await.unwrap();
+    assert_eq!((seq, appended), (0, true));
+
+    // A retry carrying the same cmid is a no-op that returns the ORIGINAL
+    // row's seq — even when the retried payload differs (cmid is the
+    // idempotency key, first row wins).
+    let retry = record(MessageRole::User, "hello (retried)", Some("cmid-1"));
+    let (seq, appended) = mgr.add_message_once_with_seq(&key, retry).await.unwrap();
+    assert_eq!((seq, appended), (0, false));
+
+    // A fresh cmid appends normally.
+    let second = record(MessageRole::Assistant, "hi back", Some("cmid-2"));
+    let mut second = second;
+    second.thread_id = Some("cmid-1".to_owned());
+    let (seq, appended) = mgr
+        .add_message_once_with_seq(&key, second)
+        .await
+        .unwrap();
+    assert_eq!((seq, appended), (1, true));
+
+    let session = mgr.load(&key).await.unwrap();
+    assert_eq!(session.messages.len(), 2, "retry must not double-append");
+    assert_eq!(session.messages[0].content, "hello");
+}
+
+#[tokio::test]
+async fn add_message_once_without_client_message_id_never_dedupes() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("api", "append-no-cmid");
+
+    for expected_seq in 0..2 {
+        let (seq, appended) = mgr
+            .add_message_once_with_seq(&key, record(MessageRole::System, "note", None))
+            .await
+            .unwrap();
+        assert_eq!((seq, appended), (expected_seq, true));
+    }
+    let session = mgr.load(&key).await.unwrap();
+    assert_eq!(session.messages.len(), 2);
+}
+
+#[tokio::test]
+async fn add_message_once_persists_source_and_thread_binding() {
+    let tmp = TempDir::new().unwrap();
+    let key = SessionKey::new("api", "append-source");
+
+    let mut user = record(MessageRole::User, "what is the capital?", Some("cmid-1"));
+    user.source = Some("external_record:whiteboard".to_owned());
+    let mut assistant = record(MessageRole::Assistant, "Kyoto.", Some("cmid-2"));
+    assistant.thread_id = Some("cmid-1".to_owned());
+    assistant.source = Some("external_record:whiteboard".to_owned());
+    {
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        mgr.add_message_once_with_seq(&key, user).await.unwrap();
+        mgr.add_message_once_with_seq(&key, assistant).await.unwrap();
+    }
+
+    // A fresh manager reads the same rows back with source + thread intact —
+    // the tags live on the durable JSONL rows, not just the mirror.
+    let mgr = SessionManager::open(tmp.path()).unwrap();
+    let session = mgr.load(&key).await.unwrap();
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(
+        session.messages[0].source.as_deref(),
+        Some("external_record:whiteboard")
+    );
+    assert_eq!(session.messages[0].thread_id.as_deref(), Some("cmid-1"));
+    assert_eq!(
+        session.messages[1].source.as_deref(),
+        Some("external_record:whiteboard")
+    );
+    assert_eq!(session.messages[1].thread_id.as_deref(), Some("cmid-1"));
+}

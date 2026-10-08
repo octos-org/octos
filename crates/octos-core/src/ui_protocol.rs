@@ -1116,6 +1116,12 @@ pub mod methods {
     /// `session/btw` — quick aside question answered out-of-band (no tools)
     /// while the session's live turn, if any, keeps running.
     pub const SESSION_BTW: &str = "session/btw";
+    /// UPCR-2026-041 `session/append_message` — record-only history write.
+    /// Appends one row to the session's persisted history WITHOUT starting a
+    /// turn, calling a model, or running a tool — the write-side mirror of
+    /// `session/btw` and the gentlest member of the `session/rollback` /
+    /// `session/fork` history-mutating family.
+    pub const SESSION_APPEND_MESSAGE: &str = "session/append_message";
 
     /// UPCR-2026-021 M15 agent inspection/control surface.
     pub const AGENT_LIST: &str = "agent/list";
@@ -1438,6 +1444,7 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
     methods::SESSION_BTW,
+    methods::SESSION_APPEND_MESSAGE,
     methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
@@ -1573,6 +1580,7 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::APPROVAL_RESPOND,
     methods::APPROVAL_SCOPES_LIST,
     methods::SESSION_BTW,
+    methods::SESSION_APPEND_MESSAGE,
     methods::USER_QUESTION_RESPOND,
     methods::PERMISSION_PROFILE_LIST,
     methods::PERMISSION_PROFILE_SET,
@@ -2024,6 +2032,7 @@ pub enum UiResultKind {
     ThreadGraphGet,
     TurnStateGet,
     SessionBtw,
+    SessionAppendMessage,
     UnsupportedCapability,
 }
 
@@ -2050,6 +2059,7 @@ pub fn first_server_result_kind_for_method(method: &str) -> Option<UiResultKind>
         methods::THREAD_GRAPH_GET => Some(UiResultKind::ThreadGraphGet),
         methods::TURN_STATE_GET => Some(UiResultKind::TurnStateGet),
         methods::SESSION_BTW => Some(UiResultKind::SessionBtw),
+        methods::SESSION_APPEND_MESSAGE => Some(UiResultKind::SessionAppendMessage),
         _ => None,
     }
 }
@@ -3200,6 +3210,58 @@ pub struct SessionForkResult {
     pub copied_messages: u32,
 }
 
+// ----- UPCR-2026-041 `session/append_message` -----
+
+/// Params for `session/append_message` (UPCR-2026-041) — record-only history
+/// write. Never starts a turn, calls a model, or runs a tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAppendMessageParams {
+    pub session_id: SessionKey,
+    /// `"user" | "assistant" | "system"`. `tool` is rejected: tool rows are
+    /// turn machinery, not conversational records.
+    pub role: String,
+    /// Non-blank record body, capped at
+    /// [`SESSION_APPEND_MESSAGE_MAX_CONTENT_CHARS`].
+    pub content: String,
+    /// Media references stored verbatim on the row; entries must be
+    /// non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<String>,
+    /// Required provenance tag persisted on the row (e.g.
+    /// `external_record:whiteboard`). Turn-written rows leave
+    /// `Message::source` absent.
+    pub source: String,
+    /// Correlation token. When a live row in the addressed session already
+    /// carries it, the call is an idempotent retry: nothing is appended and
+    /// the existing row's seq is returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    /// Assistant-only explicit thread binding; a caller-supplied value wins
+    /// (same rule as the turn path). Invalid with `user` (rows root their own
+    /// thread) and `system` (rows are not thread-scoped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+/// Result for `session/append_message`. `thread_id` echoes the resolved
+/// binding (absent for `system` rows) so callers can correlate without a
+/// follow-up read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAppendMessageResult {
+    pub session_id: SessionKey,
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
+
+/// Abuse bound for `session/append_message` `content` — generous enough for a
+/// full skill answer, tight enough that one record cannot dominate a session
+/// file (the 1 MiB tool-argument precedent).
+pub const SESSION_APPEND_MESSAGE_MAX_CONTENT_CHARS: usize = 1_000_000;
+
+/// Provenance-tag cap, matching `SESSION_TITLE_SET_MAX_CHARS`.
+pub const SESSION_APPEND_MESSAGE_MAX_SOURCE_CHARS: usize = 200;
+
 // ----- UPCR-2026-010 `thread/graph/get` -----
 
 /// Params for `thread/graph/get` (UPCR-2026-010).
@@ -4300,6 +4362,7 @@ pub enum UiCommand {
     ThreadGraphGet(ThreadGraphGetParams),
     TurnStateGet(TurnStateGetParams),
     SessionBtw(SessionBtwParams),
+    SessionAppendMessage(SessionAppendMessageParams),
     // ---- M12 Phase D-1 auxiliary REST → WS frames ----
     SessionList(SessionListParams),
     SessionSnapshot(SessionSnapshotParams),
@@ -4359,6 +4422,7 @@ impl UiCommand {
             Self::ThreadGraphGet(_) => methods::THREAD_GRAPH_GET,
             Self::TurnStateGet(_) => methods::TURN_STATE_GET,
             Self::SessionBtw(_) => methods::SESSION_BTW,
+            Self::SessionAppendMessage(_) => methods::SESSION_APPEND_MESSAGE,
             Self::SessionList(_) => methods::SESSION_LIST,
             Self::SessionSnapshot(_) => methods::SESSION_SNAPSHOT,
             Self::SessionMessagesPage(_) => methods::SESSION_MESSAGES_PAGE,
@@ -4418,6 +4482,7 @@ impl UiCommand {
             Self::ThreadGraphGet(params) => serde_json::to_value(params),
             Self::TurnStateGet(params) => serde_json::to_value(params),
             Self::SessionBtw(params) => serde_json::to_value(params),
+            Self::SessionAppendMessage(params) => serde_json::to_value(params),
             Self::SessionList(params) => serde_json::to_value(params),
             Self::SessionSnapshot(params) => serde_json::to_value(params),
             Self::SessionMessagesPage(params) => serde_json::to_value(params),
@@ -4503,6 +4568,9 @@ impl UiCommand {
             methods::THREAD_GRAPH_GET => Ok(Self::ThreadGraphGet(decode_params(method, params)?)),
             methods::TURN_STATE_GET => Ok(Self::TurnStateGet(decode_params(method, params)?)),
             methods::SESSION_BTW => Ok(Self::SessionBtw(decode_params(method, params)?)),
+            methods::SESSION_APPEND_MESSAGE => {
+                Ok(Self::SessionAppendMessage(decode_params(method, params)?))
+            }
             methods::SESSION_LIST => Ok(Self::SessionList(decode_optional_params(method, params)?)),
             methods::LAUNCH_RESOLVE => Ok(Self::LaunchResolve(decode_params(method, params)?)),
             methods::SESSION_SNAPSHOT => Ok(Self::SessionSnapshot(decode_params(method, params)?)),

@@ -2085,6 +2085,49 @@ impl SessionManager {
         self.add_message_with_seq_unlocked(key, message).await
     }
 
+    /// Append a message unless the session already carries a live row with
+    /// the same `client_message_id` — the `session/append_message`
+    /// idempotent-retry primitive (UPCR-2026-041; the
+    /// `persist_system_note_once` pattern): the existence scan and the append
+    /// share the per-key persist lock, so a retry racing the original commit
+    /// can never double-append.
+    ///
+    /// Returns `(seq, appended)` — on a retry hit, the EXISTING row's seq
+    /// with `appended == false`; the caller's message is dropped (`cmid` is
+    /// an idempotency key, first row wins — callers mint fresh ids for new
+    /// records). Rows without a `client_message_id` never dedupe. The scan
+    /// sees the loaded window (the same visibility every other reader of
+    /// this manager gets); a row sealed beyond the load budget is outside it.
+    pub async fn add_message_once_with_seq(
+        &mut self,
+        key: &SessionKey,
+        message: Message,
+    ) -> Result<(usize, bool)> {
+        let Some(cmid) = message
+            .client_message_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+        else {
+            let seq = self.add_message_with_seq(key, message).await?;
+            return Ok((seq, true));
+        };
+        let lock = persist_lock_for(key);
+        let _guard = lock.lock().await;
+        {
+            let session = self.get_or_create(key).await;
+            if let Some(index) = session
+                .messages
+                .iter()
+                .position(|row| row.client_message_id.as_deref() == Some(cmid.as_str()))
+            {
+                return Ok((session.base_seq + index, false));
+            }
+        }
+        let seq = self.add_message_with_seq_unlocked(key, message).await?;
+        Ok((seq, true))
+    }
+
     /// Append + seq derivation without taking the persist lock — the caller
     /// must already hold it (see [`persist_lock_for`]).
     ///
