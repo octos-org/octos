@@ -1283,6 +1283,18 @@ async fn resolve_identity(state: &AppState, token: &str) -> Option<AuthIdentity>
         return None;
     }
 
+    // A --shared solo listener is bound to loopback and publishes this
+    // process-lifetime credential only in its owner-private discovery file.
+    // It is independent of the dashboard's rotated admin credential.
+    if state
+        .ui_protocol
+        .shared_instance_token
+        .get()
+        .is_some_and(|expected| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+    {
+        return Some(AuthIdentity::Admin);
+    }
+
     // 1. Check hashed admin-token store. When the file is present, it is
     //    authoritative for admin auth — the bootstrap token no longer works
     //    until an operator runs `octos admin reset-token`. A corrupt file
@@ -1889,6 +1901,27 @@ mod tests {
         ));
         // Bootstrap token must NOT work once rotated.
         assert!(resolve_identity(&state, "boot").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_local_credential_survives_admin_rotation_without_restoring_bootstrap() {
+        use crate::admin_token_store::{AdminTokenRecord, AdminTokenStore};
+        let dir = tempfile::tempdir().unwrap();
+        AdminTokenStore::new(dir.path())
+            .save(&AdminTokenRecord::from_plaintext("rotated"))
+            .unwrap();
+        let state = identity_state(dir.path(), Some("boot"));
+        state
+            .ui_protocol
+            .shared_instance_token
+            .set("local-only".into())
+            .unwrap();
+        assert!(matches!(
+            resolve_identity(&state, "local-only").await,
+            Some(AuthIdentity::Admin)
+        ));
+        assert!(resolve_identity(&state, "boot").await.is_none());
+        assert!(resolve_identity(&state, "wrong").await.is_none());
     }
 
     #[tokio::test]
