@@ -105,6 +105,7 @@ async fn test_01_deepseek_connectivity() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     };
 
     let resp = provider
@@ -166,6 +167,7 @@ async fn test_01_dashscope_connectivity() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     };
 
     let resp = provider
@@ -1689,6 +1691,7 @@ async fn test_22_inbound_media_to_agent_message() {
         client_message_id: None,
         thread_id: None,
         timestamp: inbound.timestamp,
+        source: None,
     };
 
     assert_eq!(agent_msg.media.len(), 1);

@@ -254,6 +254,12 @@ pub struct Message {
     /// in-memory so `Session::threads()` produces sensible groupings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// Provenance tag for rows written outside an agent turn
+    /// (`session/append_message`, UPCR-2026-041). Turn-written rows leave it
+    /// `None`; callers distinguish out-of-band records by `Some(source)`.
+    /// Legacy persisted rows omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -280,6 +286,7 @@ impl Message {
             reasoning_content: None,
             client_message_id: Some(cmid.0),
             thread_id: None,
+            source: None,
             timestamp: Utc::now(),
         }
     }
@@ -303,6 +310,7 @@ impl Message {
             reasoning_content: None,
             client_message_id: Some(cmid.0),
             thread_id: Some(thread_id.0),
+            source: None,
             timestamp: Utc::now(),
         }
     }
@@ -325,6 +333,7 @@ impl Message {
             reasoning_content: None,
             client_message_id: None,
             thread_id: Some(thread_id.0),
+            source: None,
             timestamp: Utc::now(),
         }
     }
@@ -348,6 +357,7 @@ impl Message {
             reasoning_content: None,
             client_message_id: None,
             thread_id: Some(thread_id.0),
+            source: None,
             timestamp: Utc::now(),
         }
     }
@@ -371,6 +381,7 @@ impl Message {
             reasoning_content: None,
             client_message_id: None,
             thread_id: None,
+            source: None,
             timestamp: Utc::now(),
         }
     }
@@ -392,6 +403,7 @@ impl Message {
             reasoning_content: None,
             client_message_id: None,
             thread_id: None,
+            source: None,
             timestamp: Utc::now(),
         }
     }
@@ -412,6 +424,7 @@ impl Message {
             reasoning_content: None,
             client_message_id: None,
             thread_id: None,
+            source: None,
             timestamp: Utc::now(),
         }
     }
@@ -729,6 +742,7 @@ mod tests {
             reasoning_content: None,
             client_message_id: None,
             thread_id: None,
+            source: None,
             timestamp: Utc::now(),
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -794,6 +808,28 @@ mod tests {
         let msg: Message = serde_json::from_str(legacy).unwrap();
         assert!(msg.client_message_id.is_none());
         assert_eq!(msg.content, "hi");
+    }
+
+    #[test]
+    fn message_source_roundtrips_and_legacy_rows_omit_it() {
+        // UPCR-2026-041: out-of-band rows carry `source`; turn-written rows
+        // and legacy JSONL keep it absent — and absent means ABSENT on
+        // serialize, so row bytes for turn-written messages are unchanged.
+        let mut msg = Message::system("recorded answer");
+        assert!(msg.source.is_none());
+        let bare = serde_json::to_string(&msg).unwrap();
+        assert!(!bare.contains("source"), "no source key when None: {bare}");
+
+        msg.source = Some("external_record:whiteboard".to_owned());
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""source":"external_record:whiteboard""#));
+        let parsed: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source.as_deref(), Some("external_record:whiteboard"));
+
+        let legacy: Message =
+            serde_json::from_str(r#"{"role":"assistant","content":"hi","timestamp":"2026-04-24T00:00:00Z"}"#)
+                .unwrap();
+        assert!(legacy.source.is_none());
     }
 
     #[test]

@@ -719,6 +719,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            source: None,
         }
     }
 
@@ -733,6 +734,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 1).unwrap(),
+            source: None,
         }
     }
 
@@ -757,6 +759,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 2).unwrap(),
+            source: None,
         }
     }
 
@@ -771,6 +774,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 3).unwrap(),
+            source: None,
         }
     }
 
@@ -785,6 +789,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 4).unwrap(),
+            source: None,
         }
     }
 
@@ -799,6 +804,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 5).unwrap(),
+            source: None,
         }
     }
 

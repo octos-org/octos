@@ -56,6 +56,7 @@ fn make_message(role: MessageRole, content: &str) -> Message {
         client_message_id: None,
         thread_id,
         timestamp: Utc::now(),
+        source: None,
     }
 }
 
@@ -2634,6 +2635,7 @@ async fn test_load_from_disk_merges_flat_and_per_user_histories() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: newer,
+                source: None,
             })
             .unwrap()
         ),
@@ -2664,6 +2666,7 @@ async fn test_load_from_disk_merges_flat_and_per_user_histories() {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: older,
+                source: None,
             })
             .unwrap()
         ),
@@ -2945,6 +2948,7 @@ fn should_sanitize_loaded_messages_in_place() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     });
     handle.session.messages.push(Message {
         role: MessageRole::Assistant,
@@ -2956,6 +2960,7 @@ fn should_sanitize_loaded_messages_in_place() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     });
 
     let before = handle.session.messages.len();
@@ -3005,6 +3010,7 @@ async fn cold_reload_fails_interrupted_thinking_only_tail() {
             client_message_id: None,
             thread_id: Some("01a05fda-turn".into()),
             timestamp: chrono::Utc::now(),
+            source: None,
         };
         writer.add_message(spiral).await.unwrap();
     }
@@ -3148,6 +3154,7 @@ fn session_actor_does_not_continue_with_unsanitized_transcript_on_worktree_missi
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     });
 
     let gone = tmp.path().join("ghost-worktree");
@@ -3687,6 +3694,7 @@ async fn add_message_with_seq_accepts_legacy_replay_via_legacy_load() {
             client_message_id: cmid.map(String::from),
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         }
     }
     let mut messages = vec![

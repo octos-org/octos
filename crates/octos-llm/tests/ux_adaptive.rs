@@ -33,6 +33,7 @@ fn msg(content: &str) -> Message {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn assistant_msg(content: &str) -> Message {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     }
 }
 

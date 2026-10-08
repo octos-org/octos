@@ -371,6 +371,7 @@ async fn compaction_started_precedes_completed_in_lifecycle_batch() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         });
     }
 
@@ -444,6 +445,7 @@ fn open_snapshot_padding_history(messages: usize) -> Vec<octos_core::Message> {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         })
         .collect()
 }
@@ -3894,6 +3896,7 @@ fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     }
 }
 
@@ -21007,6 +21010,7 @@ fn build_btw_messages_shapes_prompt_without_tools() {
         client_message_id: None,
         thread_id: None,
         timestamp: now,
+        source: None,
     };
     let transcript = vec![
         mk(MessageRole::User, "please refactor the parser"),
@@ -22216,6 +22220,7 @@ fn final_assistant_content_already_persisted_ignores_tool_rows() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     };
     let messages = vec![tool_row];
     let final_content = "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要更详细的湾区预报吗？";
@@ -22299,6 +22304,7 @@ fn final_assistant_carrier_trimmed_equality_rejects_non_assistant_roles() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     };
     assert!(!is_final_assistant_carrier_under_trimmed_equality(
         &user_row,
@@ -22375,6 +22381,7 @@ fn pre_stamp_turn_thread_id_stamps_user_assistant_and_tool_when_unbound() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         },
         turn_thread_id,
     );
@@ -22422,6 +22429,7 @@ fn pre_stamp_turn_thread_id_leaves_system_rows_alone() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     };
 
     let stamped = pre_stamp_turn_thread_id(system, "turn-abc");
@@ -25957,6 +25965,7 @@ fn prg_seed_user_assistant(session: &mut octos_bus::Session) {
         client_message_id: Some("cmid-user-1".into()),
         thread_id: Some("cmid-user-1".into()),
         timestamp: now,
+        source: None,
     });
     session.messages.push(Message {
         role: MessageRole::Assistant,
@@ -25968,6 +25977,7 @@ fn prg_seed_user_assistant(session: &mut octos_bus::Session) {
         client_message_id: None,
         thread_id: Some("cmid-user-1".into()),
         timestamp: now + chrono::Duration::milliseconds(10),
+        source: None,
     });
 }
 
@@ -25997,6 +26007,7 @@ async fn prg_state_with_persisted_turns(
                 client_message_id: Some(tid.clone()),
                 thread_id: Some(tid.clone()),
                 timestamp: now,
+                source: None,
             };
             guard
                 .add_message(session_id, user)
@@ -26012,6 +26023,7 @@ async fn prg_state_with_persisted_turns(
                 client_message_id: None,
                 thread_id: Some(tid.clone()),
                 timestamp: now + chrono::Duration::milliseconds(1),
+                source: None,
             };
             guard
                 .add_message(session_id, asst)
@@ -26677,6 +26689,7 @@ async fn session_fork_concurrent_same_child_one_wins() {
             client_message_id: None,
             thread_id: None,
             timestamp: now,
+            source: None,
         };
         guard.add_message(&parent_b, msg).await.expect("seed b");
     }
@@ -28015,6 +28028,7 @@ async fn thread_graph_get_surfaces_orphans() {
             client_message_id: Some("cmid-1".into()),
             thread_id: Some("cmid-1".into()),
             timestamp: now,
+            source: None,
         });
         session.messages.push(Message {
             role: MessageRole::Assistant,
@@ -28026,6 +28040,7 @@ async fn thread_graph_get_surfaces_orphans() {
             client_message_id: None,
             thread_id: None, // <- orphan
             timestamp: now + chrono::Duration::milliseconds(10),
+            source: None,
         });
     });
     let active_turns = active_turns_registry();
@@ -28330,6 +28345,7 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             client_message_id: Some("cmid-user-1".into()),
             thread_id: Some("cmid-user-1".into()),
             timestamp: now,
+            source: None,
         });
         // Historical companion row; current producer paths carry its
         // media on the background-child payload instead.
@@ -28343,6 +28359,7 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             client_message_id: None,
             thread_id: Some("cmid-user-1".into()),
             timestamp: now + chrono::Duration::milliseconds(5),
+            source: None,
         });
         // Background completion row.
         session.messages.push(Message {
@@ -28358,6 +28375,7 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             client_message_id: None,
             thread_id: Some("cmid-user-1".into()),
             timestamp: spawn_ack_ts,
+            source: None,
         });
     });
     let approvals = PendingApprovalStore::default();
@@ -28773,6 +28791,7 @@ async fn message_commit_observer_runs_after_each_commit_in_order() {
             client_message_id: Some(format!("cmid-{content}")),
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         };
         manager
             .add_message_with_seq(&session_id, msg)
@@ -28833,6 +28852,7 @@ async fn message_commit_observer_is_not_retroactive_after_installation() {
         client_message_id: Some("cmid-1".into()),
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     };
     manager
         .add_message_with_seq(&session_id, msg)
@@ -28860,6 +28880,7 @@ async fn message_commit_observer_is_not_retroactive_after_installation() {
         client_message_id: Some("cmid-2".into()),
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     };
     manager
         .add_message_with_seq(&session_id, msg2)
@@ -28893,6 +28914,7 @@ fn is_metadata_only_assistant_row_truth_table() {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     };
     assert!(is_metadata_only_assistant_row(&empty_assistant));
 
@@ -28920,6 +28942,7 @@ fn is_metadata_only_assistant_row_truth_table() {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     };
     assert!(!is_metadata_only_assistant_row(&tool_message));
 
@@ -28934,6 +28957,7 @@ fn is_metadata_only_assistant_row_truth_table() {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     };
     assert!(!is_metadata_only_assistant_row(&user_message));
 }
@@ -28983,6 +29007,7 @@ async fn metadata_only_commits_emit_one_v2_assistant_persisted_row() {
         client_message_id: None,
         thread_id: Some(thread.clone()),
         timestamp: Utc::now(),
+        source: None,
     };
     let mk_tool = |out: &str, tc_id: &str| Message {
         role: MessageRole::Tool,
@@ -28994,6 +29019,7 @@ async fn metadata_only_commits_emit_one_v2_assistant_persisted_row() {
         client_message_id: None,
         thread_id: Some(thread.clone()),
         timestamp: Utc::now(),
+        source: None,
     };
 
     // Iteration 1: assistant returns only tool_calls (empty content).
@@ -30597,6 +30623,7 @@ async fn synth_ack_not_persisted_to_jsonl_when_spawn_only() {
         client_message_id: None,
         thread_id: Some("thread-spawn-only-synth-no-persist".into()),
         timestamp: Utc::now(),
+        source: None,
     };
     manager
         .add_message_with_seq(&session_id, preamble)
@@ -30622,6 +30649,7 @@ async fn synth_ack_not_persisted_to_jsonl_when_spawn_only() {
         client_message_id: None,
         thread_id: Some("thread-spawn-only-synth-no-persist".into()),
         timestamp: Utc::now(),
+        source: None,
     };
     // Intentionally no `manager.add_message_with_seq(...)` call.
     // This is the post-fix shape — the ack never reaches JSONL.
@@ -30832,6 +30860,7 @@ async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
             client_message_id: None,
             thread_id: Some(format!("thread-{tool_name}")),
             timestamp: Utc::now(),
+            source: None,
         };
         manager
             .add_message_with_seq(&session_id, preamble)
@@ -30861,6 +30890,7 @@ async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
             client_message_id: None,
             thread_id: Some(format!("thread-{tool_name}")),
             timestamp: Utc::now(),
+            source: None,
         };
         // Production inputs at the persist site: the agent loop
         // sets `synthesized_from_spawn_only=true` whenever the
@@ -42051,6 +42081,7 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
                         client_message_id: None,
                         thread_id: None,
                         timestamp: Utc::now(),
+                        source: None,
                     },
                 )
                 .await

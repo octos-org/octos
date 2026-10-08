@@ -991,6 +991,7 @@ impl Agent {
                     client_message_id: None,
                     thread_id: None,
                     timestamp: chrono::Utc::now(),
+                    source: None,
                 }];
 
                 // #1587: session-start conversational episodic recall.
@@ -1063,6 +1064,7 @@ impl Agent {
                     client_message_id: None,
                     thread_id: None,
                     timestamp: chrono::Utc::now(),
+                    source: None,
                 };
                 messages.push(current_user.clone());
 
@@ -1224,6 +1226,7 @@ impl Agent {
                                         client_message_id: None,
                                         thread_id: None,
                                         timestamp: chrono::Utc::now(),
+                                        source: None,
                                     },
                                 );
                             }
@@ -3332,6 +3335,7 @@ impl Agent {
                     client_message_id: None,
                     thread_id: None,
                     timestamp: chrono::Utc::now(),
+                    source: None,
                 };
                 match outcome {
                     Ok(Some(draft)) => {
@@ -3785,6 +3789,7 @@ fn session_limit_message(tool_call: &octos_core::ToolCall, content: String) -> M
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     }
 }
 
@@ -4230,6 +4235,7 @@ fn inject_loop_detected_synthetic_results_with_log(
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         };
         messages.push(tool_msg.clone());
         rows_for_log.push(tool_msg);

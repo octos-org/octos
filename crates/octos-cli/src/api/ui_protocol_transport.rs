@@ -14502,6 +14502,7 @@ async fn raw_profile_llm_test(
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     }];
     let canonical_family = octos_llm::registry::lookup(&family_id)
         .map(|entry| entry.name)
@@ -31075,6 +31076,7 @@ fn build_btw_messages(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         },
         Message {
             role: MessageRole::User,
@@ -31086,6 +31088,7 @@ fn build_btw_messages(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         },
     ]
 }
@@ -37016,6 +37019,7 @@ async fn model_join_review_summary(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         },
         Message {
             role: MessageRole::User,
@@ -37027,6 +37031,7 @@ async fn model_join_review_summary(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         },
     ];
     let config = review_join_chat_config();
