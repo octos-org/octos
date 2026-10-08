@@ -4211,9 +4211,10 @@ async fn send_raw_sse_bound_overwrites_stale_thread_id_in_payload() {
 }
 
 /// #2729: the admin shell auth failure must not disclose configuration to
-/// the unauthenticated caller. The failure body stays the same generic
-/// string as the channel's other auth guards — the presented/expected
-/// token lengths and the local data-dir paths stay server-side.
+/// the unauthenticated caller: the body is the same generic string as the
+/// channel's other auth guards, and the presented/expected token lengths
+/// and the local data-dir paths stay out of the log line too — the same
+/// log hygiene the CLI router pins for its auth rejections.
 #[tokio::test]
 async fn admin_shell_auth_failure_body_discloses_no_configuration() {
     let expected = "octos-admin-e2e-secret-token";
@@ -4234,13 +4235,13 @@ async fn admin_shell_auth_failure_body_discloses_no_configuration() {
             event_seq: Arc::new(StdMutex::new(HashMap::new())),
         });
 
-    async fn probe(app: Router, token: Option<&str>, body: &str) -> (StatusCode, String) {
+    async fn probe(app: Router, token: Option<(&str, String)>, body: &str) -> (StatusCode, String) {
         let mut request = Request::builder()
             .method("POST")
             .uri("/admin/shell")
             .header("content-type", "application/json");
-        if let Some(token) = token {
-            request = request.header("authorization", format!("Bearer {token}"));
+        if let Some((header, value)) = token {
+            request = request.header(header, value);
         }
         let response = app
             .oneshot(request.body(Body::from(body.to_string())).unwrap())
@@ -4253,19 +4254,97 @@ async fn admin_shell_auth_failure_body_discloses_no_configuration() {
         (status, String::from_utf8_lossy(&body).into_owned())
     }
 
-    // A wrong token (different length than expected) and no token at all
-    // both get the generic guard body — never a debug echo of what the
-    // server tried to match against. The probes post an empty command so
-    // even a fail-open auth regression can never spawn a shell here.
-    for presented in [Some("short"), None] {
-        let (status, body) = probe(app.clone(), presented, r#"{"command":""}"#).await;
+    // A wrong bearer token, the same wrong token over the x-auth-token
+    // intake, and no token at all all get the generic guard body — never a
+    // debug echo of what the server tried to match against. The probes
+    // post an empty command so even a fail-open auth regression can never
+    // spawn a shell here.
+    for auth in [
+        Some(("authorization", "Bearer short".to_string())),
+        Some(("x-auth-token", "short".to_string())),
+        None,
+    ] {
+        let (status, body) = probe(app.clone(), auth, r#"{"command":""}"#).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body, "invalid auth token", "leaky body: {body}");
     }
 
     // The correct token passes the auth gate: the empty command surfaces
     // the next validation error.
-    let (status, body) = probe(app, Some(expected), r#"{"command":""}"#).await;
+    let (status, body) = probe(
+        app,
+        Some(("authorization", format!("Bearer {expected}"))),
+        r#"{"command":""}"#,
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body, "command is required");
+}
+
+/// Captures `tracing` output so log-emitting behaviour can be asserted
+/// (same shape as the matrix channel's LogCapture).
+#[derive(Clone, Default)]
+struct LogCapture {
+    buf: Arc<StdMutex<Vec<u8>>>,
+}
+
+impl LogCapture {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// #2729: the auth-failure log carries presence booleans only — never
+/// token lengths or the local data-dir paths that used to ride the
+/// response body.
+#[test]
+fn admin_shell_auth_rejection_log_omits_lengths_and_paths() {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(capture.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    log_admin_shell_auth_rejection(true, true);
+    log_admin_shell_auth_rejection(false, false);
+
+    let logs = capture.contents();
+    assert_eq!(
+        logs.matches("admin shell auth failed").count(),
+        2,
+        "logs: {logs}"
+    );
+    assert!(logs.contains("token_present=true"), "logs: {logs}");
+    assert!(logs.contains("token_present=false"), "logs: {logs}");
+    assert!(logs.contains("token_configured=true"), "logs: {logs}");
+    assert!(logs.contains("token_configured=false"), "logs: {logs}");
+    assert!(
+        !logs.contains("_len"),
+        "token lengths must stay out: {logs}"
+    );
+    assert!(!logs.contains("data_dir"), "logs: {logs}");
+    assert!(!logs.contains("home="), "logs: {logs}");
+    assert!(!logs.contains("/Users/"), "logs: {logs}");
 }

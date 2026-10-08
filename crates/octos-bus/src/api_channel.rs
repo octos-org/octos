@@ -2603,6 +2603,13 @@ struct ShellResponse {
     timed_out: bool,
 }
 
+/// Auth-failure log for the admin shell — same hygiene as the router's
+/// auth rejections: presence booleans only, never token lengths or the
+/// local data-dir paths (#2729).
+fn log_admin_shell_auth_rejection(token_present: bool, token_configured: bool) {
+    warn!(token_present, token_configured, "admin shell auth failed");
+}
+
 /// POST /admin/shell — execute a shell command (admin auth required).
 async fn handle_admin_shell(
     State(state): State<ApiState>,
@@ -2664,16 +2671,11 @@ async fn handle_admin_shell(
     };
 
     if !is_admin {
-        // Details stay server-side: echoing the expected token length and
-        // the local data-dir paths back to an unauthenticated caller is a
-        // token-format oracle plus a configuration disclosure.
-        warn!(
-            presented_len = token.len(),
-            expected_len = expected_token.as_ref().map(|t| t.len()).unwrap_or(0),
-            data_dir = std::env::var("OCTOS_DATA_DIR").unwrap_or_else(|_| "unset".into()),
-            home = std::env::var("HOME").unwrap_or_else(|_| "unset".into()),
-            "admin shell auth failed"
-        );
+        let token_configured = expected_token
+            .as_ref()
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
+        log_admin_shell_auth_rejection(!token.is_empty(), token_configured);
         return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
     }
 
