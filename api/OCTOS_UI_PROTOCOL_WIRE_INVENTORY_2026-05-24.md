@@ -152,19 +152,24 @@ spec and UPCR documents. The authoritative source remains code:
 
 ## Notifications
 
+This table includes registered internal/legacy source names. Current server
+WebSocket/stdio delivery projects assistant, tool, attachment, and terminal
+source records into canonical `projection/envelope` v2; those raw names do not
+form an additional live stream. See the [spec §14](OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md#14-canonical-v2-projection-envelope).
+
 | Method | Status |
 |---|---|
 | `session/open` | shipped open/resume notification; carries `accepted_client_commands` (UPCR-2026-038) |
 | `turn/started` | shipped base notification |
-| `turn/completed` | shipped base notification |
-| `turn/error` | shipped base notification |
+| `turn/completed` | internal/legacy source; delivered through canonical v2 projection |
+| `turn/error` | internal/legacy source; delivered through canonical v2 projection |
 | `turn/steer_dropped` | shipped steer return notification, UPCR-2026-033 |
 | `context/state_reported` | shipped live token-estimate notification (context.state.v1) |
-| `message/delta` | shipped base notification |
-| `message/reasoning_delta` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
-| `tool/started` | shipped base notification |
-| `tool/progress` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
-| `tool/completed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `message/delta` | internal/legacy source; delivered through canonical v2 projection |
+| `message/reasoning_delta` | internal/legacy source; delivered through canonical v2 projection |
+| `tool/started` | internal/legacy source; delivered through canonical v2 projection |
+| `tool/progress` | internal/legacy source; delivered through canonical v2 projection |
+| `tool/completed` | internal/legacy source; delivered through canonical v2 projection |
 | `approval/requested` | shipped base notification, UPCR-2026-001 |
 | `approval/auto_resolved` | shipped durable approval notification |
 | `approval/decided` | shipped durable approval notification |
@@ -176,15 +181,15 @@ spec and UPCR documents. The authoritative source remains code:
 | `progress/updated` | shipped typed progress notification |
 | `warning` | shipped base notification |
 | `protocol/replay_lossy` | shipped backpressure/replay notification |
-| `turn/spawn_complete` | shipped background completion notification |
-| `file/attached` | shipped, UPCR-2026-014 |
+| `turn/spawn_complete` | internal/legacy source; delivered through canonical v2 projection |
+| `file/attached` | internal/legacy source; delivered through canonical v2 projection |
 | `visual/generating` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `visual/succeeded` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `visual/failed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `voice/exit` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `skill/action/job/updated` | shipped AppUI extra notification, UPCR-2026-027 |
 | `voice/audio_chunk` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
-| `projection/envelope` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `projection/envelope` | shipped canonical v2 live/replay on every connection; spec §14 |
 | `session/event` | shipped, UPCR-2026-014 |
 | `router/status` | shipped adaptive-router notification |
 | `router/failover` | shipped adaptive-router notification |

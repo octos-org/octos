@@ -3998,7 +3998,8 @@ pub struct TurnSpawnCompleteEvent {
 
 // ----- UPCR-2026-014 M9-γ projection envelope -----
 
-/// Token usage carried on `turn_completed` projection envelopes.
+/// Token usage carried on canonical v2 `turn_terminal` projection envelopes
+/// and historical v1 `turn_completed` envelopes.
 ///
 /// Mirrors [`crate::TokenUsage`] but is wire-stable for the M9-γ
 /// projection: all fields default to zero, and the field set is frozen
@@ -4030,8 +4031,8 @@ fn is_zero_u64(value: &u64) -> bool {
 /// wall-clock commit timestamp clients use for ordering displays.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageMeta {
-    /// Server-assigned UUID of the durable row (mirrors
-    /// `MessageMeta.message_id`). Stable across replays.
+    /// Opaque server-assigned identity of the durable row (mirrors
+    /// `MessageMeta.message_id`). Stable across replays; not necessarily a UUID.
     pub message_id: String,
     /// RFC 3339 wall-clock time the row committed.
     pub persisted_at: DateTime<Utc>,
