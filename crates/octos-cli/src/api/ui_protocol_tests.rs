@@ -3804,6 +3804,19 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         APPUI_METHOD_SNAPSHOT_RESTORE => {
             json!({ "session_id": session_id, "snapshot_id": "deadbeef" })
         }
+        octos_core::ui_protocol::methods::SERVER_INSTANCE_GET => json!({}),
+        workspace_team::LIST => json!({ "session_id": session_id }),
+        workspace_team::LEADER => json!({
+            "session_id": session_id,
+            "agent_id": "workspace-probe",
+            "expected_revision": 1,
+        }),
+        workspace_team::MESSAGE => json!({
+            "session_id": session_id,
+            "agent_id": "workspace-probe",
+            "message": "probe workspace peer message",
+            "occurrence_id": "workspace-dispatch-probe",
+        }),
         APPUI_METHOD_PEER_PREPARE => json!({
             "brief": "probe peer brief",
             "session_id": session_id,
