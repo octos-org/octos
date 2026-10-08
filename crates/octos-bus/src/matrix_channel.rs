@@ -1260,7 +1260,8 @@ const APPSERVICE_BIND_ENV: &str = "OCTOS_MATRIX_APPSERVICE_BIND";
 /// not be reachable from other hosts unless an operator opts out.
 fn appservice_bind_addr(port: u16, configured: Option<&str>) -> String {
     configured
-        .filter(|v| !v.trim().is_empty())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("127.0.0.1:{port}"))
 }
@@ -2438,6 +2439,16 @@ impl Channel for MatrixChannel {
 
         let configured_bind = std::env::var(APPSERVICE_BIND_ENV).ok();
         let addr = appservice_bind_addr(self.port, configured_bind.as_deref());
+        if let Some((_, bind_port)) = addr.rsplit_once(':') {
+            if bind_port.parse::<u16>().ok() != Some(self.port) {
+                warn!(
+                    bind_addr = %addr,
+                    config_port = self.port,
+                    "appservice bind port differs from the channel's configured port; \
+                     the homeserver must push to the bound port"
+                );
+            }
+        }
         info!(port = self.port, "Matrix appservice listening on {addr}");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 

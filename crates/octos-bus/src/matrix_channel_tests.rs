@@ -528,7 +528,7 @@ fn test_default_appservice_bind_addr_is_loopback() {
 #[test]
 fn test_appservice_bind_addr_env_override_wins() {
     assert_eq!(
-        appservice_bind_addr(9880, Some("0.0.0.0:9880")),
+        appservice_bind_addr(9880, Some("  0.0.0.0:9880  ")),
         "0.0.0.0:9880"
     );
 }
