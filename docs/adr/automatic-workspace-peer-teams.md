@@ -208,9 +208,12 @@ native defect remains open; backend directory canonicalization is not changed.
 
 ## Delivery limits
 
-This change has not been merged, released, or deployed. The TUI requires a
-matching backend that supports `--shared`; the previous published backend
-bundle does not, so packaging must be updated together with the backend release.
+This change does not publish or deploy a release. Workspace teams require a
+matching backend that supports `--shared`. Implicit TUI launches probe that
+capability and retain private stdio with a notice on older backends, including
+the currently pinned auto-install release. Explicit transport choices remain
+unchanged. Packaging must pin a matching backend release to enable teams for
+new installations.
 Native and web clients can use the OUP team API through the same server; their
 own team-picker UI is not part of this implementation. Windows startup has not
 been exercised here.

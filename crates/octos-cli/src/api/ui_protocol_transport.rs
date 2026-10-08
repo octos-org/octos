@@ -555,10 +555,10 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
     APPUI_METHOD_SNAPSHOT_LIST,
     APPUI_METHOD_SNAPSHOT_RESTORE,
-    workspace_team::LIST,
-    workspace_team::LEADER,
-    workspace_team::MESSAGE,
-    "server/instance.get",
+    octos_core::ui_protocol::methods::PEER_TEAM_LIST,
+    octos_core::ui_protocol::methods::PEER_TEAM_LEADER_SET,
+    octos_core::ui_protocol::methods::PEER_TEAM_MESSAGE,
+    octos_core::ui_protocol::methods::SERVER_INSTANCE_GET,
     APPUI_METHOD_PEER_PREPARE,
     APPUI_METHOD_PEER_GATHER,
     APPUI_METHOD_PEER_MODEL_SET,
@@ -21224,16 +21224,14 @@ async fn handle_raw_appui_rpc(
         workspace_team::LIST | workspace_team::LEADER | workspace_team::MESSAGE => {
             workspace_team_rpc::rpc(ws, state, request, connection_profile_id).await
         }
-        "server/instance.get" => {
-            state
-                .ui_protocol
-                .shared_instance
-                .get()
-                .cloned()
-                .ok_or_else(|| {
-                    RpcError::invalid_request("server is not a discoverable shared instance")
-                })
-        }
+        octos_core::ui_protocol::methods::SERVER_INSTANCE_GET => state
+            .ui_protocol
+            .shared_instance
+            .get()
+            .cloned()
+            .ok_or_else(|| {
+                RpcError::invalid_request("server is not a discoverable shared instance")
+            }),
         APPUI_METHOD_SERVER_SHUTDOWN => handle_server_shutdown(state),
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
@@ -21793,7 +21791,7 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
         workspace_team::LIST
             | workspace_team::LEADER
             | workspace_team::MESSAGE
-            | "server/instance.get"
+            | octos_core::ui_protocol::methods::SERVER_INSTANCE_GET
             | APPUI_METHOD_CONFIG_CAPABILITIES_LIST
             | APPUI_METHOD_SERVER_SHUTDOWN
             | APPUI_METHOD_SESSION_STATUS_READ

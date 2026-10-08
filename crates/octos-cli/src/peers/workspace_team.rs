@@ -10,9 +10,9 @@ use octos_core::SessionKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub(crate) const LIST: &str = "peer/team/list";
-pub(crate) const LEADER: &str = "peer/team/leader/set";
-pub(crate) const MESSAGE: &str = "peer/team/message";
+pub(crate) const LIST: &str = octos_core::ui_protocol::methods::PEER_TEAM_LIST;
+pub(crate) const LEADER: &str = octos_core::ui_protocol::methods::PEER_TEAM_LEADER_SET;
+pub(crate) const MESSAGE: &str = octos_core::ui_protocol::methods::PEER_TEAM_MESSAGE;
 pub(crate) const UPDATED: &str = "peer/team/updated";
 pub(crate) const FEATURE: &str = "peer.workspace_team.v1";
 pub(crate) const MESSAGE_KIND: &str = "workspace_peer_message";
