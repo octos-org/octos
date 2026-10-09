@@ -252,6 +252,21 @@ pub fn safe_filename(name: &str) -> String {
     encoded
 }
 
+/// Constant-time byte comparison for auth tokens (no length leak): the fold
+/// always runs over the longer slice, so neither content nor length biases
+/// the timing. The canonical workspace copy — every token compare should go
+/// through this helper (#2705, #2736).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let len_eq = a.len() ^ b.len();
+    let mut result = 0u8;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        result |= x ^ y;
+    }
+    result == 0 && len_eq == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,5 +598,18 @@ mod tests {
         assert_eq!(hi.content, truncate_head_tail(&s, 100, 5.0));
         let lo = truncate_head_tail_report(&s, 100, -1.0);
         assert_eq!(lo.head_ratio, 0.1);
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"secret-token", b"secret-token"));
+        assert!(!constant_time_eq(b"secret-token", b"wrong-token!"));
+        // Different lengths are rejected (and leak no length through timing).
+        assert!(!constant_time_eq(b"short", b"longer-string"));
+        assert!(!constant_time_eq(b"longer-string", b"short"));
+        // Same length, single-bit difference.
+        assert!(!constant_time_eq(b"\x00", b"\x01"));
+        // Both empty compares equal.
+        assert!(constant_time_eq(b"", b""));
     }
 }
