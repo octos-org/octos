@@ -1433,11 +1433,7 @@ async fn handle_chat(
 ) -> Response {
     // Validate auth token if configured
     if let Some(ref expected) = state.auth_token {
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if provided != Some(expected.as_str()) {
+        if !channel_bearer_auth_ok(&headers, expected) {
             return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
         }
     }
@@ -1577,11 +1573,7 @@ async fn handle_session_event_stream(
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
     if let Some(ref expected) = state.auth_token {
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if provided != Some(expected.as_str()) {
+        if !channel_bearer_auth_ok(&headers, expected) {
             return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
         }
     }
@@ -2601,6 +2593,21 @@ struct ShellResponse {
     stderr: String,
     exit_code: i32,
     timed_out: bool,
+}
+
+/// Bearer token from `Authorization: Bearer …` (chat / session-stream guards).
+fn bearer_token_from_authorization(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Constant-time bearer check for routes guarded by `state.auth_token`
+/// (#2736 — replaces the plaintext `!=` compare on these paths).
+fn channel_bearer_auth_ok(headers: &HeaderMap, expected: &str) -> bool {
+    bearer_token_from_authorization(headers)
+        .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
 }
 
 /// Constant-time byte comparison to prevent timing attacks on auth tokens

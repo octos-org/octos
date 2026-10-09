@@ -4371,3 +4371,129 @@ fn admin_shell_auth_rejection_log_omits_lengths_and_paths() {
     assert!(!logs.contains("home="), "logs: {logs}");
     assert!(!logs.contains("/Users/"), "logs: {logs}");
 }
+
+/// #2736: `/chat` and `/sessions/.../events/stream` must use the same
+/// constant-time bearer check as the admin shell — wrong bearer, no bearer,
+/// and a length-matched wrong-content token all get the generic guard body;
+/// the correct token passes the gate.
+#[tokio::test]
+async fn channel_bearer_auth_rejects_invalid_tokens_with_generic_body() {
+    let expected = "octos-channel-e2e-secret-token";
+    let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+    let state = ApiState {
+        inbound_tx,
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        watchers: Arc::new(Mutex::new(HashMap::new())),
+        auth_token: Some(expected.to_string()),
+        profile_id: Some(TEST_PROFILE_ID.to_string()),
+        sessions: test_sessions(),
+        task_query: None,
+        task_cancel: None,
+        task_relaunch: None,
+        on_session_deleted: None,
+        metrics_renderer: None,
+        event_seq: Arc::new(StdMutex::new(HashMap::new())),
+    };
+    let chat_app = Router::new()
+        .route("/chat", post(handle_chat))
+        .with_state(state.clone());
+    let stream_app = Router::new()
+        .route(
+            "/sessions/{id}/events/stream",
+            get(handle_session_event_stream),
+        )
+        .with_state(state);
+
+    let chat_body = serde_json::json!({
+        "message": "hello",
+        "session_id": "web-auth-test",
+        "thread_id": "thread-auth-1",
+    })
+    .to_string();
+
+    async fn probe_chat(app: Router, auth: Option<&str>, body: &str) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/chat")
+            .header("content-type", "application/json");
+        if let Some(token) = auth {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn probe_chat_status(app: Router, auth: Option<&str>, body: &str) -> StatusCode {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/chat")
+            .header("content-type", "application/json");
+        if let Some(token) = auth {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        app.oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn probe_stream(app: Router, auth: Option<&str>) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/sessions/web-auth-test/events/stream");
+        if let Some(token) = auth {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn probe_stream_status(app: Router, auth: Option<&str>) -> StatusCode {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/sessions/web-auth-test/events/stream");
+        if let Some(token) = auth {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    for auth in [Some("short"), None, Some("octos-channel-e2e-secret-tokeX")] {
+        let (status, body) = probe_chat(chat_app.clone(), auth, &chat_body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "chat auth={auth:?}");
+        assert_eq!(body, "invalid auth token", "chat leaky body: {body}");
+
+        let (status, body) = probe_stream(stream_app.clone(), auth).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "stream auth={auth:?}");
+        assert_eq!(body, "invalid auth token", "stream leaky body: {body}");
+    }
+
+    // Success paths return long-lived SSE streams — assert status only.
+    assert_eq!(
+        probe_chat_status(chat_app, Some(expected), &chat_body).await,
+        StatusCode::OK,
+        "valid chat bearer must pass auth gate"
+    );
+    assert_eq!(
+        probe_stream_status(stream_app, Some(expected)).await,
+        StatusCode::OK,
+        "valid stream bearer must pass auth gate"
+    );
+}
