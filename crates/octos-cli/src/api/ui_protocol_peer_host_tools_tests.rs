@@ -3262,6 +3262,7 @@ async fn should_carry_the_owning_app_and_the_caller_when_a_cross_app_tool_is_cal
         .unwrap();
     assert!(result.success, "{}", result.output);
     drop(registry);
+    drop(ws);
     crate::peers::host_tools::set_host_route(&peers_root(&fx), "news", 0, Arc::new(|_, _| false));
     let calls = host.await.unwrap();
     assert_eq!(calls.len(), 1);
@@ -3279,9 +3280,19 @@ async fn should_carry_the_owning_app_and_the_caller_when_a_cross_app_tool_is_cal
     // An owning app id must be well formed. The re-registration comes from
     // the owning connection — a different connection would be refused by
     // the route-ownership gate before validation ever runs (UPCR-2026-041).
+    // The route above was moved to connection 0, so the fresh connection
+    // that re-registers takes the route first, and the gate then lets it
+    // through to the validation refusal.
     let mut bad = news_list();
     bad["app"] = json!("Calendar App");
-    let error = register(&fx, &ws, &token, json!({ "tools": [bad] })).unwrap_err();
+    let (ws2, _rx2) = ws_connection_for_test(8);
+    crate::peers::host_tools::set_host_route(
+        &peers_root(&fx),
+        "news",
+        ws2.connection_id.0,
+        Arc::new(|_, _| false),
+    );
+    let error = register(&fx, &ws2, &token, json!({ "tools": [bad] })).unwrap_err();
     assert_eq!(error.data.unwrap()["kind"], "peer_tools_invalid");
 }
 
