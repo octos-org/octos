@@ -123,7 +123,10 @@ async fn env_token_arms_chat_and_stream_endpoints() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = isolated_data_dir(tmp.path());
     let _env = EnvGuard::pivot(&[
-        ("OCTOS_AUTH_TOKEN", Some(OsStr::new("octos-env-secret-token"))),
+        (
+            "OCTOS_AUTH_TOKEN",
+            Some(OsStr::new("octos-env-secret-token")),
+        ),
         ("OCTOS_DATA_DIR", Some(data_dir.as_os_str())),
         ("HOME", Some(tmp.path().as_os_str())),
     ]);
@@ -151,7 +154,6 @@ async fn env_token_arms_chat_and_stream_endpoints() {
         stream_status(&base, Some(expected)).await,
         reqwest::StatusCode::OK
     );
-
 }
 
 /// Same chain, config.json leg: no env token, but the top-level
@@ -189,7 +191,6 @@ async fn config_json_token_arms_chat_and_stream_endpoints() {
         stream_status(&base, Some(expected)).await,
         reqwest::StatusCode::OK
     );
-
 }
 
 /// Precedence over the wire: when both the channel config and the env
@@ -199,7 +200,10 @@ async fn channel_token_wins_over_env_token() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = isolated_data_dir(tmp.path());
     let _env = EnvGuard::pivot(&[
-        ("OCTOS_AUTH_TOKEN", Some(OsStr::new("octos-env-secret-token"))),
+        (
+            "OCTOS_AUTH_TOKEN",
+            Some(OsStr::new("octos-env-secret-token")),
+        ),
         ("OCTOS_DATA_DIR", Some(data_dir.as_os_str())),
         ("HOME", Some(tmp.path().as_os_str())),
     ]);
@@ -212,7 +216,6 @@ async fn channel_token_wins_over_env_token() {
     let (status, body) = post_chat(&base, Some("octos-channel-secret-token")).await;
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body: {body}");
     assert_eq!(body, "thread_id is required");
-
 }
 
 /// Negative control: with no token configured anywhere the gate stays
@@ -233,5 +236,4 @@ async fn unarmed_channel_stays_open() {
     let (status, _) = post_chat(&base, None).await;
     assert_ne!(status, reqwest::StatusCode::UNAUTHORIZED);
     assert_eq!(stream_status(&base, None).await, reqwest::StatusCode::OK);
-
 }
