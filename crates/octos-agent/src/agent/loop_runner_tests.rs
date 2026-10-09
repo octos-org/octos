@@ -7705,6 +7705,120 @@ async fn user_prompt_submit_hook_deny_blocks_turn_before_llm() {
     );
 }
 
+// A real, unfinished stream: the user input must wake it before Done or a
+// stream timeout. One process_message invocation continues with the new input.
+struct SteerableStallProvider {
+    calls: AtomicUsize,
+    observed: ObservedRolePrompts,
+    waiting: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl LlmProvider for SteerableStallProvider {
+    async fn chat(
+        &self,
+        _: &[Message],
+        _: &[octos_llm::ToolSpec],
+        _: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        eyre::bail!("steering must not fall back or retry the old prompt")
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _: &[octos_llm::ToolSpec],
+        _: &octos_llm::ChatConfig,
+    ) -> Result<octos_llm::ChatStream> {
+        use futures::StreamExt;
+        self.observed.lock().unwrap().push(
+            messages
+                .iter()
+                .map(|m| (m.role, m.content.clone()))
+                .collect(),
+        );
+        if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+            let waiting = self.waiting.clone();
+            Ok(Box::pin(
+                futures::stream::iter(vec![octos_llm::StreamEvent::TextDelta(
+                    "Before correction".into(),
+                )])
+                .chain(futures::stream::poll_fn(move |_| {
+                    waiting.notify_one();
+                    std::task::Poll::Pending
+                })),
+            ))
+        } else {
+            Ok(Box::pin(futures::stream::iter(vec![
+                octos_llm::StreamEvent::TextDelta("Applied correction".into()),
+                octos_llm::StreamEvent::Done(StopReason::EndTurn),
+            ])))
+        }
+    }
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn steering_resumes_same_turn_without_waiting_for_model_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let buffer = Arc::new(crate::steering::SteerBuffer::default());
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(SteerableStallProvider {
+        calls: AtomicUsize::new(0),
+        observed: observed.clone(),
+        waiting: waiting.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("steered"),
+        provider,
+        ToolRegistry::with_builtins(dir.path()),
+        memory,
+    )
+    .with_steer_buffer(buffer.clone());
+    let work = agent.process_message("original task", &[], vec![]);
+    let input = async {
+        waiting.notified().await;
+        buffer.push("correct course now".into());
+    };
+    let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(work, input)
+    })
+    .await
+    .expect("the first stream never completes: steering must wake it");
+    let result = result.unwrap();
+    assert_eq!(result.content, "Applied correction");
+    let observed = observed.lock().unwrap();
+    assert_eq!(
+        observed.len(),
+        2,
+        "one preempted request and one corrected request"
+    );
+    let second = &observed[1];
+    let visible = second
+        .iter()
+        .position(|(role, text)| *role == MessageRole::Assistant && text == "Before correction")
+        .unwrap();
+    let input = second
+        .iter()
+        .position(|(role, text)| *role == MessageRole::User && text == "correct course now")
+        .unwrap();
+    assert!(visible < input);
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User && m.content == "correct course now")
+            .count(),
+        1
+    );
+}
+
 // --- Mid-turn steer injection (codex `TurnState.pending_input` parity) ---
 
 /// Per-request prompt capture: `(role, content)` per message, one vec per
