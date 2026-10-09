@@ -141,7 +141,12 @@ has), and names are only checked to be kernel tool names (no `.`; app tools
 are dotted). A set stored before this field became optional (a plain list)
 reads as that exact list.
 
-Limits: 64 app tools, 256 generic tools, 2 KiB per description. Options are
+Limits: 64 app tools on an app peer's set and 96 on a host session's (a
+registration without `peer`, e.g. the system agent's, which gathers the
+tools the host granted it from many apps; with the up to 32 kernel tools
+such a session may also keep, that is the 128 functions an
+OpenAI-compatible chat request accepts), 256 generic tools, 2 KiB per
+description. Options are
 clamped, and a host may raise the defaults up to the maximum:
 `call_timeout_ms` 1–300 000 (default 30 000), `approval_ttl_secs` 1–604 800
 (default 3 600), `max_result_bytes` 1–1 048 576 (default 262 144).

@@ -47,7 +47,13 @@ pub(crate) const PEER_TOOL_CANCEL_NOTIFICATION: &str =
 /// Server → host: the system agent's input for a host-owned peer.
 pub(crate) const PEER_INPUT_NOTIFICATION: &str = octos_core::ui_protocol::methods::PEER_INPUT;
 
+/// An app peer's set: one app's own tools.
 pub(crate) const MAX_APP_TOOLS: usize = 64;
+/// A host session's set (`peer/tools/register` without `peer`, e.g. the
+/// system agent's): the tools the host granted it from many apps. With the
+/// up to 32 kernel tools such a session may also keep, 96 stays within the
+/// 128 functions an OpenAI-compatible chat request accepts.
+pub(crate) const MAX_SESSION_TOOLS: usize = 96;
 pub(crate) const MAX_GENERIC_TOOLS: usize = 256;
 const MAX_DESCRIPTION_BYTES: usize = 2 * 1024;
 const MAX_SCHEMA_BYTES: usize = 16 * 1024;
@@ -271,15 +277,34 @@ fn check_schema_shape(schema: &Value, depth: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a registration and build the next set (`version` is filled by
-/// the caller).
+/// Validate an app peer's registration and build the next set (`version` is
+/// filled by the caller).
 pub(crate) fn build_tool_set(
     flat: Vec<ToolInput>,
     generic_tools: Option<Vec<String>>,
     options: ToolSetOptions,
 ) -> Result<PeerHostToolSet, String> {
-    if flat.len() > MAX_APP_TOOLS {
-        return Err(format!("{} app tools (max {MAX_APP_TOOLS})", flat.len()));
+    build_tool_set_up_to(MAX_APP_TOOLS, flat, generic_tools, options)
+}
+
+/// [`build_tool_set`] for a host session's registration, which may hold
+/// [`MAX_SESSION_TOOLS`].
+pub(crate) fn build_session_tool_set(
+    flat: Vec<ToolInput>,
+    generic_tools: Option<Vec<String>>,
+    options: ToolSetOptions,
+) -> Result<PeerHostToolSet, String> {
+    build_tool_set_up_to(MAX_SESSION_TOOLS, flat, generic_tools, options)
+}
+
+fn build_tool_set_up_to(
+    max_tools: usize,
+    flat: Vec<ToolInput>,
+    generic_tools: Option<Vec<String>>,
+    options: ToolSetOptions,
+) -> Result<PeerHostToolSet, String> {
+    if flat.len() > max_tools {
+        return Err(format!("{} app tools (max {max_tools})", flat.len()));
     }
     let generic = match generic_tools {
         None => None,
