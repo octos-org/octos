@@ -5,10 +5,14 @@ use super::*;
 /// Windows, where loaded check-windows runners miss fixed-duration waits
 /// that pass everywhere else (the 10s handshake fired on main runs
 /// 37792417952 and 37861678480; the two 20s cycle watchdogs joined on the
-/// latter, lane wall 655s vs ~350s nominal). Deadlines only, never
-/// stimuli — the 3s EOF deadline in
-/// `input_eof_closes_an_idle_acp_session_without_waiting_for_output_to_close`
-/// is the load-bearing assertion and stays fixed.
+/// latter, whose octos-cli lib shard ran 655s). Deadlines only, never
+/// stimuli — every wait here bounds a hang, and that includes the 3s EOF
+/// deadline in
+/// `input_eof_closes_an_idle_acp_session_without_waiting_for_output_to_close`:
+/// its failure mode (`oup.rs` — after EOF the idle output pump keeps the
+/// transport joined) waits forever, so any finite bound keeps the test's
+/// detection power; scaling it only stops a slow-but-real teardown from
+/// tripping the bound on a loaded runner.
 fn waiting_budget(base: std::time::Duration) -> std::time::Duration {
     #[cfg(windows)]
     {
@@ -73,7 +77,7 @@ async fn input_eof_closes_an_idle_acp_session_without_waiting_for_output_to_clos
         }
     }
     client.tx.close_channel();
-    tokio::time::timeout(std::time::Duration::from_secs(3), serving)
+    tokio::time::timeout(waiting_budget(std::time::Duration::from_secs(3)), serving)
         .await
         .expect("stdin EOF must not wait for the idle output pump")
         .unwrap()
