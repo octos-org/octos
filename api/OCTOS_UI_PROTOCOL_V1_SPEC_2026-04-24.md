@@ -453,7 +453,14 @@ Session, turn, and approval core:
   registry lock; the agent loop drains them FIFO at its next iteration
   boundary — before the next LLM call — as plain `role: user` messages
   with no wrapper text, persisting each through the canonical session
-  path so the standard v2 `UserMessage` envelope announces the fold-in;
+  path so the standard v2 `UserMessage` envelope announces the fold-in.
+  Pending input is checked before each serial tool admission and each new
+  batch: tools already running finish, while unstarted calls receive explicit
+  not-executed results so the model can reconsider them after reading the input.
+  Already-admitted parallel calls settle before the next model request.
+  New input wakes a pending streaming model request: emitted text and observed
+  usage are retained, unexecuted tool arguments are discarded, and sampling
+  resumes with the new input in the SAME turn (no terminal or second start);
   a steer landing after the model's final answer forces one more round
   in the SAME turn. Returns `steered: true` + the ACTIVE turn id. An
   `expected_turn_id` naming a different turn → `invalid_params`; a live

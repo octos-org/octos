@@ -2621,7 +2621,16 @@ impl Agent {
         );
         let tool_timeout = tool_timeout_secs.map(Duration::from_secs);
 
-        let results: Vec<ToolCallResult> = if !any_exclusive {
+        let results: Vec<ToolCallResult> = if self.steer_input_pending() {
+            // A newer user instruction arrived during sampling or an earlier
+            // batch. Complete the call/result pairs without starting stale work;
+            // the loop drains the input before its next model request.
+            response
+                .tool_calls
+                .iter()
+                .map(steering_deferred_result)
+                .collect()
+        } else if !any_exclusive {
             // Parallel admission — the classic all-Safe path. Spawn every
             // tool call as a detached task and join them against one shared
             // deadline (see `join_parallel_handles` for the aggregation and
@@ -2785,6 +2794,11 @@ impl Agent {
                     "cancelling remaining tool call in serial batch after sibling error"
                 );
                 results.push(cancelled_result(tool_call));
+                continue;
+            }
+
+            if self.steer_input_pending() {
+                results.push(steering_deferred_result(tool_call));
                 continue;
             }
 
@@ -3024,6 +3038,17 @@ async fn join_parallel_handles(
             .map(|(r, tc)| r.unwrap_or_else(|e| panic_result(tc, &e.to_string())))
             .collect(),
     }
+}
+
+/// Preserve protocol pairing for a call not started because the user steered.
+/// Running tools finish normally; these results never claim execution or undo.
+fn steering_deferred_result(tool_call: &octos_core::ToolCall) -> ToolCallResult {
+    let mut result = cancelled_result(tool_call);
+    result.0.content = format!(
+        "Tool '{}' was not executed because a newer user instruction is pending. Read that instruction before deciding whether this call is still needed.",
+        tool_call.name
+    );
+    result
 }
 
 /// Build a synthetic tool-result message for a peer that was cancelled after
@@ -3871,6 +3896,88 @@ mod tests {
                 success: true,
                 ..Default::default()
             })
+        }
+    }
+
+    struct SteeringBoundaryTool {
+        buffer: crate::steering::SharedSteerBuffer,
+        safe: bool,
+    }
+
+    #[async_trait]
+    impl Tool for SteeringBoundaryTool {
+        fn name(&self) -> &str {
+            "steering_boundary"
+        }
+        fn description(&self) -> &str {
+            "Injects steering while a tool is running"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn concurrency_class(&self) -> crate::tools::ConcurrencyClass {
+            if self.safe {
+                crate::tools::ConcurrencyClass::Safe
+            } else {
+                crate::tools::ConcurrencyClass::Exclusive
+            }
+        }
+        async fn execute(&self, _: &serde_json::Value) -> eyre::Result<ToolResult> {
+            self.buffer.push("stop editing; explain first".into());
+            Ok(ToolResult {
+                output: "FIRST_COMPLETED".into(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_yields_after_running_tool_before_another_mutation() {
+        // Exercise both serial execution and the read-to-write boundary of a
+        // mixed batch. Real tools run: a later mutation must never be invoked.
+        for safe in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let buffer = Arc::new(crate::steering::SteerBuffer::default());
+            let mutated = Arc::new(AtomicBool::new(false));
+            let mut tools = ToolRegistry::new();
+            tools.register(SteeringBoundaryTool {
+                buffer: buffer.clone(),
+                safe,
+            });
+            tools.register(MutatingTool {
+                mutated: mutated.clone(),
+            });
+            let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+            let agent = Agent::new(
+                AgentId::new("boundary"),
+                Arc::new(NoChatProvider),
+                tools,
+                memory,
+            )
+            .with_steer_buffer(buffer.clone());
+            let response = ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![
+                    tool_call("first", "steering_boundary"),
+                    tool_call("second", "mutating_tool"),
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            };
+            let (messages, _, _, _, _, success) = agent.execute_tools(&response).await.unwrap();
+            assert!(!mutated.load(Ordering::SeqCst));
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].content, "FIRST_COMPLETED");
+            assert_eq!(messages[1].tool_call_id.as_deref(), Some("second"));
+            assert!(messages[1].content.contains("was not executed"));
+            assert_eq!(
+                success,
+                vec![("first".into(), true), ("second".into(), false)]
+            );
+            assert_eq!(buffer.drain(), vec!["stop editing; explain first"]);
         }
     }
 
