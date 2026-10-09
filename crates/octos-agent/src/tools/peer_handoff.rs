@@ -142,20 +142,13 @@ impl Tool for PeerHandoffTool {
     }
 
     fn description(&self) -> &str {
-        "Hand a SELF-CONTAINED piece of work to a sovereign peer session with its \
-         own durable brief, workspace, and lifecycle, and keep working yourself. \
-         Give the peer a short, unique NAME — it is the peer's primary address \
-         (\"let Edison do X\"); you reach it later by name with peer_send_input / \
-         peer_close / peer_gather. Use when the work outlives this turn, needs its \
-         own workspace or safety envelope, or the user may steer it separately. \
-         You will NOT receive the result in this turn — the peer reports to the \
-         user's session strip and the shared blackboard. Handing work off does NOT \
-         end your turn: delegating is what lets you make progress on your own \
-         remaining work in parallel, so continue it immediately unless the peer \
-         took over everything you had left. For work whose result THIS turn needs \
-         to continue reasoning, use spawn instead. The brief is a complete task \
-         contract: include all context the peer needs (it cannot see this \
-         conversation)."
+        "Hand self-contained work to a durable peer session with its own workspace and \
+         lifecycle; keep working yourself. Use for work that outlives this turn, needs \
+         separate permissions, or needs independent user steering. Give it a short unique \
+         name and a complete brief: it cannot see this conversation. Address it later with \
+         peer_send_input, peer_close or peer_gather. Results go to the session strip and \
+         blackboard, not this turn; use spawn if you need the result this turn. Handoff \
+         does NOT end your turn: continue remaining work unless the peer took over all of it."
     }
 
     fn tags(&self) -> &[&str] {
