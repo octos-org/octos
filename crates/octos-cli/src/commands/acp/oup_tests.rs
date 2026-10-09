@@ -1,10 +1,11 @@
 use super::*;
 
-/// Mirrors `session_actor_tests::waiting_budget` (#2718): scale a test's
-/// WAITING budget on Windows, where loaded check-windows runners miss
-/// fixed-duration waits that pass everywhere else (this file's 10s handshake
-/// and 20s cycle watchdogs fired on main runs 37792417952/37861678480 while
-/// the identical tests stayed green on Linux). Deadlines only, never
+/// Mirrors the `session_actor_tests::waiting_budget` helper (#2053 lineage);
+/// tracked for this file under #2718. Scales a test's WAITING budget on
+/// Windows, where loaded check-windows runners miss fixed-duration waits
+/// that pass everywhere else (the 10s handshake fired on main runs
+/// 37792417952 and 37861678480; the two 20s cycle watchdogs joined on the
+/// latter, lane wall 655s vs ~350s nominal). Deadlines only, never
 /// stimuli — the 3s EOF deadline in
 /// `input_eof_closes_an_idle_acp_session_without_waiting_for_output_to_close`
 /// is the load-bearing assertion and stays fixed.
@@ -226,8 +227,9 @@ async fn should_report_cancelled_when_session_cancel_arrives_during_turn() {
     let stop_for_main = stop_reason.clone();
     let prompt_cwd = cwd.clone();
 
+    let budget = waiting_budget(std::time::Duration::from_secs(20));
     tokio::time::timeout(
-        waiting_budget(std::time::Duration::from_secs(20)),
+        budget,
         Client
             .builder()
             .name("octos-acp-cancel-client")
@@ -280,7 +282,9 @@ async fn should_report_cancelled_when_session_cancel_arrives_during_turn() {
             ),
     )
     .await
-    .expect("ACP request cycle must complete within the waiting budget")
+    .unwrap_or_else(|elapsed| {
+        panic!("ACP request cycle must complete within {budget:?}: {elapsed:?}")
+    })
     .expect("ACP client run completes");
 
     let got = *stop_reason.lock().await;
@@ -322,8 +326,9 @@ async fn should_report_end_turn_for_fresh_prompt_after_prior_turn_was_cancelled(
     let second_for_main = second_stop.clone();
     let prompt_cwd = cwd.clone();
 
+    let budget = waiting_budget(std::time::Duration::from_secs(20));
     tokio::time::timeout(
-        waiting_budget(std::time::Duration::from_secs(20)),
+        budget,
         Client
             .builder()
             .name("octos-acp-cancel-then-fresh-client")
@@ -392,7 +397,9 @@ async fn should_report_end_turn_for_fresh_prompt_after_prior_turn_was_cancelled(
             ),
     )
     .await
-    .expect("ACP request cycle must complete within the waiting budget")
+    .unwrap_or_else(|elapsed| {
+        panic!("ACP request cycle must complete within {budget:?}: {elapsed:?}")
+    })
     .expect("ACP client run completes");
 
     let got = *second_stop.lock().await;
@@ -449,8 +456,9 @@ async fn should_reject_a_concurrent_prompt_on_the_same_session() {
     };
 
     let prompt_cwd = cwd.clone();
+    let budget = waiting_budget(std::time::Duration::from_secs(20));
     tokio::time::timeout(
-        waiting_budget(std::time::Duration::from_secs(20)),
+        budget,
         Client
             .builder()
             .name("octos-acp-concurrent-prompt-client")
@@ -562,6 +570,8 @@ async fn should_reject_a_concurrent_prompt_on_the_same_session() {
             ),
     )
     .await
-    .expect("ACP request cycle must complete within the waiting budget")
+    .unwrap_or_else(|elapsed| {
+        panic!("ACP request cycle must complete within {budget:?}: {elapsed:?}")
+    })
     .expect("ACP client run completes");
 }
