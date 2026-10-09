@@ -28,6 +28,10 @@ spec and UPCR documents. The authoritative source remains code:
 | `config/capabilities/list` | shipped AppUI extra, UPCR-2026-017 |
 | `profile/local/create` | shipped, UPCR-2026-018 |
 | `server/shutdown` | shipped local-solo AppUI extra, UPCR-2026-032; stops this `octos serve` exactly as Ctrl+C would |
+| `server/instance.get` | raw AppUI extra; public identity of the authenticated shared local runtime |
+| `peer/team/list` | raw AppUI extra; profile/workspace-scoped membership and update subscription |
+| `peer/team/leader/set` | raw AppUI extra; user coordinator transfer with expected revision |
+| `peer/team/message` | raw AppUI extra; durable attributed direct/broadcast message receipts |
 | `session/open` | shipped base method; optional `client_commands` param UPCR-2026-037; `accepted_client_commands` result field UPCR-2026-038 |
 | `session/list` | shipped REST-to-WS method |
 | `session/history/list` | raw AppUI method; authorized profiles and known project stores |
@@ -242,3 +246,12 @@ form an additional live stream. See the [spec §14](OCTOS_UI_PROTOCOL_V1_SPEC_20
 - `auth/logout` and all `content/*` methods are recorded as auth-bound
   unavailable over unauthenticated stdio, matching
   `APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS`.
+
+## Conditional raw notifications
+
+`peer/team/updated` is emitted for clients subscribed by `peer/team/list` or
+`peer/team/leader/set`, under `peer.workspace_team.v1`. It carries a full team
+snapshot. This raw AppUI extension is handled before the typed notification
+codec by compatible clients and is not part of `UI_PROTOCOL_NOTIFICATION_METHODS`.
+See the workspace-team contract in the OUP specification and
+`crates/octos-cli/src/api/ui_protocol_workspace_team.rs`.

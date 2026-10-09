@@ -713,6 +713,10 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   `host_gone`, so the system agent's later `peer_send_input` fails "not
   connected"; idempotent; `peer/tools/register` restores the route; refused
   to external clients)
+- `server/instance.get` (shared local server identity; returns no credential;
+  see [workspace teams ADR](../docs/adr/automatic-workspace-peer-teams.md)).
+- `peer/team/list`, `peer/team/leader/set`, `peer/team/message` (automatic
+  workspace teams; capability `peer.workspace_team.v1`; contract below).
 - `peer/gather` (#1801 v2 blackboard read: per staged peer its brief + the
   latest `result.md` — written server-side on every peer-session turn
   terminal — with per-field truncation flags and `result_updated_unix`;
@@ -870,6 +874,8 @@ Session orchestration status (whole-job indicator; ungated; accepted
 
 Peer staging (#1801 v3, ungated):
 
+- `peer/team/updated` — ephemeral complete team snapshot for a connection
+  that called `peer/team/list` or `peer/team/leader/set`; re-list after reconnect.
 - `peer/staged` — agent-initiated peer staging: the model's `peer_handoff`
   tool staged a sovereign peer session server-side (durable brief + optional
   fenced worktree), and the client auto-opens the staged session (topic
@@ -3463,3 +3469,55 @@ fields are open registries; clients must preserve unknown values. The
 `LoopFire` object mirrors the `loop/fire_now` result object (`queued`,
 optional `duplicate`, `continuation_id`, `dedupe_key`, `reason`,
 `priority`, and `message`).
+
+
+## Automatic workspace peer teams (`peer.workspace_team.v1`)
+
+These methods extend the existing peer execution and durable continuation
+machinery. Team identity is the authenticated profile plus the canonical
+server workspace established by `session/open`. Clients cannot supply a team
+storage path or sender identity. Hosted/staged peer sessions retain their
+existing lifecycle and are not automatically admitted to workspace teams.
+
+All three requests require `session_id`; `profile_id` is optional and follows
+the existing connection/session profile validation. A successful session open
+joins idempotently. A new coding launch chooses a fresh session ID; attaching
+or resuming the same ID creates no additional member.
+
+| Method | Additional request fields | Result |
+| --- | --- | --- |
+| `peer/team/list` | none | Team snapshot; subscribes this connection to updates |
+| `peer/team/leader/set` | `agent_id`, `expected_revision` (integer) | Updated snapshot; stale revisions fail with invalid request |
+| `peer/team/message` | `agent_id` **or** `broadcast:true`, `message`, `occurrence_id` | `{session_id, receipts:[{agent_id,status,error?}]}` |
+
+Snapshot: `{session_id, workspace, revision, leader, members}`. Each member:
+`{agent_id, session_id, role, attached, status, result_turn_id}`. `role` is
+`coordinator` or `member`; `status` is `running` or `idle`; `attached` indicates
+UI presence, not whether background execution is available. Result turn IDs
+are nullable. Clients tolerate additional fields. `peer/team/updated` carries
+the same full snapshot, coalesced on the two-second housekeeping tick.
+Membership/leadership are persisted; presence is process-local. Revision changes
+on membership or leader change. Disconnecting never replaces the coordinator.
+
+Messages are 1–65536 bytes, nonblank. Occurrence IDs are 1–256 bytes. A caller
+must reuse the occurrence ID when retrying an uncertain delivery. Each target
+gets `queued`, `already_queued`, or `failed` (with an error); a queue receipt is
+not a completed task. Broadcast excludes the caller. Targets must be in the
+same team and have opened their workspace in this server incarnation. New
+messages to a member currently opened in another workspace are rejected.
+Queued messages remain scoped to the original workspace and wait for it to
+reopen after restart. No automatic resend of user turns occurs.
+
+Model tools use `peer_list`, `peer_send_input`, and `peer_gather`; coordinator
+turns additionally receive `peer_assign`, which checks the persisted leadership
+epoch at admission. Assignments already admitted can finish after a transfer.
+Messages are attributed synthetic input, never direct human authorization.
+The existing scheduler serializes delivery against active turns and approvals.
+
+`server/instance.get` requires normal authenticated OUP access and is available
+only on `serve --shared --solo --host 127.0.0.1`. It returns
+`{version:1, instance_id, data_dir, cwd, protocol:"peer.workspace_team.v1"}`.
+The corresponding owner-private `shared-instance.json` adds `pid`, `endpoint`
+and `auth_token`. Clients validate the local endpoint and runtime path before
+sending the token, then compare the authenticated returned identity. The
+process-lifetime local credential is separate from dashboard admin rotation.

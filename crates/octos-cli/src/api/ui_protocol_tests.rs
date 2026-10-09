@@ -3812,6 +3812,19 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         APPUI_METHOD_SNAPSHOT_RESTORE => {
             json!({ "session_id": session_id, "snapshot_id": "deadbeef" })
         }
+        octos_core::ui_protocol::methods::SERVER_INSTANCE_GET => json!({}),
+        workspace_team::LIST => json!({ "session_id": session_id }),
+        workspace_team::LEADER => json!({
+            "session_id": session_id,
+            "agent_id": "workspace-probe",
+            "expected_revision": 1,
+        }),
+        workspace_team::MESSAGE => json!({
+            "session_id": session_id,
+            "agent_id": "workspace-probe",
+            "message": "probe workspace peer message",
+            "occurrence_id": "workspace-dispatch-probe",
+        }),
         APPUI_METHOD_PEER_PREPARE => json!({
             "brief": "probe peer brief",
             "session_id": session_id,
@@ -49931,4 +49944,84 @@ fn external_record_row_merges_into_live_and_snapshot_context_views() {
         }),
         "the snapshot-branch record landed in the durable snapshot"
     );
+}
+
+#[tokio::test]
+async fn workspace_team_open_list_election_notifications_and_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = Arc::new(session_list_state_with_dev_runtime(tmp.path()).await);
+    let workspace = tmp.path().join("project");
+    std::fs::create_dir(&workspace).unwrap();
+    let (ws_a, mut rx_a) = ws_connection_for_test(256);
+    let (ws_b, _rx_b) = ws_connection_for_test(256);
+    let a = SessionKey::with_profile_topic("dev", "local", "workspace-team-test", "coding-a");
+    let b = SessionKey::with_profile_topic("dev", "local", "workspace-team-test", "coding-b");
+    let ledger = Arc::new(UiProtocolLedger::new(128));
+    let approvals = PendingApprovalStore::default();
+    let questions = PendingQuestionStore::default();
+    let forwarders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    for (ws, session) in [(&ws_a, &a), (&ws_b, &b), (&ws_a, &a)] {
+        assert!(
+            handle_session_open(
+                ws,
+                &state,
+                &ledger,
+                &approvals,
+                &questions,
+                &forwarders,
+                Some("dev"),
+                None,
+                ConnectionUiFeatures::stdio_defaults(),
+                "open-team".into(),
+                SessionOpenParams {
+                    client_commands: None,
+                    session_id: session.clone(),
+                    topic: None,
+                    profile_id: Some("dev".into()),
+                    cwd: Some(workspace.to_string_lossy().into_owned()),
+                    sandbox: None,
+                    after: None
+                },
+                false
+            )
+            .await
+        );
+    }
+    let list = RpcRequest::new("list-team", workspace_team::LIST, json!({"session_id": a}));
+    let first = workspace_team_rpc::rpc(&ws_a, &state, &list, Some("dev"))
+        .await
+        .unwrap();
+    assert_eq!(first["members"].as_array().unwrap().len(), 2);
+    assert_eq!(first["leader"], "workspace-1");
+    let elect = RpcRequest::new(
+        "elect-team",
+        workspace_team::LEADER,
+        json!({"session_id": b, "agent_id": "workspace-2", "expected_revision": first["revision"]}),
+    );
+    let elected = workspace_team_rpc::rpc(&ws_b, &state, &elect, Some("dev"))
+        .await
+        .unwrap();
+    assert_eq!(elected["leader"], "workspace-2");
+    assert!(
+        workspace_team_rpc::rpc(&ws_b, &state, &elect, Some("dev"))
+            .await
+            .is_err()
+    );
+    assert!(
+        workspace_team_rpc::rpc(&ws_a, &state, &list, Some("another-profile"))
+            .await
+            .is_err()
+    );
+    while rx_a.try_recv().is_ok() {}
+    workspace_team_rpc::emit_updates(&ws_a, &state).await;
+    let update = recv_rpc_json(&mut rx_a).await;
+    assert_eq!(update["method"], workspace_team::UPDATED);
+    assert_eq!(update["params"]["leader"], "workspace-2");
+    release_connection_client_commands(&state, ws_b.connection_id()).await;
+    workspace_team_rpc::emit_updates(&ws_a, &state).await;
+    let update = recv_rpc_json(&mut rx_a).await;
+    assert_eq!(update["params"]["members"][1]["attached"], false);
+    for (_, handle) in forwarders.lock().await.drain() {
+        handle.abort();
+    }
 }

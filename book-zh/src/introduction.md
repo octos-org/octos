@@ -1,5 +1,7 @@
 # 简介
 
+<img src="images/octos-logo.svg" alt="Octos logo" width="96" height="96">
+
 > 🌐 **[English Documentation](/octos/)**
 
 ## Octos 是什么？

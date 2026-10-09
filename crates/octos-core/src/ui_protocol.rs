@@ -1080,6 +1080,11 @@ where
 }
 
 pub mod methods {
+    // Raw AppUI workspace-team methods; advertised through APPUI_EXTRA_METHODS.
+    pub const SERVER_INSTANCE_GET: &str = "server/instance.get";
+    pub const PEER_TEAM_LIST: &str = "peer/team/list";
+    pub const PEER_TEAM_LEADER_SET: &str = "peer/team/leader/set";
+    pub const PEER_TEAM_MESSAGE: &str = "peer/team/message";
     pub const CONFIG_CAPABILITIES_LIST: &str = "config/capabilities/list";
     pub const SESSION_STATUS_READ: &str = "session/status/read";
     pub const PROFILE_LOCAL_CREATE: &str = "profile/local/create";
