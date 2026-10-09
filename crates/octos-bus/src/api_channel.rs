@@ -25,7 +25,7 @@ use futures::stream::{self, StreamExt};
 use metrics::counter;
 use octos_core::{
     EventEnvelope, InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, OutboundMessage,
-    SessionKey, ThreadId, TurnContext,
+    SessionKey, ThreadId, TurnContext, constant_time_eq,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -724,7 +724,7 @@ impl Channel for ApiChannel {
             inbound_tx,
             pending: self.pending.clone(),
             watchers: self.watchers.clone(),
-            auth_token: self.auth_token.clone(),
+            auth_token: resolve_api_token(self.auth_token.as_deref()),
             profile_id: self.profile_id.clone(),
             sessions: self.sessions.clone(),
             task_query: self.task_query.clone(),
@@ -1433,11 +1433,7 @@ async fn handle_chat(
 ) -> Response {
     // Validate auth token if configured
     if let Some(ref expected) = state.auth_token {
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if provided != Some(expected.as_str()) {
+        if !bearer_token_matches(&headers, expected) {
             return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
         }
     }
@@ -1577,11 +1573,7 @@ async fn handle_session_event_stream(
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
     if let Some(ref expected) = state.auth_token {
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if provided != Some(expected.as_str()) {
+        if !bearer_token_matches(&headers, expected) {
             return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
         }
     }
@@ -2603,18 +2595,52 @@ struct ShellResponse {
     timed_out: bool,
 }
 
-/// Constant-time byte comparison to prevent timing attacks on auth tokens
-/// (no length leak) — the same shape the CLI router uses for its token
-/// compares (#2705).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let len_eq = a.len() ^ b.len();
-    let mut result = 0u8;
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        result |= x ^ y;
-    }
-    result == 0 && len_eq == 0
+/// Resolve the token that guards the channel's HTTP surface: the channel's
+/// own config first, then OCTOS_AUTH_TOKEN, then the top-level config.json
+/// auth_token — the same chain the admin shell accepts, so every deployment
+/// style that arms the admin surface arms the chat surface too (#2736).
+fn resolve_api_token(channel_token: Option<&str>) -> Option<String> {
+    channel_token
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("OCTOS_AUTH_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
+        .or_else(|| {
+            // Try OCTOS_DATA_DIR, then ~/.octos
+            let home = std::env::var("HOME").unwrap_or_default();
+            let candidates = [
+                std::env::var("OCTOS_DATA_DIR").unwrap_or_default(),
+                format!("{home}/.octos"),
+            ];
+            for dir in &candidates {
+                if dir.is_empty() {
+                    continue;
+                }
+                if let Ok(s) = std::fs::read_to_string(format!("{dir}/config.json")) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                        if let Some(t) = v.get("auth_token").and_then(|t| t.as_str()) {
+                            if !t.is_empty() {
+                                return Some(t.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        })
+}
+
+/// Constant-time `Authorization: Bearer` check against the resolved token —
+/// the same max-len compare the admin shell uses (#2705, #2736).
+fn bearer_token_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
 }
 
 /// Auth-failure log for the admin shell — same hygiene as the router's
@@ -2639,38 +2665,7 @@ async fn handle_admin_shell(
         .unwrap_or("");
 
     // Check channel-level token, env var, then config.json auth_token.
-    let expected_token: Option<String> = state
-        .auth_token
-        .clone()
-        .filter(|t| !t.is_empty())
-        .or_else(|| {
-            std::env::var("OCTOS_AUTH_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-        })
-        .or_else(|| {
-            // Try OCTOS_DATA_DIR, then ~/.octos, then cwd/.octos
-            let home = std::env::var("HOME").unwrap_or_default();
-            let candidates = [
-                std::env::var("OCTOS_DATA_DIR").unwrap_or_default(),
-                format!("{home}/.octos"),
-            ];
-            for dir in &candidates {
-                if dir.is_empty() {
-                    continue;
-                }
-                if let Ok(s) = std::fs::read_to_string(format!("{dir}/config.json")) {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                        if let Some(t) = v.get("auth_token").and_then(|t| t.as_str()) {
-                            if !t.is_empty() {
-                                return Some(t.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            None
-        });
+    let expected_token = resolve_api_token(state.auth_token.as_deref());
     let is_admin = match &expected_token {
         Some(expected) if !expected.is_empty() => {
             constant_time_eq(token.as_bytes(), expected.as_bytes())
