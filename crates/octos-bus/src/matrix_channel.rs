@@ -881,7 +881,8 @@ fn error_json_response(
     )
 }
 
-/// Query parameters for Matrix Appservice endpoints.
+/// Query parameters for Matrix Appservice endpoints. The `access_token`
+/// query parameter is a deprecated hs_token fallback (see `validate_hs_token`).
 #[derive(Deserialize)]
 struct AccessTokenQuery {
     access_token: Option<String>,
@@ -1080,7 +1081,8 @@ impl MatrixChannel {
     }
 
     /// Generate a Matrix Appservice registration YAML file at `{data_dir}/matrix-appservice-registration.yaml`.
-    /// Returns the file path. Does NOT overwrite existing files.
+    /// Returns the file path. Does NOT overwrite existing files. The file
+    /// carries both tokens in plaintext, so it is written owner-only (0600) on Unix.
     pub fn generate_registration(&self, data_dir: &std::path::Path) -> Result<PathBuf> {
         use std::io::Write;
         let path = data_dir.join("matrix-appservice-registration.yaml");
@@ -1129,11 +1131,15 @@ impl MatrixChannel {
             .wrap_err("failed to serialize registration YAML")?;
 
         // Atomic: create_new(true) fails if file already exists (no TOCTOU race)
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Applied at creation, so there is no looser-perm window.
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
             Ok(mut f) => {
                 f.write_all(yaml.as_bytes()).wrap_err_with(|| {
                     format!("failed to write registration YAML to {}", path.display())
@@ -1244,8 +1250,20 @@ fn managed_localpart<'a>(user_id: &'a str, server_name: &str) -> Option<&'a str>
         .and_then(|s| s.strip_suffix(&format!(":{server_name}")))
 }
 
-fn default_appservice_bind_addr(port: u16) -> String {
-    format!("0.0.0.0:{port}")
+/// Environment override for the appservice listener bind address. Cross-container
+/// homeserver deployments (see the user guide's Docker Compose) set it to
+/// `0.0.0.0:{port}` so the homeserver can push events to the listener.
+const APPSERVICE_BIND_ENV: &str = "OCTOS_MATRIX_APPSERVICE_BIND";
+
+/// Appservice listener bind address. Defaults to loopback — the AS endpoints
+/// (event injection, bot reload) authenticate with the hs_token alone and must
+/// not be reachable from other hosts unless an operator opts out.
+fn appservice_bind_addr(port: u16, configured: Option<&str>) -> String {
+    configured
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("127.0.0.1:{port}"))
 }
 
 async fn register_user_via_appservice(
@@ -1371,12 +1389,17 @@ async fn leave_room_via_appservice(
 
 // ── Axum handlers ────────────────────────────────────────────────────────────
 
-/// Validate the hs_token from either query parameter or Authorization header.
+/// Validate the hs_token from the Authorization header. The `access_token`
+/// query parameter is honored only as a deprecated fallback — Matrix spec
+/// v1.11 deprecated query-string tokens because they land verbatim in
+/// homeserver and proxy request-line logs.
 fn validate_hs_token(
     query: &AccessTokenQuery,
     headers: &HeaderMap,
     expected: &str,
 ) -> std::result::Result<(), StatusCode> {
+    static QUERY_HS_TOKEN_WARNED: AtomicBool = AtomicBool::new(false);
+
     let bearer_token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -1389,10 +1412,20 @@ fn validate_hs_token(
         }
     }
 
-    // Accept whichever token is present (query takes priority).
-    let token = query.access_token.as_deref().or(bearer_token);
+    // Header wins; a query token is only accepted as the deprecated fallback.
+    // The deprecation warning fires after the grant validates, so unauthenticated
+    // scanners fuzzing ?access_token= cannot flood the log.
+    let token = bearer_token.or(query.access_token.as_deref());
     match token {
-        Some(t) if bool::from(t.as_bytes().ct_eq(expected.as_bytes())) => Ok(()),
+        Some(t) if bool::from(t.as_bytes().ct_eq(expected.as_bytes())) => {
+            if bearer_token.is_none() && !QUERY_HS_TOKEN_WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "hs_token accepted from the deprecated access_token query parameter; \
+                     the homeserver should send Authorization: Bearer"
+                );
+            }
+            Ok(())
+        }
         Some(_) => Err(StatusCode::FORBIDDEN),
         None => Err(StatusCode::UNAUTHORIZED),
     }
@@ -2306,7 +2339,8 @@ async fn handle_ping(
 
 /// Reload bot routes and registered users from disk.
 /// Called by CLI after `create-matrix-bot` or `delete-matrix-bot`.
-/// Requires `hs_token` authentication (query param or Bearer header).
+/// Requires `hs_token` authentication (Bearer header, or the deprecated
+/// `access_token` query parameter).
 async fn handle_reload_bots(
     Query(query): Query<AccessTokenQuery>,
     headers: HeaderMap,
@@ -2403,7 +2437,18 @@ impl Channel for MatrixChannel {
             )
             .with_state(state);
 
-        let addr = default_appservice_bind_addr(self.port);
+        let configured_bind = std::env::var(APPSERVICE_BIND_ENV).ok();
+        let addr = appservice_bind_addr(self.port, configured_bind.as_deref());
+        if let Some((_, bind_port)) = addr.rsplit_once(':') {
+            if bind_port.parse::<u16>().ok() != Some(self.port) {
+                warn!(
+                    bind_addr = %addr,
+                    config_port = self.port,
+                    "appservice bind port differs from the channel's configured port; \
+                     the homeserver must push to the bound port"
+                );
+            }
+        }
         info!(port = self.port, "Matrix appservice listening on {addr}");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
 

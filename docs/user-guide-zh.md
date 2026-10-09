@@ -2328,7 +2328,7 @@ openssl rand -hex 32   # → hs_token
 
 #### 2. 创建应用服务注册文件
 
-创建 `appservices/octos-registration.yaml`：
+创建 `appservices/octos-registration.yaml`（文件明文携带两个 token，保持仅所有者可读：`chmod 600 appservices/octos-registration.yaml`）：
 
 ```yaml
 # Matrix 应用服务注册 — octos
@@ -2432,7 +2432,7 @@ Matrix 频道字段说明：
 | `server_name` | Matrix 域名（必须与 `palpo.toml` 一致）。 |
 | `sender_localpart` | 机器人用户名（必须与注册文件一致）。 |
 | `user_prefix` | 此应用服务管理的桥接用户 ID 前缀。 |
-| `port` | Octos 监听来自 Palpo 的应用服务事件的端口。 |
+| `port` | Octos 监听来自 Palpo 的应用服务事件的端口。监听默认只绑 `127.0.0.1`；跨容器部署用 `OCTOS_MATRIX_APPSERVICE_BIND` 覆盖绑定地址（见下方 compose 文件）。 |
 | `allowed_senders` | 允许与机器人对话的 Matrix 用户 ID。空数组 = 允许所有人。 |
 | `mention_only` | 可选，默认 `true`。在真正的 1:1 私聊之外，机器人只在被显式寻址时才回复（`m.mentions` 条目、MXID pill/提及、或客户端指定的 target）。真正的 1:1 私聊——1 个人类 + 该应用服务在此房间仅管理 1 个机器人（以应用服务自己的房间映射为准）——始终回复。多机器人房间即使只有 1 个人类也要求提及，避免所有机器人同时应答。设为 `false` 则在所有房间回复每条消息（带 `org.octos.explicit_room` 标记的消息仍走门控）。 |
 
@@ -2482,11 +2482,15 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - 8009:8009     # 应用服务监听（接收 Palpo 推送的事件）
+      # 8009 刻意不发布到主机：Palpo 通过 internal 桥接网络直连应用服务监听
+      # （http://octos:8009），监听只靠 hs_token 认证，不应暴露到 compose
+      # 网络之外。
       - 8010:8080     # Octos 仪表盘 / 管理 API
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       RUST_LOG: octos=debug,info
+      # 应用服务监听默认只绑回环地址；跨容器的 homeserver 推送需要显式放开。
+      OCTOS_MATRIX_APPSERVICE_BIND: 0.0.0.0:8009
     volumes:
       - ./data/octos:/root/.octos
       - ./config/botfather.json:/root/.octos/profiles/botfather.json:ro
@@ -2526,7 +2530,7 @@ Palpo 在启动时读取 `appservices/octos-registration.yaml`。当 Matrix 用�
 | 症状 | 原因 | 解决方法 |
 |------|------|----------|
 | 机器人无响应 | 注册文件与配置文件之间令牌不匹配 | 检查[令牌匹配清单](#164-令牌匹配检查清单) |
-| Palpo 日志中出现 `Connection refused` | Octos 未运行或注册文件中 `url` 错误 | 确保 Octos 已启动；使用 Docker 服务名（`http://octos:8009`），不要用 `localhost` |
+| Palpo 日志中出现 `Connection refused` | Octos 未运行、注册文件中 `url` 错误，或 Palpo 容器连不到监听 | 确保 Octos 已启动；使用 Docker 服务名（`http://octos:8009`），不要用 `localhost`。跨容器部署必须设置 `OCTOS_MATRIX_APPSERVICE_BIND: 0.0.0.0:8009` —— 监听默认只绑回环地址 |
 | `User ID not in namespace` | `sender_localpart` 与注册文件 `namespaces.users` 正则不匹配 | 更新正则以包含机器人的完整用户 ID |
 | 未授权用户的消息被忽略 | `allowed_senders` 过滤 | 将用户的 Matrix ID 添加到数组中，或设置为 `[]` 以允许所有人 |
 

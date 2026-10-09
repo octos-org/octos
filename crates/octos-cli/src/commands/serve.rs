@@ -1,5 +1,8 @@
 //! Serve command: start the REST API server.
 
+#[path = "shared_instance.rs"]
+mod shared_instance;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -352,6 +355,12 @@ pub struct ServeCommand {
     /// Run AppUI JSON-RPC over stdin/stdout instead of binding HTTP.
     #[arg(long)]
     pub stdio: bool,
+
+    /// Publish an owner-readable discovery record for shared local clients.
+    /// Requires loopback and --solo; the server outlives individual clients.
+    #[arg(long, requires = "solo", conflicts_with_all = ["stdio", "host_managed"])]
+    #[serde(default)]
+    pub shared: bool,
 
     /// Run as the loopback server of an embedding host (an app shell), which
     /// owns this process: the host writes the host token and an optional
@@ -860,6 +869,9 @@ impl Executable for ServeCommand {
 
 impl ServeCommand {
     async fn run_async(self) -> Result<()> {
+        if self.shared && self.host != "127.0.0.1" {
+            eyre::bail!("--shared requires --host 127.0.0.1");
+        }
         let cwd = match &self.cwd {
             Some(p) => p.clone(),
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
@@ -1124,7 +1136,17 @@ impl ServeCommand {
             None
         };
 
-        let auth_token = if let Some((host_token, _)) = &host_managed_tokens {
+        let auth_token = if self.shared {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            Some(format!(
+                "{:016x}{:016x}{:016x}{:016x}",
+                rng.r#gen::<u64>(),
+                rng.r#gen::<u64>(),
+                rng.r#gen::<u64>(),
+                rng.r#gen::<u64>()
+            ))
+        } else if let Some((host_token, _)) = &host_managed_tokens {
             Some(host_token.clone())
         } else if let Some((token, source)) = resolve_auth_token(
             self.auth_token.clone(),
@@ -1824,6 +1846,7 @@ impl ServeCommand {
         // The stop switch exists before AppState so the `server/shutdown`
         // method and the signal watcher (installed further down) share it.
         let serve_shutdown_tx = Arc::new(tokio::sync::watch::channel(false).0);
+        let shared_token = self.shared.then(|| auth_token.clone()).flatten();
         let state = Arc::new(AppState {
             ui_protocol: crate::api::UiProtocolRuntimeResources::default(),
             profiles: profile_runtimes,
@@ -2238,6 +2261,19 @@ impl ServeCommand {
         // (#1973 fix E — the global master-continuation drain used to be
         // spawned HERE, after the stdio early-return; it now spawns right
         // before that branch so stdio serves share the safety net.)
+        let _shared_publication = if let Some(token) = shared_token.as_deref() {
+            let identity = uuid::Uuid::new_v4().to_string();
+            let (publication, identity) =
+                shared_instance::publish(&data_dir, &cwd, effective_serve_port, token, &identity)?;
+            let _ = state.ui_protocol.shared_instance.set(identity);
+            let _ = state
+                .ui_protocol
+                .shared_instance_token
+                .set(token.to_owned());
+            Some(publication)
+        } else {
+            None
+        };
         let app = build_router(state);
         let listener =
             http_listener.expect("non-stdio serve must bind its HTTP listener before AppState");

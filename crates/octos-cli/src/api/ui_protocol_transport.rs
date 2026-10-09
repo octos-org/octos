@@ -1,5 +1,9 @@
 //! UI Protocol v1 WebSocket transport.
 
+#[path = "ui_protocol_workspace_team.rs"]
+mod workspace_team_rpc;
+use crate::peers::workspace_team;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
@@ -551,6 +555,10 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
     APPUI_METHOD_SNAPSHOT_LIST,
     APPUI_METHOD_SNAPSHOT_RESTORE,
+    octos_core::ui_protocol::methods::PEER_TEAM_LIST,
+    octos_core::ui_protocol::methods::PEER_TEAM_LEADER_SET,
+    octos_core::ui_protocol::methods::PEER_TEAM_MESSAGE,
+    octos_core::ui_protocol::methods::SERVER_INSTANCE_GET,
     APPUI_METHOD_PEER_PREPARE,
     APPUI_METHOD_PEER_GATHER,
     APPUI_METHOD_PEER_MODEL_SET,
@@ -2648,6 +2656,10 @@ impl ConnectionUiFeatures {
 
     fn advertised_capabilities(self, state: &AppState) -> UiProtocolCapabilities {
         let mut capabilities = self.negotiated_capabilities();
+        push_capability_feature(
+            &mut capabilities.supported_features,
+            workspace_team::FEATURE,
+        );
         for method in APPUI_EXTRA_METHODS {
             if *method == APPUI_METHOD_PROFILE_LOCAL_CREATE
                 && !supports_local_solo_profile_create(state)
@@ -7434,6 +7446,7 @@ async fn ui_protocol_connection(
                 break;
             }
             _ = appui_continuation_tick.tick() => {
+                workspace_team_rpc::emit_updates(&ws, &state).await;
                 // The select is `biased`: this housekeeping arm is polled
                 // before the read arm, so frames that queued behind a slow
                 // inline dispatch would sit in the kernel buffer while the
@@ -8456,6 +8469,7 @@ where
                     break;
                 }
                 _ = appui_continuation_tick.tick() => {
+                    workspace_team_rpc::emit_updates(&ws, &state).await;
                     if embedded.as_ref().is_some_and(|control| !control.continuations_enabled.load(Ordering::Acquire)) {
                         continue;
                     }
@@ -9382,6 +9396,10 @@ async fn abort_btw_aside_tasks(tasks: &mut Vec<tokio::task::JoinHandle<()>>) {
 /// on `session/open`; drop them so later turns (loops, cron, peers) don't
 /// advertise a client that is gone.
 async fn release_connection_client_commands(state: &AppState, connection_id: ConnectionId) {
+    state
+        .ui_protocol
+        .workspace_teams
+        .disconnect(connection_id.0);
     state
         .session_cache
         .release_client_commands(connection_id.0)
@@ -21203,6 +21221,17 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
             Ok(json!({ "capabilities": features.advertised_capabilities(state) }))
         }
+        workspace_team::LIST | workspace_team::LEADER | workspace_team::MESSAGE => {
+            workspace_team_rpc::rpc(ws, state, request, connection_profile_id).await
+        }
+        octos_core::ui_protocol::methods::SERVER_INSTANCE_GET => state
+            .ui_protocol
+            .shared_instance
+            .get()
+            .cloned()
+            .ok_or_else(|| {
+                RpcError::invalid_request("server is not a discoverable shared instance")
+            }),
         APPUI_METHOD_SERVER_SHUTDOWN => handle_server_shutdown(state),
         APPUI_METHOD_SESSION_STATUS_READ => {
             raw_session_status_result(state, request, features, connection_profile_id).await
@@ -21759,7 +21788,11 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
     }
     if matches!(
         method,
-        APPUI_METHOD_CONFIG_CAPABILITIES_LIST
+        workspace_team::LIST
+            | workspace_team::LEADER
+            | workspace_team::MESSAGE
+            | octos_core::ui_protocol::methods::SERVER_INSTANCE_GET
+            | APPUI_METHOD_CONFIG_CAPABILITIES_LIST
             | APPUI_METHOD_SERVER_SHUTDOWN
             | APPUI_METHOD_SESSION_STATUS_READ
             | APPUI_METHOD_SESSION_HISTORY_LIST
@@ -22185,6 +22218,25 @@ async fn handle_session_open(
     // forwarders let the second open silently retarget the first session's
     // pump, starving it of every profile-carrying frame.
     let live_profile_scope = outcome.profile_scope.clone();
+    // A successful coding-session open joins its canonical workspace team.
+    // App peers/context sessions keep their host-owned lifecycle and authority.
+    if !session_ingress && peer_handoff_allowed_for_session(&session_id_for_subscribe) {
+        let opened = &outcome.result.opened;
+        if let (Some(runtime), Some(workspace)) = (
+            resolve_session_profile_runtime(state, opened.active_profile_id.as_deref()),
+            opened.workspace_root.as_deref(),
+        ) {
+            if let Err(error) = state.ui_protocol.workspace_teams.join(
+                &runtime.data_dir,
+                Path::new(workspace),
+                &opened.session_id,
+                ws.connection_id.0,
+            ) {
+                let _ = send_rpc_error(ws, Some(id), RpcError::internal_error(error));
+                return false;
+            }
+        }
+    }
 
     // #1594 follow-up: a session-ingress connection may only call the
     // session-scoped surface, so the SessionOpened reply it receives must not
@@ -27120,6 +27172,11 @@ async fn maybe_spawn_appui_master_continuation_runner(
             if kind == crate::autonomy::agent_orchestrator::PEER_SEND_INPUT_EXTERNAL_KIND
                 || kind == crate::autonomy::agent_orchestrator::STEER_EXTERNAL_KIND
     );
+    let requires_message_dispatch = persist_peer_input_prompt
+        || matches!(
+            &continuation.reason,
+            MasterContinuationReason::External(kind) if kind == workspace_team::MESSAGE_KIND
+        );
     let cache_reservation = match reserve_peer_build_cache_turn(
         state,
         &session_id,
@@ -27203,7 +27260,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         // actually dispatched the agent, so an UNDELIVERED injection (e.g. a
         // failed `TurnStarted`) is NOT marked completed and stays durable for
         // retry/replay. `None` for every other continuation kind (unchanged).
-        let turn_dispatched = persist_peer_input_prompt
+        let turn_dispatched = requires_message_dispatch
             .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         run_standalone_turn(
             ws_for_turn,
@@ -27263,7 +27320,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
         let agent_dispatched = turn_dispatched
             .as_ref()
             .is_none_or(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
-        if continuation_may_complete(persist_peer_input_prompt, agent_dispatched) {
+        if continuation_may_complete(requires_message_dispatch, agent_dispatched) {
             default_agent_orchestrator().mark_continuation_completed(
                 &continuation,
                 Some("processed_by_appui_turn_runtime".to_owned()),
@@ -27403,7 +27460,22 @@ async fn drain_appui_due_master_continuations(
             continue;
         }
         // #436 P1 #2 — never run another client's peer turn on this connection.
-        if !peer_target_deliverable_on_connection(&wire_key, open_sessions) {
+        let is_workspace_member = resolve_session_profile_runtime(state, Some(&profile_id))
+            .and_then(|runtime| {
+                session_workspace_root_for_profile(Some(&profile_id), &wire_key).and_then(
+                    |workspace| {
+                        state
+                            .ui_protocol
+                            .workspace_teams
+                            .get(&runtime.data_dir, &workspace, &wire_key)
+                            .ok()
+                    },
+                )
+            })
+            .is_some();
+        if (is_workspace_member && !open_sessions.contains(&wire_key))
+            || !peer_target_deliverable_on_connection(&wire_key, open_sessions)
+        {
             continue;
         }
         let _ = maybe_spawn_appui_master_continuation_runner(
@@ -40054,6 +40126,32 @@ async fn run_standalone_turn(
                 Some((session_id.clone(), gathered_peer_results.clone())),
                 session_runtime.profile.profile_id.clone(),
             );
+            let team_state = state.clone();
+            let team_runtime = session_runtime.profile.clone();
+            let team_workspace = session_runtime.workspace_root.clone();
+            let team_session = session_id.clone();
+            let gather = Arc::new(move |ids: Option<Vec<String>>| {
+                let team = team_state
+                    .ui_protocol
+                    .workspace_teams
+                    .get(&team_runtime.data_dir, &team_workspace, &team_session)
+                    .ok();
+                let team_text = team
+                    .as_ref()
+                    .map(|t| t.gather(ids.as_deref()))
+                    .unwrap_or_default();
+                let staged_ids = ids.map(|ids| {
+                    ids.into_iter()
+                        .filter(|id| !id.starts_with("workspace-"))
+                        .collect::<Vec<_>>()
+                });
+                let staged_text = if staged_ids.as_ref().is_some_and(Vec::is_empty) {
+                    String::new()
+                } else {
+                    gather(staged_ids)?
+                };
+                Ok(format!("{staged_text}{team_text}"))
+            });
             tool_registry.register(octos_agent::PeerGatherTool::new(gather));
         }
 
@@ -40078,7 +40176,62 @@ async fn run_standalone_turn(
                 contracts.clone(),
                 session_runtime.profile.profile_id.clone(),
             );
+            let team_state = state.clone();
+            let team_runtime = session_runtime.profile.clone();
+            let team_workspace = session_runtime.workspace_root.clone();
+            let team_session = session_id.clone();
+            let list = Arc::new(move || {
+                let team = team_state
+                    .ui_protocol
+                    .workspace_teams
+                    .get(&team_runtime.data_dir, &team_workspace, &team_session)
+                    .map(|team| team.index(&team_session))
+                    .unwrap_or_default();
+                Ok(format!("{team}\n{}", list()?))
+            });
             tool_registry.register(octos_agent::PeerListTool::new(list));
+        }
+
+        if let Ok(team) = state.ui_protocol.workspace_teams.get(
+            &session_runtime.profile.data_dir,
+            &session_runtime.workspace_root,
+            &session_id,
+        ) {
+            if team
+                .member(&team.leader)
+                .is_some_and(|member| member.session_id == session_id)
+            {
+                let team_state = state.clone();
+                let team_runtime = session_runtime.profile.clone();
+                let team_workspace = session_runtime.workspace_root.clone();
+                let caller = session_id.clone();
+                let assignment_turn = turn_id.clone();
+                let epoch = team.leadership_epoch;
+                let assign = Arc::new(move |req: octos_agent::PeerSendInputRequest| {
+                    team_state.ui_protocol.workspace_teams.with_leader(
+                        &team_runtime.data_dir,
+                        &team_workspace,
+                        &caller,
+                        epoch,
+                        |team| {
+                            workspace_team_rpc::deliver_snapshot(
+                                &team_runtime,
+                                &caller,
+                                &req.slug,
+                                &peer_send_input_occurrence_id(
+                                    &caller.0,
+                                    &assignment_turn,
+                                    &req.occurrence_id,
+                                ),
+                                &req.message,
+                                team,
+                                true,
+                            )
+                        },
+                    )
+                });
+                tool_registry.register(octos_agent::PeerSendInputTool::new(assign).as_assignment());
+            }
         }
 
         // #436 — `peer_send_input`: cross-session input injection into a
@@ -40104,8 +40257,26 @@ async fn run_standalone_turn(
             // inject into it.
             let send_origin_session = session_id.to_string();
             let send_turn_id = turn_id.clone();
+            let team_state = state.clone();
+            let team_runtime = session_runtime.profile.clone();
+            let team_workspace = session_runtime.workspace_root.clone();
             let send_input: octos_agent::PeerSendInputCallback =
                 Arc::new(move |req: octos_agent::PeerSendInputRequest| {
+                    if req.slug.starts_with("workspace-") {
+                        return workspace_team_rpc::deliver(
+                            &team_state,
+                            &team_runtime,
+                            &team_workspace,
+                            &SessionKey(send_origin_session.clone()),
+                            &req.slug,
+                            &peer_send_input_occurrence_id(
+                                &send_origin_session,
+                                &send_turn_id,
+                                &req.occurrence_id,
+                            ),
+                            &req.message,
+                        );
+                    }
                     deliver_peer_send_input(
                         &send_profile_id,
                         &send_peers_root,
@@ -40436,6 +40607,19 @@ async fn run_standalone_turn(
         &session_id,
         ws.is_external(),
     );
+    if !ws.is_external() {
+        if let Ok(team) = state.ui_protocol.workspace_teams.get(
+            &session_runtime.profile.data_dir,
+            &session_runtime.workspace_root,
+            &session_id,
+        ) {
+            tail_context_events.push((
+                ContextEventKind::PeerResultsReady,
+                "workspace-peer-team",
+                team.index(&session_id),
+            ));
+        }
+    }
     if let Some(notes) = read_and_clear_goal_progress_notes(
         &session_runtime.profile.data_dir,
         &session_id.to_string(),
@@ -42330,6 +42514,15 @@ async fn run_standalone_turn(
                 // turn's accumulated spend (folded from this `done` event
                 // just above) rides along so a goal-bound peer charges the
                 // master goal's budget.
+                if let Err(error) = state.ui_protocol.workspace_teams.record_result(
+                    &session_runtime.profile.data_dir,
+                    &session_runtime.workspace_root,
+                    &session_id,
+                    &turn_id.0.to_string(),
+                    event.get("content").and_then(Value::as_str).unwrap_or(""),
+                ) {
+                    tracing::warn!(%error, "failed to persist workspace peer result");
+                }
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,
@@ -42477,6 +42670,15 @@ async fn run_standalone_turn(
                 // turn's real accumulated spend (folded from this event's token
                 // fields just above), so a goal-bound peer that rate-limited
                 // mid-run charges the master goal instead of 0.
+                if let Err(error) = state.ui_protocol.workspace_teams.record_result(
+                    &session_runtime.profile.data_dir,
+                    &session_runtime.workspace_root,
+                    &session_id,
+                    &turn_id.0.to_string(),
+                    &wire_msg,
+                ) {
+                    tracing::warn!(%error, "failed to persist workspace peer result");
+                }
                 write_peer_result_if_peer_session(
                     &state,
                     &session_id,

@@ -67,7 +67,7 @@ impl Tool for PeerGatherTool {
 
     fn description(&self) -> &str {
         "Read the peer blackboard: each peer's task brief and its latest result \
-         (peers write results when their turns end). Use AFTER you have handed \
+         (peers write results when their turns end). Also reads automatic workspace peers by workspace agent_id. Use AFTER you have handed \
          work off with peer_handoff — typically later in the conversation, or \
          when the user asks what the peers found — to collect and synthesize \
          their results. Peers with no result yet are listed as still running; \

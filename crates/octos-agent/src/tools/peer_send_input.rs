@@ -95,6 +95,7 @@ pub type PeerSendInputAnswerCallback = Arc<
 /// `peer_send_input` tool. See the module docs for the cross-session channel.
 pub struct PeerSendInputTool {
     send_input: PeerSendInputCallback,
+    assignment: bool,
     await_answer: Option<PeerSendInputAnswerCallback>,
 }
 
@@ -102,8 +103,16 @@ impl PeerSendInputTool {
     pub fn new(send_input: PeerSendInputCallback) -> Self {
         Self {
             send_input,
+            assignment: false,
             await_answer: None,
         }
+    }
+
+    /// Same delivery primitive, with coordinator authorization supplied by
+    /// the host callback. No new agent lifecycle is introduced.
+    pub fn as_assignment(mut self) -> Self {
+        self.assignment = true;
+        self
     }
 
     /// After a delivery, wait for the receiving host's answer so a refusal
@@ -123,17 +132,24 @@ struct Input {
 #[async_trait]
 impl Tool for PeerSendInputTool {
     fn name(&self) -> &str {
-        "peer_send_input"
+        if self.assignment {
+            "peer_assign"
+        } else {
+            "peer_send_input"
+        }
     }
 
     fn description(&self) -> &str {
-        "Send a follow-up message to a RUNNING peer identified by its NAME (or \
-         slug), as reported by peer_handoff / peer_list. The peer receives it as \
-         its next turn. Use when a deployed peer needs steering, additional \
-         context, or a correction — but only when the peer was staged earlier in \
-         THIS conversation or the user confirms the name. The peer MUST be running \
-         (the user opened the staged session); if it has completed or is idle \
-         this will fail with an error."
+        if self.assignment {
+            return "Assign work to an existing workspace peer using its workspace agent_id as slug. Only the current coordinator can assign. Include the task, file ownership, acceptance criteria and context. The member keeps its own session and permissions; busy members queue the assignment. Use peer_gather for results.";
+        }
+        "Send a message or task to a peer returned by peer_list. For automatic \
+         same-workspace peers use its workspace agent_id as slug; the target may \
+         be idle or busy (busy targets process it after their current turn). \
+         The coordinator distributes tasks and gathers results; every member \
+         can message other members. Preserve their user tasks and permissions. \
+         Staged peers still use their existing name/slug and ownership rules. \
+         Do not send acknowledgment-only replies or repeat delivery while queued."
     }
 
     fn tags(&self) -> &[&str] {

@@ -521,8 +521,21 @@ fn test_make_api_url_strips_trailing_slash() {
 }
 
 #[test]
-fn test_default_appservice_bind_addr_uses_all_interfaces() {
-    assert_eq!(default_appservice_bind_addr(9880), "0.0.0.0:9880");
+fn test_default_appservice_bind_addr_is_loopback() {
+    assert_eq!(appservice_bind_addr(9880, None), "127.0.0.1:9880");
+}
+
+#[test]
+fn test_appservice_bind_addr_env_override_wins() {
+    assert_eq!(
+        appservice_bind_addr(9880, Some("  0.0.0.0:9880  ")),
+        "0.0.0.0:9880"
+    );
+}
+
+#[test]
+fn test_appservice_bind_addr_blank_override_falls_back_to_loopback() {
+    assert_eq!(appservice_bind_addr(9880, Some("   ")), "127.0.0.1:9880");
 }
 
 #[test]
@@ -620,6 +633,16 @@ fn test_validate_hs_token_rejects_mismatched_query_and_header() {
     headers.insert("authorization", "Bearer wrong".parse().unwrap());
     let result = validate_hs_token(&query, &headers, "secret");
     assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn test_validate_hs_token_accepts_matching_query_and_header() {
+    let query = AccessTokenQuery {
+        access_token: Some("secret".to_string()),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", "Bearer secret".parse().unwrap());
+    assert!(validate_hs_token(&query, &headers, "secret").is_ok());
 }
 
 // ── txn_id dedup test ────────────────────────────────────────────────
@@ -2126,6 +2149,23 @@ fn test_matrix_registration_no_overwrite() {
 
     let content = std::fs::read_to_string(&file_path).unwrap();
     assert_eq!(content, "custom", "existing file should not be overwritten");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_matrix_registration_file_mode_is_owner_only() {
+    let ch = make_channel();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = ch.generate_registration(tmp.path()).unwrap();
+
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "registration YAML must not be group/world accessible: {:o}",
+        mode & 0o777
+    );
 }
 
 #[test]
