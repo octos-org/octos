@@ -3261,7 +3261,20 @@ async fn should_carry_the_owning_app_and_the_caller_when_a_cross_app_tool_is_cal
         .await
         .unwrap();
     assert!(result.success, "{}", result.output);
+
+    // An owning app id must be well formed. The re-registration comes from
+    // the owning connection — a different connection would be refused by
+    // the route-ownership gate before validation ever runs (UPCR-2026-041).
+    // It runs BEFORE the drop(ws): dropping ws closes the mpsc sender, and
+    // removing the drop made host.await hang for the whole CI window
+    // (the deterministic deadlock BH3GEI's review caught).
+    let mut bad = news_list();
+    bad["app"] = json!("Calendar App");
+    let error = register(&fx, &ws, &token, json!({ "tools": [bad] })).unwrap_err();
+    assert_eq!(error.data.unwrap()["kind"], "peer_tools_invalid");
+
     drop(registry);
+    drop(ws);
     crate::peers::host_tools::set_host_route(&peers_root(&fx), "news", 0, Arc::new(|_, _| false));
     let calls = host.await.unwrap();
     assert_eq!(calls.len(), 1);
@@ -3275,14 +3288,6 @@ async fn should_carry_the_owning_app_and_the_caller_when_a_cross_app_tool_is_cal
     );
     let rows = audit_rows(&fx);
     assert_eq!(rows[0]["app"], "calendar");
-
-    // An owning app id must be well formed. The re-registration comes from
-    // the owning connection — a different connection would be refused by
-    // the route-ownership gate before validation ever runs (UPCR-2026-041).
-    let mut bad = news_list();
-    bad["app"] = json!("Calendar App");
-    let error = register(&fx, &ws, &token, json!({ "tools": [bad] })).unwrap_err();
-    assert_eq!(error.data.unwrap()["kind"], "peer_tools_invalid");
 }
 
 // ---------------------------------------------------------------------------
