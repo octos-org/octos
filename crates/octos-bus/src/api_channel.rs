@@ -2603,6 +2603,27 @@ struct ShellResponse {
     timed_out: bool,
 }
 
+/// Constant-time byte comparison to prevent timing attacks on auth tokens
+/// (no length leak) — the same shape the CLI router uses for its token
+/// compares (#2705).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let len_eq = a.len() ^ b.len();
+    let mut result = 0u8;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        result |= x ^ y;
+    }
+    result == 0 && len_eq == 0
+}
+
+/// Auth-failure log for the admin shell — same hygiene as the router's
+/// auth rejections: presence booleans only, never token lengths or the
+/// local data-dir paths (#2729).
+fn log_admin_shell_auth_rejection(token_present: bool, token_configured: bool) {
+    warn!(token_present, token_configured, "admin shell auth failed");
+}
+
 /// POST /admin/shell — execute a shell command (admin auth required).
 async fn handle_admin_shell(
     State(state): State<ApiState>,
@@ -2652,27 +2673,14 @@ async fn handle_admin_shell(
         });
     let is_admin = match &expected_token {
         Some(expected) if !expected.is_empty() => {
-            token.len() == expected.len()
-                && token
-                    .as_bytes()
-                    .iter()
-                    .zip(expected.as_bytes())
-                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                    == 0
+            constant_time_eq(token.as_bytes(), expected.as_bytes())
         }
         _ => false,
     };
 
     if !is_admin {
-        // Debug: return what we tried to match against
-        let debug = format!(
-            "token_len={} expected_len={} data_dir={} home={}",
-            token.len(),
-            expected_token.as_ref().map(|t| t.len()).unwrap_or(0),
-            std::env::var("OCTOS_DATA_DIR").unwrap_or_else(|_| "unset".into()),
-            std::env::var("HOME").unwrap_or_else(|_| "unset".into()),
-        );
-        return (StatusCode::UNAUTHORIZED, debug).into_response();
+        log_admin_shell_auth_rejection(!token.is_empty(), expected_token.is_some());
+        return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
     }
 
     if req.command.is_empty() {
