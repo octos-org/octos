@@ -22291,8 +22291,20 @@ async fn handle_session_open(
                 &opened.session_id,
                 ws.connection_id.0,
             ) {
-                let _ = send_rpc_error(ws, Some(id), RpcError::internal_error(error));
-                return false;
+                // The join failure degrades to "opened, outside the team"
+                // (#2741): a fail-closed refusal here bricks long-lived
+                // workspaces — the lifetime member accumulation + the 1024
+                // hard cap mean every open past the cap permanently fails.
+                // The session stays fully usable (the memory/skills/history
+                // bindings are durable, not team-gated); the team features
+                // (shared history, team messaging) are absent, and the
+                // operator sees the reason in the logs.
+                tracing::error!(
+                    session = %opened.session_id,
+                    workspace = %workspace,
+                    %error,
+                    "workspace team join failed; the session opened outside the team"
+                );
             }
         }
     }
