@@ -653,7 +653,7 @@ impl Tool for GoalPlanTool {
                                         "description": "The tools the worker may hold. Omit = the base file tools (read_file/write_file/edit_file/glob/grep/list_dir/shell). Add web_fetch/web_search (each REQUIRES a network grant)."
                                     },
                                     "fs": {
-                                        "description": "Filesystem reach. Omit = workspace (the worker's own scratch dir only, read+write). String \"host\" = FULL daemon-user filesystem read+write (broad — grant only when a task genuinely needs host access). OBJECT = per-path WRITE fence (#1976): {\"write\": [\"exemplar.card\", \"cards/*.card\"], \"create_only\": true} — the worker may WRITE only the listed workspace-relative paths (globs: * and ? within one path segment; no **), everything else is read-only, kernel-enforced (file tools + shell sandbox). create_only additionally means listed paths may be CREATED but never overwritten/edited.",
+                                        "description": "Omit/workspace: read+write in own scratch dir. host: full daemon-user filesystem access; grant only if needed. Object: only listed workspace-relative paths are writable (* and ? per segment; no **); all others read-only. Enforced for file tools and shell. create_only permits creation, never edits, overwrites or deletion.",
                                         "oneOf": [
                                             { "type": "string", "enum": ["workspace", "host"] },
                                             {

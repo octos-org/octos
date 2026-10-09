@@ -656,11 +656,11 @@ impl Tool for CronTool {
                 "mode": {
                     "type": "string",
                     "enum": ["agent", "notify"],
-                    "description": "How the job fires. 'agent' (default) hands `message` to you as a task and costs one model turn per fire. 'notify' delivers `message` verbatim and costs nothing — use it whenever the job only has to say a fixed thing on a schedule, e.g. a reminder whose full text you already know now."
+                    "description": "agent (default): process message as a task, one model turn per firing. notify: deliver message verbatim without a model call; prefer for fixed-text reminders."
                 },
                 "message": {
                     "type": "string",
-                    "description": "Instruction for the agent to process when the job fires. This is NOT sent directly to the user — instead, you (the agent) receive it as a task, execute tools as needed, and compose a response. Respond with [SILENT] to suppress output. Required for 'add'."
+                    "description": "Required for add. Agent-mode task instruction, or verbatim text in notify mode. In agent mode, use tools as needed; respond with [SILENT] to suppress delivery."
                 },
                 "every_seconds": {
                     "type": "integer",

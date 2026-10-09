@@ -132,20 +132,57 @@ impl Tool for SendAppCardTool {
     }
 
     fn description(&self) -> &str {
-        "Send a structured app card to this chat, with `body` as the text fallback. \
-         Prefer it to `message` for registered app types. NEVER fabricate `initial_state`: \
-         use real data from a prior tool call in this turn; fetch it first or use an honest text reply.\n\
-         Weather: first call get_weather(city), or get_forecast(city, days) for multi-day requests. \
-         Pass city names in English. Map the returned city to location, Temperature to temp_c, \
-         and optional feels-like, Humidity (%), and Wind (km/h) to feels_like_c, humidity, wind_kph. \
-         Map conditions: clear/mainly clear/sunny -> sunny; partly cloudy/overcast/cloudy -> cloudy; \
-         drizzle/rain/showers/freezing rain -> rainy; snow/snow showers/snow fall -> snowy; \
-         thunderstorms (with or without hail) -> stormy; fog/rime fog/mist/haze -> foggy. \
-         Include forecast only from get_forecast: up to 7 {day, high_c, low_c, condition} entries. \
-         Use the user's language for the one-line body and for location when a localized name is returned.\n\
-         Mission room: set type=mission_room, scope=room and a stable app_id (e.g. mission.main). \
-         Put the full shared mission snapshot in initial_state and human controls in actions \
-         ({id, label, style}) for planning, approval, execution, review and blocker updates."
+        "Deliver a structured mini-app card (e.g. a weather card) to the \
+         current chat. Capable clients (such as Robrix) render this as a \
+         native GPU card; other clients fall back to the `body` text.\n\
+         \n\
+         CRITICAL — NEVER FABRICATE APP DATA:\n\
+         You MUST populate `initial_state` from real data obtained via \
+         other tools in a PRIOR tool call in the same turn. Do NOT fill \
+         `initial_state` from your own training knowledge or guesses. If \
+         you do not have real data, call the appropriate data-fetching \
+         tool first, or fall back to the plain `message` tool with an \
+         honest text reply.\n\
+         \n\
+         WEATHER TYPE (type=\"weather\"):\n\
+         You MUST first call `get_weather(city)` (or `get_forecast(city, days)` \
+         if the user asks for multi-day forecast). Parse the returned text \
+         output and map it to the schema:\n\
+         - `location`: the displayed city name from the `get_weather` output\n\
+         - `temp_c`: the temperature number from `Temperature: X.X°C` line\n\
+         - `feels_like_c` (optional): from `(feels like X.X°C)` if present\n\
+         - `humidity` (optional): integer from `Humidity: X%` line\n\
+         - `wind_kph` (optional): number from `Wind: X.X km/h` line\n\
+         - `condition`: map the conditions text to ONE OF: `sunny`, `cloudy`, \
+         `rainy`, `snowy`, `stormy`, `foggy`, using this table:\n\
+           * `Clear sky`, `Mainly clear`, `Sunny` → `sunny`\n\
+           * `Partly cloudy`, `Overcast`, `Cloudy` → `cloudy`\n\
+           * `Drizzle`, `Rain`, `Rain showers`, `Freezing rain` → `rainy`\n\
+           * `Snow`, `Snow showers`, `Snow fall` → `snowy`\n\
+           * `Thunderstorm`, `Thunderstorm with hail` → `stormy`\n\
+           * `Fog`, `Depositing rime fog`, `Mist`, `Haze` → `foggy`\n\
+         - `forecast` (optional): if you called `get_forecast`, build an \
+         array (max 7) of `{day, high_c, low_c, condition}` entries parsed \
+         from each forecast day; otherwise omit the field.\n\
+         - `body`: a concise one-line natural language summary for clients \
+         without the app registry, e.g. `\"Beijing 22°C partly cloudy\"`.\n\
+         \n\
+         MISSION ROOM TYPE (type=\"mission_room\"):\n\
+         You MUST set `scope` to `room` and provide a stable `app_id` such as \
+         `mission.main`. Put the full shared mission snapshot in \
+         `initial_state`, and put shared human controls in `actions` as an \
+         array of `{id, label, style}` objects. Use this for room-scoped \
+         planning, approval, execution, review, and blocker updates.\n\
+         \n\
+         If the user wrote a non-English city name, pass it to `get_weather` \
+         in English (that tool requires English). Use the original language \
+         of the user's request for the `body` fallback text and for `location` \
+         if the get_weather output includes a localized name.\n\
+         \n\
+         Use this tool INSTEAD OF the plain `message` tool whenever the user \
+         asks for data that has a registered app type AND you have real data \
+         from a prior tool call to populate it. Never use this tool with \
+         made-up `initial_state`."
     }
 
     fn tags(&self) -> &[&str] {
