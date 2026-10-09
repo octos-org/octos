@@ -4371,3 +4371,132 @@ fn admin_shell_auth_rejection_log_omits_lengths_and_paths() {
     assert!(!logs.contains("home="), "logs: {logs}");
     assert!(!logs.contains("/Users/"), "logs: {logs}");
 }
+
+// ------------------------------------------------------------------
+// #2736 — the chat surface sits behind the same token chain as the
+// admin shell, with a constant-time compare. The env/config legs of
+// the chain are covered end-to-end in tests/api_channel_token_e2e.rs
+// (own process, so the env pivot can't race this binary).
+// ------------------------------------------------------------------
+
+/// The channel token wins without consulting the env fallback: the
+/// or_else chain is lazy, so this holds whatever the environment says.
+#[test]
+fn resolve_api_token_prefers_channel_token() {
+    assert_eq!(
+        resolve_api_token(Some("chan-tok")).as_deref(),
+        Some("chan-tok")
+    );
+}
+
+fn gated_app(auth_token: Option<String>) -> Router {
+    Router::new()
+        .route("/chat", post(handle_chat))
+        .route(
+            "/sessions/{id}/events/stream",
+            get(handle_session_event_stream),
+        )
+        .with_state(ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions: test_sessions(),
+            task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+            event_seq: Arc::new(StdMutex::new(HashMap::new())),
+        })
+}
+
+/// #2736: with a token configured, POST /chat refuses missing, wrong, and
+/// length-matched wrong bearers with the generic body, and the correct
+/// token passes the gate (reaching the next validation error).
+#[tokio::test]
+async fn chat_auth_gate_refuses_wrong_bearer_and_accepts_configured_token() {
+    let expected = "octos-chat-e2e-secret-token";
+    let app = gated_app(Some(expected.to_string()));
+
+    async fn probe(app: Router, auth: Option<&str>) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/chat")
+            .header("content-type", "application/json");
+        if let Some(token) = auth {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .oneshot(request.body(Body::from(r#"{"message":"hi"}"#)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    let filler = "x".repeat(expected.len());
+    for auth in [None, Some("wrong-token"), Some(filler.as_str())] {
+        let (status, body) = probe(app.clone(), auth).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "auth: {auth:?}");
+        assert_eq!(body, "invalid auth token", "auth: {auth:?}");
+    }
+
+    let (status, body) = probe(app, Some(expected)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "thread_id is required");
+}
+
+/// #2736: the session event stream endpoint enforces the same gate.
+#[tokio::test]
+async fn session_event_stream_auth_gate_refuses_wrong_bearer_and_accepts_configured_token() {
+    let expected = "octos-chat-e2e-secret-token";
+    let app = gated_app(Some(expected.to_string()));
+
+    async fn probe(app: Router, auth: Option<&str>) -> StatusCode {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/sessions/web-sse-auth/events/stream");
+        if let Some(token) = auth {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    let filler = "x".repeat(expected.len());
+    for auth in [None, Some("wrong-token"), Some(filler.as_str())] {
+        assert_eq!(
+            probe(app.clone(), auth).await,
+            StatusCode::UNAUTHORIZED,
+            "auth: {auth:?}"
+        );
+    }
+    assert_eq!(probe(app, Some(expected)).await, StatusCode::OK);
+}
+
+/// With no token configured the gate stays open — a tokenless dev/test
+/// channel keeps working.
+#[tokio::test]
+async fn chat_auth_gate_is_open_when_no_token_configured() {
+    let app = gated_app(None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"message":"hi"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+}
