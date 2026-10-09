@@ -213,10 +213,11 @@ impl Agent {
                 iteration,
                 attempt,
                 async {
-                    let stream = self
-                        .llm
-                        .chat_stream(messages, tools_spec, attempt_config)
-                        .await?;
+                    let stream: octos_llm::ChatStream = tokio::select! {
+                        biased;
+                        _ = self.wait_for_steer_input() => Box::pin(futures::stream::empty()),
+                        result = self.llm.chat_stream(messages, tools_spec, attempt_config) => result?,
+                    };
                     if emit_progress {
                         self.consume_stream_with_input_estimate(stream, iteration, input_estimate)
                             .await
@@ -254,7 +255,7 @@ impl Agent {
             match call_result {
                 Ok((response, streamed)) => {
                     self.record_prompt_cache_usage(&response, attempt_config, iteration, attempt);
-                    if !Self::is_retriable_response(&response) {
+                    if self.steer_input_pending() || !Self::is_retriable_response(&response) {
                         // Genuine success -- merge retry usage into response.
                         // Price the FINAL attempt at its own slot BEFORE the
                         // merge, then add the pre-priced retry spend.

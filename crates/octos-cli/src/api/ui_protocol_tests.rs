@@ -42122,15 +42122,12 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
     );
 }
 
-/// LLM stub for the end-to-end mid-turn steer test. Call 0 announces it
-/// entered (so the test can steer while the model is "streaming"), waits
-/// for the go-signal, then returns a FINAL answer; the pending steer must
-/// force a second round whose request carries the steer as a plain
-/// `role: user` message after the recorded first answer.
+/// Emits visible text, then stalls indefinitely. Steering must wake this
+/// stream without a completion signal and preserve the emitted text before
+/// the new user message in the next request and durable history.
 struct GatedSteerLlm {
     call_count: std::sync::atomic::AtomicUsize,
-    entered: tokio::sync::Notify,
-    proceed: tokio::sync::Notify,
+    entered: Arc<tokio::sync::Notify>,
     observed: StdMutex<Vec<Vec<(MessageRole, String)>>>,
 }
 
@@ -42138,10 +42135,20 @@ struct GatedSteerLlm {
 impl octos_llm::LlmProvider for GatedSteerLlm {
     async fn chat(
         &self,
-        messages: &[Message],
+        _messages: &[Message],
         _tools: &[octos_llm::ToolSpec],
         _config: &octos_llm::ChatConfig,
     ) -> eyre::Result<octos_llm::ChatResponse> {
+        eyre::bail!("steering must continue streaming, not fall back to chat")
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatStream> {
+        use futures::StreamExt;
         self.observed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -42152,25 +42159,23 @@ impl octos_llm::LlmProvider for GatedSteerLlm {
                     .collect(),
             );
         let call = self.call_count.fetch_add(1, Ordering::SeqCst);
-        let content = if call == 0 {
-            self.entered.notify_one();
-            self.proceed.notified().await;
-            "first answer"
+        if call == 0 {
+            let entered = self.entered.clone();
+            Ok(Box::pin(
+                futures::stream::iter(vec![octos_llm::StreamEvent::TextDelta(
+                    "first answer".into(),
+                )])
+                .chain(futures::stream::poll_fn(move |_| {
+                    entered.notify_one();
+                    std::task::Poll::Pending
+                })),
+            ))
         } else {
-            "second answer"
-        };
-        Ok(octos_llm::ChatResponse {
-            content: Some(content.to_string()),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            stop_reason: octos_llm::StopReason::EndTurn,
-            usage: octos_llm::TokenUsage {
-                input_tokens: 8,
-                output_tokens: 4,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+            Ok(Box::pin(futures::stream::iter(vec![
+                octos_llm::StreamEvent::TextDelta("second answer".into()),
+                octos_llm::StreamEvent::Done(octos_llm::StopReason::EndTurn),
+            ])))
+        }
     }
 
     fn model_id(&self) -> &str {
@@ -42183,7 +42188,7 @@ impl octos_llm::LlmProvider for GatedSteerLlm {
 }
 
 /// End-to-end over the REAL turn runtime: `turn/start` runs a turn; while
-/// the model produces its final answer a `turn/steer` lands in the ACTIVE
+/// the model stalls after partial text a `turn/steer` lands in the ACTIVE
 /// turn; the loop runs ONE more round whose LLM request carries the steer
 /// (drained before the call, plain user role, after the recorded first
 /// answer), and the steer row persists into durable history exactly once,
@@ -42193,8 +42198,7 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
     let temp = tempfile::TempDir::new().expect("temp dir");
     let provider = Arc::new(GatedSteerLlm {
         call_count: std::sync::atomic::AtomicUsize::new(0),
-        entered: tokio::sync::Notify::new(),
-        proceed: tokio::sync::Notify::new(),
+        entered: Arc::new(tokio::sync::Notify::new()),
         observed: StdMutex::new(Vec::new()),
     });
     let (state, profile_runtime) =
@@ -42267,8 +42271,7 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
         "steer must land in the ACTIVE turn"
     );
 
-    // Release the model; the pending steer must force a second round.
-    provider.proceed.notify_one();
+    // There is no release signal: the steer must wake the stalled stream.
     for _ in 0..300 {
         let terminal = {
             let registry = active_turns.lock().await;
@@ -42285,7 +42288,7 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
     assert_eq!(
         provider.call_count.load(Ordering::SeqCst),
         2,
-        "steer after the final answer must force exactly one more round"
+        "steer during a stalled stream must force exactly one more round"
     );
 
     // The second request carries: recorded first answer, then the steer as
