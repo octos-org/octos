@@ -4212,11 +4212,20 @@ async fn send_raw_sse_bound_overwrites_stale_thread_id_in_payload() {
 
 /// #2729: the admin shell auth failure must not disclose configuration to
 /// the unauthenticated caller: the body is the same generic string as the
-/// channel's other auth guards, and the presented/expected token lengths
-/// and the local data-dir paths stay out of the log line too — the same
-/// log hygiene the CLI router pins for its auth rejections.
+/// channel's other auth guards, every rejection is logged (presence
+/// booleans only — the same hygiene the CLI router pins for its auth
+/// rejections), and a length-matched but wrong token is still refused.
 #[tokio::test]
 async fn admin_shell_auth_failure_body_discloses_no_configuration() {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(capture.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
     let expected = "octos-admin-e2e-secret-token";
     let app = Router::new()
         .route("/admin/shell", post(handle_admin_shell))
@@ -4255,14 +4264,19 @@ async fn admin_shell_auth_failure_body_discloses_no_configuration() {
     }
 
     // A wrong bearer token, the same wrong token over the x-auth-token
-    // intake, and no token at all all get the generic guard body — never a
-    // debug echo of what the server tried to match against. The probes
-    // post an empty command so even a fail-open auth regression can never
-    // spawn a shell here.
+    // intake, no token at all, and a token matching the expected length
+    // byte-for-byte in size but not content all get the generic guard body
+    // — never a debug echo of what the server tried to match against. The
+    // probes post an empty command so even a fail-open auth regression can
+    // never spawn a shell here.
     for auth in [
         Some(("authorization", "Bearer short".to_string())),
         Some(("x-auth-token", "short".to_string())),
         None,
+        Some((
+            "authorization",
+            "Bearer octos-admin-e2e-secret-tokeX".to_string(),
+        )),
     ] {
         let (status, body) = probe(app.clone(), auth, r#"{"command":""}"#).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -4279,6 +4293,15 @@ async fn admin_shell_auth_failure_body_discloses_no_configuration() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body, "command is required");
+
+    // Every failed probe was logged exactly once, and the successful one
+    // was not.
+    let logs = capture.contents();
+    assert_eq!(
+        logs.matches("admin shell auth failed").count(),
+        4,
+        "each failed probe must log: {logs}"
+    );
 }
 
 /// Captures `tracing` output so log-emitting behaviour can be asserted

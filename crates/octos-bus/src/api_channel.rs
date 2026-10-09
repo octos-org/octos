@@ -2603,6 +2603,20 @@ struct ShellResponse {
     timed_out: bool,
 }
 
+/// Constant-time byte comparison to prevent timing attacks on auth tokens
+/// (no length leak) — the same shape the CLI router uses for its token
+/// compares (#2705).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let len_eq = a.len() ^ b.len();
+    let mut result = 0u8;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        result |= x ^ y;
+    }
+    result == 0 && len_eq == 0
+}
+
 /// Auth-failure log for the admin shell — same hygiene as the router's
 /// auth rejections: presence booleans only, never token lengths or the
 /// local data-dir paths (#2729).
@@ -2659,23 +2673,13 @@ async fn handle_admin_shell(
         });
     let is_admin = match &expected_token {
         Some(expected) if !expected.is_empty() => {
-            token.len() == expected.len()
-                && token
-                    .as_bytes()
-                    .iter()
-                    .zip(expected.as_bytes())
-                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                    == 0
+            constant_time_eq(token.as_bytes(), expected.as_bytes())
         }
         _ => false,
     };
 
     if !is_admin {
-        let token_configured = expected_token
-            .as_ref()
-            .map(|t| !t.is_empty())
-            .unwrap_or(false);
-        log_admin_shell_auth_rejection(!token.is_empty(), token_configured);
+        log_admin_shell_auth_rejection(!token.is_empty(), expected_token.is_some());
         return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
     }
 
