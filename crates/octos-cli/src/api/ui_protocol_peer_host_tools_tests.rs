@@ -3262,7 +3262,6 @@ async fn should_carry_the_owning_app_and_the_caller_when_a_cross_app_tool_is_cal
         .unwrap();
     assert!(result.success, "{}", result.output);
     drop(registry);
-    drop(ws);
     crate::peers::host_tools::set_host_route(&peers_root(&fx), "news", 0, Arc::new(|_, _| false));
     let calls = host.await.unwrap();
     assert_eq!(calls.len(), 1);
@@ -3277,11 +3276,12 @@ async fn should_carry_the_owning_app_and_the_caller_when_a_cross_app_tool_is_cal
     let rows = audit_rows(&fx);
     assert_eq!(rows[0]["app"], "calendar");
 
-    // An owning app id must be well formed.
+    // An owning app id must be well formed. The re-registration comes from
+    // the owning connection — a different connection would be refused by
+    // the route-ownership gate before validation ever runs (UPCR-2026-041).
     let mut bad = news_list();
     bad["app"] = json!("Calendar App");
-    let (ws2, _rx2) = ws_connection_for_test(8);
-    let error = register(&fx, &ws2, &token, json!({ "tools": [bad] })).unwrap_err();
+    let error = register(&fx, &ws, &token, json!({ "tools": [bad] })).unwrap_err();
     assert_eq!(error.data.unwrap()["kind"], "peer_tools_invalid");
 }
 
@@ -4033,17 +4033,19 @@ async fn should_give_the_system_agent_the_app_tools_the_host_registers_on_its_se
     // The host's kernel tool list for the session narrows every turn on it:
     // the host's, other clients', kernel wake-ups; another session of the
     // profile is unaffected.
-    let (list_ws, _list_rx) = ws_connection_for_test(8);
+    // The narrowing re-declaration comes from the owning connection — a
+    // different connection would be refused by the route-ownership gate
+    // (UPCR-2026-041).
     register_on_session(
         &fx,
-        &list_ws,
+        &ws,
         Some(&token),
         &fx.system,
         json!({ "tools": [calendar_today()], "generic_tools": ["read_file", "ask_user_question"] }),
     )
     .unwrap();
     for connection in [
-        Some(list_ws.connection_id.0),
+        Some(ws.connection_id.0),
         Some(other_ws.connection_id.0),
         None,
     ] {
@@ -4056,7 +4058,7 @@ async fn should_give_the_system_agent_the_app_tools_the_host_registers_on_its_se
             connection,
         );
         let names = sorted_names(&narrowed);
-        let expected: Vec<&str> = if connection == Some(list_ws.connection_id.0) {
+        let expected: Vec<&str> = if connection == Some(ws.connection_id.0) {
             vec!["ask_user_question", "calendar_today", "read_file"]
         } else {
             vec!["ask_user_question", "read_file"]
@@ -4070,10 +4072,10 @@ async fn should_give_the_system_agent_the_app_tools_the_host_registers_on_its_se
         &peers_root(&fx),
         &chat,
         "turn-e",
-        Some(list_ws.connection_id.0),
+        Some(ws.connection_id.0),
     );
     assert_eq!(sorted_names(&elsewhere), usual);
-    crate::peers::host_tools::drop_routes_for_connection(list_ws.connection_id.0);
+    crate::peers::host_tools::drop_routes_for_connection(ws.connection_id.0);
     // Registered again by the first host connection (as it was).
     register_on_session(
         &fx,
