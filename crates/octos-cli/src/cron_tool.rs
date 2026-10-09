@@ -635,23 +635,13 @@ impl Tool for CronTool {
     }
 
     fn description(&self) -> &str {
-        "Schedule recurring or one-time tasks. Actions: add, list, remove, enable, disable. \
-         The 'message' is an instruction sent to you (the agent) when the job fires — you will \
-         process it through your full tool chain (call tools, check data, reason about results). \
-         This means you can schedule complex tasks like 'Check system metrics and report only \
-         if CPU > 80% or memory > 90%' — the message is your task, not the final output. \
-         Respond with [SILENT] to suppress delivery when no action is needed. \
-         When adding a job, 'channel' and 'chat_id' are auto-filled from the current \
-         conversation — you do NOT need to ask the user for them. Just call add with \
-         'message' and 'every_seconds' (or 'cron_expr'). \
-         IMPORTANT: cron expressions are evaluated in UTC by default. Use the 'timezone' \
-         parameter (IANA name like 'America/Los_Angeles', 'Asia/Shanghai') so the user's \
-         local time is interpreted correctly. Always set timezone when the user specifies \
-         a local time. \
-         For relative one-time reminders (e.g. 'in 10 minutes'), prefer 'after_seconds' \
-         to avoid timestamp math errors. \
-         Use 'every_seconds' for recurring reminders, not 'at_ms'. \
-         To remove jobs, use 'name' for fuzzy matching (preferred) or 'job_id' for exact match."
+        "Manage recurring or one-time tasks: add, list, remove, enable, disable. \
+         In agent mode, message is your task at firing time; use tools as needed and \
+         return [SILENT] when no delivery is needed. Channel/chat_id default to this \
+         conversation; do not ask for them. Cron defaults to UTC: always set an IANA \
+         timezone for local-time requests. Prefer after_seconds for relative one-time \
+         reminders and every_seconds for recurring intervals; at_ms is one-time only. \
+         Remove by fuzzy name (preferred) or exact job_id."
     }
 
     fn input_schema(&self) -> serde_json::Value {

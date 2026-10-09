@@ -406,15 +406,11 @@ impl Tool for GoalGetTool {
     }
 
     fn description(&self) -> &str {
-        "Read this session's persistent goal: objective, status, token spend vs budget \
-         (remaining budget), and continuation count. When the goal drives a fleet (see \
-         goal_plan), also returns a `fleet` object with the objective, per-task \
-         title/status/verdict, the ready set, and status counts — call this after a \
-         fleet-completion wake to see progress and, when every task is accepted, the goal \
-         auto-transitions to complete. A task with status `Blocked` and a `pending_escalation` \
-         (a worker's `reason` + advisory `requested_grant`) is waiting on YOUR operator decision: \
-         call goal_grant (widen its grant + resume it) or goal_deny (fail it). Returns status=none \
-         when no goal is set."
+        "Read this session's goal, status, token spend/budget and continuation count; \
+         status=none if unset. For fleets, includes task titles/status/verdicts, ready tasks \
+         and counts. Call after worker completion wakes; all tasks accepted auto-completes \
+         the goal. For Blocked tasks with pending_escalation, review reason/requested_grant \
+         and call goal_grant to resume or goal_deny to fail."
     }
 
     fn input_schema(&self) -> Value {
@@ -586,26 +582,15 @@ impl Tool for GoalPlanTool {
     }
 
     fn description(&self) -> &str {
-        "Decompose THIS session's goal into a durable fleet of tasks that background workers \
-         execute. Call once, early in a goal, after you understand the objective: pass a list \
-         of tasks, each with a stable `task_id`, a short `title`, a `detail` brief the worker \
-         acts on, optional `deps` (task_ids that must finish first), and optional `acceptance` \
-         (shell commands that must exit 0 for the task to count as done). Idempotent — if a \
-         fleet already exists this returns its id unchanged. After planning, call goal_dispatch \
-         to launch ready tasks. Requires a live session (the workspace root is captured then). \
-         Each task runs in its OWN isolated scratch directory (replay-safe), NOT your repo \
-         checkout: v1 fleet tasks do self-contained local work, not in-repo edits to the \
-         controller's files — in-repo/remote-mutating goals are out of v1 scope. \
-         \
-         YOU are the operator: provision each worker's capabilities with an optional per-task \
-         `grant` — least privilege by default. Omit `grant` and the worker gets exactly today's \
-         closed set (no network, the base file tools read/write/edit/glob/grep/list_dir/shell, \
-         its own scratch dir). Grant MORE only where a task needs it: `network.mode`=`hosts` \
-         with a `hosts` allowlist lets its web_fetch reach ONLY those hosts (the shell still has \
-         no raw network); `network.mode`=`full` gives raw egress (git/npm); add `web_fetch`/\
-         `web_search` to `tools` (they require a network grant); set `fs`=`host` ONLY when a task \
-         needs the full host filesystem (it is broad — the default scratch-dir scope covers most \
-         work). Grant each task the minimum it needs."
+        "Plan this session's goal as a durable fleet of background tasks. Call once early \
+         with task IDs, titles, self-contained briefs, dependencies and acceptance checks; \
+         then call goal_dispatch. Requires a live session; an existing fleet is returned \
+         unchanged. Workers run in isolated scratch directories, not your checkout: v1 \
+         supports self-contained local work, not in-repo or remote-mutating goals. \
+         Grant only required capabilities. Defaults: base file tools, own scratch dir, \
+         no network. network.mode=hosts allows web_fetch to listed hosts, not shell egress; \
+         full allows raw egress. web_fetch/web_search require a network grant. fs=host \
+         grants broad host filesystem access; use only when necessary. See grant fields."
     }
 
     fn input_schema(&self) -> Value {
@@ -791,14 +776,10 @@ impl Tool for GoalDispatchTool {
     }
 
     fn description(&self) -> &str {
-        "Launch every currently-ready task of this goal's fleet onto background workers (call \
-         goal_plan first to create the fleet). Ready = dependency-free or all deps succeeded. \
-         Each launched task runs to completion in the background and wakes this goal when it \
-         finishes, so the loop is: goal_dispatch → (workers run) → wake → goal_get to see \
-         progress → goal_dispatch again for the newly-ready tasks, until goal_get reports all \
-         tasks accepted. Safe to call repeatedly — already-running tasks are not relaunched. If a \
-         woken task is `Blocked` on a `pending_escalation`, resolve it with goal_grant or goal_deny \
-         (not goal_dispatch) before it can run again."
+        "Launch ready fleet tasks after goal_plan: no dependencies or all dependencies \
+         succeeded. Running tasks are not relaunched. Workers wake the goal on completion; \
+         call goal_get, then dispatch newly ready tasks until all are accepted. Resolve \
+         Blocked tasks with pending_escalation via goal_grant or goal_deny before retrying."
     }
 
     fn input_schema(&self) -> Value {
@@ -886,14 +867,10 @@ impl Tool for GoalGrantTool {
     }
 
     fn description(&self) -> &str {
-        "APPROVE a fleet worker's mid-task escalation: widen the blocked task's operator grant \
-         and resume it (a fresh attempt re-runs with the new capability; its scratch dir \
-         persists). Use when goal_get shows a task with status `Blocked` and a `pending_escalation` \
-         — read the worker's `reason` and its advisory `requested_grant`, then decide. Pass the \
-         `task_id`. Omit `grant` to approve the worker's requested grant as-is, OR pass a `grant` \
-         (same shape as goal_plan's task grant) to grant LESS — you are the operator and may narrow \
-         what it asked for (e.g. a tighter host allowlist). The grant is validated exactly as at \
-         plan time. To refuse instead, use goal_deny."
+        "Approve a Blocked fleet task's pending_escalation after reviewing reason and \
+         requested_grant in goal_get. Pass task_id; omit grant to accept the request, or \
+         supply a narrower grant using goal_plan's schema and validation. Restarts the task \
+         with added capabilities; its scratch directory persists. To refuse, use goal_deny."
     }
 
     fn input_schema(&self) -> Value {
@@ -1061,12 +1038,9 @@ impl Tool for GoalDenyTool {
     }
 
     fn description(&self) -> &str {
-        "REFUSE a fleet worker's mid-task escalation: the blocked task cannot proceed without a \
-         capability you are not willing to grant, so FAIL it (terminal). Use when goal_get shows a \
-         Blocked task with a `pending_escalation` you decide not to approve. Pass the `task_id` and \
-         a short `reason`. This is terminal — the task will not re-run; the fleet then completes \
-         around it (a Blocked task left undecided would wedge the goal forever, so decide every \
-         escalation with either goal_grant or goal_deny). To approve instead, use goal_grant."
+        "Refuse a Blocked fleet task's pending_escalation from goal_get. Pass task_id and \
+         a short reason. Permanently fails the task; it will not rerun. Resolve every \
+         escalation with goal_grant (approve) or goal_deny so the fleet can finish."
     }
 
     fn input_schema(&self) -> Value {
