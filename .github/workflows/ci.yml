@@ -12,11 +12,14 @@ on:
 # Release artifacts are built by release.yml, not this workflow.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Only PR runs cancel (the head moves fast; the latest is what matters).
+  # A manual dispatch on main shares this group with push builds — a negative
+  # `!= 'push'` condition would let it cancel a running push (BH3GEI's P2).
   # Main pushes must QUEUE, not supersede: a cancelled required leg makes the
   # aggregation report "cancelled" and the gate reads it as a failure — the
   # main green was stolen twice this way in one day. PR pushes keep the
   # cancellation (the head moves fast; the latest run is the one that matters).
-  cancel-in-progress: ${{ github.event_name != 'push' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
