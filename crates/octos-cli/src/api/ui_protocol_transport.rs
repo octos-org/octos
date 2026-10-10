@@ -6937,7 +6937,10 @@ fn approval_event_from_tool_request(
         // engaged server-side (PR #712).
         event.risk = Some(server_risk_for(&event.tool_name));
 
-        if event.tool_name == "shell" {
+        // `bash` and `exec_command` are Codex-style aliases of `shell` (one
+        // family in the tool registry) and gate the same commands, so a
+        // client gets the same typed command details whichever one ran.
+        if matches!(event.tool_name.as_str(), "shell" | "bash" | "exec_command") {
             let command = request.command;
             if command.is_some() || request.cwd.is_some() {
                 event.approval_kind = Some(approval_kinds::COMMAND.to_owned());
