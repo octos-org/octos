@@ -2143,12 +2143,13 @@ mod tests {
         );
     }
 
-    // ---- Verification token check regression tests (#2751) ----
+    // ---- Verification token check regression tests (#2751, #2756) ----
     //
-    // The plaintext-event token compare now goes through the canonical
-    // constant-time helper; these pin the behavioral contract it must
-    // keep: a non-empty wrong token is refused, a correct token and a
-    // missing/empty token still forward (the pre-existing acceptance).
+    // The plaintext-event token compare goes through the canonical
+    // constant-time helper. The armed-channel contract (#2756): a MISSING
+    // or empty token is refused exactly like a wrong one — a configured
+    // verification_token means credential-less events never forward. The
+    // unarmed-channel passthrough stays unchanged.
 
     fn webhook_state_with_verification_token() -> (WebhookState, mpsc::Receiver<serde_json::Value>)
     {
@@ -2186,14 +2187,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn feishu_webhook_without_event_token_still_forwards() {
+    async fn feishu_webhook_without_event_token_is_rejected() {
         let (state, mut rx) = webhook_state_with_verification_token();
-        // Pre-existing acceptance: a plaintext event with no token field
-        // is forwarded (older event shapes / url_verification probes).
+        // #2756: an armed channel must not treat an absent token field as
+        // verified — the missing credential is refused like a wrong one.
+        let body = r#"{"type":"event_callback","event":{}}"#;
+
+        let status = call_handle_webhook(state, build_headers(&[]), body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "an armed channel must refuse an event with no token field"
+        );
+        assert!(rx.try_recv().is_err(), "refused event must not forward");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_empty_event_token_is_rejected() {
+        let (state, mut rx) = webhook_state_with_verification_token();
+        let body = r#"{"type":"event_callback","token":"","event":{}}"#;
+
+        let status = call_handle_webhook(state, build_headers(&[]), body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "an armed channel must refuse an empty verification token"
+        );
+        assert!(rx.try_recv().is_err(), "refused event must not forward");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_without_configured_token_still_forwards() {
+        let (tx, mut rx) = mpsc::channel::<serde_json::Value>(8);
+        let state = WebhookState {
+            encrypt_key: None,
+            verification_token: None,
+            inbound_tx: tx,
+        };
+        // Unarmed deployment: no verification_token configured, the
+        // passthrough contract is unchanged (#2756).
         let body = r#"{"type":"event_callback","event":{}}"#;
 
         let status = call_handle_webhook(state, build_headers(&[]), body).await;
         assert_eq!(status, axum::http::StatusCode::OK);
-        assert!(rx.try_recv().is_ok(), "tokenless event should forward");
+        assert!(rx.try_recv().is_ok(), "unarmed channel should forward");
     }
 }
