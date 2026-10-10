@@ -1766,6 +1766,16 @@ Clients must use that method list to enable or disable slash commands.
 
 - provide the model/provider management surface used by TUI onboarding and
   slash-command flows
+- successful `profile/llm/select`, `upsert`, and `delete` persist the profile
+  selection and replace its runtime for the next turn, including profiles
+  loaded at startup. Active turns retain their original provider and context.
+  The choice is a profile default shared by its sessions, not a per-session override.
+- `applied` reports persistence; `runtime_disposition` reports `reloaded`,
+  `deferred` (no runnable selection), `persisted_but_not_live` (with
+  `runtime_error`), or `unchanged`. `restart_required` is false for store-backed
+  replacements. Clients must not infer restart from a cached runtime model
+  differing from the saved default. Failed replacements never restore a
+  retired startup provider; a later turn retries bootstrap.
 - `profile/llm/test` must execute a minimal provider API probe using either
   the supplied raw `api_key` or the saved `route.api_key_env` value from the
   profile. It returns the same mutation-shaped provider state as

@@ -75,6 +75,7 @@ mod groq;
 mod local;
 mod minimax;
 mod minimax_cn;
+mod minimax_coding;
 mod moonshot;
 mod moonshot_coding;
 mod nvidia;
@@ -208,6 +209,7 @@ static ALL: &[ProviderEntry] = &[
     // Region-variant families FIRST so an explicit `minimax-cn` resolves to
     // the China endpoint before the base family's name/aliases.
     minimax_cn::ENTRY,
+    minimax_coding::ENTRY,
     minimax::ENTRY,
     zai_coding::ENTRY,
     zhipu::ENTRY,
@@ -382,6 +384,7 @@ mod tests {
             ("local", "local-default"),
             ("minimax", "MiniMax-M3"),
             ("minimax-cn", "MiniMax-M3"),
+            ("minimax-coding", "MiniMax-M3.1-Flash-Preview"),
             ("moonshot-coding", "k3"),
             ("openai", "gpt-4o"),
             ("openrouter", "anthropic/claude-sonnet-4-6"),
@@ -537,7 +540,7 @@ mod tests {
 
     #[test]
     fn all_entries_count() {
-        assert_eq!(all_entries().len(), 20);
+        assert_eq!(all_entries().len(), 21);
     }
 
     /// Keyless = provider construction succeeds with no API key. The
@@ -602,6 +605,46 @@ mod tests {
     }
 
     #[test]
+    fn minimax_coding_uses_subscription_key_and_latest_plan_model() {
+        let plan = lookup("minimax-coding").expect("MiniMax M Plan registered");
+        assert_eq!(lookup("minimax-m-plan").map(|e| e.name), Some(plan.name));
+        assert_eq!(
+            lookup("minimax-token-plan").map(|e| e.name),
+            Some(plan.name)
+        );
+        assert_eq!(plan.api_key_env, Some("MINIMAX_CODING_API_KEY"));
+        // A pay-as-you-go key must not silently replace a subscription key.
+        assert!(!plan.is_known_key_env("MINIMAX_API_KEY"));
+        assert!(!plan.is_known_key_env("MINIMAX_CN_API_KEY"));
+        assert!(
+            (plan.create)(CreateParams {
+                api_key: None,
+                model: None,
+                base_url: None,
+                model_hints: None,
+                llm_timeout_secs: None,
+                llm_connect_timeout_secs: None,
+            })
+            .is_err(),
+            "a subscription credential is required"
+        );
+        let provider = (plan.create)(CreateParams {
+            api_key: Some("test-subscription-key".into()),
+            model: None,
+            base_url: None,
+            model_hints: None,
+            llm_timeout_secs: None,
+            llm_connect_timeout_secs: None,
+        })
+        .expect("construct M Plan provider");
+        let metadata = provider.provider_metadata();
+        assert_eq!(metadata.provider, "minimax-coding");
+        assert_eq!(metadata.model, "MiniMax-M3.1-Flash-Preview");
+        assert_eq!(plan.default_base_url, Some("https://api.minimax.io/v1"));
+        assert_eq!(detect_provider("MiniMax-M3"), Some("minimax"));
+    }
+
+    #[test]
     fn vertex_entry_is_registered_with_sa_json_credential() {
         let e = lookup("vertex").expect("vertex provider should be registered");
         assert_eq!(e.name, "vertex");
@@ -655,6 +698,7 @@ mod tests {
             ("local", &["llamacpp", "llama.cpp", "llama-server", "llama_server", "lmstudio", "lm-studio", "openai-compatible"], None, &[], Some("http://127.0.0.1:8080/v1"), false, false, false, &[]),
             ("minimax", &[], Some("MINIMAX_API_KEY"), &[], Some("https://api.minimax.io/v1"), true, false, false, &["minimax"]),
             ("minimax-cn", &["minimaxi"], Some("MINIMAX_CN_API_KEY"), &["MINIMAX_API_KEY"], Some("https://api.minimaxi.com/v1"), true, false, false, &[]),
+            ("minimax-coding", &["minimax-m-plan", "minimax-token-plan"], Some("MINIMAX_CODING_API_KEY"), &[], Some("https://api.minimax.io/v1"), true, false, false, &[]),
             ("moonshot", &["kimi"], Some("MOONSHOT_API_KEY"), &["KIMI_API_KEY"], Some("https://api.moonshot.ai/v1"), true, false, false, &["kimi", "moonshot"]),
             ("moonshot-coding", &["kimi-coding"], Some("KIMI_CODING_API_KEY"), &["KIMI_API_KEY", "MOONSHOT_API_KEY"], Some("https://api.kimi.com/coding/v1"), true, false, false, &[]),
             ("nvidia", &["nim"], Some("NVIDIA_API_KEY"), &[], Some("https://integrate.api.nvidia.com/v1"), true, false, false, &[]),
