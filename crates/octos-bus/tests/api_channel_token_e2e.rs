@@ -380,3 +380,68 @@ async fn env_token_arms_the_whole_session_surface() {
         );
     }
 }
+
+// ------------------------------------------------------------------
+// #2328 — the loopback guard at the wire: raw HTTP/1.1 on a fresh TCP
+// connection to the real listener, exactly the bytes a rebound page
+// (Host: evil.com) and a cross-site page (Origin: https://evil.com)
+// put on the wire — no client library to rewrite either header.
+// ------------------------------------------------------------------
+
+/// One raw request; returns the status code and the response head.
+async fn raw_request(port: u16, host: &str, origin: Option<&str>) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let origin_line = origin
+        .map(|value| format!("origin: {value}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "GET /metrics HTTP/1.1\r\nhost: {host}\r\n{origin_line}connection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut head = Vec::new();
+    stream.read_to_end(&mut head).await.unwrap();
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, head)
+}
+
+#[tokio::test]
+async fn the_wire_refuses_a_rebound_host_and_a_cross_site_origin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = isolated_data_dir(tmp.path());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let sessions = SessionManager::open(&data_dir).unwrap();
+    let channel = ApiChannel::new(
+        port,
+        None,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::new(tokio::sync::Mutex::new(sessions)),
+        None,
+    );
+    let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+    let _server = tokio::spawn(async move { channel.start(inbound_tx).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The rebinding vector: the browser resolves evil.com to 127.0.0.1,
+    // the Host header still names evil.com.
+    let (status, head) = raw_request(port, "evil.com", None).await;
+    assert_eq!(status, 421, "rebound Host must not reach a route: {head}");
+
+    // The CSRF vector: a cross-site page POSTs to the loopback directly.
+    let (status, head) = raw_request(port, "127.0.0.1:1", Some("https://evil.com")).await;
+    assert_eq!(status, 403, "cross-site Origin must not reach a route: {head}");
+
+    // What curl and scripts send: the loopback Host, no Origin.
+    let (status, head) = raw_request(port, "127.0.0.1:1", None).await;
+    assert_eq!(status, 200, "local callers must keep working: {head}");
+}

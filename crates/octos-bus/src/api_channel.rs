@@ -14,8 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
@@ -715,8 +716,9 @@ fn initial_sse_events(
 
 /// The channel's HTTP surface as one Router — every route consults the
 /// armed token (#2751), so the auth contract lives at the route table
-/// rather than being re-derived per caller. `start()` serves this; tests
-/// drive it directly with `oneshot`.
+/// rather than being re-derived per caller, and the table sits behind the
+/// loopback guard (#2328). `start()` serves this; tests drive it directly
+/// with `oneshot`.
 ///
 /// Exception: `/admin/shell` keeps its own stricter gate (it also accepts
 /// `x-auth-token` and re-resolves per request) — don't "unify" it onto the
@@ -747,6 +749,67 @@ fn api_router(state: ApiState) -> Router {
         .route("/upload", post(handle_upload))
         .route("/admin/shell", post(handle_admin_shell))
         .with_state(state)
+        .layer(middleware::from_fn(loopback_guard))
+}
+
+/// The outermost guard (#2328): the channel binds 127.0.0.1 and speaks to
+/// local callers only, so a `Host` that does not name the loopback
+/// listener is a rebound/proxied request, and a browser `Origin` outside
+/// the loopback is a cross-site page reaching the API directly (no
+/// rebinding needed — simple requests carry no preflight). Non-browser
+/// callers send no `Origin` and pass; any loopback port is accepted, so
+/// SSH/port-forwarded callers keep working. Mirrors serve's host-managed
+/// `host_header_guard`.
+async fn loopback_guard(req: Request, next: Next) -> Response {
+    let host_ok = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(loopback_host)
+        .unwrap_or(false);
+    if !host_ok {
+        warn!("rejected request whose Host does not name the loopback listener");
+        return (StatusCode::MISDIRECTED_REQUEST, "unexpected Host").into_response();
+    }
+    let origin_ok = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(loopback_origin)
+        .unwrap_or(true);
+    if !origin_ok {
+        warn!("rejected request whose Origin is outside the loopback");
+        return (StatusCode::FORBIDDEN, "unexpected Origin").into_response();
+    }
+    next.run(req).await
+}
+
+/// `127.0.0.1`, `localhost`, `::1` (bracketed or bare), with or without a
+/// port — textual, case-insensitive: the guard's job is to catch a Host
+/// naming some other name (a rebound domain, a LAN IP), not to
+/// re-represent addresses.
+fn loopback_host(authority: &str) -> bool {
+    let authority = authority.trim();
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once(']')
+            .map(|(literal, _)| literal)
+            .unwrap_or(authority)
+    } else if authority.matches(':').count() > 1 {
+        authority // a bare IPv6 literal carries no port
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "::1")
+}
+
+/// A browser `Origin` naming the loopback — `http://127.0.0.1:8091`,
+/// `https://localhost:5173`; any port, so a locally served UI passes.
+/// `null` (sandboxed iframe) and every other authority fail.
+fn loopback_origin(origin: &str) -> bool {
+    origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .is_some_and(loopback_host)
 }
 
 #[async_trait]

@@ -4569,7 +4569,11 @@ async fn every_route_sits_behind_the_bearer_gate_when_armed() {
         body: &str,
         auth: Option<&str>,
     ) -> StatusCode {
-        let mut request = Request::builder().method(method).uri(uri);
+        // Real clients always send Host on HTTP/1.1 (#2328 guard).
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1");
         if !ct.is_empty() {
             request = request.header("content-type", ct);
         }
@@ -4626,5 +4630,174 @@ async fn every_route_sits_behind_the_bearer_gate_when_armed() {
     assert_eq!(
         probe(&unarmed, "GET", "/sessions", "", "", None).await,
         StatusCode::OK
+    );
+}
+
+// ------------------------------------------------------------------
+// #2328 — the loopback guard in front of the route table: the channel
+// binds 127.0.0.1 and speaks to local callers, so a Host naming
+// anything else is a rebound/proxied request, and a browser Origin
+// outside the loopback is a cross-site page reaching the API directly.
+// ------------------------------------------------------------------
+
+/// Unarmed table (the guard is unconditional — it does not consult the
+/// token), probed with explicit Host/Origin headers.
+async fn guard_probe(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    host: Option<&str>,
+    origin: Option<&str>,
+) -> StatusCode {
+    let mut request = Request::builder().method(method).uri(uri);
+    if let Some(host) = host {
+        request = request.header("host", host);
+    }
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    app.clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+fn unarmed_router() -> Router {
+    api_router(ApiState {
+        inbound_tx: mpsc::channel(1).0,
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        watchers: Arc::new(Mutex::new(HashMap::new())),
+        auth_token: None,
+        profile_id: Some(TEST_PROFILE_ID.to_string()),
+        sessions: test_sessions(),
+        task_query: None,
+        task_cancel: None,
+        task_relaunch: None,
+        on_session_deleted: None,
+        metrics_renderer: None,
+        event_seq: Arc::new(StdMutex::new(HashMap::new())),
+    })
+}
+
+/// Every probed route refuses a Host naming another origin — the rebound
+/// page's request never reaches a handler (mirrors the #2751 walk: the
+/// guard lives on the route table, not per handler).
+#[tokio::test]
+async fn every_route_rejects_a_rebound_host() {
+    let app = unarmed_router();
+
+    // Collect every serving route instead of stopping at the first.
+    let mut serving = Vec::new();
+    for (method, uri, _, _) in SURFACE_PROBES {
+        if guard_probe(&app, method, uri, Some("evil.com"), None).await
+            != StatusCode::MISDIRECTED_REQUEST
+        {
+            serving.push(format!("{method} {uri}"));
+        }
+    }
+    assert!(
+        serving.is_empty(),
+        "routes serving a rebound Host: {}",
+        serving.join(", ")
+    );
+}
+
+/// The loopback names the listener actually answers to — both spellings
+/// of the IPv4/IPv6 loopback, with or without a port, case-insensitive.
+#[tokio::test]
+async fn loopback_hosts_reach_the_routes() {
+    let app = unarmed_router();
+    for host in [
+        "127.0.0.1:8091",
+        "localhost:8091",
+        "localhost",
+        "LOCALHOST:8091",
+        "[::1]:8091",
+        "::1",
+    ] {
+        assert_eq!(
+            guard_probe(&app, "GET", "/metrics", Some(host), None).await,
+            StatusCode::OK,
+            "loopback host {host} must reach the route"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cross_site_origins_are_rejected_and_loopback_origins_pass() {
+    let app = unarmed_router();
+    // A page on the open internet reaching the loopback directly — no
+    // rebinding needed — carries its own origin.
+    assert_eq!(
+        guard_probe(
+            &app,
+            "GET",
+            "/metrics",
+            Some("127.0.0.1:8091"),
+            Some("https://evil.com")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    // Sandboxed iframes send the opaque `null` origin.
+    assert_eq!(
+        guard_probe(
+            &app,
+            "GET",
+            "/metrics",
+            Some("127.0.0.1:8091"),
+            Some("null")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    // The CSRF face: a simple cross-site POST is refused on its Origin
+    // before the handler (multipart /upload is CORS-safelisted).
+    assert_eq!(
+        guard_probe(
+            &app,
+            "POST",
+            "/upload",
+            Some("127.0.0.1:8091"),
+            Some("https://evil.com")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    for origin in [
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://[::1]:4173",
+    ] {
+        assert_eq!(
+            guard_probe(
+                &app,
+                "GET",
+                "/metrics",
+                Some("127.0.0.1:8091"),
+                Some(origin)
+            )
+            .await,
+            StatusCode::OK,
+            "loopback origin {origin} must pass"
+        );
+    }
+    // Non-browser callers send no Origin at all.
+    assert_eq!(
+        guard_probe(&app, "GET", "/metrics", Some("127.0.0.1:8091"), None).await,
+        StatusCode::OK
+    );
+}
+
+/// Browsers, curl and reqwest always send Host on HTTP/1.1; a Hostless
+/// request is malformed raw traffic, refused like a foreign Host rather
+/// than waved through.
+#[tokio::test]
+async fn a_request_without_a_host_header_is_refused() {
+    let app = unarmed_router();
+    assert_eq!(
+        guard_probe(&app, "GET", "/metrics", None, None).await,
+        StatusCode::MISDIRECTED_REQUEST
     );
 }
