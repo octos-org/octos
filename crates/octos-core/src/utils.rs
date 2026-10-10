@@ -252,10 +252,11 @@ pub fn safe_filename(name: &str) -> String {
     encoded
 }
 
-/// Constant-time byte comparison for auth tokens (no length leak): the fold
-/// always runs over the longer slice, so neither content nor length biases
-/// the timing. The canonical workspace copy — every token compare should go
-/// through this helper (#2705, #2736).
+/// Constant-time byte comparison for auth tokens: the fold always runs over
+/// the longer slice with no early exit, so the content never short-circuits
+/// the compare (total time still scales with the longer length — the same
+/// trade-off the crates.io `constant_time_eq` crate makes). The canonical
+/// workspace copy for token compares (#2705, #2736).
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let len_eq = a.len() ^ b.len();
     let mut result = 0u8;

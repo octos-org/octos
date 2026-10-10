@@ -218,6 +218,32 @@ async fn channel_token_wins_over_env_token() {
     assert_eq!(body, "thread_id is required");
 }
 
+/// An empty channel token arms nothing: it falls through the chain to the
+/// env leg instead of arming a compare that would reject every bearer.
+#[tokio::test]
+async fn empty_channel_token_falls_through_to_env_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = isolated_data_dir(tmp.path());
+    let _env = EnvGuard::pivot(&[
+        (
+            "OCTOS_AUTH_TOKEN",
+            Some(OsStr::new("octos-env-secret-token")),
+        ),
+        ("OCTOS_DATA_DIR", Some(data_dir.as_os_str())),
+        ("HOME", Some(tmp.path().as_os_str())),
+    ]);
+
+    let base = spawn_server(&data_dir, Some("")).await;
+
+    // The env token is the one enforced: accepted on the gate, while the
+    // missing bearer is refused.
+    let (status, body) = post_chat(&base, Some("octos-env-secret-token")).await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body, "thread_id is required");
+    let (status, _) = post_chat(&base, None).await;
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+}
+
 /// Negative control: with no token configured anywhere the gate stays
 /// open — a tokenless dev/test channel must keep working, and this pins
 /// that the new resolution never invents a token out of nothing.

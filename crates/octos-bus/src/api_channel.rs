@@ -2599,6 +2599,9 @@ struct ShellResponse {
 /// own config first, then OCTOS_AUTH_TOKEN, then the top-level config.json
 /// auth_token — the same chain the admin shell accepts, so every deployment
 /// style that arms the admin surface arms the chat surface too (#2736).
+/// The chat/stream gates resolve once at channel start; arming them from
+/// config.json written after startup takes a channel restart (the admin
+/// shell, in contrast, re-resolves per request).
 fn resolve_api_token(channel_token: Option<&str>) -> Option<String> {
     channel_token
         .filter(|t| !t.is_empty())
