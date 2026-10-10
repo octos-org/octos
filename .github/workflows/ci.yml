@@ -389,6 +389,13 @@ jobs:
       - name: Test octos-bus
         run: cargo test -p octos-bus
 
+      # The api-gated octos-bus suite only runs workspace-wide in the nightly
+      # and self-hosted lanes (octos-bus/api is enabled there via feature
+      # unification), so the #2736 chat token gate — and the #2735 admin
+      # shell guards before it — never executed on PR CI.
+      - name: Test octos-bus api-gated suite
+        run: cargo test -p octos-bus --features api --lib --test api_channel_token_e2e
+
       - name: Test octos-pipeline
         run: cargo test -p octos-pipeline
 

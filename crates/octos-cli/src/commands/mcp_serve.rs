@@ -237,8 +237,10 @@ fn mcp_http_router(
             .headers()
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok());
-        let authorized = octos_agent::mcp_server::parse_bearer_token(provided)
-            .is_some_and(|candidate| octos_agent::mcp_server::constant_time_eq(&candidate, &token));
+        let authorized =
+            octos_agent::mcp_server::parse_bearer_token(provided).is_some_and(|candidate| {
+                octos_core::constant_time_eq(candidate.as_bytes(), token.as_bytes())
+            });
         if !authorized {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
         }

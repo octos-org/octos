@@ -802,22 +802,6 @@ impl SessionLifecycleObserver for SupervisorObserver<'_> {
     }
 }
 
-/// Constant-time comparison of two strings, used by the HTTP bearer-token
-/// check (in the CLI's axum middleware) to avoid timing leaks. Public so the
-/// serving layer can reuse the same comparison the parser is paired with.
-pub fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 // ---- simple pass-through observer wrapper for the Arc<Mutex<_>> flavour ----
 
 /// Lock-based observer that records lifecycle transitions into a shared
@@ -948,13 +932,6 @@ mod tests {
         assert_eq!(parse_bearer_token(None), None);
         assert_eq!(parse_bearer_token(Some("")), None);
         assert_eq!(parse_bearer_token(Some("Bearer  ")), None);
-    }
-
-    #[test]
-    fn constant_time_eq_is_length_sensitive() {
-        assert!(constant_time_eq("abc", "abc"));
-        assert!(!constant_time_eq("abc", "abcd"));
-        assert!(!constant_time_eq("abc", "abd"));
     }
 
     #[test]
