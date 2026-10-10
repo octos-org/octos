@@ -717,6 +717,12 @@ fn initial_sse_events(
 /// armed token (#2751), so the auth contract lives at the route table
 /// rather than being re-derived per caller. `start()` serves this; tests
 /// drive it directly with `oneshot`.
+///
+/// Exception: `/admin/shell` keeps its own stricter gate (it also accepts
+/// `x-auth-token` and re-resolves per request) — don't "unify" it onto the
+/// shared Bearer-only gate. New routes must add a handler gate AND a
+/// `SURFACE_PROBES` row (see `api_channel_tests`) or the walk can't see
+/// them.
 fn api_router(state: ApiState) -> Router {
     Router::new()
         .route("/metrics", get(handle_metrics))

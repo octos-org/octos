@@ -510,7 +510,7 @@ async fn handle_webhook(
             }
 
             let computed = verify_signature(timestamp, nonce, ek, &body);
-            if computed != expected_sig {
+            if !constant_time_eq(computed.as_bytes(), expected_sig.as_bytes()) {
                 warn!("Feishu webhook: signature mismatch");
                 return (
                     axum::http::StatusCode::UNAUTHORIZED,

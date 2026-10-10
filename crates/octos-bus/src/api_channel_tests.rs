@@ -4503,12 +4503,14 @@ async fn chat_auth_gate_is_open_when_no_token_configured() {
 
 // ------------------------------------------------------------------
 // #2751 — the gate covers the WHOLE route table, not just the chat
-// surface. The probe walks the real `api_router`, so a route added
-// without its guard fails here instead of shipping open.
+// surface. The probe walks the real `api_router` — so a route added
+// without a probe row stays invisible to this walk: every new route
+// must add its handler gate AND a `SURFACE_PROBES` row below, or the
+// gap ships open. A missing gate on a probed route fails loudly here.
 // ------------------------------------------------------------------
 
 /// `(method, uri, content-type, body)` reaching every route's handler:
-/// one probe per row of the `api_router` table.
+/// one probe per row of the `api_router` table, kept in sync by hand.
 const SURFACE_PROBES: &[(&str, &str, &str, &str)] = &[
     ("GET", "/metrics", "", ""),
     ("POST", "/chat", "application/json", r#"{"message":"hi"}"#),
