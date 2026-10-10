@@ -49702,6 +49702,79 @@ async fn session_append_message_retry_returns_existing_seq_without_a_second_row(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn session_append_message_retry_echoes_the_existing_row_binding() {
+    let session_id = SessionKey("local:append-retry-thread".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+
+    // A system record is legitimately unbound.
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(
+        &ws,
+        &state,
+        None,
+        None,
+        "am-s".into(),
+        SessionAppendMessageParams {
+            session_id: session_id.clone(),
+            role: "system".into(),
+            content: "imported note".into(),
+            media: vec![],
+            source: "external_record:import".into(),
+            client_message_id: Some("review-same-id".into()),
+            thread_id: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["seq"], 1);
+    assert_eq!(frame["result"]["thread_id"], serde_json::Value::Null, "{frame}");
+
+    // Retrying the same cmid under a role that would root its own thread
+    // still hits the durable row — and must echo ITS binding (absent), not
+    // the retry payload's freshly stamped one.
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(
+        &ws,
+        &state,
+        None,
+        None,
+        "am-r".into(),
+        SessionAppendMessageParams {
+            session_id: session_id.clone(),
+            role: "user".into(),
+            content: "retried as user".into(),
+            media: vec![],
+            source: "external_record:import".into(),
+            client_message_id: Some("review-same-id".into()),
+            thread_id: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["seq"], 1, "retry returns the original seq");
+    assert_eq!(
+        frame["result"]["thread_id"],
+        serde_json::Value::Null,
+        "a found row with no binding stays unbound: {frame}"
+    );
+
+    let sessions = state.sessions.as_ref().unwrap();
+    let guard = sessions.lock().await;
+    let session = guard.load(&session_id).await.expect("session");
+    assert_eq!(session.messages.len(), 2, "retry must not double-append");
+    let system_row = session
+        .messages
+        .iter()
+        .find(|row| row.client_message_id.as_deref() == Some("review-same-id"))
+        .expect("durable system row");
+    assert_eq!(system_row.role, MessageRole::System);
+    assert_eq!(
+        system_row.thread_id, None,
+        "the retry must not mint a thread onto the durable row"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn session_append_message_user_record_roots_its_own_thread() {
     let session_id = SessionKey("local:append-user".into());
     let (state, _tmp) = append_state_with_user_row(&session_id).await;
@@ -49944,6 +50017,102 @@ fn external_record_row_merges_into_live_and_snapshot_context_views() {
         }),
         "the snapshot-branch record landed in the durable snapshot"
     );
+}
+
+/// UPCR-2026-042 review: an external record committed while a turn is
+/// running must not enter that turn's later model requests, must survive the
+/// per-iteration canonical copy-back the in-flight bridge performs, and must
+/// surface to the next turn's prompt.
+#[test]
+fn external_record_committed_mid_turn_defers_to_the_next_turn_prompt() {
+    let session_id = SessionKey::new("api", "context-external-midturn");
+    let history = vec![
+        test_message(MessageRole::User, "old request"),
+        test_message(MessageRole::Assistant, "old answer"),
+    ];
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    // Production registers the session runtime's canonical manager, so the
+    // external-record handler routes into THIS Arc via the live branch.
+    let registration = register_appui_session_context_manager(&session_id, &manager);
+    let dir = tempfile::tempdir().unwrap();
+    let request = |phase: PromptContextPhase, iteration: u32| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".to_string(),
+        model_id: "large-context".to_string(),
+        context_window: 16_000,
+    };
+
+    // Turn 1: the in-flight bridge builds its first prompt.
+    let bridge = AppUiPromptContextBridge::new(
+        session_id.clone(),
+        dir.path().to_path_buf(),
+        manager.clone(),
+        false,
+    );
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history.clone());
+    prompt.push(test_message(MessageRole::User, "current request"));
+    bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("turn start");
+
+    // Mid-turn append, committed into the live canonical manager.
+    let mut side_note = test_message(MessageRole::User, "mid-turn side note");
+    side_note.source = Some("external_record:import".to_owned());
+    record_appui_context_manager_external_record(dir.path(), &session_id, &side_note, 2);
+
+    // A later iteration of the SAME turn must not pick the row up.
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut prompt)
+        .expect("iteration");
+    assert!(
+        !prompt
+            .iter()
+            .any(|message| message.content == "mid-turn side note"),
+        "the in-flight turn must not see an externally appended row"
+    );
+
+    // ...and the copy-back must not drop the row from canonical either.
+    assert!(
+        manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .ledger_items()
+            .iter()
+            .any(|item| matches!(
+                &item.kind,
+                crate::context_manager::TranscriptItemKind::UserInput { content, .. }
+                    if content == "mid-turn side note"
+            )),
+        "the deferred row must survive the in-flight copy-back"
+    );
+
+    drop(bridge);
+    // Turn 2 is a fresh per-turn bridge over the same canonical manager.
+    let next_turn = AppUiPromptContextBridge::new(
+        session_id.clone(),
+        dir.path().to_path_buf(),
+        manager.clone(),
+        false,
+    );
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history);
+    prompt.push(test_message(MessageRole::User, "next request"));
+    next_turn
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("turn 2 start");
+    assert!(
+        prompt.iter().any(|message| {
+            message.role == MessageRole::User && message.content == "mid-turn side note"
+        }),
+        "the deferred row must surface to the next turn's prompt"
+    );
+    drop(registration);
 }
 
 #[tokio::test]
