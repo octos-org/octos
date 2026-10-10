@@ -478,6 +478,7 @@ Session, turn, and approval core:
 - `permission/profile/list`, `permission/profile/set`
   (accepted `UPCR-2026-018`)
 - `diff/preview/get`
+- `diff/workspace/get` (capability-gated workspace snapshot)
 
 Task and harness control:
 
@@ -1324,6 +1325,33 @@ Minimum params:
 
 - `session_id`
 - `preview_id`
+
+### `diff/workspace/get`
+
+Read-only snapshot of uncommitted Git changes in the workspace bound by
+`session/open`. Params: `{ "session_id": "…" }` (`DiffWorkspaceGetParams`).
+Client paths and other fields are rejected. Returns `DiffPreviewGetResult`:
+`status: "ready"`, `source: "pending_store"`, and a fresh session-bound preview
+ID, title and file/hunk/line data. The server stores the captured snapshot so
+`diff/preview/get` can read that ID later, subject to normal preview retention.
+No turn-preview notification is emitted.
+
+The snapshot combines staged and unstaged tracked changes against HEAD,
+plus non-ignored untracked files. Unborn repositories are supported. A session
+opened in a repository subdirectory sees only that directory. Neither the Git
+index nor worktree is written. Rename detection is disabled (delete + add);
+binary and mode-only changes can have no line hunks. Reads are limited to 256
+files, 10,000 patch lines, 2 MiB of Git output and 15 seconds; oversized, non-Git,
+unavailable or timed-out reads fail explicitly, never return a silently truncated success.
+Git can change during the read; Refresh captures a new snapshot.
+
+Clients must label this scope **Workspace uncommitted changes**, which can
+include changes from other sessions, and keep it distinct from **Session change
+preview**. They must check the advertised method before requesting it and drop
+results after a scope/session/request change or close. The method uses raw OUP
+dispatch on stdio and WebSocket, with the existing profile and host-peer gates;
+session-ingress credentials cannot call it and do not see it advertised.
+An open server-side session workspace binding is required.
 
 ### `task/output/read`
 

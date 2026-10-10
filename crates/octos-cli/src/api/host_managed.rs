@@ -179,6 +179,7 @@ pub const EXTERNAL_ALLOWED_METHODS: &[&str] = &[
     "approval/scopes/list",
     "user_question/respond",
     "diff/preview/get",
+    "diff/workspace/get",
 ];
 
 /// Methods that answer a prompt: allowed only on a session this external

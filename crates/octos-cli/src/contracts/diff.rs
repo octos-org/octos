@@ -998,7 +998,7 @@ fn status_from_operation(operation: &str) -> DiffPreviewFileStatus {
     }
 }
 
-fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> {
+pub(crate) fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> {
     let mut files = Vec::new();
     let mut current: Option<DiffPreviewFile> = None;
     let mut current_hunk: Option<DiffPreviewHunk> = None;
@@ -1006,10 +1006,8 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
     let mut new_line = 0_u32;
 
     for line in diff.lines() {
-        if let Some((old_path, new_path)) = line
-            .strip_prefix("diff --git ")
-            .and_then(parse_diff_git_paths)
-        {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let (old_path, new_path) = parse_diff_git_paths(rest)?;
             push_hunk(&mut current, &mut current_hunk);
             if let Some(file) = current.take() {
                 files.push(file);
@@ -1047,9 +1045,6 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
                 lines: Vec::new(),
             });
         } else if let Some(hunk) = current_hunk.as_mut() {
-            if line.starts_with("--- ") || line.starts_with("+++ ") {
-                continue;
-            }
             let Some(first) = line.chars().next() else {
                 continue;
             };
@@ -1095,8 +1090,75 @@ fn parse_unified_diff_preview_files(diff: &str) -> Option<Vec<DiffPreviewFile>> 
 }
 
 fn parse_diff_git_paths(rest: &str) -> Option<(String, String)> {
-    let (old_path, new_path) = rest.split_once(' ')?;
-    Some((strip_diff_prefix(old_path), strip_diff_prefix(new_path)))
+    if rest.starts_with('"') {
+        let (old, tail) = unquote_git_path(rest)?;
+        let tail = tail.trim_start();
+        let new = if tail.starts_with('"') {
+            unquote_git_path(tail)?.0
+        } else {
+            tail.into()
+        };
+        return Some((strip_diff_prefix(&old), strip_diff_prefix(&new)));
+    }
+    // Git leaves spaces unquoted. Prefer the equal-path split used by ordinary
+    // changes, even when a filename itself contains " b/".
+    for (i, _) in rest.match_indices(" b/") {
+        let old = strip_diff_prefix(&rest[..i]);
+        let new = strip_diff_prefix(&rest[i + 1..]);
+        if old == new {
+            return Some((old, new));
+        }
+    }
+    let split = rest.find(" b/").or_else(|| rest.find(" \"b/"))?;
+    let old = &rest[..split];
+    let tail = &rest[split + 1..];
+    let new = if tail.starts_with('"') {
+        unquote_git_path(tail)?.0
+    } else {
+        tail.into()
+    };
+    Some((strip_diff_prefix(old), strip_diff_prefix(&new)))
+}
+
+/// Git C-quotes tabs, newlines, quotes, backslashes and octal UTF-8 bytes.
+fn unquote_git_path(input: &str) -> Option<(String, &str)> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some((String::from_utf8(out).ok()?, &input[i + 1..])),
+            b'\\' => {
+                i += 1;
+                let b = *bytes.get(i)?;
+                out.push(match b {
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'a' => 7,
+                    b'b' => 8,
+                    b'v' => 11,
+                    b'f' => 12,
+                    b'0'..=b'7' => {
+                        let mut n = b - b'0';
+                        for _ in 0..2 {
+                            if let Some(next @ b'0'..=b'7') = bytes.get(i + 1) {
+                                n = n.wrapping_mul(8).wrapping_add(next - b'0');
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        n
+                    }
+                    _ => b,
+                });
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    None
 }
 
 fn strip_diff_prefix(path: &str) -> String {

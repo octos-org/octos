@@ -1,5 +1,7 @@
 //! UI Protocol v1 WebSocket transport.
 
+#[path = "ui_protocol_workspace_diff.rs"]
+mod workspace_diff_rpc;
 #[path = "ui_protocol_workspace_team.rs"]
 mod workspace_team_rpc;
 use crate::peers::workspace_team;
@@ -555,6 +557,7 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_PROFILE_SUB_PROVIDERS_REMOVE,
     APPUI_METHOD_SNAPSHOT_LIST,
     APPUI_METHOD_SNAPSHOT_RESTORE,
+    octos_core::ui_protocol::methods::DIFF_WORKSPACE_GET,
     octos_core::ui_protocol::methods::PEER_TEAM_LIST,
     octos_core::ui_protocol::methods::PEER_TEAM_LEADER_SET,
     octos_core::ui_protocol::methods::PEER_TEAM_MESSAGE,
@@ -21280,6 +21283,9 @@ async fn handle_raw_appui_rpc(
         APPUI_METHOD_CONFIG_CAPABILITIES_LIST => {
             Ok(json!({ "capabilities": features.advertised_capabilities(state) }))
         }
+        octos_core::ui_protocol::methods::DIFF_WORKSPACE_GET => {
+            workspace_diff_rpc::rpc(state, contracts, request, connection_profile_id).await
+        }
         workspace_team::LIST | workspace_team::LEADER | workspace_team::MESSAGE => {
             workspace_team_rpc::rpc(ws, state, request, connection_profile_id).await
         }
@@ -21847,7 +21853,8 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
     }
     if matches!(
         method,
-        workspace_team::LIST
+        octos_core::ui_protocol::methods::DIFF_WORKSPACE_GET
+            | workspace_team::LIST
             | workspace_team::LEADER
             | workspace_team::MESSAGE
             | octos_core::ui_protocol::methods::SERVER_INSTANCE_GET

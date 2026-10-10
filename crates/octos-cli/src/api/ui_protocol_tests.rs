@@ -49633,3 +49633,66 @@ async fn workspace_team_open_list_election_notifications_and_scope() {
         handle.abort();
     }
 }
+
+#[tokio::test]
+async fn workspace_diff_rpc_requires_open_binding_and_stores_session_scoped_snapshot() {
+    use octos_core::ui_protocol::{
+        DiffPreviewGetParams, DiffPreviewGetResult, methods::DIFF_WORKSPACE_GET,
+    };
+    let data = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let profile = format!("diff-test-{}", uuid::Uuid::now_v7());
+    let session = SessionKey::with_profile(&profile, "api", "changes");
+    let (state, runtime) = state_with_profile(data.path(), &profile).await;
+    let contracts = UiProtocolContractStores::default();
+    let request = RpcRequest::new(
+        "workspace",
+        DIFF_WORKSPACE_GET,
+        json!({"session_id": session}),
+    );
+    assert!(
+        workspace_diff_rpc::rpc(&state, &contracts, &request, Some(&profile))
+            .await
+            .is_err()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(workspace.path().join("new.txt"), "new content\n").unwrap();
+    session_workspaces().set(&profile, session.clone(), workspace.path().to_owned());
+    let value = workspace_diff_rpc::rpc(&state, &contracts, &request, Some(&profile))
+        .await
+        .unwrap();
+    let result: DiffPreviewGetResult = serde_json::from_value(value).unwrap();
+    assert_eq!(result.preview.session_id, session);
+    assert_eq!(result.preview.files[0].path, "new.txt");
+    let store = contracts.diff_previews(Some(&runtime.data_dir));
+    assert!(
+        store
+            .get(DiffPreviewGetParams {
+                session_id: session,
+                preview_id: result.preview.preview_id.clone()
+            })
+            .is_ok()
+    );
+    assert!(
+        store
+            .get(DiffPreviewGetParams {
+                session_id: SessionKey("other".into()),
+                preview_id: result.preview.preview_id
+            })
+            .is_err()
+    );
+    assert!(
+        workspace_diff_rpc::rpc(&state, &contracts, &request, Some("another-profile"))
+            .await
+            .is_err()
+    );
+    let capabilities = ConnectionUiFeatures::default().advertised_capabilities(&state);
+    assert!(capabilities.supports_method(DIFF_WORKSPACE_GET));
+}

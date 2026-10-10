@@ -19,6 +19,7 @@
     { "method": "permission/profile/list", "classification": "shared" },
     { "method": "permission/profile/set", "classification": "shared" },
     { "method": "diff/preview/get", "classification": "shared" },
+    { "method": "diff/workspace/get", "classification": "shared" },
     { "method": "task/list", "classification": "shared" },
     { "method": "task/cancel", "classification": "shared" },
     { "method": "task/restart_from_node", "classification": "shared" },
