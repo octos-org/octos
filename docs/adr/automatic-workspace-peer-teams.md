@@ -225,3 +225,25 @@ latest gathered results are limited to 16 KiB per member. Agents coordinate
 file ownership through messages; concurrent conflicting file edits are not
 automatically merged.
 
+
+## Amendment (2026-10-10): the join-failure trade-off, recorded
+
+The original text left the join-failure behavior unstated; the
+implementation initially made `session/open` fail closed on any
+workspace-team join error. That is **no longer true**: as of the
+#2741 fix, a join failure **degrades** — the session opens fully
+usable (the memory/skills/history bindings are durable, not
+team-gated), the team features (shared history, team messaging) are
+absent, and the reason is logged. This is a deliberate fail-open on
+the team-join leg only: the alternative (the fail-closed refusal)
+bricks long-lived workspaces, because the members are
+lifetime-accumulating with a **hard cap of 1024 (`MAX_MEMBERS`,
+workspace_team.rs) and no GC** — every open past the cap would
+permanently fail, recoverable only by hand-editing team.json.
+
+Accepted residual risks, now on the record:
+- A corrupted/tampered team.json degrades silently (the operator must
+  watch the logs).
+- The 1024 cap still needs a member GC or a capacity warning; until
+  then, the team surface silently stops accepting new members at the
+  cap (the sessions keep working).
