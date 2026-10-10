@@ -4514,8 +4514,10 @@ struct AppUiLoopPromptScratch {
     /// Cleared/replaced when a new TurnStart phase fires.
     runtime_system: Option<Message>,
     /// Highest durable source sequence absorbed from the canonical manager.
-    /// Rows committed by a concurrent mid-turn path after this watermark are
-    /// adopted before the next prompt projection and before scratch copyback.
+    /// Non-external rows committed by a concurrent mid-turn path after this
+    /// watermark are adopted before the next prompt projection and before
+    /// scratch copyback; `external_record` rows are deferred from the scratch
+    /// entirely (UPCR-2026-042) and re-folded into canonical at copyback.
     source_watermark: Option<usize>,
     /// Token estimate last pushed to the client as `context/state_reported`
     /// this turn (`context.state.v1`). `None` until the first report, so a
@@ -4708,7 +4710,7 @@ impl AppUiPromptContextBridge {
         // into canonical instead.
         let adopted = scratch
             .manager
-            .adopt_source_items_except_event_kind(canonical, "external_record");
+            .adopt_source_items_except_event_kind(canonical, EXTERNAL_RECORD_EVENT_KIND);
         scratch.source_watermark = scratch
             .source_watermark
             .max(canonical.source_high_watermark());
@@ -4972,11 +4974,11 @@ impl PromptContextManager for AppUiPromptContextBridge {
             let has_external_rows = canonical.ledger_items().iter().any(|item| {
                 item.source_ref
                     .as_ref()
-                    .is_some_and(|source| source.source_event_kind == "external_record")
+                    .is_some_and(|source| source.source_event_kind == EXTERNAL_RECORD_EVENT_KIND)
             });
             *canonical = if has_external_rows {
                 let mut folded = scratch.manager.clone();
-                folded.adopt_source_items_with_event_kind(&canonical, "external_record");
+                folded.adopt_source_items_with_event_kind(&canonical, EXTERNAL_RECORD_EVENT_KIND);
                 folded
             } else {
                 scratch.manager.clone()
@@ -5103,6 +5105,11 @@ fn record_appui_context_manager_message(
     }
 }
 
+/// Source-event kind tagging out-of-band `session/append_message` rows
+/// (UPCR-2026-042). Load-bearing for the mid-turn deferral policy — the
+/// adoption filter and copy-back fold key on it — so it lives in one place.
+const EXTERNAL_RECORD_EVENT_KIND: &str = "external_record";
+
 fn merge_appui_out_of_band_row(
     manager: &mut ContextManager,
     session_id: &SessionKey,
@@ -5112,7 +5119,7 @@ fn merge_appui_out_of_band_row(
 ) {
     // An external record is not a turn boundary: unlike background rows it
     // must never close the receiving ledger's open tool interactions.
-    let ids = if source_event_kind == "external_record" {
+    let ids = if source_event_kind == EXTERNAL_RECORD_EVENT_KIND {
         manager.record_external_message_merging_prompt_equivalent(message, seq)
     } else {
         manager.record_persisted_message_merging_prompt_equivalent(message, seq)
@@ -5212,7 +5219,13 @@ fn record_appui_context_manager_external_record(
 ) {
     if let Some(live) = live_appui_session_context_manager(session_id) {
         let mut manager = live.lock().unwrap_or_else(|error| error.into_inner());
-        merge_appui_out_of_band_row(&mut manager, session_id, message, seq, "external_record");
+        merge_appui_out_of_band_row(
+            &mut manager,
+            session_id,
+            message,
+            seq,
+            EXTERNAL_RECORD_EVENT_KIND,
+        );
         publish_appui_context_status(session_id, &manager);
         if let Err(error) = persist_appui_context_snapshot(data_dir, session_id, &manager) {
             warn!(
@@ -5230,7 +5243,13 @@ fn record_appui_context_manager_external_record(
         .unwrap_or_else(|error| error.into_inner());
     match load_context_manager_snapshot(data_dir, &session_id.to_string()) {
         Ok(Some(mut manager)) => {
-            merge_appui_out_of_band_row(&mut manager, session_id, message, seq, "external_record");
+            merge_appui_out_of_band_row(
+                &mut manager,
+                session_id,
+                message,
+                seq,
+                EXTERNAL_RECORD_EVENT_KIND,
+            );
             publish_appui_context_status(session_id, &manager);
             if let Err(error) =
                 persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)

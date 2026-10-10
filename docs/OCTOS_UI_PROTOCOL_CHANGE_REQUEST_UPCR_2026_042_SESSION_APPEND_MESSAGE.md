@@ -74,7 +74,11 @@ Mid-turn appends are allowed and deliberate: the record-only write adds
 history, it does not rewrite it, so — unlike `session/rollback` — there is
 no turn-in-progress refusal. The in-flight turn does not see the row: the
 record is deferred from the turn's live prompt context (later model
-iterations included) and surfaces to the next turn. The per-key persist lock serializes the row
+iterations included) and surfaces to the next turn. Live merges of external
+records also leave a still-running tool batch pending, unlike the turn
+path's close-on-user-row rule; a snapshot-less rebuild replays the durable
+transcript with that canonical rule instead, since the free-form `source`
+tag is caller text and cannot carry the distinction. The per-key persist lock serializes the row
 between the turn's own writes. The assistant thread fallback reads the
 loaded history outside that lock, so under a concurrent writer it can bind
 to a user row that is no longer the newest by commit time — a caller

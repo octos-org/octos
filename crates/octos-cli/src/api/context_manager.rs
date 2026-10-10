@@ -2406,17 +2406,13 @@ impl ContextManager {
         self.items.insert(items_index, item);
     }
 
-    /// Adopt durable rows that `source` merged while this scratch copy was
-    /// working from an older clone. Presence, rather than the scalar
+    /// Adopt every durable row that `source` merged while this scratch copy
+    /// was working from an older clone. Presence, rather than the scalar
     /// high-watermark, decides whether a possibly out-of-order row is new.
     pub(crate) fn adopt_source_items_after(
         &mut self,
         source: &ContextManager,
-        watermark: Option<usize>,
     ) -> Vec<TranscriptItemId> {
-        // Presence, rather than the scalar high-watermark, decides whether a
-        // possibly out-of-order row is new.
-        let _ = watermark;
         self.adopt_source_items_selectively(source, |_| true)
     }
 
@@ -8433,7 +8429,6 @@ mod tests {
         let mut canonical =
             ContextManager::from_session_history(session_id, None, &[Message::user("earlier")]);
         let mut scratch = canonical.clone();
-        let watermark = scratch.source_high_watermark();
         scratch.record_message(&Message::user("request"));
         scratch.record_message(&Message::assistant("working"));
         scratch.record_message(&Message::user("steer: also check tests"));
@@ -8441,12 +8436,7 @@ mod tests {
             &Message::user("steer: also check tests"),
             1,
         );
-        assert_eq!(
-            scratch
-                .adopt_source_items_after(&canonical, watermark)
-                .len(),
-            1
-        );
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 1);
         canonical = scratch.clone();
         canonical.record_persisted_message_merging_prompt_equivalent(&Message::user("request"), 2);
         canonical
@@ -8506,19 +8496,15 @@ mod tests {
         let result_b = canonical
             .record_persisted_message_merging_prompt_equivalent(&Message::assistant("result B"), 2);
         canonical.mark_source_event_kind(&result_b, "background_result");
-        assert_eq!(scratch.adopt_source_items_after(&canonical, mark).len(), 1);
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 1);
         let mark = mark.max(canonical.source_high_watermark());
         assert_eq!(mark, Some(2));
 
         let result_a = canonical
             .record_persisted_message_merging_prompt_equivalent(&Message::assistant("result A"), 1);
         canonical.mark_source_event_kind(&result_a, "background_result");
-        assert_eq!(scratch.adopt_source_items_after(&canonical, mark).len(), 1);
-        assert!(
-            scratch
-                .adopt_source_items_after(&canonical, mark)
-                .is_empty()
-        );
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 1);
+        assert!(scratch.adopt_source_items_after(&canonical).is_empty());
         assert_eq!(
             source_head_hash_for_items(scratch.ledger_items()),
             source_head_hash_for_items(canonical.ledger_items())
@@ -9115,7 +9101,6 @@ mod tests {
         let mut canonical =
             ContextManager::from_session_history(session_id, None, &[Message::user("request")]);
         let mut scratch = canonical.clone();
-        let watermark = scratch.source_high_watermark();
         scratch.record_message(&Message::user("steer: also check tests"));
         scratch.record_message(&Message::assistant("working"));
         canonical.record_persisted_message_merging_prompt_equivalent(
@@ -9127,18 +9112,9 @@ mod tests {
             2,
         );
         canonical.mark_source_event_kind(&background, "background_result");
-        assert_eq!(
-            scratch
-                .adopt_source_items_after(&canonical, watermark)
-                .len(),
-            2
-        );
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 2);
         assert_eq!(scratch.source_high_watermark(), Some(2));
         assert_eq!(scratch.source_head_hash(), canonical.source_head_hash());
-        assert!(
-            scratch
-                .adopt_source_items_after(&canonical, watermark)
-                .is_empty()
-        );
+        assert!(scratch.adopt_source_items_after(&canonical).is_empty());
     }
 }
