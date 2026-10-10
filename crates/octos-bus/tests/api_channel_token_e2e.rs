@@ -397,9 +397,8 @@ async fn raw_request(port: u16, host: &str, origin: Option<&str>) -> (u16, Strin
     let origin_line = origin
         .map(|value| format!("origin: {value}\r\n"))
         .unwrap_or_default();
-    let request = format!(
-        "GET /metrics HTTP/1.1\r\nhost: {host}\r\n{origin_line}connection: close\r\n\r\n"
-    );
+    let request =
+        format!("GET /metrics HTTP/1.1\r\nhost: {host}\r\n{origin_line}connection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut head = Vec::new();
     stream.read_to_end(&mut head).await.unwrap();
@@ -439,7 +438,10 @@ async fn the_wire_refuses_a_rebound_host_and_a_cross_site_origin() {
 
     // The CSRF vector: a cross-site page POSTs to the loopback directly.
     let (status, head) = raw_request(port, "127.0.0.1:1", Some("https://evil.com")).await;
-    assert_eq!(status, 403, "cross-site Origin must not reach a route: {head}");
+    assert_eq!(
+        status, 403,
+        "cross-site Origin must not reach a route: {head}"
+    );
 
     // What curl and scripts send: the loopback Host, no Origin.
     let (status, head) = raw_request(port, "127.0.0.1:1", None).await;
