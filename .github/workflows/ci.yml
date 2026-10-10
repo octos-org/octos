@@ -12,7 +12,11 @@ on:
 # Release artifacts are built by release.yml, not this workflow.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Main pushes must QUEUE, not supersede: a cancelled required leg makes the
+  # aggregation report "cancelled" and the gate reads it as a failure — the
+  # main green was stolen twice this way in one day. PR pushes keep the
+  # cancellation (the head moves fast; the latest run is the one that matters).
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 permissions:
   contents: read
