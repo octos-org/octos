@@ -571,13 +571,22 @@ pub fn peer_answer_denied(what: &str) -> octos_core::ui_protocol::RpcError {
 }
 
 /// Outermost guard: refuse a request whose `Host` does not name the loopback
-/// listener (DNS rebinding). A no-op unless host-managed.
+/// listener (DNS rebinding), and refuse a duplicate `Host` outright — the
+/// matcher below would only ever see the first of the pair (RFC 9112 §3.2).
+/// A no-op unless host-managed.
 pub(crate) async fn host_header_guard(
     State(state): State<Arc<AppState>>,
     req: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     if let Some(host_managed) = &state.host_managed {
+        if req.headers().get_all(header::HOST).iter().count() > 1 {
+            tracing::warn!(
+                target: "octos::api::host_managed",
+                "rejected request carrying more than one Host header"
+            );
+            return (StatusCode::MISDIRECTED_REQUEST, "unexpected Host").into_response();
+        }
         let authority = req.uri().authority().map(|a| a.as_str().to_owned());
         if !host_managed.host_allowed(req.headers(), authority.as_deref()) {
             tracing::warn!(

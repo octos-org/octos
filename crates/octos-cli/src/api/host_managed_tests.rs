@@ -272,6 +272,45 @@ async fn should_reject_a_request_whose_host_header_does_not_name_the_listener() 
 }
 
 #[tokio::test]
+async fn should_reject_a_request_carrying_more_than_one_host_header() {
+    let server = serve(true).await;
+    let port = server.addr.port();
+    // Two Host headers on one request is malformed at the wire (RFC 9112
+    // §3.2); the guard must refuse the pair outright, not score whichever
+    // header the accessor happens to read first (#2758).
+    for (first, second) in [
+        (
+            format!("127.0.0.1:{port}"),
+            format!("rebind.example:{port}"),
+        ),
+        (
+            format!("rebind.example:{port}"),
+            format!("127.0.0.1:{port}"),
+        ),
+    ] {
+        let mut tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        tcp.write_all(
+            format!(
+                "GET /health HTTP/1.1\r\nHost: {first}\r\nHost: {second}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut response = String::new();
+        tcp.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains(" 421 "),
+            "{first} + {second}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn should_admit_only_configured_browser_origins() {
     let server = serve(true).await;
     let with_origin = |origin: &'static str| {
