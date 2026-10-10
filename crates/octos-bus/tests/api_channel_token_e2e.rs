@@ -380,3 +380,68 @@ async fn env_token_arms_the_whole_session_surface() {
         );
     }
 }
+
+// ------------------------------------------------------------------
+// #2328 — the loopback guard at the wire: raw HTTP/1.1 on a fresh TCP
+// connection to the real listener, exactly the bytes a rebound page
+// (Host: evil.com) and a cross-site page (Origin: https://evil.com)
+// put on the wire — no client library to rewrite either header.
+// ------------------------------------------------------------------
+
+/// One raw request; returns the status code and the response head.
+async fn raw_request(port: u16, host: &str, origin: Option<&str>) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let origin_line = origin
+        .map(|value| format!("origin: {value}\r\n"))
+        .unwrap_or_default();
+    let request =
+        format!("GET /metrics HTTP/1.1\r\nhost: {host}\r\n{origin_line}connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut head = Vec::new();
+    stream.read_to_end(&mut head).await.unwrap();
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, head)
+}
+
+#[tokio::test]
+async fn the_wire_refuses_a_rebound_host_and_a_cross_site_origin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = isolated_data_dir(tmp.path());
+    // The guard is unconditional, but the channel must stay UNARMED here:
+    // without this pivot a sibling test's env token arms the process's
+    // channels (env is global to the test binary) and the loopback probe
+    // below 401s before it ever reaches the guard's pass leg.
+    let _env = EnvGuard::pivot(&[
+        ("OCTOS_AUTH_TOKEN", None),
+        ("OCTOS_DATA_DIR", Some(data_dir.as_os_str())),
+        ("HOME", Some(tmp.path().as_os_str())),
+    ]);
+
+    let base = spawn_server(&data_dir, None).await;
+    let port: u16 = base.rsplit_once(':').unwrap().1.parse().unwrap();
+
+    // The rebinding vector: the browser resolves evil.com to 127.0.0.1,
+    // the Host header still names evil.com.
+    let (status, head) = raw_request(port, "evil.com", None).await;
+    assert_eq!(status, 421, "rebound Host must not reach a route: {head}");
+
+    // The CSRF vector: a cross-site page fetching the loopback in CORS
+    // mode carries its Origin even on a plain GET.
+    let (status, head) = raw_request(port, "127.0.0.1:1", Some("https://evil.com")).await;
+    assert_eq!(
+        status, 403,
+        "cross-site Origin must not reach a route: {head}"
+    );
+
+    // What curl and scripts send: the loopback Host, no Origin.
+    let (status, head) = raw_request(port, "127.0.0.1:1", None).await;
+    assert_eq!(status, 200, "local callers must keep working: {head}");
+}
