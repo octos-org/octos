@@ -490,12 +490,15 @@ impl HostManaged {
         }
     }
 
-    /// Whether the request's `Host` names this listener.
+    /// Whether the request's `Host` names this listener. Fail-closed on a
+    /// duplicated `Host`: the pair names nothing reliably (#2758).
     pub fn host_allowed(&self, headers: &HeaderMap, authority: Option<&str>) -> bool {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .or(authority);
+        let mut hosts = headers.get_all(header::HOST).iter();
+        let host = match (hosts.next(), hosts.next()) {
+            (Some(host), None) => host.to_str().ok().or(authority),
+            (Some(_), Some(_)) => None,
+            (None, _) => authority,
+        };
         host.is_some_and(|host| {
             let host = host.trim().to_ascii_lowercase();
             self.allowed_hosts.contains(&host)

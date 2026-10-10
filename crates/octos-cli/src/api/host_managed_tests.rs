@@ -310,6 +310,26 @@ async fn should_reject_a_request_carrying_more_than_one_host_header() {
     }
 }
 
+#[test]
+fn should_fail_closed_when_a_request_carries_more_than_one_host() {
+    let host_managed = HostManaged::new(HOST.into(), None, 8080).unwrap();
+    let mut headers = axum::http::HeaderMap::new();
+    headers.append("host", "127.0.0.1:8080".parse().unwrap());
+    assert!(host_managed.host_allowed(&headers, None));
+    // The duplicated pair names nothing reliably — and the URI authority
+    // must not rescue it, so the fail-close lives in the accessor itself,
+    // not only in the guard's wire-level refusal (#2758).
+    headers.append("host", "rebind.example:9".parse().unwrap());
+    assert!(!host_managed.host_allowed(&headers, None));
+    assert!(!host_managed.host_allowed(&headers, Some("127.0.0.1:8080")));
+    // No `Host` header at all: the authority is the only name the request
+    // carries (an absolute-form request line, or h2's :authority).
+    let empty = axum::http::HeaderMap::new();
+    assert!(host_managed.host_allowed(&empty, Some("127.0.0.1:8080")));
+    assert!(!host_managed.host_allowed(&empty, Some("rebind.example:9")));
+    assert!(!host_managed.host_allowed(&empty, None));
+}
+
 #[tokio::test]
 async fn should_admit_only_configured_browser_origins() {
     let server = serve(true).await;
