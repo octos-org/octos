@@ -771,12 +771,13 @@ async fn loopback_guard(req: Request, next: Next) -> Response {
         warn!("rejected request whose Host does not name the loopback listener");
         return (StatusCode::MISDIRECTED_REQUEST, "unexpected Host").into_response();
     }
-    let origin_ok = req
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .map(loopback_origin)
-        .unwrap_or(true);
+    let origin_ok = match req.headers().get(header::ORIGIN) {
+        // Absent: not a browser context (curl, scripts, SDKs).
+        None => true,
+        // Present: a browser spoke — parse failure is refused like any
+        // other non-loopback origin, not waved through.
+        Some(value) => value.to_str().map(loopback_origin).unwrap_or(false),
+    };
     if !origin_ok {
         warn!("rejected request whose Origin is outside the loopback");
         return (StatusCode::FORBIDDEN, "unexpected Origin").into_response();
