@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 #[derive(Debug, Default)]
 pub struct SteerBuffer {
     items: std::sync::Mutex<Vec<String>>,
+    changed: tokio::sync::Notify,
 }
 
 impl SteerBuffer {
@@ -35,6 +36,19 @@ impl SteerBuffer {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .push(text);
+        self.changed.notify_one();
+    }
+
+    /// Wake the current model request without polling. Register before checking
+    /// the buffer so input arriving at the check/await boundary is not missed.
+    pub async fn wait_for_input(&self) {
+        loop {
+            let changed = self.changed.notified();
+            if !self.is_empty() {
+                return;
+            }
+            changed.await;
+        }
     }
 
     /// Drain every pending input in arrival order (codex `split_off(0)`).
@@ -57,12 +71,10 @@ pub type SharedSteerBuffer = std::sync::Arc<SteerBuffer>;
 
 /// Host callback observing each drained steer batch, called INLINE from the
 /// agent loop right after the drained texts are appended to the prompt and
-/// BEFORE the next LLM call. Hosts use it to persist the injected user
-/// message and emit their standard persisted-user-message event (codex
-/// `record_user_prompt_and_emit_turn_item` parity). When a callback is
-/// registered the host owns persistence of steer rows; the loop then keeps
-/// them OUT of the turn output log so end-of-turn persistence cannot write
-/// them a second time.
+/// BEFORE the next LLM call. Hosts use it to emit the injected user
+/// message echo (codex `record_user_prompt_and_emit_turn_item` parity).
+/// The loop always retains the rows in its chronological turn output log;
+/// hosts persist that log once, rather than persisting callback rows again.
 pub type SteerDrainedCallback = std::sync::Arc<
     dyn Fn(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + Send

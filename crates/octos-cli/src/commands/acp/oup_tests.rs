@@ -1,5 +1,29 @@
 use super::*;
 
+/// Mirrors the `session_actor_tests::waiting_budget` helper (#2053 lineage);
+/// tracked for this file under #2718. Scales a test's WAITING budget on
+/// Windows, where loaded check-windows runners miss fixed-duration waits
+/// that pass everywhere else (the 10s handshake fired on main runs
+/// 37792417952 and 37861678480; the two 20s cycle watchdogs joined on the
+/// latter, whose octos-cli lib shard ran 655s). Deadlines only, never
+/// stimuli — every wait here bounds a hang, and that includes the 3s EOF
+/// deadline in
+/// `input_eof_closes_an_idle_acp_session_without_waiting_for_output_to_close`:
+/// its failure mode (`oup.rs` — after EOF the idle output pump keeps the
+/// transport joined) waits forever, so any finite bound keeps the test's
+/// detection power; scaling it only stops a slow-but-real teardown from
+/// tripping the bound on a loaded runner.
+fn waiting_budget(base: std::time::Duration) -> std::time::Duration {
+    #[cfg(windows)]
+    {
+        base * 4
+    }
+    #[cfg(not(windows))]
+    {
+        base
+    }
+}
+
 #[tokio::test]
 async fn input_eof_closes_an_idle_acp_session_without_waiting_for_output_to_close() {
     use futures::StreamExt;
@@ -37,11 +61,14 @@ async fn input_eof_closes_an_idle_acp_session_without_waiting_for_output_to_clos
             .unwrap()))
             .unwrap();
         loop {
-            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), client.rx.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            let frame = tokio::time::timeout(
+                waiting_budget(std::time::Duration::from_secs(10)),
+                client.rx.next(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             let frame = serde_json::to_value(frame).unwrap();
             if frame["id"] == id {
                 assert!(frame.get("error").is_none(), "{frame}");
@@ -50,7 +77,7 @@ async fn input_eof_closes_an_idle_acp_session_without_waiting_for_output_to_clos
         }
     }
     client.tx.close_channel();
-    tokio::time::timeout(std::time::Duration::from_secs(3), serving)
+    tokio::time::timeout(waiting_budget(std::time::Duration::from_secs(3)), serving)
         .await
         .expect("stdin EOF must not wait for the idle output pump")
         .unwrap()
@@ -153,7 +180,8 @@ impl agent_client_protocol::ConnectTo<Client> for CancelTestTransport {
 /// the dispatch loop, the turn would complete un-cancelled, and the test
 /// would flake to `EndTurn` (seen repeatedly on CI under load).
 async fn wait_for_cancel_dispatch(sessions: &Sessions, sid: &SessionId) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let budget = waiting_budget(std::time::Duration::from_secs(10));
+    let deadline = std::time::Instant::now() + budget;
     loop {
         let flagged = sessions
             .lock()
@@ -167,7 +195,7 @@ async fn wait_for_cancel_dispatch(sessions: &Sessions, sid: &SessionId) {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "session/cancel was not dispatched within 10s"
+            "session/cancel was not dispatched within {budget:?}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
@@ -203,8 +231,9 @@ async fn should_report_cancelled_when_session_cancel_arrives_during_turn() {
     let stop_for_main = stop_reason.clone();
     let prompt_cwd = cwd.clone();
 
+    let budget = waiting_budget(std::time::Duration::from_secs(20));
     tokio::time::timeout(
-        std::time::Duration::from_secs(20),
+        budget,
         Client
             .builder()
             .name("octos-acp-cancel-client")
@@ -257,7 +286,9 @@ async fn should_report_cancelled_when_session_cancel_arrives_during_turn() {
             ),
     )
     .await
-    .expect("ACP request cycle must complete within 20 seconds")
+    .unwrap_or_else(|elapsed| {
+        panic!("ACP request cycle must complete within {budget:?}: {elapsed:?}")
+    })
     .expect("ACP client run completes");
 
     let got = *stop_reason.lock().await;
@@ -299,8 +330,9 @@ async fn should_report_end_turn_for_fresh_prompt_after_prior_turn_was_cancelled(
     let second_for_main = second_stop.clone();
     let prompt_cwd = cwd.clone();
 
+    let budget = waiting_budget(std::time::Duration::from_secs(20));
     tokio::time::timeout(
-        std::time::Duration::from_secs(20),
+        budget,
         Client
             .builder()
             .name("octos-acp-cancel-then-fresh-client")
@@ -369,7 +401,9 @@ async fn should_report_end_turn_for_fresh_prompt_after_prior_turn_was_cancelled(
             ),
     )
     .await
-    .expect("ACP request cycle must complete within 20 seconds")
+    .unwrap_or_else(|elapsed| {
+        panic!("ACP request cycle must complete within {budget:?}: {elapsed:?}")
+    })
     .expect("ACP client run completes");
 
     let got = *second_stop.lock().await;
@@ -426,8 +460,9 @@ async fn should_reject_a_concurrent_prompt_on_the_same_session() {
     };
 
     let prompt_cwd = cwd.clone();
+    let budget = waiting_budget(std::time::Duration::from_secs(20));
     tokio::time::timeout(
-        std::time::Duration::from_secs(20),
+        budget,
         Client
             .builder()
             .name("octos-acp-concurrent-prompt-client")
@@ -539,6 +574,8 @@ async fn should_reject_a_concurrent_prompt_on_the_same_session() {
             ),
     )
     .await
-    .expect("ACP request cycle must complete within 20 seconds")
+    .unwrap_or_else(|elapsed| {
+        panic!("ACP request cycle must complete within {budget:?}: {elapsed:?}")
+    })
     .expect("ACP client run completes");
 }

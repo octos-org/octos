@@ -262,7 +262,19 @@ impl Agent {
             };
 
             let event = tokio::select! {
+                biased;
+                // Preserve events already buffered by the provider, including
+                // usage and completion; preempt instead of awaiting more data.
                 event = stream.next() => event,
+                _ = self.wait_for_steer_input() => {
+                    // This is a sampling boundary, not turn cancellation. Keep
+                    // visible text and observed usage, discard unexecuted tool
+                    // arguments (possibly incomplete), and let the same turn
+                    // drain the new input before its next model request.
+                    tool_calls.clear();
+                    stop_reason = StopReason::EndTurn;
+                    break;
+                }
                 _ = self.wait_for_shutdown() => {
                     warn!("shutdown received during streaming");
                     break;
@@ -1133,6 +1145,43 @@ mod tests {
             elapsed < std::time::Duration::from_secs(4),
             "overall cap took {elapsed:?} — wall-clock backstop did not fire promptly"
         );
+    }
+
+    #[tokio::test]
+    async fn steering_wakes_stalled_sampling_preserves_text_and_discards_partial_tools() {
+        let (agent, _dir) = build_test_agent().await;
+        let buffer = Arc::new(crate::steering::SteerBuffer::default());
+        let agent = agent.with_steer_buffer(buffer.clone());
+        let stream = stalling_stream(vec![
+            StreamEvent::TextDelta("Already visible".into()),
+            StreamEvent::Usage(LlmTokenUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                ..Default::default()
+            }),
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("not_executed".into()),
+                name: Some("write_file".into()),
+                arguments_delta: "{\"path\":".into(),
+            },
+        ]);
+        // Poll the actual consumer through all buffered events into its pending
+        // read, then inject input. No timing assumption or provider credentials.
+        let consume = agent.consume_stream_for_test(stream, 1, 0, test_thresholds(60));
+        tokio::pin!(consume);
+        assert!(futures::poll!(&mut consume).is_pending());
+        buffer.push("stop writing and explain".into());
+        let (response, _) = tokio::time::timeout(std::time::Duration::from_secs(1), consume)
+            .await
+            .expect("steering must wake without waiting for the idle timeout")
+            .unwrap();
+        assert_eq!(response.content.as_deref(), Some("Already visible"));
+        assert_eq!(response.usage.input_tokens, 7);
+        assert_eq!(response.usage.output_tokens, 3);
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(buffer.drain(), vec!["stop writing and explain"]);
     }
 
     #[tokio::test]

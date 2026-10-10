@@ -860,11 +860,16 @@ impl Agent {
         }
     }
 
-    /// Whether a mid-turn steer input is pending (codex `has_pending_input`,
-    /// `turn.rs:304-318`). Read in the EndTurn arm so
-    /// `needs_follow_up = model_wants_more || buffer_nonempty` — a steer
-    /// landing after the model's final answer forces one more round.
-    fn steer_input_pending(&self) -> bool {
+    /// Wake a pending model request when new user input arrives.
+    pub(super) async fn wait_for_steer_input(&self) {
+        match self.steer_buffer.as_ref() {
+            Some(buffer) => buffer.wait_for_input().await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    /// Whether user input needs another model round or should defer tool admission.
+    pub(super) fn steer_input_pending(&self) -> bool {
         self.steer_buffer
             .as_ref()
             .is_some_and(|buffer| !buffer.is_empty())
@@ -1241,10 +1246,9 @@ impl Agent {
                     // Codex-parity steer drain (turn.rs:225-233): fold any
                     // mid-turn injected user inputs into the conversation at
                     // the TOP of each iteration, BEFORE the next LLM call,
-                    // in FIFO order. Steering never interrupts an in-flight
-                    // round — inputs buffered while the model streams are
-                    // picked up here, after the previous round's tool
-                    // results are recorded.
+                    // in FIFO order. New input wakes sampling and defers
+                    // unstarted tools; already-running tools settle first.
+                    // Their results are recorded before input is drained.
                     self.drain_pending_steer_input(&mut messages, &mut turn_output_log)
                         .await;
                     // The previous checkpoint summary is transient working
@@ -1790,25 +1794,6 @@ impl Agent {
                     match response.stop_reason {
                         StopReason::EndTurn | StopReason::StopSequence => {
                             let content = response.content.clone().unwrap_or_default();
-                            // #2359: the grace call is exempt — a veto here
-                            // would only convert the synthesis into the canned
-                            // budget-stop message, with no budget left to act
-                            // on the verdict (same reasoning as the
-                            // convergence-checkpoint exemption above).
-                            if !grace_iteration
-                                && !self
-                                    .verifier_allows_termination(
-                                        &mut messages,
-                                        turn_ledger.as_mut(),
-                                        &content,
-                                        iteration,
-                                        &mut turn,
-                                        tracker,
-                                    )
-                                    .await?
-                            {
-                                continue;
-                            }
                             // Codex-parity follow-up gate (turn.rs:304-318):
                             // `needs_follow_up = model_needs_follow_up ||
                             // has_pending_input`. The model produced its
@@ -1832,6 +1817,25 @@ impl Agent {
                                      instead of terminating the turn"
                                 );
                                 continue 'agent_loop;
+                            }
+                            // #2359: the grace call is exempt — a veto here
+                            // would only convert the synthesis into the canned
+                            // budget-stop message, with no budget left to act
+                            // on the verdict (same reasoning as the
+                            // convergence-checkpoint exemption above).
+                            if !grace_iteration
+                                && !self
+                                    .verifier_allows_termination(
+                                        &mut messages,
+                                        turn_ledger.as_mut(),
+                                        &content,
+                                        iteration,
+                                        &mut turn,
+                                        tracker,
+                                    )
+                                    .await?
+                            {
+                                continue;
                             }
                             self.emit_cost_update(&turn, &response, attributed_cost);
                             return Ok(ConversationResponse {

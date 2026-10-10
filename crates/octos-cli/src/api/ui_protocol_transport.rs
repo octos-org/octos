@@ -16557,7 +16557,7 @@ fn raw_session_tools_register(
     host_connection: bool,
 ) -> Result<Value, RpcError> {
     use crate::peers::host_tools::{
-        SessionRegisterError, build_tool_set, register_session_tool_set,
+        SessionRegisterError, build_session_tool_set, register_session_tool_set,
     };
     authorize_host_session_call(
         peers_root,
@@ -16582,7 +16582,7 @@ fn raw_session_tools_register(
             ));
         }
     }
-    let set = build_tool_set(params.tools, params.generic_tools, params.options)
+    let set = build_session_tool_set(params.tools, params.generic_tools, params.options)
         .map_err(|err| host_peer_error("peer_tools_invalid", err))?;
     let route_ws = ws.clone();
     let (previous, version) = register_session_tool_set(

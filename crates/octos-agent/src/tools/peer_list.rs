@@ -58,12 +58,9 @@ impl Tool for PeerListTool {
     }
 
     fn description(&self) -> &str {
-        "List your peers as a compact index — ONE line per peer with its \
-         status (running / done / closed), when it last updated, how many \
-         turns it has run, and whether it has its own worktree. Use this to \
-         see WHAT peers exist and which have finished; then use peer_gather \
-         to read a specific peer's actual brief and result. Takes no \
-         arguments — includes your automatic workspace team and staged peers."
+        "List automatic workspace teammates and staged peers: status, last update, \
+         turn count and worktree presence. Takes no arguments. Use peer_gather to read \
+         their briefs and results."
     }
 
     fn tags(&self) -> &[&str] {

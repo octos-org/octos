@@ -2739,6 +2739,55 @@ async fn should_never_give_an_external_turn_a_host_routed_tool_when_one_is_regis
     assert_eq!(sorted_names(&registry), vec!["grep"]);
 }
 
+/// `n` distinct read tools, each of its own app (`t0.read` … ), as a
+/// registration's `tools`.
+fn many_tools(n: usize) -> Value {
+    let tools: Vec<Value> = (0..n)
+        .map(|i| {
+            json!({
+                "name": format!("t{i}.read"),
+                "app": format!("t{i}"),
+                "description": "Reads.",
+                "input_schema": {"type": "object"},
+                "risk": "read",
+            })
+        })
+        .collect();
+    json!({ "tools": tools })
+}
+
+/// An app peer's set is one app's tools (64 at most). A host session's set
+/// (the system agent's) gathers the tools the host granted it from many
+/// apps, so it may hold 96: next to the 32 kernel tools it can also keep,
+/// that is the 128 functions an OpenAI-compatible request accepts.
+#[tokio::test]
+async fn should_take_96_tools_on_a_host_session_and_64_on_an_app_peer() {
+    let fx = fixture().await;
+    let (stdio_tx, _stdio_rx) = std::sync::mpsc::sync_channel(8);
+    let stdio = WsConnection::new_stdio(stdio_tx);
+    let registered = register_on_session(&fx, &stdio, None, &fx.system, many_tools(96))
+        .expect("a host session takes 96 tools");
+    assert_eq!(registered["version"], 1);
+    let refused = register_on_session(&fx, &stdio, None, &fx.system, many_tools(97)).unwrap_err();
+    assert_eq!(refused.data.as_ref().unwrap()["kind"], "peer_tools_invalid");
+    assert!(
+        refused.message.contains("97 app tools (max 96)"),
+        "{}",
+        refused.message
+    );
+
+    let token = prepare_news(&fx).await;
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    register(&fx, &host_ws, &token, many_tools(64)).expect("an app peer takes 64 tools");
+    let refused = register(&fx, &host_ws, &token, many_tools(65)).unwrap_err();
+    assert_eq!(refused.data.as_ref().unwrap()["kind"], "peer_tools_invalid");
+    assert!(
+        refused.message.contains("65 app tools (max 64)"),
+        "{}",
+        refused.message
+    );
+}
+
 #[test]
 fn should_refuse_a_host_tool_whose_model_name_is_a_kernel_tools() {
     let error = crate::peers::host_tools::build_tool_set(
@@ -3262,6 +3311,7 @@ async fn should_carry_the_owning_app_and_the_caller_when_a_cross_app_tool_is_cal
         .unwrap();
     assert!(result.success, "{}", result.output);
     drop(registry);
+    drop(ws);
     crate::peers::host_tools::set_host_route(&peers_root(&fx), "news", 0, Arc::new(|_, _| false));
     let calls = host.await.unwrap();
     assert_eq!(calls.len(), 1);
@@ -3279,9 +3329,19 @@ async fn should_carry_the_owning_app_and_the_caller_when_a_cross_app_tool_is_cal
     // An owning app id must be well formed. The re-registration comes from
     // the owning connection — a different connection would be refused by
     // the route-ownership gate before validation ever runs (UPCR-2026-041).
+    // The route above was moved to connection 0, so the fresh connection
+    // that re-registers takes the route first, and the gate then lets it
+    // through to the validation refusal.
     let mut bad = news_list();
     bad["app"] = json!("Calendar App");
-    let error = register(&fx, &ws, &token, json!({ "tools": [bad] })).unwrap_err();
+    let (ws2, _rx2) = ws_connection_for_test(8);
+    crate::peers::host_tools::set_host_route(
+        &peers_root(&fx),
+        "news",
+        ws2.connection_id.0,
+        Arc::new(|_, _| false),
+    );
+    let error = register(&fx, &ws2, &token, json!({ "tools": [bad] })).unwrap_err();
     assert_eq!(error.data.unwrap()["kind"], "peer_tools_invalid");
 }
 
