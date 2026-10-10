@@ -6278,6 +6278,39 @@ struct UiProtocolApprovalRequester {
 #[async_trait::async_trait]
 impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
     async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        self.request_with_escalation(request, None).await
+    }
+
+    async fn request_sandbox_escalation(
+        &self,
+        mut request: ToolApprovalRequest,
+        details: octos_core::ui_protocol::ApprovalSandboxEscalationDetails,
+    ) -> ToolApprovalDecision {
+        // Embedded app confinement and external-client confinement are hard
+        // host boundaries, not something a tool approval can remove. A peer
+        // must not use its own approval channel to escape its assigned scope.
+        if !self.ws.is_stdio()
+            || self.ws.is_external()
+            || self.state.host_managed.is_some()
+            || self
+                .session_id
+                .topic()
+                .is_some_and(|topic| topic.starts_with("peer-") || topic.starts_with("peerctx-"))
+            || !self.features.typed_approvals
+        {
+            return ToolApprovalDecision::Deny;
+        }
+        request.once_only = true;
+        self.request_with_escalation(request, Some(details)).await
+    }
+}
+
+impl UiProtocolApprovalRequester {
+    async fn request_with_escalation(
+        &self,
+        request: ToolApprovalRequest,
+        escalation: Option<octos_core::ui_protocol::ApprovalSandboxEscalationDetails>,
+    ) -> ToolApprovalDecision {
         let approval_id = ApprovalId::new();
         // UPCR-2026-035: a once-only approval (a host-routed app tool's exact
         // call) is never answered by a remembered scope.
@@ -6294,13 +6327,38 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
                 self.ws.connection_id().0,
             );
         }
-        let event = approval_event_from_tool_request(
+        let escalation_command = escalation.as_ref().map(|_| ApprovalCommandDetails {
+            argv: Vec::new(),
+            command_line: request.command.clone(),
+            cwd: request.cwd.as_deref().map(sanitize_display_path),
+            env_keys: Vec::new(),
+            tool_call_id: Some(request.tool_id.clone()),
+        });
+        let mut event = approval_event_from_tool_request(
             request,
             self.session_id.clone(),
             approval_id.clone(),
             self.turn_id.clone(),
             self.features,
         );
+        if let Some(escalation) = escalation {
+            let mut details = ApprovalTypedDetails::command(escalation_command.unwrap(), None);
+            details.kind = approval_kinds::SANDBOX_ESCALATION.to_owned();
+            details.sandbox_escalation = Some(escalation);
+            event.approval_kind = Some(approval_kinds::SANDBOX_ESCALATION.to_owned());
+            event.risk = Some("high".to_owned());
+            event.typed_details = Some(details);
+            event.render_hints = Some(ApprovalRenderHints {
+                default_decision: Some("deny".to_owned()),
+                primary_label: Some("Run once outside sandbox".to_owned()),
+                secondary_label: Some("Deny".to_owned()),
+                danger: Some(true),
+                monospace_fields: vec![
+                    "typed_details.command.command_line".to_owned(),
+                    "typed_details.command.cwd".to_owned(),
+                ],
+            });
+        }
 
         // Scope-policy short circuit: if the user previously chose
         // `approve_for_*` for a matching tool/turn/session, resolve this
@@ -28802,6 +28860,32 @@ async fn handle_approval_respond(
 ) {
     if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
         send_scope_error(ws, id, error);
+        return;
+    }
+    let escalation = contracts
+        .approvals
+        .pending_for_session(&params.session_id)
+        .iter()
+        .any(|event| {
+            event.approval_id == params.approval_id
+                && event.approval_kind.as_deref() == Some(approval_kinds::SANDBOX_ESCALATION)
+        });
+    if escalation
+        && (!ws.is_stdio()
+            || ws.is_external()
+            || contracts
+                .approvals
+                .pending_owner(&params.session_id, &params.approval_id)
+                != Some(Some(ws.connection_id.0)))
+    {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::permission_denied(
+                "sandbox escalation must be answered on the local connection that requested it",
+            )
+            .with_data(json!({"kind": "sandbox_escalation_owner_only"})),
+        );
         return;
     }
     // `octos serve --host-managed`: a host-owned app peer's approvals belong
