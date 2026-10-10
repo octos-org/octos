@@ -4601,7 +4601,7 @@ async fn torn_tail_does_not_eat_rollback_marker_in_per_user_layout() {
     );
 }
 
-// ----- UPCR-2026-041 `session/append_message` primitives -----
+// ----- UPCR-2026-042 `session/append_message` primitives -----
 
 fn record(role: MessageRole, content: &str, cmid: Option<&str>) -> Message {
     let mut message = make_message(role, content);

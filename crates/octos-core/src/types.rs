@@ -255,7 +255,7 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     /// Provenance tag for rows written outside an agent turn
-    /// (`session/append_message`, UPCR-2026-041). Turn-written rows leave it
+    /// (`session/append_message`, UPCR-2026-042). Turn-written rows leave it
     /// `None`; callers distinguish out-of-band records by `Some(source)`.
     /// Legacy persisted rows omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -812,7 +812,7 @@ mod tests {
 
     #[test]
     fn message_source_roundtrips_and_legacy_rows_omit_it() {
-        // UPCR-2026-041: out-of-band rows carry `source`; turn-written rows
+        // UPCR-2026-042: out-of-band rows carry `source`; turn-written rows
         // and legacy JSONL keep it absent — and absent means ABSENT on
         // serialize, so row bytes for turn-written messages are unchanged.
         let mut msg = Message::system("recorded answer");

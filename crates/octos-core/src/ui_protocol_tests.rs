@@ -4861,7 +4861,7 @@ fn upcr_009_010_011_command_methods_round_trip_through_rpc_envelope() {
 }
 
 #[test]
-fn upcr_041_append_message_round_trips_through_rpc_envelope() {
+fn upcr_042_append_message_round_trips_through_rpc_envelope() {
     let append = UiCommand::SessionAppendMessage(SessionAppendMessageParams {
         session_id: sample_session_id(),
         role: "assistant".to_owned(),

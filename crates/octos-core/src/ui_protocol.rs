@@ -1121,7 +1121,7 @@ pub mod methods {
     /// `session/btw` — quick aside question answered out-of-band (no tools)
     /// while the session's live turn, if any, keeps running.
     pub const SESSION_BTW: &str = "session/btw";
-    /// UPCR-2026-041 `session/append_message` — record-only history write.
+    /// UPCR-2026-042 `session/append_message` — record-only history write.
     /// Appends one row to the session's persisted history WITHOUT starting a
     /// turn, calling a model, or running a tool — the write-side mirror of
     /// `session/btw` and the gentlest member of the `session/rollback` /
@@ -3215,9 +3215,9 @@ pub struct SessionForkResult {
     pub copied_messages: u32,
 }
 
-// ----- UPCR-2026-041 `session/append_message` -----
+// ----- UPCR-2026-042 `session/append_message` -----
 
-/// Params for `session/append_message` (UPCR-2026-041) — record-only history
+/// Params for `session/append_message` (UPCR-2026-042) — record-only history
 /// write. Never starts a turn, calls a model, or runs a tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionAppendMessageParams {

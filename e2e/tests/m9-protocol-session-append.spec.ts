@@ -1,7 +1,7 @@
 /**
- * M9 wire-level e2e: `session/append_message` (UPCR-2026-041).
+ * M9 wire-level e2e: `session/append_message` (UPCR-2026-042).
  *
- * Spec  : docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_041_SESSION_APPEND_MESSAGE.md
+ * Spec  : docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_042_SESSION_APPEND_MESSAGE.md
  * Issue : https://github.com/octos-org/octos/issues/2355
  *
  * Asserts envelope shape, idempotent-retry semantics and live projection —

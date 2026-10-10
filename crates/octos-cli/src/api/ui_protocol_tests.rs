@@ -49588,7 +49588,7 @@ async fn should_replay_an_external_prompt_to_its_owner_after_the_side_table_forg
 #[path = "session_history_tests.rs"]
 mod session_history_tests;
 
-// ===== UPCR-2026-041 `session/append_message` handler =====
+// ===== UPCR-2026-042 `session/append_message` handler =====
 
 /// Disk-backed state with one persisted user row so assistant records have a
 /// thread to derive from. Mirrors `prg_state_with_persisted_turns`'s shape.
@@ -49860,7 +49860,7 @@ async fn session_append_message_rejects_invalid_params_with_typed_kinds() {
     assert_eq!(frame["result"]["thread_id"], "imported-thread");
 }
 
-// ===== UPCR-2026-041 `session/append_message` context recording =====
+// ===== UPCR-2026-042 `session/append_message` context recording =====
 
 /// An out-of-band record merges into the session's context view wherever it
 /// exists: the live manager directly, otherwise the durable snapshot

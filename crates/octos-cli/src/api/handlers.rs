@@ -1208,7 +1208,7 @@ pub struct MessageInfo {
     /// field continue to round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
-    /// Provenance tag from the persisted row (UPCR-2026-041). Present only on
+    /// Provenance tag from the persisted row (UPCR-2026-042). Present only on
     /// out-of-band records (`session/append_message`); turn-written rows
     /// omit it so legacy clients keep round-tripping cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]

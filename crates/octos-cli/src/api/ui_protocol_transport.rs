@@ -5172,7 +5172,7 @@ fn record_appui_context_manager_background_message(
     }
 }
 
-/// Record an out-of-band `session/append_message` row (UPCR-2026-041) into
+/// Record an out-of-band `session/append_message` row (UPCR-2026-042) into
 /// the session's AppUI context view, tagged `external_record`. Mirrors the
 /// background-row recording path (live manager first, durable snapshot
 /// otherwise) minus the per-turn fallback: a session with neither a live
@@ -28569,7 +28569,7 @@ const HOST_PEER_SESSION_WRITE_METHODS: &[&str] = &[
     "turn/steer",
     "turn/interrupt",
     "session/rollback",
-    // UPCR-2026-041: a record-only append still lands in the peer's next
+    // UPCR-2026-042: a record-only append still lands in the peer's next
     // turn's prompt — the same injection surface as the writes above.
     "session/append_message",
     "session/goal/set",
@@ -30779,7 +30779,7 @@ async fn handle_session_fork(
     send_serialized_rpc_result(ws, id, method, result);
 }
 
-/// UPCR-2026-041 `session/append_message` — record-only history write.
+/// UPCR-2026-042 `session/append_message` — record-only history write.
 ///
 /// Appends one row through the canonical persist path
 /// (`add_message_once_with_seq`) without starting a turn, calling a model,

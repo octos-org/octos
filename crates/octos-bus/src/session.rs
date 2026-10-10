@@ -2087,7 +2087,7 @@ impl SessionManager {
 
     /// Append a message unless the session already carries a live row with
     /// the same `client_message_id` — the `session/append_message`
-    /// idempotent-retry primitive (UPCR-2026-041; the
+    /// idempotent-retry primitive (UPCR-2026-042; the
     /// `persist_system_note_once` pattern): the existence scan and the append
     /// share the per-key persist lock, so a retry racing the original commit
     /// can never double-append.
