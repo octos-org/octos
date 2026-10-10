@@ -49727,7 +49727,11 @@ async fn session_append_message_retry_echoes_the_existing_row_binding() {
     .await;
     let frame = recv_rpc_json(&mut rx).await;
     assert_eq!(frame["result"]["seq"], 1);
-    assert_eq!(frame["result"]["thread_id"], serde_json::Value::Null, "{frame}");
+    assert_eq!(
+        frame["result"]["thread_id"],
+        serde_json::Value::Null,
+        "{frame}"
+    );
 
     // Retrying the same cmid under a role that would root its own thread
     // still hits the durable row — and must echo ITS binding (absent), not

@@ -8537,14 +8537,18 @@ mod tests {
             &[Message::user("run the release check")],
         );
         canonical.record_message(&assistant_tool_call("tc-check-1"));
-        assert!(canonical.items().iter().any(|item| matches!(
-            item.kind,
-            TranscriptItemKind::AssistantToolCall { .. }
-        )));
-        assert!(!canonical.items().iter().any(|item| matches!(
-            item.kind,
-            TranscriptItemKind::ToolOutput { .. }
-        )));
+        assert!(
+            canonical
+                .items()
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::AssistantToolCall { .. }))
+        );
+        assert!(
+            !canonical
+                .items()
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::ToolOutput { .. }))
+        );
 
         let mut external = Message::user("side-channel status note");
         external.source = Some("external_record:import".into());
