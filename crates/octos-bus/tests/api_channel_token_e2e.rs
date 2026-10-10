@@ -415,21 +415,18 @@ async fn raw_request(port: u16, host: &str, origin: Option<&str>) -> (u16, Strin
 async fn the_wire_refuses_a_rebound_host_and_a_cross_site_origin() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = isolated_data_dir(tmp.path());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    // The guard is unconditional, but the channel must stay UNARMED here:
+    // without this pivot a sibling test's env token arms the process's
+    // channels (env is global to the test binary) and the loopback probe
+    // below 401s before it ever reaches the guard's pass leg.
+    let _env = EnvGuard::pivot(&[
+        ("OCTOS_AUTH_TOKEN", None),
+        ("OCTOS_DATA_DIR", Some(data_dir.as_os_str())),
+        ("HOME", Some(tmp.path().as_os_str())),
+    ]);
 
-    let sessions = SessionManager::open(&data_dir).unwrap();
-    let channel = ApiChannel::new(
-        port,
-        None,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        Arc::new(tokio::sync::Mutex::new(sessions)),
-        None,
-    );
-    let (inbound_tx, _inbound_rx) = mpsc::channel(1);
-    let _server = tokio::spawn(async move { channel.start(inbound_tx).await });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let base = spawn_server(&data_dir, None).await;
+    let port: u16 = base.rsplit_once(':').unwrap().1.parse().unwrap();
 
     // The rebinding vector: the browser resolves evil.com to 127.0.0.1,
     // the Host header still names evil.com.
