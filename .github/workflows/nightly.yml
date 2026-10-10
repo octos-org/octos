@@ -14,7 +14,10 @@ on:
 
 concurrency:
   group: nightly-${{ github.ref }}
-  cancel-in-progress: true
+  # A scheduled nightly superseded by a main push loses the entire night's
+  # verdict — and the reconcile step then reports success on a run with no
+  # test signal. Queue instead: one night's verdict is worth the wait.
+  cancel-in-progress: false
 
 permissions:
   contents: read
