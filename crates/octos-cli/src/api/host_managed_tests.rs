@@ -272,6 +272,65 @@ async fn should_reject_a_request_whose_host_header_does_not_name_the_listener() 
 }
 
 #[tokio::test]
+async fn should_reject_a_request_carrying_more_than_one_host_header() {
+    let server = serve(true).await;
+    let port = server.addr.port();
+    // Two Host headers on one request is malformed at the wire (RFC 9112
+    // §3.2); the guard must refuse the pair outright, not score whichever
+    // header the accessor happens to read first (#2758).
+    for (first, second) in [
+        (
+            format!("127.0.0.1:{port}"),
+            format!("rebind.example:{port}"),
+        ),
+        (
+            format!("rebind.example:{port}"),
+            format!("127.0.0.1:{port}"),
+        ),
+    ] {
+        let mut tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        tcp.write_all(
+            format!(
+                "GET /health HTTP/1.1\r\nHost: {first}\r\nHost: {second}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut response = String::new();
+        tcp.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains(" 421 "),
+            "{first} + {second}"
+        );
+    }
+}
+
+#[test]
+fn should_fail_closed_when_a_request_carries_more_than_one_host() {
+    let host_managed = HostManaged::new(HOST.into(), None, 8080).unwrap();
+    let mut headers = axum::http::HeaderMap::new();
+    headers.append("host", "127.0.0.1:8080".parse().unwrap());
+    assert!(host_managed.host_allowed(&headers, None));
+    // The duplicated pair names nothing reliably — and the URI authority
+    // must not rescue it, so the fail-close lives in the accessor itself,
+    // not only in the guard's wire-level refusal (#2758).
+    headers.append("host", "rebind.example:9".parse().unwrap());
+    assert!(!host_managed.host_allowed(&headers, None));
+    assert!(!host_managed.host_allowed(&headers, Some("127.0.0.1:8080")));
+    // No `Host` header at all: the authority is the only name the request
+    // carries (an absolute-form request line, or h2's :authority).
+    let empty = axum::http::HeaderMap::new();
+    assert!(host_managed.host_allowed(&empty, Some("127.0.0.1:8080")));
+    assert!(!host_managed.host_allowed(&empty, Some("rebind.example:9")));
+    assert!(!host_managed.host_allowed(&empty, None));
+}
+
+#[tokio::test]
 async fn should_admit_only_configured_browser_origins() {
     let server = serve(true).await;
     let with_origin = |origin: &'static str| {
