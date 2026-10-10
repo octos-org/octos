@@ -568,12 +568,15 @@ async fn handle_webhook(
     }
 
     // Verification token check (for non-encrypted plaintext events, and
-    // decrypted encrypted events). An armed channel refuses a missing or
-    // empty token exactly like a wrong one (#2756) — absent must not mean
-    // verified.
+    // decrypted encrypted events). The token arrives top-level on v1.0
+    // shapes and url_verification probes, at `header.token` on v2.0
+    // envelopes — accept either. On an armed channel a MISSING or empty
+    // token is refused exactly like a wrong one (#2756): absent must not
+    // mean verified.
     if let Some(ref vt) = state.verification_token {
         let event_token = event_json
             .get("token")
+            .or_else(|| event_json.pointer("/header/token"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if event_token.is_empty() || !constant_time_eq(event_token.as_bytes(), vt.as_bytes()) {
@@ -2220,6 +2223,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn feishu_webhook_v2_envelope_with_header_token_forwards() {
+        let (state, mut rx) = webhook_state_with_verification_token();
+        // v2.0 envelopes carry the verification token at `header.token` —
+        // the only shape `parse_event` dispatches — so the armed check must
+        // accept it there (#2756 review).
+        let body = r#"{"schema":"2.0","header":{"event_type":"im.message.receive_v1","token":"octos-vt-secret"},"event":{}}"#;
+
+        let status = call_handle_webhook(state, build_headers(&[]), body).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(rx.try_recv().is_ok(), "verified v2 push should forward");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_v2_envelope_with_wrong_header_token_is_rejected() {
+        let (state, mut rx) = webhook_state_with_verification_token();
+        let body = r#"{"schema":"2.0","header":{"event_type":"im.message.receive_v1","token":"forged"},"event":{}}"#;
+
+        let status = call_handle_webhook(state, build_headers(&[]), body).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert!(rx.try_recv().is_err(), "refused event must not forward");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_non_string_token_is_rejected() {
+        let (state, mut rx) = webhook_state_with_verification_token();
+        // A non-string token fails `.as_str()` and must not fall through as
+        // verified.
+        let body = r#"{"type":"event_callback","token":12345,"event":{}}"#;
+
+        let status = call_handle_webhook(state, build_headers(&[]), body).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert!(rx.try_recv().is_err(), "refused event must not forward");
+    }
+
+    #[tokio::test]
     async fn feishu_webhook_without_configured_token_still_forwards() {
         let (tx, mut rx) = mpsc::channel::<serde_json::Value>(8);
         let state = WebhookState {
@@ -2288,6 +2326,16 @@ mod tests {
         let signed = r#"{"type":"event_callback","token":"octos-vt-secret","event":{}}"#;
         assert_eq!(post_webhook_event(addr, signed).await, 200);
         assert!(rx.try_recv().is_ok(), "verified push should forward");
+
+        // The v2.0 envelope Lark actually pushes (token at `header.token`)
+        // is accepted over the wire, and a credential-less v2 push is not.
+        let v2_unsigned =
+            r#"{"schema":"2.0","header":{"event_type":"im.message.receive_v1"},"event":{}}"#;
+        assert_eq!(post_webhook_event(addr, v2_unsigned).await, 403);
+        assert!(rx.try_recv().is_err(), "refused push must not forward");
+        let v2_signed = r#"{"schema":"2.0","header":{"event_type":"im.message.receive_v1","token":"octos-vt-secret"},"event":{}}"#;
+        assert_eq!(post_webhook_event(addr, v2_signed).await, 200);
+        assert!(rx.try_recv().is_ok(), "verified v2 push should forward");
 
         // Unarmed channel: the passthrough contract is unchanged.
         let (addr, mut rx) = spawn_webhook_router(None).await;

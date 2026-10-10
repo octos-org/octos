@@ -32,10 +32,13 @@ pub fn register(
         .get("encrypt_key")
         .and_then(|v| v.as_str())
         .map(String::from);
+    // An empty-string placeholder must not arm the channel into refusing
+    // every event (#2756 review): treat it as unconfigured.
     let verification_token = entry
         .settings
         .get("verification_token")
         .and_then(|v| v.as_str())
+        .filter(|token| !token.is_empty())
         .map(String::from);
     channel_mgr.register(Arc::new(
         octos_bus::FeishuChannel::new(
