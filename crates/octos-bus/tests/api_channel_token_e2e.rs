@@ -433,7 +433,8 @@ async fn the_wire_refuses_a_rebound_host_and_a_cross_site_origin() {
     let (status, head) = raw_request(port, "evil.com", None).await;
     assert_eq!(status, 421, "rebound Host must not reach a route: {head}");
 
-    // The CSRF vector: a cross-site page POSTs to the loopback directly.
+    // The CSRF vector: a cross-site page fetching the loopback in CORS
+    // mode carries its Origin even on a plain GET.
     let (status, head) = raw_request(port, "127.0.0.1:1", Some("https://evil.com")).await;
     assert_eq!(
         status, 403,

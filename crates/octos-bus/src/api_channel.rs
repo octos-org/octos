@@ -761,6 +761,12 @@ fn api_router(state: ApiState) -> Router {
 /// SSH/port-forwarded callers keep working. Mirrors serve's host-managed
 /// `host_header_guard`.
 async fn loopback_guard(req: Request, next: Next) -> Response {
+    // Two Host headers on one request is malformed at the wire (RFC 9112
+    // §3.2) — and the accessor below would only ever see the first.
+    if req.headers().get_all(header::HOST).iter().count() > 1 {
+        warn!("rejected request carrying more than one Host header");
+        return (StatusCode::MISDIRECTED_REQUEST, "unexpected Host").into_response();
+    }
     let host_ok = req
         .headers()
         .get(header::HOST)
@@ -785,28 +791,37 @@ async fn loopback_guard(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
-/// `127.0.0.1`, `localhost`, `::1` (bracketed or bare), with or without a
+/// `127.0.0.1`, `localhost`, `::1` (bracketed or bare), with an optional
 /// port — textual, case-insensitive: the guard's job is to catch a Host
 /// naming some other name (a rebound domain, a LAN IP), not to
-/// re-represent addresses.
+/// re-represent addresses. Anything after `]` or after the host must be a
+/// plain digit port; a malformed authority is refused, not re-interpreted.
 fn loopback_host(authority: &str) -> bool {
     let authority = authority.trim();
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split_once(']')
-            .map(|(literal, _)| literal)
-            .unwrap_or(authority)
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((literal, "")) => (literal, ""),
+            Some((literal, port)) => match port.strip_prefix(':') {
+                Some(port) => (literal, port),
+                None => return false,
+            },
+            None => return false,
+        }
     } else if authority.matches(':').count() > 1 {
-        authority // a bare IPv6 literal carries no port
+        (authority, "") // a bare IPv6 literal carries no port
     } else {
-        authority.split(':').next().unwrap_or(authority)
+        authority.split_once(':').unwrap_or((authority, ""))
     };
-    host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "::1")
+    port.bytes().all(|b| b.is_ascii_digit())
+        && (host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "::1"))
 }
 
 /// A browser `Origin` naming the loopback — `http://127.0.0.1:8091`,
 /// `https://localhost:5173`; any port, so a locally served UI passes.
 /// `null` (sandboxed iframe) and every other authority fail.
 fn loopback_origin(origin: &str) -> bool {
+    // Lowercased so the scheme compare matches the host's case handling.
+    let origin = origin.to_ascii_lowercase();
     origin
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"))

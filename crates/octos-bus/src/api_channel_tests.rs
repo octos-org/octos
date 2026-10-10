@@ -4724,6 +4724,58 @@ async fn loopback_hosts_reach_the_routes() {
     }
 }
 
+/// Authorities that merely contain a loopback spelling but aren't one are
+/// refused rather than re-interpreted.
+#[tokio::test]
+async fn malformed_authorities_are_refused() {
+    let app = unarmed_router();
+    for host in [
+        "[::1]evil.com",   // garbage behind the bracket
+        "[::1]:8091x",     // non-digit port, bracketed
+        "127.0.0.1:8091x", // non-digit port, bare
+        "127.0.0.1.evil.com",
+        "127.0.0.1:8091:666",
+    ] {
+        assert_eq!(
+            guard_probe(&app, "GET", "/metrics", Some(host), None).await,
+            StatusCode::MISDIRECTED_REQUEST,
+            "malformed authority {host} must be refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_host_header_is_refused() {
+    let app = unarmed_router();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .header("host", "127.0.0.1")
+        .header("host", "evil.com");
+    let status = app
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+}
+
+/// The guard wraps the whole router — the 404 fallback included — so a
+/// route-table refactor that swaps `layer` for `route_layer` fails here
+/// instead of silently narrowing the guard's coverage.
+#[tokio::test]
+async fn the_guard_covers_the_fallback_too() {
+    let app = unarmed_router();
+    assert_eq!(
+        guard_probe(&app, "GET", "/nope", Some("evil.com"), None).await,
+        StatusCode::MISDIRECTED_REQUEST
+    );
+    assert_eq!(
+        guard_probe(&app, "GET", "/nope", Some("127.0.0.1:8091"), None).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
 #[tokio::test]
 async fn cross_site_origins_are_rejected_and_loopback_origins_pass() {
     let app = unarmed_router();
