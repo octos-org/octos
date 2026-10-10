@@ -13,8 +13,11 @@ uncommitted work, especially when several sessions share a folder.
 
 ## Contract
 
-`diff/workspace/get` accepts only `{ "session_id": "..." }`. Unknown fields,
-including client-supplied paths, are rejected. The method is advertised alongside
+`diff/workspace/get` accepts `session_id` and optional `profile_id`. The latter
+supports legacy/opaque session IDs without an encoded profile and must match
+any connection-bound or session-encoded profile. Clients send the active profile
+from `session/open`. Unknown fields, including client-supplied paths, are
+rejected. The method is advertised alongside
 `diff/preview/get` and uses the existing profile, connection and peer admission
 checks. It requires an open session with a server-bound workspace.
 
@@ -27,7 +30,10 @@ The snapshot compares the current working tree to HEAD, combining staged and
 unstaged changes, and includes nonignored untracked files. An unborn repository
 uses the empty tree. Paths are relative to and limited to the bound workspace;
 the operation does not write files or alter the Git index. Git external diff,
-textconv and fsmonitor hooks are disabled. Binary files retain file entries.
+textconv, content filters and fsmonitor hooks are disabled. Git content filters
+are overridden per invocation without editing repository configuration, so the
+snapshot shows raw working-tree contents. Server-inherited Git environment
+overrides are removed. Binary files retain file entries.
 
 Requests fail explicitly for non-Git workspaces, unsupported filenames, Git
 errors, output above 2 MiB, more than 256 changed files, more than 10,000 patch

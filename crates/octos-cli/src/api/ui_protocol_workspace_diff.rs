@@ -28,7 +28,11 @@ pub(super) async fn rpc(
     connection_profile: Option<&str>,
 ) -> Result<Value, RpcError> {
     let params: DiffWorkspaceGetParams = parse_raw_params(request)?;
-    let profile = validate_session_scope(&params.session_id, None, connection_profile)?;
+    let profile = validate_session_scope(
+        &params.session_id,
+        params.profile_id.as_deref(),
+        connection_profile,
+    )?;
     let runtime = resolve_session_profile_runtime(state, profile.as_deref())
         .ok_or_else(|| runtime_unavailable_error("profile runtime unavailable"))?;
     let workspace =
@@ -55,10 +59,28 @@ pub(super) async fn rpc(
     .map_err(|e| RpcError::internal_error(e.to_string()))
 }
 
-// No shell, external diff drivers, textconv or fsmonitor hooks. Bounded pipes
+// No external diff drivers, textconv, content filters or fsmonitor hooks. Bounded pipes
 // and kill-on-drop also bound resource use when the request times out.
-async fn git(root: &Path, args: &[&str], remaining: &mut usize) -> Result<(bool, Vec<u8>), String> {
-    let mut child = tokio::process::Command::new("git")
+async fn git(
+    root: &Path,
+    args: &[&str],
+    remaining: &mut usize,
+    config: &[String],
+) -> Result<(i32, Vec<u8>), String> {
+    let mut command = std::process::Command::new("git");
+    octos_core::env_hygiene::sanitize_git_command_env(&mut command);
+    // Server launch environment must not redirect a session's Git directory,
+    // worktree/index, inject config, or enable external helpers/tracing.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let mut command = tokio::process::Command::from(command);
+    for setting in config {
+        command.arg("-c").arg(setting);
+    }
+    let mut child = command
         .args([
             "--no-pager",
             "-c",
@@ -89,28 +111,78 @@ async fn git(root: &Path, args: &[&str], remaining: &mut usize) -> Result<(bool,
     }
     *remaining -= bytes.len();
     let status = child.wait().await.map_err(|e| e.to_string())?;
-    Ok((status.success(), bytes))
+    Ok((status.code().unwrap_or(-1), bytes))
 }
 
 async fn collect(root: &Path, session_id: SessionKey) -> Result<DiffPreview, String> {
     let mut remaining = MAX_BYTES;
-    let (repo, _) = git(root, &["rev-parse", "--show-toplevel"], &mut remaining).await?;
-    if !repo {
+    // A normal diff can run clean/process filters while inspecting tracked
+    // files, even with --no-textconv and --no-ext-diff. Disable every configured
+    // filter for this read without rewriting repository or user configuration.
+    let (code, keys) = git(
+        root,
+        &[
+            "config",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process|required)$",
+        ],
+        &mut remaining,
+        &[],
+    )
+    .await?;
+    if code != 0 && code != 1 {
+        return Err("Git could not inspect content filters".into());
+    }
+    let config: Vec<String> = keys
+        .split(|b| *b == 0)
+        .filter(|key| !key.is_empty())
+        .map(|key| {
+            let key = std::str::from_utf8(key).map_err(|_| "unsupported Git filter name")?;
+            if key.contains('=') {
+                return Err("unsupported Git filter name");
+            }
+            Ok(format!(
+                "{key}={}",
+                if key.ends_with(".required") {
+                    "false"
+                } else {
+                    ""
+                }
+            ))
+        })
+        .collect::<Result<_, _>>()?;
+    let (repo, _) = git(
+        root,
+        &["rev-parse", "--show-toplevel"],
+        &mut remaining,
+        &config,
+    )
+    .await?;
+    if repo != 0 {
         return Err("this workspace is not a Git repository".into());
     }
-    let (has_head, _) = git(root, &["rev-parse", "--verify", "HEAD"], &mut remaining).await?;
+    let (has_head, _) = git(
+        root,
+        &["rev-parse", "--verify", "HEAD"],
+        &mut remaining,
+        &config,
+    )
+    .await?;
     // The empty tree works for unborn repositories and includes staged new files.
     let empty_tree;
-    let base = if has_head {
+    let base = if has_head == 0 {
         "HEAD"
     } else {
         let (ok, hash) = git(
             root,
             &["hash-object", "-t", "tree", "--stdin"],
             &mut remaining,
+            &config,
         )
         .await?;
-        if !ok {
+        if ok != 0 {
             return Err("Git could not resolve an empty tree".into());
         }
         empty_tree = String::from_utf8(hash).map_err(|_| "invalid Git object ID")?;
@@ -132,9 +204,10 @@ async fn collect(root: &Path, session_id: SessionKey) -> Result<DiffPreview, Str
             ".",
         ],
         &mut remaining,
+        &config,
     )
     .await?;
-    if !ok {
+    if ok != 0 {
         return Err("Git could not read the workspace diff".into());
     }
     let mut patch_lines = 0;
@@ -152,9 +225,10 @@ async fn collect(root: &Path, session_id: SessionKey) -> Result<DiffPreview, Str
             ".",
         ],
         &mut remaining,
+        &config,
     )
     .await?;
-    if !ok {
+    if ok != 0 {
         return Err("Git could not list untracked files".into());
     }
     for path in untracked.split(|b| *b == 0).filter(|p| !p.is_empty()) {
@@ -182,7 +256,7 @@ async fn collect(root: &Path, session_id: SessionKey) -> Result<DiffPreview, Str
         if !parent.starts_with(&canonical_root) {
             return Err("changed file is outside the workspace".into());
         }
-        let (_, patch) = git(
+        let (code, patch) = git(
             root,
             &[
                 "diff",
@@ -197,8 +271,12 @@ async fn collect(root: &Path, session_id: SessionKey) -> Result<DiffPreview, Str
                 path,
             ],
             &mut remaining,
+            &config,
         )
         .await?;
+        if code != 0 && code != 1 {
+            return Err(format!("Git could not read {path}"));
+        }
         count_patch_lines(&patch, &mut patch_lines)?;
         let mut added =
             parse_unified_diff_preview_files(&String::from_utf8_lossy(&patch)).unwrap_or_default();
@@ -333,6 +411,90 @@ mod tests {
                 .contains("2 MiB")
         );
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_diff_disables_content_filters_without_rewriting_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_sync(root, &["init"]);
+        std::fs::write(
+            root.join(".gitattributes"),
+            "*.txt filter=probe diff=probe\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("file.txt"), "old\n").unwrap();
+        git_sync(root, &["add", "."]);
+        git_sync(
+            root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.test",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+        std::fs::write(root.join("file.txt"), "new\n").unwrap();
+        git_sync(root, &["config", "filter.probe.required", "true"]);
+        git_sync(
+            root,
+            &[
+                "config",
+                "diff.probe.command",
+                "sh -c 'touch helper-ran; exit 1'",
+            ],
+        );
+        git_sync(
+            root,
+            &[
+                "config",
+                "diff.probe.textconv",
+                "sh -c 'touch helper-ran; exit 1'",
+            ],
+        );
+        for option in ["clean", "process"] {
+            git_sync(
+                root,
+                &[
+                    "config",
+                    &format!("filter.probe.{option}"),
+                    "sh -c 'touch helper-ran; cat'",
+                ],
+            );
+            let before = std::fs::read(root.join(".git/config")).unwrap();
+            let preview = collect(root, SessionKey("s".into())).await.unwrap();
+            assert_eq!(preview.files.len(), 1);
+            assert!(
+                preview.files[0]
+                    .hunks
+                    .iter()
+                    .flat_map(|h| &h.lines)
+                    .any(|line| line.content == "new")
+            );
+            assert!(!root.join("helper-ran").exists(), "{option} must not run");
+            assert_eq!(before, std::fs::read(root.join(".git/config")).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_diff_rejects_file_count_overflow_without_partial_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_sync(root, &["init"]);
+        for index in 0..=MAX_FILES {
+            std::fs::write(root.join(format!("{index}.txt")), "new\n").unwrap();
+        }
+        git_sync(root, &["add", "."]);
+        assert!(
+            collect(root, SessionKey("s".into()))
+                .await
+                .unwrap_err()
+                .contains("256 files")
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn workspace_diff_symlink_content_never_reads_its_external_target() {

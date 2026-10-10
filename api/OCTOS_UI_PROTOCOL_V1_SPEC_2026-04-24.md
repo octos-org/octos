@@ -1329,8 +1329,12 @@ Minimum params:
 ### `diff/workspace/get`
 
 Read-only snapshot of uncommitted Git changes in the workspace bound by
-`session/open`. Params: `{ "session_id": "…" }` (`DiffWorkspaceGetParams`).
-Client paths and other fields are rejected. Returns `DiffPreviewGetResult`:
+`session/open`. Params: `{ "session_id": "…", "profile_id": "…" }`
+(`DiffWorkspaceGetParams`). Optional `profile_id` selects the session's profile
+when its ID does not encode one (for example, legacy `profile:main` IDs).
+It must match any connection-bound or session-encoded profile. Clients should
+send the active profile from `session/open`. Client paths and other fields
+are rejected. Returns `DiffPreviewGetResult`:
 `status: "ready"`, `source: "pending_store"`, and a fresh session-bound preview
 ID, title and file/hunk/line data. The server stores the captured snapshot so
 `diff/preview/get` can read that ID later, subject to normal preview retention.
@@ -1344,6 +1348,9 @@ binary and mode-only changes can have no line hunks. Reads are limited to 256
 files, 10,000 patch lines, 2 MiB of Git output and 15 seconds; oversized, non-Git,
 unavailable or timed-out reads fail explicitly, never return a silently truncated success.
 Git can change during the read; Refresh captures a new snapshot.
+Git content filters (clean/process/smudge) are disabled for the read; this view
+shows raw working-tree contents. Server-inherited Git routing/configuration
+environment variables cannot redirect the bound workspace.
 
 Clients must label this scope **Workspace uncommitted changes**, which can
 include changes from other sessions, and keep it distinct from **Session change

@@ -3718,6 +3718,7 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             "session_id": session_id,
             "preview_id": preview_id,
         }),
+        methods::DIFF_WORKSPACE_GET => json!({ "session_id": session_id }),
         methods::TASK_OUTPUT_READ => json!({
             "session_id": session_id,
             "task_id": task_id,
@@ -49690,6 +49691,47 @@ async fn workspace_diff_rpc_requires_open_binding_and_stores_session_scoped_snap
     );
     assert!(
         workspace_diff_rpc::rpc(&state, &contracts, &request, Some("another-profile"))
+            .await
+            .is_err()
+    );
+    // Desktop initial sessions use a legacy two-part ID. On an owner-token
+    // connection only the explicit profile can select their runtime.
+    let legacy_session = SessionKey(format!("{profile}:main"));
+    assert!(legacy_session.profile_id().is_none());
+    let legacy_request = RpcRequest::new(
+        "legacy-workspace",
+        DIFF_WORKSPACE_GET,
+        json!({"session_id": legacy_session, "profile_id": profile}),
+    );
+    // A supplied profile must not bypass the open-session workspace binding.
+    assert!(
+        workspace_diff_rpc::rpc(&state, &contracts, &legacy_request, None)
+            .await
+            .is_err()
+    );
+    session_workspaces().set(
+        &profile,
+        legacy_session.clone(),
+        workspace.path().to_owned(),
+    );
+    let legacy = workspace_diff_rpc::rpc(&state, &contracts, &legacy_request, None)
+        .await
+        .unwrap();
+    assert_eq!(legacy["preview"]["session_id"], legacy_session.0);
+    assert_eq!(legacy["preview"]["files"][0]["path"], "new.txt");
+    assert!(
+        workspace_diff_rpc::rpc(&state, &contracts, &legacy_request, Some("another-profile"))
+            .await
+            .is_err()
+    );
+    let wrong_profile = RpcRequest::new(
+        "wrong-profile",
+        DIFF_WORKSPACE_GET,
+        json!({"session_id": request.params["session_id"],
+               "profile_id": "another-profile"}),
+    );
+    assert!(
+        workspace_diff_rpc::rpc(&state, &contracts, &wrong_profile, None)
             .await
             .is_err()
     );

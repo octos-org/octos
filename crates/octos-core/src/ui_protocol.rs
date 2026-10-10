@@ -2632,6 +2632,8 @@ pub struct DiffPreviewGetParams {
 #[serde(deny_unknown_fields)]
 pub struct DiffWorkspaceGetParams {
     pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
