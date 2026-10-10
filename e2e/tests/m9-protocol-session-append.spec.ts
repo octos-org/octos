@@ -103,14 +103,27 @@ test.describe("M9 protocol — session/append_message", () => {
         client_message_id: `cmid-${sid}-note`,
       };
       const first = await client.rawRequest<AppendResult>("session/append_message", params);
+      expect(first.thread_id ?? null).toBeNull();
       const retry = await client.rawRequest<AppendResult>("session/append_message", {
         ...params,
         content: "a DIFFERENT body must still lose to the first row",
       });
       expect(retry.seq).toBe(first.seq);
+      expect(retry.thread_id ?? null).toBeNull();
+
+      // A role-switching retry over the UNBOUND durable row must keep
+      // echoing the row's absent binding — not the retry payload's freshly
+      // stamped one (a user row would root its own thread on first commit).
+      const switched = await client.rawRequest<AppendResult>("session/append_message", {
+        ...params,
+        role: "user",
+        content: "retry body under a role that roots its own thread",
+      });
+      expect(switched.seq).toBe(first.seq);
+      expect(switched.thread_id ?? null).toBeNull();
 
       const page = await client.rawRequest<{
-        messages: Array<{ content: string }>;
+        messages: Array<{ content: string; thread_id?: string }>;
       }>("session/messages_page", { session_id: sid });
       expect(
         page.messages.filter((m) => m.content === "importer checkpoint"),
@@ -118,6 +131,9 @@ test.describe("M9 protocol — session/append_message", () => {
       expect(
         page.messages.filter((m) => m.content.includes("DIFFERENT body")),
       ).toHaveLength(0);
+      // The durable row never grew a thread from the retries.
+      const imported = page.messages.find((m) => m.content === "importer checkpoint");
+      expect(imported?.thread_id).toBeUndefined();
     } finally {
       await client.close();
     }

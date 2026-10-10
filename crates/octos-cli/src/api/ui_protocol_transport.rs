@@ -4702,9 +4702,13 @@ impl AppUiPromptContextBridge {
         scratch: &mut AppUiLoopPromptScratch,
         canonical: &ContextManager,
     ) -> usize {
+        // UPCR-2026-042: external records are deferred from the in-flight
+        // turn — adoption skips them so a row appended mid-turn cannot reach
+        // this turn's next model request. The copy-back below re-folds them
+        // into canonical instead.
         let adopted = scratch
             .manager
-            .adopt_source_items_after(canonical, scratch.source_watermark);
+            .adopt_source_items_except_event_kind(canonical, "external_record");
         scratch.source_watermark = scratch
             .source_watermark
             .max(canonical.source_high_watermark());
@@ -4960,7 +4964,23 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             self.adopt_canonical_source_rows(scratch, &canonical);
-            *canonical = scratch.manager.clone();
+            // Deferred external records never entered the scratch, so the
+            // wholesale copy-back below would silently drop them. Fold them
+            // into a throwaway copy of the scratch state instead: they stay
+            // out of this turn's prompts and surface to the next turn's
+            // TurnStart clone (UPCR-2026-042).
+            let has_external_rows = canonical.ledger_items().iter().any(|item| {
+                item.source_ref
+                    .as_ref()
+                    .is_some_and(|source| source.source_event_kind == "external_record")
+            });
+            *canonical = if has_external_rows {
+                let mut folded = scratch.manager.clone();
+                folded.adopt_source_items_with_event_kind(&canonical, "external_record");
+                folded
+            } else {
+                scratch.manager.clone()
+            };
             publish_appui_context_status(&self.session_id, &canonical);
             if let Err(error) =
                 persist_appui_context_snapshot(&self.data_dir, &self.session_id, &canonical)
@@ -5090,7 +5110,13 @@ fn merge_appui_out_of_band_row(
     seq: usize,
     source_event_kind: &str,
 ) {
-    let ids = manager.record_persisted_message_merging_prompt_equivalent(message, seq);
+    // An external record is not a turn boundary: unlike background rows it
+    // must never close the receiving ledger's open tool interactions.
+    let ids = if source_event_kind == "external_record" {
+        manager.record_external_message_merging_prompt_equivalent(message, seq)
+    } else {
+        manager.record_persisted_message_merging_prompt_equivalent(message, seq)
+    };
     manager.mark_source_event_kind(&ids, source_event_kind);
     debug!(
         session = %session_id.0,
@@ -31015,19 +31041,25 @@ async fn handle_session_append_message(
             },
             Ok((seq, false)) => {
                 // Idempotent retry hit — echo the EXISTING row's binding, not
-                // a freshly minted one.
+                // a freshly minted one. A found row with no binding (a system
+                // row is legitimately unbound) stays unbound: substituting
+                // this request's stamp would report a thread the durable row
+                // never had, so the fallback only covers a row that cannot be
+                // located at all.
                 let thread_id = match client_message_id.as_deref() {
-                    Some(cmid) => match sessions_guard.load(&params.session_id).await {
-                        Some(session) => session
-                            .messages
-                            .iter()
-                            .find(|row| row.client_message_id.as_deref() == Some(cmid))
-                            .and_then(|row| row.thread_id.clone()),
-                        None => None,
-                    },
-                    None => None,
-                }
-                .or(stamped_thread);
+                    Some(cmid) => sessions_guard
+                        .load(&params.session_id)
+                        .await
+                        .and_then(|session| {
+                            session
+                                .messages
+                                .iter()
+                                .find(|row| row.client_message_id.as_deref() == Some(cmid))
+                                .map(|row| row.thread_id.clone())
+                        })
+                        .unwrap_or(stamped_thread),
+                    None => stamped_thread,
+                };
                 AppendOutcome::RetryHit { seq, thread_id }
             }
             Err(error) => {
