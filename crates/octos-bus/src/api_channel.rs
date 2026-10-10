@@ -713,6 +713,36 @@ fn initial_sse_events(
     Ok(events)
 }
 
+/// The channel's HTTP surface as one Router — every route consults the
+/// armed token (#2751), so the auth contract lives at the route table
+/// rather than being re-derived per caller. `start()` serves this; tests
+/// drive it directly with `oneshot`.
+fn api_router(state: ApiState) -> Router {
+    Router::new()
+        .route("/metrics", get(handle_metrics))
+        .route("/chat", post(handle_chat))
+        .route("/sessions", get(handle_list_sessions))
+        .route("/sessions/{id}/messages", get(handle_session_messages))
+        .route(
+            "/sessions/{id}/events/stream",
+            get(handle_session_event_stream),
+        )
+        .route("/sessions/{id}/status", get(handle_session_status))
+        .route("/sessions/{id}/tasks", get(handle_session_tasks))
+        .route("/sessions/{id}", delete(handle_delete_session))
+        .route("/sessions/{id}/title", patch(handle_update_session_title))
+        // M7.9 / W2 — task supervisor exposure
+        .route("/tasks/{task_id}/cancel", post(handle_task_cancel))
+        .route(
+            "/tasks/{task_id}/restart-from-node",
+            post(handle_task_relaunch),
+        )
+        .route("/files/{*path}", get(handle_file_download))
+        .route("/upload", post(handle_upload))
+        .route("/admin/shell", post(handle_admin_shell))
+        .with_state(state)
+}
+
 #[async_trait]
 impl Channel for ApiChannel {
     fn name(&self) -> &str {
@@ -735,29 +765,7 @@ impl Channel for ApiChannel {
             event_seq: self.event_seq.clone(),
         };
 
-        let app = Router::new()
-            .route("/metrics", get(handle_metrics))
-            .route("/chat", post(handle_chat))
-            .route("/sessions", get(handle_list_sessions))
-            .route("/sessions/{id}/messages", get(handle_session_messages))
-            .route(
-                "/sessions/{id}/events/stream",
-                get(handle_session_event_stream),
-            )
-            .route("/sessions/{id}/status", get(handle_session_status))
-            .route("/sessions/{id}/tasks", get(handle_session_tasks))
-            .route("/sessions/{id}", delete(handle_delete_session))
-            .route("/sessions/{id}/title", patch(handle_update_session_title))
-            // M7.9 / W2 — task supervisor exposure
-            .route("/tasks/{task_id}/cancel", post(handle_task_cancel))
-            .route(
-                "/tasks/{task_id}/restart-from-node",
-                post(handle_task_relaunch),
-            )
-            .route("/files/{*path}", get(handle_file_download))
-            .route("/upload", post(handle_upload))
-            .route("/admin/shell", post(handle_admin_shell))
-            .with_state(state);
+        let app = api_router(state);
 
         let addr = format!("127.0.0.1:{}", self.port);
         info!(port = self.port, "API channel listening on {addr}");
@@ -1305,12 +1313,16 @@ impl Channel for ApiChannel {
     }
 }
 
-async fn handle_metrics(State(state): State<ApiState>) -> String {
+async fn handle_metrics(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
     state
         .metrics_renderer
         .as_ref()
         .map(|render| render())
         .unwrap_or_default()
+        .into_response()
 }
 
 impl ApiChannel {
@@ -1431,11 +1443,8 @@ async fn handle_chat(
     headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    // Validate auth token if configured
-    if let Some(ref expected) = state.auth_token {
-        if !bearer_token_matches(&headers, expected) {
-            return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
-        }
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
     }
 
     let session_id = req
@@ -1572,10 +1581,8 @@ async fn handle_session_event_stream(
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
-    if let Some(ref expected) = state.auth_token {
-        if !bearer_token_matches(&headers, expected) {
-            return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
-        }
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
     }
 
     let rx = {
@@ -2041,9 +2048,14 @@ async fn replay_committed_session_results(
 /// GET /sessions/:id/status — check if a session has an active task.
 async fn handle_session_status(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let active = {
         let pending = state.pending.lock().await;
         pending.contains_key(&id)
@@ -2068,9 +2080,14 @@ async fn handle_session_status(
 /// GET /sessions/:id/tasks — list background tasks for a session.
 async fn handle_session_tasks(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let Some(ref query_fn) = state.task_query else {
         return Json(serde_json::json!([])).into_response();
     };
@@ -2088,8 +2105,13 @@ async fn handle_session_tasks(
 /// status codes.
 async fn handle_task_cancel(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(task_id): axum::extract::Path<String>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let Some(ref cancel_fn) = state.task_cancel else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2138,9 +2160,14 @@ struct ApiRestartFromNodeRequest {
 /// `with_task_relaunch` callback. Body: `{ "node_id": Option<String> }`.
 async fn handle_task_relaunch(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(task_id): axum::extract::Path<String>,
     body: Option<Json<ApiRestartFromNodeRequest>>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let body = body.map(|Json(b)| b).unwrap_or_default();
     let Some(ref relaunch_fn) = state.task_relaunch else {
         return (
@@ -2187,7 +2214,11 @@ async fn handle_task_relaunch(
 /// generic `list_sessions` is O(N) over every JSONL on disk and was
 /// observed to hang 30s+ on a user dir with 65k+ child JSONLs (river /
 /// mini4) — see issue #607 §D.
-async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
+async fn handle_list_sessions(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let sess = state.sessions.lock().await;
     let mut seen = std::collections::HashSet::new();
     let list: Vec<SessionInfo> = sess
@@ -2213,9 +2244,14 @@ async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
 /// GET /sessions/:id/messages — get session message history.
 async fn handle_session_messages(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let limit = params.limit.min(500);
     let offset = params.offset.min(10_000);
     let fetch_count = match offset.checked_add(limit) {
@@ -2292,8 +2328,13 @@ async fn handle_session_messages(
 /// DELETE /sessions/:id — delete a session.
 async fn handle_delete_session(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let mut sess = state.sessions.lock().await;
     let mut deleted = false;
     for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
@@ -2329,9 +2370,14 @@ struct UpdateSessionTitleRequest {
 /// PATCH /sessions/:id/title — set a manual title.
 async fn handle_update_session_title(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<UpdateSessionTitleRequest>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let title = body.title.trim().to_string();
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title must not be empty").into_response();
@@ -2365,8 +2411,13 @@ async fn handle_update_session_title(
 /// GET /files/*path — download a file produced by write_file/send_file.
 async fn handle_file_download(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let data_dir = {
         let sess = state.sessions.lock().await;
         sess.data_dir()
@@ -2486,9 +2537,14 @@ fn effective_upload_tenant(
 /// preserving the previous behaviour.
 async fn handle_upload(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<UploadQuery>,
     mut multipart: axum::extract::Multipart,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let upload_root = std::env::temp_dir().join("octos-uploads");
     // #1377: stamp the upload with the OWNING tenant so the resolved handle
     // matches what the subsequent `/chat` filters against. When the client
@@ -2644,6 +2700,19 @@ fn bearer_token_matches(headers: &HeaderMap, expected: &str) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
+}
+
+/// The shared bearer gate for the channel's HTTP surface: when a token is
+/// armed (resolved once at start, #2736 chain), a request without a
+/// matching Bearer token is rejected with the generic body — every route,
+/// not just the chat surface (#2751). `None` = the caller may proceed;
+/// an unarmed channel stays open (tokenless dev/test deployments).
+fn unauthorized_without_bearer(state: &ApiState, headers: &HeaderMap) -> Option<Response> {
+    let expected = state.auth_token.as_ref()?;
+    if bearer_token_matches(headers, expected) {
+        return None;
+    }
+    Some((StatusCode::UNAUTHORIZED, "invalid auth token").into_response())
 }
 
 /// Auth-failure log for the admin shell — same hygiene as the router's
