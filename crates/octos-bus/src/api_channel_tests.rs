@@ -4500,3 +4500,131 @@ async fn chat_auth_gate_is_open_when_no_token_configured() {
         .unwrap();
     assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ------------------------------------------------------------------
+// #2751 — the gate covers the WHOLE route table, not just the chat
+// surface. The probe walks the real `api_router` — so a route added
+// without a probe row stays invisible to this walk: every new route
+// must add its handler gate AND a `SURFACE_PROBES` row below, or the
+// gap ships open. A missing gate on a probed route fails loudly here.
+// ------------------------------------------------------------------
+
+/// `(method, uri, content-type, body)` reaching every route's handler:
+/// one probe per row of the `api_router` table, kept in sync by hand.
+const SURFACE_PROBES: &[(&str, &str, &str, &str)] = &[
+    ("GET", "/metrics", "", ""),
+    ("POST", "/chat", "application/json", r#"{"message":"hi"}"#),
+    ("GET", "/sessions", "", ""),
+    ("GET", "/sessions/s1/messages", "", ""),
+    ("GET", "/sessions/s1/events/stream", "", ""),
+    ("GET", "/sessions/s1/status", "", ""),
+    ("GET", "/sessions/s1/tasks", "", ""),
+    ("DELETE", "/sessions/s1", "", ""),
+    (
+        "PATCH",
+        "/sessions/s1/title",
+        "application/json",
+        r#"{"title":"t"}"#,
+    ),
+    ("POST", "/tasks/t1/cancel", "", ""),
+    ("POST", "/tasks/t1/restart-from-node", "", ""),
+    ("GET", "/files/attachment.txt", "", ""),
+    (
+        "POST",
+        "/upload",
+        "multipart/form-data; boundary=octosprobe",
+        "",
+    ),
+    (
+        "POST",
+        "/admin/shell",
+        "application/json",
+        r#"{"command":""}"#,
+    ),
+];
+
+#[tokio::test]
+async fn every_route_sits_behind_the_bearer_gate_when_armed() {
+    let expected = "octos-surface-e2e-secret-token";
+    let app = api_router(ApiState {
+        inbound_tx: mpsc::channel(1).0,
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        watchers: Arc::new(Mutex::new(HashMap::new())),
+        auth_token: Some(expected.to_string()),
+        profile_id: Some(TEST_PROFILE_ID.to_string()),
+        sessions: test_sessions(),
+        task_query: None,
+        task_cancel: None,
+        task_relaunch: None,
+        on_session_deleted: None,
+        metrics_renderer: None,
+        event_seq: Arc::new(StdMutex::new(HashMap::new())),
+    });
+
+    async fn probe(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        ct: &str,
+        body: &str,
+        auth: Option<&str>,
+    ) -> StatusCode {
+        let mut request = Request::builder().method(method).uri(uri);
+        if !ct.is_empty() {
+            request = request.header("content-type", ct);
+        }
+        if let Some(token) = auth {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        response.status()
+    }
+
+    // Collect every open route instead of stopping at the first, so a
+    // regression reports the full exposed surface at once.
+    let mut open = Vec::new();
+    for (method, uri, ct, body) in SURFACE_PROBES {
+        if probe(&app, method, uri, ct, body, None).await != StatusCode::UNAUTHORIZED {
+            open.push(format!("{method} {uri}"));
+        }
+    }
+    assert!(
+        open.is_empty(),
+        "routes serving an unauthenticated caller despite an armed token: {}",
+        open.join(", ")
+    );
+
+    // The correct bearer passes the gate on the read routes.
+    assert_eq!(
+        probe(&app, "GET", "/sessions", "", "", Some(expected)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        probe(&app, "GET", "/metrics", "", "", Some(expected)).await,
+        StatusCode::OK
+    );
+
+    // Unarmed contrast: the same table stays open without a token.
+    let unarmed = api_router(ApiState {
+        inbound_tx: mpsc::channel(1).0,
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        watchers: Arc::new(Mutex::new(HashMap::new())),
+        auth_token: None,
+        profile_id: Some(TEST_PROFILE_ID.to_string()),
+        sessions: test_sessions(),
+        task_query: None,
+        task_cancel: None,
+        task_relaunch: None,
+        on_session_deleted: None,
+        metrics_renderer: None,
+        event_seq: Arc::new(StdMutex::new(HashMap::new())),
+    });
+    assert_eq!(
+        probe(&unarmed, "GET", "/sessions", "", "", None).await,
+        StatusCode::OK
+    );
+}
