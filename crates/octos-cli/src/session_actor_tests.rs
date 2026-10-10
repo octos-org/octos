@@ -88,6 +88,7 @@ fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     }
 }
 

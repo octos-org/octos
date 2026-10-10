@@ -606,6 +606,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         }
     }
 

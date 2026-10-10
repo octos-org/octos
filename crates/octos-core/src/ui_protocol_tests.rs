@@ -885,6 +885,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "approval/respond",
             "approval/scopes/list",
             "session/btw",
+            "session/append_message",
             "user_question/respond",
             "permission/profile/list",
             "permission/profile/set",
@@ -1022,6 +1023,7 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "approval/respond",
             "approval/scopes/list",
             "session/btw",
+            "session/append_message",
             "user_question/respond",
             "permission/profile/list",
             "permission/profile/set",
@@ -1117,6 +1119,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "approval/respond",
                 "approval/scopes/list",
                 "session/btw",
+                "session/append_message",
                 "user_question/respond",
                 "permission/profile/list",
                 "permission/profile/set",
@@ -4855,6 +4858,58 @@ fn upcr_009_010_011_command_methods_round_trip_through_rpc_envelope() {
     assert_eq!(rpc.method, methods::TURN_STATE_GET);
     let decoded = UiCommand::from_rpc_request(rpc).expect("decode state");
     assert_eq!(decoded, state);
+}
+
+#[test]
+fn upcr_042_append_message_round_trips_through_rpc_envelope() {
+    let append = UiCommand::SessionAppendMessage(SessionAppendMessageParams {
+        session_id: sample_session_id(),
+        role: "assistant".to_owned(),
+        content: "The capital is Kyoto.".to_owned(),
+        media: vec!["uploads/map.png".to_owned()],
+        source: "external_record:whiteboard".to_owned(),
+        client_message_id: Some("cmid-1".to_owned()),
+        thread_id: Some("cmid-0".to_owned()),
+    });
+    let rpc = append
+        .clone()
+        .into_rpc_request("req-41")
+        .expect("serialize append_message");
+    assert_eq!(rpc.method, methods::SESSION_APPEND_MESSAGE);
+    let decoded = UiCommand::from_rpc_request(rpc).expect("decode append_message");
+    assert_eq!(decoded, append);
+
+    // Optional fields stay absent on the wire when unset (a system record
+    // carries neither correlation nor thread binding).
+    let bare = SessionAppendMessageParams {
+        session_id: sample_session_id(),
+        role: "system".to_owned(),
+        content: "session archived by importer".to_owned(),
+        media: vec![],
+        source: "external_record:import".to_owned(),
+        client_message_id: None,
+        thread_id: None,
+    };
+    let json = serde_json::to_value(&bare).expect("params json");
+    assert!(json.get("client_message_id").is_none());
+    assert!(json.get("thread_id").is_none());
+    assert!(
+        !json
+            .get("media")
+            .map(|m| !m.as_array().unwrap().is_empty())
+            .unwrap_or(false)
+    );
+
+    // Result DTO round-trip.
+    let result = SessionAppendMessageResult {
+        session_id: sample_session_id(),
+        seq: 7,
+        thread_id: Some("cmid-0".to_owned()),
+    };
+    let parsed: SessionAppendMessageResult =
+        serde_json::from_value(serde_json::to_value(&result).expect("result json"))
+            .expect("result round trip");
+    assert_eq!(parsed, result);
 }
 
 // ===== M12 Phase D-1 auxiliary REST → WS frames =====

@@ -41,21 +41,23 @@ use octos_core::ui_protocol::{
     MemoryEntityParams, MemoryIngestParams, MemoryLoadParams, MemoryOverviewParams,
     MemorySearchParams, MessageDeltaEvent, MessageMeta, OutputCursor, PayloadV2, PeerClosedEvent,
     PeerStagedEvent, ReplayLossyEvent, RpcError, RpcErrorResponse, RpcRequest, RpcResponse,
+    SESSION_APPEND_MESSAGE_MAX_CONTENT_CHARS, SESSION_APPEND_MESSAGE_MAX_SOURCE_CHARS,
     SESSION_HYDRATE_INCLUDE_MAX, SESSION_MESSAGES_PAGE_DEFAULT_LIMIT,
     SESSION_MESSAGES_PAGE_MAX_LIMIT, SESSION_MESSAGES_PAGE_MAX_OFFSET, SESSION_TITLE_SET_MAX_CHARS,
-    SessionBtwParams, SessionDeleteParams, SessionFilesListParams, SessionHydrateParams,
-    SessionHydrateResult, SessionListParams, SessionMessagesPageParams, SessionOpenParams,
-    SessionOpenResult, SessionOpened, SessionOrchestrationEvent, SessionRollbackParams,
-    SessionRollbackResult, SessionSnapshotParams, SessionStatusGetParams, SessionTasksListParams,
-    SessionTitleSetParams, SessionWorkspaceGetParams, SkillActionJobUpdatedEvent,
-    SystemStatusGetParams, TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams,
-    TaskArtifactReadResult, TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry,
-    TaskListParams, TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams,
-    TaskRestartFromNodeResult, TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent,
-    ThreadGraphEntry, ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent,
-    ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent,
-    TurnErrorPartialResult, TurnId, TurnInterruptParams, TurnInterruptResult, TurnLifecycleState,
-    TurnSessionResult, TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
+    SessionAppendMessageParams, SessionAppendMessageResult, SessionBtwParams, SessionDeleteParams,
+    SessionFilesListParams, SessionHydrateParams, SessionHydrateResult, SessionListParams,
+    SessionMessagesPageParams, SessionOpenParams, SessionOpenResult, SessionOpened,
+    SessionOrchestrationEvent, SessionRollbackParams, SessionRollbackResult, SessionSnapshotParams,
+    SessionStatusGetParams, SessionTasksListParams, SessionTitleSetParams,
+    SessionWorkspaceGetParams, SkillActionJobUpdatedEvent, SystemStatusGetParams,
+    TaskArtifactListParams, TaskArtifactListResult, TaskArtifactReadParams, TaskArtifactReadResult,
+    TaskArtifactRecord, TaskCancelParams, TaskCancelResult, TaskListEntry, TaskListParams,
+    TaskListResult, TaskOutputDeltaEvent, TaskRestartFromNodeParams, TaskRestartFromNodeResult,
+    TaskRuntimeState as UiTaskRuntimeState, TaskUpdatedEvent, ThreadGraphEntry,
+    ThreadGraphGetParams, ThreadGraphGetResult, ToolCompletedEvent, ToolProgressEvent,
+    ToolStartedEvent, TurnCompletedEvent, TurnErrorEvent, TurnErrorPartialResult, TurnId,
+    TurnInterruptParams, TurnInterruptResult, TurnLifecycleState, TurnSessionResult,
+    TurnStartParams, TurnStateGetParams, TurnStateGetResult, TurnTerminalError,
     TurnTerminalOutcome, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1, UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
@@ -5081,14 +5083,15 @@ fn record_appui_context_manager_message(
     }
 }
 
-fn merge_appui_background_row(
+fn merge_appui_out_of_band_row(
     manager: &mut ContextManager,
     session_id: &SessionKey,
     message: &Message,
     seq: usize,
+    source_event_kind: &str,
 ) {
     let ids = manager.record_persisted_message_merging_prompt_equivalent(message, seq);
-    manager.mark_source_event_kind(&ids, "background_result");
+    manager.mark_source_event_kind(&ids, source_event_kind);
     debug!(
         session = %session_id.0,
         seq,
@@ -5106,7 +5109,7 @@ fn record_appui_context_manager_background_message(
 ) {
     if let Some(live) = live_appui_session_context_manager(session_id) {
         let mut manager = live.lock().unwrap_or_else(|error| error.into_inner());
-        merge_appui_background_row(&mut manager, session_id, message, seq);
+        merge_appui_out_of_band_row(&mut manager, session_id, message, seq, "background_result");
         publish_appui_context_status(session_id, &manager);
         if let Err(error) = persist_appui_context_snapshot(data_dir, session_id, &manager) {
             warn!(
@@ -5125,7 +5128,13 @@ fn record_appui_context_manager_background_message(
             .unwrap_or_else(|error| error.into_inner());
         match load_context_manager_snapshot(data_dir, &session_id.to_string()) {
             Ok(Some(mut manager)) => {
-                merge_appui_background_row(&mut manager, session_id, message, seq);
+                merge_appui_out_of_band_row(
+                    &mut manager,
+                    session_id,
+                    message,
+                    seq,
+                    "background_result",
+                );
                 publish_appui_context_status(session_id, &manager);
                 if let Err(error) =
                     persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
@@ -5152,7 +5161,7 @@ fn record_appui_context_manager_background_message(
     let mut manager = fallback_context_manager
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    merge_appui_background_row(&mut manager, session_id, message, seq);
+    merge_appui_out_of_band_row(&mut manager, session_id, message, seq, "background_result");
     publish_appui_context_status(session_id, &manager);
     if let Err(error) = persist_appui_context_snapshot(data_dir, session_id, &manager) {
         warn!(
@@ -5160,6 +5169,61 @@ fn record_appui_context_manager_background_message(
             error = %error,
             "failed to persist appui background context boundary"
         );
+    }
+}
+
+/// Record an out-of-band `session/append_message` row (UPCR-2026-042) into
+/// the session's AppUI context view, tagged `external_record`. Mirrors the
+/// background-row recording path (live manager first, durable snapshot
+/// otherwise) minus the per-turn fallback: a session with neither a live
+/// manager nor a snapshot has nothing to keep in sync — its next bootstrap
+/// reads the durable transcript, which already contains the row.
+fn record_appui_context_manager_external_record(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    message: &Message,
+    seq: usize,
+) {
+    if let Some(live) = live_appui_session_context_manager(session_id) {
+        let mut manager = live.lock().unwrap_or_else(|error| error.into_inner());
+        merge_appui_out_of_band_row(&mut manager, session_id, message, seq, "external_record");
+        publish_appui_context_status(session_id, &manager);
+        if let Err(error) = persist_appui_context_snapshot(data_dir, session_id, &manager) {
+            warn!(
+                session = %session_id.0,
+                error = %error,
+                "failed to persist appui external-record context boundary"
+            );
+        }
+        return;
+    }
+
+    let persist_lock = appui_context_persist_lock(session_id);
+    let _persist_guard = persist_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    match load_context_manager_snapshot(data_dir, &session_id.to_string()) {
+        Ok(Some(mut manager)) => {
+            merge_appui_out_of_band_row(&mut manager, session_id, message, seq, "external_record");
+            publish_appui_context_status(session_id, &manager);
+            if let Err(error) =
+                persist_context_manager_snapshot(data_dir, &session_id.to_string(), &manager)
+            {
+                warn!(
+                    session = %session_id.0,
+                    error = %error,
+                    "failed to persist appui external-record context snapshot"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!(
+                session = %session_id.0,
+                error = %error,
+                "context ledger snapshot unreadable; external record stays transcript-only"
+            );
+        }
     }
 }
 
@@ -7846,6 +7910,17 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::SessionAppendMessage(params) => {
+                handle_session_append_message(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    routed_profile_id,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::SessionFork(params) => {
                 handle_session_fork(
                     &ws,
@@ -8816,6 +8891,17 @@ where
                         &state,
                         &ledger,
                         &active_turns,
+                        connection_profile_id_owned.as_deref(),
+                        None,
+                        id,
+                        params,
+                    )
+                    .await;
+                }
+                UiCommand::SessionAppendMessage(params) => {
+                    handle_session_append_message(
+                        &ws,
+                        &state,
                         connection_profile_id_owned.as_deref(),
                         None,
                         id,
@@ -14520,6 +14606,7 @@ async fn raw_profile_llm_test(
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     }];
     let canonical_family = octos_llm::registry::lookup(&family_id)
         .map(|entry| entry.name)
@@ -22025,6 +22112,7 @@ fn validate_session_ingress_command_scope(
         UiCommand::TaskArtifactRead(params) => params.session_id.clone(),
         UiCommand::SessionHydrate(params) => params.session_id.clone(),
         UiCommand::SessionRollback(params) => params.session_id.clone(),
+        UiCommand::SessionAppendMessage(params) => params.session_id.clone(),
         UiCommand::ThreadGraphGet(params) => params.session_id.clone(),
         UiCommand::TurnStateGet(params) => params.session_id.clone(),
         UiCommand::SessionBtw(params) => {
@@ -28540,6 +28628,9 @@ const HOST_PEER_SESSION_WRITE_METHODS: &[&str] = &[
     "turn/steer",
     "turn/interrupt",
     "session/rollback",
+    // UPCR-2026-042: a record-only append still lands in the peer's next
+    // turn's prompt — the same injection surface as the writes above.
+    "session/append_message",
     "session/goal/set",
     "session/goal/clear",
     "session/goal/operator_transition",
@@ -30747,6 +30838,294 @@ async fn handle_session_fork(
     send_serialized_rpc_result(ws, id, method, result);
 }
 
+/// UPCR-2026-042 `session/append_message` — record-only history write.
+///
+/// Appends one row through the canonical persist path
+/// (`add_message_once_with_seq`) without starting a turn, calling a model,
+/// or running a tool. Validation is typed: role/content/source/media rules
+/// and the thread-binding matrix (assistant rows bind to an explicit or
+/// most-recent-user thread and are REFUSED, not silently minted, when the
+/// session has no user row; user rows root their own thread; system rows are
+/// not thread-scoped).
+async fn handle_session_append_message(
+    ws: &WsConnection,
+    state: &Arc<AppState>,
+    connection_profile_id: Option<&str>,
+    routed_profile_id: Option<&str>,
+    id: String,
+    params: SessionAppendMessageParams,
+) {
+    let method = octos_core::ui_protocol::methods::SESSION_APPEND_MESSAGE;
+    if let Err(error) = validate_session_scope(&params.session_id, None, connection_profile_id) {
+        send_scope_error(ws, id, error);
+        return;
+    }
+    // An empty key would otherwise be auto-created as a session — append is
+    // the one history mutator that creates implicitly, so it must refuse the
+    // unaddressable form explicitly.
+    if params.session_id.0.trim().is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: session_id must not be empty"))
+                .with_data(json!({ "kind": "invalid_session_id" })),
+        );
+        return;
+    }
+
+    let role = match params.role.as_str() {
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        "system" => MessageRole::System,
+        other => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: role must be \"user\", \"assistant\", or \"system\", got '{other}'"
+                ))
+                .with_data(json!({ "kind": "invalid_role" })),
+            );
+            return;
+        }
+    };
+    if params.content.trim().is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: content must not be blank"))
+                .with_data(json!({ "kind": "invalid_content" })),
+        );
+        return;
+    }
+    if params.content.chars().count() > SESSION_APPEND_MESSAGE_MAX_CONTENT_CHARS {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: content must be at most {SESSION_APPEND_MESSAGE_MAX_CONTENT_CHARS} chars"
+            ))
+            .with_data(json!({ "kind": "invalid_content" })),
+        );
+        return;
+    }
+    let source = params.source.trim();
+    if source.is_empty() {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: source must not be empty"))
+                .with_data(json!({ "kind": "invalid_source" })),
+        );
+        return;
+    }
+    if source.chars().count() > SESSION_APPEND_MESSAGE_MAX_SOURCE_CHARS {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: source must be at most {SESSION_APPEND_MESSAGE_MAX_SOURCE_CHARS} chars"
+            ))
+            .with_data(json!({ "kind": "invalid_source" })),
+        );
+        return;
+    }
+    if params.media.iter().any(|entry| entry.trim().is_empty()) {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!("{method}: media entries must not be empty"))
+                .with_data(json!({ "kind": "invalid_media" })),
+        );
+        return;
+    }
+    let client_message_id = params
+        .client_message_id
+        .as_deref()
+        .filter(|cmid| !cmid.is_empty())
+        .map(str::to_owned);
+    let requested_thread_id = params
+        .thread_id
+        .as_deref()
+        .filter(|thread| !thread.is_empty())
+        .map(str::to_owned);
+    if requested_thread_id.is_some() && role != MessageRole::Assistant {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            RpcError::invalid_params(format!(
+                "{method}: thread_id is only valid with role \"assistant\""
+            ))
+            .with_data(json!({ "kind": "invalid_thread_id" })),
+        );
+        return;
+    }
+
+    let message = Message {
+        role,
+        content: params.content,
+        media: params.media,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+        client_message_id: client_message_id.clone(),
+        thread_id: None,
+        source: Some(source.to_owned()),
+        timestamp: Utc::now(),
+    };
+    // Thread binding is resolved BEFORE the write so the echoed value always
+    // describes the durable row: user rows root their own thread (their
+    // cmid, else a synthesized UUIDv7 — exactly what the canonical
+    // derivation would produce), assistant rows take the explicit binding or
+    // derive from the most recent user row below, system rows stay unbound.
+    let stamped_thread = match role {
+        MessageRole::User => Some(
+            client_message_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        ),
+        MessageRole::Assistant => requested_thread_id.clone(),
+        MessageRole::System => None,
+        MessageRole::Tool => unreachable!("tool role rejected above"),
+    };
+
+    let Some(sessions) = resolve_sessions_for_lookup(
+        state,
+        connection_profile_id,
+        routed_profile_id,
+        &params.session_id,
+    )
+    .await
+    else {
+        let _ = send_rpc_error(
+            ws,
+            Some(id),
+            runtime_unavailable_error("Sessions not available"),
+        );
+        return;
+    };
+
+    enum AppendOutcome {
+        Committed {
+            seq: usize,
+            thread_id: Option<String>,
+            // Boxed so the small RetryHit variant does not stretch this enum
+            // past the large-variant-difference lint (Message alone is ~264B).
+            message: Box<Message>,
+            data_dir: std::path::PathBuf,
+        },
+        RetryHit {
+            seq: usize,
+            thread_id: Option<String>,
+        },
+    }
+
+    let outcome = {
+        let mut sessions_guard = sessions.lock().await;
+        let mut message = message;
+        let mut stamped_thread = stamped_thread;
+        if role == MessageRole::Assistant && stamped_thread.is_none() {
+            // Linear-history fallback, mirroring `persist_assistant_message`:
+            // bind to the most recent user row's thread. A public wire
+            // surface must not silently mint threads, so a session with no
+            // user row is a typed refusal, not a synthesized binding.
+            let derived = sessions_guard
+                .load(&params.session_id)
+                .await
+                .and_then(|session| {
+                    session
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|row| matches!(row.role, MessageRole::User))
+                        .and_then(|user| {
+                            user.thread_id
+                                .clone()
+                                .or_else(|| user.client_message_id.clone())
+                        })
+                })
+                .filter(|thread| !thread.is_empty());
+            let Some(thread) = derived else {
+                drop(sessions_guard);
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::invalid_params(format!(
+                        "{method}: assistant records need thread_id when the session has no user row"
+                    ))
+                    .with_data(json!({ "kind": "unbound_thread" })),
+                );
+                return;
+            };
+            stamped_thread = Some(thread);
+        }
+        message.thread_id = stamped_thread.clone();
+
+        let data_dir = sessions_guard.data_dir().to_path_buf();
+        match sessions_guard
+            .add_message_once_with_seq(&params.session_id, message.clone())
+            .await
+        {
+            Ok((seq, true)) => AppendOutcome::Committed {
+                seq,
+                thread_id: stamped_thread,
+                message: Box::new(message),
+                data_dir,
+            },
+            Ok((seq, false)) => {
+                // Idempotent retry hit — echo the EXISTING row's binding, not
+                // a freshly minted one.
+                let thread_id = match client_message_id.as_deref() {
+                    Some(cmid) => match sessions_guard.load(&params.session_id).await {
+                        Some(session) => session
+                            .messages
+                            .iter()
+                            .find(|row| row.client_message_id.as_deref() == Some(cmid))
+                            .and_then(|row| row.thread_id.clone()),
+                        None => None,
+                    },
+                    None => None,
+                }
+                .or(stamped_thread);
+                AppendOutcome::RetryHit { seq, thread_id }
+            }
+            Err(error) => {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::internal_error(format!("{method}: persist failed: {error}")),
+                );
+                return;
+            }
+        }
+    };
+
+    if let AppendOutcome::Committed {
+        seq,
+        message,
+        data_dir,
+        ..
+    } = &outcome
+    {
+        record_appui_context_manager_external_record(data_dir, &params.session_id, message, *seq);
+    }
+
+    let (seq, thread_id) = match outcome {
+        AppendOutcome::Committed { seq, thread_id, .. } => (seq, thread_id),
+        AppendOutcome::RetryHit { seq, thread_id } => (seq, thread_id),
+    };
+    send_serialized_rpc_result(
+        ws,
+        id,
+        method,
+        SessionAppendMessageResult {
+            session_id: params.session_id,
+            seq: seq as u64,
+            thread_id,
+        },
+    );
+}
+
 /// Per UPCR-2026-010: lift the in-memory thread partition onto the wire.
 // Connection state, ledger, turn registry, and the caller's profile scope
 // arrive as separate per-request pieces — a flat dependency list.
@@ -31206,6 +31585,7 @@ fn build_btw_messages(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         },
         Message {
             role: MessageRole::User,
@@ -31217,6 +31597,7 @@ fn build_btw_messages(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         },
     ]
 }
@@ -37147,6 +37528,7 @@ async fn model_join_review_summary(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         },
         Message {
             role: MessageRole::User,
@@ -37158,6 +37540,7 @@ async fn model_join_review_summary(
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         },
     ];
     let config = review_join_chat_config();

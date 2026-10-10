@@ -1154,6 +1154,7 @@ pub async fn session_messages(
                         timestamp: m.timestamp.to_rfc3339(),
                         media: m.media.clone(),
                         thread_id: m.thread_id.clone(),
+                        source: m.source.clone(),
                     })
                     .collect();
                 // Keep the historical contract: a page that is past the
@@ -1207,6 +1208,11 @@ pub struct MessageInfo {
     /// field continue to round-trip cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// Provenance tag from the persisted row (UPCR-2026-042). Present only on
+    /// out-of-band records (`session/append_message`); turn-written rows
+    /// omit it so legacy clients keep round-tripping cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 // Helper for `ui_protocol_transport::handle_session_status_get` (M12 Phase D-5).
@@ -2559,6 +2565,7 @@ async fn read_profile_session_messages(
                 timestamp: m.timestamp.to_rfc3339(),
                 media: m.media.clone(),
                 thread_id: m.thread_id.clone(),
+                source: m.source.clone(),
             })
             .collect();
         return Some(messages);
@@ -4594,6 +4601,7 @@ mod tests {
             timestamp: "2025-01-01T00:00:00Z".into(),
             media: Vec::new(),
             thread_id: None,
+            source: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["role"], "user");
@@ -4616,6 +4624,7 @@ mod tests {
             timestamp: "2026-04-26T00:00:00Z".into(),
             media: Vec::new(),
             thread_id: Some("thread-cmid-1".into()),
+            source: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["thread_id"], "thread-cmid-1");

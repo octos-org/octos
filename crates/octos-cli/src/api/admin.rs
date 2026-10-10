@@ -1151,6 +1151,7 @@ pub async fn test_provider(
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     }];
     // Gemini 2.5+ "thinking" models consume tokens on internal reasoning,
     // so 16 tokens is too small — they return empty content.  Use 128 for

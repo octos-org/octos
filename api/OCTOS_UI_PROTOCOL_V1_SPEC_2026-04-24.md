@@ -434,6 +434,8 @@ Session, turn, and approval core:
   re-projects the trimmed thread exactly like `session/hydrate`; #1516)
 - `session/fork` (branch a session into a new one with copied history; #1613)
 - `session/btw` (quick aside question answered while the current turn runs; #1609)
+- `session/append_message` (record-only history write: appends one row without starting
+  a turn, accepted `UPCR-2026-042`)
 - `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command)
 - `session/compact/mode/set` (per-session LLM-vs-heuristic compaction mode; the `/context` menu)
 - `turn/start`

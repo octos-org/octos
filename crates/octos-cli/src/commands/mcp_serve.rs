@@ -664,6 +664,7 @@ impl McpSessionDispatch for RealSessionDispatch {
                         client_message_id: None,
                         thread_id: None,
                         timestamp: chrono::Utc::now(),
+                        source: None,
                     }],
                     ..Default::default()
                 },

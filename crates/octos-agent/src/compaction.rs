@@ -910,6 +910,7 @@ impl CompactionRunner {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: Utc::now(),
+                source: None,
             },
         );
         outcome.performed = true;
@@ -1782,6 +1783,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         }
     }
 
@@ -1796,6 +1798,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         }
     }
 
@@ -1815,6 +1818,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         }
     }
 
@@ -1829,6 +1833,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         }
     }
 
@@ -1843,6 +1848,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         }
     }
 
@@ -1952,6 +1958,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         }];
 
         let summary = compact_messages(&messages, 10000);
@@ -2045,6 +2052,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         };
         let summary = summarize_message(&msg, &[]);
         assert!(summary.contains("[media omitted]"));
