@@ -567,13 +567,16 @@ async fn handle_webhook(
         return axum::Json(serde_json::json!({"challenge": challenge})).into_response();
     }
 
-    // Verification token check (for non-encrypted plaintext events)
+    // Verification token check (for non-encrypted plaintext events, and
+    // decrypted encrypted events). An armed channel refuses a missing or
+    // empty token exactly like a wrong one (#2756) — absent must not mean
+    // verified.
     if let Some(ref vt) = state.verification_token {
         let event_token = event_json
             .get("token")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if !event_token.is_empty() && !constant_time_eq(event_token.as_bytes(), vt.as_bytes()) {
+        if event_token.is_empty() || !constant_time_eq(event_token.as_bytes(), vt.as_bytes()) {
             warn!("Feishu webhook: verification token mismatch");
             return (
                 axum::http::StatusCode::FORBIDDEN,
@@ -2230,6 +2233,65 @@ mod tests {
 
         let status = call_handle_webhook(state, build_headers(&[]), body).await;
         assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(rx.try_recv().is_ok(), "unarmed channel should forward");
+    }
+
+    /// Mount the same one-route Router `start_webhook` serves and drive it
+    /// over a real TCP socket, so the status codes above are observed the
+    /// way Lark's push observes them (real HTTP framing, axum extractors,
+    /// handler, inbound forwarding).
+    async fn spawn_webhook_router(
+        verification_token: Option<&str>,
+    ) -> (std::net::SocketAddr, mpsc::Receiver<serde_json::Value>) {
+        let (tx, rx) = mpsc::channel::<serde_json::Value>(8);
+        let state = WebhookState {
+            encrypt_key: None,
+            verification_token: verification_token.map(String::from),
+            inbound_tx: tx,
+        };
+        let app = axum::Router::new()
+            .route("/webhook/event", axum::routing::post(handle_webhook))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        (addr, rx)
+    }
+
+    async fn post_webhook_event(addr: std::net::SocketAddr, body: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "POST /webhook/event HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let head = String::from_utf8_lossy(&response);
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in response: {head}"))
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_http_path_enforces_armed_token_over_real_tcp() {
+        let event_without_token = r#"{"type":"event_callback","event":{}}"#;
+
+        // Armed channel: the credential-less push is refused on the wire and
+        // nothing reaches the inbound bus (#2756's fail-open, before/after).
+        let (addr, mut rx) = spawn_webhook_router(Some("octos-vt-secret")).await;
+        assert_eq!(post_webhook_event(addr, event_without_token).await, 403);
+        assert!(rx.try_recv().is_err(), "refused push must not forward");
+        let signed = r#"{"type":"event_callback","token":"octos-vt-secret","event":{}}"#;
+        assert_eq!(post_webhook_event(addr, signed).await, 200);
+        assert!(rx.try_recv().is_ok(), "verified push should forward");
+
+        // Unarmed channel: the passthrough contract is unchanged.
+        let (addr, mut rx) = spawn_webhook_router(None).await;
+        assert_eq!(post_webhook_event(addr, event_without_token).await, 200);
         assert!(rx.try_recv().is_ok(), "unarmed channel should forward");
     }
 }
