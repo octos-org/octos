@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use eyre::{Result, WrapErr};
 use futures::StreamExt;
-use octos_core::{InboundMessage, OutboundMessage};
+use octos_core::{InboundMessage, OutboundMessage, constant_time_eq};
 use reqwest::Client;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -573,7 +573,7 @@ async fn handle_webhook(
             .get("token")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if !event_token.is_empty() && event_token != vt {
+        if !event_token.is_empty() && !constant_time_eq(event_token.as_bytes(), vt.as_bytes()) {
             warn!("Feishu webhook: verification token mismatch");
             return (
                 axum::http::StatusCode::FORBIDDEN,
@@ -2141,5 +2141,59 @@ mod tests {
             axum::http::StatusCode::UNAUTHORIZED,
             "mismatched signature must be rejected"
         );
+    }
+
+    // ---- Verification token check regression tests (#2751) ----
+    //
+    // The plaintext-event token compare now goes through the canonical
+    // constant-time helper; these pin the behavioral contract it must
+    // keep: a non-empty wrong token is refused, a correct token and a
+    // missing/empty token still forward (the pre-existing acceptance).
+
+    fn webhook_state_with_verification_token(
+    ) -> (WebhookState, mpsc::Receiver<serde_json::Value>) {
+        let (tx, rx) = mpsc::channel::<serde_json::Value>(8);
+        let state = WebhookState {
+            encrypt_key: None,
+            verification_token: Some("octos-vt-secret".to_string()),
+            inbound_tx: tx,
+        };
+        (state, rx)
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_wrong_verification_token_is_rejected() {
+        let (state, mut rx) = webhook_state_with_verification_token();
+        let body = r#"{"type":"event_callback","token":"forged","event":{}}"#;
+
+        let status = call_handle_webhook(state, build_headers(&[]), body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "a non-empty wrong verification token must be refused"
+        );
+        assert!(rx.try_recv().is_err(), "refused event must not forward");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_correct_verification_token_forwards() {
+        let (state, mut rx) = webhook_state_with_verification_token();
+        let body = r#"{"type":"event_callback","token":"octos-vt-secret","event":{}}"#;
+
+        let status = call_handle_webhook(state, build_headers(&[]), body).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(rx.try_recv().is_ok(), "verified event should forward");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_without_event_token_still_forwards() {
+        let (state, mut rx) = webhook_state_with_verification_token();
+        // Pre-existing acceptance: a plaintext event with no token field
+        // is forwarded (older event shapes / url_verification probes).
+        let body = r#"{"type":"event_callback","event":{}}"#;
+
+        let status = call_handle_webhook(state, build_headers(&[]), body).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(rx.try_recv().is_ok(), "tokenless event should forward");
     }
 }

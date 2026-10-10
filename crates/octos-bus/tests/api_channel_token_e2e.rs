@@ -109,6 +109,54 @@ async fn stream_status(base: &str, auth: Option<&str>) -> reqwest::StatusCode {
     request.send().await.unwrap().status()
 }
 
+/// One probe against the real server: `(method, path, content-type, body)`.
+async fn probe(
+    base: &str,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &str,
+    auth: Option<&str>,
+) -> reqwest::StatusCode {
+    let client = reqwest::Client::new();
+    let method: reqwest::Method = method.parse().unwrap();
+    let mut request = client.request(method, format!("{base}{path}"));
+    if !content_type.is_empty() {
+        request = request.header("content-type", content_type);
+    }
+    if let Some(token) = auth {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    request.send().await.unwrap().status()
+}
+
+/// Every route on the session surface except /chat, the SSE stream, and
+/// the admin shell (those three carry their own e2e probes). One row per
+/// route of the real router table.
+const SESSION_SURFACE: &[(&str, &str, &str, &str)] = &[
+    ("GET", "/metrics", "", ""),
+    ("GET", "/sessions", "", ""),
+    ("GET", "/sessions/web-e2e/messages", "", ""),
+    ("GET", "/sessions/web-e2e/status", "", ""),
+    ("GET", "/sessions/web-e2e/tasks", "", ""),
+    ("DELETE", "/sessions/web-e2e", "", ""),
+    (
+        "PATCH",
+        "/sessions/web-e2e/title",
+        "application/json",
+        r#"{"title":"t"}"#,
+    ),
+    ("POST", "/tasks/t1/cancel", "", ""),
+    ("POST", "/tasks/t1/restart-from-node", "", ""),
+    ("GET", "/files/attachment.txt", "", ""),
+    (
+        "POST",
+        "/upload",
+        "multipart/form-data; boundary=octose2eprobe",
+        "",
+    ),
+];
+
 fn isolated_data_dir(tmp: &std::path::Path) -> std::path::PathBuf {
     let data_dir = tmp.join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -262,4 +310,70 @@ async fn unarmed_channel_stays_open() {
     let (status, _) = post_chat(&base, None).await;
     assert_ne!(status, reqwest::StatusCode::UNAUTHORIZED);
     assert_eq!(stream_status(&base, None).await, reqwest::StatusCode::OK);
+    // #2751: the rest of the surface shares the property.
+    assert_eq!(
+        probe(&base, "GET", "/sessions", "", "", None).await,
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        probe(&base, "GET", "/metrics", "", "", None).await,
+        reqwest::StatusCode::OK
+    );
+}
+
+/// #2751: with the env token armed, the WHOLE session surface refuses
+/// unauthenticated callers over real TCP — not just /chat and the SSE
+/// stream — while the correct token passes the gate.
+#[tokio::test]
+async fn env_token_arms_the_whole_session_surface() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = isolated_data_dir(tmp.path());
+    let _env = EnvGuard::pivot(&[
+        (
+            "OCTOS_AUTH_TOKEN",
+            Some(OsStr::new("octos-surface-secret-token")),
+        ),
+        ("OCTOS_DATA_DIR", Some(data_dir.as_os_str())),
+        ("HOME", Some(tmp.path().as_os_str())),
+    ]);
+
+    let base = spawn_server(&data_dir, None).await;
+    let expected = "octos-surface-secret-token";
+
+    let mut still_open = Vec::new();
+    for (method, path, content_type, body) in SESSION_SURFACE {
+        if probe(&base, method, path, content_type, body, None).await
+            != reqwest::StatusCode::UNAUTHORIZED
+        {
+            still_open.push(format!("{method} {path}"));
+        }
+    }
+    assert!(
+        still_open.is_empty(),
+        "surface routes reachable without a token on an armed deployment: {}",
+        still_open.join(", ")
+    );
+
+    // The correct token passes the gate: exact 200 on the read routes,
+    // a clean idempotent delete, and no 401 anywhere else.
+    assert_eq!(
+        probe(&base, "GET", "/sessions", "", "", Some(expected)).await,
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        probe(&base, "GET", "/metrics", "", "", Some(expected)).await,
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        probe(&base, "DELETE", "/sessions/web-e2e", "", "", Some(expected)).await,
+        reqwest::StatusCode::NO_CONTENT
+    );
+    for (method, path, content_type, body) in SESSION_SURFACE {
+        let status = probe(&base, method, path, content_type, body, Some(expected)).await;
+        assert_ne!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{method} {path} must accept the configured token"
+        );
+    }
 }
