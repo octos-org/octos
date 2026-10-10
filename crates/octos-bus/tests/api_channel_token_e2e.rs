@@ -124,6 +124,9 @@ async fn probe(
     if !content_type.is_empty() {
         request = request.header("content-type", content_type);
     }
+    if !body.is_empty() {
+        request = request.body(body.to_string());
+    }
     if let Some(token) = auth {
         request = request.header("authorization", format!("Bearer {token}"));
     }

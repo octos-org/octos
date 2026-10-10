@@ -2150,8 +2150,8 @@ mod tests {
     // keep: a non-empty wrong token is refused, a correct token and a
     // missing/empty token still forward (the pre-existing acceptance).
 
-    fn webhook_state_with_verification_token(
-    ) -> (WebhookState, mpsc::Receiver<serde_json::Value>) {
+    fn webhook_state_with_verification_token() -> (WebhookState, mpsc::Receiver<serde_json::Value>)
+    {
         let (tx, rx) = mpsc::channel::<serde_json::Value>(8);
         let state = WebhookState {
             encrypt_key: None,

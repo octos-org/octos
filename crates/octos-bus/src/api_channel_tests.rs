@@ -4518,7 +4518,12 @@ const SURFACE_PROBES: &[(&str, &str, &str, &str)] = &[
     ("GET", "/sessions/s1/status", "", ""),
     ("GET", "/sessions/s1/tasks", "", ""),
     ("DELETE", "/sessions/s1", "", ""),
-    ("PATCH", "/sessions/s1/title", "application/json", r#"{"title":"t"}"#),
+    (
+        "PATCH",
+        "/sessions/s1/title",
+        "application/json",
+        r#"{"title":"t"}"#,
+    ),
     ("POST", "/tasks/t1/cancel", "", ""),
     ("POST", "/tasks/t1/restart-from-node", "", ""),
     ("GET", "/files/attachment.txt", "", ""),
@@ -4528,7 +4533,12 @@ const SURFACE_PROBES: &[(&str, &str, &str, &str)] = &[
         "multipart/form-data; boundary=octosprobe",
         "",
     ),
-    ("POST", "/admin/shell", "application/json", r#"{"command":""}"#),
+    (
+        "POST",
+        "/admin/shell",
+        "application/json",
+        r#"{"command":""}"#,
+    ),
 ];
 
 #[tokio::test]
