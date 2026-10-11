@@ -139,10 +139,9 @@ fn persist(dir: &Path, team: &Team) -> Result<(), String> {
     .map_err(|e| format!("persist workspace team: {e}"))
 }
 
-/// Seat numbers must never repeat within a team: members address each other
-/// by agent_id, and a seat freed by eviction keeps its number reserved in
-/// every client's view of the team. Derive the next number from the highest
-/// existing seat instead of the member count.
+/// Seat numbers must never repeat among listed members: peers address each
+/// other by agent_id. Derive the next number from the highest existing seat
+/// instead of the member count.
 fn next_agent_number(team: &Team) -> usize {
     team.members
         .iter()
@@ -150,26 +149,29 @@ fn next_agent_number(team: &Team) -> usize {
         .filter_map(|suffix| suffix.parse::<usize>().ok())
         .max()
         .unwrap_or(0)
-        + 1
+        .saturating_add(1)
 }
 
 /// #2741 — members accumulate for the workspace's lifetime, so a long-lived
 /// workspace reaches the cap holding mostly stale seats. To admit the
 /// joining session, evict the stalest members that have no live connection
-/// (they rejoin with a fresh seat on their next open). A connected member is
-/// never evicted: if even the disconnected seats cannot make room, the team
-/// is left untouched so a full team stays a full team.
+/// and no turn in flight (they rejoin with a fresh seat on their next open).
+/// A connected or turn-active member is never evicted: if even the
+/// disconnected idle seats cannot make room, the team is left untouched so a
+/// full team stays a full team.
 fn evict_stale_members_for_join(
     team: &mut Team,
     connections: &HashMap<(PathBuf, SessionKey), HashSet<u64>>,
+    turn_active: &HashSet<SessionKey>,
     dir: &Path,
 ) -> Vec<Member> {
     let surplus = team.members.len() + 1 - MAX_MEMBERS;
     let mut stale: Vec<usize> = (0..team.members.len())
         .filter(|&i| {
-            connections
-                .get(&(dir.to_path_buf(), team.members[i].session_id.clone()))
-                .is_none_or(|seats| seats.is_empty())
+            !turn_active.contains(&team.members[i].session_id)
+                && connections
+                    .get(&(dir.to_path_buf(), team.members[i].session_id.clone()))
+                    .is_none_or(|seats| seats.is_empty())
         })
         .collect();
     stale.sort_by_key(|&i| team.members[i].joined_at_ms);
@@ -189,7 +191,9 @@ fn evict_stale_members_for_join(
     team.members = kept;
     if evicted.iter().any(|m| m.agent_id == team.leader) {
         // Mirror the join-time election: the earliest-joined survivor leads,
-        // and the epoch bump fences a coordinator evicted mid-flight.
+        // and the epoch bump fences a coordinator evicted mid-flight. There
+        // is always a survivor — eviction keeps MAX_MEMBERS - 1 seats — so
+        // the team file never records a leader outside its member list.
         team.leader = team
             .members
             .iter()
@@ -203,12 +207,16 @@ fn evict_stale_members_for_join(
 }
 
 impl WorkspaceTeams {
+    /// `turn_active` carries the sessions with a turn in flight (the
+    /// process-global active-turn registry); eviction never takes a seat
+    /// whose turn could still record a result into the team.
     pub fn join(
         &self,
         profile_data: &Path,
         workspace: &Path,
         session: &SessionKey,
         connection: u64,
+        turn_active: &HashSet<SessionKey>,
     ) -> Result<Team, String> {
         let (dir, workspace) = location(profile_data, workspace)?;
         let mut state = self.0.lock().map_err(|_| "workspace team lock poisoned")?;
@@ -234,7 +242,8 @@ impl WorkspaceTeams {
         };
         if team.member(&session.0).is_none() {
             if team.members.len() >= MAX_MEMBERS {
-                let evicted = evict_stale_members_for_join(&mut team, &state.connections, &dir);
+                let evicted =
+                    evict_stale_members_for_join(&mut team, &state.connections, turn_active, &dir);
                 if evicted.is_empty() {
                     return Err("workspace team member limit reached".into());
                 }
@@ -456,6 +465,10 @@ mod tests {
         persist(&dir, &team).unwrap();
     }
 
+    fn read_team_file(dir: &Path) -> Team {
+        serde_json::from_str(&std::fs::read_to_string(dir.join("team.json")).unwrap()).unwrap()
+    }
+
     fn seat_ids(count: usize) -> Vec<(String, String)> {
         (0..count)
             .map(|i| (format!("workspace-{}", i + 1), format!("local:s{i}")))
@@ -478,7 +491,13 @@ mod tests {
         // The leader reconnects; every other seat stays stale (no live
         // connection ever registered for it in this process).
         let joined = teams
-            .join(profile.path(), workspace.path(), &leader, 1)
+            .join(
+                profile.path(),
+                workspace.path(),
+                &leader,
+                1,
+                &HashSet::new(),
+            )
             .unwrap();
         assert_eq!(joined.members.len(), MAX_MEMBERS);
 
@@ -488,6 +507,7 @@ mod tests {
                 workspace.path(),
                 &SessionKey("local:new".into()),
                 2,
+                &HashSet::new(),
             )
             .unwrap();
         assert_eq!(joined.members.len(), MAX_MEMBERS);
@@ -502,7 +522,13 @@ mod tests {
         // The eviction is durable: a fresh registry reloads the same team.
         let restarted = WorkspaceTeams::default();
         let reloaded = restarted
-            .join(profile.path(), workspace.path(), &leader, 3)
+            .join(
+                profile.path(),
+                workspace.path(),
+                &leader,
+                3,
+                &HashSet::new(),
+            )
             .unwrap();
         assert_eq!(reloaded.members.len(), MAX_MEMBERS);
         assert!(reloaded.member("local:s1").is_none());
@@ -528,6 +554,7 @@ mod tests {
                     workspace.path(),
                     &SessionKey(session.clone()),
                     i as u64 + 1,
+                    &HashSet::new(),
                 )
                 .unwrap();
         }
@@ -537,6 +564,7 @@ mod tests {
                 workspace.path(),
                 &SessionKey("local:new".into()),
                 MAX_MEMBERS as u64 + 1,
+                &HashSet::new(),
             )
             .unwrap_err();
         assert!(error.contains("member limit"), "got: {error}");
@@ -570,6 +598,7 @@ mod tests {
                 workspace.path(),
                 &SessionKey("local:new".into()),
                 1,
+                &HashSet::new(),
             )
             .unwrap();
         assert!(joined.member("local:s0").is_none());
@@ -586,7 +615,13 @@ mod tests {
         let restarted = WorkspaceTeams::default();
         let successor = SessionKey("local:s1".into());
         let reloaded = restarted
-            .join(profile.path(), workspace.path(), &successor, 2)
+            .join(
+                profile.path(),
+                workspace.path(),
+                &successor,
+                2,
+                &HashSet::new(),
+            )
             .unwrap();
         assert_eq!(reloaded.leader, "workspace-2");
         assert_eq!(reloaded.leadership_epoch, 2);
@@ -632,6 +667,7 @@ mod tests {
                 workspace.path(),
                 &SessionKey("local:new".into()),
                 1,
+                &HashSet::new(),
             )
             .unwrap();
         let ids: HashSet<_> = joined.members.iter().map(|m| m.agent_id.clone()).collect();
@@ -669,6 +705,7 @@ mod tests {
                 workspace.path(),
                 &SessionKey("local:new".into()),
                 1,
+                &HashSet::new(),
             )
             .unwrap();
         assert!(
@@ -699,6 +736,7 @@ mod tests {
                 quiet_workspace.path(),
                 &SessionKey("local:new".into()),
                 1,
+                &HashSet::new(),
             )
             .unwrap();
         assert!(
@@ -706,6 +744,188 @@ mod tests {
             "an admission below the warning line must stay quiet, got: {}",
             quiet.contents()
         );
+    }
+
+    #[test]
+    fn join_at_cap_never_evicts_a_member_with_a_turn_in_flight() {
+        let profile = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let seats = seat_ids(MAX_MEMBERS);
+        let seat_refs: Vec<(&str, &str)> = seats
+            .iter()
+            .map(|(a, s)| (a.as_str(), s.as_str()))
+            .collect();
+        seed_team_file(profile.path(), workspace.path(), &seat_refs);
+
+        let teams = WorkspaceTeams::default();
+        // The oldest stale seat is running a drained turn with no connected
+        // client; its result can still land in the team, so the eviction
+        // must skip it and take the next-stale seat instead.
+        let mut turn_active = HashSet::new();
+        turn_active.insert(SessionKey("local:s0".into()));
+        let joined = teams
+            .join(
+                profile.path(),
+                workspace.path(),
+                &SessionKey("local:new".into()),
+                1,
+                &turn_active,
+            )
+            .unwrap();
+        assert!(joined.member("local:s0").is_some());
+        assert!(joined.member("local:s1").is_none());
+
+        // With every seat turn-active or connected there is nothing to
+        // evict: the team stays full and the join is refused.
+        for (_, session) in seats.iter().skip(1) {
+            turn_active.insert(SessionKey(session.clone()));
+        }
+        let error = teams
+            .join(
+                profile.path(),
+                workspace.path(),
+                &SessionKey("local:newer".into()),
+                2,
+                &turn_active,
+            )
+            .unwrap_err();
+        assert!(error.contains("member limit"), "got: {error}");
+        assert!(
+            teams
+                .get(
+                    profile.path(),
+                    workspace.path(),
+                    &SessionKey("local:s0".into())
+                )
+                .unwrap()
+                .member("local:newer")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn join_past_the_cap_evicts_exactly_enough_and_warns_the_operator() {
+        let profile = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        // A hand-edited file may exceed the cap; the loader does not
+        // re-validate the seat count.
+        let seats = seat_ids(MAX_MEMBERS + 2);
+        let seat_refs: Vec<(&str, &str)> = seats
+            .iter()
+            .map(|(a, s)| (a.as_str(), s.as_str()))
+            .collect();
+        seed_team_file(profile.path(), workspace.path(), &seat_refs);
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let joined = WorkspaceTeams::default()
+            .join(
+                profile.path(),
+                workspace.path(),
+                &SessionKey("local:new".into()),
+                1,
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(joined.members.len(), MAX_MEMBERS);
+        for i in 0..3 {
+            assert!(
+                joined.member(&format!("local:s{i}")).is_none(),
+                "the three stalest seats are evicted in order"
+            );
+        }
+        assert!(joined.member("local:s3").is_some());
+        assert_eq!(
+            joined.member("local:new").unwrap().agent_id,
+            format!("workspace-{}", MAX_MEMBERS + 3)
+        );
+        let logs = capture.contents();
+        assert!(
+            logs.contains("evicted its disconnected members"),
+            "an eviction must warn the operator, got: {logs}"
+        );
+        assert!(logs.contains("evicted=3"), "got: {logs}");
+    }
+
+    #[test]
+    fn an_evicted_session_rejoins_with_a_fresh_seat_and_no_stale_result() {
+        let profile = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let seats = seat_ids(MAX_MEMBERS);
+        let seat_refs: Vec<(&str, &str)> = seats
+            .iter()
+            .map(|(a, s)| (a.as_str(), s.as_str()))
+            .collect();
+        seed_team_file(profile.path(), workspace.path(), &seat_refs);
+        // A recorded result is part of the seat, not the session: the
+        // eviction drops it and the rejoin starts clean.
+        {
+            let (dir, _) = location(profile.path(), workspace.path()).unwrap();
+            let mut team = read_team_file(&dir);
+            team.members[0].result = Some("stale".into());
+            team.members[0].result_turn_id = Some("turn-stale".into());
+            persist(&dir, &team).unwrap();
+        }
+
+        let teams = WorkspaceTeams::default();
+        teams
+            .join(
+                profile.path(),
+                workspace.path(),
+                &SessionKey("local:new".into()),
+                1,
+                &HashSet::new(),
+            )
+            .unwrap();
+        // The evicted seat's result is unreachable through the team.
+        let evicted = SessionKey("local:s0".into());
+        assert!(
+            teams
+                .record_result(
+                    profile.path(),
+                    workspace.path(),
+                    &evicted,
+                    "turn-after",
+                    "orphan"
+                )
+                .is_ok()
+        );
+        assert!(
+            teams
+                .get(
+                    profile.path(),
+                    workspace.path(),
+                    &SessionKey("local:new".into())
+                )
+                .unwrap()
+                .members
+                .iter()
+                .all(|m| m.result.as_deref() != Some("orphan"))
+        );
+
+        // The evicted session rejoins with a fresh seat: the freed number is
+        // not reissued while a later member still holds it.
+        let rejoined = teams
+            .join(
+                profile.path(),
+                workspace.path(),
+                &evicted,
+                2,
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            rejoined.member(&evicted.0).unwrap().agent_id,
+            format!("workspace-{}", MAX_MEMBERS + 2)
+        );
+        assert!(rejoined.member(&evicted.0).unwrap().result.is_none());
     }
 
     /// Captures `tracing` output so operator-visibility behaviour can be
@@ -747,9 +967,15 @@ mod tests {
         let a = SessionKey("local:a".into());
         let b = SessionKey("local:b".into());
         let teams = WorkspaceTeams::default();
-        teams.join(temp.path(), workspace.path(), &a, 1).unwrap();
-        teams.join(temp.path(), workspace.path(), &a, 2).unwrap();
-        let joined = teams.join(temp.path(), workspace.path(), &b, 3).unwrap();
+        teams
+            .join(temp.path(), workspace.path(), &a, 1, &HashSet::new())
+            .unwrap();
+        teams
+            .join(temp.path(), workspace.path(), &a, 2, &HashSet::new())
+            .unwrap();
+        let joined = teams
+            .join(temp.path(), workspace.path(), &b, 3, &HashSet::new())
+            .unwrap();
         assert_eq!(joined.members.len(), 2);
         assert_eq!(joined.leader, "workspace-1");
         let elected = teams
@@ -778,7 +1004,7 @@ mod tests {
         assert!(!teams.attached(temp.path(), workspace.path(), &a));
         let restarted = WorkspaceTeams::default();
         let recovered = restarted
-            .join(temp.path(), workspace.path(), &a, 4)
+            .join(temp.path(), workspace.path(), &a, 4, &HashSet::new())
             .unwrap();
         assert_eq!(recovered.leader, elected.leader);
         assert_eq!(recovered.revision, elected.revision);
@@ -793,9 +1019,15 @@ mod tests {
         let teams = WorkspaceTeams::default();
         let a = SessionKey("local:a".into());
         let b = SessionKey("local:b".into());
-        teams.join(p1.path(), w1.path(), &a, 1).unwrap();
-        teams.join(p1.path(), w2.path(), &b, 2).unwrap();
-        teams.join(p2.path(), w1.path(), &b, 3).unwrap();
+        teams
+            .join(p1.path(), w1.path(), &a, 1, &HashSet::new())
+            .unwrap();
+        teams
+            .join(p1.path(), w2.path(), &b, 2, &HashSet::new())
+            .unwrap();
+        teams
+            .join(p2.path(), w1.path(), &b, 3, &HashSet::new())
+            .unwrap();
         assert!(teams.get(p1.path(), w2.path(), &a).is_err());
         assert!(teams.get(p2.path(), w1.path(), &a).is_err());
         assert!(teams.set_leader(p1.path(), w1.path(), &a, &b.0, 1).is_err());
@@ -811,7 +1043,7 @@ mod tests {
                 let (teams, p, w) = (&teams, profile.path(), workspace.path());
                 scope.spawn(move || {
                     teams
-                        .join(p, w, &SessionKey(format!("local:{n}")), n)
+                        .join(p, w, &SessionKey(format!("local:{n}")), n, &HashSet::new())
                         .unwrap()
                 });
             }
@@ -858,8 +1090,12 @@ mod tests {
         let teams = WorkspaceTeams::default();
         let a = SessionKey("local:a".into());
         let b = SessionKey("local:b".into());
-        let first = teams.join(profile.path(), workspace.path(), &a, 1).unwrap();
-        let joined = teams.join(profile.path(), workspace.path(), &b, 2).unwrap();
+        let first = teams
+            .join(profile.path(), workspace.path(), &a, 1, &HashSet::new())
+            .unwrap();
+        let joined = teams
+            .join(profile.path(), workspace.path(), &b, 2, &HashSet::new())
+            .unwrap();
         assert!(
             teams
                 .with_leader(
@@ -924,7 +1160,11 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let teams = WorkspaceTeams::default();
         let a = SessionKey("local:a".into());
-        assert!(teams.join(profile.path(), workspace.path(), &a, 1).is_err());
+        assert!(
+            teams
+                .join(profile.path(), workspace.path(), &a, 1, &HashSet::new(),)
+                .is_err()
+        );
         assert!(!teams.attached(profile.path(), workspace.path(), &a));
         assert!(teams.get(profile.path(), workspace.path(), &a).is_err());
     }
@@ -939,10 +1179,12 @@ mod tests {
         std::os::unix::fs::symlink(&workspace, &alias).unwrap();
         let a = SessionKey("local:a".into());
         let teams = WorkspaceTeams::default();
-        teams.join(root.path(), &workspace, &a, 1).unwrap();
+        teams
+            .join(root.path(), &workspace, &a, 1, &HashSet::new())
+            .unwrap();
         assert_eq!(
             teams
-                .join(root.path(), &alias, &a, 2)
+                .join(root.path(), &alias, &a, 2, &HashSet::new())
                 .unwrap()
                 .members
                 .len(),
@@ -952,7 +1194,9 @@ mod tests {
             .record_result(root.path(), &alias, &a, "turn-a", &"文".repeat(10000))
             .unwrap();
         let restarted = WorkspaceTeams::default();
-        let team = restarted.join(root.path(), &workspace, &a, 3).unwrap();
+        let team = restarted
+            .join(root.path(), &workspace, &a, 3, &HashSet::new())
+            .unwrap();
         assert_eq!(team.members[0].result_turn_id.as_deref(), Some("turn-a"));
         assert!(team.members[0].result.as_ref().unwrap().len() <= MAX_RESULT_BYTES);
         assert!(team.gather(None).contains("文"));

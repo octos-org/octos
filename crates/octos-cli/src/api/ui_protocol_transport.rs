@@ -22285,11 +22285,15 @@ async fn handle_session_open(
             resolve_session_profile_runtime(state, opened.active_profile_id.as_deref()),
             opened.workspace_root.as_deref(),
         ) {
+            // Eviction must not take the seat of a session whose turn is
+            // still able to record a result into the team (#2741).
+            let turn_active = active_turn_sessions(&active_turns_registry()).await;
             if let Err(error) = state.ui_protocol.workspace_teams.join(
                 &runtime.data_dir,
                 Path::new(workspace),
                 &opened.session_id,
                 ws.connection_id.0,
+                &turn_active,
             ) {
                 // The join failure degrades to "opened, outside the team"
                 // (#2741): a fail-closed refusal here bricks long-lived

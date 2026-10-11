@@ -249,11 +249,17 @@ Accepted residual risks, now on the record:
   sessions keep working).
 
 Amendment (2026-10-11): the accumulate side is fixed. A join at the
-1024 cap first evicts the stalest members with no live connection
-(oldest `joined_at_ms` first, exactly enough to admit the joiner; a
-connected member is never evicted) and warns the operator. Seat
-numbers derive from the highest existing seat, so a freed number is
-never reused while its old holder is still listed. An evicted
-leader's role falls to the earliest survivor with a `leadership_epoch`
-bump, fencing a coordinator evicted mid-flight. Admissions at 75% of
-the cap warn before the pressure starts.
+1024 cap first evicts the stalest members with no live connection and
+no turn in flight (oldest `joined_at_ms` first, exactly enough to
+admit the joiner; a connected or turn-active member is never evicted)
+and warns the operator. Seat numbers derive from the highest existing
+seat, so a freed number is never reused while its old holder is still
+listed. An evicted leader's role falls to the earliest survivor with
+a `leadership_epoch` bump, fencing a coordinator evicted mid-flight.
+Admissions at 75% of the cap warn before the pressure starts.
+
+Accepted residual risk on the record: the turn-active check is a
+snapshot taken at the joining open, so a drained turn that starts
+between that snapshot and the eviction can still lose its
+team-recorded result (the session's own transcript is unaffected; the
+member rejoins with a fresh seat on its next open).
