@@ -5086,6 +5086,8 @@ impl PromptContextManager for AppUiPromptContextBridge {
     }
 }
 
+// Reference path for checkpoint-equivalence and context-merge regression tests.
+#[cfg(test)]
 fn record_appui_context_manager_message(
     data_dir: &Path,
     context_manager: &Arc<StdMutex<ContextManager>>,
@@ -5116,6 +5118,9 @@ fn record_appui_context_manager_message(
         );
     }
 }
+
+#[path = "postturn_context_batch.rs"]
+mod postturn_context_batch;
 
 fn merge_appui_background_row(
     manager: &mut ContextManager,
@@ -41766,6 +41771,14 @@ async fn run_standalone_turn(
                 let mut final_assistant_persisted = false;
                 {
                     let mut sessions = sessions.lock().await;
+                    // Journal rows and their cursors remain individually durable.
+                    // Derive/hash/serialize the full context once for this batch;
+                    // the guard checkpoints completed rows on cancellation too.
+                    let mut context_batch = postturn_context_batch::AppUiContextCommitBatch::new(
+                        &context_data_dir_for_result,
+                        &context_manager_for_result,
+                        &agent_session_id,
+                    );
                     let final_assistant = final_assistant_message_for_response(&response);
                     // Fleet-UX soak NEW-03 (mini3/mini5, 2026-05-23):
                     // the #1183 fix hid the synthesised spawn_only ack
@@ -41925,13 +41938,7 @@ async fn run_standalone_turn(
                                 }
                                 entry.last_touched_at = now;
                             }
-                            record_appui_context_manager_message(
-                                &context_data_dir_for_result,
-                                &context_manager_for_result,
-                                &agent_session_id,
-                                &saved_for_context,
-                                seq,
-                            );
+                            context_batch.record(&saved_for_context, seq);
                             cursor = Some(UiCursor {
                                 stream: agent_session_id.0.clone(),
                                 seq: seq as u64,
@@ -42101,13 +42108,7 @@ async fn run_standalone_turn(
                                         }
                                         entry.last_touched_at = now;
                                     }
-                                    record_appui_context_manager_message(
-                                        &context_data_dir_for_result,
-                                        &context_manager_for_result,
-                                        &agent_session_id,
-                                        &saved_for_context,
-                                        seq,
-                                    );
+                                    context_batch.record(&saved_for_context, seq);
                                     cursor = Some(UiCursor {
                                         stream: agent_session_id.0.clone(),
                                         seq: seq as u64,
@@ -42137,6 +42138,12 @@ async fn run_standalone_turn(
                                 }
                             }
                         }
+                    }
+                    // Both successful and failed/truncated-response carriers use
+                    // this path. Complete the checkpoint before any terminal or
+                    // self-paced continuation can observe this batch as finished.
+                    if let Err(error) = context_batch.finish() {
+                        warn!(session = %agent_session_id.0, %error, "failed to persist post-turn context batch snapshot");
                     }
                     // NEW-16 codex round-3 P1+P2: do NOT GC the
                     // cursor here AND do NOT GC at the bottom of
