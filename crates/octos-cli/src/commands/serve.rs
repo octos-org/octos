@@ -1961,6 +1961,17 @@ impl ServeCommand {
             // path.
             preview_sweeper: Some(preview_sweeper),
         });
+        tracing::info!(
+            llm_compaction = state.llm_compaction,
+            compaction_default = if state.llm_compaction {
+                "llm"
+            } else {
+                "heuristic"
+            },
+            scope = "AppUI turns/manual compaction",
+            session_open_mode = "heuristic",
+            "compaction default configured; per-session mode overrides take precedence"
+        );
 
         // mini5 soak gap #1 / #1973 fix E: drain queued master continuations
         // (ChildCompleted / ScatterJoinComplete / GoalContinue / LoopFire)
