@@ -656,9 +656,12 @@ impl FeishuChannel {
         self
     }
 
-    /// Set encrypt key for AES-256-CBC event decryption.
+    /// Set encrypt key for AES-256-CBC event decryption. An empty key is
+    /// treated as unconfigured: it would arm the webhook signature gate and
+    /// the decrypt path with the publicly-known sha256(""), letting anyone
+    /// forge signatures and decrypt events (#2772).
     pub fn with_encrypt_key(mut self, key: Option<String>) -> Self {
-        self.encrypt_key = key;
+        self.encrypt_key = key.filter(|key| !key.is_empty());
         self
     }
 
@@ -2279,11 +2282,12 @@ mod tests {
     /// way Lark's push observes them (real HTTP framing, axum extractors,
     /// handler, inbound forwarding).
     async fn spawn_webhook_router(
+        encrypt_key: Option<&str>,
         verification_token: Option<&str>,
     ) -> (std::net::SocketAddr, mpsc::Receiver<serde_json::Value>) {
         let (tx, rx) = mpsc::channel::<serde_json::Value>(8);
         let state = WebhookState {
-            encrypt_key: None,
+            encrypt_key: encrypt_key.map(String::from),
             verification_token: verification_token.map(String::from),
             inbound_tx: tx,
         };
@@ -2297,11 +2301,23 @@ mod tests {
     }
 
     async fn post_webhook_event(addr: std::net::SocketAddr, body: &str) -> u16 {
+        post_webhook_event_with_headers(addr, &[], body).await
+    }
+
+    async fn post_webhook_event_with_headers(
+        addr: std::net::SocketAddr,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut extra_headers = String::new();
+        for (name, value) in headers {
+            extra_headers.push_str(&format!("{name}: {value}\r\n"));
+        }
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let request = format!(
             "POST /webhook/event HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+             {extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -2320,7 +2336,7 @@ mod tests {
 
         // Armed channel: the credential-less push is refused on the wire and
         // nothing reaches the inbound bus (#2756's fail-open, before/after).
-        let (addr, mut rx) = spawn_webhook_router(Some("octos-vt-secret")).await;
+        let (addr, mut rx) = spawn_webhook_router(None, Some("octos-vt-secret")).await;
         assert_eq!(post_webhook_event(addr, event_without_token).await, 403);
         assert!(rx.try_recv().is_err(), "refused push must not forward");
         let signed = r#"{"type":"event_callback","token":"octos-vt-secret","event":{}}"#;
@@ -2338,8 +2354,94 @@ mod tests {
         assert!(rx.try_recv().is_ok(), "verified v2 push should forward");
 
         // Unarmed channel: the passthrough contract is unchanged.
-        let (addr, mut rx) = spawn_webhook_router(None).await;
+        let (addr, mut rx) = spawn_webhook_router(None, None).await;
         assert_eq!(post_webhook_event(addr, event_without_token).await, 200);
         assert!(rx.try_recv().is_ok(), "unarmed channel should forward");
+    }
+
+    // ---- Empty encrypt_key normalization (#2772) ----
+    //
+    // `encrypt_key: ""` used to arm the channel: the signature gate verified
+    // against the publicly-known sha256("") and the AES-256-CBC decrypt path
+    // opened attacker-crafted ciphertext. The builder now treats the empty
+    // string as unconfigured, so the same push lands on the unarmed-channel
+    // refusal and nothing forwards.
+
+    /// Lark's event envelope: base64(IV ‖ AES-256-CBC(sha256(key), PKCS7)).
+    fn lark_encrypt(key: &str, plaintext: &str) -> String {
+        use aes::cipher::{BlockEncryptMut, KeyIvInit};
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use cbc::cipher::block_padding::Pkcs7;
+        use sha2::{Digest, Sha256};
+
+        let key_hash: [u8; 32] = Sha256::digest(key.as_bytes()).into();
+        let iv = [0u8; 16]; // fixed test IV — the handler reads it from the payload
+        let encryptor = cbc::Encryptor::<aes::Aes256>::new((&key_hash).into(), (&iv).into());
+        let mut buf = iv.to_vec();
+        buf.extend_from_slice(&encryptor.encrypt_padded_vec_mut::<Pkcs7>(plaintext.as_bytes()));
+        BASE64.encode(buf)
+    }
+
+    #[test]
+    fn with_encrypt_key_treats_empty_string_as_unconfigured() {
+        let ch = FeishuChannel::new(
+            "id",
+            "secret",
+            vec![],
+            Arc::new(AtomicBool::new(false)),
+            "global",
+            PathBuf::from("/tmp"),
+        )
+        .with_encrypt_key(Some(String::new()));
+        assert!(
+            ch.encrypt_key.is_none(),
+            "empty encrypt_key must not arm the channel (#2772)"
+        );
+        let ch = ch.with_encrypt_key(Some("real-key".to_string()));
+        assert_eq!(ch.encrypt_key.as_deref(), Some("real-key"));
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_empty_encrypt_key_no_longer_accepts_publicly_keyed_forgeries() {
+        // The exact builder chain the gateway adapter runs for an
+        // `encrypt_key: ""` config — pre-fix this armed the webhook (#2772).
+        let ch = FeishuChannel::new(
+            "id",
+            "secret",
+            vec![],
+            Arc::new(AtomicBool::new(false)),
+            "global",
+            PathBuf::from("/tmp"),
+        )
+        .with_encrypt_key(Some(String::new()));
+        let (addr, mut rx) = spawn_webhook_router(ch.encrypt_key.clone().as_deref(), None).await;
+
+        // A push forged entirely with the publicly-known sha256("") — valid
+        // signature, valid ciphertext. The pre-fix channel verified and
+        // decrypted it; an unarmed channel must refuse instead.
+        let timestamp = "1700000000";
+        let nonce = "nonce-abc";
+        let body = format!(
+            r#"{{"encrypt":"{}"}}"#,
+            lark_encrypt("", r#"{"type":"event_callback","event":{}}"#)
+        );
+        let signature = verify_signature(timestamp, nonce, "", &body);
+        let status = post_webhook_event_with_headers(
+            addr,
+            &[
+                ("X-Lark-Request-Timestamp", timestamp),
+                ("X-Lark-Request-Nonce", nonce),
+                ("X-Lark-Signature", &signature),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "empty-key config must not decrypt publicly-keyed ciphertext (#2772)"
+        );
+        assert!(rx.try_recv().is_err(), "refused push must not forward");
     }
 }
