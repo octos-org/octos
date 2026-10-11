@@ -139,6 +139,69 @@ fn persist(dir: &Path, team: &Team) -> Result<(), String> {
     .map_err(|e| format!("persist workspace team: {e}"))
 }
 
+/// Seat numbers must never repeat within a team: members address each other
+/// by agent_id, and a seat freed by eviction keeps its number reserved in
+/// every client's view of the team. Derive the next number from the highest
+/// existing seat instead of the member count.
+fn next_agent_number(team: &Team) -> usize {
+    team.members
+        .iter()
+        .filter_map(|m| m.agent_id.strip_prefix("workspace-"))
+        .filter_map(|suffix| suffix.parse::<usize>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+/// #2741 — members accumulate for the workspace's lifetime, so a long-lived
+/// workspace reaches the cap holding mostly stale seats. To admit the
+/// joining session, evict the stalest members that have no live connection
+/// (they rejoin with a fresh seat on their next open). A connected member is
+/// never evicted: if even the disconnected seats cannot make room, the team
+/// is left untouched so a full team stays a full team.
+fn evict_stale_members_for_join(
+    team: &mut Team,
+    connections: &HashMap<(PathBuf, SessionKey), HashSet<u64>>,
+    dir: &Path,
+) -> Vec<Member> {
+    let surplus = team.members.len() + 1 - MAX_MEMBERS;
+    let mut stale: Vec<usize> = (0..team.members.len())
+        .filter(|&i| {
+            connections
+                .get(&(dir.to_path_buf(), team.members[i].session_id.clone()))
+                .is_none_or(|seats| seats.is_empty())
+        })
+        .collect();
+    stale.sort_by_key(|&i| team.members[i].joined_at_ms);
+    if stale.len() < surplus {
+        return Vec::new();
+    }
+    let evicting: HashSet<usize> = stale[..surplus].iter().copied().collect();
+    let mut evicted = Vec::with_capacity(surplus);
+    let mut kept = Vec::with_capacity(team.members.len() - surplus);
+    for (i, member) in std::mem::take(&mut team.members).into_iter().enumerate() {
+        if evicting.contains(&i) {
+            evicted.push(member);
+        } else {
+            kept.push(member);
+        }
+    }
+    team.members = kept;
+    if evicted.iter().any(|m| m.agent_id == team.leader) {
+        // Mirror the join-time election: the earliest-joined survivor leads,
+        // and the epoch bump fences a coordinator evicted mid-flight.
+        team.leader = team
+            .members
+            .iter()
+            .min_by_key(|m| m.joined_at_ms)
+            .map(|m| m.agent_id.clone())
+            .unwrap_or_default();
+        team.leadership_epoch += 1;
+    }
+    team.revision += 1;
+    evicted
+}
+
 impl WorkspaceTeams {
     pub fn join(
         &self,
@@ -171,9 +234,17 @@ impl WorkspaceTeams {
         };
         if team.member(&session.0).is_none() {
             if team.members.len() >= MAX_MEMBERS {
-                return Err("workspace team member limit reached".into());
+                let evicted = evict_stale_members_for_join(&mut team, &state.connections, &dir);
+                if evicted.is_empty() {
+                    return Err("workspace team member limit reached".into());
+                }
+                tracing::warn!(
+                    evicted = evicted.len(),
+                    seats = team.members.len(),
+                    "workspace team hit the member limit and evicted its disconnected members"
+                );
             }
-            let id = format!("workspace-{}", team.members.len() + 1);
+            let id = format!("workspace-{}", next_agent_number(&team));
             if team.members.is_empty() {
                 team.leader = id.clone();
             }
@@ -186,6 +257,13 @@ impl WorkspaceTeams {
             });
             team.revision += 1;
             persist(&dir, &team)?;
+            if team.members.len() >= CAPACITY_WARN_AT {
+                tracing::warn!(
+                    seats = team.members.len(),
+                    cap = MAX_MEMBERS,
+                    "workspace team is approaching the member limit"
+                );
+            }
         }
         state.teams.insert(dir.clone(), team.clone());
         state
@@ -389,8 +467,10 @@ mod tests {
         let profile = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let seats = seat_ids(MAX_MEMBERS);
-        let seat_refs: Vec<(&str, &str)> =
-            seats.iter().map(|(a, s)| (a.as_str(), s.as_str())).collect();
+        let seat_refs: Vec<(&str, &str)> = seats
+            .iter()
+            .map(|(a, s)| (a.as_str(), s.as_str()))
+            .collect();
         seed_team_file(profile.path(), workspace.path(), &seat_refs);
 
         let teams = WorkspaceTeams::default();
@@ -434,8 +514,10 @@ mod tests {
         let profile = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let seats = seat_ids(MAX_MEMBERS);
-        let seat_refs: Vec<(&str, &str)> =
-            seats.iter().map(|(a, s)| (a.as_str(), s.as_str())).collect();
+        let seat_refs: Vec<(&str, &str)> = seats
+            .iter()
+            .map(|(a, s)| (a.as_str(), s.as_str()))
+            .collect();
         seed_team_file(profile.path(), workspace.path(), &seat_refs);
 
         let teams = WorkspaceTeams::default();
@@ -475,8 +557,10 @@ mod tests {
         let profile = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let seats = seat_ids(MAX_MEMBERS);
-        let seat_refs: Vec<(&str, &str)> =
-            seats.iter().map(|(a, s)| (a.as_str(), s.as_str())).collect();
+        let seat_refs: Vec<(&str, &str)> = seats
+            .iter()
+            .map(|(a, s)| (a.as_str(), s.as_str()))
+            .collect();
         seed_team_file(profile.path(), workspace.path(), &seat_refs);
 
         let teams = WorkspaceTeams::default();
@@ -574,8 +658,10 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         let seats = seat_ids(CAPACITY_WARN_AT - 1);
-        let seat_refs: Vec<(&str, &str)> =
-            seats.iter().map(|(a, s)| (a.as_str(), s.as_str())).collect();
+        let seat_refs: Vec<(&str, &str)> = seats
+            .iter()
+            .map(|(a, s)| (a.as_str(), s.as_str()))
+            .collect();
         seed_team_file(profile.path(), workspace.path(), &seat_refs);
         WorkspaceTeams::default()
             .join(
@@ -594,9 +680,19 @@ mod tests {
         let quiet_profile = tempfile::tempdir().unwrap();
         let quiet_workspace = tempfile::tempdir().unwrap();
         let seats = seat_ids(2);
-        let seat_refs: Vec<(&str, &str)> =
-            seats.iter().map(|(a, s)| (a.as_str(), s.as_str())).collect();
+        let seat_refs: Vec<(&str, &str)> = seats
+            .iter()
+            .map(|(a, s)| (a.as_str(), s.as_str()))
+            .collect();
         seed_team_file(quiet_profile.path(), quiet_workspace.path(), &seat_refs);
+        let quiet = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(quiet.clone())
+            .finish();
+        let _quiet_guard = tracing::subscriber::set_default(subscriber);
         WorkspaceTeams::default()
             .join(
                 quiet_profile.path(),
@@ -606,9 +702,9 @@ mod tests {
             )
             .unwrap();
         assert!(
-            !capture.contents().contains("approaching the member limit"),
+            !quiet.contents().contains("approaching the member limit"),
             "an admission below the warning line must stay quiet, got: {}",
-            capture.contents()
+            quiet.contents()
         );
     }
 
