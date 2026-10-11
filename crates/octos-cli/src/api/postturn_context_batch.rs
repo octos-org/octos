@@ -298,4 +298,164 @@ mod tests {
                 .contains("Verified deck")
         );
     }
+
+    /// Provider-free diagnostic, intentionally excluded from normal test runs.
+    /// Run with `benchmark_long_postturn_context_batch --ignored --nocapture`.
+    #[test]
+    #[ignore = "large synthetic history diagnostic; legacy checkpoint phase bounded to about 60s"]
+    fn benchmark_long_postturn_context_batch() {
+        let fixture_start = std::time::Instant::now();
+        let legacy_dir = tempfile::tempdir().unwrap();
+        let batch_dir = tempfile::tempdir().unwrap();
+        let session = SessionKey("benchmark-postturn-context".into());
+        let stamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut history = vec![Message::user("Inspect the repository")];
+        let payload = "stable source content; validated tool output; ".repeat(23);
+        for index in 0..6_290 {
+            let call_id = format!("call_history_{index}");
+            let mut call = Message::assistant("");
+            call.tool_calls = Some(vec![ToolCall {
+                id: call_id.clone(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path":format!("src/module_{index}.ts")}),
+                metadata: None,
+            }]);
+            history.push(call);
+            history.push(Message::tool_with_thread(
+                format!("file {index}: {payload}"),
+                call_id,
+                ThreadId::new("history-thread"),
+            ));
+        }
+        history.push(Message::user("Earlier repository inspection is complete"));
+        for row in &mut history {
+            row.timestamp = stamp;
+        }
+        let mut initial = ContextManager::from_session_history(session.to_string(), None, &history);
+        let compaction = initial.compact_context(
+            "Earlier repository inspection retained in summary",
+            CompactContextPolicy {
+                // Start at a call boundary: complete call/result pairs plus
+                // the newest user row, then the installed summary itself.
+                keep_recent_items: 2_901,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            compaction.status,
+            crate::context_manager::ContextCompactionStatus::Installed
+        );
+        let initial_canonical_items = initial.ledger_items().len();
+        let initial_active_items = initial.items().len();
+        let mut rows = vec![Message::user("Finish the verified update")];
+        for index in 0..5 {
+            let call_id = format!("call_batch_{index}");
+            let mut call = Message::assistant("");
+            call.tool_calls = Some(vec![ToolCall {
+                id: call_id.clone(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path":format!("src/final_{index}.ts")}),
+                metadata: None,
+            }]);
+            rows.push(call);
+            rows.push(Message::tool_with_thread(
+                format!("verified {index}: {payload}"),
+                call_id,
+                ThreadId::new("batch-thread"),
+            ));
+        }
+        rows.push(Message::assistant(
+            "All five checks completed; update verified.",
+        ));
+        for row in &mut rows {
+            row.timestamp = stamp;
+        }
+        let legacy = Arc::new(Mutex::new(initial.clone()));
+        let batched = Arc::new(Mutex::new(initial));
+        let fixture_seconds = fixture_start.elapsed().as_secs_f64();
+
+        let legacy_path = context_ledger_path(legacy_dir.path(), &session.to_string());
+        let legacy_start = std::time::Instant::now();
+        let mut committed = Vec::new();
+        let mut legacy_snapshot_installs = 0;
+        let mut last_modified = None;
+        for row in &rows {
+            super::super::record_appui_context_manager_message(
+                legacy_dir.path(),
+                &legacy,
+                &session,
+                row,
+                history.len() + committed.len(),
+            );
+            let modified = legacy_path.metadata().unwrap().modified().unwrap();
+            assert_ne!(
+                last_modified,
+                Some(modified),
+                "each legacy row installs another snapshot"
+            );
+            last_modified = Some(modified);
+            legacy_snapshot_installs += 1;
+            committed.push(row.clone());
+            if legacy_start.elapsed().as_secs() >= 45 && row.role == octos_core::MessageRole::Tool {
+                // Stop only after a complete tool pair, then persist the final
+                // assistant row so both paths still see the same closed batch.
+                let final_row = rows.last().unwrap();
+                super::super::record_appui_context_manager_message(
+                    legacy_dir.path(),
+                    &legacy,
+                    &session,
+                    final_row,
+                    history.len() + committed.len(),
+                );
+                legacy_snapshot_installs += 1;
+                committed.push(final_row.clone());
+                break;
+            }
+        }
+        let legacy_seconds = legacy_start.elapsed().as_secs_f64();
+        let batch_path = context_ledger_path(batch_dir.path(), &session.to_string());
+        let batch_start = std::time::Instant::now();
+        let mut batch = AppUiContextCommitBatch::new(batch_dir.path(), &batched, &session);
+        for (index, row) in committed.iter().enumerate() {
+            batch.record(row, history.len() + index);
+            assert!(!batch_path.exists(), "no intermediate batch snapshot");
+        }
+        batch.finish().unwrap();
+        let batch_seconds = batch_start.elapsed().as_secs_f64();
+        let final_modified = batch_path.metadata().unwrap().modified().unwrap();
+        drop(batch);
+        assert_eq!(
+            batch_path.metadata().unwrap().modified().unwrap(),
+            final_modified
+        );
+        let old = legacy.lock().unwrap();
+        let new = batched.lock().unwrap();
+        assert_eq!(prompt_value(&old), prompt_value(&new));
+        assert_eq!(old.source_head_hash(), new.source_head_hash());
+        let old_loaded = load_context_manager_snapshot(legacy_dir.path(), &session.to_string())
+            .unwrap()
+            .unwrap();
+        let new_loaded = load_context_manager_snapshot(batch_dir.path(), &session.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(prompt_value(&old_loaded), prompt_value(&new_loaded));
+        assert_eq!(old_loaded.source_head_hash(), new_loaded.source_head_hash());
+        println!(
+            "POSTTURN_BENCHMARK {}",
+            serde_json::json!({
+                "fixture_seconds":fixture_seconds,
+                "history_rows":history.len(), "initial_canonical_items":initial_canonical_items,
+                "initial_active_items":initial_active_items, "completed_response_rows":committed.len(),
+                "planned_response_rows":rows.len(), "legacy_seconds":legacy_seconds,
+                "batch_seconds":batch_seconds, "legacy_snapshot_installs":legacy_snapshot_installs,
+                "batch_snapshot_installs":1, "legacy_snapshot_bytes":legacy_path.metadata().unwrap().len(),
+                "batch_snapshot_bytes":batch_path.metadata().unwrap().len(),
+                "final_canonical_items":new.ledger_items().len(), "final_active_items":new.items().len(),
+                "normalized_prompt_equal":true, "source_head_equal":true,
+                "reloaded_prompt_equal":true, "reloaded_source_head_equal":true,
+                "profile":"debug", "order":"legacy_then_batch", "provider_calls":0,
+                "scope":"one synthetic diagnostic under host contention; not a production speedup claim"
+            })
+        );
+    }
 }

@@ -23,3 +23,24 @@ Only the foreground batch checkpoint is coalesced. Background writers retain the
 Four focused tests cover: deferred single checkpoint with the same normalized projection/source hash as the former per-row path; task cancellation after real transcript appends; stale-checkpoint recovery retaining committed compaction and tool pairing; and recovery after a checkpoint-write failure without fabricating a final answer.
 
 Seventeen existing regression tests cover segment identities, terminal FIFO order, interruption races, background merges, committed usage, truncated voice directives, and recovery from stale/aborted/uncommitted context. The production-only library is checked separately with default features disabled and `api` enabled. Exact results and commands live in the experiment root's `postturn-batch-results.json` and referenced logs. No global executable is built or installed, and no active A/B binary is replaced.
+
+## Opt-in synthetic checkpoint diagnostic
+
+`benchmark_long_postturn_context_batch` is ignored in ordinary tests. It creates deterministic tool-call/result history in temporary directories, installs a summary retaining complete recent tool pairs, and compares the former per-row context checkpoint with the batch helper on the same completed response rows. The legacy phase stops after roughly 45 seconds at a complete tool-pair boundary and appends a final response if necessary; this is a bounded diagnostic, not a timing assertion.
+
+Run it with:
+
+```sh
+cargo test --offline --locked -p octos-cli --lib --no-default-features --features api benchmark_long_postturn_context_batch -- --ignored --nocapture --test-threads=1
+```
+
+The 2026-10-11 debug run used 12,582 history rows, producing 12,583 canonical and 2,902 active items after compaction. Its complete response batch contained 12 rows: a user message, five tool-call/result pairs and a final assistant message. Both resulting snapshots contained 12,595 canonical and 2,914 active items, occupying 26,098,077 bytes each.
+
+| Context update/checkpoint path | Snapshot installs | Measured seconds |
+| --- | ---: | ---: |
+| Former per-row checkpoint | 12 | 37.297 |
+| One checkpoint after the batch | 1 | 2.930 |
+
+The normalized model prompts and source-head hashes were equal in memory and after reloading both snapshots. Fixture construction took 5.915 seconds outside the measured paths; the full test, including equality checks and reloads, took 55.36 seconds. There were no provider calls. The timed paths include context merge, status publication and snapshot persistence; they do not measure model inference, tools, journal appends, UI delivery or the full turn.
+
+The snapshot-count reduction is the direct result. The approximately 12.7-fold elapsed-time difference is one diagnostic observation, not a production speedup claim: this was an unoptimized build, legacy ran first, filesystem/cache order was not controlled, and three other debug runtimes each used about one CPU core on the 18-logical-CPU host. It is not a release-profile benchmark or repeated statistical experiment. Exact output and host observations are retained in the experiment root's `benchmark-postturn-batch.log`, `postturn-benchmark-results.json` and `postturn-benchmark-contention.json`.
