@@ -21,7 +21,13 @@ concurrency:
   #   single pending slot let a third push cancel a queued second, so that
   #   commit never received a verdict (BH3GEI's P2).
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-  queue: ${{ github.event_name == 'pull_request' && 1 || 'max' }}
+  # NOTE: no `queue` field here BY VALIDITY — `queue` combined with
+  # cancel-in-progress: true is a workflow-validation error (BH3GEI's
+  # blocking finding; the expression form emitted `queue: 1` on PR events,
+  # failing every validation). The main-push multi-pending (BH3GEI's P2-2)
+  # needs the separate-policy route (a split workflow or the org-level
+  # setting) and is tracked as the follow-up; until then a third push
+  # supersedes a queued second on main.
 
 permissions:
   contents: read
