@@ -464,9 +464,15 @@ pub struct ServeCommand {
     /// context fills, ask the model for a high-quality handoff summary (a real
     /// model call — slower, a few seconds) instead of the instant deterministic
     /// heuristic. Falls back to the heuristic on any error/timeout, so it never
-    /// breaks a turn. Off by default.
-    #[arg(long)]
+    /// breaks a turn. On by default; use --no-llm-compaction to opt out.
+    #[arg(long, action = clap::ArgAction::Set, default_value_t = true,
+          num_args = 0..=1, default_missing_value = "true", require_equals = true,
+          conflicts_with = "no_llm_compaction")]
     pub llm_compaction: bool,
+
+    /// Use deterministic heuristic context summaries instead of an LLM call.
+    #[arg(long, conflicts_with = "llm_compaction")]
+    pub no_llm_compaction: bool,
 
     /// Disable automatic retry on transient errors.
     #[arg(long)]
@@ -1908,7 +1914,7 @@ impl ServeCommand {
             serve_shutdown: (!self.stdio).then(|| serve_shutdown_tx.clone()),
             dangerous_default_permissions: dangerous_default_permissions_flag,
             default_network_denied: default_network_denied_flag,
-            llm_compaction: self.llm_compaction,
+            llm_compaction: self.llm_compaction && !self.no_llm_compaction,
             allow_admin_shell: config.allow_admin_shell,
             content_catalog_mgr: Some(Arc::new(
                 crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
@@ -2602,6 +2608,25 @@ mod tests {
             .is_err(),
             "the two credentials must differ"
         );
+    }
+
+    #[test]
+    fn should_default_llm_compaction_on_and_allow_explicit_opt_out() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+        let default = Cli::try_parse_from(["octos"]).unwrap();
+        assert!(default.serve.llm_compaction && !default.serve.no_llm_compaction);
+        let explicit = Cli::try_parse_from(["octos", "--llm-compaction"]).unwrap();
+        assert!(explicit.serve.llm_compaction);
+        let off = Cli::try_parse_from(["octos", "--no-llm-compaction"]).unwrap();
+        assert!(off.serve.no_llm_compaction);
+        let off_value = Cli::try_parse_from(["octos", "--llm-compaction=false"]).unwrap();
+        assert!(!off_value.serve.llm_compaction);
+        assert!(Cli::try_parse_from(["octos", "--llm-compaction", "--no-llm-compaction"]).is_err());
     }
 
     #[test]

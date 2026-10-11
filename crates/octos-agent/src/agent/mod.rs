@@ -337,6 +337,21 @@ impl std::fmt::Display for IncompleteResponseError {
 
 impl std::error::Error for IncompleteResponseError {}
 
+/// Completed conversation rows carried out of an unsuccessful turn. The
+/// original error remains in the eyre chain; hosts persist `partial` and still
+/// emit an error terminal. This is not a successful final answer.
+#[derive(Debug, Clone)]
+pub struct FailedConversationProgress {
+    pub partial: ConversationResponse,
+    pub message: String,
+}
+
+impl std::fmt::Display for FailedConversationProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Shared atomic counters for real-time token tracking (used by status indicators).
 pub struct TokenTracker {
     pub input_tokens: AtomicU32,

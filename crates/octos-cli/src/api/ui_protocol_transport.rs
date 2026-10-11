@@ -3905,7 +3905,10 @@ fn appui_compaction_summary(
     ) {
         return summary;
     }
-    // Heuristic fallback still uses the summary-size budget (correct there).
+    info!(
+        compaction_path = "heuristic_fallback",
+        budget_tokens, "LLM compaction unavailable, failed, timed out, or returned empty text"
+    );
     frame.compact_summary(budget_tokens)
 }
 
@@ -4567,6 +4570,8 @@ struct AppUiPromptContextBridge {
     /// the per-turn bridge only when the flag is on; child/spawn bridges leave
     /// it `None`.
     llm_compaction_provider: Option<Arc<dyn octos_llm::LlmProvider>>,
+    token_estimation_provider: Option<Arc<dyn octos_llm::LlmProvider>>,
+    token_estimation_tools: Vec<octos_llm::ToolSpec>,
     /// UPCR-2026-035: render earlier `memory_update` context events as "no
     /// memory" in the outgoing prompt (a turn without the app's context).
     redact_memory_events: bool,
@@ -4597,6 +4602,8 @@ impl AppUiPromptContextBridge {
             context_lifecycle_notify: None,
             context_state_updates: false,
             llm_compaction_provider: None,
+            token_estimation_provider: None,
+            token_estimation_tools: Vec::new(),
             redact_memory_events: false,
             ephemeral_block: None,
             ephemeral_anchor: StdMutex::new(None),
@@ -4642,6 +4649,16 @@ impl AppUiPromptContextBridge {
 
     fn with_context_state_updates(mut self, enabled: bool) -> Self {
         self.context_state_updates = enabled;
+        self
+    }
+
+    fn with_token_estimation_provider(
+        mut self,
+        provider: Arc<dyn octos_llm::LlmProvider>,
+        tools: Vec<octos_llm::ToolSpec>,
+    ) -> Self {
+        self.token_estimation_provider = Some(provider);
+        self.token_estimation_tools = tools;
         self
     }
 
@@ -4779,7 +4796,25 @@ impl PromptContextManager for AppUiPromptContextBridge {
             self.adopt_canonical_source_rows(scratch, &canonical);
         }
 
-        let threshold = Self::threshold_tokens(&request);
+        // Runtime instructions and tool declarations are outside the transcript
+        // ledger but still consume the model's context window.
+        let overhead = self
+            .token_estimation_provider
+            .as_ref()
+            .map_or(0, |provider| {
+                let system = scratch.runtime_system.as_ref().or_else(|| {
+                    messages
+                        .first()
+                        .filter(|message| message.role == MessageRole::System)
+                });
+                provider.estimate_request_tokens(
+                    &system.into_iter().cloned().collect::<Vec<_>>(),
+                    &self.token_estimation_tools,
+                ) as usize
+            });
+        let threshold = Self::threshold_tokens(&request)
+            .saturating_sub(overhead)
+            .max(1);
         let mut compaction_performed = false;
         // UPCR-2026-026 follow-up: surface the MID-TURN pass to the client.
         // This is where compaction actually happens for a session whose
@@ -4809,7 +4844,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
                         session_id: self.session_id.clone(),
                         context_state: ui_context_state_for(&self.session_id, &scratch.manager),
                         trigger: trigger.clone(),
-                        threshold_tokens: threshold,
+                        threshold_tokens: Self::threshold_tokens(&request),
                     },
                 ));
             }
@@ -4839,6 +4874,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
             }
             info!(
                 session = %self.session_id.0,
+                compaction_mode = if self.llm_compaction_provider.is_some() { "llm" } else { "heuristic" },
                 phase = request.phase.as_str(),
                 iteration = request.iteration,
                 compaction_id = %record.compaction_id.as_str(),
@@ -4881,7 +4917,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // here and emitted with the other lifecycle events after the scratch
         // lock drops.
         if self.context_state_updates && self.context_lifecycle_notify.is_some() {
-            let estimate = frame.report.token_estimate;
+            let estimate = frame.report.token_estimate.saturating_add(overhead);
             let moved = scratch
                 .last_reported_token_estimate
                 .is_none_or(|last| estimate.abs_diff(last) >= context_state_report_step(threshold));
@@ -4895,12 +4931,12 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 // "ctx 1M/1M ~100%" against the transcript number), and a
                 // gauge that says full while the provider bills a fifth of
                 // that is the misleading signal this feature exists to fix.
-                context_state.token_estimate = frame.report.token_estimate;
+                context_state.token_estimate = estimate;
                 lifecycle_events.push(UiNotification::ContextStateReported(
                     octos_core::ui_protocol::ContextStateReportedEvent {
                         session_id: self.session_id.clone(),
                         context_state,
-                        threshold_tokens: threshold,
+                        threshold_tokens: Self::threshold_tokens(&request),
                         iteration: request.iteration,
                     },
                 ));
@@ -4975,7 +5011,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
             compaction_performed,
             messages_before,
             messages_after: messages.len(),
-            token_estimate: Some(frame.report.token_estimate),
+            token_estimate: Some(frame.report.token_estimate.saturating_add(overhead)),
             generation: Some(frame.context_state.generation),
         };
         // Emit AFTER releasing the scratch lock (see the collection comment
@@ -5909,13 +5945,11 @@ impl Drop for StatusWordRotatorGuard {
     }
 }
 
+#[path = "progress_delivery.rs"]
+mod progress_delivery;
+
 struct BoundedChannelReporter {
-    tx: tokio::sync::mpsc::Sender<String>,
-    /// Mirrors WS-layer drops: when the progress channel is full the agent
-    /// produced an event the WS layer will never see. Without this counter
-    /// the cursor would lie. Surfaced opportunistically as `protocol/replay_lossy`
-    /// from the consuming task.
-    progress_dropped: Arc<AtomicU64>,
+    delivery: progress_delivery::ProgressDelivery,
     /// PR F (M8.10 thread-binding): bound `thread_id` for every progress
     /// event this reporter emits. Set once at turn-start to the originating
     /// `TurnId`; from then on every JSON payload carries `thread_id` so the
@@ -5927,8 +5961,7 @@ struct BoundedChannelReporter {
 impl BoundedChannelReporter {
     fn new(tx: tokio::sync::mpsc::Sender<String>, progress_dropped: Arc<AtomicU64>) -> Self {
         Self {
-            tx,
-            progress_dropped,
+            delivery: progress_delivery::ProgressDelivery::new(tx, progress_dropped),
             thread_id: None,
         }
     }
@@ -5945,22 +5978,10 @@ impl BoundedChannelReporter {
 
 impl octos_agent::ProgressReporter for BoundedChannelReporter {
     fn report(&self, event: octos_agent::ProgressEvent) {
-        let json = match serde_json::to_string(&super::events::event_to_json(
+        self.delivery.push(super::events::event_to_json(
             &event,
             self.thread_id.as_deref(),
-        )) {
-            Ok(json) => json,
-            Err(_) => return,
-        };
-        if let Err(err) = self.tx.try_send(json) {
-            self.progress_dropped.fetch_add(1, Ordering::Relaxed);
-            metrics::counter!("ws.send.drop.backpressure", "method" => "progress").increment(1);
-            tracing::warn!(
-                target: "octos::ui_protocol::ws",
-                reason = ?err,
-                "progress event dropped before reaching ws layer"
-            );
-        }
+        ));
     }
 
     /// Issue #960 fix: expose the per-turn `thread_id` bound at
@@ -40587,11 +40608,12 @@ async fn run_standalone_turn(
     // Without this wrap the heartbeat publishes into the channel-only path
     // and the SPA's tool-status bubble never refreshes for long-running
     // spawn_only tools (run_pipeline, podcast_generate, mofa_slides, ...).
+    let channel_reporter =
+        BoundedChannelReporter::new(progress_tx.clone(), progress_dropped.clone())
+            .with_thread_id(Some(turn_id.0.to_string()));
+    let progress_delivery = channel_reporter.delivery.clone();
     let inner_reporter: Arc<dyn octos_agent::ProgressReporter> =
-        Arc::new(MetricsReporter::new(Arc::new(
-            BoundedChannelReporter::new(progress_tx.clone(), progress_dropped.clone())
-                .with_thread_id(Some(turn_id.0.to_string())),
-        )));
+        Arc::new(MetricsReporter::new(Arc::new(channel_reporter)));
     let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
         super::ui_protocol_alpha2_bridge::LedgerToolProgressReporter::new(
             inner_reporter,
@@ -40938,7 +40960,8 @@ async fn run_standalone_turn(
     .with_context_lifecycle_notify(context_lifecycle_notify)
     .with_redacted_memory_events(!app_context_allowed)
     .with_ephemeral_block(shared_history_block)
-    .with_context_state_updates(features.context_state_available());
+    .with_context_state_updates(features.context_state_available())
+    .with_token_estimation_provider(llm_provider.clone(), tool_registry.specs());
     // Only wire the provider when `--llm-compaction` is on; a present provider
     // is what flips the in-loop bridge to the LLM-summarization path.
     if session_compaction_llm_enabled(&session_id, &state) {
@@ -41625,6 +41648,9 @@ async fn run_standalone_turn(
         )
         .await;
         let llm_latency = start.elapsed();
+        // Drain the ordered reporter before the directly-sent terminal event.
+        progress_delivery.flush().await;
+
 
         // Drive the router's auto-escalation. We pass the raw session id
         // (with `api:` prefix preserved) so concurrent gateway + serve
@@ -41636,14 +41662,30 @@ async fn run_standalone_turn(
 
         // Reuse the canonical persistence path for actual truncated output,
         // without turning an incomplete model response into a successful turn.
+        let terminal_error_code = if result.as_ref().err().is_some_and(|error|
+            error.downcast_ref::<octos_agent::IncompleteResponseError>().is_some()) {
+            "output_truncated"
+        } else {
+            "turn_failed"
+        };
         let incomplete_message = result.as_ref().err().and_then(|error| {
-            error.downcast_ref::<octos_agent::IncompleteResponseError>()
-                .map(ToString::to_string)
+            if error.downcast_ref::<octos_agent::IncompleteResponseError>().is_some()
+                || error.downcast_ref::<octos_agent::FailedConversationProgress>().is_some()
+            {
+                Some(classify_runtime_error_message(error))
+            } else {
+                None
+            }
         });
         let result = match result {
-            Err(error) if incomplete_message.is_some() => Ok(error
-                .downcast_ref::<octos_agent::IncompleteResponseError>()
-                .expect("incomplete carrier checked above").partial.clone()),
+            Err(error) if incomplete_message.is_some() => {
+                let partial = error.downcast_ref::<octos_agent::IncompleteResponseError>()
+                    .map(|carrier| carrier.partial.clone())
+                    .or_else(|| error.downcast_ref::<octos_agent::FailedConversationProgress>()
+                        .map(|carrier| carrier.partial.clone()))
+                    .expect("partial conversation carrier checked above");
+                Ok(partial)
+            }
             result => result,
         };
         match result {
@@ -42225,7 +42267,7 @@ async fn run_standalone_turn(
                             }),
                     };
                     let error = json!({
-                        "type": "error", "code": "output_truncated", "message": message,
+                        "type": "error", "code": terminal_error_code, "message": message,
                         "partial_result": partial_result,
                         "tokens_in": response.token_usage.input_tokens,
                         "tokens_out": response.token_usage.output_tokens,

@@ -1267,7 +1267,8 @@ fn expected_v2_active_projection(
         compaction_summary_insert_index(&installed),
         summary_item.clone(),
     );
-    if record.token_estimate_after != Some(estimate_items_tokens(&installed))
+    if (record.token_estimate_after != Some(estimate_items_tokens(&installed))
+        && record.token_estimate_after != Some(legacy_estimate_items_tokens(&installed)))
         || record.installed_transcript_hash.as_deref()
             != Some(
                 transcript_hash_for_projection(
@@ -1305,7 +1306,8 @@ fn v2_active_projection_is_coherent(
     let projected_ids = projected.iter().map(|item| &item.id).collect::<Vec<_>>();
     if projected_ids != expected_ids
         || snapshot.state.item_count != projected.len()
-        || snapshot.state.token_estimate != estimate_items_tokens(projected)
+        || (snapshot.state.token_estimate != estimate_items_tokens(projected)
+            && snapshot.state.token_estimate != legacy_estimate_items_tokens(projected))
         || snapshot.state.transcript_hash
             != transcript_hash_for_projection(
                 &snapshot.state.session_id,
@@ -4255,7 +4257,59 @@ fn tool_output_preview(value: &str) -> String {
     .0
 }
 
+/// Model-visible size, excluding ledger metadata, hidden reasoning, raw
+/// sidecars and checkpoints. Provider serialization overhead/tool declarations
+/// are reserved separately by the prompt bridge. Legacy estimates are accepted
+/// on snapshot load so upgrading does not discard a valid compacted history.
+fn estimate_item_tokens(item: &TranscriptItem) -> usize {
+    use octos_llm::context::estimate_tokens;
+    let text = |value: &str| estimate_tokens(value) as usize + 4;
+    match &item.kind {
+        TranscriptItemKind::SystemInstruction { content }
+        | TranscriptItemKind::DeveloperInstruction { content }
+        | TranscriptItemKind::AssistantFinal { content } => text(content),
+        TranscriptItemKind::UserInput { content, media } => {
+            let mut message = Message::user(content.clone());
+            message.media = media.clone();
+            octos_llm::context::estimate_message_tokens(&message) as usize
+        }
+        TranscriptItemKind::AssistantToolCall {
+            call_id,
+            name,
+            arguments,
+        } => text(name) + text(call_id) + text(&arguments.to_string()),
+        TranscriptItemKind::ToolOutput { envelope } => {
+            let mut message = Message::assistant(envelope.model_visible_content.clone());
+            message.media = envelope.media.clone();
+            octos_llm::context::estimate_message_tokens(&message) as usize
+        }
+        TranscriptItemKind::ContextInjection { label, content }
+        | TranscriptItemKind::ContextEvent { label, content, .. } => {
+            text(label) + text(content) + 24
+        }
+        TranscriptItemKind::ChildResultSummary {
+            child_agent_id,
+            summary,
+            artifact_refs,
+            reference_artifact_refs,
+        } => {
+            text(child_agent_id)
+                + text(summary)
+                + text(&artifact_refs.join(", "))
+                + text(&reference_artifact_refs.join(", "))
+        }
+        TranscriptItemKind::CompactionSummary { summary, .. } => text(summary) + 96,
+        TranscriptItemKind::AssistantReasoning { .. }
+        | TranscriptItemKind::Checkpoint { .. }
+        | TranscriptItemKind::ForkBoundary { .. } => 0,
+    }
+}
+
 fn estimate_items_tokens(items: &[TranscriptItem]) -> usize {
+    items.iter().map(estimate_item_tokens).sum::<usize>().max(1)
+}
+
+fn legacy_estimate_items_tokens(items: &[TranscriptItem]) -> usize {
     let bytes = items
         .iter()
         .map(|item| {
@@ -4326,11 +4380,11 @@ fn xml_escape_text(value: &str) -> String {
 }
 
 fn estimate_messages_tokens(messages: &[Message]) -> usize {
-    let bytes = messages
+    messages
         .iter()
-        .map(|message| message.content.len() + message.media.iter().map(String::len).sum::<usize>())
-        .sum::<usize>();
-    estimate_tokens_from_bytes(bytes)
+        .map(|message| octos_llm::context::estimate_message_tokens(message) as usize)
+        .sum::<usize>()
+        .max(1)
 }
 
 fn estimate_tokens_from_bytes(bytes: usize) -> usize {
@@ -4682,15 +4736,11 @@ fn semantic_blocks_for_items(items: &[TranscriptItem]) -> Vec<SemanticBlock> {
 }
 
 fn estimate_semantic_block_tokens(items: &[&TranscriptItem]) -> usize {
-    let bytes = items
+    items
         .iter()
-        .map(|item| {
-            serde_json::to_vec(&item.kind)
-                .map(|bytes| bytes.len())
-                .unwrap_or_default()
-        })
-        .sum::<usize>();
-    estimate_tokens_from_bytes(bytes)
+        .map(|item| estimate_item_tokens(item))
+        .sum::<usize>()
+        .max(1)
 }
 
 fn hash_json(value: &Value) -> String {
@@ -4777,6 +4827,64 @@ mod tests {
     ///
     /// Paired with the perf property: an unchanged history must take the fast
     /// path, or the optimisation does nothing.
+    #[test]
+    fn should_count_tool_arguments_and_media_in_model_visible_budget() {
+        let plain = Message::user("inspect");
+        let mut image = plain.clone();
+        image.media.push("/tmp/chart.png".to_owned());
+        assert!(estimate_messages_tokens(&[image]) > estimate_messages_tokens(&[plain]) + 100);
+        let mut call = Message::assistant("");
+        call.tool_calls = Some(vec![ToolCall {
+            id: "one".into(),
+            name: "write_file".into(),
+            metadata: None,
+            arguments: json!({"content": "x".repeat(16_000)}),
+        }]);
+        assert!(estimate_messages_tokens(&[call]) >= 4_000);
+    }
+
+    #[test]
+    fn should_exclude_hidden_reasoning_and_raw_ledger_payload_from_compaction_threshold() {
+        let mut manager = ContextManager::new("model-budget", None);
+        let mut assistant = Message::assistant("artifact saved");
+        assistant.reasoning_content = Some("private reasoning ".repeat(50_000));
+        manager.record_message(&Message::user("continue"));
+        manager.record_message(&assistant);
+        assert!(legacy_estimate_items_tokens(manager.items()) > 100_000);
+        assert!(!manager.should_auto_compact(1_000));
+        manager.record_tool_output("one", "read_file", &"raw logs ".repeat(50_000));
+        assert!(
+            estimate_items_tokens(manager.items()) < 4_000,
+            "spilled raw data must not trigger compaction"
+        );
+    }
+
+    #[test]
+    fn should_load_legacy_token_estimates_without_losing_compacted_projection() {
+        let mut manager = ContextManager::new("budget-upgrade", None);
+        manager.record_message(&Message::user("old request ".repeat(500)));
+        manager.record_message(&Message::assistant("old answer ".repeat(500)));
+        manager.record_message(&Message::user("p36-v9 complete; next clean artwork"));
+        manager.compact_context(
+            "earlier work complete",
+            CompactContextPolicy {
+                keep_recent_tokens: Some(64),
+                target_tokens_after_compaction: Some(1_000),
+                ..Default::default()
+            },
+        );
+        let mut snapshot = manager.snapshot();
+        snapshot.state.token_estimate = legacy_estimate_items_tokens(manager.items());
+        let expected = manager.for_prompt(&PromptBuildPolicy::default()).messages;
+        let loaded = ContextManager::from_snapshot(snapshot);
+        let actual = loaded.for_prompt(&PromptBuildPolicy::default()).messages;
+        assert_eq!(
+            actual.iter().map(|m| &m.content).collect::<Vec<_>>(),
+            expected.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.generation(), manager.generation());
+    }
+
     #[test]
     fn should_never_claim_coverage_the_replay_would_deny() {
         for history in differential_histories() {

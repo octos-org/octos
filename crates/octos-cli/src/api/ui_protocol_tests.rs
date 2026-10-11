@@ -4619,6 +4619,63 @@ fn appui_prompt_context_bridge_reports_live_context_state_when_negotiated() {
 }
 
 #[test]
+fn appui_prompt_context_bridge_retains_one_shot_reflection_at_original_position() {
+    let session_id = SessionKey::new("api", "checkpoint-once");
+    let manager = Arc::new(StdMutex::new(ContextManager::new(
+        session_id.to_string(),
+        None,
+    )));
+    let dir = tempfile::tempdir().unwrap();
+    let bridge =
+        AppUiPromptContextBridge::new(session_id, dir.path().to_path_buf(), manager.clone(), false);
+    let mut prompt = vec![
+        Message::system("stable runtime"),
+        Message::user("finish deck"),
+    ];
+    let request = |phase, iteration| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".into(),
+        model_id: "large-context".into(),
+        context_window: 200_000,
+    };
+    bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .unwrap();
+    let checkpoint = "<context_event kind=\"convergence_checkpoint\" authority=\"background\">p36-v9 complete</context_event>";
+    prompt.push(Message::user(checkpoint));
+    prompt.push(Message::assistant("new clean artwork requested"));
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut prompt)
+        .unwrap();
+    let original = prompt.iter().position(|m| m.content == checkpoint).unwrap();
+    prompt.push(Message::assistant("clean artwork received"));
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 3), &mut prompt)
+        .unwrap();
+    assert_eq!(
+        prompt
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.content == checkpoint)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>(),
+        vec![original]
+    );
+    assert_eq!(prompt.last().unwrap().content, "clean artwork received");
+    let reloaded = ContextManager::from_snapshot(manager.lock().unwrap().snapshot());
+    assert_eq!(
+        reloaded
+            .for_prompt(&PromptBuildPolicy::default())
+            .messages
+            .iter()
+            .filter(|m| m.content == checkpoint)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn appui_prompt_context_bridge_preserves_current_user_turn() {
     let session_id = SessionKey::new("api", "context-current-user");
     let history = vec![
@@ -29075,7 +29132,7 @@ async fn bounded_channel_reporter_emits_typed_thread_id_on_progress_events() {
         .with_thread_id(Some("turn-pr-f-A".to_string()));
     reporter.report(octos_agent::ProgressEvent::Thinking { iteration: 0 });
 
-    let event = rx.try_recv().expect("event must be available");
+    let event = rx.recv().await.expect("event must be available");
     let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
     assert_eq!(
         parsed["thread_id"], "turn-pr-f-A",
@@ -29086,7 +29143,7 @@ async fn bounded_channel_reporter_emits_typed_thread_id_on_progress_events() {
     let (tx2, mut rx2) = tokio::sync::mpsc::channel::<String>(8);
     let unbound = BoundedChannelReporter::new(tx2, dropped);
     unbound.report(octos_agent::ProgressEvent::Thinking { iteration: 1 });
-    let event = rx2.try_recv().expect("event must be available");
+    let event = rx2.recv().await.expect("event must be available");
     let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
     assert!(
         parsed.get("thread_id").is_none(),
@@ -31296,7 +31353,11 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
     );
     assert_eq!(response.assistant_segments.final_iteration, 4);
     if progress_mode == 2 {
-        assert!(progress_dropped.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            progress_dropped.load(Ordering::SeqCst),
+            0,
+            "a full transport queue must not discard tool/identity events"
+        );
     }
     let (ws, _writer) = ws_connection_for_test(512);
     let context = ProgressMappingContext::new(session.clone(), turn_id);
@@ -31305,7 +31366,9 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
     let mut saw_delta = false;
     let mut expected_stream_ids = Vec::new();
     let mut delayed_progress = Vec::new();
-    while let Ok(json) = rx.try_recv() {
+    while let Ok(Some(json)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+    {
         let event: Value = serde_json::from_str(&json).unwrap();
         if progress_mode == 4 {
             delayed_progress.push(event);
