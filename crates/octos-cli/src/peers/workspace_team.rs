@@ -17,6 +17,8 @@ pub(crate) const UPDATED: &str = "peer/team/updated";
 pub(crate) const FEATURE: &str = "peer.workspace_team.v1";
 pub(crate) const MESSAGE_KIND: &str = "workspace_peer_message";
 const MAX_MEMBERS: usize = 1024;
+/// New-member admissions at or past this seat count warn the operator (#2741).
+const CAPACITY_WARN_AT: usize = MAX_MEMBERS / 4 * 3;
 const MAX_RESULT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -349,6 +351,298 @@ impl WorkspaceTeams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    /// Writes a team file with the given `(agent_id, session_id)` seats,
+    /// joined in order (earliest first) with the first seat as leader.
+    fn seed_team_file(profile: &Path, workspace: &Path, seats: &[(&str, &str)]) {
+        let (dir, canonical) = location(profile, workspace).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let team = Team {
+            workspace: canonical,
+            revision: seats.len() as u64,
+            leader: seats[0].0.to_owned(),
+            leadership_epoch: 1,
+            members: seats
+                .iter()
+                .enumerate()
+                .map(|(i, (agent_id, session))| Member {
+                    agent_id: (*agent_id).to_owned(),
+                    session_id: SessionKey((*session).to_owned()),
+                    joined_at_ms: now + i as i64,
+                    result: None,
+                    result_turn_id: None,
+                })
+                .collect(),
+        };
+        persist(&dir, &team).unwrap();
+    }
+
+    fn seat_ids(count: usize) -> Vec<(String, String)> {
+        (0..count)
+            .map(|i| (format!("workspace-{}", i + 1), format!("local:s{i}")))
+            .collect()
+    }
+
+    #[test]
+    fn join_at_cap_evicts_the_stalest_disconnected_member() {
+        let profile = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let seats = seat_ids(MAX_MEMBERS);
+        let seat_refs: Vec<(&str, &str)> =
+            seats.iter().map(|(a, s)| (a.as_str(), s.as_str())).collect();
+        seed_team_file(profile.path(), workspace.path(), &seat_refs);
+
+        let teams = WorkspaceTeams::default();
+        let leader = SessionKey("local:s0".into());
+        // The leader reconnects; every other seat stays stale (no live
+        // connection ever registered for it in this process).
+        let joined = teams
+            .join(profile.path(), workspace.path(), &leader, 1)
+            .unwrap();
+        assert_eq!(joined.members.len(), MAX_MEMBERS);
+
+        let joined = teams
+            .join(
+                profile.path(),
+                workspace.path(),
+                &SessionKey("local:new".into()),
+                2,
+            )
+            .unwrap();
+        assert_eq!(joined.members.len(), MAX_MEMBERS);
+        assert!(joined.member("local:s1").is_none());
+        assert!(joined.member("local:s2").is_some());
+        assert_eq!(
+            joined.member("local:new").unwrap().agent_id,
+            format!("workspace-{}", MAX_MEMBERS + 1)
+        );
+        assert_eq!(joined.leader, "workspace-1");
+
+        // The eviction is durable: a fresh registry reloads the same team.
+        let restarted = WorkspaceTeams::default();
+        let reloaded = restarted
+            .join(profile.path(), workspace.path(), &leader, 3)
+            .unwrap();
+        assert_eq!(reloaded.members.len(), MAX_MEMBERS);
+        assert!(reloaded.member("local:s1").is_none());
+        assert!(reloaded.member("local:new").is_some());
+    }
+
+    #[test]
+    fn join_at_cap_with_every_seat_connected_still_refuses() {
+        let profile = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let seats = seat_ids(MAX_MEMBERS);
+        let seat_refs: Vec<(&str, &str)> =
+            seats.iter().map(|(a, s)| (a.as_str(), s.as_str())).collect();
+        seed_team_file(profile.path(), workspace.path(), &seat_refs);
+
+        let teams = WorkspaceTeams::default();
+        for (i, (_, session)) in seats.iter().enumerate() {
+            teams
+                .join(
+                    profile.path(),
+                    workspace.path(),
+                    &SessionKey(session.clone()),
+                    i as u64 + 1,
+                )
+                .unwrap();
+        }
+        let error = teams
+            .join(
+                profile.path(),
+                workspace.path(),
+                &SessionKey("local:new".into()),
+                MAX_MEMBERS as u64 + 1,
+            )
+            .unwrap_err();
+        assert!(error.contains("member limit"), "got: {error}");
+        // No seat was silently dropped to make the failure look like success.
+        let team = teams
+            .get(
+                profile.path(),
+                workspace.path(),
+                &SessionKey("local:s0".into()),
+            )
+            .unwrap();
+        assert_eq!(team.members.len(), MAX_MEMBERS);
+        assert!(team.member("local:new").is_none());
+    }
+
+    #[test]
+    fn capped_join_transfers_leadership_when_the_stale_leader_is_evicted() {
+        let profile = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let seats = seat_ids(MAX_MEMBERS);
+        let seat_refs: Vec<(&str, &str)> =
+            seats.iter().map(|(a, s)| (a.as_str(), s.as_str())).collect();
+        seed_team_file(profile.path(), workspace.path(), &seat_refs);
+
+        let teams = WorkspaceTeams::default();
+        let joined = teams
+            .join(
+                profile.path(),
+                workspace.path(),
+                &SessionKey("local:new".into()),
+                1,
+            )
+            .unwrap();
+        assert!(joined.member("local:s0").is_none());
+        assert_eq!(
+            joined.leader, "workspace-2",
+            "leadership falls to the earliest remaining member"
+        );
+        assert_eq!(
+            joined.leadership_epoch, 2,
+            "the epoch bump fences the evicted coordinator"
+        );
+
+        // The file stays loadable: the recorded leader is still a member.
+        let restarted = WorkspaceTeams::default();
+        let successor = SessionKey("local:s1".into());
+        let reloaded = restarted
+            .join(profile.path(), workspace.path(), &successor, 2)
+            .unwrap();
+        assert_eq!(reloaded.leader, "workspace-2");
+        assert_eq!(reloaded.leadership_epoch, 2);
+        assert!(
+            restarted
+                .with_leader(
+                    profile.path(),
+                    workspace.path(),
+                    &SessionKey("local:new".into()),
+                    1,
+                    |_| Ok(())
+                )
+                .is_err()
+        );
+        assert!(
+            restarted
+                .with_leader(
+                    profile.path(),
+                    workspace.path(),
+                    &successor,
+                    reloaded.leadership_epoch,
+                    |_| Ok(())
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn regenerated_agent_ids_never_collide_with_gapped_existing_members() {
+        let profile = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        // workspace-2 was evicted earlier; the next seat must not reuse a
+        // live member's number.
+        seed_team_file(
+            profile.path(),
+            workspace.path(),
+            &[("workspace-1", "local:a"), ("workspace-3", "local:c")],
+        );
+        let teams = WorkspaceTeams::default();
+        let joined = teams
+            .join(
+                profile.path(),
+                workspace.path(),
+                &SessionKey("local:new".into()),
+                1,
+            )
+            .unwrap();
+        let ids: HashSet<_> = joined.members.iter().map(|m| m.agent_id.clone()).collect();
+        assert_eq!(ids.len(), joined.members.len());
+        assert!(joined.member("workspace-4").is_some());
+        assert_eq!(
+            joined.member("workspace-3").unwrap().session_id.0,
+            "local:c"
+        );
+    }
+
+    #[test]
+    fn joining_when_approaching_the_member_cap_warns_the_operator() {
+        let profile = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let seats = seat_ids(CAPACITY_WARN_AT - 1);
+        let seat_refs: Vec<(&str, &str)> =
+            seats.iter().map(|(a, s)| (a.as_str(), s.as_str())).collect();
+        seed_team_file(profile.path(), workspace.path(), &seat_refs);
+        WorkspaceTeams::default()
+            .join(
+                profile.path(),
+                workspace.path(),
+                &SessionKey("local:new".into()),
+                1,
+            )
+            .unwrap();
+        assert!(
+            capture.contents().contains("approaching the member limit"),
+            "an admission at the warning line must warn, got: {}",
+            capture.contents()
+        );
+
+        let quiet_profile = tempfile::tempdir().unwrap();
+        let quiet_workspace = tempfile::tempdir().unwrap();
+        let seats = seat_ids(2);
+        let seat_refs: Vec<(&str, &str)> =
+            seats.iter().map(|(a, s)| (a.as_str(), s.as_str())).collect();
+        seed_team_file(quiet_profile.path(), quiet_workspace.path(), &seat_refs);
+        WorkspaceTeams::default()
+            .join(
+                quiet_profile.path(),
+                quiet_workspace.path(),
+                &SessionKey("local:new".into()),
+                1,
+            )
+            .unwrap();
+        assert!(
+            !capture.contents().contains("approaching the member limit"),
+            "an admission below the warning line must stay quiet, got: {}",
+            capture.contents()
+        );
+    }
+
+    /// Captures `tracing` output so operator-visibility behaviour can be
+    /// asserted.
+    #[derive(Clone, Default)]
+    struct LogCapture {
+        buf: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buf.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[test]
     fn joins_are_idempotent_and_leadership_survives_restart() {
