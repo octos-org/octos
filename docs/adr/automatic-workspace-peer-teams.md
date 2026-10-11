@@ -244,6 +244,16 @@ permanently fail, recoverable only by hand-editing team.json.
 Accepted residual risks, now on the record:
 - A corrupted/tampered team.json degrades silently (the operator must
   watch the logs).
-- The 1024 cap still needs a member GC or a capacity warning; until
-  then, the team surface silently stops accepting new members at the
-  cap (the sessions keep working).
+- A team whose every seat is live-connected still cannot admit new
+  members; those joins degrade to opened-outside-the-team (the
+  sessions keep working).
+
+Amendment (2026-10-11): the accumulate side is fixed. A join at the
+1024 cap first evicts the stalest members with no live connection
+(oldest `joined_at_ms` first, exactly enough to admit the joiner; a
+connected member is never evicted) and warns the operator. Seat
+numbers derive from the highest existing seat, so a freed number is
+never reused while its old holder is still listed. An evicted
+leader's role falls to the earliest survivor with a `leadership_epoch`
+bump, fencing a coordinator evicted mid-flight. Admissions at 75% of
+the cap warn before the pressure starts.
