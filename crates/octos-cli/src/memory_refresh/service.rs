@@ -311,8 +311,36 @@ impl Drop for RefreshLock {
     }
 }
 
+/// Retry budget for [`acquire_refresh_lock`]: a transient lock-setup
+/// failure (a loaded host can fail `open`/`flock` with a one-off error —
+/// the #2684 flake) must not permanently skip the sweep for a runtime's
+/// lifetime, so retry briefly before surfacing the error. Genuine
+/// contention never reaches the retry — it is `Ok(None)`, the by-design
+/// loser path.
+const LOCK_SETUP_ATTEMPTS: usize = 3;
+const LOCK_SETUP_RETRY_DELAY: Duration = Duration::from_millis(150);
+
 /// Open + `flock` the profile refresh lock. `Ok(None)` = held elsewhere.
 fn acquire_refresh_lock(data_dir: &Path) -> Result<Option<RefreshLock>> {
+    let mut attempt = 1;
+    loop {
+        match acquire_refresh_lock_once(data_dir) {
+            Ok(lock) => return Ok(lock),
+            Err(e) if attempt < LOCK_SETUP_ATTEMPTS => {
+                tracing::warn!(
+                    error = %e,
+                    attempt,
+                    "memory refresh lock setup failed; retrying"
+                );
+                attempt += 1;
+                std::thread::sleep(LOCK_SETUP_RETRY_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn acquire_refresh_lock_once(data_dir: &Path) -> Result<Option<RefreshLock>> {
     use std::io::Write;
     let memory_dir = data_dir.join("memory");
     std::fs::create_dir_all(&memory_dir)?;
@@ -1280,6 +1308,19 @@ mod tests {
         );
         assert!(replacement.is_some(), "replacement must own the sweep");
         drop(first);
+    }
+
+    #[test]
+    fn should_surface_persistent_lock_setup_failure_after_retries() {
+        // A regular file where the memory dir would live: every attempt
+        // fails, so this pins the retry loop's concession contract —
+        // the setup error still surfaces as `Err` (never the by-design
+        // `Ok(None)` contention shape, never a panic).
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("memory");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let deeper = blocker.join("deeper");
+        assert!(acquire_refresh_lock(&deeper).is_err());
     }
 
     #[cfg(unix)]
