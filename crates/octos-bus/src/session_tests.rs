@@ -2033,6 +2033,257 @@ fn list_top_level_sessions_with_meta_surfaces_updated_at() {
     );
 }
 
+// The listing row cache validates each file by its (len, modified) pair
+// (#2392), so every mutation shape below must surface on the very next
+// listing — a stale row served here would be a wrong message count, title,
+// or preview on the dashboard's polling path.
+
+#[tokio::test]
+async fn listing_cache_refreshes_rows_after_appends_from_another_manager() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "cache-append");
+
+    mgr.add_message(&key, make_message(MessageRole::User, "first"))
+        .await
+        .unwrap();
+    let rows = mgr.list_top_level_sessions_with_meta();
+    let row = rows
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-append")
+        .expect("session listed");
+    let count_after_first = row.1;
+    assert_eq!(row.4.as_deref(), Some("first"));
+
+    // The per-profile listing paths open a fresh manager per request, so the
+    // cache is shared process-wide: an append through a second instance must
+    // still invalidate the first one's cached row.
+    let mut other = SessionManager::open(tmp.path()).unwrap();
+    other
+        .add_message(&key, make_message(MessageRole::User, "second"))
+        .await
+        .unwrap();
+
+    let rows = mgr.list_top_level_sessions_with_meta();
+    let row = rows
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-append")
+        .expect("session still listed");
+    assert_eq!(
+        row.1,
+        count_after_first + 1,
+        "append must refresh the count"
+    );
+    assert_eq!(
+        row.4.as_deref(),
+        Some("second"),
+        "append must refresh the preview"
+    );
+}
+
+#[tokio::test]
+async fn listing_cache_refreshes_when_an_oversize_append_rolls_a_seal() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "cache-seal");
+
+    mgr.add_message(&key, make_message(MessageRole::User, "seed"))
+        .await
+        .unwrap();
+    let count_before = mgr
+        .list_top_level_sessions_with_meta()
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-seal")
+        .expect("session listed")
+        .1;
+
+    // The seal fires on the entry check of the append AFTER the file is
+    // already past the segment size, so first grow the file past 8 MiB with
+    // one oversized row, then append again to trigger the roll: the active
+    // file the walker stats is replaced wholesale, and the count picks up
+    // the sealed base_seq.
+    mgr.add_message(
+        &key,
+        make_message(MessageRole::Assistant, &"x".repeat(8 * 1024 * 1024 + 1024)),
+    )
+    .await
+    .unwrap();
+    let count_grown = mgr
+        .list_top_level_sessions_with_meta()
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-seal")
+        .expect("session listed after the oversize append")
+        .1;
+    assert_eq!(count_grown, count_before + 1);
+
+    mgr.add_message(&key, make_message(MessageRole::User, "after the roll"))
+        .await
+        .unwrap();
+
+    assert!(
+        walk_subdirs(tmp.path())
+            .iter()
+            .any(|dir| dir.extension().is_some_and(|ext| ext == "segments")),
+        "the second append must have sealed a segment"
+    );
+    let rows = mgr.list_top_level_sessions_with_meta();
+    let row = rows
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-seal")
+        .expect("session still listed");
+    assert_eq!(
+        row.1,
+        count_grown + 1,
+        "the rolled write must refresh the count"
+    );
+}
+
+/// Every directory under `dir`, at any depth (sealed segments live in
+/// `<active stem>.segments/` beside the session file).
+fn walk_subdirs(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path.clone());
+                stack.push(path);
+            }
+        }
+    }
+    dirs
+}
+
+#[tokio::test]
+async fn listing_cache_refreshes_title_after_update_title() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "cache-title");
+
+    mgr.add_message(&key, make_message(MessageRole::User, "hello"))
+        .await
+        .unwrap();
+    let rows = mgr.list_top_level_sessions_with_meta();
+    let row = rows
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-title")
+        .expect("session listed");
+    assert_eq!(
+        row.2.as_deref(),
+        Some("hello"),
+        "auto-derived title before the rename"
+    );
+
+    mgr.update_title(&key, "Renamed".to_string()).await.unwrap();
+
+    let rows = mgr.list_top_level_sessions_with_meta();
+    let row = rows
+        .iter()
+        .find(|(id, ..)| id == "cli:cache-title")
+        .expect("session still listed");
+    assert_eq!(
+        row.2.as_deref(),
+        Some("Renamed"),
+        "rename must refresh the title"
+    );
+}
+
+#[tokio::test]
+async fn listing_cache_drops_rows_for_deleted_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let mut mgr = SessionManager::open(tmp.path()).unwrap();
+    let key = SessionKey::new("cli", "cache-delete");
+
+    mgr.add_message(&key, make_message(MessageRole::User, "gone"))
+        .await
+        .unwrap();
+    assert!(
+        mgr.list_top_level_sessions_with_meta()
+            .iter()
+            .any(|(id, ..)| id == "cli:cache-delete")
+    );
+
+    // Remove every session file under the data dir; the next listing must
+    // not resurrect the deleted row from the cache.
+    for entry in walk_jsonl(tmp.path()) {
+        std::fs::remove_file(entry).unwrap();
+    }
+    assert!(
+        mgr.list_top_level_sessions_with_meta().is_empty(),
+        "deleted sessions must not be listed"
+    );
+}
+
+#[tokio::test]
+async fn listing_cache_keeps_other_roots_rows_and_drops_only_its_own() {
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let mut mgr_a = SessionManager::open(tmp_a.path()).unwrap();
+    let mut mgr_b = SessionManager::open(tmp_b.path()).unwrap();
+    let key_a = SessionKey::new("cli", "cache-root-a");
+    let key_b = SessionKey::new("cli", "cache-root-b");
+    mgr_a
+        .add_message(&key_a, make_message(MessageRole::User, "in a"))
+        .await
+        .unwrap();
+    mgr_b
+        .add_message(&key_b, make_message(MessageRole::User, "in b"))
+        .await
+        .unwrap();
+
+    // Warm both roots, then inspect the shared map: each /sessions request
+    // walks the per-profile dir and the process-wide store back to back, so
+    // one root's walk must never evict another's rows.
+    mgr_a.list_top_level_sessions_with_meta();
+    mgr_b.list_top_level_sessions_with_meta();
+    let root_a = std::fs::canonicalize(tmp_a.path().join("sessions")).unwrap();
+    let root_b = std::fs::canonicalize(tmp_b.path().join("sessions")).unwrap();
+    let cache = listing_row_cache().lock().unwrap();
+    assert!(
+        cache.keys().any(|path| path.starts_with(&root_a)),
+        "root A rows must be cached"
+    );
+    assert!(
+        cache.keys().any(|path| path.starts_with(&root_b)),
+        "root B rows must survive root B's walk of a different manager"
+    );
+    drop(cache);
+
+    // Delete root A's file and re-walk A: only A's entries are dropped.
+    for entry in walk_jsonl(&root_a) {
+        std::fs::remove_file(entry).unwrap();
+    }
+    mgr_a.list_top_level_sessions_with_meta();
+    let cache = listing_row_cache().lock().unwrap();
+    assert!(
+        !cache.keys().any(|path| path.starts_with(&root_a)),
+        "root A's dropped file must not keep a cache entry"
+    );
+    assert!(
+        cache.keys().any(|path| path.starts_with(&root_b)),
+        "root B rows must survive root A's walk"
+    );
+}
+
+/// Every `.jsonl` file under `dir`, at any depth (session files live in the
+/// flat layout and the per-user layout).
+fn walk_jsonl(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
 #[tokio::test]
 async fn list_top_level_sessions_with_meta_surfaces_last_user_prompt() {
     let tmp = TempDir::new().unwrap();

@@ -788,8 +788,22 @@ pub async fn list_sessions(
             .ok(),
     };
     if let Some(profile_data_dir) = profile_data_dir {
-        let profile_sessions =
-            list_profile_sessions(&profile_data_dir, active_turns, effective_profile_id);
+        // The profile listing reads session files synchronously; hand it to
+        // the blocking pool so a cold scan parks a blocking thread instead of
+        // stalling this connection's executor (#2392).
+        let active_turns = active_turns.clone();
+        let effective = effective_profile_id.to_string();
+        let profile_sessions = match tokio::task::spawn_blocking(move || {
+            list_profile_sessions(&profile_data_dir, &active_turns, &effective)
+        })
+        .await
+        {
+            Ok(profile_sessions) => profile_sessions,
+            Err(err) => {
+                tracing::warn!(%err, "profile session listing task failed");
+                Vec::new()
+            }
+        };
         let existing: std::collections::HashSet<String> =
             all.iter().map(|s| s.id.clone()).collect();
         all.extend(
@@ -800,7 +814,7 @@ pub async fn list_sessions(
     }
 
     if let Some(sessions) = &state.sessions {
-        let sess = sessions.lock().await;
+        let sessions = sessions.clone();
         let prefix = format!("{effective_profile_id}:api:");
         // Use `list_top_level_sessions` (skips `child-*` and `*.tasks` at the
         // directory walk) so a user dir with tens of thousands of spawn
@@ -810,8 +824,24 @@ pub async fn list_sessions(
         // pre-dating the encoder rules).
         let existing: std::collections::HashSet<String> =
             all.iter().map(|s| s.id.clone()).collect();
+        // The walk reads every active session file (meta line, tail preview,
+        // row count) under the manager lock; the lock is taken on the
+        // blocking pool so a cold scan parks there instead of stalling an
+        // async executor while it runs (#2392). `blocking_lock` is sound on
+        // that pool and serializes the walk exactly as the awaited lock did.
+        let listed = match tokio::task::spawn_blocking(move || {
+            sessions.blocking_lock().list_top_level_sessions_with_meta()
+        })
+        .await
+        {
+            Ok(listed) => listed,
+            Err(err) => {
+                tracing::warn!(%err, "session listing task failed");
+                Vec::new()
+            }
+        };
         all.extend(
-            sess.list_top_level_sessions_with_meta()
+            listed
                 .into_iter()
                 .filter_map(|(id, count, title, updated_at, last_prompt)| {
                     let chat_id = id.strip_prefix(&prefix)?;
