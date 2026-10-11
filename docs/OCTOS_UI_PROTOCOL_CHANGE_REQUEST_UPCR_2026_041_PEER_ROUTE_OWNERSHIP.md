@@ -2,8 +2,8 @@
 
 - **Request id**: UPCR-2026-041
 - **Date**: 2026-10-07
-- **Status**: implemented (this PR)
-- **Implements**: the #2660 register-hijack fix (this PR's route-ownership gates)
+- **Status**: implemented (merged as #2690)
+- **Implements**: the #2660 register-hijack fix (the route-ownership gates merged in #2690)
 
 ## Problem
 

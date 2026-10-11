@@ -1,8 +1,11 @@
-# UPCR-2026-027: Skill Action Background Jobs
+# UPCR-2026-045: Skill Action Background Jobs
 
 Status: accepted
 Date: 2026-07-09
-PR: TBD
+PR: #1637
+
+Formerly filed as UPCR-2026-027; renumbered to the next free number to resolve a
+duplicate-numbering collision (see [the UPCR registry](upcr/README.md)).
 
 ## Summary
 
@@ -11,7 +14,7 @@ Add a generic AppUI background-job surface for manifest-declared skill actions:
 `skill/action/job/updated` notification, advertised through
 `skill.action_jobs.v1`.
 
-This extends UPCR-2026-026 without making NotebookLM or source import a backend
+This extends UPCR-2026-044 without making NotebookLM or source import a backend
 protocol primitive. Skills decide which actions are background-capable through
 their manifest. AppUI clients can start an action and observe job progress, but
 they still cannot invoke arbitrary tools or override a skill-owned binding.
@@ -20,7 +23,7 @@ they still cannot invoke arbitrary tools or override a skill-owned binding.
 
 Do add an optional `execution` field to skill manifest actions:
 
-- `sync` (default): existing UPCR-2026-026 behavior
+- `sync` (default): existing UPCR-2026-044 behavior
 - `background`: `skill/action/invoke` enqueues one or more durable jobs and
   returns immediately
 
@@ -205,7 +208,7 @@ state machine.
 ## Compatibility
 
 Backward-compatible. Existing manifests omit `execution` and keep synchronous
-UPCR-2026-026 behavior. Existing clients that only know `skill.actions.v1` see
+UPCR-2026-044 behavior. Existing clients that only know `skill.actions.v1` see
 and can call synchronous actions only. Background actions are omitted from
 their action list and direct invocation fails with `method_not_supported`.
 Clients that support background actions must negotiate `skill.action_jobs.v1`
@@ -224,10 +227,10 @@ before relying on job methods or notifications.
   `e2e/fixtures/compat-test-skill/manifest.json`
   (`compat-test-skill@1.0.0`), exporting concrete `source.import` and
   background `reports.generate` actions. Production action packages and their
-  pinned registry commit are listed in UPCR-2026-026.
+  pinned registry commit are listed in UPCR-2026-044.
 
 ## References
 
-- UPCR-2026-026 for manifest-declared skill action discovery and sync invoke.
+- UPCR-2026-044 for manifest-declared skill action discovery and sync invoke.
 - `crates/octos-cli/src/api/ui_protocol.rs::APPUI_EXTRA_METHODS`.
 - `crates/octos-core/src/ui_protocol.rs::UI_PROTOCOL_NOTIFICATION_METHODS`.

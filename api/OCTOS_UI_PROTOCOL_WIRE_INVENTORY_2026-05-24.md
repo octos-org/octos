@@ -102,10 +102,10 @@ spec and UPCR documents. The authoritative source remains code:
 | `profile/skills/registry/search` | shipped AppUI extra when profile store is configured |
 | `profile/skills/install` | shipped AppUI extra when profile store is configured |
 | `profile/skills/remove` | shipped AppUI extra when profile store is configured |
-| `skill/action/list` | shipped AppUI extra, UPCR-2026-026 |
-| `skill/action/invoke` | shipped AppUI extra, UPCR-2026-026 |
-| `skill/action/job/list` | shipped AppUI extra, UPCR-2026-027 |
-| `skill/action/job/read` | shipped AppUI extra, UPCR-2026-027 |
+| `skill/action/list` | shipped AppUI extra, UPCR-2026-044 |
+| `skill/action/invoke` | shipped AppUI extra, UPCR-2026-044 |
+| `skill/action/job/list` | shipped AppUI extra, UPCR-2026-045 |
+| `skill/action/job/read` | shipped AppUI extra, UPCR-2026-045 |
 | `voice/admit` | shipped AppUI extra, gate `voice.asr_admission.v1`; ASR-only preflight for uploaded audio, never starts an LLM turn |
 | `voice/commit_admission` | shipped AppUI extra, gate `voice.asr_admission.v1`; consumes a speech admission and starts the admitted turn |
 | `onboarding/workspace_probe` | shipped local-solo AppUI extra |
@@ -191,7 +191,7 @@ form an additional live stream. See the [spec §14](OCTOS_UI_PROTOCOL_V1_SPEC_20
 | `visual/succeeded` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `visual/failed` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `voice/exit` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
-| `skill/action/job/updated` | shipped AppUI extra notification, UPCR-2026-027 |
+| `skill/action/job/updated` | shipped AppUI extra notification, UPCR-2026-045 |
 | `voice/audio_chunk` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `projection/envelope` | shipped canonical v2 live/replay on every connection; spec §14 |
 | `session/event` | shipped, UPCR-2026-014 |

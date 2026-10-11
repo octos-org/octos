@@ -106,7 +106,7 @@ pub const UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1: &str = "pane.snapshots.v1";
 /// Feature flag for UPCR-2026-003 per-session workspace cwd requests.
 pub const UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1: &str = "session.workspace_cwd.v1";
 
-/// Feature flag for UPCR-2026-022 per-session sandbox narrowing requests.
+/// Feature flag for UPCR-2026-043 per-session sandbox narrowing requests.
 pub const UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1: &str = "session.sandbox.v1";
 
 /// Feature flag for harness task registry/control commands.
@@ -1243,7 +1243,7 @@ pub mod methods {
     /// playing — it must NOT navigate before the reply audio drains. Ungated;
     /// emitted on the same ledger-backed live path as `file/attached`.
     pub const VOICE_EXIT: &str = "voice/exit";
-    /// UPCR-2026-027 `skill/action/job/updated` — latest persisted snapshot
+    /// UPCR-2026-045 `skill/action/job/updated` — latest persisted snapshot
     /// for a manifest-declared background skill action job.
     pub const SKILL_ACTION_JOB_UPDATED: &str = "skill/action/job/updated";
     /// Streamed voice-reply audio chunk (gated by `event.voice_audio.v1`).
@@ -6712,7 +6712,7 @@ pub struct QueueStateEvent {
     pub head_client_message_id: Option<String>,
 }
 
-/// UPCR-2026-027 — latest background skill action job snapshot.
+/// UPCR-2026-045 — latest background skill action job snapshot.
 ///
 /// `job` is intentionally a generic JSON object at the core protocol layer so
 /// octos-core does not depend on a specific host-side job store type.
@@ -6849,7 +6849,7 @@ pub enum UiNotification {
     /// UPCR-2026-025 voice exit intent: the voice turn detected an end /
     /// goodbye / mute intent; the client returns home after the farewell audio.
     VoiceExit(VoiceExitEvent),
-    /// UPCR-2026-027: latest background skill action job snapshot.
+    /// UPCR-2026-045: latest background skill action job snapshot.
     SkillActionJobUpdated(SkillActionJobUpdatedEvent),
     ToolStarted(ToolStartedEvent),
     ToolProgress(ToolProgressEvent),
