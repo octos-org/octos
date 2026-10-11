@@ -320,7 +320,6 @@ impl Drop for RefreshLock {
 const LOCK_SETUP_ATTEMPTS: usize = 3;
 const LOCK_SETUP_RETRY_DELAY: Duration = Duration::from_millis(150);
 
-/// Open + `flock` the profile refresh lock. `Ok(None)` = held elsewhere.
 fn acquire_refresh_lock(data_dir: &Path) -> Result<Option<RefreshLock>> {
     let mut attempt = 1;
     loop {
@@ -333,6 +332,11 @@ fn acquire_refresh_lock(data_dir: &Path) -> Result<Option<RefreshLock>> {
                     "memory refresh lock setup failed; retrying"
                 );
                 attempt += 1;
+                // Failure path only: at most `LOCK_SETUP_ATTEMPTS - 1`
+                // sleeps (~300ms total) block the caller's thread. Every
+                // caller is a cold path — `try_start` at serve/gateway
+                // bootstrap or the `octos memory refresh/status`
+                // commands — never a hot loop.
                 std::thread::sleep(LOCK_SETUP_RETRY_DELAY);
             }
             Err(e) => return Err(e),
@@ -1311,7 +1315,27 @@ mod tests {
     }
 
     #[test]
-    fn should_surface_persistent_lock_setup_failure_after_retries() {
+    fn should_recover_when_transient_lock_setup_failure_clears() {
+        // The #2684 shape: attempt 1 hits a `.refresh.lock` that is
+        // still a directory (a one-off setup failure); a helper thread
+        // removes it mid-retry, so the retry budget must land the
+        // acquisition instead of surfacing the error and silently
+        // skipping the sweep for this runtime's lifetime.
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("memory").join(".refresh.lock");
+        std::fs::create_dir_all(&lock_path).unwrap();
+        let clearer = lock_path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            std::fs::remove_dir(clearer).ok();
+        });
+        let lock = acquire_refresh_lock(dir.path())
+            .expect("retry must ride out the transient setup failure");
+        assert!(lock.is_some(), "lock must be acquired once the path clears");
+    }
+
+    #[test]
+    fn should_surface_persistent_lock_setup_failure_as_err() {
         // A regular file where the memory dir would live: every attempt
         // fails, so this pins the retry loop's concession contract —
         // the setup error still surfaces as `Err` (never the by-design
