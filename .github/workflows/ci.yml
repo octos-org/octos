@@ -353,6 +353,11 @@ jobs:
           python3 scripts/lint-ui-protocol-inventory.py --self-test
           python3 scripts/lint-ui-protocol-inventory.py
 
+      - name: UPCR filename registry lint
+        run: |
+          python3 scripts/lint-upcr-registry.py --self-test
+          python3 scripts/lint-upcr-registry.py
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_VERSION }}

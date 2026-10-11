@@ -141,6 +141,8 @@ test_a2.md
 # api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md.
 !docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_TEMPLATE.md
 !docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_*.md
+# UPCR registry index — the number -> title/status/file/landing-PR map (#2423).
+!docs/upcr/README.md
 # `octos serve --host-managed` operator/host contract (UPCR-2026-036), cited
 # from the CLI help and crates/octos-cli/src/api/host_managed.rs.
 !docs/HOST_MANAGED_SERVE.md
