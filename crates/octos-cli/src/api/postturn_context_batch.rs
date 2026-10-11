@@ -52,8 +52,9 @@ impl AppUiContextCommitBatch {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         super::publish_appui_context_status(&self.session, &manager);
-        let result = super::persist_appui_context_snapshot(&self.data_dir, &self.session, &manager)
-            .map(|_| ());
+        let result =
+            super::persist_appui_context_transition(&self.data_dir, &self.session, &manager)
+                .map(|_| ());
         tracing::info!(
             session = %self.session.0,
             committed_rows = rows,
@@ -173,6 +174,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = SessionKey("batch-cancel".into());
         let manager = Arc::new(Mutex::new(ContextManager::new(session.to_string(), None)));
+        let root = persist_context_manager_snapshot(
+            dir.path(),
+            &session.to_string(),
+            &manager.lock().unwrap(),
+        )
+        .unwrap();
+        let baseline = std::fs::read(&root).unwrap();
         let task_manager = manager.clone();
         let task_session = session.clone();
         let task_dir = dir.path().to_path_buf();
@@ -196,9 +204,14 @@ mod tests {
             std::future::pending::<()>().await;
         });
         received.await.unwrap();
-        assert!(!context_ledger_path(dir.path(), &session.to_string()).exists());
+        assert_eq!(std::fs::read(&root).unwrap(), baseline);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            std::fs::read(root).unwrap(),
+            baseline,
+            "cancellation appends a transition without rewriting history"
+        );
         let loaded = load_context_manager_snapshot(dir.path(), &session.to_string())
             .unwrap()
             .unwrap();
@@ -299,6 +312,111 @@ mod tests {
         );
     }
 
+    #[test]
+    fn should_restart_incremental_batch_after_repeated_bridge_checkpoints_and_route_change() {
+        use octos_agent::{PromptContextManager, PromptContextPhase, PromptContextRequest};
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionKey("bridge-transition-restart".into());
+        let mut history = vec![
+            Message::user("earlier work"),
+            Message::assistant("background result"),
+            Message::user("finish verified work"),
+        ];
+        let initial_rows = history.len();
+        let mut initial = ContextManager::from_session_history(session.to_string(), None, &history);
+        initial.reconcile_prompt_cache_epoch("fixture", "model", "runtime system", &[]);
+        let manager = Arc::new(Mutex::new(initial));
+        let bridge = super::super::AppUiPromptContextBridge::new(
+            session.clone(),
+            dir.path().to_owned(),
+            manager.clone(),
+            false,
+        );
+        let request = |phase, iteration| PromptContextRequest {
+            phase,
+            iteration,
+            provider_name: "fixture".into(),
+            model_id: "model".into(),
+            context_window: 200_000,
+        };
+        let mut prompt = vec![Message::system("runtime system")];
+        prompt.extend(history.clone());
+        bridge
+            .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+            .unwrap();
+        {
+            let mut canonical = manager.lock().unwrap();
+            let ids: Vec<_> = canonical
+                .ledger_items()
+                .iter()
+                .filter(|item| {
+                    item.source_ref
+                        .as_ref()
+                        .and_then(|source| source.source_seq)
+                        == Some(1)
+                })
+                .map(|item| item.id.clone())
+                .collect();
+            let generation = canonical.generation();
+            canonical.mark_source_event_kind(&ids, "background_result");
+            assert_eq!(canonical.generation(), generation);
+            super::super::persist_appui_context_snapshot(dir.path(), &session, &canonical).unwrap();
+        }
+        for iteration in 2..=4 {
+            let mut call = Message::assistant("");
+            let id = format!("call_bridge_{iteration}");
+            call.tool_calls = Some(vec![ToolCall {
+                id: id.clone(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path":"README.md"}),
+                metadata: None,
+            }]);
+            let result = Message::tool_with_thread("verified", id, ThreadId::new("thread"));
+            history.extend([call.clone(), result.clone()]);
+            prompt.extend([call, result]);
+            bridge
+                .prepare_prompt(
+                    request(PromptContextPhase::Iteration, iteration),
+                    &mut prompt,
+                )
+                .unwrap();
+            if iteration == 2 {
+                bridge.observe_effective_provider_route("fixture", "model-2");
+            }
+        }
+        let root = context_ledger_path(dir.path(), &session.to_string());
+        let before = std::fs::read(&root).unwrap();
+        let mut batch = AppUiContextCommitBatch::new(dir.path(), &manager, &session);
+        for (index, row) in history.iter().enumerate().skip(initial_rows) {
+            batch.record(row, index);
+        }
+        history.push(Message::assistant("done"));
+        batch.record(history.last().unwrap(), history.len() - 1);
+        batch.finish().unwrap();
+        assert_eq!(
+            std::fs::read(root).unwrap(),
+            before,
+            "last bridge checkpoint remains immutable"
+        );
+        let (loaded, status) =
+            load_or_rebuild_context_manager(dir.path(), session.to_string(), None, &history);
+        assert_eq!(status, ContextLedgerLoadStatus::Loaded);
+        assert_eq!(
+            prompt_value(&loaded),
+            prompt_value(&manager.lock().unwrap())
+        );
+        assert_eq!(loaded.cache_epoch(), manager.lock().unwrap().cache_epoch());
+        assert_eq!(
+            loaded.source_head_hash(),
+            manager.lock().unwrap().source_head_hash()
+        );
+        assert!(loaded.ledger_items().iter().any(|item| {
+            item.source_ref.as_ref().is_some_and(|source| {
+                source.source_seq == Some(1) && source.source_event_kind == "background_result"
+            })
+        }));
+    }
+
     /// Provider-free diagnostic, intentionally excluded from normal test runs.
     /// Run with `benchmark_long_postturn_context_batch --ignored --nocapture`.
     #[test]
@@ -307,6 +425,7 @@ mod tests {
         let fixture_start = std::time::Instant::now();
         let legacy_dir = tempfile::tempdir().unwrap();
         let batch_dir = tempfile::tempdir().unwrap();
+        let incremental_dir = tempfile::tempdir().unwrap();
         let session = SessionKey("benchmark-postturn-context".into());
         let stamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let mut history = vec![Message::user("Inspect the repository")];
@@ -371,6 +490,14 @@ mod tests {
             row.timestamp = stamp;
         }
         let legacy = Arc::new(Mutex::new(initial.clone()));
+        let incremental = Arc::new(Mutex::new(initial.clone()));
+        let incremental_root = persist_context_manager_snapshot(
+            incremental_dir.path(),
+            &session.to_string(),
+            &incremental.lock().unwrap(),
+        )
+        .unwrap();
+        let initial_checkpoint_bytes = std::fs::read(&incremental_root).unwrap();
         let batched = Arc::new(Mutex::new(initial));
         let fixture_seconds = fixture_start.elapsed().as_secs_f64();
 
@@ -428,8 +555,41 @@ mod tests {
             batch_path.metadata().unwrap().modified().unwrap(),
             final_modified
         );
+        let incremental_start = std::time::Instant::now();
+        let mut incremental_batch =
+            AppUiContextCommitBatch::new(incremental_dir.path(), &incremental, &session);
+        for (index, row) in committed.iter().enumerate() {
+            incremental_batch.record(row, history.len() + index);
+        }
+        incremental_batch.finish().unwrap();
+        let incremental_seconds = incremental_start.elapsed().as_secs_f64();
+        assert_eq!(
+            std::fs::read(&incremental_root).unwrap(),
+            initial_checkpoint_bytes
+        );
+        let incremental_loaded =
+            load_context_manager_snapshot(incremental_dir.path(), &session.to_string())
+                .unwrap()
+                .unwrap();
+        let incremental_journal_bytes: u64 =
+            std::fs::read_dir(incremental_dir.path().join("context_ledgers"))
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "jsonl")
+                })
+                .map(|entry| entry.metadata().unwrap().len())
+                .sum();
         let old = legacy.lock().unwrap();
         let new = batched.lock().unwrap();
+        assert_eq!(prompt_value(&incremental_loaded), prompt_value(&new));
+        assert_eq!(
+            incremental_loaded.source_head_hash(),
+            new.source_head_hash()
+        );
         assert_eq!(prompt_value(&old), prompt_value(&new));
         assert_eq!(old.source_head_hash(), new.source_head_hash());
         let old_loaded = load_context_manager_snapshot(legacy_dir.path(), &session.to_string())
@@ -443,6 +603,11 @@ mod tests {
         println!(
             "POSTTURN_BENCHMARK {}",
             serde_json::json!({
+                "incremental_seconds":incremental_seconds,
+                "incremental_journal_bytes":incremental_journal_bytes,
+                "incremental_checkpoint_rewrites":0,
+                "incremental_transition_appends":1,
+                "incremental_reloaded_prompt_and_source_equal":true,
                 "fixture_seconds":fixture_seconds,
                 "history_rows":history.len(), "initial_canonical_items":initial_canonical_items,
                 "initial_active_items":initial_active_items, "completed_response_rows":committed.len(),
@@ -453,7 +618,7 @@ mod tests {
                 "final_canonical_items":new.ledger_items().len(), "final_active_items":new.items().len(),
                 "normalized_prompt_equal":true, "source_head_equal":true,
                 "reloaded_prompt_equal":true, "reloaded_source_head_equal":true,
-                "profile":"debug", "order":"legacy_then_batch", "provider_calls":0,
+                "profile":"debug", "order":"legacy_then_batch_then_incremental", "provider_calls":0,
                 "scope":"one synthetic diagnostic under host contention; not a production speedup claim"
             })
         );

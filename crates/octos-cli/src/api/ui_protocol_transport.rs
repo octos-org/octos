@@ -3343,6 +3343,20 @@ fn persist_appui_context_snapshot(
     persist_context_manager_snapshot(data_dir, &session_id.to_string(), manager)
 }
 
+fn persist_appui_context_transition(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    manager: &ContextManager,
+) -> Result<PathBuf, String> {
+    let lock = appui_context_persist_lock(session_id);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    crate::context_manager::persist_context_manager_incremental(
+        data_dir,
+        &session_id.to_string(),
+        manager,
+    )
+}
+
 fn appui_context_status_value(manager: &ContextManager) -> Value {
     let state = manager.state();
     let last_compaction = manager.compactions().last().map(|record| {
@@ -4994,16 +5008,27 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             self.adopt_canonical_source_rows(scratch, &canonical);
+            if !scratch
+                .manager
+                .rebase_context_persistence_after_merge(&canonical)
+            {
+                return Err(
+                    "newer canonical context facts were not preserved by scratch merge".into(),
+                );
+            }
             *canonical = scratch.manager.clone();
             publish_appui_context_status(&self.session_id, &canonical);
-            if let Err(error) =
-                persist_appui_context_snapshot(&self.data_dir, &self.session_id, &canonical)
-            {
-                warn!(
+            match persist_appui_context_snapshot(&self.data_dir, &self.session_id, &canonical) {
+                Ok(_) => {
+                    scratch
+                        .manager
+                        .acknowledge_identical_context_persistence(&canonical);
+                }
+                Err(error) => warn!(
                     session = %self.session_id.0,
                     error = %error,
                     "failed to persist appui prompt context manager snapshot"
-                );
+                ),
             }
         }
         let report = PromptContextReport {
@@ -5074,14 +5099,28 @@ impl PromptContextManager for AppUiPromptContextBridge {
             "appui prompt cache epoch rotated to effective provider route"
         );
         publish_appui_context_status(&self.session_id, &snapshot);
-        if let Err(error) =
-            persist_appui_context_snapshot(&self.data_dir, &self.session_id, &snapshot)
-        {
-            warn!(
+        match persist_appui_context_snapshot(&self.data_dir, &self.session_id, &snapshot) {
+            Ok(_) => {
+                let mut scratch = self
+                    .scratch
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let mut canonical = self
+                    .context_manager
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                canonical.acknowledge_identical_context_persistence(&snapshot);
+                if let Some(scratch) = scratch.as_mut() {
+                    scratch
+                        .manager
+                        .acknowledge_identical_context_persistence(&snapshot);
+                }
+            }
+            Err(error) => warn!(
                 session = %self.session_id.0,
                 error = %error,
                 "failed to persist effective provider-route cache epoch"
-            );
+            ),
         }
     }
 }
@@ -30475,19 +30514,18 @@ async fn handle_session_rollback(
         };
         let data_dir = sessions_guard.data_dir();
         let session = sessions_guard.get_or_create(&params.session_id).await;
-        // Rebuild + persist the context ledger from the trimmed history.
-        // The ledger coverage check (`context_ledger_covers_history`) is a
-        // high-watermark `>=` — deliberately tolerant of bounded history
-        // slices — so a pre-rollback snapshot still "covers" the shrunken
-        // history and would be Loaded verbatim on the next turn, feeding the
-        // rolled-back turns straight back into the model prompt. Mirrors
-        // `reset_context_manager_from_history` on the session-actor path.
+        // Rebuild context after the canonical rollback marker commits. Exact
+        // history coverage also rejects the old future if this reset is
+        // interrupted, but the explicit reset immediately retires its
+        // summaries, cache epoch and transition lineage. Mirrors the actor's
+        // reset_context_manager_from_history path.
         let mut rebuilt_context = crate::context_manager::ContextManager::from_session_history(
             params.session_id.to_string(),
             None,
             &session.messages,
         );
         rebuilt_context.set_recovery_state(crate::context_manager::ContextRecoveryState::Rebuilt);
+        rebuilt_context.mark_ledger_rebuilt();
         if let Err(error) =
             persist_appui_context_snapshot(&data_dir, &params.session_id, &rebuilt_context)
         {

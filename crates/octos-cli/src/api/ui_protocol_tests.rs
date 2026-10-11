@@ -26249,12 +26249,9 @@ async fn session_rollback_survives_reload_from_disk() {
 }
 
 /// A stale context ledger must not resurrect rolled-back turns. The
-/// ledger coverage check is a high-watermark `>=` (deliberately
-/// slice-tolerant, because turn paths pass bounded history slices), so
-/// after a rollback shrinks durable history a pre-rollback ledger still
-/// "covers" it, gets Loaded verbatim, and the next model prompt would
-/// contain the very turns the user rewound away. `session/rollback` must
-/// rebuild + persist the context ledger from the trimmed history.
+/// Exact source-history coverage rejects a pre-rollback ledger on resume.
+/// The rollback handler also rebuilds and persists immediately, retiring
+/// summaries and cache state before any later turn resumes.
 #[tokio::test(flavor = "current_thread")]
 async fn session_rollback_rebuilds_context_ledger() {
     let session_id = SessionKey("local:rollback-ctx-ledger".into());
@@ -49695,4 +49692,228 @@ async fn workspace_team_open_list_election_notifications_and_scope() {
     for (_, handle) in forwarders.lock().await.drain() {
         handle.abort();
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_rollback_retires_context_transitions_and_resumes_new_branch() {
+    let session_id = SessionKey("local:rollback-context-transitions".into());
+    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+    let data_dir = {
+        let mut sessions = state.sessions.as_ref().unwrap().lock().await;
+        let data_dir = sessions.data_dir();
+        let history = sessions.get_or_create(&session_id).await.messages.clone();
+        let mut context =
+            ContextManager::from_session_history(session_id.to_string(), None, &history[..4]);
+        context.reconcile_prompt_cache_epoch("fixture", "old-model", "stable", &[]);
+        persist_context_manager_snapshot(&data_dir, &session_id.to_string(), &context).unwrap();
+        for (seq, row) in history.iter().enumerate().skip(4) {
+            context.record_persisted_message_merging_prompt_equivalent(row, seq);
+        }
+        context.compact_context(
+            "LATER-SUMMARY-REMOVE",
+            crate::context_manager::CompactContextPolicy {
+                keep_recent_items: 2,
+                ..Default::default()
+            },
+        );
+        assert!(!context.compactions().is_empty());
+        crate::context_manager::persist_context_manager_incremental(
+            &data_dir,
+            &session_id.to_string(),
+            &context,
+        )
+        .unwrap();
+        data_dir
+    };
+    let ledger = event_ledger(&state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_rollback(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns_registry(),
+        None,
+        None,
+        "rewind-transitions".into(),
+        SessionRollbackParams {
+            session_id: session_id.clone(),
+            num_turns: 1,
+        },
+    )
+    .await;
+    let response = recv_rpc_json(&mut rx).await;
+    assert!(response.get("error").is_none(), "{response}");
+    // Inspect the actual persisted reset directly, not a fallback rebuild.
+    let context =
+        crate::context_manager::load_context_manager_snapshot(&data_dir, &session_id.to_string())
+            .unwrap()
+            .unwrap();
+    assert!(
+        context.compactions().is_empty(),
+        "rewind must retire later compaction metadata"
+    );
+    assert!(
+        context.cache_epoch().is_none(),
+        "rewind must retire the later cache epoch"
+    );
+    assert!(
+        !serde_json::to_string(&context.snapshot())
+            .unwrap()
+            .contains("LATER-SUMMARY-REMOVE")
+    );
+    let manager = Arc::new(StdMutex::new(context));
+    let mut sessions = octos_bus::SessionManager::open(&data_dir).unwrap();
+    let trimmed = sessions.get_or_create(&session_id).await.messages.clone();
+    assert_eq!(trimmed.len(), 4);
+    assert!(
+        trimmed
+            .iter()
+            .all(|message| message.content != "turn 3" && message.content != "reply 3")
+    );
+    let mut batch =
+        postturn_context_batch::AppUiContextCommitBatch::new(&data_dir, &manager, &session_id);
+    for row in [
+        Message::user_rooting_thread("NEW-BRANCH", octos_core::ClientMessageId::new("branch")),
+        Message::assistant_with_thread("NEW-RESULT", octos_core::ThreadId::new("branch")),
+    ] {
+        let seq = sessions
+            .add_message_with_seq(&session_id, row.clone())
+            .await
+            .unwrap();
+        batch.record(&row, seq);
+    }
+    manager
+        .lock()
+        .unwrap()
+        .reconcile_prompt_cache_epoch("fixture", "new-model", "stable", &[]);
+    batch.finish().unwrap();
+    drop(sessions);
+    let mut resumed_sessions = octos_bus::SessionManager::open(&data_dir).unwrap();
+    let resumed_history = resumed_sessions
+        .get_or_create(&session_id)
+        .await
+        .messages
+        .clone();
+    let (mut resumed, status) =
+        load_or_rebuild_context_manager(&data_dir, session_id.to_string(), None, &resumed_history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
+    assert_eq!(
+        resumed_history.len(),
+        6,
+        "new branch reuses the rolled-back sequence positions"
+    );
+    assert_eq!(resumed.cache_epoch().unwrap().model, "new-model");
+    let frame = resumed.for_prompt(&PromptBuildPolicy::default());
+    assert!(
+        frame
+            .messages
+            .iter()
+            .any(|message| message.content == "NEW-RESULT")
+    );
+    assert!(
+        frame
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("turn 3")
+                && !message.content.contains("reply 3")
+                && !message.content.contains("LATER-SUMMARY-REMOVE"))
+    );
+    resumed.compact_context(
+        "NEW-BRANCH-SUMMARY",
+        crate::context_manager::CompactContextPolicy {
+            keep_recent_items: 2,
+            ..Default::default()
+        },
+    );
+    persist_context_manager_snapshot(&data_dir, &session_id.to_string(), &resumed).unwrap();
+    let (after_full, status) =
+        load_or_rebuild_context_manager(&data_dir, session_id.to_string(), None, &resumed_history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
+    assert_eq!(after_full.compactions(), resumed.compactions());
+    assert_eq!(after_full.cache_epoch(), resumed.cache_epoch());
+    assert!(
+        !serde_json::to_string(&after_full.snapshot())
+            .unwrap()
+            .contains("LATER-SUMMARY-REMOVE")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_resume_rejects_future_context_after_interrupted_rollback_checkpoint() {
+    let session_id = SessionKey("local:rollback-checkpoint-window".into());
+    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+    let data_dir = {
+        let mut sessions = state.sessions.as_ref().unwrap().lock().await;
+        let data_dir = sessions.data_dir();
+        let history = sessions.get_or_create(&session_id).await.messages.clone();
+        let mut context =
+            ContextManager::from_session_history(session_id.to_string(), None, &history);
+        context.reconcile_prompt_cache_epoch("fixture", "future-model", "stable", &[]);
+        context.compact_context(
+            "FUTURE-SUMMARY",
+            crate::context_manager::CompactContextPolicy {
+                keep_recent_items: 2,
+                ..Default::default()
+            },
+        );
+        persist_context_manager_snapshot(&data_dir, &session_id.to_string(), &context).unwrap();
+        context.record_context_event(
+            crate::context_manager::ContextEventKind::GoalSnapshot,
+            "goal",
+            "FUTURE-FACT",
+        );
+        crate::context_manager::persist_context_manager_incremental(
+            &data_dir,
+            &session_id.to_string(),
+            &context,
+        )
+        .unwrap();
+        // The actual rollback API commits its marker before the handler resets
+        // context. Simulate a crash at precisely that boundary.
+        sessions
+            .rollback_last_n_user_turns(&session_id, 1)
+            .await
+            .unwrap();
+        data_dir
+    };
+    let mut restarted_sessions = octos_bus::SessionManager::open(&data_dir).unwrap();
+    let history = restarted_sessions
+        .get_or_create(&session_id)
+        .await
+        .messages
+        .clone();
+    assert_eq!(history.len(), 4);
+    // Exercise normal session-open context hydration, not a manual reset.
+    appui_context_open_snapshot(&data_dir, &session_id, &history, None);
+    let restored =
+        crate::context_manager::load_context_manager_snapshot(&data_dir, &session_id.to_string())
+            .unwrap()
+            .unwrap();
+    assert!(restored.compactions().is_empty());
+    assert!(restored.cache_epoch().is_none());
+    let state_json = serde_json::to_string(&restored.snapshot()).unwrap();
+    for dropped in [
+        "FUTURE-SUMMARY",
+        "FUTURE-FACT",
+        "turn 3",
+        "reply 3",
+        "future-model",
+    ] {
+        assert!(
+            !state_json.contains(dropped),
+            "dropped context resurrected: {dropped}"
+        );
+    }
+    let (_, status) =
+        load_or_rebuild_context_manager(&data_dir, session_id.to_string(), None, &history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
 }
