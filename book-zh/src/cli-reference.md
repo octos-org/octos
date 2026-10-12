@@ -143,7 +143,7 @@ octos serve --stdio                       # AppUI JSON-RPC 走 stdin/stdout（�
 | `--stdio` | 通过 stdin/stdout 运行 AppUI JSON-RPC 协议，而非 HTTP |
 | `--solo` | 启用仅回环的免密码 solo 登录（`POST /api/auth/solo*`）；也可用 `OCTOS_SOLO_LOGIN=1`。切勿在反向代理之后启用 |
 | `--data-dir <P>` | episodes/记忆/会话的数据目录（默认 `$OCTOS_HOME` 或 `~/.octos`） |
-| `--auth-token <T>` | API 访问的管理员 Bearer 令牌 |
+| `--auth-token <T>` | API 访问的管理员 Bearer 令牌。令牌会出现在进程列表（`ps`）中——建议改用 `OCTOS_AUTH_TOKEN` 环境变量或配置文件 |
 | `--config <P>` | 配置文件路径 |
 | `--swarm-backend <stdio\|http>` | 启用 `/api/swarm/*` 契约创作端点（配合 `--swarm-backend-cmd` / `--swarm-backend-url`） |
 
@@ -174,7 +174,38 @@ octos clean [--all] [--dry-run]
 octos completions <shell>
 ```
 
-支持的 Shell：`bash`、`zsh`、`fish`、`powershell`。
+支持的 Shell：`bash`、`elvish`、`fish`、`powershell`、`zsh`。
+
+**静态安装。** 打印出的脚本可以补全标志与子命令：
+
+```bash
+octos completions bash > ~/.local/share/bash-completion/completions/octos
+```
+
+**动态安装（推荐）。** 改为 source 注册脚本，让 Shell 在每次按 Tab 时回调 `octos` 获取候选——脚本在 Shell 启动时重新生成，因此始终与已安装的二进制保持一致：
+
+```bash
+# bash（4+；macOS 系统自带的 bash 3.2 等较旧版本可能无法可靠地 source 这种
+# 形式——那些环境请使用上面的静态脚本，或改用 Homebrew 的 bash）
+echo 'source <(OCTOS_COMPLETE=bash octos)' >> ~/.bashrc
+# zsh
+echo 'source <(OCTOS_COMPLETE=zsh octos)' >> ~/.zshrc
+# fish
+echo 'OCTOS_COMPLETE=fish octos | source' >> ~/.config/fish/config.fish
+# elvish
+echo 'eval (E:OCTOS_COMPLETE=elvish octos | slurp)' >> ~/.elvish/rc.elv
+# powershell
+echo '$env:OCTOS_COMPLETE = "powershell"; octos | Out-String | Invoke-Expression; Remove-Item Env:\OCTOS_COMPLETE' >> $PROFILE
+```
+
+`--dynamic` 打印某一类别的候选列表而不是脚本——适合脚本编排，也适合先看看补全会给出什么：
+
+```bash
+octos completions bash --dynamic models     # model_catalog.json 中的模型名
+octos completions bash --dynamic providers  # 注册表中的服务商族
+octos completions bash --dynamic sessions   # ./.octos/sessions 中的会话 id
+octos completions bash --dynamic skills     # ./.octos/skills 中的技能
+```
 
 ---
 

@@ -343,6 +343,11 @@ jobs:
           python3 scripts/lint-doc-references.py --self-test
           python3 scripts/lint-doc-references.py
 
+      - name: book-zh parity lint
+        run: |
+          python3 scripts/lint-book-zh-parity.py --self-test
+          python3 scripts/lint-book-zh-parity.py
+
       - name: Installer token-hygiene lint
         run: |
           python3 scripts/lint-installer-token-hygiene.py --self-test
