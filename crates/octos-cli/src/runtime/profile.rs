@@ -2065,11 +2065,29 @@ mod tests {
             "the shared cron service keeps running"
         );
         assert_eq!(replacement.primary_model_id, "gemini-m2");
-        assert_eq!(
-            replacement.memory_refresh.is_some(),
-            replacement.memory_refresh_enabled,
-            "the replacement takes over the memory refresh sweep"
-        );
+        use fs2::FileExt as _;
+        if replacement.memory_refresh.is_some() != replacement.memory_refresh_enabled {
+            // Unreachable in a quiet process: the predecessor's lock is
+            // released before the replacement's try_start (#2666), and
+            // nothing else holds this fresh tempdir's lock — so a
+            // mismatch means the lock setup itself failed. Probe the
+            // lock file's live state so the failure names its cause
+            // instead of red-ing opaquely (#2684).
+            let probe = std::fs::OpenOptions::new()
+                .read(true)
+                .open(data_dir.join("memory").join(".refresh.lock"))
+                .map(|file| {
+                    let lock_free = file.try_lock_exclusive().is_ok();
+                    drop(file);
+                    lock_free
+                });
+            panic!(
+                "the replacement takes over the memory refresh sweep \
+                 (enabled={}, sweep_running={}, lock probe open+try_lock={probe:?})",
+                replacement.memory_refresh_enabled,
+                replacement.memory_refresh.is_some(),
+            );
+        }
         let derived = derived_snapshot(&replacement);
 
         drop(replacement);

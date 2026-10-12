@@ -16560,6 +16560,19 @@ fn raw_peer_tools_unregister(
             format!("peer '{slug}' is not a host-owned app peer"),
         ));
     }
+    // Route-ownership gate (#2660): only the owning connection may release
+    // the route — a shared host token cannot unregister another
+    // connection's route out from under it.
+    if let Some(owner) = crate::peers::host_tools::host_route_connection(&peers_root, &slug) {
+        if owner != ws.connection_id.0 {
+            return Err(host_peer_error(
+                "peer_route_not_owner",
+                format!(
+                    "peer '{slug}' is routed to another connection of its host; unregister it there"
+                ),
+            ));
+        }
+    }
     let unregistered = crate::peers::host_tools::unregister_peer_route(&peers_root, &slug);
     Ok(json!({
         "slug": slug,
@@ -16676,7 +16689,7 @@ fn raw_session_tools_register(
     host_connection: bool,
 ) -> Result<Value, RpcError> {
     use crate::peers::host_tools::{
-        SessionRegisterError, build_tool_set, register_session_tool_set,
+        SessionRegisterError, build_session_tool_set, register_session_tool_set,
     };
     authorize_host_session_call(
         peers_root,
@@ -16684,7 +16697,24 @@ fn raw_session_tools_register(
         params.host_token.as_deref(),
         host_connection,
     )?;
-    let set = build_tool_set(params.tools, params.generic_tools, params.options)
+    // Route-ownership gate (#2660): the session's tool route belongs to the
+    // connection that registered it — another live connection registering
+    // would silently take over the session's kernel-tool surface (the same
+    // gate session/tool_list/set carries).
+    if let Some(owner) =
+        crate::peers::host_tools::session_set_connection(peers_root, &params.session_id)
+    {
+        if owner != ws.connection_id.0 {
+            return Err(host_peer_error(
+                "peer_route_not_owner",
+                format!(
+                    "session '{}' has its tool route on another connection of its host",
+                    params.session_id
+                ),
+            ));
+        }
+    }
+    let set = build_session_tool_set(params.tools, params.generic_tools, params.options)
         .map_err(|err| host_peer_error("peer_tools_invalid", err))?;
     let route_ws = ws.clone();
     let (previous, version) = register_session_tool_set(
@@ -16816,6 +16846,21 @@ fn raw_session_tool_list_set(
         &params.session_id,
         params.host_token.as_deref(),
     )?;
+    // Route-ownership gate (#2660): the session's tool route belongs to the
+    // connection that declared it — another live connection re-declaring
+    // would silently take over the session's kernel-tool surface.
+    if let Some(owner) = crate::peers::host_tools::session_set_connection(
+        &data_dir.join("peers"),
+        &params.session_id,
+    ) {
+        if owner != ws.connection_id.0 {
+            return Err(RpcError::permission_denied(format!(
+                "session '{}' has its tool route on another connection of its host",
+                params.session_id
+            ))
+            .with_data(json!({ "kind": "peer_route_not_owner" })));
+        }
+    }
     let generic_tools = params
         .generic_tools
         .map(normalize_tool_list)
@@ -16946,6 +16991,20 @@ fn raw_peer_tools_register(
         &params.session_id,
         params.host_token.as_deref(),
     )?;
+    // Route-ownership gate (#2660): refuse to take over a live route another
+    // connection still owns — a leaked or stolen host token cannot silently
+    // redirect another consumer's tool traffic. Release there (unregister)
+    // or purge first.
+    if let Some(owner) = crate::peers::host_tools::host_route_connection(&peers_root, &slug) {
+        if owner != ws.connection_id.0 {
+            return Err(host_peer_error(
+                "peer_route_not_owner",
+                format!(
+                    "peer '{slug}' is routed to another connection of its host; unregister it there"
+                ),
+            ));
+        }
+    }
     if crate::peers::app_binding::read_peer_host_binding(&peers_root, &slug).is_none() {
         return Err(host_peer_error(
             "peer_not_host_bound",
@@ -22359,14 +22418,30 @@ async fn handle_session_open(
             resolve_session_profile_runtime(state, opened.active_profile_id.as_deref()),
             opened.workspace_root.as_deref(),
         ) {
+            // Eviction must not take the seat of a session whose turn is
+            // still able to record a result into the team (#2741).
+            let turn_active = active_turn_sessions(&active_turns_registry()).await;
             if let Err(error) = state.ui_protocol.workspace_teams.join(
                 &runtime.data_dir,
                 Path::new(workspace),
                 &opened.session_id,
                 ws.connection_id.0,
+                &turn_active,
             ) {
-                let _ = send_rpc_error(ws, Some(id), RpcError::internal_error(error));
-                return false;
+                // The join failure degrades to "opened, outside the team"
+                // (#2741): a fail-closed refusal here bricks long-lived
+                // workspaces — the lifetime member accumulation + the 1024
+                // hard cap mean every open past the cap permanently fails.
+                // The session stays fully usable (the memory/skills/history
+                // bindings are durable, not team-gated); the team features
+                // (shared history, team messaging) are absent, and the
+                // operator sees the reason in the logs.
+                tracing::error!(
+                    session = %opened.session_id,
+                    workspace = %workspace,
+                    %error,
+                    "workspace team join failed; the session opened outside the team"
+                );
             }
         }
     }

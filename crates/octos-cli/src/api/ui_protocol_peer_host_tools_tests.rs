@@ -2739,6 +2739,55 @@ async fn should_never_give_an_external_turn_a_host_routed_tool_when_one_is_regis
     assert_eq!(sorted_names(&registry), vec!["grep"]);
 }
 
+/// `n` distinct read tools, each of its own app (`t0.read` … ), as a
+/// registration's `tools`.
+fn many_tools(n: usize) -> Value {
+    let tools: Vec<Value> = (0..n)
+        .map(|i| {
+            json!({
+                "name": format!("t{i}.read"),
+                "app": format!("t{i}"),
+                "description": "Reads.",
+                "input_schema": {"type": "object"},
+                "risk": "read",
+            })
+        })
+        .collect();
+    json!({ "tools": tools })
+}
+
+/// An app peer's set is one app's tools (64 at most). A host session's set
+/// (the system agent's) gathers the tools the host granted it from many
+/// apps, so it may hold 96: next to the 32 kernel tools it can also keep,
+/// that is the 128 functions an OpenAI-compatible request accepts.
+#[tokio::test]
+async fn should_take_96_tools_on_a_host_session_and_64_on_an_app_peer() {
+    let fx = fixture().await;
+    let (stdio_tx, _stdio_rx) = std::sync::mpsc::sync_channel(8);
+    let stdio = WsConnection::new_stdio(stdio_tx);
+    let registered = register_on_session(&fx, &stdio, None, &fx.system, many_tools(96))
+        .expect("a host session takes 96 tools");
+    assert_eq!(registered["version"], 1);
+    let refused = register_on_session(&fx, &stdio, None, &fx.system, many_tools(97)).unwrap_err();
+    assert_eq!(refused.data.as_ref().unwrap()["kind"], "peer_tools_invalid");
+    assert!(
+        refused.message.contains("97 app tools (max 96)"),
+        "{}",
+        refused.message
+    );
+
+    let token = prepare_news(&fx).await;
+    let (host_ws, _host_rx) = ws_connection_for_test(64);
+    register(&fx, &host_ws, &token, many_tools(64)).expect("an app peer takes 64 tools");
+    let refused = register(&fx, &host_ws, &token, many_tools(65)).unwrap_err();
+    assert_eq!(refused.data.as_ref().unwrap()["kind"], "peer_tools_invalid");
+    assert!(
+        refused.message.contains("65 app tools (max 64)"),
+        "{}",
+        refused.message
+    );
+}
+
 #[test]
 fn should_refuse_a_host_tool_whose_model_name_is_a_kernel_tools() {
     let error = crate::peers::host_tools::build_tool_set(
@@ -3277,10 +3326,21 @@ async fn should_carry_the_owning_app_and_the_caller_when_a_cross_app_tool_is_cal
     let rows = audit_rows(&fx);
     assert_eq!(rows[0]["app"], "calendar");
 
-    // An owning app id must be well formed.
+    // An owning app id must be well formed. The re-registration comes from
+    // the owning connection — a different connection would be refused by
+    // the route-ownership gate before validation ever runs (UPCR-2026-041).
+    // The route above was moved to connection 0, so the fresh connection
+    // that re-registers takes the route first, and the gate then lets it
+    // through to the validation refusal.
     let mut bad = news_list();
     bad["app"] = json!("Calendar App");
     let (ws2, _rx2) = ws_connection_for_test(8);
+    crate::peers::host_tools::set_host_route(
+        &peers_root(&fx),
+        "news",
+        ws2.connection_id.0,
+        Arc::new(|_, _| false),
+    );
     let error = register(&fx, &ws2, &token, json!({ "tools": [bad] })).unwrap_err();
     assert_eq!(error.data.unwrap()["kind"], "peer_tools_invalid");
 }
@@ -4034,17 +4094,19 @@ async fn should_give_the_system_agent_the_app_tools_the_host_registers_on_its_se
     // The host's kernel tool list for the session narrows every turn on it:
     // the host's, other clients', kernel wake-ups; another session of the
     // profile is unaffected.
-    let (list_ws, _list_rx) = ws_connection_for_test(8);
+    // The narrowing re-declaration comes from the owning connection — a
+    // different connection would be refused by the route-ownership gate
+    // (UPCR-2026-041).
     register_on_session(
         &fx,
-        &list_ws,
+        &ws,
         Some(&token),
         &fx.system,
         json!({ "tools": [calendar_today()], "generic_tools": ["read_file", "ask_user_question"] }),
     )
     .unwrap();
     for connection in [
-        Some(list_ws.connection_id.0),
+        Some(ws.connection_id.0),
         Some(other_ws.connection_id.0),
         None,
     ] {
@@ -4057,7 +4119,7 @@ async fn should_give_the_system_agent_the_app_tools_the_host_registers_on_its_se
             connection,
         );
         let names = sorted_names(&narrowed);
-        let expected: Vec<&str> = if connection == Some(list_ws.connection_id.0) {
+        let expected: Vec<&str> = if connection == Some(ws.connection_id.0) {
             vec!["ask_user_question", "calendar_today", "read_file"]
         } else {
             vec!["ask_user_question", "read_file"]
@@ -4071,10 +4133,10 @@ async fn should_give_the_system_agent_the_app_tools_the_host_registers_on_its_se
         &peers_root(&fx),
         &chat,
         "turn-e",
-        Some(list_ws.connection_id.0),
+        Some(ws.connection_id.0),
     );
     assert_eq!(sorted_names(&elsewhere), usual);
-    crate::peers::host_tools::drop_routes_for_connection(list_ws.connection_id.0);
+    crate::peers::host_tools::drop_routes_for_connection(ws.connection_id.0);
     // Registered again by the first host connection (as it was).
     register_on_session(
         &fx,

@@ -328,7 +328,7 @@ Current M9 sandbox-parity decision:
 - The additive manifest-declared skill action surface
   (`skill/action/list`, `skill/action/invoke`, and the `skill.actions.v1`
   capability feature) is governed by accepted
-  [UPCR-2026-026](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_026_SKILL_ACTIONS.md).
+  [UPCR-2026-044](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_044_SKILL_ACTIONS.md).
   It lets clients render and invoke skill-owned UI actions without gaining a
   generic AppUI tool-call primitive. Skill manifests own the action id, input
   schema, UI hints, bound backend tool, and any file-materialization mode.
@@ -336,7 +336,7 @@ Current M9 sandbox-parity decision:
   (`skill/action/job/list`, `skill/action/job/read`, the
   `skill/action/job/updated` notification, and the `skill.action_jobs.v1`
   capability feature) is governed by accepted
-  [UPCR-2026-027](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_027_SKILL_ACTION_JOBS.md).
+  [UPCR-2026-045](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_045_SKILL_ACTION_JOBS.md).
   It lets clients observe manifest-declared background actions through generic
   projections of persisted supervised tasks. It does not introduce
   notebook-specific routes or a generic client-selected tool-call primitive.
@@ -455,7 +455,14 @@ Session, turn, and approval core:
   registry lock; the agent loop drains them FIFO at its next iteration
   boundary — before the next LLM call — as plain `role: user` messages
   with no wrapper text, persisting each through the canonical session
-  path so the standard v2 `UserMessage` envelope announces the fold-in;
+  path so the standard v2 `UserMessage` envelope announces the fold-in.
+  Pending input is checked before each serial tool admission and each new
+  batch: tools already running finish, while unstarted calls receive explicit
+  not-executed results so the model can reconsider them after reading the input.
+  Already-admitted parallel calls settle before the next model request.
+  New input wakes a pending streaming model request: emitted text and observed
+  usage are retained, unexecuted tool arguments are discarded, and sampling
+  resumes with the new input in the SAME turn (no terminal or second start);
   a steer landing after the model's final answer forces one more round
   in the SAME turn. Returns `steered: true` + the ACTIVE turn id. An
   `expected_turn_id` naming a different turn → `invalid_params`; a live
@@ -727,9 +734,9 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   `profile/skills/install`, `profile/skills/remove` (server-handled skills
   management)
 - `skill/action/list`, `skill/action/invoke` (gate `skill.actions.v1`,
-  accepted `UPCR-2026-026`; manifest-declared skill actions only)
+  accepted `UPCR-2026-044`; manifest-declared skill actions only)
 - `skill/action/job/list`, `skill/action/job/read` (gate
-  `skill.action_jobs.v1`, accepted `UPCR-2026-027`; persisted background skill
+  `skill.action_jobs.v1`, accepted `UPCR-2026-045`; persisted background skill
   action jobs only)
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
 - `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
@@ -793,7 +800,7 @@ Structured user-question lifecycle (gate `user_question.v1`, proposed
 
 - `user_question/requested`
 
-Skill action jobs (gate `skill.action_jobs.v1`, accepted `UPCR-2026-027`):
+Skill action jobs (gate `skill.action_jobs.v1`, accepted `UPCR-2026-045`):
 
 - `skill/action/job/updated`
 
@@ -2657,7 +2664,7 @@ Required fields: `session_id`, `task_id`, `seq`, `message_id`, `source`,
 `thread_id`, `tool_call_id`, `response_to_client_message_id`, `media`.
 
 Full field set and semantics are documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `approval/auto_resolved`
 
@@ -2667,7 +2674,7 @@ a previously recorded scope policy entry, instead of surfacing a fresh
 
 Required fields: `session_id`, `approval_id`, `turn_id`, `tool_name`,
 `scope`, `scope_match`, `decision`. Full field set documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `approval/decided`
 
@@ -2680,7 +2687,7 @@ intentionally omitted for compliance / PII reasons.
 Required fields: `session_id`, `approval_id`, `turn_id`, `decision`,
 `decided_at`, `decided_by`, `auto_resolved`. Optional fields: `scope`,
 `policy_id`, `client_note`. Full field set documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `approval/cancelled`
 
@@ -2692,7 +2699,7 @@ new entries as future drains land (e.g. `session_closed`). Initial values:
 
 Required fields: `session_id`, `approval_id`, `turn_id`, `reason`. Full
 field set documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `progress/updated`
 
@@ -2705,7 +2712,7 @@ Required fields: `session_id`, `metadata`. Optional field: `turn_id`. The
 `metadata.kind` field is an open registry; initial values include `status`,
 `retry_backoff`, `file_mutation`, and `token_cost_update`. Full field set,
 typed sub-objects, and forward-compat `extra` map documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 `progress/updated` is a durable ledger event. Each frame is committed to
 the per-session append-only ledger before the wire frame is enqueued, so
@@ -2729,7 +2736,7 @@ Capability gate: `context.lifecycle.v1`.
 Required fields: `session_id`, `context_state`, `compaction`. Full field
 set, `UiContextState` shape, and `UiContextCompactionRecord` shape
 documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `context/compaction_started`
 
@@ -2789,7 +2796,7 @@ Capability gate: `context.lifecycle.v1`.
 
 Required fields: `session_id`, `context_state`, `normalization`. Full field
 set and the `UiContextNormalizationReport` shape documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### `protocol/replay_lossy`
 
@@ -2810,7 +2817,7 @@ rules.
 
 Required fields: `session_id`, `dropped_count`. Optional field:
 `last_durable_cursor`. Full field set documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ## 9. Reconnect and Cursor Rules
 
@@ -2838,7 +2845,7 @@ reports a *backlog* condition (durable frames dropped from the live socket)
 rather than its own durability, so reconnecting clients observe the signal
 on replay alongside the surrounding durable events. The full wire contract
 for the signal is documented by
-[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022.md).
+[UPCR-2026-022](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_022_WIRE_CONTRACTS_BACKFILL.md).
 
 ### 9.1 Ledger Durability Contract (M9-FIX-05 / #643)
 

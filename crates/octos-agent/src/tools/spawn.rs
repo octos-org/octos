@@ -2936,18 +2936,17 @@ impl Tool for SpawnTool {
                     })
                 } else {
                     let mut desc_parts =
-                        vec!["Model key for the subagent. Available models:".to_string()];
+                        vec!["Models (ctx/out=max, budget=default context; tokens):".to_string()];
                     let mut enum_vals = Vec::new();
                     for m in &models {
-                        let mut line =
-                            format!("- '{}': {} ({})", m.key, m.model_id, m.provider_name);
+                        let mut line = format!("{}: {} ({})", m.key, m.model_id, m.provider_name);
                         if let Some(ref cost) = m.cost_info {
                             line.push_str(&format!(", {cost}"));
                         }
-                        line.push_str(&format!(", {}k max ctx", m.context_window / 1000));
-                        line.push_str(&format!(", {}k max output", m.max_output_tokens / 1000));
+                        line.push_str(&format!(", ctx={}k", m.context_window / 1000));
+                        line.push_str(&format!(", out={}k", m.max_output_tokens / 1000));
                         if let Some(default_cw) = m.default_context_window {
-                            line.push_str(&format!(", {}k default budget", default_cw / 1000));
+                            line.push_str(&format!(", budget={}k", default_cw / 1000));
                         }
                         if let Some(ref desc) = m.description {
                             line.push_str(&format!(". {desc}"));
@@ -2998,12 +2997,12 @@ impl Tool for SpawnTool {
                 "allowed_tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Tool names the subagent may use. Empty = all builtins (the recommended default). CAUTION: if you narrow this list AND the subagent must PRODUCE A FILE (a report, review, generated code, any deliverable), you MUST include `write_file` (and usually `edit_file`) here — OR set the top-level `deliverable` glob. A subagent given `shell` but not `write_file` and no `deliverable` can only write via a shell redirect, and any file it writes outside the working tree (e.g. under /tmp) is LOST (never collected as output_files). When in doubt, leave this empty."
+                    "description": "Allowed tool names; empty = all builtins (recommended). For file deliverables with a narrowed list, include write_file (usually edit_file too) OR set deliverable. Shell-written files outside the working tree (e.g. /tmp) are not collected without deliverable."
                 },
                 "role": {
                     "type": "string",
                     "enum": ["reviewer", "implementer", "test_worker", "explorer"],
-                    "description": "Backend-owned M14-C role template. When set, the server resolves tool budget, sandbox, approval, model preference, and prompt prefix from the runtime template."
+                    "description": "Server role template for tool budget, sandbox, approval, model preference and prompt prefix."
                 },
                 "context": {
                     "type": "string",
@@ -3017,11 +3016,11 @@ impl Tool for SpawnTool {
                 "max_iterations": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Override the subagent's tool-call iteration budget (default 50). Raise it for repo-scale reviews or research that need many read/shell steps one at a time; a broad from-scratch review often needs ~100-150. Clamped to a safe ceiling to prevent runaway loops."
+                    "description": "Tool-call iteration budget (default 50, capped). Large reviews/research may need 100-150."
                 },
                 "additional_instructions": {
                     "type": "string",
-                    "description": "Extra instructions appended to the subagent's system prompt. Use to specialize behavior (e.g. 'Focus on OWASP Top 10 security issues.'). Cannot override or replace the base system prompt."
+                    "description": "Specialization instructions appended to, not replacing or overriding, the base system prompt."
                 },
                 "workflow": {
                     "type": "object",
@@ -3055,7 +3054,7 @@ impl Tool for SpawnTool {
                 "backend": {
                     "type": "string",
                     "enum": ["builtin", "agent_mcp"],
-                    "description": "Sub-agent backend. 'builtin' runs an in-process Agent (default). 'agent_mcp' dispatches to the configured MCP agent backend (Claude Code / Codex / hermes / jiuwenclaw) so the sub-agent's internal tool calls never leak back to the parent context.",
+                    "description": "builtin: in-process agent (default). agent_mcp: configured MCP agent; its internal tool calls stay outside the parent context.",
                     "default": "builtin"
                 },
                 "agent_mcp_tool_name": {
@@ -3064,11 +3063,11 @@ impl Tool for SpawnTool {
                 },
                 "agent_definition_id": {
                     "type": "string",
-                    "description": "Optional id of an AgentDefinition manifest (see crates/octos-agent/src/agents). The manifest's fields (tools, model, max_turns, etc.) become defaults for this spawn; any inline field on the spawn args overrides the manifest (inline wins)."
+                    "description": "AgentDefinition manifest ID supplying defaults (tools, model, max_turns, etc.); inline spawn arguments take precedence."
                 },
                 "deliverable": {
                     "type": "string",
-                    "description": "Glob for the file(s) this spawn should produce (e.g. '*-review.md', 'report.md'). When set, the child runs in a fresh output directory and is told to write its deliverable there; whatever matches the glob is collected as this task's output_files — even if the worker wrote it with a shell heredoc rather than write_file. Empty string means '*' (top-level files). Use a PRECISE glob (avoid '**/*') so a repo the worker clones into its output dir is not swept in."
+                    "description": "Output-file glob (e.g. '*-review.md'). Runs the child in a fresh output directory; matches become output_files, including shell-written files. Empty = '*' (top-level files). Use a precise glob, not '**/*', to exclude cloned repos."
                 }
             },
             "required": ["task"]

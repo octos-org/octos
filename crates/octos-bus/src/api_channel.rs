@@ -14,8 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
@@ -25,7 +26,7 @@ use futures::stream::{self, StreamExt};
 use metrics::counter;
 use octos_core::{
     EventEnvelope, InboundMessage, MAIN_PROFILE_ID, Message, MessageRole, OutboundMessage,
-    SessionKey, ThreadId, TurnContext,
+    SessionKey, ThreadId, TurnContext, constant_time_eq,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -713,6 +714,120 @@ fn initial_sse_events(
     Ok(events)
 }
 
+/// The channel's HTTP surface as one Router — every route consults the
+/// armed token (#2751), so the auth contract lives at the route table
+/// rather than being re-derived per caller, and the table sits behind the
+/// loopback guard (#2328). `start()` serves this; tests drive it directly
+/// with `oneshot`.
+///
+/// Exception: `/admin/shell` keeps its own stricter gate (it also accepts
+/// `x-auth-token` and re-resolves per request) — don't "unify" it onto the
+/// shared Bearer-only gate. New routes must add a handler gate AND a
+/// `SURFACE_PROBES` row (see `api_channel_tests`) or the walk can't see
+/// them.
+fn api_router(state: ApiState) -> Router {
+    Router::new()
+        .route("/metrics", get(handle_metrics))
+        .route("/chat", post(handle_chat))
+        .route("/sessions", get(handle_list_sessions))
+        .route("/sessions/{id}/messages", get(handle_session_messages))
+        .route(
+            "/sessions/{id}/events/stream",
+            get(handle_session_event_stream),
+        )
+        .route("/sessions/{id}/status", get(handle_session_status))
+        .route("/sessions/{id}/tasks", get(handle_session_tasks))
+        .route("/sessions/{id}", delete(handle_delete_session))
+        .route("/sessions/{id}/title", patch(handle_update_session_title))
+        // M7.9 / W2 — task supervisor exposure
+        .route("/tasks/{task_id}/cancel", post(handle_task_cancel))
+        .route(
+            "/tasks/{task_id}/restart-from-node",
+            post(handle_task_relaunch),
+        )
+        .route("/files/{*path}", get(handle_file_download))
+        .route("/upload", post(handle_upload))
+        .route("/admin/shell", post(handle_admin_shell))
+        .with_state(state)
+        .layer(middleware::from_fn(loopback_guard))
+}
+
+/// The outermost guard (#2328): the channel binds 127.0.0.1 and speaks to
+/// local callers only, so a `Host` that does not name the loopback
+/// listener is a rebound/proxied request, and a browser `Origin` outside
+/// the loopback is a cross-site page reaching the API directly (no
+/// rebinding needed — simple requests carry no preflight). Non-browser
+/// callers send no `Origin` and pass; any loopback port is accepted, so
+/// SSH/port-forwarded callers keep working. Mirrors serve's host-managed
+/// `host_header_guard`.
+async fn loopback_guard(req: Request, next: Next) -> Response {
+    // Two Host headers on one request is malformed at the wire (RFC 9112
+    // §3.2) — and the accessor below would only ever see the first.
+    if req.headers().get_all(header::HOST).iter().count() > 1 {
+        warn!("rejected request carrying more than one Host header");
+        return (StatusCode::MISDIRECTED_REQUEST, "unexpected Host").into_response();
+    }
+    let host_ok = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(loopback_host)
+        .unwrap_or(false);
+    if !host_ok {
+        warn!("rejected request whose Host does not name the loopback listener");
+        return (StatusCode::MISDIRECTED_REQUEST, "unexpected Host").into_response();
+    }
+    let origin_ok = match req.headers().get(header::ORIGIN) {
+        // Absent: not a browser context (curl, scripts, SDKs).
+        None => true,
+        // Present: a browser spoke — parse failure is refused like any
+        // other non-loopback origin, not waved through.
+        Some(value) => value.to_str().map(loopback_origin).unwrap_or(false),
+    };
+    if !origin_ok {
+        warn!("rejected request whose Origin is outside the loopback");
+        return (StatusCode::FORBIDDEN, "unexpected Origin").into_response();
+    }
+    next.run(req).await
+}
+
+/// `127.0.0.1`, `localhost`, `::1` (bracketed or bare), with an optional
+/// port — textual, case-insensitive: the guard's job is to catch a Host
+/// naming some other name (a rebound domain, a LAN IP), not to
+/// re-represent addresses. Anything after `]` or after the host must be a
+/// plain digit port; a malformed authority is refused, not re-interpreted.
+fn loopback_host(authority: &str) -> bool {
+    let authority = authority.trim();
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((literal, "")) => (literal, ""),
+            Some((literal, port)) => match port.strip_prefix(':') {
+                Some(port) => (literal, port),
+                None => return false,
+            },
+            None => return false,
+        }
+    } else if authority.matches(':').count() > 1 {
+        (authority, "") // a bare IPv6 literal carries no port
+    } else {
+        authority.split_once(':').unwrap_or((authority, ""))
+    };
+    port.bytes().all(|b| b.is_ascii_digit())
+        && (host.eq_ignore_ascii_case("localhost") || matches!(host, "127.0.0.1" | "::1"))
+}
+
+/// A browser `Origin` naming the loopback — `http://127.0.0.1:8091`,
+/// `https://localhost:5173`; any port, so a locally served UI passes.
+/// `null` (sandboxed iframe) and every other authority fail.
+fn loopback_origin(origin: &str) -> bool {
+    // Lowercased so the scheme compare matches the host's case handling.
+    let origin = origin.to_ascii_lowercase();
+    origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .is_some_and(loopback_host)
+}
+
 #[async_trait]
 impl Channel for ApiChannel {
     fn name(&self) -> &str {
@@ -724,7 +839,7 @@ impl Channel for ApiChannel {
             inbound_tx,
             pending: self.pending.clone(),
             watchers: self.watchers.clone(),
-            auth_token: self.auth_token.clone(),
+            auth_token: resolve_api_token(self.auth_token.as_deref()),
             profile_id: self.profile_id.clone(),
             sessions: self.sessions.clone(),
             task_query: self.task_query.clone(),
@@ -735,29 +850,7 @@ impl Channel for ApiChannel {
             event_seq: self.event_seq.clone(),
         };
 
-        let app = Router::new()
-            .route("/metrics", get(handle_metrics))
-            .route("/chat", post(handle_chat))
-            .route("/sessions", get(handle_list_sessions))
-            .route("/sessions/{id}/messages", get(handle_session_messages))
-            .route(
-                "/sessions/{id}/events/stream",
-                get(handle_session_event_stream),
-            )
-            .route("/sessions/{id}/status", get(handle_session_status))
-            .route("/sessions/{id}/tasks", get(handle_session_tasks))
-            .route("/sessions/{id}", delete(handle_delete_session))
-            .route("/sessions/{id}/title", patch(handle_update_session_title))
-            // M7.9 / W2 — task supervisor exposure
-            .route("/tasks/{task_id}/cancel", post(handle_task_cancel))
-            .route(
-                "/tasks/{task_id}/restart-from-node",
-                post(handle_task_relaunch),
-            )
-            .route("/files/{*path}", get(handle_file_download))
-            .route("/upload", post(handle_upload))
-            .route("/admin/shell", post(handle_admin_shell))
-            .with_state(state);
+        let app = api_router(state);
 
         let addr = format!("127.0.0.1:{}", self.port);
         info!(port = self.port, "API channel listening on {addr}");
@@ -1305,12 +1398,16 @@ impl Channel for ApiChannel {
     }
 }
 
-async fn handle_metrics(State(state): State<ApiState>) -> String {
+async fn handle_metrics(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
     state
         .metrics_renderer
         .as_ref()
         .map(|render| render())
         .unwrap_or_default()
+        .into_response()
 }
 
 impl ApiChannel {
@@ -1431,15 +1528,8 @@ async fn handle_chat(
     headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> Response {
-    // Validate auth token if configured
-    if let Some(ref expected) = state.auth_token {
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if provided != Some(expected.as_str()) {
-            return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
-        }
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
     }
 
     let session_id = req
@@ -1576,14 +1666,8 @@ async fn handle_session_event_stream(
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
-    if let Some(ref expected) = state.auth_token {
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        if provided != Some(expected.as_str()) {
-            return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
-        }
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
     }
 
     let rx = {
@@ -2049,9 +2133,14 @@ async fn replay_committed_session_results(
 /// GET /sessions/:id/status — check if a session has an active task.
 async fn handle_session_status(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let active = {
         let pending = state.pending.lock().await;
         pending.contains_key(&id)
@@ -2076,9 +2165,14 @@ async fn handle_session_status(
 /// GET /sessions/:id/tasks — list background tasks for a session.
 async fn handle_session_tasks(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let Some(ref query_fn) = state.task_query else {
         return Json(serde_json::json!([])).into_response();
     };
@@ -2096,8 +2190,13 @@ async fn handle_session_tasks(
 /// status codes.
 async fn handle_task_cancel(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(task_id): axum::extract::Path<String>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let Some(ref cancel_fn) = state.task_cancel else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2146,9 +2245,14 @@ struct ApiRestartFromNodeRequest {
 /// `with_task_relaunch` callback. Body: `{ "node_id": Option<String> }`.
 async fn handle_task_relaunch(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(task_id): axum::extract::Path<String>,
     body: Option<Json<ApiRestartFromNodeRequest>>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let body = body.map(|Json(b)| b).unwrap_or_default();
     let Some(ref relaunch_fn) = state.task_relaunch else {
         return (
@@ -2195,7 +2299,11 @@ async fn handle_task_relaunch(
 /// generic `list_sessions` is O(N) over every JSONL on disk and was
 /// observed to hang 30s+ on a user dir with 65k+ child JSONLs (river /
 /// mini4) — see issue #607 §D.
-async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
+async fn handle_list_sessions(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let sess = state.sessions.lock().await;
     let mut seen = std::collections::HashSet::new();
     let list: Vec<SessionInfo> = sess
@@ -2221,9 +2329,14 @@ async fn handle_list_sessions(State(state): State<ApiState>) -> Response {
 /// GET /sessions/:id/messages — get session message history.
 async fn handle_session_messages(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<PaginationParams>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let limit = params.limit.min(500);
     let offset = params.offset.min(10_000);
     let fetch_count = match offset.checked_add(limit) {
@@ -2300,8 +2413,13 @@ async fn handle_session_messages(
 /// DELETE /sessions/:id — delete a session.
 async fn handle_delete_session(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let mut sess = state.sessions.lock().await;
     let mut deleted = false;
     for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
@@ -2337,9 +2455,14 @@ struct UpdateSessionTitleRequest {
 /// PATCH /sessions/:id/title — set a manual title.
 async fn handle_update_session_title(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<UpdateSessionTitleRequest>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let title = body.title.trim().to_string();
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title must not be empty").into_response();
@@ -2373,8 +2496,13 @@ async fn handle_update_session_title(
 /// GET /files/*path — download a file produced by write_file/send_file.
 async fn handle_file_download(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let data_dir = {
         let sess = state.sessions.lock().await;
         sess.data_dir()
@@ -2494,9 +2622,14 @@ fn effective_upload_tenant(
 /// preserving the previous behaviour.
 async fn handle_upload(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<UploadQuery>,
     mut multipart: axum::extract::Multipart,
 ) -> Response {
+    if let Some(rejection) = unauthorized_without_bearer(&state, &headers) {
+        return rejection;
+    }
+
     let upload_root = std::env::temp_dir().join("octos-uploads");
     // #1377: stamp the upload with the OWNING tenant so the resolved handle
     // matches what the subsequent `/chat` filters against. When the client
@@ -2603,32 +2736,24 @@ struct ShellResponse {
     timed_out: bool,
 }
 
-/// POST /admin/shell — execute a shell command (admin auth required).
-async fn handle_admin_shell(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(req): Json<ShellRequest>,
-) -> Response {
-    // Verify admin token
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .or_else(|| headers.get("x-auth-token").and_then(|v| v.to_str().ok()))
-        .unwrap_or("");
-
-    // Check channel-level token, env var, then config.json auth_token.
-    let expected_token: Option<String> = state
-        .auth_token
-        .clone()
+/// Resolve the token that guards the channel's HTTP surface: the channel's
+/// own config first, then OCTOS_AUTH_TOKEN, then the top-level config.json
+/// auth_token — the same chain the admin shell accepts, so every deployment
+/// style that arms the admin surface arms the chat surface too (#2736).
+/// The chat/stream gates resolve once at channel start; arming them from
+/// config.json written after startup takes a channel restart (the admin
+/// shell, in contrast, re-resolves per request).
+fn resolve_api_token(channel_token: Option<&str>) -> Option<String> {
+    channel_token
         .filter(|t| !t.is_empty())
+        .map(str::to_string)
         .or_else(|| {
             std::env::var("OCTOS_AUTH_TOKEN")
                 .ok()
                 .filter(|t| !t.is_empty())
         })
         .or_else(|| {
-            // Try OCTOS_DATA_DIR, then ~/.octos, then cwd/.octos
+            // Try OCTOS_DATA_DIR, then ~/.octos
             let home = std::env::var("HOME").unwrap_or_default();
             let candidates = [
                 std::env::var("OCTOS_DATA_DIR").unwrap_or_default(),
@@ -2649,30 +2774,65 @@ async fn handle_admin_shell(
                 }
             }
             None
-        });
+        })
+}
+
+/// Constant-time `Authorization: Bearer` check against the resolved token —
+/// the same max-len compare the admin shell uses (#2705, #2736).
+fn bearer_token_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
+}
+
+/// The shared bearer gate for the channel's HTTP surface: when a token is
+/// armed (resolved once at start, #2736 chain), a request without a
+/// matching Bearer token is rejected with the generic body — every route,
+/// not just the chat surface (#2751). `None` = the caller may proceed;
+/// an unarmed channel stays open (tokenless dev/test deployments).
+fn unauthorized_without_bearer(state: &ApiState, headers: &HeaderMap) -> Option<Response> {
+    let expected = state.auth_token.as_ref()?;
+    if bearer_token_matches(headers, expected) {
+        return None;
+    }
+    Some((StatusCode::UNAUTHORIZED, "invalid auth token").into_response())
+}
+
+/// Auth-failure log for the admin shell — same hygiene as the router's
+/// auth rejections: presence booleans only, never token lengths or the
+/// local data-dir paths (#2729).
+fn log_admin_shell_auth_rejection(token_present: bool, token_configured: bool) {
+    warn!(token_present, token_configured, "admin shell auth failed");
+}
+
+/// POST /admin/shell — execute a shell command (admin auth required).
+async fn handle_admin_shell(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<ShellRequest>,
+) -> Response {
+    // Verify admin token
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| headers.get("x-auth-token").and_then(|v| v.to_str().ok()))
+        .unwrap_or("");
+
+    // Check channel-level token, env var, then config.json auth_token.
+    let expected_token = resolve_api_token(state.auth_token.as_deref());
     let is_admin = match &expected_token {
         Some(expected) if !expected.is_empty() => {
-            token.len() == expected.len()
-                && token
-                    .as_bytes()
-                    .iter()
-                    .zip(expected.as_bytes())
-                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                    == 0
+            constant_time_eq(token.as_bytes(), expected.as_bytes())
         }
         _ => false,
     };
 
     if !is_admin {
-        // Debug: return what we tried to match against
-        let debug = format!(
-            "token_len={} expected_len={} data_dir={} home={}",
-            token.len(),
-            expected_token.as_ref().map(|t| t.len()).unwrap_or(0),
-            std::env::var("OCTOS_DATA_DIR").unwrap_or_else(|_| "unset".into()),
-            std::env::var("HOME").unwrap_or_else(|_| "unset".into()),
-        );
-        return (StatusCode::UNAUTHORIZED, debug).into_response();
+        log_admin_shell_auth_rejection(!token.is_empty(), expected_token.is_some());
+        return (StatusCode::UNAUTHORIZED, "invalid auth token").into_response();
     }
 
     if req.command.is_empty() {

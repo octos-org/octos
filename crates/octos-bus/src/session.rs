@@ -1576,6 +1576,37 @@ pub type SessionTitleMetaRow = (
 /// soft ~100-character cap; multibyte scripts yield fewer characters.
 const LAST_PROMPT_PREVIEW_BYTES: usize = 100;
 
+/// A cached listing row for one session file, validated by the file's
+/// `(len, modified)` pair. Every in-process mutation — message append, seal
+/// roll, meta rewrite, delete — changes at least one of the two, so an entry
+/// matching both is the same content and the walk skips its reads. An
+/// EXTERNAL writer that restores files while preserving mtimes (`rsync -a`,
+/// `cp -p`) can keep a restored file matching a stale entry until its next
+/// real write — accepted, since no in-process signal exists for that case
+/// and the write heals it (#2392: a listing runs under the manager lock, so
+/// repeating a full meta + tail + row-count read of every active file on
+/// each poll held that lock for the whole scan).
+#[derive(Clone)]
+struct CachedListingRow {
+    len: u64,
+    modified: std::time::SystemTime,
+    row: SessionTitleMetaRow,
+}
+
+/// Process-wide listing row cache, keyed by file path. Held off the manager
+/// so the per-request managers of the profile-scoped listing paths share one
+/// warm map with the process-wide store. Each walk merges its rows under the
+/// walk's own root and drops the entries it no longer saw, so rows for
+/// deleted files disappear without a separate eviction policy while other
+/// roots' warm rows survive the walk.
+fn listing_row_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, CachedListingRow>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, CachedListingRow>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 /// Extract the text of the MOST RECENT user message from an already-loaded
 /// session JSONL transcript, truncated to [`LAST_PROMPT_PREVIEW_BYTES`].
 ///
@@ -1797,14 +1828,50 @@ impl SessionManager {
     ) -> Vec<SessionTitleMetaRow> {
         // Reuse the path discovery from list_sessions_inner, but read each
         // file's first line to extract the title alongside the line count.
+        // The walk runs through the canonical sessions dir so cache keys are
+        // immune to how the data dir was spelled when the manager was opened
+        // (same device as `set_scoped_message_commit_observer`).
+        let root =
+            std::fs::canonicalize(&self.sessions_dir).unwrap_or_else(|_| self.sessions_dir.clone());
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
+        // Rows land in a fresh map that merges into the shared cache when
+        // the walk ends (scoped to this walk's dirs), so a concurrent
+        // listing never waits on this one's cold scans.
+        let mut fresh: std::collections::HashMap<PathBuf, CachedListingRow> =
+            std::collections::HashMap::new();
 
         let push_with_title = |path: &Path,
                                session_key: String,
                                seen: &mut std::collections::HashSet<String>,
+                               fresh: &mut std::collections::HashMap<PathBuf, CachedListingRow>,
                                out: &mut Vec<SessionTitleMetaRow>| {
             if seen.contains(&session_key) {
+                return;
+            }
+            // A (len, modified) stat is the whole cost of a warm poll. Every
+            // in-process mutation — append, seal roll, meta rewrite, delete —
+            // changes at least one of the two, so an entry matching both is
+            // the same content; anything else falls through to the reads
+            // below (#2392: the stat replaced a per-poll rescan of every
+            // active file, up to the 8 MiB segment size each). The one blind
+            // spot is an external writer that preserves mtimes, noted on
+            // [`CachedListingRow`].
+            let file_meta = std::fs::metadata(path).ok();
+            let stat = file_meta
+                .as_ref()
+                .and_then(|meta| meta.modified().ok().map(|modified| (meta.len(), modified)));
+            if let Some((len, modified)) = stat
+                && let Some(cached) = listing_row_cache()
+                    .lock()
+                    .unwrap()
+                    .get(path)
+                    .filter(|cached| cached.len == len && cached.modified == modified)
+                    .cloned()
+            {
+                seen.insert(session_key.clone());
+                fresh.insert(path.to_owned(), cached.clone());
+                out.push(cached.row);
                 return;
             }
             // Read the meta line and the tail of the file, never the whole
@@ -1819,8 +1886,8 @@ impl SessionManager {
             // stale while its JSONL file mtime keeps advancing. Take the LATER
             // of the two (codex P2) so recency tracks real writes; the file
             // mtime alone also covers the missing / unparseable-meta case.
-            let file_mtime = std::fs::metadata(path)
-                .ok()
+            let file_mtime = file_meta
+                .as_ref()
                 .and_then(|meta| meta.modified().ok())
                 .map(DateTime::<Utc>::from);
             let updated_at = match (meta_updated_at, file_mtime) {
@@ -1833,10 +1900,21 @@ impl SessionManager {
             let last_prompt = last_user_prompt_from_file(path);
             let count = Self::count_lines(path);
             seen.insert(session_key.clone());
-            out.push((session_key, count, title, updated_at, last_prompt));
+            let row = (session_key, count, title, updated_at, last_prompt);
+            if let Some((len, modified)) = stat {
+                fresh.insert(
+                    path.to_owned(),
+                    CachedListingRow {
+                        len,
+                        modified,
+                        row: row.clone(),
+                    },
+                );
+            }
+            out.push(row);
         };
 
-        if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
+        if let Ok(entries) = std::fs::read_dir(&root) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -1849,15 +1927,11 @@ impl SessionManager {
                 if skip_internal_topics && Self::is_internal_session_key(&decoded) {
                     continue;
                 }
-                push_with_title(&path, decoded, &mut seen, &mut result);
+                push_with_title(&path, decoded, &mut seen, &mut fresh, &mut result);
             }
         }
 
-        let users_dir = self
-            .sessions_dir
-            .parent()
-            .unwrap_or(&self.sessions_dir)
-            .join("users");
+        let users_dir = root.parent().unwrap_or(&root).join("users");
         if let Ok(user_entries) = std::fs::read_dir(&users_dir) {
             for user_entry in user_entries.flatten() {
                 let user_path = user_entry.path();
@@ -1889,12 +1963,28 @@ impl SessionManager {
                         } else {
                             format!("{base_key}#{topic}")
                         };
-                        push_with_title(&file_path, session_key, &mut seen, &mut result);
+                        push_with_title(
+                            &file_path,
+                            session_key,
+                            &mut seen,
+                            &mut fresh,
+                            &mut result,
+                        );
                     }
                 }
             }
         }
 
+        // Merge this walk's rows into the shared cache, dropping only the
+        // entries under the dirs THIS walk covers: another listing's root
+        // (the per-profile dirs, other data dirs) must keep its warm rows —
+        // a wholesale replace would thrash the cache on every /sessions
+        // request, which walks two different roots back to back.
+        {
+            let mut cache = listing_row_cache().lock().unwrap();
+            cache.retain(|path, _| !(path.starts_with(&root) || path.starts_with(&users_dir)));
+            cache.extend(fresh);
+        }
         result
     }
 

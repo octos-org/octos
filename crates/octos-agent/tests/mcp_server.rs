@@ -20,7 +20,7 @@ use octos_agent::harness_events::HarnessEventPayload;
 use octos_agent::mcp_server::{
     McpServer, McpServerError, McpSessionCost, McpSessionDispatch, McpSessionOutcome,
     SessionLifecycleObserver, build_initialize_response, build_tools_list_response,
-    constant_time_eq, dispatch_run_octos_session, parse_bearer_token, render_mcp_error,
+    dispatch_run_octos_session, parse_bearer_token, render_mcp_error,
 };
 use octos_agent::task_supervisor::{TaskLifecycleState, TaskSupervisor};
 use octos_agent::validators::{ValidatorOutcome, ValidatorPhase, ValidatorStatus};
@@ -327,9 +327,20 @@ fn bearer_token_parsing_and_constant_time_comparison() {
     assert_eq!(parse_bearer_token(Some("Basic abc")), None);
     assert_eq!(parse_bearer_token(Some("Bearer ")), None);
 
-    assert!(constant_time_eq("super-secret", "super-secret"));
-    assert!(!constant_time_eq("super-secret", "super-secre"));
-    assert!(!constant_time_eq("super-secret", "wrong-secret"));
+    // The canonical octos-core helper backs the token gate: same-length
+    // wrong content and different lengths are both rejected.
+    assert!(octos_core::constant_time_eq(
+        b"super-secret",
+        b"super-secret"
+    ));
+    assert!(!octos_core::constant_time_eq(
+        b"super-secret",
+        b"super-secre"
+    ));
+    assert!(!octos_core::constant_time_eq(
+        b"super-secret",
+        b"wrong-secret"
+    ));
 }
 
 #[tokio::test]

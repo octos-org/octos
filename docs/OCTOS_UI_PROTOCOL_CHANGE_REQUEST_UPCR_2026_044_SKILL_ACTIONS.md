@@ -1,8 +1,11 @@
-# UPCR-2026-026: Manifest-Declared Skill Actions
+# UPCR-2026-044: Manifest-Declared Skill Actions
 
 Status: accepted
 Date: 2026-07-09
-PR: TBD
+PR: #1637
+
+Formerly filed as UPCR-2026-026; renumbered to the next free number to resolve a
+duplicate-numbering collision (see [the UPCR registry](upcr/README.md)).
 
 ## Summary
 

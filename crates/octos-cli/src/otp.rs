@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
 use eyre::{Result, bail};
+use octos_core::constant_time_eq;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -911,19 +912,6 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Constant-time byte comparison (no length leak).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let len_eq = a.len() ^ b.len();
-    let mut result = 0u8;
-    // Always iterate over both, using modular index to avoid early exit
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        result |= x ^ y;
-    }
-    result == 0 && len_eq == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,14 +932,6 @@ mod tests {
         let token = generate_session_token();
         assert_eq!(token.len(), 64);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn test_constant_time_eq() {
-        assert!(constant_time_eq(b"123456", b"123456"));
-        assert!(!constant_time_eq(b"123456", b"654321"));
-        assert!(!constant_time_eq(b"short", b"longer"));
-        assert!(constant_time_eq(b"", b""));
     }
 
     #[test]

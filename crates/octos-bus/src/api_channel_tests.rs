@@ -4215,3 +4215,647 @@ async fn send_raw_sse_bound_overwrites_stale_thread_id_in_payload() {
         "send_raw_sse_bound must overwrite stale payload thread_id with bound id. event: {parsed}"
     );
 }
+
+/// #2729: the admin shell auth failure must not disclose configuration to
+/// the unauthenticated caller: the body is the same generic string as the
+/// channel's other auth guards, every rejection is logged (presence
+/// booleans only — the same hygiene the CLI router pins for its auth
+/// rejections), and a length-matched but wrong token is still refused.
+#[tokio::test]
+async fn admin_shell_auth_failure_body_discloses_no_configuration() {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(capture.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let expected = "octos-admin-e2e-secret-token";
+    let app = Router::new()
+        .route("/admin/shell", post(handle_admin_shell))
+        .with_state(ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: Some(expected.to_string()),
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions: test_sessions(),
+            task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+            event_seq: Arc::new(StdMutex::new(HashMap::new())),
+        });
+
+    async fn probe(app: Router, token: Option<(&str, String)>, body: &str) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/admin/shell")
+            .header("content-type", "application/json");
+        if let Some((header, value)) = token {
+            request = request.header(header, value);
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    // A wrong bearer token, the same wrong token over the x-auth-token
+    // intake, no token at all, and a token matching the expected length
+    // byte-for-byte in size but not content all get the generic guard body
+    // — never a debug echo of what the server tried to match against. The
+    // probes post an empty command so even a fail-open auth regression can
+    // never spawn a shell here.
+    for auth in [
+        Some(("authorization", "Bearer short".to_string())),
+        Some(("x-auth-token", "short".to_string())),
+        None,
+        Some((
+            "authorization",
+            "Bearer octos-admin-e2e-secret-tokeX".to_string(),
+        )),
+    ] {
+        let (status, body) = probe(app.clone(), auth, r#"{"command":""}"#).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, "invalid auth token", "leaky body: {body}");
+    }
+
+    // The correct token passes the auth gate: the empty command surfaces
+    // the next validation error.
+    let (status, body) = probe(
+        app,
+        Some(("authorization", format!("Bearer {expected}"))),
+        r#"{"command":""}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "command is required");
+
+    // Every failed probe was logged exactly once, and the successful one
+    // was not.
+    let logs = capture.contents();
+    assert_eq!(
+        logs.matches("admin shell auth failed").count(),
+        4,
+        "each failed probe must log: {logs}"
+    );
+}
+
+/// Captures `tracing` output so log-emitting behaviour can be asserted
+/// (same shape as the matrix channel's LogCapture).
+#[derive(Clone, Default)]
+struct LogCapture {
+    buf: Arc<StdMutex<Vec<u8>>>,
+}
+
+impl LogCapture {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// #2729: the auth-failure log carries presence booleans only — never
+/// token lengths or the local data-dir paths that used to ride the
+/// response body.
+#[test]
+fn admin_shell_auth_rejection_log_omits_lengths_and_paths() {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(capture.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    log_admin_shell_auth_rejection(true, true);
+    log_admin_shell_auth_rejection(false, false);
+
+    let logs = capture.contents();
+    assert_eq!(
+        logs.matches("admin shell auth failed").count(),
+        2,
+        "logs: {logs}"
+    );
+    assert!(logs.contains("token_present=true"), "logs: {logs}");
+    assert!(logs.contains("token_present=false"), "logs: {logs}");
+    assert!(logs.contains("token_configured=true"), "logs: {logs}");
+    assert!(logs.contains("token_configured=false"), "logs: {logs}");
+    assert!(
+        !logs.contains("_len"),
+        "token lengths must stay out: {logs}"
+    );
+    assert!(!logs.contains("data_dir"), "logs: {logs}");
+    assert!(!logs.contains("home="), "logs: {logs}");
+    assert!(!logs.contains("/Users/"), "logs: {logs}");
+}
+
+// ------------------------------------------------------------------
+// #2736 — the chat surface sits behind the same token chain as the
+// admin shell, with a constant-time compare. The env/config legs of
+// the chain are covered end-to-end in tests/api_channel_token_e2e.rs
+// (own process, so the env pivot can't race this binary).
+// ------------------------------------------------------------------
+
+/// The channel token wins without consulting the env fallback: the
+/// or_else chain is lazy, so this holds whatever the environment says.
+#[test]
+fn resolve_api_token_prefers_channel_token() {
+    assert_eq!(
+        resolve_api_token(Some("chan-tok")).as_deref(),
+        Some("chan-tok")
+    );
+}
+
+fn gated_app(auth_token: Option<String>) -> Router {
+    Router::new()
+        .route("/chat", post(handle_chat))
+        .route(
+            "/sessions/{id}/events/stream",
+            get(handle_session_event_stream),
+        )
+        .with_state(ApiState {
+            inbound_tx: mpsc::channel(1).0,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            auth_token,
+            profile_id: Some(TEST_PROFILE_ID.to_string()),
+            sessions: test_sessions(),
+            task_query: None,
+            task_cancel: None,
+            task_relaunch: None,
+            on_session_deleted: None,
+            metrics_renderer: None,
+            event_seq: Arc::new(StdMutex::new(HashMap::new())),
+        })
+}
+
+/// #2736: with a token configured, POST /chat refuses missing, wrong, and
+/// length-matched wrong bearers with the generic body, and the correct
+/// token passes the gate (reaching the next validation error).
+#[tokio::test]
+async fn chat_auth_gate_refuses_wrong_bearer_and_accepts_configured_token() {
+    let expected = "octos-chat-e2e-secret-token";
+    let app = gated_app(Some(expected.to_string()));
+
+    async fn probe(app: Router, auth: Option<&str>) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/chat")
+            .header("content-type", "application/json");
+        if let Some(token) = auth {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .oneshot(request.body(Body::from(r#"{"message":"hi"}"#)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    let filler = "x".repeat(expected.len());
+    for auth in [None, Some("wrong-token"), Some(filler.as_str())] {
+        let (status, body) = probe(app.clone(), auth).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "auth: {auth:?}");
+        assert_eq!(body, "invalid auth token", "auth: {auth:?}");
+    }
+
+    let (status, body) = probe(app, Some(expected)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "thread_id is required");
+}
+
+/// #2736: the session event stream endpoint enforces the same gate.
+#[tokio::test]
+async fn session_event_stream_auth_gate_refuses_wrong_bearer_and_accepts_configured_token() {
+    let expected = "octos-chat-e2e-secret-token";
+    let app = gated_app(Some(expected.to_string()));
+
+    async fn probe(app: Router, auth: Option<&str>) -> StatusCode {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/sessions/web-sse-auth/events/stream");
+        if let Some(token) = auth {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        app.oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    let filler = "x".repeat(expected.len());
+    for auth in [None, Some("wrong-token"), Some(filler.as_str())] {
+        assert_eq!(
+            probe(app.clone(), auth).await,
+            StatusCode::UNAUTHORIZED,
+            "auth: {auth:?}"
+        );
+    }
+    assert_eq!(probe(app, Some(expected)).await, StatusCode::OK);
+}
+
+/// With no token configured the gate stays open — a tokenless dev/test
+/// channel keeps working.
+#[tokio::test]
+async fn chat_auth_gate_is_open_when_no_token_configured() {
+    let app = gated_app(None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"message":"hi"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ------------------------------------------------------------------
+// #2751 — the gate covers the WHOLE route table, not just the chat
+// surface. The probe walks the real `api_router` — so a route added
+// without a probe row stays invisible to this walk: every new route
+// must add its handler gate AND a `SURFACE_PROBES` row below, or the
+// gap ships open. A missing gate on a probed route fails loudly here.
+// ------------------------------------------------------------------
+
+/// `(method, uri, content-type, body)` reaching every route's handler:
+/// one probe per row of the `api_router` table, kept in sync by hand.
+const SURFACE_PROBES: &[(&str, &str, &str, &str)] = &[
+    ("GET", "/metrics", "", ""),
+    ("POST", "/chat", "application/json", r#"{"message":"hi"}"#),
+    ("GET", "/sessions", "", ""),
+    ("GET", "/sessions/s1/messages", "", ""),
+    ("GET", "/sessions/s1/events/stream", "", ""),
+    ("GET", "/sessions/s1/status", "", ""),
+    ("GET", "/sessions/s1/tasks", "", ""),
+    ("DELETE", "/sessions/s1", "", ""),
+    (
+        "PATCH",
+        "/sessions/s1/title",
+        "application/json",
+        r#"{"title":"t"}"#,
+    ),
+    ("POST", "/tasks/t1/cancel", "", ""),
+    ("POST", "/tasks/t1/restart-from-node", "", ""),
+    ("GET", "/files/attachment.txt", "", ""),
+    (
+        "POST",
+        "/upload",
+        "multipart/form-data; boundary=octosprobe",
+        "",
+    ),
+    (
+        "POST",
+        "/admin/shell",
+        "application/json",
+        r#"{"command":""}"#,
+    ),
+];
+
+#[tokio::test]
+async fn every_route_sits_behind_the_bearer_gate_when_armed() {
+    let expected = "octos-surface-e2e-secret-token";
+    let app = api_router(ApiState {
+        inbound_tx: mpsc::channel(1).0,
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        watchers: Arc::new(Mutex::new(HashMap::new())),
+        auth_token: Some(expected.to_string()),
+        profile_id: Some(TEST_PROFILE_ID.to_string()),
+        sessions: test_sessions(),
+        task_query: None,
+        task_cancel: None,
+        task_relaunch: None,
+        on_session_deleted: None,
+        metrics_renderer: None,
+        event_seq: Arc::new(StdMutex::new(HashMap::new())),
+    });
+
+    async fn probe(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        ct: &str,
+        body: &str,
+        auth: Option<&str>,
+    ) -> StatusCode {
+        // Real clients always send Host on HTTP/1.1 (#2328 guard).
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1");
+        if !ct.is_empty() {
+            request = request.header("content-type", ct);
+        }
+        if let Some(token) = auth {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        response.status()
+    }
+
+    // Collect every open route instead of stopping at the first, so a
+    // regression reports the full exposed surface at once.
+    let mut open = Vec::new();
+    for (method, uri, ct, body) in SURFACE_PROBES {
+        if probe(&app, method, uri, ct, body, None).await != StatusCode::UNAUTHORIZED {
+            open.push(format!("{method} {uri}"));
+        }
+    }
+    assert!(
+        open.is_empty(),
+        "routes serving an unauthenticated caller despite an armed token: {}",
+        open.join(", ")
+    );
+
+    // The correct bearer passes the gate on the read routes.
+    assert_eq!(
+        probe(&app, "GET", "/sessions", "", "", Some(expected)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        probe(&app, "GET", "/metrics", "", "", Some(expected)).await,
+        StatusCode::OK
+    );
+
+    // Unarmed contrast: the same table stays open without a token.
+    let unarmed = api_router(ApiState {
+        inbound_tx: mpsc::channel(1).0,
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        watchers: Arc::new(Mutex::new(HashMap::new())),
+        auth_token: None,
+        profile_id: Some(TEST_PROFILE_ID.to_string()),
+        sessions: test_sessions(),
+        task_query: None,
+        task_cancel: None,
+        task_relaunch: None,
+        on_session_deleted: None,
+        metrics_renderer: None,
+        event_seq: Arc::new(StdMutex::new(HashMap::new())),
+    });
+    assert_eq!(
+        probe(&unarmed, "GET", "/sessions", "", "", None).await,
+        StatusCode::OK
+    );
+}
+
+// ------------------------------------------------------------------
+// #2328 — the loopback guard in front of the route table: the channel
+// binds 127.0.0.1 and speaks to local callers, so a Host naming
+// anything else is a rebound/proxied request, and a browser Origin
+// outside the loopback is a cross-site page reaching the API directly.
+// ------------------------------------------------------------------
+
+/// Unarmed table (the guard is unconditional — it does not consult the
+/// token), probed with explicit Host/Origin headers.
+async fn guard_probe(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    host: Option<&str>,
+    origin: Option<&str>,
+) -> StatusCode {
+    let mut request = Request::builder().method(method).uri(uri);
+    if let Some(host) = host {
+        request = request.header("host", host);
+    }
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    app.clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+fn unarmed_router() -> Router {
+    api_router(ApiState {
+        inbound_tx: mpsc::channel(1).0,
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        watchers: Arc::new(Mutex::new(HashMap::new())),
+        auth_token: None,
+        profile_id: Some(TEST_PROFILE_ID.to_string()),
+        sessions: test_sessions(),
+        task_query: None,
+        task_cancel: None,
+        task_relaunch: None,
+        on_session_deleted: None,
+        metrics_renderer: None,
+        event_seq: Arc::new(StdMutex::new(HashMap::new())),
+    })
+}
+
+/// Every probed route refuses a Host naming another origin — the rebound
+/// page's request never reaches a handler (mirrors the #2751 walk: the
+/// guard lives on the route table, not per handler).
+#[tokio::test]
+async fn every_route_rejects_a_rebound_host() {
+    let app = unarmed_router();
+
+    // Collect every serving route instead of stopping at the first.
+    let mut serving = Vec::new();
+    for (method, uri, _, _) in SURFACE_PROBES {
+        if guard_probe(&app, method, uri, Some("evil.com"), None).await
+            != StatusCode::MISDIRECTED_REQUEST
+        {
+            serving.push(format!("{method} {uri}"));
+        }
+    }
+    assert!(
+        serving.is_empty(),
+        "routes serving a rebound Host: {}",
+        serving.join(", ")
+    );
+}
+
+/// The loopback names the listener actually answers to — both spellings
+/// of the IPv4/IPv6 loopback, with or without a port, case-insensitive.
+#[tokio::test]
+async fn loopback_hosts_reach_the_routes() {
+    let app = unarmed_router();
+    for host in [
+        "127.0.0.1:8091",
+        "localhost:8091",
+        "localhost",
+        "LOCALHOST:8091",
+        "[::1]:8091",
+        "::1",
+    ] {
+        assert_eq!(
+            guard_probe(&app, "GET", "/metrics", Some(host), None).await,
+            StatusCode::OK,
+            "loopback host {host} must reach the route"
+        );
+    }
+}
+
+/// Authorities that merely contain a loopback spelling but aren't one are
+/// refused rather than re-interpreted.
+#[tokio::test]
+async fn malformed_authorities_are_refused() {
+    let app = unarmed_router();
+    for host in [
+        "[::1]evil.com",   // garbage behind the bracket
+        "[::1]:8091x",     // non-digit port, bracketed
+        "127.0.0.1:8091x", // non-digit port, bare
+        "127.0.0.1.evil.com",
+        "127.0.0.1:8091:666",
+    ] {
+        assert_eq!(
+            guard_probe(&app, "GET", "/metrics", Some(host), None).await,
+            StatusCode::MISDIRECTED_REQUEST,
+            "malformed authority {host} must be refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_host_header_is_refused() {
+    let app = unarmed_router();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .header("host", "127.0.0.1")
+        .header("host", "evil.com");
+    let status = app
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
+}
+
+/// The guard wraps the whole router — the 404 fallback included — so a
+/// route-table refactor that swaps `layer` for `route_layer` fails here
+/// instead of silently narrowing the guard's coverage.
+#[tokio::test]
+async fn the_guard_covers_the_fallback_too() {
+    let app = unarmed_router();
+    assert_eq!(
+        guard_probe(&app, "GET", "/nope", Some("evil.com"), None).await,
+        StatusCode::MISDIRECTED_REQUEST
+    );
+    assert_eq!(
+        guard_probe(&app, "GET", "/nope", Some("127.0.0.1:8091"), None).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn cross_site_origins_are_rejected_and_loopback_origins_pass() {
+    let app = unarmed_router();
+    // A page on the open internet reaching the loopback directly — no
+    // rebinding needed — carries its own origin.
+    assert_eq!(
+        guard_probe(
+            &app,
+            "GET",
+            "/metrics",
+            Some("127.0.0.1:8091"),
+            Some("https://evil.com")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    // Sandboxed iframes send the opaque `null` origin.
+    assert_eq!(
+        guard_probe(
+            &app,
+            "GET",
+            "/metrics",
+            Some("127.0.0.1:8091"),
+            Some("null")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    // The CSRF face: a simple cross-site POST is refused on its Origin
+    // before the handler (multipart /upload is CORS-safelisted).
+    assert_eq!(
+        guard_probe(
+            &app,
+            "POST",
+            "/upload",
+            Some("127.0.0.1:8091"),
+            Some("https://evil.com")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    for origin in [
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://[::1]:4173",
+    ] {
+        assert_eq!(
+            guard_probe(
+                &app,
+                "GET",
+                "/metrics",
+                Some("127.0.0.1:8091"),
+                Some(origin)
+            )
+            .await,
+            StatusCode::OK,
+            "loopback origin {origin} must pass"
+        );
+    }
+    // Non-browser callers send no Origin at all.
+    assert_eq!(
+        guard_probe(&app, "GET", "/metrics", Some("127.0.0.1:8091"), None).await,
+        StatusCode::OK
+    );
+}
+
+/// Browsers, curl and reqwest always send Host on HTTP/1.1; a Hostless
+/// request is malformed raw traffic, refused like a foreign Host rather
+/// than waved through.
+#[tokio::test]
+async fn a_request_without_a_host_header_is_refused() {
+    let app = unarmed_router();
+    assert_eq!(
+        guard_probe(&app, "GET", "/metrics", None, None).await,
+        StatusCode::MISDIRECTED_REQUEST
+    );
+}
