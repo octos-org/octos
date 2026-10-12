@@ -25,7 +25,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # Full history: the book-zh parity lint compares per-chapter last-touch
+      # commits between book/ and book-zh/ (#2453).
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Lint book-zh parity
+        run: python3 scripts/lint-book-zh-parity.py
 
       - name: Install mdBook
         uses: peaceiris/actions-mdbook@v2
