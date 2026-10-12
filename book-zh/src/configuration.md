@@ -128,7 +128,14 @@
   // 智能体设置
   "max_iterations": 50,
 
-  // 向量嵌入（用于记忆的向量搜索）
+  // 向量嵌入（用于记忆的向量搜索）。省略本节时默认使用内置的进程内嵌入器
+  // （llama.cpp，特性 embed-llama，默认启用）：首次使用时会把
+  // EmbeddingGemma-300M Q8_0（334 MB，Gemma 使用条款——见
+  // docs/THIRD_PARTY_MODELS.md）一次性下载到 <data_dir>/models/，无需 API 密钥。
+  // model_path 可指向其他任意 GGUF；auto_download: false（或
+  // OCTOS_NO_MODEL_DOWNLOAD=1）在提供模型之前让记忆保持纯关键词模式。
+  // 切换 provider 或模型会改变向量维度，使已建索引失效——切换后需
+  // 重新生成嵌入。
   "embedding": {
     "provider": "openai",
     "api_key_env": "OPENAI_API_KEY",
