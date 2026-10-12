@@ -675,6 +675,13 @@ pub(crate) fn persist_context_manager_incremental(
     context_journal::persist_incremental(data_dir, session_id, manager)
 }
 
+pub(crate) fn remove_context_manager_store(
+    data_dir: &Path,
+    session_id: &str,
+) -> Result<usize, String> {
+    context_journal::remove_store(data_dir, session_id)
+}
+
 fn context_ledger_artifact_path(data_dir: &Path, artifact_ref: &str) -> Result<PathBuf, String> {
     let root = data_dir.join("context_ledgers");
     let mut path = root.clone();

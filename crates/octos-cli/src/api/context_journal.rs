@@ -90,6 +90,11 @@ fn journal_for(root: &Path, id: Option<&str>) -> PathBuf {
     let suffix = id
         .map(|id| sha256_prefixed(id.as_bytes()).replace(':', "-"))
         .unwrap_or_else(|| "legacy".into());
+    let session = journal_session_prefix(root);
+    root.with_file_name(format!("{session}{suffix}.transitions.jsonl"))
+}
+
+fn journal_session_prefix(root: &Path) -> String {
     let session = sha256_prefixed(
         root.file_name()
             .unwrap_or_default()
@@ -97,7 +102,39 @@ fn journal_for(root: &Path, id: Option<&str>) -> PathBuf {
             .as_bytes(),
     )
     .replace(':', "-");
-    root.with_file_name(format!("{session}-{suffix}.transitions.jsonl"))
+    format!("{session}-")
+}
+
+pub(super) fn remove_store(data_dir: &Path, session_id: &str) -> Result<usize, String> {
+    let root = context_ledger_path(data_dir, session_id);
+    let lock = path_lock(&root);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut removed = 0;
+    // Match the session digest independently of the current checkpoint header:
+    // interrupted promotion can leave old journals, or even no root snapshot.
+    let prefix = journal_session_prefix(&root);
+    let parent = root.parent().expect("context ledger has a parent");
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("read context store for removal: {error}")),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".transitions.jsonl") {
+            removed += usize::from(
+                crate::peers::purge::remove_tree_within(data_dir, &entry.path())
+                    .map_err(|error| format!("remove context journal: {error}"))?,
+            );
+        }
+    }
+    removed += usize::from(
+        crate::peers::purge::remove_tree_within(data_dir, &root)
+            .map_err(|error| format!("remove context checkpoint: {error}"))?,
+    );
+    Ok(removed)
 }
 
 fn file_len(path: &Path) -> Result<u64, String> {

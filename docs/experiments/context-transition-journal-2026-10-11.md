@@ -26,6 +26,8 @@ The existing committed-only rule is unchanged: source-less conversation rows are
 
 A missing/legacy checkpoint is promoted by the first incremental commit using one full save. Older runtimes understand only the root checkpoint and will not replay the new sidecar. A downgrade therefore requires successful full-checkpoint promotion with this runtime first; it is not safe to assume an old runtime preserves transition-only metadata. No automatic production migration/deployment is performed by this experiment.
 
+Peer purge removes the session's checkpoint and all its transition sidecars, including orphaned older lineages or journals whose root is missing. The removal shares the context persistence lock, preserves other sessions, and uses the existing confined deletion helper. The full CLI regression suite exposed the original snapshot-only cleanup gap; the existing end-to-end peer purge test and focused orphan/isolation/symlink tests cover this integration.
+
 ## Costs and limitations
 
 Ordinary transition writes avoid historical semantic-index derivation and full payload rewrite. They still cost the changed canonical suffix plus active-ID and compaction metadata, and `state()` still derives active state. Per-row source-history witnessing, in-memory merging, status publication and the final synchronous write remain. An early insertion or classification can make the replacement suffix large. This is not a claim that the whole turn or every persistence path is O(delta).

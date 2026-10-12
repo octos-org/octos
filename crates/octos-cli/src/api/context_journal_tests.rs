@@ -1,5 +1,61 @@
 use super::*;
 
+#[test]
+fn should_erase_context_journals_without_touching_another_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = ContextManager::from_session_history("purged", None, &[Message::user("private")]);
+    let root = persist_context_manager_snapshot(dir.path(), "purged", &manager).unwrap();
+    let orphan = context_journal::journal_path(dir.path(), "purged");
+    std::fs::write(&orphan, b"private orphaned journal").unwrap();
+    // Simulate a promotion that installed a new lineage but left the old file.
+    let old_bytes = std::fs::read(&orphan).unwrap();
+    let mut rebuilt = manager.clone();
+    rebuilt.mark_ledger_rebuilt();
+    persist_context_manager_snapshot(dir.path(), "purged", &rebuilt).unwrap();
+    std::fs::write(&orphan, old_bytes).unwrap();
+    let current = context_journal::journal_path(dir.path(), "purged");
+    assert_ne!(orphan, current);
+    let other = ContextManager::from_session_history("kept", None, &[Message::user("keep me")]);
+    let other_root = persist_context_manager_snapshot(dir.path(), "kept", &other).unwrap();
+    let other_journal = context_journal::journal_path(dir.path(), "kept");
+    let other_bytes = std::fs::read(&other_root).unwrap();
+
+    assert_eq!(
+        remove_context_manager_store(dir.path(), "purged").unwrap(),
+        3
+    );
+    assert!(!root.exists() && !current.exists() && !orphan.exists());
+    assert_eq!(std::fs::read(other_root).unwrap(), other_bytes);
+    assert!(other_journal.exists());
+    // Missing roots must not hide crash leftovers; repeated purge is harmless.
+    std::fs::write(&orphan, b"private crash residue").unwrap();
+    assert_eq!(
+        remove_context_manager_store(dir.path(), "purged").unwrap(),
+        1
+    );
+    assert_eq!(
+        remove_context_manager_store(dir.path(), "purged").unwrap(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn should_refuse_context_store_removal_through_an_external_parent_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let manager = ContextManager::from_session_history("purged", None, &[Message::user("outside")]);
+    let root = persist_context_manager_snapshot(outside.path(), "purged", &manager).unwrap();
+    let journal = context_journal::journal_path(outside.path(), "purged");
+    std::os::unix::fs::symlink(
+        outside.path().join("context_ledgers"),
+        dir.path().join("context_ledgers"),
+    )
+    .unwrap();
+    assert!(remove_context_manager_store(dir.path(), "purged").is_err());
+    assert!(root.exists() && journal.exists());
+}
+
 fn assert_equivalent(actual: &ContextManager, expected: &ContextManager) {
     assert_eq!(
         actual.canonical_ledger_hash(),
