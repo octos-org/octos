@@ -12,12 +12,17 @@ This lint fails the deploy when:
 
 1. A chapter file exists in one book but not the other.
 2. A chapter's English copy was committed more recently than its Chinese
-   copy — the en update was never carried over — unless the file is listed
-   in `STALE_BASELINE` below.
+   copy — the en update was never carried over — unless the file carries a
+   `STALE_BASELINE` entry whose cutoff date covers the en commit.
+3. The checkout cannot judge staleness at all: not a git repository, a
+   shallow clone (history truncated epochs would both read 0 and pass),
+   or no `book/src` next to the CWD.
 
 What it cannot see: content dropped while the zh file was still touched
 later for unrelated reasons. That class needs eyes on the diff; the gate
-only guarantees the process convention going forward.
+only guarantees the process convention going forward. The %ct anchor also
+trusts committer dates — a rebased zh commit can look fresh without being
+carried over; the docstring is the honest boundary of what is mechanical.
 """
 
 from __future__ import annotations
@@ -25,32 +30,39 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 EN = Path("book/src")
 ZH = Path("book-zh/src")
 
 # Known-stale chapters with drift older than this lint, exempted until a
-# backfill lands. Each entry must name the gap so the exemption stays
-# auditable; remove the entry once the chapter is carried over.
-STALE_BASELINE: dict[str, str] = {
-    # Four pre-09-01 en sections have no zh counterpart (structural gap is
-    # older than the #2691 drift, which this PR did backfill).
-    "providers.md": "pre-2026-09 sections untranslated",
-    # One en section with no zh counterpart; last lockstep commit 043544a2.
-    "advanced.md": "one section untranslated",
-    # Three en sections with no zh counterpart; last lockstep 73bf14c8.
-    "skill-development.md": "three sections untranslated",
+# backfill lands. Each entry names its gap and a cutoff date: the exemption
+# only covers en commits from ON or BEFORE the cutoff — any later en-only
+# update to the chapter is flagged like anywhere else. Remove the entry once
+# the recorded gap is translated.
+STALE_BASELINE: dict[str, tuple[str, str]] = {
+    # Four pre-09 sections have no zh counterpart (8437c548 QoS ranking /
+    # provider metadata / hedge mode, b33811c4 providing the API key). The
+    # 2026-09-16..10-07 drift (#2691 et al.) is backfilled; anything newer
+    # must be carried over.
+    "providers.md": ("four pre-2026-09 sections untranslated", "2026-10-12"),
+    # One en section with no zh counterpart, as of lockstep 043544a2.
+    "advanced.md": ("one en section untranslated", "2026-09-23"),
+    # Three en sections with no zh counterpart, as of lockstep 73bf14c8.
+    "skill-development.md": ("three en sections untranslated", "2026-06-21"),
 }
+
+
+def git_lines(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], capture_output=True, text=True
+    ).stdout.strip()
 
 
 def last_commit_epoch(path: str) -> int:
     """Unix timestamp of the last commit touching path; 0 when untracked."""
-    out = subprocess.run(
-        ["git", "log", "-1", "--format=%ct", "--", path],
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    out = git_lines("log", "-1", "--format=%ct", "--", path)
     return int(out) if out else 0
 
 
@@ -58,8 +70,19 @@ def chapters(root: Path) -> set[str]:
     return {str(p.relative_to(root)) for p in root.rglob("*.md")}
 
 
+def cutoff_epoch(date: str) -> int:
+    return datetime.fromisoformat(f"{date}T00:00:00+00:00").timestamp()
+
+
 def failures() -> list[str]:
     problems: list[str] = []
+    if not EN.is_dir() or not ZH.is_dir():
+        return [f"run from the repository root ({EN} / {ZH} not found)"]
+    if git_lines("rev-parse", "--is-shallow-repository") != "false":
+        problems.append(
+            "shallow checkout: per-chapter staleness needs full history "
+            "(set fetch-depth: 0)"
+        )
     en_files, zh_files = chapters(EN), chapters(ZH)
     for missing in sorted(en_files - zh_files):
         problems.append(f"no Chinese chapter for {EN / missing}")
@@ -69,7 +92,7 @@ def failures() -> list[str]:
         en_ts, zh_ts = last_commit_epoch(str(EN / rel)), last_commit_epoch(str(ZH / rel))
         if en_ts <= zh_ts:
             continue
-        if rel in STALE_BASELINE:
+        if rel in STALE_BASELINE and en_ts <= cutoff_epoch(STALE_BASELINE[rel][1]):
             continue
         problems.append(
             f"{ZH / rel} lags {EN / rel}: en committed after the last zh touch "
@@ -109,10 +132,12 @@ def self_test() -> int:
                 cwd=repo, env=env, check=True, capture_output=True,
             )
 
-        def run_lint() -> subprocess.CompletedProcess[str]:
+        def run_lint(
+            cwd: str = repo, script: str = "scripts/lint-book-zh-parity.py"
+        ) -> subprocess.CompletedProcess[str]:
             return subprocess.run(
-                [sys.executable, "scripts/lint-book-zh-parity.py"],
-                cwd=repo, capture_output=True, text=True,
+                [sys.executable, script],
+                cwd=cwd, capture_output=True, text=True,
             )
 
         # Scenario 1: lockstep commit touches both trees — pass.
@@ -147,16 +172,43 @@ def self_test() -> int:
         if out.returncode == 0 or "lags" not in out.stdout:
             print(f"self-test: stale backfill not flagged:\n{out.stdout}{out.stderr}")
             return 1
-        # Scenario 5: baseline exemption silences the staleness flag — pass.
+        # Scenario 5: a baseline entry exempts only en commits up to its
+        # cutoff — the 01-04 en update inside the cutoff is silenced.
         exempted = lint.replace(
-            "STALE_BASELINE: dict[str, str] = {",
-            'STALE_BASELINE: dict[str, str] = {\n    "extra.md": "test exemption",',
+            "STALE_BASELINE: dict[str, tuple[str, str]] = {",
+            'STALE_BASELINE: dict[str, tuple[str, str]] = {\n'
+            '    "extra.md": ("test exemption", "2026-01-05"),',
             1,
         )
         (Path(repo) / "scripts" / "lint-book-zh-parity.py").write_text(exempted)
         out = run_lint()
         if out.returncode != 0 or "extra.md" in out.stdout:
-            print(f"self-test: baseline exemption not honored:\n{out.stdout}{out.stderr}")
+            print(f"self-test: in-cutoff exemption not honored:\n{out.stdout}{out.stderr}")
+            return 1
+        # Scenario 5b: an en update AFTER the cutoff is flagged despite the
+        # entry — the baseline cannot blind the gate to new incidents.
+        commit("book/src", "extra.md", "# Extra v2\n", "2026-01-06T00:00:00 +0000")
+        out = run_lint()
+        if out.returncode == 0 or "extra.md" not in out.stdout:
+            print(f"self-test: post-cutoff update not flagged:\n{out.stdout}{out.stderr}")
+            return 1
+        # Scenario 6: shallow clone — the gate refuses to judge instead of
+        # silently passing on truncated epochs.
+        shallow = str(Path(tmp) / "shallow")
+        subprocess.run(
+            ["git", "clone", "-q", "--depth=1", f"file://{repo}", shallow],
+            check=True, capture_output=True,
+        )
+        out = run_lint(cwd=shallow)
+        if out.returncode == 0 or "shallow" not in out.stdout:
+            print(f"self-test: shallow clone not flagged:\n{out.stdout}{out.stderr}")
+            return 1
+        # Scenario 7: degenerate CWD without the books — loud failure, no green.
+        out = run_lint(
+            cwd=tmp, script=os.path.join(repo, "scripts", "lint-book-zh-parity.py")
+        )
+        if out.returncode == 0 or "repository root" not in out.stdout:
+            print(f"self-test: missing book dirs not flagged:\n{out.stdout}{out.stderr}")
             return 1
     print("ok: self-test")
     return 0
