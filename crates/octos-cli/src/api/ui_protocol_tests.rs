@@ -44842,6 +44842,244 @@ fn should_merge_late_background_result_into_current_session_manager_not_stale_tu
     );
 }
 
+/// Exercise the RPC handler and the real OpenAI-compatible HTTP client. The
+/// two routes deliberately have different models and credentials, so a primary
+/// fallback cannot look like successful peer compaction.
+async fn manual_compaction_model_case(case: &str, topic: &str, lane: Option<&str>, llm: bool) {
+    use axum::{Json, Router, http::HeaderMap, http::Uri, routing::post};
+
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests = captured.clone();
+    let router = Router::new().fallback(post(
+        move |uri: Uri, headers: HeaderMap, Json(body): Json<Value>| {
+            let requests = requests.clone();
+            async move {
+                requests.lock().unwrap().push((
+                    uri.path().to_owned(),
+                    headers
+                        .get("authorization")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                    body.clone(),
+                ));
+                Json(json!({
+                    "id": "compaction-fixture", "object": "chat.completion", "created": 0,
+                    "model": body["model"],
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "COMPACTION_ROUTE_SUMMARY"}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+                }))
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile_id = format!("compact-model-{case}");
+    let profile_dir = dir.path().join("profiles").join(&profile_id).join("data");
+    let mut config = config_with_lane("strong");
+    config.bypass_auth_store = true;
+    config.api_key_env = Some("COMPACTION_PRIMARY_TEST_KEY".to_owned());
+    config.env_vars.insert(
+        "COMPACTION_PRIMARY_TEST_KEY".into(),
+        "primary-fixture-key".into(),
+    );
+    config.sub_providers[0].base_url = Some(format!("{base}/peer/v1"));
+    if lane == Some("unbuildable") {
+        config.sub_providers[0].key = "unbuildable".into();
+        config.sub_providers[0].provider = "unsupported-compaction-test-provider".into();
+    }
+    let primary = crate::commands::chat::create_provider_with_api_type(
+        "openai",
+        &config,
+        Some("gpt-4o".into()),
+        Some(format!("{base}/primary/v1")),
+        Some("openai"),
+    )
+    .unwrap();
+    let mut profile = make_m11e_profile_with_llm_and_sandbox(
+        &profile_id,
+        &profile_dir,
+        primary,
+        octos_agent::SandboxConfig::default(),
+    )
+    .await;
+    Arc::get_mut(&mut profile).unwrap().config = config;
+    let peer_dir = stage_peer_dir_with(&profile_dir.join("peers"), "compactor");
+    if let Some(lane) = lane {
+        std::fs::write(peer_dir.join("model"), lane).unwrap();
+    }
+    if let Some((slug, context_id)) = crate::peers::app_binding::parse_context_topic(topic) {
+        use crate::peers::app_binding::{
+            PeerContextBinding, PeerHostBinding, context_memory_namespace, write_context_binding,
+            write_host_binding_in,
+        };
+        let cwd = dir.path().join("workspace");
+        let context_cwd = cwd.join("contexts").join(context_id);
+        std::fs::create_dir_all(&context_cwd).unwrap();
+        let namespace = "app/compactor/test";
+        write_host_binding_in(
+            &peer_dir,
+            &PeerHostBinding {
+                version: 1,
+                cwd: dunce::canonicalize(&cwd).unwrap(),
+                memory_namespace: namespace.into(),
+                token_sha256: crate::peers::app_binding::token_digest("fixture-host-token"),
+            },
+        )
+        .unwrap();
+        write_context_binding(
+            &profile_dir.join("peers"),
+            slug,
+            context_id,
+            &PeerContextBinding {
+                version: 1,
+                cwd: dunce::canonicalize(&context_cwd).unwrap(),
+                memory_namespace: context_memory_namespace(namespace, context_id),
+                closed: false,
+                share_history: None,
+                read_parent: false,
+            },
+        )
+        .unwrap();
+    }
+    let state = Arc::new(AppState {
+        profiles: HashMap::from([(profile_id.clone(), profile.clone())]),
+        llm_compaction: llm,
+        ..AppState::empty_for_tests()
+    });
+    let session = SessionKey::with_profile_topic(&profile_id, "api", "test", topic);
+    let runtime = state
+        .session_cache
+        .get_or_init(&profile, session.clone(), None)
+        .await
+        .unwrap();
+    // Enough closed turns to compact with either provider's context window;
+    // no real credentials, environment mutation, or external network requests.
+    let history: Vec<Message> = (0..60)
+        .map(|index| {
+            test_message(
+                if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                format!("history {index}: {}", "prior context ".repeat(800)),
+            )
+        })
+        .collect();
+    runtime
+        .sessions
+        .lock()
+        .await
+        .get_or_create(&session)
+        .await
+        .messages = history;
+    let (writer, _reader) = mpsc::channel(32);
+    let ws = WsConnection::new(writer);
+    let result = handle_session_compact(
+        &ws,
+        &state,
+        &Arc::new(UiProtocolLedger::new(32)),
+        ConnectionUiFeatures::default(),
+        Some(&profile_id),
+        &RpcRequest::new(
+            "compact",
+            APPUI_METHOD_SESSION_COMPACT,
+            json!({"session_id": session}),
+        ),
+    )
+    .await
+    .unwrap();
+    server.abort();
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(result["compacted"], true, "{case}: {result}");
+    if !llm {
+        assert!(
+            requests.is_empty(),
+            "heuristic compaction must not call either model"
+        );
+        return;
+    }
+    assert_eq!(requests.len(), 1, "exactly one summary call: {case}");
+    let use_peer = topic != "ordinary" && lane == Some("strong");
+    let (path, authorization, body) = &requests[0];
+    assert_eq!(
+        path,
+        if use_peer {
+            "/peer/v1/chat/completions"
+        } else {
+            "/primary/v1/chat/completions"
+        },
+        "{case}"
+    );
+    assert_eq!(
+        authorization,
+        if use_peer {
+            "Bearer sk-peer-lane-test"
+        } else {
+            "Bearer primary-fixture-key"
+        },
+        "{case}"
+    );
+    assert_eq!(
+        body["model"],
+        if use_peer { "gpt-4o-mini" } else { "gpt-4o" },
+        "{case}"
+    );
+    let snapshot = crate::context_manager::load_context_manager_snapshot(
+        &runtime.sessions_root,
+        &session.to_string(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        snapshot
+            .for_prompt(&PromptBuildPolicy::default())
+            .messages
+            .iter()
+            .any(|message| message.content.contains("COMPACTION_ROUTE_SUMMARY")),
+        "the selected model's summary must survive reload"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_peer_model_when_manually_compacting_peer_session() {
+    manual_compaction_model_case("peer", "peer-compactor", Some("strong"), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_owner_peer_model_when_manually_compacting_request_context() {
+    manual_compaction_model_case("context", "peerctx-compactor.request", Some("strong"), true)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_primary_model_when_manually_compacting_ordinary_session() {
+    manual_compaction_model_case("ordinary", "ordinary", Some("strong"), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_primary_model_when_manual_compaction_peer_lane_is_unavailable() {
+    for (case, lane) in [
+        ("absent", None),
+        ("unknown", Some("missing")),
+        ("invalid", Some("unbuildable")),
+    ] {
+        manual_compaction_model_case(case, "peer-compactor", lane, true).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_skip_model_when_manually_compacting_with_heuristic_mode() {
+    manual_compaction_model_case("heuristic", "peer-compactor", Some("strong"), false).await;
+}
+
 struct ManualCompactTinyProvider;
 
 #[async_trait::async_trait]

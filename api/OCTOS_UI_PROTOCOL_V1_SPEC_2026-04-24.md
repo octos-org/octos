@@ -434,7 +434,14 @@ Session, turn, and approval core:
   re-projects the trimmed thread exactly like `session/hydrate`; #1516)
 - `session/fork` (branch a session into a new one with copied history; #1613)
 - `session/btw` (quick aside question answered while the current turn runs; #1609)
-- `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command)
+- `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command).
+  Manual and automatic compaction use the same session model selection: a
+  peer's configured model lane (also for its request-context sessions), otherwise
+  the profile primary provider. This selects the model, endpoint, credentials,
+  and context-window budget together; compaction has no separate provider
+  configuration. Missing or unbuildable peer lanes retain the turn path's
+  primary-provider fallback. Heuristic mode makes no model call, and manual
+  compaction remains deferred while a turn is active.
 - `session/compact/mode/set` (per-session LLM-vs-heuristic compaction mode; the `/context` menu)
 - `turn/start`
 - `turn/interrupt`
