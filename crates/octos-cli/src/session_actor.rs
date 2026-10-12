@@ -538,7 +538,10 @@ fn reset_context_manager_from_history(
     data_dir: &Path,
     messages: &[Message],
 ) {
-    let rebuilt = context_manager_from_history(session_key, messages);
+    let mut rebuilt = context_manager_from_history(session_key, messages);
+    // The canonical rollback/reset already committed; this deliberately
+    // starts a new context lineage rather than overwriting from a stale clone.
+    rebuilt.mark_ledger_rebuilt();
     let state = rebuilt.state();
     let mut manager = context_manager.lock().unwrap_or_else(|e| e.into_inner());
     *manager = rebuilt;

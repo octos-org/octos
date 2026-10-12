@@ -903,7 +903,13 @@ mod tests {
         create_fleet(store.clone(), "f1", vec![task_spec("a", &[], vec![])]).await;
 
         let work = TempDir::new().unwrap();
-        let (_md, factory) = factory_for(Arc::new(SuccessProvider)).await;
+        // GatedProvider pins the attempt mid-flight: an instantly-finishing
+        // provider let the first attempt settle between the two dispatches
+        // (child terminal → the launch CAS answers RejectedNotReady), which
+        // flaked this test in CI. wait_for_status below then asserts that
+        // in-flight premise explicitly.
+        let (provider, release) = GatedProvider::new();
+        let (_md, factory) = factory_for(Arc::new(provider)).await;
         let pool = FleetWorkerPool::new(
             store.clone(),
             Arc::new(factory),
@@ -919,7 +925,10 @@ mod tests {
         );
 
         // The child is now in flight with a live attempt: a second dispatch
-        // of the same task is a double-launch and spawns NO work.
+        // of the same task is a double-launch and spawns NO work. Asserting
+        // the status first keeps any gate bypass a loud timeout here instead
+        // of a re-flake below.
+        wait_for_status(&store, "f1", "a", ChildStatus::Running).await;
         let second = pool.dispatch("f1", "a").await.unwrap();
         assert_eq!(second.launch, LaunchOutcome::RejectedDoubleLaunch);
         assert!(
@@ -928,9 +937,15 @@ mod tests {
         );
 
         // Let the first attempt finish cleanly.
+        release.notify_one();
         let outcome = first.handle.unwrap().await.unwrap();
         assert!(
-            matches!(outcome, AttemptOutcome::Completed { .. }),
+            matches!(
+                outcome,
+                AttemptOutcome::Completed {
+                    verdict: AcceptanceVerdict::Accepted { .. }
+                }
+            ),
             "got {outcome:?}",
         );
     }

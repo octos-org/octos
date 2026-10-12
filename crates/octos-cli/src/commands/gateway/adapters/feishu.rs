@@ -27,11 +27,18 @@ pub fn register(
         .get("webhook_port")
         .and_then(|v| v.as_u64())
         .unwrap_or(9321) as u16;
-    let encrypt_key = entry
-        .settings
-        .get("encrypt_key")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let encrypt_key = entry.settings.get("encrypt_key").and_then(|v| v.as_str());
+    // An empty encrypt_key must not arm the channel: sha256("") is publicly
+    // known, so signature verification and event decryption would both accept
+    // attacker-crafted material (#2772). Treat it as unconfigured like the
+    // verification_token below; tell the operator their setting was dropped.
+    if encrypt_key.is_some_and(|key| key.is_empty()) {
+        tracing::warn!(
+            "Feishu channel: encrypt_key is set but empty — treated as unconfigured \
+             (webhook signature verification will stay DISABLED)"
+        );
+    }
+    let encrypt_key = encrypt_key.filter(|key| !key.is_empty()).map(String::from);
     // An empty-string placeholder must not arm the channel into refusing
     // every event (#2756 review): treat it as unconfigured.
     let verification_token = entry

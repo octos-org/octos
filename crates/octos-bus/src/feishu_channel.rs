@@ -34,6 +34,10 @@ use futures::SinkExt;
 const TOKEN_TTL_SECS: u64 = 7000;
 /// Maximum message IDs to track for dedup.
 const MAX_SEEN_IDS: usize = 1000;
+/// Webhook signature-timestamp freshness tolerance (#2773): the signature
+/// pins the timestamp, so a captured validly-signed event re-verifies
+/// forever unless the clock is consulted. 5 minutes — the OWASP/Stripe norm.
+const WEBHOOK_TIMESTAMP_TOLERANCE_SECS: i64 = 300;
 /// Default ping interval for Feishu WS (2 minutes, matching official SDK).
 const FEISHU_PING_INTERVAL_SECS: u64 = 120;
 
@@ -446,7 +450,10 @@ struct WebhookState {
 /// Security: when `encrypt_key` is set, ALL THREE Lark signature headers
 /// (`X-Lark-Signature`, `X-Lark-Request-Timestamp`, `X-Lark-Request-Nonce`)
 /// MUST be present AND the computed HMAC MUST match. Any missing header or
-/// signature mismatch returns 401 Unauthorized. See #862.
+/// signature mismatch returns 401 Unauthorized. See #862. The pinned
+/// timestamp must additionally fall within `WEBHOOK_TIMESTAMP_TOLERANCE_SECS`
+/// of the current clock — a replay of an older capture is refused with 403
+/// (#2773).
 async fn handle_webhook(
     axum::extract::State(state): axum::extract::State<WebhookState>,
     headers: axum::http::HeaderMap,
@@ -515,6 +522,36 @@ async fn handle_webhook(
                 return (
                     axum::http::StatusCode::UNAUTHORIZED,
                     axum::Json(serde_json::json!({"error": "signature mismatch"})),
+                )
+                    .into_response();
+            }
+
+            // Freshness: the signature re-verifies for a captured event
+            // indefinitely, so the clock is the only bound on replay (#2773).
+            // The message dedup window alone (60s) left every capture
+            // replayable after it expired. Reject timestamps outside the
+            // tolerance — symmetric, the Stripe norm — and unparseable ones
+            // fail closed, like a non-string token (#2756).
+            let ts: i64 = match timestamp.parse() {
+                Ok(ts) => ts,
+                Err(_) => {
+                    warn!("Feishu webhook: non-numeric request timestamp; rejecting");
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        axum::Json(serde_json::json!({"error": "invalid timestamp"})),
+                    )
+                        .into_response();
+                }
+            };
+            let age_secs = Utc::now().timestamp().abs_diff(ts);
+            if age_secs > WEBHOOK_TIMESTAMP_TOLERANCE_SECS as u64 {
+                warn!(
+                    age_secs,
+                    "Feishu webhook: request timestamp outside the freshness window; rejecting"
+                );
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({"error": "stale timestamp"})),
                 )
                     .into_response();
             }
@@ -636,7 +673,12 @@ impl FeishuChannel {
             http: Client::new(),
             media_dir,
             token_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            dedup: MessageDedup::with_config(MAX_SEEN_IDS, Duration::from_secs(60)),
+            // ≥2× the timestamp tolerance so duplicates stay filtered across
+            // the whole replay window (#2773; OWASP: dedup ≥ 2× tolerance).
+            dedup: MessageDedup::with_config(
+                MAX_SEEN_IDS,
+                Duration::from_secs(2 * WEBHOOK_TIMESTAMP_TOLERANCE_SECS as u64),
+            ),
             mode: "ws".to_string(),
             webhook_port: 9321,
             encrypt_key: None,
@@ -656,9 +698,12 @@ impl FeishuChannel {
         self
     }
 
-    /// Set encrypt key for AES-256-CBC event decryption.
+    /// Set encrypt key for AES-256-CBC event decryption. An empty key is
+    /// treated as unconfigured: it would arm the webhook signature gate and
+    /// the decrypt path with the publicly-known sha256(""), letting anyone
+    /// forge signatures and decrypt events (#2772).
     pub fn with_encrypt_key(mut self, key: Option<String>) -> Self {
-        self.encrypt_key = key;
+        self.encrypt_key = key.filter(|key| !key.is_empty());
         self
     }
 
@@ -2059,11 +2104,11 @@ mod tests {
     async fn feishu_webhook_with_secret_and_valid_signature_succeeds() {
         let (state, mut rx) = webhook_state_with_secret(Some("mykey"));
         let body = r#"{"type":"event_callback","event":{}}"#;
-        let timestamp = "1700000000";
+        let timestamp = Utc::now().timestamp().to_string();
         let nonce = "nonce-abc";
-        let sig = verify_signature(timestamp, nonce, "mykey", body);
+        let sig = verify_signature(&timestamp, nonce, "mykey", body);
         let headers = build_headers(&[
-            ("X-Lark-Request-Timestamp", Some(timestamp)),
+            ("X-Lark-Request-Timestamp", Some(&timestamp)),
             ("X-Lark-Request-Nonce", Some(nonce)),
             ("X-Lark-Signature", Some(&sig)),
         ]);
@@ -2147,6 +2192,127 @@ mod tests {
             axum::http::StatusCode::UNAUTHORIZED,
             "mismatched signature must be rejected"
         );
+    }
+
+    // ---- Replay protection: signature-timestamp freshness (#2773) ----
+    //
+    // The signature pins the timestamp but nothing consulted the clock, so
+    // a captured validly-signed event re-verified forever once the 60s
+    // message dedup expired. The contract now: timestamps outside the
+    // tolerance window (either direction — the Stripe norm) are refused
+    // with 403, and unparseable ones fail closed like a non-string token.
+
+    #[tokio::test]
+    async fn feishu_webhook_with_valid_signature_but_stale_timestamp_is_rejected() {
+        let (state, mut rx) = webhook_state_with_secret(Some("mykey"));
+        let body = r#"{"type":"event_callback","event":{}}"#;
+        // One second past the tolerance — a capture from just before expiry.
+        let timestamp = (Utc::now().timestamp() - WEBHOOK_TIMESTAMP_TOLERANCE_SECS - 1).to_string();
+        let sig = verify_signature(&timestamp, "nonce-abc", "mykey", body);
+        let headers = build_headers(&[
+            ("X-Lark-Request-Timestamp", Some(&timestamp)),
+            ("X-Lark-Request-Nonce", Some("nonce-abc")),
+            ("X-Lark-Signature", Some(&sig)),
+        ]);
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "a validly-signed stale capture must be refused as a replay (#2773)"
+        );
+        assert!(rx.try_recv().is_err(), "replayed event must not forward");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_far_future_timestamp_is_rejected() {
+        let (state, mut rx) = webhook_state_with_secret(Some("mykey"));
+        let body = r#"{"type":"event_callback","event":{}}"#;
+        // Generous margin: unlike the stale direction, elapsed test time
+        // shrinks a future timestamp's distance from the clock.
+        let timestamp =
+            (Utc::now().timestamp() + WEBHOOK_TIMESTAMP_TOLERANCE_SECS + 60).to_string();
+        let sig = verify_signature(&timestamp, "nonce-abc", "mykey", body);
+        let headers = build_headers(&[
+            ("X-Lark-Request-Timestamp", Some(&timestamp)),
+            ("X-Lark-Request-Nonce", Some("nonce-abc")),
+            ("X-Lark-Signature", Some(&sig)),
+        ]);
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "the tolerance window is symmetric around the current clock"
+        );
+        assert!(rx.try_recv().is_err(), "refused event must not forward");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_timestamp_well_within_tolerance_still_forwards() {
+        // The acceptance side of the window: a capture from a minute ago is
+        // ordinary in-flight latency and must pass — pins the window against
+        // regressions that collapse it to zero.
+        let (state, mut rx) = webhook_state_with_secret(Some("mykey"));
+        let body = r#"{"type":"event_callback","event":{}}"#;
+        let timestamp = (Utc::now().timestamp() - 60).to_string();
+        let sig = verify_signature(&timestamp, "nonce-abc", "mykey", body);
+        let headers = build_headers(&[
+            ("X-Lark-Request-Timestamp", Some(&timestamp)),
+            ("X-Lark-Request-Nonce", Some("nonce-abc")),
+            ("X-Lark-Signature", Some(&sig)),
+        ]);
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "an in-window capture must not be refused"
+        );
+        assert!(rx.try_recv().is_ok(), "in-window event should forward");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_non_numeric_timestamp_is_rejected() {
+        let (state, mut rx) = webhook_state_with_secret(Some("mykey"));
+        let body = r#"{"type":"event_callback","event":{}}"#;
+        let sig = verify_signature("not-a-number", "nonce-abc", "mykey", body);
+        let headers = build_headers(&[
+            ("X-Lark-Request-Timestamp", Some("not-a-number")),
+            ("X-Lark-Request-Nonce", Some("nonce-abc")),
+            ("X-Lark-Signature", Some(&sig)),
+        ]);
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "an unparseable timestamp cannot establish freshness — fail closed"
+        );
+        assert!(rx.try_recv().is_err(), "refused event must not forward");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_with_extreme_timestamp_is_rejected() {
+        let (state, mut rx) = webhook_state_with_secret(Some("mykey"));
+        let body = r#"{"type":"event_callback","event":{}}"#;
+        // i64::MIN: the age subtraction must neither panic on overflow nor
+        // wrap the magnitude back under the tolerance.
+        let timestamp = i64::MIN.to_string();
+        let sig = verify_signature(&timestamp, "nonce-abc", "mykey", body);
+        let headers = build_headers(&[
+            ("X-Lark-Request-Timestamp", Some(&timestamp)),
+            ("X-Lark-Request-Nonce", Some("nonce-abc")),
+            ("X-Lark-Signature", Some(&sig)),
+        ]);
+
+        let status = call_handle_webhook(state, headers, body).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "an extreme timestamp must be refused without arithmetic overflow"
+        );
+        assert!(rx.try_recv().is_err(), "refused event must not forward");
     }
 
     // ---- Verification token check regression tests (#2751, #2756) ----
@@ -2279,11 +2445,12 @@ mod tests {
     /// way Lark's push observes them (real HTTP framing, axum extractors,
     /// handler, inbound forwarding).
     async fn spawn_webhook_router(
+        encrypt_key: Option<&str>,
         verification_token: Option<&str>,
     ) -> (std::net::SocketAddr, mpsc::Receiver<serde_json::Value>) {
         let (tx, rx) = mpsc::channel::<serde_json::Value>(8);
         let state = WebhookState {
-            encrypt_key: None,
+            encrypt_key: encrypt_key.map(String::from),
             verification_token: verification_token.map(String::from),
             inbound_tx: tx,
         };
@@ -2297,11 +2464,23 @@ mod tests {
     }
 
     async fn post_webhook_event(addr: std::net::SocketAddr, body: &str) -> u16 {
+        post_webhook_event_with_headers(addr, &[], body).await
+    }
+
+    async fn post_webhook_event_with_headers(
+        addr: std::net::SocketAddr,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut extra_headers = String::new();
+        for (name, value) in headers {
+            extra_headers.push_str(&format!("{name}: {value}\r\n"));
+        }
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let request = format!(
             "POST /webhook/event HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+             {extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(request.as_bytes()).await.unwrap();
@@ -2320,7 +2499,7 @@ mod tests {
 
         // Armed channel: the credential-less push is refused on the wire and
         // nothing reaches the inbound bus (#2756's fail-open, before/after).
-        let (addr, mut rx) = spawn_webhook_router(Some("octos-vt-secret")).await;
+        let (addr, mut rx) = spawn_webhook_router(None, Some("octos-vt-secret")).await;
         assert_eq!(post_webhook_event(addr, event_without_token).await, 403);
         assert!(rx.try_recv().is_err(), "refused push must not forward");
         let signed = r#"{"type":"event_callback","token":"octos-vt-secret","event":{}}"#;
@@ -2338,8 +2517,153 @@ mod tests {
         assert!(rx.try_recv().is_ok(), "verified v2 push should forward");
 
         // Unarmed channel: the passthrough contract is unchanged.
-        let (addr, mut rx) = spawn_webhook_router(None).await;
+        let (addr, mut rx) = spawn_webhook_router(None, None).await;
         assert_eq!(post_webhook_event(addr, event_without_token).await, 200);
         assert!(rx.try_recv().is_ok(), "unarmed channel should forward");
+    }
+
+    // ---- Empty encrypt_key normalization (#2772) ----
+    //
+    // `encrypt_key: ""` used to arm the channel: the signature gate verified
+    // against the publicly-known sha256("") and the AES-256-CBC decrypt path
+    // opened attacker-crafted ciphertext. The builder now treats the empty
+    // string as unconfigured, so the same push lands on the unarmed-channel
+    // refusal and nothing forwards.
+
+    /// Lark's event envelope: base64(IV ‖ AES-256-CBC(sha256(key), PKCS7)).
+    fn lark_encrypt(key: &str, plaintext: &str) -> String {
+        use aes::cipher::{BlockEncryptMut, KeyIvInit};
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use cbc::cipher::block_padding::Pkcs7;
+        use sha2::{Digest, Sha256};
+
+        let key_hash: [u8; 32] = Sha256::digest(key.as_bytes()).into();
+        let iv = [0u8; 16]; // fixed test IV — the handler reads it from the payload
+        let encryptor = cbc::Encryptor::<aes::Aes256>::new((&key_hash).into(), (&iv).into());
+        let mut buf = iv.to_vec();
+        buf.extend_from_slice(&encryptor.encrypt_padded_vec_mut::<Pkcs7>(plaintext.as_bytes()));
+        BASE64.encode(buf)
+    }
+
+    #[test]
+    fn with_encrypt_key_treats_empty_string_as_unconfigured() {
+        let ch = FeishuChannel::new(
+            "id",
+            "secret",
+            vec![],
+            Arc::new(AtomicBool::new(false)),
+            "global",
+            PathBuf::from("/tmp"),
+        )
+        .with_encrypt_key(Some(String::new()));
+        assert!(
+            ch.encrypt_key.is_none(),
+            "empty encrypt_key must not arm the channel (#2772)"
+        );
+        let ch = ch.with_encrypt_key(Some("real-key".to_string()));
+        assert_eq!(ch.encrypt_key.as_deref(), Some("real-key"));
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_empty_encrypt_key_no_longer_accepts_publicly_keyed_forgeries() {
+        // The exact builder chain the gateway adapter runs for an
+        // `encrypt_key: ""` config — pre-fix this armed the webhook (#2772).
+        let ch = FeishuChannel::new(
+            "id",
+            "secret",
+            vec![],
+            Arc::new(AtomicBool::new(false)),
+            "global",
+            PathBuf::from("/tmp"),
+        )
+        .with_encrypt_key(Some(String::new()));
+        let (addr, mut rx) = spawn_webhook_router(ch.encrypt_key.clone().as_deref(), None).await;
+
+        // A push forged entirely with the publicly-known sha256("") — valid
+        // signature, valid ciphertext. The pre-fix channel verified and
+        // decrypted it; an unarmed channel must refuse instead.
+        let timestamp = "1700000000";
+        let nonce = "nonce-abc";
+        let body = format!(
+            r#"{{"encrypt":"{}"}}"#,
+            lark_encrypt("", r#"{"type":"event_callback","event":{}}"#)
+        );
+        let signature = verify_signature(timestamp, nonce, "", &body);
+        let status = post_webhook_event_with_headers(
+            addr,
+            &[
+                ("X-Lark-Request-Timestamp", timestamp),
+                ("X-Lark-Request-Nonce", nonce),
+                ("X-Lark-Signature", &signature),
+            ],
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "empty-key config must not decrypt publicly-keyed ciphertext (#2772)"
+        );
+        assert!(rx.try_recv().is_err(), "refused push must not forward");
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_replayed_capture_is_refused_on_the_wire() {
+        // The production builder chain with a real encrypt_key, driven over
+        // a real TCP socket: the same capture — identical body and signature
+        // — is refused while stale and accepted re-signed fresh. That status
+        // flip is the replay window closing (#2773).
+        let ch = FeishuChannel::new(
+            "id",
+            "secret",
+            vec![],
+            Arc::new(AtomicBool::new(false)),
+            "global",
+            PathBuf::from("/tmp"),
+        )
+        .with_encrypt_key(Some("real-key".to_string()));
+        let (addr, mut rx) = spawn_webhook_router(ch.encrypt_key.clone().as_deref(), None).await;
+
+        let body = r#"{"type":"event_callback","event":{}}"#;
+
+        // A capture signed one second past the tolerance: pre-fix it
+        // verified and forwarded (200); now refused.
+        let stale = (Utc::now().timestamp() - WEBHOOK_TIMESTAMP_TOLERANCE_SECS - 1).to_string();
+        let stale_sig = verify_signature(&stale, "nonce-abc", "real-key", body);
+        assert_eq!(
+            post_webhook_event_with_headers(
+                addr,
+                &[
+                    ("X-Lark-Request-Timestamp", &stale),
+                    ("X-Lark-Request-Nonce", "nonce-abc"),
+                    ("X-Lark-Signature", &stale_sig),
+                ],
+                body,
+            )
+            .await,
+            403,
+            "replayed capture must be refused on the wire (#2773)"
+        );
+        assert!(rx.try_recv().is_err(), "replay must not forward");
+
+        // The same push re-signed with the current clock arrives fresh.
+        let fresh = Utc::now().timestamp().to_string();
+        let fresh_sig = verify_signature(&fresh, "nonce-abc", "real-key", body);
+        assert_eq!(
+            post_webhook_event_with_headers(
+                addr,
+                &[
+                    ("X-Lark-Request-Timestamp", &fresh),
+                    ("X-Lark-Request-Nonce", "nonce-abc"),
+                    ("X-Lark-Signature", &fresh_sig),
+                ],
+                body,
+            )
+            .await,
+            200,
+            "the same capture re-signed fresh must still be accepted"
+        );
+        assert!(rx.try_recv().is_ok(), "fresh push should forward");
     }
 }

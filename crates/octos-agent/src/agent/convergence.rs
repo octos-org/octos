@@ -12,7 +12,7 @@ const DEFAULT_LLM_CALL_INTERVAL: u32 = 20;
 const DEFAULT_ACTIVE_TOKEN_INTERVAL: u64 = 100_000;
 const DEFAULT_ELAPSED_INTERVAL_SECS: u64 = 300;
 
-/// Typed tail envelope for the transient reflection. It is re-injected as a
+/// Typed chronological envelope for a reflection. It is recorded once as a
 /// USER-role context event, never as a System row: Anthropic hoists every
 /// System row into the `system` field and OpenAI-compatible caches key on the
 /// exact serialized prefix, so a System row whose text changes at each
@@ -95,7 +95,7 @@ pub(super) struct ConvergenceController {
     /// records them as real spend; the thresholds must not.
     reflection_active_tokens: u64,
     pending_reason: Option<CheckpointReason>,
-    latest_reflection: Option<String>,
+    pending_reflection: Option<String>,
     checkpoints: u32,
 }
 
@@ -144,7 +144,7 @@ impl ConvergenceController {
             active_tokens_at_checkpoint: 0,
             reflection_active_tokens: 0,
             pending_reason: None,
-            latest_reflection: None,
+            pending_reflection: None,
             checkpoints: 0,
         }
     }
@@ -251,9 +251,7 @@ impl ConvergenceController {
         self.active_tokens_at_checkpoint = self.action_active_tokens(usage);
         self.last_checkpoint_at = Instant::now();
         let reflection = reflection.trim();
-        if !reflection.is_empty() {
-            self.latest_reflection = Some(reflection.to_string());
-        }
+        self.pending_reflection = (!reflection.is_empty()).then(|| reflection.to_string());
     }
 
     /// Turn-cumulative active tokens minus what the reflection calls consumed.
@@ -261,10 +259,10 @@ impl ConvergenceController {
         active_tokens(usage).saturating_sub(self.reflection_active_tokens)
     }
 
-    /// The latest reflection as a typed User-role tail envelope (see
-    /// [`CHECKPOINT_CONTEXT_OPEN`]); `None` before the first checkpoint.
-    pub(super) fn context_message(&self) -> Option<String> {
-        self.latest_reflection.as_ref().map(|reflection| {
+    /// Consume a newly completed reflection once. The caller appends it to
+    /// chronological history; later actions must not relocate it to the tail.
+    pub(super) fn take_context_message(&mut self) -> Option<String> {
+        self.pending_reflection.take().map(|reflection| {
             format!(
                 "{CHECKPOINT_CONTEXT_OPEN}\n{CHECKPOINT_CONTEXT_PREFIX}\n{reflection}\n\
                  Use this internal reflection to guide the next action. Verify it against the \n\
@@ -279,10 +277,10 @@ impl ConvergenceController {
     }
 }
 
-/// True for the transient User-role reflection envelope produced by
-/// [`ConvergenceController::context_message`], so the loop can strip it before
-/// prompt repair/compaction and re-inject only the latest one.
-pub(super) fn is_checkpoint_context(message: &str) -> bool {
+/// True for the User-role reflection envelope produced by
+/// [`ConvergenceController::take_context_message`].
+#[cfg(test)]
+fn is_checkpoint_context(message: &str) -> bool {
     message.starts_with(CHECKPOINT_CONTEXT_OPEN)
 }
 
@@ -469,7 +467,7 @@ mod tests {
     #[test]
     fn should_wrap_reflection_in_typed_context_event_envelope_when_reinjected() {
         let mut controller = new_controller(3, 10_000);
-        assert!(controller.context_message().is_none());
+        assert!(controller.take_context_message().is_none());
 
         controller.complete(
             &TokenUsage::default(),
@@ -477,7 +475,9 @@ mod tests {
             "  next: one bounded edit  ".into(),
         );
 
-        let context = controller.context_message().expect("reflection stored");
+        let context = controller
+            .take_context_message()
+            .expect("reflection stored");
         assert!(context.starts_with(
             "<context_event kind=\"convergence_checkpoint\" authority=\"background\">"
         ));
@@ -488,6 +488,29 @@ mod tests {
             "<context_event kind=\"other\">x</context_event>"
         ));
         assert!(!is_checkpoint_context("[internal convergence checkpoint]"));
+    }
+
+    #[test]
+    fn should_consume_each_reflection_only_once_without_replaying_stale_work() {
+        let mut controller = new_controller(3, 10_000);
+        controller.complete(&TokenUsage::default(), None, "p36-v9 completed".into());
+        assert!(
+            controller
+                .take_context_message()
+                .unwrap()
+                .contains("p36-v9 completed")
+        );
+        assert!(controller.take_context_message().is_none());
+        controller.complete(&TokenUsage::default(), None, String::new());
+        assert!(controller.take_context_message().is_none());
+        controller.complete(&TokenUsage::default(), None, "p36 blank is ready".into());
+        assert!(
+            controller
+                .take_context_message()
+                .unwrap()
+                .contains("blank is ready")
+        );
+        assert!(controller.take_context_message().is_none());
     }
 
     #[test]

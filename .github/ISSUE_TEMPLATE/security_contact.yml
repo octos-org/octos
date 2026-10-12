@@ -1,0 +1,38 @@
+name: Security contact request
+description: Ask a maintainer to establish a private reporting channel
+title: "security contact: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        STOP: this issue will be public.
+
+        Use the repository Security page's "Report a vulnerability" option when available. Use this form only to request a private channel. Do not include vulnerability details, exploit steps, affected paths, logs, screenshots, secrets, or user data.
+  - type: input
+    id: contact
+    attributes:
+      label: Preferred contact
+      description: Provide a GitHub handle or another contact method where maintainers can reach you privately.
+      placeholder: "@username"
+    validations:
+      required: true
+  - type: dropdown
+    id: category
+    attributes:
+      label: Non-sensitive category
+      options:
+        - Credential or token exposure
+        - Command execution or path handling
+        - Update or release integrity
+        - Permission or authorization boundary
+        - Dependency vulnerability
+        - Other or unsure
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have not included vulnerability details, secrets, logs, affected paths, or user data in this public request.
+          required: true

@@ -4619,6 +4619,63 @@ fn appui_prompt_context_bridge_reports_live_context_state_when_negotiated() {
 }
 
 #[test]
+fn appui_prompt_context_bridge_retains_one_shot_reflection_at_original_position() {
+    let session_id = SessionKey::new("api", "checkpoint-once");
+    let manager = Arc::new(StdMutex::new(ContextManager::new(
+        session_id.to_string(),
+        None,
+    )));
+    let dir = tempfile::tempdir().unwrap();
+    let bridge =
+        AppUiPromptContextBridge::new(session_id, dir.path().to_path_buf(), manager.clone(), false);
+    let mut prompt = vec![
+        Message::system("stable runtime"),
+        Message::user("finish deck"),
+    ];
+    let request = |phase, iteration| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".into(),
+        model_id: "large-context".into(),
+        context_window: 200_000,
+    };
+    bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .unwrap();
+    let checkpoint = "<context_event kind=\"convergence_checkpoint\" authority=\"background\">p36-v9 complete</context_event>";
+    prompt.push(Message::user(checkpoint));
+    prompt.push(Message::assistant("new clean artwork requested"));
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut prompt)
+        .unwrap();
+    let original = prompt.iter().position(|m| m.content == checkpoint).unwrap();
+    prompt.push(Message::assistant("clean artwork received"));
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 3), &mut prompt)
+        .unwrap();
+    assert_eq!(
+        prompt
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.content == checkpoint)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>(),
+        vec![original]
+    );
+    assert_eq!(prompt.last().unwrap().content, "clean artwork received");
+    let reloaded = ContextManager::from_snapshot(manager.lock().unwrap().snapshot());
+    assert_eq!(
+        reloaded
+            .for_prompt(&PromptBuildPolicy::default())
+            .messages
+            .iter()
+            .filter(|m| m.content == checkpoint)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn appui_prompt_context_bridge_preserves_current_user_turn() {
     let session_id = SessionKey::new("api", "context-current-user");
     let history = vec![
@@ -26192,12 +26249,9 @@ async fn session_rollback_survives_reload_from_disk() {
 }
 
 /// A stale context ledger must not resurrect rolled-back turns. The
-/// ledger coverage check is a high-watermark `>=` (deliberately
-/// slice-tolerant, because turn paths pass bounded history slices), so
-/// after a rollback shrinks durable history a pre-rollback ledger still
-/// "covers" it, gets Loaded verbatim, and the next model prompt would
-/// contain the very turns the user rewound away. `session/rollback` must
-/// rebuild + persist the context ledger from the trimmed history.
+/// Exact source-history coverage rejects a pre-rollback ledger on resume.
+/// The rollback handler also rebuilds and persists immediately, retiring
+/// summaries and cache state before any later turn resumes.
 #[tokio::test(flavor = "current_thread")]
 async fn session_rollback_rebuilds_context_ledger() {
     let session_id = SessionKey("local:rollback-ctx-ledger".into());
@@ -29075,7 +29129,7 @@ async fn bounded_channel_reporter_emits_typed_thread_id_on_progress_events() {
         .with_thread_id(Some("turn-pr-f-A".to_string()));
     reporter.report(octos_agent::ProgressEvent::Thinking { iteration: 0 });
 
-    let event = rx.try_recv().expect("event must be available");
+    let event = rx.recv().await.expect("event must be available");
     let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
     assert_eq!(
         parsed["thread_id"], "turn-pr-f-A",
@@ -29086,7 +29140,7 @@ async fn bounded_channel_reporter_emits_typed_thread_id_on_progress_events() {
     let (tx2, mut rx2) = tokio::sync::mpsc::channel::<String>(8);
     let unbound = BoundedChannelReporter::new(tx2, dropped);
     unbound.report(octos_agent::ProgressEvent::Thinking { iteration: 1 });
-    let event = rx2.try_recv().expect("event must be available");
+    let event = rx2.recv().await.expect("event must be available");
     let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
     assert!(
         parsed.get("thread_id").is_none(),
@@ -31296,7 +31350,11 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
     );
     assert_eq!(response.assistant_segments.final_iteration, 4);
     if progress_mode == 2 {
-        assert!(progress_dropped.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            progress_dropped.load(Ordering::SeqCst),
+            0,
+            "a full transport queue must not discard tool/identity events"
+        );
     }
     let (ws, _writer) = ws_connection_for_test(512);
     let context = ProgressMappingContext::new(session.clone(), turn_id);
@@ -31305,7 +31363,9 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
     let mut saw_delta = false;
     let mut expected_stream_ids = Vec::new();
     let mut delayed_progress = Vec::new();
-    while let Ok(json) = rx.try_recv() {
+    while let Ok(Some(json)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+    {
         let event: Value = serde_json::from_str(&json).unwrap();
         if progress_mode == 4 {
             delayed_progress.push(event);
@@ -49632,4 +49692,228 @@ async fn workspace_team_open_list_election_notifications_and_scope() {
     for (_, handle) in forwarders.lock().await.drain() {
         handle.abort();
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_rollback_retires_context_transitions_and_resumes_new_branch() {
+    let session_id = SessionKey("local:rollback-context-transitions".into());
+    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+    let data_dir = {
+        let mut sessions = state.sessions.as_ref().unwrap().lock().await;
+        let data_dir = sessions.data_dir();
+        let history = sessions.get_or_create(&session_id).await.messages.clone();
+        let mut context =
+            ContextManager::from_session_history(session_id.to_string(), None, &history[..4]);
+        context.reconcile_prompt_cache_epoch("fixture", "old-model", "stable", &[]);
+        persist_context_manager_snapshot(&data_dir, &session_id.to_string(), &context).unwrap();
+        for (seq, row) in history.iter().enumerate().skip(4) {
+            context.record_persisted_message_merging_prompt_equivalent(row, seq);
+        }
+        context.compact_context(
+            "LATER-SUMMARY-REMOVE",
+            crate::context_manager::CompactContextPolicy {
+                keep_recent_items: 2,
+                ..Default::default()
+            },
+        );
+        assert!(!context.compactions().is_empty());
+        crate::context_manager::persist_context_manager_incremental(
+            &data_dir,
+            &session_id.to_string(),
+            &context,
+        )
+        .unwrap();
+        data_dir
+    };
+    let ledger = event_ledger(&state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_rollback(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns_registry(),
+        None,
+        None,
+        "rewind-transitions".into(),
+        SessionRollbackParams {
+            session_id: session_id.clone(),
+            num_turns: 1,
+        },
+    )
+    .await;
+    let response = recv_rpc_json(&mut rx).await;
+    assert!(response.get("error").is_none(), "{response}");
+    // Inspect the actual persisted reset directly, not a fallback rebuild.
+    let context =
+        crate::context_manager::load_context_manager_snapshot(&data_dir, &session_id.to_string())
+            .unwrap()
+            .unwrap();
+    assert!(
+        context.compactions().is_empty(),
+        "rewind must retire later compaction metadata"
+    );
+    assert!(
+        context.cache_epoch().is_none(),
+        "rewind must retire the later cache epoch"
+    );
+    assert!(
+        !serde_json::to_string(&context.snapshot())
+            .unwrap()
+            .contains("LATER-SUMMARY-REMOVE")
+    );
+    let manager = Arc::new(StdMutex::new(context));
+    let mut sessions = octos_bus::SessionManager::open(&data_dir).unwrap();
+    let trimmed = sessions.get_or_create(&session_id).await.messages.clone();
+    assert_eq!(trimmed.len(), 4);
+    assert!(
+        trimmed
+            .iter()
+            .all(|message| message.content != "turn 3" && message.content != "reply 3")
+    );
+    let mut batch =
+        postturn_context_batch::AppUiContextCommitBatch::new(&data_dir, &manager, &session_id);
+    for row in [
+        Message::user_rooting_thread("NEW-BRANCH", octos_core::ClientMessageId::new("branch")),
+        Message::assistant_with_thread("NEW-RESULT", octos_core::ThreadId::new("branch")),
+    ] {
+        let seq = sessions
+            .add_message_with_seq(&session_id, row.clone())
+            .await
+            .unwrap();
+        batch.record(&row, seq);
+    }
+    manager
+        .lock()
+        .unwrap()
+        .reconcile_prompt_cache_epoch("fixture", "new-model", "stable", &[]);
+    batch.finish().unwrap();
+    drop(sessions);
+    let mut resumed_sessions = octos_bus::SessionManager::open(&data_dir).unwrap();
+    let resumed_history = resumed_sessions
+        .get_or_create(&session_id)
+        .await
+        .messages
+        .clone();
+    let (mut resumed, status) =
+        load_or_rebuild_context_manager(&data_dir, session_id.to_string(), None, &resumed_history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
+    assert_eq!(
+        resumed_history.len(),
+        6,
+        "new branch reuses the rolled-back sequence positions"
+    );
+    assert_eq!(resumed.cache_epoch().unwrap().model, "new-model");
+    let frame = resumed.for_prompt(&PromptBuildPolicy::default());
+    assert!(
+        frame
+            .messages
+            .iter()
+            .any(|message| message.content == "NEW-RESULT")
+    );
+    assert!(
+        frame
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("turn 3")
+                && !message.content.contains("reply 3")
+                && !message.content.contains("LATER-SUMMARY-REMOVE"))
+    );
+    resumed.compact_context(
+        "NEW-BRANCH-SUMMARY",
+        crate::context_manager::CompactContextPolicy {
+            keep_recent_items: 2,
+            ..Default::default()
+        },
+    );
+    persist_context_manager_snapshot(&data_dir, &session_id.to_string(), &resumed).unwrap();
+    let (after_full, status) =
+        load_or_rebuild_context_manager(&data_dir, session_id.to_string(), None, &resumed_history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
+    assert_eq!(after_full.compactions(), resumed.compactions());
+    assert_eq!(after_full.cache_epoch(), resumed.cache_epoch());
+    assert!(
+        !serde_json::to_string(&after_full.snapshot())
+            .unwrap()
+            .contains("LATER-SUMMARY-REMOVE")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_resume_rejects_future_context_after_interrupted_rollback_checkpoint() {
+    let session_id = SessionKey("local:rollback-checkpoint-window".into());
+    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+    let data_dir = {
+        let mut sessions = state.sessions.as_ref().unwrap().lock().await;
+        let data_dir = sessions.data_dir();
+        let history = sessions.get_or_create(&session_id).await.messages.clone();
+        let mut context =
+            ContextManager::from_session_history(session_id.to_string(), None, &history);
+        context.reconcile_prompt_cache_epoch("fixture", "future-model", "stable", &[]);
+        context.compact_context(
+            "FUTURE-SUMMARY",
+            crate::context_manager::CompactContextPolicy {
+                keep_recent_items: 2,
+                ..Default::default()
+            },
+        );
+        persist_context_manager_snapshot(&data_dir, &session_id.to_string(), &context).unwrap();
+        context.record_context_event(
+            crate::context_manager::ContextEventKind::GoalSnapshot,
+            "goal",
+            "FUTURE-FACT",
+        );
+        crate::context_manager::persist_context_manager_incremental(
+            &data_dir,
+            &session_id.to_string(),
+            &context,
+        )
+        .unwrap();
+        // The actual rollback API commits its marker before the handler resets
+        // context. Simulate a crash at precisely that boundary.
+        sessions
+            .rollback_last_n_user_turns(&session_id, 1)
+            .await
+            .unwrap();
+        data_dir
+    };
+    let mut restarted_sessions = octos_bus::SessionManager::open(&data_dir).unwrap();
+    let history = restarted_sessions
+        .get_or_create(&session_id)
+        .await
+        .messages
+        .clone();
+    assert_eq!(history.len(), 4);
+    // Exercise normal session-open context hydration, not a manual reset.
+    appui_context_open_snapshot(&data_dir, &session_id, &history, None);
+    let restored =
+        crate::context_manager::load_context_manager_snapshot(&data_dir, &session_id.to_string())
+            .unwrap()
+            .unwrap();
+    assert!(restored.compactions().is_empty());
+    assert!(restored.cache_epoch().is_none());
+    let state_json = serde_json::to_string(&restored.snapshot()).unwrap();
+    for dropped in [
+        "FUTURE-SUMMARY",
+        "FUTURE-FACT",
+        "turn 3",
+        "reply 3",
+        "future-model",
+    ] {
+        assert!(
+            !state_json.contains(dropped),
+            "dropped context resurrected: {dropped}"
+        );
+    }
+    let (_, status) =
+        load_or_rebuild_context_manager(&data_dir, session_id.to_string(), None, &history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
 }

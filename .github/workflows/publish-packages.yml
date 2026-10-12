@@ -58,7 +58,7 @@ jobs:
     steps:
       # Base the formula-bump branch on main (a release event otherwise checks
       # out the tag commit, which would make the PR diff/auto-merge messy).
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: main
           token: ${{ github.token }}
@@ -157,9 +157,9 @@ jobs:
     env:
       TAG: ${{ inputs.tag || github.event.release.tag_name }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'

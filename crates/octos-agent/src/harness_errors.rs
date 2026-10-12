@@ -352,6 +352,25 @@ impl HarnessError {
         if let Some(llm) = report.downcast_ref::<LlmError>() {
             return Self::from_llm_error(llm);
         }
+        // Request construction can fail before a stream exists. Preserve the
+        // typed reqwest cause instead of classifying a read/connect deadline
+        // hidden by `wrap_err("failed to send streaming request")` as a bug.
+        if tool_name.is_none() {
+            if let Some(network) = report
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+            {
+                let message = truncate(&report.to_string(), MAX_HARNESS_ERROR_MESSAGE_BYTES);
+                if network.is_timeout() {
+                    return HarnessError::Timeout { message };
+                }
+                if network.status().is_none()
+                    && (network.is_connect() || network.is_request() || network.is_body())
+                {
+                    return HarnessError::Network { message };
+                }
+            }
+        }
         // #2249 — a before-hook deny is expected policy behaviour: classify it
         // `policy`/`expected` so dashboards stop paging on it as `internal`/`bug`.
         if report
