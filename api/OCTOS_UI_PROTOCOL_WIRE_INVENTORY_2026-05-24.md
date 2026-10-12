@@ -54,6 +54,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `permission/profile/list` | shipped, UPCR-2026-018 |
 | `permission/profile/set` | shipped, UPCR-2026-018 |
 | `diff/preview/get` | shipped base method |
+| `diff/workspace/get` | raw, read-only; `DiffWorkspaceGetParams` → `DiffPreviewGetResult`; opened session workspace only; no turn attribution |
 | `task/output/read` | shipped, UPCR-2026-006 |
 | `task/list` | shipped, UPCR-2026-005 |
 | `task/cancel` | shipped, UPCR-2026-005 |

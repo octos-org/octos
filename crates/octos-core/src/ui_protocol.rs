@@ -1099,6 +1099,7 @@ pub mod methods {
     pub const PERMISSION_PROFILE_LIST: &str = "permission/profile/list";
     pub const PERMISSION_PROFILE_SET: &str = "permission/profile/set";
     pub const DIFF_PREVIEW_GET: &str = "diff/preview/get";
+    pub const DIFF_WORKSPACE_GET: &str = "diff/workspace/get";
     pub const TASK_LIST: &str = "task/list";
     pub const TASK_CANCEL: &str = "task/cancel";
     pub const TASK_RESTART_FROM_NODE: &str = "task/restart_from_node";
@@ -2623,6 +2624,16 @@ pub struct ProfileLocalCreateResult {
 pub struct DiffPreviewGetParams {
     pub session_id: SessionKey,
     pub preview_id: PreviewId,
+}
+
+/// Read uncommitted Git changes in the workspace bound to an open session.
+/// The server chooses the workspace; this request never accepts a client path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiffWorkspaceGetParams {
+    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

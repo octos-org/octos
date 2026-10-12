@@ -1145,6 +1145,7 @@ function routeProbeParams(method) {
     case 'session/files.list':
     case 'session/tasks.list':
     case 'session/workspace.get':
+    case 'diff/workspace/get':
     case 'session/delete':
       return { session_id: sessionId };
     case 'permission/profile/set':
