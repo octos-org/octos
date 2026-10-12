@@ -49917,3 +49917,39 @@ async fn session_resume_rejects_future_context_after_interrupted_rollback_checkp
         crate::context_manager::ContextLedgerLoadStatus::Loaded
     );
 }
+
+#[tokio::test]
+async fn should_shed_reported_critical_events_over_the_wire_budget() {
+    use octos_agent::ProgressReporter as _;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reporter = BoundedChannelReporter::new(tx, dropped.clone());
+    // The real producer path: ProgressEvent → event_to_json → delivery
+    // queue. 64 × 128 KiB tool arguments ≈ 8 MiB, twice the queued-critical
+    // budget, with the consumer stalled (channel(1), never read).
+    let body = "x".repeat(128 * 1024);
+    for i in 0..64 {
+        reporter.report(octos_agent::ProgressEvent::ToolStarted {
+            name: "write".into(),
+            tool_id: format!("t{i}"),
+            arguments: Some(serde_json::json!({"body": body})),
+        });
+    }
+    drop(reporter);
+    let mut received = 0;
+    while let Some(row) = rx.recv().await {
+        let row: serde_json::Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(row["type"], "tool_start");
+        received += 1;
+    }
+    let shed = dropped.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        shed > 0,
+        "reported critical events beyond the wire budget must be shed"
+    );
+    assert_eq!(
+        received + shed as usize,
+        64,
+        "shed accounting must conserve events"
+    );
+}

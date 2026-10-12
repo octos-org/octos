@@ -636,6 +636,16 @@ jobs:
         if: matrix.part == 'unit'
         run: ./scripts/ci-api-filter-test.sh api::auth_handlers
 
+      # The progress-delivery shed contract only runs in the unit lane today
+      # because `api` sits in the default feature set. Pin it explicitly
+      # #2029-style: the zero-match guard fails if these tests are renamed
+      # away, and the step keeps covering them if `api` ever leaves the
+      # default set. The second filter is the same contract through the turn
+      # reporter's production path.
+      - name: Progress delivery backpressure shed (octos-cli)
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh progress_delivery should_shed_reported_critical_events_over_the_wire_budget
+
       # The §6 catalog guard lives in the feature-gated `api` module, so the
       # unfeatured lib/integration runs above never compile it. Run it
       # explicitly so UI Protocol spec/impl drift actually fails CI.
