@@ -1184,7 +1184,7 @@ JSONL persistence at `.octos/sessions/{key}.jsonl`.
 
 - **In-memory cache**: LRU with disk sync on write
 - **Filenames**: Percent-encoded SessionKey, truncated to 183 chars with `_{hash:016X}` suffix on truncation to prevent collisions
-- **Rolling segments**: Files roll into `<name>.segments/NNNNNN.jsonl` at `OCTOS_SESSION_SEGMENT_BYTES` (8MB); loads read the newest segments up to `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32MB, 0 = all)
+- **Rolling segments**: Files roll into `<name>.segments/NNNNNN.jsonl` at `OCTOS_SESSION_SEGMENT_BYTES` (8 MiB); loads read the newest segments up to `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB, 0 = all)
 - **Crash safety**: Atomic write-then-rename
 - **Forking**: `fork()` creates child session with `parent_key` tracking, copies last N messages
 
@@ -1610,7 +1610,7 @@ crates/
 - Tool output sanitization: strips base64 data URIs and long hex strings (`sanitize.rs`)
 - UTF-8 safe truncation via `truncate_utf8()` across all tool outputs and email bodies
 - Session file collision prevention via percent-encoded filenames with hash suffix on truncation
-- Session files roll into 8MB segments and loads stop at `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32MB), preventing OOM on oversized histories
+- Session files roll into 8 MiB segments and loads stop at `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB), preventing OOM on oversized histories
 - Atomic write-then-rename for session persistence (crash safety)
 - API server binds to 127.0.0.1 by default (not 0.0.0.0)
 - Channel access control via `allowed_senders` lists
