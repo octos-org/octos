@@ -65,6 +65,7 @@ records.
 | 039 | Hydrated Tool Call Identity | implemented | `..._039_HYDRATED_TOOL_CALL_IDENTITY.md` | #2675 |
 | 040 | Persistent Project Session History | implemented | `..._040_SESSION_HISTORY.md` | #2710 |
 | 041 | peer route ownership on tool registration, unregister, and session tool-list set | implemented (merged as #2690) | `..._041_PEER_ROUTE_OWNERSHIP.md` | #2690 |
+| 042 | Add record-only `session/append_message` history writes without an agent turn | implemented | `..._042_SESSION_APPEND_MESSAGE.md` | #2730 |
 | 043 | Session Sandbox Narrowing | proposed | `..._043_SESSION_SANDBOX_NARROWING.md` | #1281 |
 | 044 | Manifest-Declared Skill Actions | accepted | `..._044_SKILL_ACTIONS.md` | #1637 |
 | 045 | Skill Action Background Jobs | accepted | `..._045_SKILL_ACTION_JOBS.md` | #1637 |
