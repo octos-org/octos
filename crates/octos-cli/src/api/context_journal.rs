@@ -300,10 +300,9 @@ fn persist_checkpoint_locked(
     // recovery candidate; interruption here leaves an unreferenced file.
     if journal != next_journal
         && let Err(error) = std::fs::remove_file(&journal)
+        && error.kind() != std::io::ErrorKind::NotFound
     {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(%error, "obsolete context journal cleanup deferred");
-        }
+        tracing::warn!(%error, "obsolete context journal cleanup deferred");
     }
     manager
         .journal
