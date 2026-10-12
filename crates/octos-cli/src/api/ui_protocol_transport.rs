@@ -3345,6 +3345,20 @@ fn persist_appui_context_snapshot(
     persist_context_manager_snapshot(data_dir, &session_id.to_string(), manager)
 }
 
+fn persist_appui_context_transition(
+    data_dir: &Path,
+    session_id: &SessionKey,
+    manager: &ContextManager,
+) -> Result<PathBuf, String> {
+    let lock = appui_context_persist_lock(session_id);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    crate::context_manager::persist_context_manager_incremental(
+        data_dir,
+        &session_id.to_string(),
+        manager,
+    )
+}
+
 fn appui_context_status_value(manager: &ContextManager) -> Value {
     let state = manager.state();
     let last_compaction = manager.compactions().last().map(|record| {
@@ -3907,7 +3921,10 @@ fn appui_compaction_summary(
     ) {
         return summary;
     }
-    // Heuristic fallback still uses the summary-size budget (correct there).
+    info!(
+        compaction_path = "heuristic_fallback",
+        budget_tokens, "LLM compaction unavailable, failed, timed out, or returned empty text"
+    );
     frame.compact_summary(budget_tokens)
 }
 
@@ -4571,6 +4588,8 @@ struct AppUiPromptContextBridge {
     /// the per-turn bridge only when the flag is on; child/spawn bridges leave
     /// it `None`.
     llm_compaction_provider: Option<Arc<dyn octos_llm::LlmProvider>>,
+    token_estimation_provider: Option<Arc<dyn octos_llm::LlmProvider>>,
+    token_estimation_tools: Vec<octos_llm::ToolSpec>,
     /// UPCR-2026-035: render earlier `memory_update` context events as "no
     /// memory" in the outgoing prompt (a turn without the app's context).
     redact_memory_events: bool,
@@ -4601,6 +4620,8 @@ impl AppUiPromptContextBridge {
             context_lifecycle_notify: None,
             context_state_updates: false,
             llm_compaction_provider: None,
+            token_estimation_provider: None,
+            token_estimation_tools: Vec::new(),
             redact_memory_events: false,
             ephemeral_block: None,
             ephemeral_anchor: StdMutex::new(None),
@@ -4646,6 +4667,16 @@ impl AppUiPromptContextBridge {
 
     fn with_context_state_updates(mut self, enabled: bool) -> Self {
         self.context_state_updates = enabled;
+        self
+    }
+
+    fn with_token_estimation_provider(
+        mut self,
+        provider: Arc<dyn octos_llm::LlmProvider>,
+        tools: Vec<octos_llm::ToolSpec>,
+    ) -> Self {
+        self.token_estimation_provider = Some(provider);
+        self.token_estimation_tools = tools;
         self
     }
 
@@ -4787,7 +4818,25 @@ impl PromptContextManager for AppUiPromptContextBridge {
             self.adopt_canonical_source_rows(scratch, &canonical);
         }
 
-        let threshold = Self::threshold_tokens(&request);
+        // Runtime instructions and tool declarations are outside the transcript
+        // ledger but still consume the model's context window.
+        let overhead = self
+            .token_estimation_provider
+            .as_ref()
+            .map_or(0, |provider| {
+                let system = scratch.runtime_system.as_ref().or_else(|| {
+                    messages
+                        .first()
+                        .filter(|message| message.role == MessageRole::System)
+                });
+                provider.estimate_request_tokens(
+                    &system.into_iter().cloned().collect::<Vec<_>>(),
+                    &self.token_estimation_tools,
+                ) as usize
+            });
+        let threshold = Self::threshold_tokens(&request)
+            .saturating_sub(overhead)
+            .max(1);
         let mut compaction_performed = false;
         // UPCR-2026-026 follow-up: surface the MID-TURN pass to the client.
         // This is where compaction actually happens for a session whose
@@ -4817,7 +4866,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
                         session_id: self.session_id.clone(),
                         context_state: ui_context_state_for(&self.session_id, &scratch.manager),
                         trigger: trigger.clone(),
-                        threshold_tokens: threshold,
+                        threshold_tokens: Self::threshold_tokens(&request),
                     },
                 ));
             }
@@ -4847,6 +4896,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
             }
             info!(
                 session = %self.session_id.0,
+                compaction_mode = if self.llm_compaction_provider.is_some() { "llm" } else { "heuristic" },
                 phase = request.phase.as_str(),
                 iteration = request.iteration,
                 compaction_id = %record.compaction_id.as_str(),
@@ -4889,7 +4939,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // here and emitted with the other lifecycle events after the scratch
         // lock drops.
         if self.context_state_updates && self.context_lifecycle_notify.is_some() {
-            let estimate = frame.report.token_estimate;
+            let estimate = frame.report.token_estimate.saturating_add(overhead);
             let moved = scratch
                 .last_reported_token_estimate
                 .is_none_or(|last| estimate.abs_diff(last) >= context_state_report_step(threshold));
@@ -4903,12 +4953,12 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 // "ctx 1M/1M ~100%" against the transcript number), and a
                 // gauge that says full while the provider bills a fifth of
                 // that is the misleading signal this feature exists to fix.
-                context_state.token_estimate = frame.report.token_estimate;
+                context_state.token_estimate = estimate;
                 lifecycle_events.push(UiNotification::ContextStateReported(
                     octos_core::ui_protocol::ContextStateReportedEvent {
                         session_id: self.session_id.clone(),
                         context_state,
-                        threshold_tokens: threshold,
+                        threshold_tokens: Self::threshold_tokens(&request),
                         iteration: request.iteration,
                     },
                 ));
@@ -4970,28 +5020,40 @@ impl PromptContextManager for AppUiPromptContextBridge {
             // wholesale copy-back below would silently drop them. Fold them
             // into a throwaway copy of the scratch state instead: they stay
             // out of this turn's prompts and surface to the next turn's
-            // TurnStart clone (UPCR-2026-042).
+            // TurnStart clone (UPCR-2026-042). The rebase guard on the folded
+            // state then rejects any remaining newer canonical facts the
+            // fold did not carry over (compaction records, cache epoch,
+            // journal lineage).
             let has_external_rows = canonical.ledger_items().iter().any(|item| {
                 item.source_ref
                     .as_ref()
                     .is_some_and(|source| source.source_event_kind == EXTERNAL_RECORD_EVENT_KIND)
             });
-            *canonical = if has_external_rows {
+            let merged = if has_external_rows {
                 let mut folded = scratch.manager.clone();
                 folded.adopt_source_items_with_event_kind(&canonical, EXTERNAL_RECORD_EVENT_KIND);
                 folded
             } else {
                 scratch.manager.clone()
             };
+            if !merged.rebase_context_persistence_after_merge(&canonical) {
+                return Err(
+                    "newer canonical context facts were not preserved by scratch merge".into(),
+                );
+            }
+            *canonical = merged;
             publish_appui_context_status(&self.session_id, &canonical);
-            if let Err(error) =
-                persist_appui_context_snapshot(&self.data_dir, &self.session_id, &canonical)
-            {
-                warn!(
+            match persist_appui_context_snapshot(&self.data_dir, &self.session_id, &canonical) {
+                Ok(_) => {
+                    scratch
+                        .manager
+                        .acknowledge_identical_context_persistence(&canonical);
+                }
+                Err(error) => warn!(
                     session = %self.session_id.0,
                     error = %error,
                     "failed to persist appui prompt context manager snapshot"
-                );
+                ),
             }
         }
         let report = PromptContextReport {
@@ -4999,7 +5061,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
             compaction_performed,
             messages_before,
             messages_after: messages.len(),
-            token_estimate: Some(frame.report.token_estimate),
+            token_estimate: Some(frame.report.token_estimate.saturating_add(overhead)),
             generation: Some(frame.context_state.generation),
         };
         // Emit AFTER releasing the scratch lock (see the collection comment
@@ -5062,18 +5124,34 @@ impl PromptContextManager for AppUiPromptContextBridge {
             "appui prompt cache epoch rotated to effective provider route"
         );
         publish_appui_context_status(&self.session_id, &snapshot);
-        if let Err(error) =
-            persist_appui_context_snapshot(&self.data_dir, &self.session_id, &snapshot)
-        {
-            warn!(
+        match persist_appui_context_snapshot(&self.data_dir, &self.session_id, &snapshot) {
+            Ok(_) => {
+                let mut scratch = self
+                    .scratch
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let mut canonical = self
+                    .context_manager
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                canonical.acknowledge_identical_context_persistence(&snapshot);
+                if let Some(scratch) = scratch.as_mut() {
+                    scratch
+                        .manager
+                        .acknowledge_identical_context_persistence(&snapshot);
+                }
+            }
+            Err(error) => warn!(
                 session = %self.session_id.0,
                 error = %error,
                 "failed to persist effective provider-route cache epoch"
-            );
+            ),
         }
     }
 }
 
+// Reference path for checkpoint-equivalence and context-merge regression tests.
+#[cfg(test)]
 fn record_appui_context_manager_message(
     data_dir: &Path,
     context_manager: &Arc<StdMutex<ContextManager>>,
@@ -5104,6 +5182,9 @@ fn record_appui_context_manager_message(
         );
     }
 }
+
+#[path = "postturn_context_batch.rs"]
+mod postturn_context_batch;
 
 /// Source-event kind tagging out-of-band `session/append_message` rows
 /// (UPCR-2026-042). Load-bearing for the mid-turn deferral policy — the
@@ -6018,13 +6099,11 @@ impl Drop for StatusWordRotatorGuard {
     }
 }
 
+#[path = "progress_delivery.rs"]
+mod progress_delivery;
+
 struct BoundedChannelReporter {
-    tx: tokio::sync::mpsc::Sender<String>,
-    /// Mirrors WS-layer drops: when the progress channel is full the agent
-    /// produced an event the WS layer will never see. Without this counter
-    /// the cursor would lie. Surfaced opportunistically as `protocol/replay_lossy`
-    /// from the consuming task.
-    progress_dropped: Arc<AtomicU64>,
+    delivery: progress_delivery::ProgressDelivery,
     /// PR F (M8.10 thread-binding): bound `thread_id` for every progress
     /// event this reporter emits. Set once at turn-start to the originating
     /// `TurnId`; from then on every JSON payload carries `thread_id` so the
@@ -6036,8 +6115,7 @@ struct BoundedChannelReporter {
 impl BoundedChannelReporter {
     fn new(tx: tokio::sync::mpsc::Sender<String>, progress_dropped: Arc<AtomicU64>) -> Self {
         Self {
-            tx,
-            progress_dropped,
+            delivery: progress_delivery::ProgressDelivery::new(tx, progress_dropped),
             thread_id: None,
         }
     }
@@ -6054,22 +6132,10 @@ impl BoundedChannelReporter {
 
 impl octos_agent::ProgressReporter for BoundedChannelReporter {
     fn report(&self, event: octos_agent::ProgressEvent) {
-        let json = match serde_json::to_string(&super::events::event_to_json(
+        self.delivery.push(super::events::event_to_json(
             &event,
             self.thread_id.as_deref(),
-        )) {
-            Ok(json) => json,
-            Err(_) => return,
-        };
-        if let Err(err) = self.tx.try_send(json) {
-            self.progress_dropped.fetch_add(1, Ordering::Relaxed);
-            metrics::counter!("ws.send.drop.backpressure", "method" => "progress").increment(1);
-            tracing::warn!(
-                target: "octos::ui_protocol::ws",
-                reason = ?err,
-                "progress event dropped before reaching ws layer"
-            );
-        }
+        ));
     }
 
     /// Issue #960 fix: expose the per-turn `thread_id` bound at
@@ -30585,19 +30651,18 @@ async fn handle_session_rollback(
         };
         let data_dir = sessions_guard.data_dir();
         let session = sessions_guard.get_or_create(&params.session_id).await;
-        // Rebuild + persist the context ledger from the trimmed history.
-        // The ledger coverage check (`context_ledger_covers_history`) is a
-        // high-watermark `>=` — deliberately tolerant of bounded history
-        // slices — so a pre-rollback snapshot still "covers" the shrunken
-        // history and would be Loaded verbatim on the next turn, feeding the
-        // rolled-back turns straight back into the model prompt. Mirrors
-        // `reset_context_manager_from_history` on the session-actor path.
+        // Rebuild context after the canonical rollback marker commits. Exact
+        // history coverage also rejects the old future if this reset is
+        // interrupted, but the explicit reset immediately retires its
+        // summaries, cache epoch and transition lineage. Mirrors the actor's
+        // reset_context_manager_from_history path.
         let mut rebuilt_context = crate::context_manager::ContextManager::from_session_history(
             params.session_id.to_string(),
             None,
             &session.messages,
         );
         rebuilt_context.set_recovery_state(crate::context_manager::ContextRecoveryState::Rebuilt);
+        rebuilt_context.mark_ledger_rebuilt();
         if let Err(error) =
             persist_appui_context_snapshot(&data_dir, &params.session_id, &rebuilt_context)
         {
@@ -41021,11 +41086,12 @@ async fn run_standalone_turn(
     // Without this wrap the heartbeat publishes into the channel-only path
     // and the SPA's tool-status bubble never refreshes for long-running
     // spawn_only tools (run_pipeline, podcast_generate, mofa_slides, ...).
+    let channel_reporter =
+        BoundedChannelReporter::new(progress_tx.clone(), progress_dropped.clone())
+            .with_thread_id(Some(turn_id.0.to_string()));
+    let progress_delivery = channel_reporter.delivery.clone();
     let inner_reporter: Arc<dyn octos_agent::ProgressReporter> =
-        Arc::new(MetricsReporter::new(Arc::new(
-            BoundedChannelReporter::new(progress_tx.clone(), progress_dropped.clone())
-                .with_thread_id(Some(turn_id.0.to_string())),
-        )));
+        Arc::new(MetricsReporter::new(Arc::new(channel_reporter)));
     let reporter: Arc<dyn octos_agent::ProgressReporter> = Arc::new(
         super::ui_protocol_alpha2_bridge::LedgerToolProgressReporter::new(
             inner_reporter,
@@ -41372,7 +41438,8 @@ async fn run_standalone_turn(
     .with_context_lifecycle_notify(context_lifecycle_notify)
     .with_redacted_memory_events(!app_context_allowed)
     .with_ephemeral_block(shared_history_block)
-    .with_context_state_updates(features.context_state_available());
+    .with_context_state_updates(features.context_state_available())
+    .with_token_estimation_provider(llm_provider.clone(), tool_registry.specs());
     // Only wire the provider when `--llm-compaction` is on; a present provider
     // is what flips the in-loop bridge to the LLM-summarization path.
     if session_compaction_llm_enabled(&session_id, &state) {
@@ -42059,6 +42126,9 @@ async fn run_standalone_turn(
         )
         .await;
         let llm_latency = start.elapsed();
+        // Drain the ordered reporter before the directly-sent terminal event.
+        progress_delivery.flush().await;
+
 
         // Drive the router's auto-escalation. We pass the raw session id
         // (with `api:` prefix preserved) so concurrent gateway + serve
@@ -42070,14 +42140,30 @@ async fn run_standalone_turn(
 
         // Reuse the canonical persistence path for actual truncated output,
         // without turning an incomplete model response into a successful turn.
+        let terminal_error_code = if result.as_ref().err().is_some_and(|error|
+            error.downcast_ref::<octos_agent::IncompleteResponseError>().is_some()) {
+            "output_truncated"
+        } else {
+            "turn_failed"
+        };
         let incomplete_message = result.as_ref().err().and_then(|error| {
-            error.downcast_ref::<octos_agent::IncompleteResponseError>()
-                .map(ToString::to_string)
+            if error.downcast_ref::<octos_agent::IncompleteResponseError>().is_some()
+                || error.downcast_ref::<octos_agent::FailedConversationProgress>().is_some()
+            {
+                Some(classify_runtime_error_message(error))
+            } else {
+                None
+            }
         });
         let result = match result {
-            Err(error) if incomplete_message.is_some() => Ok(error
-                .downcast_ref::<octos_agent::IncompleteResponseError>()
-                .expect("incomplete carrier checked above").partial.clone()),
+            Err(error) if incomplete_message.is_some() => {
+                let partial = error.downcast_ref::<octos_agent::IncompleteResponseError>()
+                    .map(|carrier| carrier.partial.clone())
+                    .or_else(|| error.downcast_ref::<octos_agent::FailedConversationProgress>()
+                        .map(|carrier| carrier.partial.clone()))
+                    .expect("partial conversation carrier checked above");
+                Ok(partial)
+            }
             result => result,
         };
         match result {
@@ -42158,6 +42244,14 @@ async fn run_standalone_turn(
                 let mut final_assistant_persisted = false;
                 {
                     let mut sessions = sessions.lock().await;
+                    // Journal rows and their cursors remain individually durable.
+                    // Derive/hash/serialize the full context once for this batch;
+                    // the guard checkpoints completed rows on cancellation too.
+                    let mut context_batch = postturn_context_batch::AppUiContextCommitBatch::new(
+                        &context_data_dir_for_result,
+                        &context_manager_for_result,
+                        &agent_session_id,
+                    );
                     let final_assistant = final_assistant_message_for_response(&response);
                     // Fleet-UX soak NEW-03 (mini3/mini5, 2026-05-23):
                     // the #1183 fix hid the synthesised spawn_only ack
@@ -42317,13 +42411,7 @@ async fn run_standalone_turn(
                                 }
                                 entry.last_touched_at = now;
                             }
-                            record_appui_context_manager_message(
-                                &context_data_dir_for_result,
-                                &context_manager_for_result,
-                                &agent_session_id,
-                                &saved_for_context,
-                                seq,
-                            );
+                            context_batch.record(&saved_for_context, seq);
                             cursor = Some(UiCursor {
                                 stream: agent_session_id.0.clone(),
                                 seq: seq as u64,
@@ -42493,13 +42581,7 @@ async fn run_standalone_turn(
                                         }
                                         entry.last_touched_at = now;
                                     }
-                                    record_appui_context_manager_message(
-                                        &context_data_dir_for_result,
-                                        &context_manager_for_result,
-                                        &agent_session_id,
-                                        &saved_for_context,
-                                        seq,
-                                    );
+                                    context_batch.record(&saved_for_context, seq);
                                     cursor = Some(UiCursor {
                                         stream: agent_session_id.0.clone(),
                                         seq: seq as u64,
@@ -42529,6 +42611,12 @@ async fn run_standalone_turn(
                                 }
                             }
                         }
+                    }
+                    // Both successful and failed/truncated-response carriers use
+                    // this path. Complete the checkpoint before any terminal or
+                    // self-paced continuation can observe this batch as finished.
+                    if let Err(error) = context_batch.finish() {
+                        warn!(session = %agent_session_id.0, %error, "failed to persist post-turn context batch snapshot");
                     }
                     // NEW-16 codex round-3 P1+P2: do NOT GC the
                     // cursor here AND do NOT GC at the bottom of
@@ -42659,7 +42747,7 @@ async fn run_standalone_turn(
                             }),
                     };
                     let error = json!({
-                        "type": "error", "code": "output_truncated", "message": message,
+                        "type": "error", "code": terminal_error_code, "message": message,
                         "partial_result": partial_result,
                         "tokens_in": response.token_usage.input_tokens,
                         "tokens_out": response.token_usage.output_tokens,

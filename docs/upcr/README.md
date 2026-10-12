@@ -16,11 +16,14 @@ records.
   other renumbers to the next free number (#2730 renumbered 041 → 042 under
   this rule).
 - Filenames are `OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_NNN_SHORT_SLUG.md`.
-  `scripts/lint-upcr-registry.py` fails the `check` job on a duplicate number
-  or a non-conforming filename.
+  `scripts/lint-upcr-registry.py` fails the `check` job on a duplicate number,
+  a non-conforming filename, or the table disagreeing with the files (a file
+  with no row, a row naming no file or a different file) — #2776 is the
+  instance that turned the rows from a review convention into a lint rule.
 - Rows carry each record's self-declared status verbatim. `Landed` is the
   landing PR, or the landing commit for records that predate the `(#N)`
-  commit-subject convention. All files live in `docs/`.
+  commit-subject convention. The table's File cell uses the `..._NNN_SLUG.md`
+  shorthand for the full filename. All files live in `docs/` or below it.
 
 | # | Title | Status | File | Landed |
 |---|-------|--------|------|--------|

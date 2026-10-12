@@ -11756,3 +11756,38 @@ async fn should_offer_exactly_the_hosts_durable_list_when_a_gateway_turn_starts(
         usual
     );
 }
+
+#[test]
+fn reset_context_manager_retires_incremental_context_before_rewind_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SessionKey("local:actor-rewind-transitions".into());
+    let history = [
+        Message::user("retained"),
+        Message::assistant("retained result"),
+        Message::user("discarded"),
+    ];
+    let mut old = ContextManager::from_session_history(key.to_string(), None, &history);
+    crate::context_manager::persist_context_manager_snapshot(dir.path(), &key.to_string(), &old)
+        .unwrap();
+    old.record_context_event(
+        crate::context_manager::ContextEventKind::GoalSnapshot,
+        "goal",
+        "future fact",
+    );
+    old.reconcile_prompt_cache_epoch("fixture", "future-model", "stable", &[]);
+    crate::context_manager::persist_context_manager_incremental(dir.path(), &key.to_string(), &old)
+        .unwrap();
+    let context = Arc::new(std::sync::Mutex::new(old));
+    reset_context_manager_from_history(&context, &key, dir.path(), &history[..2]);
+    let loaded =
+        crate::context_manager::load_context_manager_snapshot(dir.path(), &key.to_string())
+            .unwrap()
+            .unwrap();
+    assert!(loaded.cache_epoch().is_none());
+    let json = serde_json::to_string(&loaded.snapshot()).unwrap();
+    assert!(!json.contains("future fact") && !json.contains("discarded"));
+    assert_eq!(
+        loaded.source_head_hash(),
+        context.lock().unwrap().source_head_hash()
+    );
+}

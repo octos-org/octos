@@ -557,6 +557,8 @@ pub(crate) struct ForkedChildContext {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ContextSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) journal_checkpoint_id: Option<String>,
     pub(crate) schema: String,
     pub(crate) state: ContextState,
     /// Append-only canonical ledger. Compaction never removes entries from
@@ -592,6 +594,7 @@ pub(crate) struct ContextSnapshot {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ContextManager {
+    journal: context_journal::Tracking,
     session_id: String,
     thread_id: Option<String>,
     generation: u64,
@@ -653,47 +656,30 @@ pub(crate) fn context_ledger_path(data_dir: &Path, session_id: &str) -> PathBuf 
         .join(format!("{encoded}.json"))
 }
 
+#[path = "context_journal.rs"]
+mod context_journal;
+
 pub(crate) fn persist_context_manager_snapshot(
     data_dir: &Path,
     session_id: &str,
     manager: &ContextManager,
 ) -> Result<PathBuf, String> {
-    persist_tool_output_artifacts(data_dir, manager)?;
-    let path = context_ledger_path(data_dir, session_id);
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("context ledger path has no parent: {}", path.display()))?;
-    std::fs::create_dir_all(parent).map_err(|err| {
-        format!(
-            "create context ledger directory {} failed: {err}",
-            parent.display()
-        )
-    })?;
-    let tmp_name = format!(
-        "{}.tmp-{}-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("context-ledger.json"),
-        std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    );
-    let tmp_path = parent.join(tmp_name);
-    let bytes = serde_json::to_vec_pretty(&manager.snapshot())
-        .map_err(|err| format!("serialize context ledger snapshot failed: {err}"))?;
-    std::fs::write(&tmp_path, bytes).map_err(|err| {
-        format!(
-            "write context ledger snapshot {} failed: {err}",
-            tmp_path.display()
-        )
-    })?;
-    if let Err(err) = std::fs::rename(&tmp_path, &path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!(
-            "install context ledger snapshot {} failed: {err}",
-            path.display()
-        ));
-    }
-    Ok(path)
+    context_journal::persist_checkpoint(data_dir, session_id, manager)
+}
+
+pub(crate) fn persist_context_manager_incremental(
+    data_dir: &Path,
+    session_id: &str,
+    manager: &ContextManager,
+) -> Result<PathBuf, String> {
+    context_journal::persist_incremental(data_dir, session_id, manager)
+}
+
+pub(crate) fn remove_context_manager_store(
+    data_dir: &Path,
+    session_id: &str,
+) -> Result<usize, String> {
+    context_journal::remove_store(data_dir, session_id)
 }
 
 fn context_ledger_artifact_path(data_dir: &Path, artifact_ref: &str) -> Result<PathBuf, String> {
@@ -774,21 +760,11 @@ pub(crate) fn load_context_manager_snapshot(
     session_id: &str,
 ) -> Result<Option<ContextManager>, String> {
     let path = context_ledger_path(data_dir, session_id);
-    if !path.exists() {
+    let Some((snapshot, journal_offset)) = context_journal::load_snapshot(data_dir, session_id)?
+    else {
         return Ok(None);
-    }
-    let bytes = std::fs::read(&path).map_err(|err| {
-        format!(
-            "read context ledger snapshot {} failed: {err}",
-            path.display()
-        )
-    })?;
-    let snapshot = serde_json::from_slice::<ContextSnapshot>(&bytes).map_err(|err| {
-        format!(
-            "parse context ledger snapshot {} failed: {err}",
-            path.display()
-        )
-    })?;
+    };
+    let journal_id = snapshot.journal_checkpoint_id.clone();
     if snapshot.schema != CONTEXT_MANAGER_SCHEMA && snapshot.schema != LEGACY_CONTEXT_MANAGER_SCHEMA
     {
         return Err(format!(
@@ -812,7 +788,16 @@ pub(crate) fn load_context_manager_snapshot(
             path.display()
         ));
     }
+    let persisted_items = snapshot.items.clone();
     let mut manager = ContextManager::from_snapshot(snapshot);
+    context_journal::bind_loaded(
+        &manager,
+        data_dir,
+        session_id,
+        journal_id,
+        journal_offset,
+        &persisted_items,
+    );
     // Committed-only load: a snapshot persisted mid-turn carries the turn's
     // source-less conversation rows. If the daemon died before turn-end
     // persistence, durable history never received them; they must not reload
@@ -1267,7 +1252,8 @@ fn expected_v2_active_projection(
         compaction_summary_insert_index(&installed),
         summary_item.clone(),
     );
-    if record.token_estimate_after != Some(estimate_items_tokens(&installed))
+    if (record.token_estimate_after != Some(estimate_items_tokens(&installed))
+        && record.token_estimate_after != Some(legacy_estimate_items_tokens(&installed)))
         || record.installed_transcript_hash.as_deref()
             != Some(
                 transcript_hash_for_projection(
@@ -1305,7 +1291,8 @@ fn v2_active_projection_is_coherent(
     let projected_ids = projected.iter().map(|item| &item.id).collect::<Vec<_>>();
     if projected_ids != expected_ids
         || snapshot.state.item_count != projected.len()
-        || snapshot.state.token_estimate != estimate_items_tokens(projected)
+        || (snapshot.state.token_estimate != estimate_items_tokens(projected)
+            && snapshot.state.token_estimate != legacy_estimate_items_tokens(projected))
         || snapshot.state.transcript_hash
             != transcript_hash_for_projection(
                 &snapshot.state.session_id,
@@ -1453,6 +1440,7 @@ fn sanitize_imported_visual_markers(items: Vec<TranscriptItem>) -> Vec<Transcrip
 impl ContextManager {
     pub(crate) fn new(session_id: impl Into<String>, thread_id: Option<String>) -> Self {
         Self {
+            journal: context_journal::Tracking::default(),
             session_id: session_id.into(),
             thread_id,
             generation: 0,
@@ -1532,6 +1520,7 @@ impl ContextManager {
             .unwrap_or(0)
             + 1;
         Self {
+            journal: context_journal::Tracking::default(),
             session_id: session_id.into(),
             thread_id,
             generation: fork.parent_generation + 1,
@@ -1552,6 +1541,108 @@ impl ContextManager {
             source_history: None,
             source_history_adopted: false,
         }
+    }
+
+    /// The loop explicitly merged newer durable rows before replacing the
+    /// canonical manager. Accept its newer disk lineage only if every changed
+    /// canonical tail row and compaction fact survived that merge.
+    pub(crate) fn rebase_context_persistence_after_merge(
+        &self,
+        canonical: &ContextManager,
+    ) -> bool {
+        if self.session_id != canonical.session_id || self.thread_id != canonical.thread_id {
+            return false;
+        }
+        if self.journal.same_lineage(&canonical.journal) {
+            return true;
+        }
+        if self.recovery_state != canonical.recovery_state {
+            return false;
+        }
+        let difference = self
+            .ledger_items
+            .iter()
+            .zip(canonical.ledger_items.iter())
+            .position(|(mine, current)| mine != current)
+            .unwrap_or(self.ledger_items.len().min(canonical.ledger_items.len()));
+        if !canonical.ledger_items[difference..].iter().all(|current| {
+            self.ledger_items[difference..].iter().any(|mine| {
+                mine.kind == current.kind
+                    && mine.source == current.source
+                    && mine.in_flight == current.in_flight
+                    && match &current.source_ref {
+                        Some(source) => mine.source_ref.as_ref() == Some(source),
+                        None => mine.id == current.id && mine.source == current.source,
+                    }
+            })
+        }) || !self.compactions.starts_with(&canonical.compactions)
+        {
+            return false;
+        }
+        if self.compactions.len() == canonical.compactions.len()
+            && (self.last_compaction_id != canonical.last_compaction_id
+                || self.last_checkpoint_id != canonical.last_checkpoint_id)
+        {
+            return false;
+        }
+        if self.compactions.len() == canonical.compactions.len()
+            && !canonical.items.iter().all(|current| {
+                self.items.iter().any(|mine| {
+                    mine.kind == current.kind
+                        && mine.source == current.source
+                        && match &current.source_ref {
+                            Some(source) => mine.source_ref.as_ref() == Some(source),
+                            None => mine.id == current.id,
+                        }
+                })
+            })
+        {
+            return false;
+        }
+        if self.cache_epoch != canonical.cache_epoch
+            && let Some(current) = canonical.cache_epoch.as_ref()
+        {
+            // A new local compaction may rotate the same stable route. Other
+            // newer route/settings changes cannot be silently reverted.
+            let local_compaction_rotation = self.cache_epoch.as_ref().is_some_and(|mine| {
+                mine.provider == current.provider
+                    && mine.model == current.model
+                    && mine.stable_instructions_hash == current.stable_instructions_hash
+                    && mine.ordered_tool_schema_hash == current.ordered_tool_schema_hash
+                    && self.last_compaction_id != canonical.last_compaction_id
+                    && self.compactions.len() > canonical.compactions.len()
+            });
+            if !local_compaction_rotation {
+                return false;
+            }
+        }
+        self.journal.rebase(&canonical.journal, difference);
+        true
+    }
+
+    /// Transfer an acknowledgement only between identical context states.
+    /// A newer background mutation or stale scratch clone cannot borrow it.
+    pub(crate) fn acknowledge_identical_context_persistence(
+        &mut self,
+        persisted: &ContextManager,
+    ) -> bool {
+        if self.session_id != persisted.session_id
+            || self.thread_id != persisted.thread_id
+            || self.generation != persisted.generation
+            || self.next_item_seq != persisted.next_item_seq
+            || self.ledger_items != persisted.ledger_items
+            || self.items != persisted.items
+            || self.last_checkpoint_id != persisted.last_checkpoint_id
+            || self.last_compaction_id != persisted.last_compaction_id
+            || self.recovery_state != persisted.recovery_state
+            || self.source_history != persisted.source_history
+            || self.compactions != persisted.compactions
+            || self.cache_epoch != persisted.cache_epoch
+        {
+            return false;
+        }
+        self.journal = persisted.journal.clone();
+        true
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -1765,6 +1856,7 @@ impl ContextManager {
                 ));
             }
         }
+        self.journal.dirty(0);
         self.ledger_items
             .retain(|item| !ghost_ids.contains(&item.id));
         self.items.retain(|item| !ghost_ids.contains(&item.id));
@@ -1898,6 +1990,7 @@ impl ContextManager {
 
     pub(crate) fn snapshot(&self) -> ContextSnapshot {
         ContextSnapshot {
+            journal_checkpoint_id: None,
             schema: CONTEXT_MANAGER_SCHEMA.to_owned(),
             state: self.state(),
             items: self.ledger_items.clone(),
@@ -1989,6 +2082,7 @@ impl ContextManager {
             .unwrap_or(0)
             + 1;
         Self {
+            journal: context_journal::Tracking::default(),
             session_id: snapshot.state.session_id,
             thread_id: snapshot.state.thread_id,
             generation: snapshot.state.generation,
@@ -2144,6 +2238,7 @@ impl ContextManager {
             recorded_at_ms: Utc::now().timestamp_millis(),
             in_flight,
         };
+        self.journal.dirty(self.ledger_items.len());
         self.ledger_items.push(item.clone());
         self.items.push(item);
         self.generation += 1;
@@ -2309,13 +2404,14 @@ impl ContextManager {
         existing.source_ref = Some(source_ref.clone());
         existing.in_flight = false;
         let existing_id = existing.id.clone();
-        if let Some(canonical) = self
+        if let Some(index) = self
             .ledger_items
-            .iter_mut()
-            .find(|item| item.id == existing_id)
+            .iter()
+            .position(|item| item.id == existing_id)
         {
-            canonical.source_ref = Some(source_ref.clone());
-            canonical.in_flight = false;
+            self.journal.dirty(index);
+            self.ledger_items[index].source_ref = Some(source_ref.clone());
+            self.ledger_items[index].in_flight = false;
         }
         self.generation += 1;
         Some(existing_id)
@@ -2374,6 +2470,7 @@ impl ContextManager {
         let seq_of =
             |candidate: &TranscriptItem| candidate.source_ref.as_ref().and_then(|r| r.source_seq);
         let Some(seq) = seq_of(&item) else {
+            self.journal.dirty(self.ledger_items.len());
             self.ledger_items.push(item.clone());
             self.items.push(item);
             return;
@@ -2392,6 +2489,7 @@ impl ContextManager {
             .map_or(0, |index| index + 1);
         let ledger_index = after_ordered.max(after_summary);
         if ledger_index >= self.ledger_items.len() {
+            self.journal.dirty(self.ledger_items.len());
             self.ledger_items.push(item.clone());
             self.items.push(item);
             return;
@@ -2402,6 +2500,7 @@ impl ContextManager {
             .iter()
             .position(|candidate| candidate.id == successor_id)
             .unwrap_or(self.items.len());
+        self.journal.dirty(ledger_index);
         self.ledger_items.insert(ledger_index, item.clone());
         self.items.insert(items_index, item);
     }
@@ -2472,6 +2571,34 @@ impl ContextManager {
                     .iter()
                     .any(|mine| seq_of(mine) == Some(seq) && mine.kind == item.kind);
             if already_adopted {
+                // A background classification may change without adding a
+                // row or generation. Preserve it in the scratch projection;
+                // local semantic group IDs intentionally remain remapped.
+                for (index, mine) in self
+                    .ledger_items
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(_, mine)| seq_of(mine) == Some(seq) && mine.kind == item.kind)
+                {
+                    if mine.source_ref != item.source_ref
+                        || mine.source != item.source
+                        || mine.in_flight != item.in_flight
+                    {
+                        self.journal.dirty(index);
+                        mine.source_ref = item.source_ref.clone();
+                        mine.source = item.source.clone();
+                        mine.in_flight = item.in_flight;
+                    }
+                }
+                for mine in self
+                    .items
+                    .iter_mut()
+                    .filter(|mine| seq_of(mine) == Some(seq) && mine.kind == item.kind)
+                {
+                    mine.source_ref = item.source_ref.clone();
+                    mine.source = item.source.clone();
+                    mine.in_flight = item.in_flight;
+                }
                 continue;
             }
             present_seqs.insert(seq);
@@ -2505,6 +2632,13 @@ impl ContextManager {
         source_event_kind: &str,
     ) {
         let item_ids = item_ids.iter().collect::<HashSet<_>>();
+        if let Some(index) = self
+            .ledger_items
+            .iter()
+            .position(|item| item_ids.contains(&item.id))
+        {
+            self.journal.dirty(index);
+        }
         for item in self
             .items
             .iter_mut()
@@ -2766,6 +2900,13 @@ impl ContextManager {
 
     /// Keep the media a tool handed the model on its recorded output.
     fn attach_tool_output_media(&mut self, id: &TranscriptItemId, media: &[String]) {
+        if let Some(index) = self.ledger_items.iter().position(|item| &item.id == id) {
+            self.journal.dirty(index);
+            if let TranscriptItemKind::ToolOutput { envelope } = &mut self.ledger_items[index].kind
+            {
+                envelope.media = media.to_vec();
+            }
+        }
         if let Some(item) = self.items.iter_mut().rev().find(|item| &item.id == id) {
             if let TranscriptItemKind::ToolOutput { envelope } = &mut item.kind {
                 envelope.media = media.to_vec();
@@ -3139,6 +3280,7 @@ impl ContextManager {
         let (replacement_transcript_hash, compaction_item, candidate, token_estimate_after) =
             installed;
         self.next_item_seq += 1;
+        self.journal.dirty(self.ledger_items.len());
         self.ledger_items.push(compaction_item.clone());
         retained = candidate;
         self.items = retained;
@@ -4308,7 +4450,59 @@ fn tool_output_preview(value: &str) -> String {
     .0
 }
 
+/// Model-visible size, excluding ledger metadata, hidden reasoning, raw
+/// sidecars and checkpoints. Provider serialization overhead/tool declarations
+/// are reserved separately by the prompt bridge. Legacy estimates are accepted
+/// on snapshot load so upgrading does not discard a valid compacted history.
+fn estimate_item_tokens(item: &TranscriptItem) -> usize {
+    use octos_llm::context::estimate_tokens;
+    let text = |value: &str| estimate_tokens(value) as usize + 4;
+    match &item.kind {
+        TranscriptItemKind::SystemInstruction { content }
+        | TranscriptItemKind::DeveloperInstruction { content }
+        | TranscriptItemKind::AssistantFinal { content } => text(content),
+        TranscriptItemKind::UserInput { content, media } => {
+            let mut message = Message::user(content.clone());
+            message.media = media.clone();
+            octos_llm::context::estimate_message_tokens(&message) as usize
+        }
+        TranscriptItemKind::AssistantToolCall {
+            call_id,
+            name,
+            arguments,
+        } => text(name) + text(call_id) + text(&arguments.to_string()),
+        TranscriptItemKind::ToolOutput { envelope } => {
+            let mut message = Message::assistant(envelope.model_visible_content.clone());
+            message.media = envelope.media.clone();
+            octos_llm::context::estimate_message_tokens(&message) as usize
+        }
+        TranscriptItemKind::ContextInjection { label, content }
+        | TranscriptItemKind::ContextEvent { label, content, .. } => {
+            text(label) + text(content) + 24
+        }
+        TranscriptItemKind::ChildResultSummary {
+            child_agent_id,
+            summary,
+            artifact_refs,
+            reference_artifact_refs,
+        } => {
+            text(child_agent_id)
+                + text(summary)
+                + text(&artifact_refs.join(", "))
+                + text(&reference_artifact_refs.join(", "))
+        }
+        TranscriptItemKind::CompactionSummary { summary, .. } => text(summary) + 96,
+        TranscriptItemKind::AssistantReasoning { .. }
+        | TranscriptItemKind::Checkpoint { .. }
+        | TranscriptItemKind::ForkBoundary { .. } => 0,
+    }
+}
+
 fn estimate_items_tokens(items: &[TranscriptItem]) -> usize {
+    items.iter().map(estimate_item_tokens).sum::<usize>().max(1)
+}
+
+fn legacy_estimate_items_tokens(items: &[TranscriptItem]) -> usize {
     let bytes = items
         .iter()
         .map(|item| {
@@ -4379,11 +4573,11 @@ fn xml_escape_text(value: &str) -> String {
 }
 
 fn estimate_messages_tokens(messages: &[Message]) -> usize {
-    let bytes = messages
+    messages
         .iter()
-        .map(|message| message.content.len() + message.media.iter().map(String::len).sum::<usize>())
-        .sum::<usize>();
-    estimate_tokens_from_bytes(bytes)
+        .map(|message| octos_llm::context::estimate_message_tokens(message) as usize)
+        .sum::<usize>()
+        .max(1)
 }
 
 fn estimate_tokens_from_bytes(bytes: usize) -> usize {
@@ -4735,15 +4929,11 @@ fn semantic_blocks_for_items(items: &[TranscriptItem]) -> Vec<SemanticBlock> {
 }
 
 fn estimate_semantic_block_tokens(items: &[&TranscriptItem]) -> usize {
-    let bytes = items
+    items
         .iter()
-        .map(|item| {
-            serde_json::to_vec(&item.kind)
-                .map(|bytes| bytes.len())
-                .unwrap_or_default()
-        })
-        .sum::<usize>();
-    estimate_tokens_from_bytes(bytes)
+        .map(|item| estimate_item_tokens(item))
+        .sum::<usize>()
+        .max(1)
 }
 
 fn hash_json(value: &Value) -> String {
@@ -4830,6 +5020,64 @@ mod tests {
     ///
     /// Paired with the perf property: an unchanged history must take the fast
     /// path, or the optimisation does nothing.
+    #[test]
+    fn should_count_tool_arguments_and_media_in_model_visible_budget() {
+        let plain = Message::user("inspect");
+        let mut image = plain.clone();
+        image.media.push("/tmp/chart.png".to_owned());
+        assert!(estimate_messages_tokens(&[image]) > estimate_messages_tokens(&[plain]) + 100);
+        let mut call = Message::assistant("");
+        call.tool_calls = Some(vec![ToolCall {
+            id: "one".into(),
+            name: "write_file".into(),
+            metadata: None,
+            arguments: json!({"content": "x".repeat(16_000)}),
+        }]);
+        assert!(estimate_messages_tokens(&[call]) >= 4_000);
+    }
+
+    #[test]
+    fn should_exclude_hidden_reasoning_and_raw_ledger_payload_from_compaction_threshold() {
+        let mut manager = ContextManager::new("model-budget", None);
+        let mut assistant = Message::assistant("artifact saved");
+        assistant.reasoning_content = Some("private reasoning ".repeat(50_000));
+        manager.record_message(&Message::user("continue"));
+        manager.record_message(&assistant);
+        assert!(legacy_estimate_items_tokens(manager.items()) > 100_000);
+        assert!(!manager.should_auto_compact(1_000));
+        manager.record_tool_output("one", "read_file", &"raw logs ".repeat(50_000));
+        assert!(
+            estimate_items_tokens(manager.items()) < 4_000,
+            "spilled raw data must not trigger compaction"
+        );
+    }
+
+    #[test]
+    fn should_load_legacy_token_estimates_without_losing_compacted_projection() {
+        let mut manager = ContextManager::new("budget-upgrade", None);
+        manager.record_message(&Message::user("old request ".repeat(500)));
+        manager.record_message(&Message::assistant("old answer ".repeat(500)));
+        manager.record_message(&Message::user("p36-v9 complete; next clean artwork"));
+        manager.compact_context(
+            "earlier work complete",
+            CompactContextPolicy {
+                keep_recent_tokens: Some(64),
+                target_tokens_after_compaction: Some(1_000),
+                ..Default::default()
+            },
+        );
+        let mut snapshot = manager.snapshot();
+        snapshot.state.token_estimate = legacy_estimate_items_tokens(manager.items());
+        let expected = manager.for_prompt(&PromptBuildPolicy::default()).messages;
+        let loaded = ContextManager::from_snapshot(snapshot);
+        let actual = loaded.for_prompt(&PromptBuildPolicy::default()).messages;
+        assert_eq!(
+            actual.iter().map(|m| &m.content).collect::<Vec<_>>(),
+            expected.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.generation(), manager.generation());
+    }
+
     #[test]
     fn should_never_claim_coverage_the_replay_would_deny() {
         for history in differential_histories() {
@@ -9118,3 +9366,7 @@ mod tests {
         assert!(scratch.adopt_source_items_after(&canonical).is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "context_journal_tests.rs"]
+mod context_journal_tests;
