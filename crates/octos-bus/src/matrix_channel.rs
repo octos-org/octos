@@ -926,6 +926,17 @@ pub struct MatrixChannel {
     dm_member_cache_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
+/// HTTP client for appservice-to-homeserver requests. Redirects are not
+/// followed: a 30x must surface as a failed request instead of silently
+/// re-issuing it at another origin, mirroring the user-channel client
+/// (`matrix_http_client` in `matrix_user_channel.rs`).
+fn appservice_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build Matrix appservice HTTP client")
+}
+
 impl MatrixChannel {
     /// Create a new Matrix Appservice channel.
     #[allow(clippy::too_many_arguments)]
@@ -950,7 +961,7 @@ impl MatrixChannel {
             bot_user_id,
             port,
             shutdown,
-            http: reqwest::Client::new(),
+            http: appservice_http_client(),
             registered_users: Arc::new(RwLock::new(HashSet::new())),
             dedup: Arc::new(MessageDedup::new()),
             bot_router: Arc::new(BotRouter::new(None)),
@@ -1182,6 +1193,81 @@ pub(crate) fn percent_encode_path(s: &str) -> String {
         }
     }
     encoded
+}
+
+/// Cap on the user-controlled part of an inbound media filename.
+const MAX_INBOUND_FILENAME_CHARS: usize = 120;
+
+/// Reduce a user-controlled inbound media filename to a single safe path
+/// component. Matrix is the only channel that stores a sender-chosen name
+/// verbatim; this makes the storage explicitly safe instead of relying on
+/// the `matrix_{ts}_` prefix to defuse path separators by accident (#2426).
+fn sanitize_inbound_filename(name: &str) -> String {
+    // Only the final path component survives: absolute paths and `..`
+    // traversal collapse to a plain name.
+    let name = name.rsplit(['/', '\\']).next().unwrap_or("");
+    // NTFS alternate data streams ride a `:` separator; control characters
+    // are illegal in filenames everywhere.
+    let name: String = name
+        .chars()
+        .map(|c| if c == ':' { '_' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
+    // Windows ignores trailing dots and spaces when naming files, so a
+    // name like "evil..." could not be opened or deleted by name there.
+    let name = name.trim_end_matches(['.', ' ']);
+    // Windows rejects reserved device names even with an extension
+    // ("CON.txt"); mark them instead of failing the write.
+    let stem = name.split('.').next().unwrap_or("");
+    let reserved = matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    );
+    let name = if reserved {
+        format!("_{name}")
+    } else {
+        name.to_string()
+    };
+
+    // Cap runaway names while keeping the extension recognizable. The
+    // trailing-dot/space trim above guarantees `ext` is non-empty here.
+    let name = match name.rsplit_once('.') {
+        Some((stem, ext))
+            if !stem.is_empty() && ext.chars().count() + 1 < MAX_INBOUND_FILENAME_CHARS =>
+        {
+            let keep = MAX_INBOUND_FILENAME_CHARS - ext.chars().count() - 1;
+            let stem: String = stem.chars().take(keep).collect();
+            format!("{stem}.{ext}")
+        }
+        _ => name.chars().take(MAX_INBOUND_FILENAME_CHARS).collect(),
+    };
+
+    if name.is_empty() {
+        "file".to_string()
+    } else {
+        name
+    }
 }
 
 /// Reject an outbound media file whose on-disk size exceeds `cap`, by reading
@@ -1671,7 +1757,7 @@ async fn handle_transaction(
                 let unique_filename = format!(
                     "matrix_{}_{}",
                     chrono::Utc::now().timestamp_millis(),
-                    filename,
+                    sanitize_inbound_filename(filename),
                 );
                 match crate::media::download_media(
                     &state.http,

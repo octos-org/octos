@@ -803,6 +803,256 @@ async fn test_handle_transaction_ignores_bot_messages() {
 }
 
 #[tokio::test]
+async fn appservice_client_does_not_follow_redirects() {
+    use axum::response::Redirect;
+    use axum::routing::get;
+
+    let app = Router::new().route(
+        "/redirect",
+        get(|| async { Redirect::temporary("/target") }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // The appservice client sends `Authorization: Bearer {as_token}` on
+    // every request, so a redirect to another origin would forward that
+    // credential (#2426). It must surface the 30x instead of following it.
+    let ch = make_channel();
+    let resp = ch
+        .http
+        .get(format!("http://{addr}/redirect"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+}
+
+#[tokio::test]
+async fn media_download_redirect_does_not_leak_as_token() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::response::Redirect;
+    use tower::ServiceExt;
+
+    // "Attacker" origin: records any Authorization header it receives.
+    let leaked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let attacker = Router::new().route(
+        "/steal",
+        axum::routing::get({
+            let leaked = leaked.clone();
+            move |headers: axum::http::HeaderMap| {
+                let leaked = leaked.clone();
+                async move {
+                    if let Some(auth) = headers.get("authorization") {
+                        leaked
+                            .lock()
+                            .await
+                            .push(auth.to_str().unwrap_or("").to_string());
+                    }
+                    "stolen"
+                }
+            }
+        }),
+    );
+    let attacker_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let attacker_addr = attacker_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(attacker_listener, attacker).await.unwrap();
+    });
+
+    // "Homeserver": 302-redirects the media download to the attacker origin.
+    let redirect_target = format!("http://{attacker_addr}/steal");
+    let homeserver = Router::new().route(
+        "/_matrix/media/v3/download/{server}/{media_id}",
+        get(move || {
+            let redirect_target = redirect_target.clone();
+            async move { Redirect::temporary(&redirect_target) }
+        }),
+    );
+    let homeserver_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let homeserver_addr = homeserver_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(homeserver_listener, homeserver).await.unwrap();
+    });
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let ch = make_channel();
+    let mut state = make_test_state(inbound_tx);
+    state.http = ch.http.clone();
+    state.homeserver = format!("http://{homeserver_addr}");
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    let body = json!({
+        "events": [{
+            "type": "m.room.message",
+            "sender": "@alice:elsewhere.org",
+            "room_id": "!room:localhost",
+            "event_id": "$ev_redirect",
+            "content": {
+                "msgtype": "m.image",
+                "body": "",
+                "filename": "notes.txt",
+                "url": "mxc://localhost/ABC123"
+            }
+        }]
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn_redirect")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test_token")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The download fails loudly instead of replaying the credential at the
+    // redirect target; the message degrades to text-only.
+    assert!(
+        leaked.lock().await.is_empty(),
+        "as_token must never reach the redirect target"
+    );
+    let msg = inbound_rx.try_recv().unwrap();
+    assert!(
+        msg.media.is_empty(),
+        "redirected download must not be followed: {:?}",
+        msg.media
+    );
+}
+
+#[tokio::test]
+async fn inbound_media_filename_is_sanitized() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let homeserver = Router::new().route(
+        "/_matrix/media/v3/download/{server}/{media_id}",
+        get(|| async { vec![1u8; 8] }),
+    );
+    let homeserver_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let homeserver_addr = homeserver_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(homeserver_listener, homeserver).await.unwrap();
+    });
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let ch = make_channel();
+    let mut state = make_test_state(inbound_tx);
+    state.http = ch.http.clone();
+    state.homeserver = format!("http://{homeserver_addr}");
+    let media_dir = tempfile::TempDir::new().unwrap();
+    state.media_dir = media_dir.path().to_path_buf();
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    // A Windows-reserved device name must not be stored verbatim.
+    let body = json!({
+        "events": [{
+            "type": "m.room.message",
+            "sender": "@alice:elsewhere.org",
+            "room_id": "!room:localhost",
+            "event_id": "$ev_name",
+            "content": {
+                "msgtype": "m.image",
+                "body": "",
+                "filename": "CON",
+                "url": "mxc://localhost/ABC123"
+            }
+        }]
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn_name")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test_token")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let msg = inbound_rx.try_recv().unwrap();
+    assert_eq!(msg.media.len(), 1, "download should succeed");
+
+    let stored = std::path::Path::new(&msg.media[0]);
+    assert!(stored.starts_with(media_dir.path()));
+    let name = stored.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with("matrix_") && name.ends_with("__CON"),
+        "reserved device name must be neutralized, got: {name}"
+    );
+
+    // Exactly one file lands in the media dir, under the sanitized name.
+    let entries: Vec<String> = std::fs::read_dir(media_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(entries, vec![name.to_string()]);
+}
+
+#[test]
+fn sanitize_inbound_filename_keeps_last_path_component_only() {
+    assert_eq!(sanitize_inbound_filename("photo.png"), "photo.png");
+    assert_eq!(sanitize_inbound_filename("../../etc/passwd"), "passwd");
+    assert_eq!(sanitize_inbound_filename("/etc/passwd"), "passwd");
+    assert_eq!(sanitize_inbound_filename("..\\..\\win\\cmd.exe"), "cmd.exe");
+    assert_eq!(sanitize_inbound_filename("dir/"), "file");
+}
+
+#[test]
+fn sanitize_inbound_filename_neutralizes_windows_reserved_names() {
+    assert_eq!(sanitize_inbound_filename("CON"), "_CON");
+    assert_eq!(sanitize_inbound_filename("con.txt"), "_con.txt");
+    assert_eq!(sanitize_inbound_filename("Nul"), "_Nul");
+    assert_eq!(sanitize_inbound_filename("COM1"), "_COM1");
+    assert_eq!(sanitize_inbound_filename("report.pdf"), "report.pdf");
+}
+
+#[test]
+fn sanitize_inbound_filename_strips_ads_and_control_chars() {
+    assert_eq!(
+        sanitize_inbound_filename("report.pdf:hidden"),
+        "report.pdf_hidden"
+    );
+    assert_eq!(sanitize_inbound_filename("a\u{0000}b.txt"), "ab.txt");
+}
+
+#[test]
+fn sanitize_inbound_filename_trims_trailing_dots_and_spaces() {
+    assert_eq!(sanitize_inbound_filename("file...."), "file");
+    assert_eq!(sanitize_inbound_filename("file. . "), "file");
+    assert_eq!(sanitize_inbound_filename(".."), "file");
+}
+
+#[test]
+fn sanitize_inbound_filename_caps_length_preserving_extension() {
+    let long = format!("{}.txt", "a".repeat(200));
+    let out = sanitize_inbound_filename(&long);
+    assert_eq!(out.chars().count(), 120);
+    assert!(out.ends_with(".txt"));
+
+    let long_no_ext: String = "b".repeat(300);
+    assert_eq!(sanitize_inbound_filename(&long_no_ext).chars().count(), 120);
+}
+
+#[tokio::test]
 async fn test_handle_ping() {
     use axum::body::Body;
     use axum::http::Request;

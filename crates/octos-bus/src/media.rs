@@ -47,6 +47,20 @@ pub async fn download_media_with_cap(
     filename: &str,
     cap: u64,
 ) -> Result<PathBuf> {
+    // Create the media dir owner-only: inbound attachments are private
+    // session data, so the default (0777 & ~umask) would expose them to
+    // every local user. Existing dirs keep their mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dest_dir)
+            .wrap_err_with(|| format!("failed to create media dir: {}", dest_dir.display()))?;
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(dest_dir)
         .wrap_err_with(|| format!("failed to create media dir: {}", dest_dir.display()))?;
 
@@ -149,6 +163,42 @@ mod tests {
         let ok = download_media_with_cap(&client, &url, &[], dir.path(), "ok.bin", 4096).await;
         assert!(ok.is_ok(), "within-cap download should succeed: {ok:?}");
         assert_eq!(std::fs::metadata(ok.unwrap()).unwrap().len(), 1024);
+
+        handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_media_creates_owner_only_media_dir() {
+        use axum::Router;
+        use axum::routing::get;
+        use std::os::unix::fs::PermissionsExt;
+
+        let app = Router::new().route("/f", get(|| async { vec![1u8; 8] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("media");
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/f");
+
+        download_media_with_cap(&client, &url, &[], &nested, "ok.bin", 4096)
+            .await
+            .unwrap();
+
+        // Inbound attachments are private session data; the directory must
+        // not be created world-traversable (#2426).
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "media dir must be owner-only, got {:o}",
+            mode & 0o777
+        );
 
         handle.abort();
     }

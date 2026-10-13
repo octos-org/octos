@@ -2651,6 +2651,8 @@ The most common misconfiguration is a token mismatch. All three of these must ag
 | `sender_localpart` | `sender_localpart: octosbot` | `"sender_localpart": "octosbot"` |
 | server name | `regex: "@octosbot:your\\.server\\.name"` | `"server_name": "your.server.name"` |
 
+Transaction retries are deduplicated by `txn_id` over a rolling window (the last 1,000 transaction IDs, 60 seconds). A retry that arrives after its ID has left the window is re-executed; this is acceptable against a trusted homeserver, which authenticates with the `hs_token` above.
+
 ### 16.5 Troubleshooting
 
 | Symptom | Cause | Fix |
