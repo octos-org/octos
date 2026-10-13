@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::goal_loop_runtime::{
     BUILT_IN_MAINTENANCE_PROMPT, DenyReason, GoalCompletionVerdict, GoalPolicyDecision,
@@ -11,6 +11,7 @@ use super::goal_loop_runtime::{
     MaintenancePromptSource, NextDueState, RuntimeIdleState as GoalRuntimeIdleState,
     SlashCommandAuthorization, WaitUntil, resolve_maintenance_prompt,
 };
+use super::human_events::{CapDecision, OriginBudget, cap_admit};
 use super::master_continuation_scheduler::{
     MAX_REDELIVERY_ATTEMPTS, MasterContinuationDedupeKey, MasterContinuationEnqueueOutcome,
     MasterContinuationReason, MasterContinuationRequest, MasterContinuationRuntimeState,
@@ -12180,6 +12181,18 @@ impl InProcessAgentOrchestrator {
             .map(|record| (record.status.clone(), record.pause_reason.clone()))
     }
 
+    /// Test hook (#2498 storm tests): re-arm a monitor past its deadline —
+    /// the test-level stand-in for the re-arm paths `monitor/resume` refuses
+    /// past-due (#2367), so a test can drive repeated real active→expired
+    /// transitions through the emit sites.
+    #[cfg(test)]
+    pub(crate) fn rearm_monitor_past_deadline_for_test(&self, monitor_id: &str) {
+        if let Some(record) = self.state().monitors.get_mut(monitor_id) {
+            record.status = "active".into();
+            record.expires_at_ms = Some(1);
+        }
+    }
+
     /// Test hook (blocker 1 durability test): overwrite a monitor's persisted
     /// change baseline so a subsequent observation can be forced down the fire
     /// path (to exercise the restart re-fire dedupe collapse).
@@ -12370,20 +12383,84 @@ pub(crate) fn set_monitor_expired_sink(sink: MonitorExpiredSink) {
     *slot = Some(sink);
 }
 
+/// Rolling window for the per-session admission budget on the
+/// `monitor/expired` sink (#2498). The sink queue is process-global and
+/// bounded while its producers are not, so — exactly like the
+/// `background/activity` human sink's per-origin budget (#2019) — a
+/// pathological expiry storm in one session must not crowd other sessions'
+/// frames out of the queue.
+pub(crate) const MONITOR_EXPIRED_WINDOW: Duration = Duration::from_secs(60);
+/// Max frames admitted per owning session per [`MONITOR_EXPIRED_WINDOW`].
+/// Expiry is a once-per-active→expired-transition lifecycle event, so this
+/// sits far above legitimate traffic (`MAX_MONITORS_PER_SESSION` per
+/// session, each re-expiring only via an explicit re-arm).
+pub(crate) const MONITOR_EXPIRED_MAX_PER_WINDOW: u32 = 40;
+
+fn monitor_expired_budget_slot() -> &'static StdMutex<HashMap<String, OriginBudget>> {
+    static BUDGETS: OnceLock<StdMutex<HashMap<String, OriginBudget>>> = OnceLock::new();
+    BUDGETS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
 /// Hand a `monitor/expired` event to the installed sink. Best-effort: no
 /// sink (or a poisoned slot) drops the event with a trace line — the durable
 /// status transition has already happened, so nothing is lost for the model.
+///
+/// Admission is budgeted per owning session with the same rolling-window
+/// state machine as the human sink: the first over-budget frame per window
+/// raises ONE warn line, every suppressed frame bumps the
+/// `ws.monitor_expired.budget_drop` counter, and the durable transition +
+/// session note are unaffected either way. Unlike the human sink there is
+/// no in-band marker row — the wire shape is a typed lifecycle frame, not a
+/// free-text stream — so the warn line and the counter carry the
+/// visibility instead.
 fn emit_monitor_expired(event: MonitorExpiredEvent) {
     let sink = monitor_expired_sink_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    match sink {
-        Some(sink) => sink(event),
-        None => tracing::trace!(
+    let Some(sink) = sink else {
+        tracing::trace!(
             monitor_id = %event.monitor_id,
             "monitor/expired dropped: no sink installed"
-        ),
+        );
+        return;
+    };
+    // Check the sink BEFORE the budget so unsinked builds (`octos chat`,
+    // unit tests) never touch the budget map — mirrors the human sink's
+    // early-out.
+    let decision = {
+        let key = event.session_id.0.clone();
+        let mut budgets = monitor_expired_budget_slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cap_admit(
+            &mut budgets,
+            &key,
+            Instant::now(),
+            MONITOR_EXPIRED_WINDOW,
+            MONITOR_EXPIRED_MAX_PER_WINDOW,
+        )
+    };
+    match decision {
+        CapDecision::Admit { .. } => sink(event),
+        CapDecision::Marker { dropped } => {
+            metrics::counter!("ws.monitor_expired.budget_drop").increment(1);
+            tracing::warn!(
+                session = %event.session_id.0,
+                monitor_id = %event.monitor_id,
+                dropped,
+                "monitor/expired suppressed: session exceeded its per-window sink \
+                 budget; durable transitions and notes are unaffected"
+            );
+        }
+        CapDecision::Drop => {
+            metrics::counter!("ws.monitor_expired.budget_drop").increment(1);
+            tracing::debug!(
+                session = %event.session_id.0,
+                monitor_id = %event.monitor_id,
+                "monitor/expired suppressed: session budget already marked this window"
+            );
+        }
     }
 }
 
@@ -12403,14 +12480,18 @@ pub(crate) fn monitor_expired_test_guard() -> std::sync::MutexGuard<'static, ()>
     guard
 }
 
-/// Remove the sink. Test-only: the slot is a `static` that cannot otherwise
-/// be reset between cases.
+/// Remove the sink and reset the budgets. Test-only: the slots are
+/// `static`s that cannot otherwise be reset between cases.
 #[cfg(test)]
 pub(crate) fn clear_monitor_expired_sink() {
     let mut slot = monitor_expired_sink_slot()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *slot = None;
+    monitor_expired_budget_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 #[derive(Debug)]
@@ -45733,6 +45814,178 @@ mod tests {
                 .0,
             "expired",
             "the refused resume leaves the record expired"
+        );
+    }
+
+    /// #2498 — the per-session admission budget. Nine storm rounds of the
+    /// REAL reconcile sweep (5 monitors re-armed past their deadline each
+    /// round = 45 active→expired transitions) deliver only the per-session
+    /// per-window cap to the sink, while every durable transition still
+    /// lands (the sweep itself is untouched).
+    #[test]
+    fn monitor_expired_sink_budget_caps_one_sessions_expiry_storm() {
+        let _guard = monitor_expired_test_guard();
+        let events: Arc<StdMutex<Vec<MonitorExpiredEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = events.clone();
+        let dir = tempfile::TempDir::new().unwrap();
+        let orchestrator = InProcessAgentOrchestrator::default();
+        let session = SessionKey::new("api", "mon-expire-budget");
+        // Same process-global cross-talk discipline as the sweep test above.
+        let own = session.clone();
+        set_monitor_expired_sink(Arc::new(move |event| {
+            if event.session_id == own {
+                recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            }
+        }));
+        for i in 0..5 {
+            let mut spec = monitor_spec(
+                &format!("storm-{i}"),
+                MonitorMode::Poll { interval_secs: 3 },
+            );
+            spec.timeout_secs = Some(1);
+            create_monitor_for_test(
+                &orchestrator,
+                &session,
+                "tenant-a",
+                spec,
+                Some(dir.path().to_path_buf()),
+            );
+        }
+        // Nine rounds: re-arm every monitor past its deadline (the test-level
+        // stand-in for the re-arm paths #2367 refuses past-due), then let the
+        // real sweep expire them — 5 transitions per round, 45 in total.
+        for _ in 0..9 {
+            {
+                let mut state = orchestrator.state();
+                for record in state.monitors.values_mut() {
+                    record.status = "active".into();
+                    record.expires_at_ms = Some(now_ms() - 1_000);
+                }
+            }
+            orchestrator.monitor_reconcile_pass();
+        }
+        let delivered = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert_eq!(
+            delivered, MONITOR_EXPIRED_MAX_PER_WINDOW as usize,
+            "one noisy session cannot crowd the process-global sink past its budget"
+        );
+        // The budget binds the client-side tap only: the durable side is
+        // unaffected — every storm round still expired its monitors.
+        let state = orchestrator.state();
+        assert!(
+            state.monitors.values().all(|r| r.status == "expired"),
+            "every transition still happened durably"
+        );
+    }
+
+    /// #2498 — budgets are per owning session: exhausting one session's
+    /// window never suppresses a sibling session's expiry frame.
+    #[test]
+    fn monitor_expired_budget_is_per_session() {
+        let _guard = monitor_expired_test_guard();
+        let events: Arc<StdMutex<Vec<MonitorExpiredEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = events.clone();
+        set_monitor_expired_sink(Arc::new(move |event| {
+            recorded
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event);
+        }));
+        let event_for = |session: &SessionKey, monitor_id: &str| MonitorExpiredEvent {
+            session_id: session.clone(),
+            profile_id: None,
+            monitor_id: monitor_id.to_owned(),
+            monitor_state: None,
+            status: Some("expired".to_owned()),
+            expired_at_ms: Some(0),
+            reason: Some("test".to_owned()),
+        };
+        let noisy = SessionKey::new("api", "mon-budget-noisy");
+        let quiet = SessionKey::new("api", "mon-budget-quiet");
+        for i in 0..45 {
+            emit_monitor_expired(event_for(&noisy, &format!("m{i}")));
+        }
+        emit_monitor_expired(event_for(&quiet, "m-quiet"));
+        let delivered = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            delivered.iter().filter(|e| e.session_id == noisy).count(),
+            MONITOR_EXPIRED_MAX_PER_WINDOW as usize,
+            "the noisy session is capped"
+        );
+        assert_eq!(
+            delivered.iter().filter(|e| e.session_id == quiet).count(),
+            1,
+            "the sibling session is never suppressed by the noisy one"
+        );
+    }
+
+    /// #2498 — the guard's reset (`clear_monitor_expired_sink`) clears the
+    /// budget map together with the sink, so a session that exhausted its
+    /// window in one test emits freely again in the next. Deleting the
+    /// `.clear()` must fail here, or every sink test quietly becomes
+    /// order-dependent.
+    #[test]
+    fn monitor_expired_budget_resets_with_the_sink_between_tests() {
+        let session = SessionKey::new("api", "mon-budget-reset");
+        let event_for = |monitor_id: &str| MonitorExpiredEvent {
+            session_id: session.clone(),
+            profile_id: None,
+            monitor_id: monitor_id.to_owned(),
+            monitor_state: None,
+            status: Some("expired".to_owned()),
+            expired_at_ms: Some(0),
+            reason: Some("test".to_owned()),
+        };
+        let events: Arc<StdMutex<Vec<MonitorExpiredEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = events.clone();
+        {
+            let _guard = monitor_expired_test_guard();
+            set_monitor_expired_sink(Arc::new(move |event| {
+                recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            }));
+            for i in 0..45 {
+                emit_monitor_expired(event_for(&format!("m{i}")));
+            }
+            assert_eq!(
+                events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .len(),
+                MONITOR_EXPIRED_MAX_PER_WINDOW as usize,
+                "the budget is active within one guard window"
+            );
+        }
+        // Re-acquiring the guard resets sink + budgets: the same session is
+        // admitted again.
+        let _guard = monitor_expired_test_guard();
+        let after: Arc<StdMutex<Vec<MonitorExpiredEvent>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_after = after.clone();
+        set_monitor_expired_sink(Arc::new(move |event| {
+            recorded_after
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event);
+        }));
+        emit_monitor_expired(event_for("m-after-reset"));
+        assert_eq!(
+            after
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "the reset cleared the budget, not only the sink"
         );
     }
 
