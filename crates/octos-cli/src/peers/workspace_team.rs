@@ -684,14 +684,7 @@ mod tests {
         let profile = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
 
-        let capture = LogCapture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(capture.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (capture, _guard) = capture_warn_subscriber();
 
         let seats = seat_ids(CAPACITY_WARN_AT - 1);
         let seat_refs: Vec<(&str, &str)> = seats
@@ -699,6 +692,12 @@ mod tests {
             .map(|(a, s)| (a.as_str(), s.as_str()))
             .collect();
         seed_team_file(profile.path(), workspace.path(), &seat_refs);
+        // A sibling test can first-register this warn! callsite on a
+        // subscriber-less thread at any point before the fire below (the
+        // #2276 trap); re-ask under this test's capture immediately
+        // beforehand so the poisoned window is the join itself rather
+        // than the whole test.
+        tracing_core::callsite::rebuild_interest_cache();
         WorkspaceTeams::default()
             .join(
                 profile.path(),
@@ -722,14 +721,10 @@ mod tests {
             .map(|(a, s)| (a.as_str(), s.as_str()))
             .collect();
         seed_team_file(quiet_profile.path(), quiet_workspace.path(), &seat_refs);
-        let quiet = LogCapture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(quiet.clone())
-            .finish();
-        let _quiet_guard = tracing::subscriber::set_default(subscriber);
+        // No re-ask needed here: the fire above already registered the
+        // callsite, and a `never` poison cannot fake a failure of a
+        // `!contains` assertion.
+        let (quiet, _quiet_guard) = capture_warn_subscriber();
         WorkspaceTeams::default()
             .join(
                 quiet_profile.path(),
@@ -743,6 +738,71 @@ mod tests {
             !quiet.contents().contains("approaching the member limit"),
             "an admission below the warning line must stay quiet, got: {}",
             quiet.contents()
+        );
+    }
+
+    #[test]
+    fn capacity_warn_survives_a_first_registration_from_a_subscriberless_thread() {
+        // Pins the flaked CI arrangement: a sibling thread crossed the
+        // warning line before this test's join, while the capture below
+        // was the only live dispatch. The callsite's first registration
+        // (on that thread) asked only the firing thread's default — none
+        // — and cached `never`, nothing guaranteed to re-ask it under a
+        // healthy subscriber before this test's own fire. Under fully
+        // parallel CI a sibling may also have registered the callsite
+        // earlier with a healthy interest, in which case this pin passes
+        // vacuously; run solo it deterministically fails without the
+        // re-ask below.
+        let profile = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (capture, _guard) = capture_warn_subscriber();
+
+        let seats = seat_ids(CAPACITY_WARN_AT - 1);
+        let seat_refs: Vec<(&str, &str)> = seats
+            .iter()
+            .map(|(a, s)| (a.as_str(), s.as_str()))
+            .collect();
+        seed_team_file(profile.path(), workspace.path(), &seat_refs);
+
+        let poison_profile = profile.path().join("poison");
+        let workspace_path = workspace.path().to_path_buf();
+        let poison_thread = std::thread::spawn(move || {
+            let seat_refs: Vec<(&str, &str)> = seats
+                .iter()
+                .map(|(a, s)| (a.as_str(), s.as_str()))
+                .collect();
+            seed_team_file(&poison_profile, &workspace_path, &seat_refs);
+            WorkspaceTeams::default()
+                .join(
+                    &poison_profile,
+                    &workspace_path,
+                    &SessionKey("local:new".into()),
+                    1,
+                    &HashSet::new(),
+                )
+                .unwrap();
+        });
+        poison_thread.join().unwrap();
+
+        // Re-ask the callsites under this test's subscriber before the
+        // admission below; without this the cached `never` statically
+        // skips the warn! and the capture stays empty.
+        tracing_core::callsite::rebuild_interest_cache();
+
+        WorkspaceTeams::default()
+            .join(
+                profile.path(),
+                workspace.path(),
+                &SessionKey("local:again".into()),
+                1,
+                &HashSet::new(),
+            )
+            .unwrap();
+        assert!(
+            capture.contents().contains("approaching the member limit"),
+            "an admission at the warning line must warn even when a sibling \
+             thread registered the callsite first, got: {}",
+            capture.contents()
         );
     }
 
@@ -816,14 +876,10 @@ mod tests {
             .collect();
         seed_team_file(profile.path(), workspace.path(), &seat_refs);
 
-        let capture = LogCapture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(capture.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (capture, _guard) = capture_warn_subscriber();
+        // Same subscriber-less first-registration trap as the capacity
+        // warn above; re-ask right before the fire.
+        tracing_core::callsite::rebuild_interest_cache();
 
         let joined = WorkspaceTeams::default()
             .join(
@@ -958,6 +1014,28 @@ mod tests {
         fn make_writer(&self) -> Self::Writer {
             self.clone()
         }
+    }
+
+    /// Installs a WARN-level capture subscriber as this thread's default.
+    /// Creating the dispatch re-asks every already-registered callsite,
+    /// but a sibling test can still first-register the warn! callsites
+    /// below on a subscriber-less thread *after* that — the registration
+    /// then asks only the firing thread's default and caches `never`,
+    /// which nothing revisits (the #2276 twin in api/router.rs hit the
+    /// same trap). So each capture test re-asks via
+    /// `rebuild_interest_cache()` right before the join it asserts on,
+    /// and the filters here must stay WARN-or-looser: interest is the
+    /// conjunction across every live dispatch, so a stricter capture
+    /// would poison the others.
+    fn capture_warn_subscriber() -> (LogCapture, tracing::subscriber::DefaultGuard) {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        (capture, tracing::subscriber::set_default(subscriber))
     }
 
     #[test]
