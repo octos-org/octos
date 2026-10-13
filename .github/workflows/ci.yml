@@ -363,6 +363,27 @@ jobs:
           python3 scripts/lint-upcr-registry.py --self-test
           python3 scripts/lint-upcr-registry.py
 
+      - name: UPCR coverage gate self-test
+        run: bash scripts/tests/test-check-ui-protocol-upcr.sh
+
+      # The coverage gate diffs HEAD against a base and fails loud when that
+      # range is empty on a clean tree — which is exactly what it would see
+      # against origin/main on a push-to-main checkout. PRs diff against
+      # their merge-base; direct main pushes override the base with
+      # github.event.before so the backstop lane keeps the same protection
+      # ("pushes to main always run everything"); workflow_dispatch has
+      # neither base shape, so it runs only the self-test above, which keeps
+      # the gate script from rotting between protocol changes.
+      - name: UPCR coverage gate (PR)
+        if: github.event_name == 'pull_request'
+        run: bash scripts/check-ui-protocol-upcr.sh
+
+      - name: UPCR coverage gate (direct push)
+        if: github.event_name == 'push'
+        env:
+          UPCR_BASE_REF: ${{ github.event.before }}
+        run: bash scripts/check-ui-protocol-upcr.sh
+
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
