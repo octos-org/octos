@@ -34709,6 +34709,322 @@ async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
     );
 }
 
+/// #2162: `session/open` with a raw wire id plus an explicit `profile_id`
+/// succeeds on an unscoped connection, but the id itself carries no profile
+/// — later lookups must still land in the open's profile manager, not fall
+/// through to the legacy global one (`unknown_session`).
+///
+/// The binding registry is process-global, so every test below keys its
+/// sessions on ids unique to that test.
+#[tokio::test]
+async fn appui_raw_open_profile_binding_keeps_the_session_addressable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "raw-open-binding";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "binding-addressable");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("open binding tier resolves the session manager");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "lookup must land in the profile the open resolved",
+    );
+    assert!(
+        sessions.lock().await.session_known(&raw_id),
+        "the session open created must be known under its raw wire id",
+    );
+}
+
+/// #2162: `session/status/read` for a raw id on an unscoped connection must
+/// resolve the open's profile instead of reporting `_main` as unresolved.
+#[tokio::test]
+async fn raw_session_status_read_resolves_open_profile_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "raw-open-status";
+    let (state, _profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "binding-status");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let status = raw_session_status_result(
+        &state,
+        &RpcRequest::<Value>::new(
+            "status-after-raw-open",
+            APPUI_METHOD_SESSION_STATUS_READ,
+            json!({ "session_id": raw_id.0 }),
+        ),
+        ConnectionUiFeatures::default(),
+        None,
+    )
+    .await
+    .expect("status/read must resolve the open binding, not _main");
+    assert_eq!(status["profile_id"], json!(profile_id));
+}
+
+/// #2162 round 2: reopening the same raw wire id under another profile
+/// rebinds it — the last open owns the wire id.
+#[tokio::test]
+async fn appui_reopen_raw_id_under_new_profile_rebinds_the_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (state, first_runtime) = state_with_profile(temp.path(), "rebind-first").await;
+    let second_dir = tempfile::tempdir().expect("tempdir");
+    let (_second_state, second_runtime) =
+        state_with_profile(second_dir.path(), "rebind-second").await;
+    let mut state_inner = Arc::try_unwrap(state)
+        .map_err(|_| "state Arc must be unique for test setup")
+        .expect("unique Arc");
+    state_inner
+        .profiles
+        .insert("rebind-second".into(), second_runtime.clone());
+    let state = Arc::new(state_inner);
+
+    let raw_id = SessionKey::new("api", "rebind-target");
+    let open = |profile_id: &'static str| {
+        let state = state.clone();
+        let raw_id = raw_id.clone();
+        async move {
+            open_session_result(
+                &state,
+                &UiProtocolLedger::new(16),
+                &PendingApprovalStore::default(),
+                &PendingQuestionStore::default(),
+                ConnectionId::next(),
+                None,
+                None,
+                ConnectionUiFeatures::default(),
+                SessionOpenParams {
+                    client_commands: None,
+                    session_id: raw_id,
+                    topic: None,
+                    profile_id: Some(profile_id.to_owned()),
+                    cwd: None,
+                    sandbox: None,
+                    after: None,
+                },
+            )
+            .await
+            .expect("raw-id session/open with an explicit profile must succeed")
+        }
+    };
+    open("rebind-first").await;
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("first binding resolves");
+    assert_eq!(sessions.lock().await.data_dir(), first_runtime.data_dir);
+
+    open("rebind-second").await;
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("rebound binding resolves");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        second_runtime.data_dir,
+        "the last open owns the wire id",
+    );
+}
+
+/// #2162 round 2: a profile-less reopen of a raw id must not steal an
+/// existing binding onto `_main` — the open itself resolved the session
+/// through the binding and shares one manager with the lookups either way.
+#[tokio::test]
+async fn appui_profileless_reopen_keeps_the_existing_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "no-steal";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "no-steal-target");
+    for params_profile in [Some(profile_id.to_owned()), None] {
+        open_session_result(
+            &state,
+            &UiProtocolLedger::new(16),
+            &PendingApprovalStore::default(),
+            &PendingQuestionStore::default(),
+            ConnectionId::next(),
+            None,
+            None,
+            ConnectionUiFeatures::default(),
+            SessionOpenParams {
+                client_commands: None,
+                session_id: raw_id.clone(),
+                topic: None,
+                profile_id: params_profile,
+                cwd: None,
+                sandbox: None,
+                after: None,
+            },
+        )
+        .await
+        .expect("session/open must succeed");
+    }
+
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("binding survives the profile-less reopen");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "the profile-less reopen must not rebind the wire id to _main",
+    );
+}
+
+/// #2162 round 2: a connection's authenticated profile outranks the binding
+/// — profile-scoped connections keep their existing isolation.
+#[tokio::test]
+async fn appui_connection_profile_outranks_the_open_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "binding-shadowed";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "shadowed-target");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let sessions = resolve_sessions_for_lookup(&state, Some("other-profile"), None, &raw_id)
+        .await
+        .expect("connection-profile lookup resolves");
+    assert_ne!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "the connection profile must win over the open binding",
+    );
+}
+
+/// #2162 round 2 (review MAJOR 2): forking a raw-id parent yields a raw
+/// child id — the child must be bound to the profile the parent resolved
+/// under, or the fork mints another half-usable identity.
+#[tokio::test]
+async fn appui_fork_binds_a_raw_child_to_the_parent_profile() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "fork-bind";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "fork-parent");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_fork(
+        &ws,
+        &state,
+        None,
+        None,
+        "fork-bind-1".into(),
+        octos_core::ui_protocol::SessionForkParams {
+            session_id: raw_id.clone(),
+            new_chat_id: "kid".into(),
+            copy_messages: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    let child = frame
+        .get("result")
+        .and_then(|result| result.get("new_session_id"))
+        .and_then(Value::as_str)
+        .expect("fork must succeed and echo the child id")
+        .to_owned();
+
+    let child_key = SessionKey(child);
+    assert!(
+        child_key.profile_id().is_none(),
+        "the parent is a raw id, so the child must be raw too",
+    );
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &child_key)
+        .await
+        .expect("child binding resolves the session manager");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "the fork child must land in the parent's profile manager",
+    );
+    assert!(
+        sessions.lock().await.session_known(&child_key),
+        "the fork child must be known under its raw wire id",
+    );
+}
+
 #[tokio::test]
 async fn should_keep_profile_transcript_store_with_fresh_cache_after_no_cwd_reseed() {
     let temp = tempfile::tempdir().expect("tempdir");

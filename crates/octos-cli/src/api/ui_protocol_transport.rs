@@ -3185,6 +3185,45 @@ fn session_workspaces() -> Arc<SessionWorkspaceStore> {
         .clone()
 }
 
+/// #2162 — server-owned binding from a successfully opened session's wire id
+/// to the profile the open resolved it under. `session/open` accepts a raw
+/// id (no embedded profile) plus an explicit `profile_id`, but follow-up
+/// methods resolve the profile from the id, the connection's auth scope, or
+/// the routed host — an unscoped admin connection supplies none of those, so
+/// a session that just opened successfully reports `unknown_session` on
+/// hydrate and `_main` (unresolved) on status. Every successful open records
+/// the resolved profile here — reopening the same wire id under another
+/// profile rebinds it (last open owns the wire id) — and the lookup paths
+/// consult it as the weakest tier after id / connection / routed profiles.
+/// Per-process only: after a serve restart the binding is gone and lookups
+/// degrade to today's behavior.
+#[derive(Default)]
+struct SessionOpenProfileStore {
+    entries: std::sync::Mutex<HashMap<SessionKey, String>>,
+}
+
+impl SessionOpenProfileStore {
+    fn record(&self, session_id: SessionKey, profile_id: &str) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(session_id, profile_id.to_owned());
+    }
+
+    fn lookup(&self, session_id: &SessionKey) -> Option<String> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session_id)
+            .cloned()
+    }
+}
+
+fn session_open_profiles() -> &'static SessionOpenProfileStore {
+    static SESSION_OPEN_PROFILES: OnceLock<SessionOpenProfileStore> = OnceLock::new();
+    SESSION_OPEN_PROFILES.get_or_init(SessionOpenProfileStore::default)
+}
+
 /// Register a `peer-<slug>` session's wire key so `peer_send_input` can resolve
 /// it, and re-home any injections queued against the peer's PREVIOUS wire key
 /// onto this one (#436 P1 #1 reconnect). No-op for non-peer / unprofiled
@@ -4386,7 +4425,19 @@ async fn handle_session_compact(
     let Some(session_id) = params.session_id.clone() else {
         return Err(RpcError::invalid_params("session_id is required"));
     };
-    let profile_id = raw_profile_id(&params, connection_profile_id);
+    let profile_id = match raw_profile_id(&params, connection_profile_id) {
+        // #2162: a raw id carries no profile and an unscoped connection
+        // supplies none either — without this, compact would bootstrap a
+        // fresh `_main` runtime and compact the wrong profile's session.
+        // Consult the open binding first, the same tier the sessions-manager
+        // lookup uses.
+        profile if profile == MAIN_PROFILE_ID && nonempty(params.profile_id.clone()).is_none() => {
+            session_open_profiles()
+                .lookup(&session_id)
+                .unwrap_or(profile)
+        }
+        profile => profile,
+    };
     let Some(profile_runtime) = ensure_session_profile_runtime(state, Some(&profile_id)).await?
     else {
         return Err(runtime_unavailable_error(format!(
@@ -7832,9 +7883,7 @@ async fn ui_protocol_connection(
                     &active_turns,
                     &connection_turns,
                     connection_profile_id,
-                    // gap #2: fall back to the session-open profile when the
-                    // connection supplied no routing profile (admin / unscoped).
-                    routed_profile_id.or(session_open_profile_id.as_deref()),
+                    routed_profile_id,
                     features,
                     id,
                     params,
@@ -7979,11 +8028,7 @@ async fn ui_protocol_connection(
                     &ledger,
                     &active_turns,
                     connection_profile_id,
-                    // gap #2: fall back to the session-open profile when the
-                    // connection supplied no routing profile (admin / unscoped)
-                    // so the aside reads and bills the SAME profile the open
-                    // resolved to.
-                    routed_profile_id.or(session_open_profile_id.as_deref()),
+                    routed_profile_id,
                     id,
                     params,
                 )
@@ -12229,7 +12274,19 @@ async fn raw_session_status_result(
     let Some(session_id) = params.session_id.clone() else {
         return Err(RpcError::invalid_params("session_id is required"));
     };
-    let profile_id = raw_profile_id(&params, connection_profile_id);
+    let profile_id = match raw_profile_id(&params, connection_profile_id) {
+        // #2162: a raw id carries no profile and an unscoped connection
+        // supplies none either, so the `_main` fallback below reports a
+        // session that opened under another profile as unresolved. Consult
+        // the open binding first — the same tier the sessions-manager
+        // lookup uses.
+        profile if profile == MAIN_PROFILE_ID && nonempty(params.profile_id.clone()).is_none() => {
+            session_open_profiles()
+                .lookup(&session_id)
+                .unwrap_or(profile)
+        }
+        profile => profile,
+    };
     let profile = state
         .profile_store
         .as_ref()
@@ -23898,6 +23955,21 @@ async fn open_session_result(
         context_snapshot_for_features(opened.context, opened.context_state, features);
     opened.context = context;
     opened.context_state = context_state;
+    // #2162: a raw wire id opened under an explicit profile is otherwise
+    // unaddressable by later lookups on an unscoped connection — record the
+    // profile this open resolved so hydrate/status route to the same
+    // identity the open materialized. Keyed by the id the reply echoes (what
+    // the client will send back); success-only, mirroring the WS loop's
+    // per-connection `resolved_open_profile` cell (which cannot scope one
+    // id per session on a multi-session socket). Only the case where the
+    // binding is load-bearing is recorded: a canonical id resolves through
+    // its own embedded profile, and a profile-less open shares the _main /
+    // process-wide manager with every lookup already — recording either
+    // would only add stale entries, and a profile-less reopen of a raw id
+    // would steal an existing binding onto `_main`.
+    if opened.active_profile_id.is_some() && opened.session_id.profile_id().is_none() {
+        session_open_profiles().record(opened.session_id.clone(), &ledger_profile_id);
+    }
     Ok(SessionOpenOutcome {
         result: SessionOpenResult::new(opened),
         replay,
@@ -25312,10 +25384,15 @@ pub(crate) async fn resolve_sessions_for_lookup(
     routed_profile_id: Option<&str>,
     session_id: &SessionKey,
 ) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
+    // #2162: last resort for a raw id on an unscoped, un-routed connection —
+    // the profile a successful `session/open` resolved it under. Never
+    // overrides the explicit scopes below.
+    let open_binding_profile = session_open_profiles().lookup(session_id);
     let active_profile_id = session_id
         .profile_id()
         .or(connection_profile_id)
-        .or(routed_profile_id);
+        .or(routed_profile_id)
+        .or(open_binding_profile.as_deref());
     if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
         let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
         let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
@@ -26008,7 +26085,13 @@ async fn resolve_voice_admission_runtime(
     session_id: &SessionKey,
     connection_profile_id: Option<&str>,
 ) -> Result<Arc<crate::runtime::SessionRuntime>, RpcError> {
-    let active_profile_id = session_id.profile_id().or(connection_profile_id);
+    let open_binding_profile = session_open_profiles().lookup(session_id);
+    let active_profile_id = session_id
+        .profile_id()
+        .or(connection_profile_id)
+        // #2162: a raw id on an unscoped connection — the profile the
+        // session's `session/open` resolved under.
+        .or(open_binding_profile.as_deref());
     if let Some(profile_id) = active_profile_id {
         ensure_known_profile(state, profile_id)?;
     }
@@ -26470,7 +26553,10 @@ async fn handle_turn_start_with_accept(
                 connection_profile_id
                     .or(routed_profile_id)
                     .map(ToOwned::to_owned)
-            });
+            })
+            // #2162: a raw id on an unscoped, un-routed connection — the
+            // profile the session's `session/open` resolved under.
+            .or_else(|| session_open_profiles().lookup(&params.session_id));
         if let Some(profile_id) = active_profile_id.as_deref() {
             if let Err(error) = ensure_known_profile(state, profile_id) {
                 let _ = send_rpc_error(ws, Some(id), error);
@@ -30851,6 +30937,30 @@ async fn handle_session_fork(
         }
     };
 
+    // #2162: `fork_child` of a raw parent id yields a raw child id, which
+    // — like a raw open — no later lookup can route on its own. Bind the
+    // child to the profile the parent resolved under, with the same guard
+    // as `session/open`'s record (a canonical child carries its own
+    // profile; an unmaterialized runtime leaves parent and lookups on the
+    // shared process-wide manager).
+    let resolved_profile_id = params
+        .session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            connection_profile_id
+                .or(routed_profile_id)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| session_open_profiles().lookup(&params.session_id));
+    if new_key.profile_id().is_none() {
+        if let Some(profile_id) = resolved_profile_id.as_deref() {
+            if resolve_session_profile_runtime(state, Some(profile_id)).is_some() {
+                session_open_profiles().record(new_key.clone(), profile_id);
+            }
+        }
+    }
+
     let result = octos_core::ui_protocol::SessionForkResult {
         new_session_id: new_key,
         parent_session_id: params.session_id,
@@ -31401,13 +31511,15 @@ async fn handle_session_btw(
 
     // ONE profile resolution shared by transcript AND provider, with
     // `resolve_sessions_for_lookup`'s exact precedence (session key →
-    // connection → routed; the ws arm threads its session-open fallback in
-    // through `routed_profile_id`) — a divergent pair would read one
-    // profile's transcript and bill another profile's provider.
+    // connection → routed → the #2162 open binding) — a divergent pair
+    // would read one profile's transcript and bill another profile's
+    // provider.
+    let open_binding_profile = session_open_profiles().lookup(&session_id);
     let active_profile_id = session_id
         .profile_id()
         .or(connection_profile_id)
         .or(routed_profile_id)
+        .or(open_binding_profile.as_deref())
         .map(ToOwned::to_owned);
 
     // Transcript tail from the same store turn persistence writes to

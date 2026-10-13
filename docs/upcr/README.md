@@ -71,6 +71,7 @@ records.
 | 043 | Session Sandbox Narrowing | proposed | `..._043_SESSION_SANDBOX_NARROWING.md` | #1281 |
 | 044 | Manifest-Declared Skill Actions | accepted | `..._044_SKILL_ACTIONS.md` | #1637 |
 | 045 | Skill Action Background Jobs | accepted | `..._045_SKILL_ACTION_JOBS.md` | #1637 |
+| 046 | Server-Owned Session Identity Binding for Raw Wire Ids | proposed | `..._046_SESSION_IDENTITY_BINDING.md` | #2162 |
 
 ## Renumbering history
 
