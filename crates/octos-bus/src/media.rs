@@ -38,6 +38,34 @@ pub async fn download_media(
     download_media_with_cap(client, url, headers, dest_dir, filename, max_media_bytes()).await
 }
 
+/// Create a media directory owner-only (0700 on Unix): inbound attachments
+/// are private session data, so the default (0777 & ~umask) would expose
+/// them to every local user. A pre-existing directory with loose group/other
+/// bits (e.g. from an older release) is tightened on the way through; that
+/// tightening is best-effort, since a chmod failure (a directory we do not
+/// own) must not turn a usable download into a hard error. (#2426)
+pub fn ensure_private_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .wrap_err_with(|| format!("failed to create media dir: {}", path.display()))?;
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)
+        .wrap_err_with(|| format!("failed to create media dir: {}", path.display()))
+}
+
 /// [`download_media`] with an explicit byte cap (for deterministic testing).
 pub async fn download_media_with_cap(
     client: &Client,
@@ -47,22 +75,7 @@ pub async fn download_media_with_cap(
     filename: &str,
     cap: u64,
 ) -> Result<PathBuf> {
-    // Create the media dir owner-only: inbound attachments are private
-    // session data, so the default (0777 & ~umask) would expose them to
-    // every local user. Existing dirs keep their mode.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dest_dir)
-            .wrap_err_with(|| format!("failed to create media dir: {}", dest_dir.display()))?;
-    }
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(dest_dir)
-        .wrap_err_with(|| format!("failed to create media dir: {}", dest_dir.display()))?;
+    ensure_private_dir(dest_dir)?;
 
     let dest = dest_dir.join(filename);
 
@@ -197,6 +210,46 @@ mod tests {
             mode & 0o777,
             0o700,
             "media dir must be owner-only, got {:o}",
+            mode & 0o777
+        );
+
+        handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_media_tightens_loose_media_dir() {
+        use axum::Router;
+        use axum::routing::get;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let app = Router::new().route("/f", get(|| async { vec![1u8; 8] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("media");
+        // Simulate a directory left loose by an older release.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(&nested)
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/f");
+        download_media_with_cap(&client, &url, &[], &nested, "ok.bin", 4096)
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "loose media dir must be tightened, got {:o}",
             mode & 0o777
         );
 

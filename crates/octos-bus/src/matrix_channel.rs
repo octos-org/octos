@@ -1195,22 +1195,27 @@ pub(crate) fn percent_encode_path(s: &str) -> String {
     encoded
 }
 
-/// Cap on the user-controlled part of an inbound media filename.
-const MAX_INBOUND_FILENAME_CHARS: usize = 120;
+/// Byte cap on the user-controlled part of an inbound media filename. The
+/// ~21-byte `matrix_{ts}_` prefix must still fit every filesystem's 255-byte
+/// NAME_MAX, multi-byte scripts included.
+const MAX_INBOUND_FILENAME_BYTES: usize = 200;
 
 /// Reduce a user-controlled inbound media filename to a single safe path
 /// component. Matrix is the only channel that stores a sender-chosen name
 /// verbatim; this makes the storage explicitly safe instead of relying on
 /// the `matrix_{ts}_` prefix to defuse path separators by accident (#2426).
+/// The prefix keeps names unique only to the millisecond: two same-named
+/// attachments within the same millisecond still overwrite, as before.
 fn sanitize_inbound_filename(name: &str) -> String {
     // Only the final path component survives: absolute paths and `..`
     // traversal collapse to a plain name.
     let name = name.rsplit(['/', '\\']).next().unwrap_or("");
-    // NTFS alternate data streams ride a `:` separator; control characters
-    // are illegal in filenames everywhere.
+    // NTFS alternate data streams ride a `:` separator, and the remaining
+    // characters are illegal in Windows filenames; control characters are
+    // illegal everywhere.
     let name: String = name
         .chars()
-        .map(|c| if c == ':' { '_' } else { c })
+        .map(|c| if "<>:\"|?*".contains(c) { '_' } else { c })
         .filter(|c| !c.is_control())
         .collect();
     // Windows ignores trailing dots and spaces when naming files, so a
@@ -1250,17 +1255,15 @@ fn sanitize_inbound_filename(name: &str) -> String {
         name.to_string()
     };
 
-    // Cap runaway names while keeping the extension recognizable. The
-    // trailing-dot/space trim above guarantees `ext` is non-empty here.
+    // Cap runaway names by bytes (NAME_MAX is a byte limit) while keeping
+    // the extension recognizable. The trailing-dot/space trim above
+    // guarantees `ext` is non-empty here.
     let name = match name.rsplit_once('.') {
-        Some((stem, ext))
-            if !stem.is_empty() && ext.chars().count() + 1 < MAX_INBOUND_FILENAME_CHARS =>
-        {
-            let keep = MAX_INBOUND_FILENAME_CHARS - ext.chars().count() - 1;
-            let stem: String = stem.chars().take(keep).collect();
-            format!("{stem}.{ext}")
+        Some((stem, ext)) if !stem.is_empty() && ext.len() + 1 < MAX_INBOUND_FILENAME_BYTES => {
+            let keep = MAX_INBOUND_FILENAME_BYTES - ext.len() - 1;
+            format!("{}.{ext}", octos_core::truncated_utf8(stem, keep, ""))
         }
-        _ => name.chars().take(MAX_INBOUND_FILENAME_CHARS).collect(),
+        _ => octos_core::truncated_utf8(&name, MAX_INBOUND_FILENAME_BYTES, ""),
     };
 
     if name.is_empty() {

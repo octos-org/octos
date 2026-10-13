@@ -817,9 +817,9 @@ async fn appservice_client_does_not_follow_redirects() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    // The appservice client sends `Authorization: Bearer {as_token}` on
-    // every request, so a redirect to another origin would forward that
-    // credential (#2426). It must surface the 30x instead of following it.
+    // Redirects must not be followed: a 30x surfaces as the response
+    // instead of the request (which carries `Authorization: Bearer
+    // {as_token}`) being silently re-issued at the redirect target (#2426).
     let ch = make_channel();
     let resp = ch
         .http
@@ -917,8 +917,11 @@ async fn media_download_redirect_does_not_leak_as_token() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // The download fails loudly instead of replaying the credential at the
-    // redirect target; the message degrades to text-only.
+    // The download fails instead of being re-issued at the redirect
+    // target; the message degrades to text-only. reqwest strips
+    // Authorization on cross-origin redirects by itself (the recorder
+    // below pins that even for a following client), so the redirect
+    // policy is the fail-loud layer, not the token's only defense.
     assert!(
         leaked.lock().await.is_empty(),
         "as_token must never reach the redirect target"
@@ -1042,14 +1045,29 @@ fn sanitize_inbound_filename_trims_trailing_dots_and_spaces() {
 }
 
 #[test]
-fn sanitize_inbound_filename_caps_length_preserving_extension() {
-    let long = format!("{}.txt", "a".repeat(200));
+fn sanitize_inbound_filename_caps_bytes_preserving_extension() {
+    // NAME_MAX is a byte limit: multi-byte scripts must fit it too.
+    let long = format!("{}.txt", "中".repeat(200));
     let out = sanitize_inbound_filename(&long);
-    assert_eq!(out.chars().count(), 120);
     assert!(out.ends_with(".txt"));
+    // The stored name (with the ~21-byte `matrix_{ts}_` prefix) fits any
+    // filesystem's 255-byte NAME_MAX.
+    assert!(out.len() + 21 <= 255, "len {}: {out}", out.len());
+
+    let long_ascii = format!("{}.txt", "a".repeat(300));
+    assert_eq!(sanitize_inbound_filename(&long_ascii).len(), 200);
 
     let long_no_ext: String = "b".repeat(300);
-    assert_eq!(sanitize_inbound_filename(&long_no_ext).chars().count(), 120);
+    assert_eq!(sanitize_inbound_filename(&long_no_ext).len(), 200);
+}
+
+#[test]
+fn sanitize_inbound_filename_neutralizes_windows_illegal_characters() {
+    assert_eq!(sanitize_inbound_filename("a|b.txt"), "a_b.txt");
+    assert_eq!(
+        sanitize_inbound_filename("a<b>?c*d\"e.txt"),
+        "a_b__c_d_e.txt"
+    );
 }
 
 #[tokio::test]
