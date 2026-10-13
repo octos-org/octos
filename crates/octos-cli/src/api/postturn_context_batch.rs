@@ -374,12 +374,18 @@ mod tests {
             let result = Message::tool_with_thread("verified", id, ThreadId::new("thread"));
             history.extend([call.clone(), result.clone()]);
             prompt.extend([call, result]);
+            let root = context_ledger_path(dir.path(), &session.to_string());
+            let baseline = std::fs::read(&root).unwrap();
             bridge
                 .prepare_prompt(
                     request(PromptContextPhase::Iteration, iteration),
                     &mut prompt,
                 )
                 .unwrap();
+            assert!(
+                std::fs::read(root).unwrap() == baseline,
+                "ordinary iterations must append after adopting a background checkpoint or route change"
+            );
             if iteration == 2 {
                 bridge.observe_effective_provider_route("fixture", "model-2");
             }

@@ -6,7 +6,7 @@ This follow-up starts from `ea7b4e9c7` in its own worktree. It does not replace 
 
 The canonical session transcript already appends messages. The expensive duplicate operation was deriving, cloning and rewriting the entire context ledger after those messages committed. The batch fix reduced many full rewrites to one. This change makes that ordinary post-turn operation an appended context transition, retaining the full checkpoint as the recovery baseline.
 
-This follows the append-and-replay principle reviewed in the local Codex source; it is not Codex format compatibility or architectural parity. Existing mid-turn, manual compaction and other general context writers still install full checkpoints. There is no new scheduler, database or provider behavior.
+This follows the append-and-replay principle reviewed in the local Codex source; it is not Codex format compatibility or architectural parity. The initial implementation retained full checkpoints for mid-turn, manual compaction and other general context writers. The October 13 follow-up below extends incremental recording to ordinary model iterations. There is no new scheduler, database or provider behavior.
 
 ## Format and acknowledgement
 
@@ -32,7 +32,7 @@ Peer purge removes the session's checkpoint and all its transition sidecars, inc
 
 Ordinary transition writes avoid historical semantic-index derivation and full payload rewrite. They still cost the changed canonical suffix plus active-ID and compaction metadata, and `state()` still derives active state. Per-row source-history witnessing, in-memory merging, status publication and the final synchronous write remain. An early insertion or classification can make the replacement suffix large. This is not a claim that the whole turn or every persistence path is O(delta).
 
-Recovery reads the root and current sidecar, validates source coverage and normalizes context. This slice does not implement a SQLite projection, fast restart index, cross-process file locking, per-tool journaling or bounded log rotation independent of existing full checkpoints. Multiple runtime processes must not concurrently own the same context store. Full checkpoint writers normally retire the previous journal; crash leftovers require later housekeeping.
+Recovery reads the root and current sidecar, validates source coverage and normalizes context. This slice does not implement a SQLite projection, fast restart index, cross-process file locking or per-tool transcript journaling. The initial implementation relied on existing full checkpoints to retire journals; the October 13 follow-up adds a byte bound. Multiple runtime processes must not concurrently own the same context store. Full checkpoint writers normally retire the previous journal; crash leftovers require later housekeeping.
 
 The narrow media fix makes the canonical ToolOutput carry the same media as its active copy. Without that coherence, either the old snapshot or a transition could lose model-visible media on restart.
 
@@ -63,3 +63,40 @@ The focused regression selection passed **152 tests, 0 failures, 1 ignored** in 
 Final normalized prompt and source head were equal across all paths and after reload. The incremental baseline was unchanged byte-for-byte. Fixture setup took 7.355 seconds outside the measured paths. Sequential execution order was legacy, full batch, then incremental; the raw log's historic two-arm `order` label was corrected in the benchmark source afterward. This correction changes diagnostic metadata only.
 
 This single debug-profile measurement ran on a shared 18-logical-CPU host. The four A/B runtime CPU samples at benchmark start were 0%, 7.5%, 0% and 18.6%; other host load and cache/order effects remain uncontrolled. Timings cover context handling/persistence of synthetic completed rows, not provider, GPU, UI or total agent-turn latency. Snapshot counts and semantic equivalence are the principal evidence. The new binary is staged separately for a subsequently identified comparison phase; earlier experiment binaries and results remain frozen.
+
+## October 13: incremental model-loop persistence
+
+`AppUiPromptContextBridge::prepare_prompt` previously installed a full checkpoint
+before every model request, even after the post-turn path became incremental.
+Ordinary iterations now use the same validated transition writer. An installed
+compaction still creates a full baseline. Missing/legacy baselines migrate as
+before; manual compaction, rollback, route changes and background checkpoint
+writers retain their existing full-checkpoint behavior.
+
+The journal is limited to 8 MiB of encoded transitions. Before an append would
+exceed that limit (including an individually oversized transition), the writer
+validates its cursor and promotes the current state atomically instead. This
+keeps long runs bounded even when a large-context model does not compact. It
+does not cap the canonical transcript or baseline size. Rotation changes the
+storage lineage, not the model prompt or compaction policy.
+
+An unsuccessful write does not acknowledge scratch state; its dirty suffix is
+retried on the next preparation. Source-less loop rows remain uncommitted, and
+resume still drops them or rejects compactions that depend on them. This change
+does not make tool side effects transactional or add per-tool transcript
+durability. In-memory manager clones, projection work and synchronous writes
+under the existing locks remain; the whole preparation is not O(delta).
+
+The `in-loop context persistence finished` log records persistence duration,
+success and whether compaction requested a full checkpoint. A separate
+`context transition journal promoted at byte budget` event identifies rotation;
+an incremental request can also create a missing baseline. The timer excludes
+LLM summarization, transcript appends, cloning and prompt construction.
+
+The regression in `inloop_context_persistence_tests.rs` first failed against
+the full-write implementation, then verifies immutable baselines across tool
+iterations, exact replay after commit (including media), interrupted-row
+discard, compaction followed by incremental writes, and failed-write retry.
+Journal rotation tests check replay, oversized records and stale-writer
+rejection. The background/route-change bridge regression additionally asserts
+that ordinary preparations preserve the latest baseline byte-for-byte.

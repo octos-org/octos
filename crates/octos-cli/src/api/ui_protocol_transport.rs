@@ -5043,7 +5043,26 @@ impl PromptContextManager for AppUiPromptContextBridge {
             }
             *canonical = merged;
             publish_appui_context_status(&self.session_id, &canonical);
-            match persist_appui_context_snapshot(&self.data_dir, &self.session_id, &canonical) {
+            // Ordinary iterations append the dirty suffix. Compaction installs
+            // a fresh replay baseline; migration and size-based rotation are
+            // handled by the incremental writer itself. Do not acknowledge a
+            // failed write on scratch, so the next iteration can retry it.
+            let persistence_start = std::time::Instant::now();
+            let persistence = if compaction_performed {
+                persist_appui_context_snapshot(&self.data_dir, &self.session_id, &canonical)
+            } else {
+                persist_appui_context_transition(&self.data_dir, &self.session_id, &canonical)
+            };
+            info!(
+                session = %self.session_id.0,
+                phase = request.phase.as_str(),
+                iteration = request.iteration,
+                full_checkpoint_requested = compaction_performed,
+                persistence_ms = persistence_start.elapsed().as_millis(),
+                persistence_ok = persistence.is_ok(),
+                "in-loop context persistence finished"
+            );
+            match persistence {
                 Ok(_) => {
                     scratch
                         .manager
@@ -5052,7 +5071,7 @@ impl PromptContextManager for AppUiPromptContextBridge {
                 Err(error) => warn!(
                     session = %self.session_id.0,
                     error = %error,
-                    "failed to persist appui prompt context manager snapshot"
+                    "failed to persist appui prompt context manager"
                 ),
             }
         }
@@ -5185,6 +5204,10 @@ fn record_appui_context_manager_message(
 
 #[path = "postturn_context_batch.rs"]
 mod postturn_context_batch;
+
+#[cfg(test)]
+#[path = "inloop_context_persistence_tests.rs"]
+mod inloop_context_persistence_tests;
 
 /// Source-event kind tagging out-of-band `session/append_message` rows
 /// (UPCR-2026-042). Load-bearing for the mid-turn deferral policy — the

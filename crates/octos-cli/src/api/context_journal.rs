@@ -1,4 +1,4 @@
-//! Incremental post-turn context persistence. Full checkpoints remain the
+//! Incremental in-loop and post-turn context persistence. Full checkpoints remain the
 //! semantic-boundary format; transitions replace an explicitly dirty suffix.
 //! This is a single-runtime writer protocol, not cross-process coordination.
 
@@ -7,6 +7,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const TRANSITION_SCHEMA: &str = "octos.context-transition.v1";
+// Large-context models may run for many iterations without compacting. Bound
+// replay/storage independently of LLM compaction, including metadata repeated
+// in transitions. This is a byte budget, not a timer or per-tool durability claim.
+const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 struct Cursor {
@@ -315,6 +319,15 @@ pub(super) fn persist_incremental(
     session_id: &str,
     manager: &ContextManager,
 ) -> Result<PathBuf, String> {
+    persist_incremental_bounded(data_dir, session_id, manager, MAX_JOURNAL_BYTES)
+}
+
+fn persist_incremental_bounded(
+    data_dir: &Path,
+    session_id: &str,
+    manager: &ContextManager,
+    max_journal_bytes: u64,
+) -> Result<PathBuf, String> {
     if manager.session_id != session_id {
         return Err("context transition session mismatch".into());
     }
@@ -344,6 +357,21 @@ pub(super) fn persist_incremental(
         cache_epoch: manager.cache_epoch.clone(),
     };
     let bytes = encode(transition)?;
+    if cursor.offset.saturating_add(bytes.len() as u64) > max_journal_bytes {
+        // Cursor validation above is required even for rotation: a stale
+        // scratch writer must never promote over a newer acknowledged state.
+        let result = persist_checkpoint_locked(data_dir, session_id, manager);
+        if result.is_ok() {
+            tracing::info!(
+                session = session_id,
+                journal_bytes = cursor.offset,
+                transition_bytes = bytes.len(),
+                max_journal_bytes,
+                "context transition journal promoted at byte budget"
+            );
+        }
+        return result;
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -446,4 +474,68 @@ pub(super) fn bind_loaded(
         .position(|(saved, normalized)| saved != normalized)
         .unwrap_or(persisted_items.len().min(manager.ledger_items.len()));
     manager.journal.dirty(first_difference);
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    #[test]
+    fn should_promote_bounded_journal_without_losing_state_or_accepting_stale_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            ContextManager::from_session_history("bounded", None, &[Message::user("start")]);
+        manager.reconcile_prompt_cache_epoch("fixture", "model", "stable", &[]);
+        let root = persist_checkpoint(dir.path(), "bounded", &manager).unwrap();
+        let original = std::fs::read(&root).unwrap();
+        manager.record_persisted_message_merging_prompt_equivalent(&Message::assistant("first"), 1);
+        persist_incremental(dir.path(), "bounded", &manager).unwrap();
+        let old_journal = journal_path(dir.path(), "bounded");
+        let limit = file_len(&old_journal).unwrap() + 1;
+        let stale = manager.clone();
+        manager.record_persisted_message_merging_prompt_equivalent(&Message::user("second"), 2);
+        persist_incremental_bounded(dir.path(), "bounded", &manager, limit).unwrap();
+        let promoted = std::fs::read(&root).unwrap();
+        assert!(promoted != original);
+        assert!(!old_journal.exists());
+        assert_eq!(file_len(&journal_path(dir.path(), "bounded")).unwrap(), 0);
+        assert!(persist_incremental_bounded(dir.path(), "bounded", &stale, 1).is_err());
+        assert!(std::fs::read(&root).unwrap() == promoted);
+
+        // The next ordinary transition uses the new lineage and replays exactly.
+        manager.record_persisted_message_merging_prompt_equivalent(&Message::assistant("third"), 3);
+        persist_incremental(dir.path(), "bounded", &manager).unwrap();
+        assert!(std::fs::read(root).unwrap() == promoted);
+        let loaded = load_context_manager_snapshot(dir.path(), "bounded")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.canonical_ledger_hash(),
+            manager.canonical_ledger_hash()
+        );
+        assert_eq!(loaded.transcript_hash(), manager.transcript_hash());
+        assert_eq!(loaded.source_head_hash(), manager.source_head_hash());
+        assert_eq!(loaded.cache_epoch(), manager.cache_epoch());
+    }
+
+    #[test]
+    fn should_checkpoint_single_transition_larger_than_journal_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager =
+            ContextManager::from_session_history("oversized", None, &[Message::user("start")]);
+        persist_checkpoint(dir.path(), "oversized", &manager).unwrap();
+        manager.record_persisted_message_merging_prompt_equivalent(
+            &Message::assistant("large change"),
+            1,
+        );
+        persist_incremental_bounded(dir.path(), "oversized", &manager, 1).unwrap();
+        assert_eq!(file_len(&journal_path(dir.path(), "oversized")).unwrap(), 0);
+        let loaded = load_context_manager_snapshot(dir.path(), "oversized")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.canonical_ledger_hash(),
+            manager.canonical_ledger_hash()
+        );
+    }
 }
