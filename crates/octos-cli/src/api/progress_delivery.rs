@@ -1,6 +1,7 @@
 //! Ordered bridge from synchronous progress callbacks to an async transport.
 //! Token deltas coalesce while the consumer is slow. Lifecycle/tool events
-//! remain queued in order; only excess ephemeral text is shed, observably.
+//! remain queued in order; excess ephemeral text is shed, observably, and so
+//! are critical events once their queued payload exceeds its own budget.
 
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -12,9 +13,22 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 const MAX_PENDING_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COALESCED_TEXT_BYTES: usize = 64 * 1024;
+// Critical (non-text) events queue in order too, but a stalled consumer must
+// not be able to grow this queue without bound: a long turn on a dead socket
+// keeps emitting tool_start/tool_progress payloads whose tool arguments and
+// progress messages are producer-sized. Same budget as the text side, same
+// shed-and-count contract. (The consumer-facing mpsc in the transport adds a
+// PROGRESS_CHANNEL_CAPACITY-slot backlog in front of this; this budget bounds
+// what this module queues.)
+const MAX_PENDING_EVENT_BYTES: usize = 4 * 1024 * 1024;
 
 enum Pending {
-    Event(Value),
+    // Coalescable text, serialized at drain so merges keep folding into the
+    // Value without re-serializing per merge.
+    Text(Value),
+    // Everything else, serialized once at push; the worker sends these exact
+    // bytes, and `event_bytes` budgets their length.
+    Critical { json: String },
     Barrier(oneshot::Sender<()>),
 }
 
@@ -22,6 +36,7 @@ enum Pending {
 struct Queue {
     entries: VecDeque<Pending>,
     text_bytes: usize,
+    event_bytes: usize,
     closed: bool,
 }
 
@@ -75,37 +90,45 @@ impl ProgressDelivery {
                 let (entry, closed) = {
                     let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
                     let entry = queue.entries.pop_front();
-                    if let Some(Pending::Event(event)) = &entry {
-                        queue.text_bytes = queue.text_bytes.saturating_sub(text_size(event));
+                    match &entry {
+                        Some(Pending::Text(event)) => {
+                            queue.text_bytes = queue.text_bytes.saturating_sub(text_size(event));
+                        }
+                        Some(Pending::Critical { json }) => {
+                            queue.event_bytes = queue.event_bytes.saturating_sub(json.len());
+                        }
+                        Some(Pending::Barrier(_)) | None => {}
                     }
                     (entry, queue.closed)
                 };
-                match entry {
-                    Some(Pending::Event(event)) => {
-                        if tx.send(event.to_string()).await.is_err() {
-                            let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.closed = true;
-                            let count = 1 + queue
-                                .entries
-                                .iter()
-                                .filter(|item| matches!(item, Pending::Event(_)))
-                                .count();
-                            shared.dropped.fetch_add(count as u64, Ordering::Relaxed);
-                            queue.entries.clear();
-                            tracing::warn!(
-                                count,
-                                "progress delivery receiver closed; pending events unavailable"
-                            );
-                            break;
-                        }
-                    }
+                let payload = match entry {
+                    Some(Pending::Text(event)) => event.to_string(),
+                    Some(Pending::Critical { json }) => json,
                     Some(Pending::Barrier(done)) => {
                         let _ = done.send(());
+                        continue;
                     }
                     None if closed => break,
                     None => {
                         notified.await;
+                        continue;
                     }
+                };
+                if tx.send(payload).await.is_err() {
+                    let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    queue.closed = true;
+                    let count = 1 + queue
+                        .entries
+                        .iter()
+                        .filter(|item| matches!(item, Pending::Text(_) | Pending::Critical { .. }))
+                        .count();
+                    shared.dropped.fetch_add(count as u64, Ordering::Relaxed);
+                    queue.entries.clear();
+                    tracing::warn!(
+                        count,
+                        "progress delivery receiver closed; pending events unavailable"
+                    );
+                    break;
                 }
             }
         });
@@ -113,30 +136,54 @@ impl ProgressDelivery {
     }
 
     pub(super) fn push(&self, event: Value) {
+        let text = text_size(&event);
+        // Text is budgeted by payload length. Every other event serializes
+        // once here and is budgeted by its wire size — the worker sends those
+        // same bytes, so for a shed event this serialization is the whole
+        // measurement cost.
+        let (size, wire) = if text > 0 {
+            (text, None)
+        } else {
+            let json = event.to_string();
+            (json.len(), Some(json))
+        };
         let mut queue = self.0.queue.lock().unwrap_or_else(|e| e.into_inner());
-        let bytes = text_size(&event);
-        if queue.closed
-            || (bytes > 0 && queue.text_bytes.saturating_add(bytes) > MAX_PENDING_TEXT_BYTES)
-        {
+        let over_budget = if text > 0 {
+            queue.text_bytes.saturating_add(size) > MAX_PENDING_TEXT_BYTES
+        } else {
+            queue.event_bytes.saturating_add(size) > MAX_PENDING_EVENT_BYTES
+        };
+        if queue.closed || over_budget {
             let previous = self.0.dropped.fetch_add(1, Ordering::Relaxed);
-            metrics::counter!("ws.send.drop.backpressure", "method" => "progress_text")
-                .increment(1);
+            let (method, reason) = if text > 0 {
+                (
+                    "progress_text",
+                    "progress text overflow or closed receiver; replay-lossy counter advanced",
+                )
+            } else {
+                (
+                    "progress_event",
+                    "progress event overflow or closed receiver; replay-lossy counter advanced",
+                )
+            };
+            metrics::counter!("ws.send.drop.backpressure", "method" => method).increment(1);
             if previous == 0 || previous.is_power_of_two() {
-                tracing::warn!(
-                    dropped = previous + 1,
-                    closed = queue.closed,
-                    "progress text overflow or closed receiver; replay-lossy counter advanced"
-                );
+                tracing::warn!(dropped = previous + 1, closed = queue.closed, message = %reason);
             }
             return;
         }
-        queue.text_bytes += bytes;
-        if let Some(Pending::Event(last)) = queue.entries.back_mut()
-            && coalesce(last, &event)
-        {
-            return;
+        if let Some(json) = wire {
+            queue.event_bytes += size;
+            queue.entries.push_back(Pending::Critical { json });
+        } else {
+            queue.text_bytes += size;
+            if let Some(Pending::Text(last)) = queue.entries.back_mut()
+                && coalesce(last, &event)
+            {
+                return;
+            }
+            queue.entries.push_back(Pending::Text(event));
         }
-        queue.entries.push_back(Pending::Event(event));
         drop(queue);
         self.0.wake.notify_one();
     }
@@ -244,6 +291,55 @@ mod tests {
         let row: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
         assert_eq!(row["type"], "tool_end");
         delivery.flush().await;
+    }
+
+    #[tokio::test]
+    async fn should_shed_excess_critical_events_and_count_them() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let delivery = ProgressDelivery::new(tx, dropped.clone());
+        // 64 × 128 KiB tool arguments ≈ 8 MiB of queued critical payload —
+        // twice the budget. The consumer is stalled (channel(1), never read),
+        // so everything lands in the queue exactly as on a dead WS client.
+        let arguments = "x".repeat(128 * 1024);
+        let pushed = 64;
+        for i in 0..pushed {
+            delivery.push(json!({
+                "type": "tool_start",
+                "tool": "write",
+                "tool_call_id": format!("t{i}"),
+                "arguments": {"body": arguments},
+            }));
+        }
+        assert!(
+            dropped.load(Ordering::Relaxed) > 0,
+            "critical events beyond the byte budget must be shed"
+        );
+        let shed = dropped.load(Ordering::Relaxed) as usize;
+        // Drain without closing, then verify the budget recovered: one
+        // overflow must not wedge the queue into shedding everything that
+        // follows (pins the pop-path accounting).
+        let mut received = 0;
+        while received + shed < pushed {
+            let row: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            assert_eq!(row["type"], "tool_start");
+            received += 1;
+        }
+        assert_eq!(
+            received + shed,
+            pushed,
+            "shed accounting must conserve events"
+        );
+        delivery.push(json!({"type": "tool_end", "tool_call_id": "after"}));
+        let row = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("post-overflow critical events must flow again")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&row).unwrap()["type"],
+            "tool_end"
+        );
+        drop(delivery);
     }
 
     #[tokio::test]

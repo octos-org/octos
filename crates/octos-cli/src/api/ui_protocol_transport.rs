@@ -4414,7 +4414,7 @@ async fn handle_session_compact(
             runtime_unavailable_error(format!("failed to resolve session runtime: {error}"))
         })?;
 
-    let llm_provider = session_runtime.profile.llm.clone();
+    let llm_provider = session_llm_provider_for(&session_id, &session_runtime);
     // #1666: the per-project ledger lives under `sessions_root`, not
     // `profile.data_dir` — the forced path must touch the SAME ledger the
     // pre-turn path uses.
@@ -17375,6 +17375,17 @@ fn peer_lane_provider_for(
     resolve_peer_lane_provider(&peers_root, slug, &session_runtime.profile.config)
 }
 
+/// Keep turns, automatic compaction and manual compaction on the same model,
+/// endpoint, credentials and context window. Request contexts inherit their
+/// owning peer's lane; missing or unbuildable lanes use the profile primary.
+fn session_llm_provider_for(
+    session_id: &SessionKey,
+    session_runtime: &crate::runtime::SessionRuntime,
+) -> Arc<dyn octos_llm::LlmProvider> {
+    peer_lane_provider_for(session_id, session_runtime)
+        .unwrap_or_else(|| session_runtime.profile.llm.clone())
+}
+
 /// Outcome of a peer awaiting-input WAKE attempt — a test-visible summary of
 /// whether (and why) the master was notified. `Woke`/`AlreadyQueued` mean a peer
 /// genuinely parked; the rest are the fail-closed no-wake reasons.
@@ -23770,10 +23781,8 @@ async fn open_session_result(
                     params.client_commands.as_deref().unwrap_or_default(),
                 );
                 accepted_client_commands = params.client_commands.is_some().then_some(accepted);
-                open_context_provider = Some(
-                    peer_lane_provider_for(&params.session_id, &runtime)
-                        .unwrap_or_else(|| runtime.profile.llm.clone()),
-                );
+                open_context_provider =
+                    Some(session_llm_provider_for(&params.session_id, &runtime));
                 effective_workspace_root = Some(runtime.workspace_root.clone());
                 effective_runtime_hint = effective_workspace_hint
                     .as_ref()
@@ -39553,9 +39562,7 @@ async fn run_standalone_turn(
     // (`peers/<slug>/model`) runs its turns on that `sub_provider` instead of
     // the profile's primary; every other session (and any missing/unmatched/
     // unbuildable lane) falls back to the profile's primary provider.
-    let llm_provider: Arc<dyn octos_llm::LlmProvider> =
-        peer_lane_provider_for(&session_id, &session_runtime)
-            .unwrap_or_else(|| session_runtime.profile.llm.clone());
+    let llm_provider = session_llm_provider_for(&session_id, &session_runtime);
     let memory_store: Arc<octos_memory::EpisodeStore> = session_runtime.memory.episodes.clone();
     let mut agent_config = session_runtime.agent.agent_config();
     // A human-driven turn does not become unattended merely because it

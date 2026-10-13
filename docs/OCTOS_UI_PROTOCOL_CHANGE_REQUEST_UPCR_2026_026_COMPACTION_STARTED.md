@@ -87,3 +87,23 @@ is measured in seconds, not microseconds.
 - Gating/classification: notification feature filter + cursorless list +
   ledger session-id mapping
 - Test: `compaction_started_precedes_completed_in_lifecycle_batch`
+
+## Manual compaction model alignment (2026-10-11)
+
+`session/compact` now resolves its provider through the same session model
+selection used by turns and automatic compaction. A peer uses its configured
+model lane; a request context uses its owning peer's lane. Ordinary sessions
+and missing, unknown or unbuildable peer lanes use the profile primary.
+This keeps the model, endpoint, credentials and context-window budget aligned.
+Previously, manual compaction always selected the primary provider, even when
+the peer's turns and automatic compaction used a different lane.
+
+There are no wire, capability, authorization or client changes. Heuristic
+compaction still makes no model call; manual compaction during an active turn
+still returns `compaction_deferred_active_turn` without changing the snapshot.
+
+Regression coverage in `crates/octos-cli/src/api/ui_protocol_tests.rs` exercises
+the RPC handler against a local HTTP fixture with distinct primary and peer
+models, endpoints and credentials. It covers peer and request-context routing,
+ordinary-session routing, unavailable-lane fallback, persisted summaries and
+heuristic mode. The existing active-turn refusal regression remains in force.

@@ -28,9 +28,9 @@ jobs:
   dashboard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
@@ -81,9 +81,9 @@ jobs:
   swarm-app:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
@@ -117,15 +117,15 @@ jobs:
   typos:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: crate-ci/typos@v1.33.1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: crate-ci/typos@b1ae8d918b6e85bd611117d3d9a3be4f903ee5e4 # v1.33.1
 
   ux-gate-report:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
@@ -144,7 +144,7 @@ jobs:
       - name: Write local UX gate summary
         run: npm --prefix e2e run ux:gate:local -- --out-dir e2e/test-results-ux/ci-local
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: ux-gate-local-summary
@@ -155,7 +155,7 @@ jobs:
   windows-deploy-script:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Windows deploy dry run
         shell: pwsh
@@ -237,9 +237,9 @@ jobs:
   web-app-base-url-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
 
@@ -250,7 +250,7 @@ jobs:
   bundle-release-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Test bundle checksum sidecar
         run: scripts/test-bundle-release.sh
@@ -276,7 +276,7 @@ jobs:
       research_only: ${{ steps.scope.outputs.research_only }}
       windows_neutral: ${{ steps.scope.outputs.windows_neutral }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -329,7 +329,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -363,12 +363,12 @@ jobs:
           python3 scripts/lint-upcr-registry.py --self-test
           python3 scripts/lint-upcr-registry.py
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -516,16 +516,16 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       RUST_TEST_THREADS: "1"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: octos-agent-tests-${{ matrix.test-mode }}
 
@@ -587,16 +587,16 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: octos-cli-tests-${{ matrix.part }}
 
@@ -635,6 +635,16 @@ jobs:
       - name: API feature tests
         if: matrix.part == 'unit'
         run: ./scripts/ci-api-filter-test.sh api::auth_handlers
+
+      # The progress-delivery shed contract only runs in the unit lane today
+      # because `api` sits in the default feature set. Pin it explicitly
+      # #2029-style: the zero-match guard fails if these tests are renamed
+      # away, and the step keeps covering them if `api` ever leaves the
+      # default set. The second filter is the same contract through the turn
+      # reporter's production path.
+      - name: Progress delivery backpressure shed (octos-cli)
+        if: matrix.part == 'unit'
+        run: ./scripts/ci-api-filter-test.sh progress_delivery should_shed_reported_critical_events_over_the_wire_budget
 
       # The §6 catalog guard lives in the feature-gated `api` module, so the
       # unfeatured lib/integration runs above never compile it. Run it
@@ -734,7 +744,7 @@ jobs:
 
       - name: Retain OUP runtime evidence
         if: always() && matrix.part == 'oup'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: oup-runtime-evidence
           path: target/oup-functional/
@@ -745,7 +755,7 @@ jobs:
       # matrix legs may not upload under one name in the same run.
       - name: Retain OUP minimal evidence
         if: always() && matrix.part == 'oup-minimal'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: oup-minimal-evidence
           path: target/oup-functional/
@@ -772,14 +782,14 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: matrix-feature
 
@@ -815,14 +825,14 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "2"  # Limit parallelism to avoid OOM on 16GB ARM runners
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: arm64
 
@@ -899,14 +909,14 @@ jobs:
     env:
       CARGO_BUILD_JOBS: "2"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: riscv64
 
@@ -1004,14 +1014,14 @@ jobs:
     # its own Windows job would cut the wall-clock; this only stops the kill.
     timeout-minutes: 150
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: windows
 
@@ -1149,13 +1159,13 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: darwin
 
@@ -1178,11 +1188,11 @@ jobs:
     needs: [check, test-octos-agent, test-octos-cli]
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Build release
         shell: bash
@@ -1207,7 +1217,7 @@ jobs:
         # (fails loudly on any missing binary; includes model_catalog.json).
         run: ./scripts/bundle-release.sh octos-bundle-aarch64-apple-darwin.tar.gz
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: octos-bundle-aarch64-apple-darwin
           path: octos-bundle-aarch64-apple-darwin.tar.gz
@@ -1218,11 +1228,11 @@ jobs:
     needs: [check, test-octos-agent, test-octos-cli]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Build release
         shell: bash
@@ -1247,7 +1257,7 @@ jobs:
         # (fails loudly on any missing binary; includes model_catalog.json).
         run: ./scripts/bundle-release.sh octos-bundle-x86_64-unknown-linux-gnu.tar.gz
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: octos-bundle-x86_64-unknown-linux-gnu
           path: octos-bundle-x86_64-unknown-linux-gnu.tar.gz
@@ -1258,11 +1268,11 @@ jobs:
     needs: check-arm
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: arm64-release
 
@@ -1289,7 +1299,7 @@ jobs:
         # (fails loudly on any missing binary; includes model_catalog.json).
         run: ./scripts/bundle-release.sh octos-bundle-aarch64-unknown-linux-gnu.tar.gz
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: octos-bundle-aarch64-unknown-linux-gnu
           path: octos-bundle-aarch64-unknown-linux-gnu.tar.gz
@@ -1300,11 +1310,11 @@ jobs:
     needs: check-windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: windows-release
 
@@ -1329,7 +1339,7 @@ jobs:
         shell: bash
         run: ./scripts/bundle-release.sh octos-bundle-x86_64-pc-windows-msvc.zip
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: octos-bundle-x86_64-pc-windows-msvc
           path: octos-bundle-x86_64-pc-windows-msvc.zip
@@ -1351,7 +1361,7 @@ jobs:
       # the PR base sha (pull_request). The default depth-1 checkout has
       # NEITHER, the old `|| echo ""` masked the resulting fatal error, and
       # FILES came out empty — so this job silently never ran its tests.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -1383,15 +1393,15 @@ jobs:
     # that changed tools without saying so in the title skipped e2e entirely.
     if: needs.e2e-changes.outputs.run == 'true'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
 
@@ -1545,15 +1555,15 @@ jobs:
       # fetch-depth: 0 is load-bearing: with the old depth-2 checkout the PR
       # base sha was absent, the masked git-diff failure produced FILES="",
       # and the security suite silently never ran on PRs.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Check for security-related changes
         id: changes

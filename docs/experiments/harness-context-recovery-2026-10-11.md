@@ -21,6 +21,8 @@ Token counts remain estimates, not the provider's tokenizer or a calibration aga
 
 The critical-event queue is deliberately non-dropping and has no hard byte cap. A persistently stalled live consumer can accumulate critical metadata; text is bounded. This patch does not redesign all background/WS transport queues or guarantee every event survives a disconnected client. Ordinary awaited channel delivery and durable ledger replay remain separate mechanisms.
 
+Update (2026-10-12): the critical-event queue now sheds queued critical events beyond a 4 MiB wire-size budget under the same counted-loss contract as text; the non-dropping limit above no longer describes the shipped queue.
+
 The combined A/B compares the patch bundle, including default-on LLM summaries, not the isolated contribution of each fix. Keep model/provider, task snapshot, skills and bridge service identical within each old/new pair; record wall time, provider usage, accepted artifacts, repeated actions, fallback summaries and recovery failures.
 
 Both experiment executables use the debug profile with `--no-default-features --features api`. The installed production executable includes additional default features; these experimental binaries are not a feature-equivalent replacement for that global installation.

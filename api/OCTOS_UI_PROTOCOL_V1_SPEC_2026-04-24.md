@@ -436,7 +436,14 @@ Session, turn, and approval core:
 - `session/btw` (quick aside question answered while the current turn runs; #1609)
 - `session/append_message` (record-only history write: appends one row without starting
   a turn, accepted `UPCR-2026-042`)
-- `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command)
+- `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command).
+  Manual and automatic compaction use the same session model selection: a
+  peer's configured model lane (also for its request-context sessions), otherwise
+  the profile primary provider. This selects the model, endpoint, credentials,
+  and context-window budget together; compaction has no separate provider
+  configuration. Missing or unbuildable peer lanes retain the turn path's
+  primary-provider fallback. Heuristic mode makes no model call, and manual
+  compaction remains deferred while a turn is active.
 - `session/compact/mode/set` (per-session LLM-vs-heuristic compaction mode; the `/context` menu)
 - `turn/start`
 - `turn/interrupt`
