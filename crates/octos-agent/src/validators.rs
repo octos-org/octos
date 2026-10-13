@@ -1557,7 +1557,7 @@ impl ValidatorRunner {
         let interval = Duration::from_millis(poll_interval_ms);
 
         let mut attempt: u32 = 0;
-        let mut last_summary = "no response yet".to_string();
+        let mut summary = ProbeFailureSummary::new();
         loop {
             // Top-of-loop deadline guard: surface a Fail with the last
             // response summary as soon as the wall-clock deadline is hit,
@@ -1571,7 +1571,8 @@ impl ValidatorRunner {
                     validator,
                     ValidatorStatus::Fail,
                     format!(
-                        "http_probe_until {url} did not match in {deadline_ms}ms; last response: {last_summary}"
+                        "http_probe_until {url} did not match in {deadline_ms}ms; last response: {}",
+                        summary.summary()
                     ),
                     started_at,
                     started,
@@ -1600,15 +1601,7 @@ impl ValidatorRunner {
                         started,
                     );
                 }
-                Err(HttpProbeFailure::Timeout) => {
-                    last_summary = format!("attempt {attempt}: per-probe timeout");
-                }
-                Err(HttpProbeFailure::Fail(reason)) => {
-                    last_summary = format!("attempt {attempt}: {reason}");
-                }
-                Err(HttpProbeFailure::Error(reason)) => {
-                    last_summary = format!("attempt {attempt}: transport error: {reason}");
-                }
+                Err(failure) => summary.fold(attempt, failure),
             }
 
             let now = std::time::Instant::now();
@@ -1618,7 +1611,8 @@ impl ValidatorRunner {
                     validator,
                     ValidatorStatus::Fail,
                     format!(
-                        "http_probe_until {url} did not match in {deadline_ms}ms; last response: {last_summary}"
+                        "http_probe_until {url} did not match in {deadline_ms}ms; last response: {}",
+                        summary.summary()
                     ),
                     started_at,
                     started,
@@ -1844,6 +1838,50 @@ enum HttpProbeFailure {
     Timeout,
     Fail(String),
     Error(String),
+}
+
+/// Folds probe results into the failure summary surfaced by
+/// [`ValidatorRunner::run_http_probe_until`]: the most recent server
+/// reply, or — until any reply arrives — the latest probe timeout.
+///
+/// A timed-out probe never saw a reply, so it must not clobber the last
+/// real response: the per-probe budget is capped by the remaining
+/// deadline, making the FINAL probe the one most likely to time out on
+/// a loaded runner — exactly when the operator most needs the last
+/// reply for one-round debugging.
+struct ProbeFailureSummary {
+    latest: String,
+    saw_response: bool,
+}
+
+impl ProbeFailureSummary {
+    fn new() -> Self {
+        Self {
+            latest: "no response yet".to_string(),
+            saw_response: false,
+        }
+    }
+
+    fn fold(&mut self, attempt: u32, failure: HttpProbeFailure) {
+        match failure {
+            HttpProbeFailure::Timeout if self.saw_response => {}
+            HttpProbeFailure::Timeout => {
+                self.latest = format!("attempt {attempt}: per-probe timeout");
+            }
+            HttpProbeFailure::Fail(reason) => {
+                self.saw_response = true;
+                self.latest = format!("attempt {attempt}: {reason}");
+            }
+            HttpProbeFailure::Error(reason) => {
+                self.saw_response = true;
+                self.latest = format!("attempt {attempt}: transport error: {reason}");
+            }
+        }
+    }
+
+    fn summary(&self) -> &str {
+        &self.latest
+    }
 }
 
 /// Substitute `${args.<key>}` references in `template` against `input_args`.
