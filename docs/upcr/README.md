@@ -89,7 +89,9 @@ records.
   repository's history.
 
 In flight: **042** is currently claimed by two open PRs — #2730 (record-only
-session history append) and #2761 (read-only workspace changes snapshots).
-Whichever lands first keeps the number and adds its row; the other renumbers
-per the rules above — the `check` job's lint flags the collision once the
-loser's branch updates onto main.
+session history append) and #2761 (read-only workspace changes snapshots) —
+**047** by #2801 (budgeted `monitor/expired` ledger admission), and **048**
+by #2810 (cooperative turn-drain delivery). Whichever lands first keeps its
+number and adds its row; the other renumbers per the rules above — the
+`check` job's lint flags the collision once the loser's branch updates onto
+main.

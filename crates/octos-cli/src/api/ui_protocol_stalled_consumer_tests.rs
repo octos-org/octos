@@ -1,6 +1,7 @@
+//! #2807 / UPCR-2026-048 — turn termination must not park on a stalled
+//! consumer: the budgeted terminal shed, the drain loop's completion-signal
+//! arm, and the cooperative stdio lifecycle lane.
 use super::*;
-
-// ---- #2807 turn termination must not park on a stalled consumer ----
 
 /// The agent task's terminal event sheds and counts into the drop counter
 /// once the stalled consumer holds the progress channel past the send
