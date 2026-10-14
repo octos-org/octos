@@ -125,7 +125,7 @@ is_open_pr() {
   [[ -s "$OPEN_PR_F" ]] && grep -qxF "$1" "$OPEN_PR_F"
 }
 
-ahead_behind() {  # echoes "behind ahead"
+ahead_behind() {  # echoes "behind ahead" (left=base-only, right=branch-only)
   git rev-list --left-right --count "$BASE...$1" 2>/dev/null | awk '{print $1, $2}'
 }
 
@@ -172,8 +172,12 @@ while IFS= read -r ref; do
   ab=$(ahead_behind "$ref" || echo "0 0")
   behind="${ab%% *}"; ahead="${ab##* }"
 
+  # A branch is merged into the base when it has no commits the base lacks,
+  # i.e. ahead == 0 (its tip is an ancestor of the base).
+  # Do NOT use behind == 0 here: that means the branch *contains* the base and
+  # is ahead of it — the opposite of merged.
   merged=0
-  [[ "$behind" == "0" ]] && merged=1
+  [[ "$ahead" == "0" ]] && merged=1
 
   if [[ "$merged" == 1 ]]; then
     printf '%s\n' "$ref" >> "$MERGED_F"

@@ -100,8 +100,11 @@ else
     is_protected "$ref" && continue
     short="${ref#"$REMOTE"/}"
     is_open_pr "$short" && continue
-    behind=$(git rev-list --left-right --count "$BASE...$ref" 2>/dev/null | awk '{print $1}')
-    if [[ "$behind" == "0" ]]; then
+    # ahead (right) == 0  => the branch tip is an ancestor of the base: merged.
+    # Never test on `behind`: behind == 0 means the branch *contains* the base
+    # and is ahead of it, which is the opposite of merged.
+    ahead=$(git rev-list --left-right --count "$BASE...$ref" 2>/dev/null | awk '{print $2}')
+    if [[ "$ahead" == "0" ]]; then
       printf '%s\n' "$ref" >> "$CANDIDATES"; continue
     fi
     plus=$(git cherry "$BASE" "$ref" 2>/dev/null | grep -c '^+' || true)
@@ -126,8 +129,8 @@ while IFS= read -r ref; do
     printf 'SKIP (open PR): %s\n' "$ref" >> "$LOGFILE"; continue
   fi
   sha=$(git rev-parse "$ref")
-  behind=$(git rev-list --left-right --count "$BASE...$ref" 2>/dev/null | awk '{print $1}')
-  if [[ "$behind" != "0" ]]; then
+  ahead=$(git rev-list --left-right --count "$BASE...$ref" 2>/dev/null | awk '{print $2}')
+  if [[ "$ahead" != "0" ]]; then
     plus=$(git cherry "$BASE" "$ref" 2>/dev/null | grep -c '^+' || true)
     if [[ "$plus" != "0" ]]; then
       printf 'SKIP (unmerged work, %s unique patches): %s\n' "$plus" "$ref" >> "$LOGFILE"

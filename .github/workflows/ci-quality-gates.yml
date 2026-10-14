@@ -24,3 +24,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check the quality baseline
         run: scripts/quality-ratchet.sh
+      - name: Branch-cleanup classification regression test
+        run: scripts/tests/branch-cleanup.test.sh
