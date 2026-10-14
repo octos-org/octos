@@ -7,11 +7,7 @@ pub fn truncate_utf8(s: &mut String, max_len: usize, suffix: &str) {
     if s.len() <= max_len {
         return;
     }
-    let mut limit = max_len;
-    while limit > 0 && !s.is_char_boundary(limit) {
-        limit -= 1;
-    }
-    s.truncate(limit);
+    s.truncate(s.floor_char_boundary(max_len));
     s.push_str(suffix);
 }
 
@@ -22,10 +18,7 @@ pub fn truncated_utf8(s: &str, max_len: usize, suffix: &str) -> String {
     if s.len() <= max_len {
         return s.to_string();
     }
-    let mut limit = max_len;
-    while limit > 0 && !s.is_char_boundary(limit) {
-        limit -= 1;
-    }
+    let limit = s.floor_char_boundary(max_len);
     format!("{}{}", &s[..limit], suffix)
 }
 
