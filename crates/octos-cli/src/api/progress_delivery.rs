@@ -21,6 +21,14 @@ const MAX_COALESCED_TEXT_BYTES: usize = 64 * 1024;
 // PROGRESS_CHANNEL_CAPACITY-slot backlog in front of this; this budget bounds
 // what this module queues.)
 const MAX_PENDING_EVENT_BYTES: usize = 4 * 1024 * 1024;
+// flush() parks behind every queued row and the worker's channel send, so a
+// consumer that stalls without disconnecting (TCP zero window, a parked
+// reader, a peer gone quiet) would suspend turn termination indefinitely.
+// The wait must still cover a healthy drain of this module's full budgets;
+// past it everything still queued is shed and counted like any other
+// backpressure loss, because the directly-sent terminal event overtakes the
+// queue either way.
+const FLUSH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 enum Pending {
     // Coalescable text, serialized at drain so merges keep folding into the
@@ -188,7 +196,12 @@ impl ProgressDelivery {
         self.0.wake.notify_one();
     }
 
-    /// Terminal result/error must not overtake queued deltas or tool completion.
+    /// Terminal result/error must not overtake queued deltas or tool
+    /// completion. A consumer stalled past [`FLUSH_DEADLINE`] forfeits that
+    /// ordering instead of suspending turn termination indefinitely: the
+    /// rows still queued are shed and counted, so the turn-boundary
+    /// `replay_lossy` discloses the gap exactly like the push-path shed
+    /// budgets.
     pub(super) async fn flush(&self) {
         let (done, wait) = oneshot::channel();
         {
@@ -199,7 +212,57 @@ impl ProgressDelivery {
             queue.entries.push_back(Pending::Barrier(done));
         }
         self.0.wake.notify_one();
-        let _ = wait.await;
+        if tokio::time::timeout(FLUSH_DEADLINE, wait).await.is_ok() {
+            return;
+        }
+        // Shed whatever the stalled consumer never picked up, restoring the
+        // byte budgets the way the worker's pop path does. A row already
+        // popped and parked inside the worker's channel send is out of reach
+        // here; conservation (delivered + counted == accepted) still holds.
+        let purged = {
+            let mut queue = self.0.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let Queue {
+                entries,
+                text_bytes,
+                event_bytes,
+                ..
+            } = &mut *queue;
+            let mut purged = 0;
+            for entry in entries.drain(..) {
+                match entry {
+                    Pending::Text(event) => {
+                        *text_bytes = text_bytes.saturating_sub(text_size(&event));
+                        purged += 1;
+                    }
+                    Pending::Critical { json } => {
+                        *event_bytes = event_bytes.saturating_sub(json.len());
+                        purged += 1;
+                    }
+                    Pending::Barrier(_) => {}
+                }
+            }
+            purged
+        };
+        if purged > 0 {
+            let previous = self.0.dropped.fetch_add(purged, Ordering::Relaxed);
+            if previous == 0 || previous.is_power_of_two() {
+                tracing::warn!(
+                    dropped = previous + purged,
+                    deadline_secs = FLUSH_DEADLINE.as_secs(),
+                    "progress flush deadline expired; queued rows shed and counted"
+                );
+            }
+        } else {
+            tracing::warn!(
+                deadline_secs = FLUSH_DEADLINE.as_secs(),
+                "progress flush deadline expired; queue already drained"
+            );
+        }
+        metrics::counter!(
+            "ws.send.drop.backpressure",
+            "method" => "progress_flush_deadline"
+        )
+        .increment(purged);
     }
 }
 
@@ -351,5 +414,80 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), delivery.flush())
             .await
             .unwrap();
+    }
+
+    // Paused time only advances when every task is idle, so the stalled
+    // worker (parked on a channel send no one will service) lets the clock
+    // jump straight to the next timer — the test is instant and the large
+    // outer guard fires before any real wait could.
+    #[tokio::test(start_paused = true)]
+    async fn should_return_from_flush_when_consumer_stalls_past_deadline() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let delivery = ProgressDelivery::new(tx, dropped.clone());
+        delivery.push(json!({"type":"tool_start","tool_call_id":"a"}));
+        delivery.push(json!({"type":"tool_end","tool_call_id":"a"}));
+        let flush = {
+            let delivery = delivery.clone();
+            tokio::spawn(async move { delivery.flush().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(600), flush)
+            .await
+            .expect("flush() must not suspend turn termination on a stalled consumer")
+            .expect("flush task must not panic");
+        // The consumer comes back after the stall: every accepted row is
+        // either delivered or counted, never both, never neither.
+        drop(delivery);
+        let mut received = 0;
+        while let Some(row) = rx.recv().await {
+            assert!(row.contains("tool_"));
+            received += 1;
+        }
+        assert_eq!(
+            received as u64 + dropped.load(Ordering::Relaxed),
+            2,
+            "delivery and drop accounting must conserve accepted rows"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_count_rows_stuck_behind_expired_flush_deadline() {
+        // Capacity 2 with four accepted rows: the worker fills both slots
+        // (a, b) and parks on c, leaving d plus the barrier queued when the
+        // deadline fires. Exactly d is purged; a/b deliver, c completes once
+        // the consumer resumes.
+        let (tx, mut rx) = mpsc::channel(2);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let delivery = ProgressDelivery::new(tx, dropped.clone());
+        for id in ["a", "b", "c", "d"] {
+            delivery.push(json!({"type":"tool_start","tool_call_id":id}));
+        }
+        let flush = {
+            let delivery = delivery.clone();
+            tokio::spawn(async move { delivery.flush().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(600), flush)
+            .await
+            .expect("flush() must not suspend turn termination on a stalled consumer")
+            .expect("flush task must not panic");
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "exactly the row still queued behind the parked send must be shed and counted"
+        );
+        drop(delivery);
+        let mut received = Vec::new();
+        while let Some(row) = rx.recv().await {
+            let id = serde_json::from_str::<Value>(&row).unwrap()["tool_call_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            received.push(id);
+            if received.len() == 3 {
+                break;
+            }
+        }
+        assert_eq!(received, ["a", "b", "c"]);
+        assert!(rx.recv().await.is_none(), "d was shed at the deadline");
     }
 }
