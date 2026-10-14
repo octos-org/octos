@@ -45835,6 +45835,32 @@ fn preview_oversized_frame(text: String) -> String {
     if text.len() <= MAX_TEXT_FRAME_BYTES {
         return text;
     }
+    // #2446: the truncation below is hundreds of ms of pure CPU per multi-MB
+    // frame (parse + measure + full-tree walk + up to two full
+    // serializations; the structural fallback re-serializes per round), and
+    // every outbound frame flows through here on the connection task's
+    // executor — inlined, every task sharing that worker starves for the
+    // whole stretch. Hand the stretch to the runtime: `block_in_place`
+    // parks this worker's scheduler so other tasks migrate while the
+    // truncation runs. `block_in_place` is only legal on a multi-threaded
+    // runtime worker — not on current-thread runtimes (panics), not inside
+    // a LocalSet (panics even under a multi-threaded handle; no LocalSet
+    // exists in this workspace today) — so anything else keeps the inline
+    // path. The output is byte-identical either way, only where it runs
+    // changes; if every worker is inside this preview at once, tasks wait
+    // just like the old inline behavior (never worse).
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| preview_uncapped_frame(text))
+        }
+        _ => preview_uncapped_frame(text),
+    }
+}
+
+/// The over-cap truncation itself (input guaranteed above
+/// [`MAX_TEXT_FRAME_BYTES`]). Synchronous and CPU-bound by design — see
+/// [`preview_oversized_frame`] for the offload contract.
+fn preview_uncapped_frame(text: String) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
         // Not parseable as JSON -> cannot rewrite; return unchanged. The
         // caller (`frame_text_within_cap`) drops it as still-over-cap.
@@ -48276,6 +48302,10 @@ mod tests;
 #[cfg(test)]
 #[path = "ui_protocol_host_app_peer_tests.rs"]
 mod host_app_peer_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_oversized_frame_tests.rs"]
+mod oversized_frame_tests;
 
 #[cfg(test)]
 #[path = "ui_protocol_peer_host_tools_tests.rs"]
