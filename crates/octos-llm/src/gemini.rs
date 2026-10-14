@@ -1288,6 +1288,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         }
     }
 
@@ -1692,6 +1693,7 @@ mod tests {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
             },
             Message {
                 role: MessageRole::Tool,
@@ -1703,6 +1705,7 @@ mod tests {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
             },
         ];
         let (contents, _) = build_gemini_contents(&messages);
@@ -1739,6 +1742,7 @@ mod tests {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
             },
         ];
 
@@ -1771,6 +1775,7 @@ mod tests {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
             },
         ];
 
@@ -1797,6 +1802,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         };
         let messages = vec![
             msg(MessageRole::User, "old turn"),
@@ -1811,6 +1817,7 @@ mod tests {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
             },
             msg(MessageRole::User, "current turn"),
             tool_call("tc2", "current_call"),
@@ -1847,6 +1854,7 @@ mod tests {
                 client_message_id: None,
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
+                source: None,
             },
         ];
 
@@ -1884,6 +1892,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         };
         let mut assistant = mk(MessageRole::Assistant, "");
         assistant.tool_calls = Some(vec![octos_core::ToolCall {

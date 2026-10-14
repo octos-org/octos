@@ -899,6 +899,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         };
         let tokens = estimate_message_tokens(&msg);
         assert_eq!(tokens, estimate_tokens("Hello, how are you today?") + 4);

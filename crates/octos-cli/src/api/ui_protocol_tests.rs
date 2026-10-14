@@ -371,6 +371,7 @@ async fn compaction_started_precedes_completed_in_lifecycle_batch() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         });
     }
 
@@ -444,6 +445,7 @@ fn open_snapshot_padding_history(messages: usize) -> Vec<octos_core::Message> {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         })
         .collect()
 }
@@ -3734,6 +3736,12 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         }),
         methods::SESSION_HYDRATE => json!({ "session_id": session_id }),
         methods::SESSION_ROLLBACK => json!({ "session_id": session_id, "num_turns": 1 }),
+        methods::SESSION_APPEND_MESSAGE => json!({
+            "session_id": session_id,
+            "role": "system",
+            "content": "dispatch probe record",
+            "source": "probe",
+        }),
         methods::THREAD_GRAPH_GET => json!({ "session_id": session_id }),
         methods::TURN_STATE_GET => json!({
             "session_id": session_id,
@@ -3907,6 +3915,7 @@ fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     }
 }
 
@@ -21077,6 +21086,7 @@ fn build_btw_messages_shapes_prompt_without_tools() {
         client_message_id: None,
         thread_id: None,
         timestamp: now,
+        source: None,
     };
     let transcript = vec![
         mk(MessageRole::User, "please refactor the parser"),
@@ -22286,6 +22296,7 @@ fn final_assistant_content_already_persisted_ignores_tool_rows() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     };
     let messages = vec![tool_row];
     let final_content = "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要更详细的湾区预报吗？";
@@ -22369,6 +22380,7 @@ fn final_assistant_carrier_trimmed_equality_rejects_non_assistant_roles() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     };
     assert!(!is_final_assistant_carrier_under_trimmed_equality(
         &user_row,
@@ -22445,6 +22457,7 @@ fn pre_stamp_turn_thread_id_stamps_user_assistant_and_tool_when_unbound() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         },
         turn_thread_id,
     );
@@ -22492,6 +22505,7 @@ fn pre_stamp_turn_thread_id_leaves_system_rows_alone() {
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     };
 
     let stamped = pre_stamp_turn_thread_id(system, "turn-abc");
@@ -26027,6 +26041,7 @@ fn prg_seed_user_assistant(session: &mut octos_bus::Session) {
         client_message_id: Some("cmid-user-1".into()),
         thread_id: Some("cmid-user-1".into()),
         timestamp: now,
+        source: None,
     });
     session.messages.push(Message {
         role: MessageRole::Assistant,
@@ -26038,6 +26053,7 @@ fn prg_seed_user_assistant(session: &mut octos_bus::Session) {
         client_message_id: None,
         thread_id: Some("cmid-user-1".into()),
         timestamp: now + chrono::Duration::milliseconds(10),
+        source: None,
     });
 }
 
@@ -26067,6 +26083,7 @@ async fn prg_state_with_persisted_turns(
                 client_message_id: Some(tid.clone()),
                 thread_id: Some(tid.clone()),
                 timestamp: now,
+                source: None,
             };
             guard
                 .add_message(session_id, user)
@@ -26082,6 +26099,7 @@ async fn prg_state_with_persisted_turns(
                 client_message_id: None,
                 thread_id: Some(tid.clone()),
                 timestamp: now + chrono::Duration::milliseconds(1),
+                source: None,
             };
             guard
                 .add_message(session_id, asst)
@@ -26744,6 +26762,7 @@ async fn session_fork_concurrent_same_child_one_wins() {
             client_message_id: None,
             thread_id: None,
             timestamp: now,
+            source: None,
         };
         guard.add_message(&parent_b, msg).await.expect("seed b");
     }
@@ -28082,6 +28101,7 @@ async fn thread_graph_get_surfaces_orphans() {
             client_message_id: Some("cmid-1".into()),
             thread_id: Some("cmid-1".into()),
             timestamp: now,
+            source: None,
         });
         session.messages.push(Message {
             role: MessageRole::Assistant,
@@ -28093,6 +28113,7 @@ async fn thread_graph_get_surfaces_orphans() {
             client_message_id: None,
             thread_id: None, // <- orphan
             timestamp: now + chrono::Duration::milliseconds(10),
+            source: None,
         });
     });
     let active_turns = active_turns_registry();
@@ -28397,6 +28418,7 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             client_message_id: Some("cmid-user-1".into()),
             thread_id: Some("cmid-user-1".into()),
             timestamp: now,
+            source: None,
         });
         // Historical companion row; current producer paths carry its
         // media on the background-child payload instead.
@@ -28410,6 +28432,7 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             client_message_id: None,
             thread_id: Some("cmid-user-1".into()),
             timestamp: now + chrono::Duration::milliseconds(5),
+            source: None,
         });
         // Background completion row.
         session.messages.push(Message {
@@ -28425,6 +28448,7 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             client_message_id: None,
             thread_id: Some("cmid-user-1".into()),
             timestamp: spawn_ack_ts,
+            source: None,
         });
     });
     let approvals = PendingApprovalStore::default();
@@ -28840,6 +28864,7 @@ async fn message_commit_observer_runs_after_each_commit_in_order() {
             client_message_id: Some(format!("cmid-{content}")),
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         };
         manager
             .add_message_with_seq(&session_id, msg)
@@ -28900,6 +28925,7 @@ async fn message_commit_observer_is_not_retroactive_after_installation() {
         client_message_id: Some("cmid-1".into()),
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     };
     manager
         .add_message_with_seq(&session_id, msg)
@@ -28927,6 +28953,7 @@ async fn message_commit_observer_is_not_retroactive_after_installation() {
         client_message_id: Some("cmid-2".into()),
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     };
     manager
         .add_message_with_seq(&session_id, msg2)
@@ -28960,6 +28987,7 @@ fn is_metadata_only_assistant_row_truth_table() {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     };
     assert!(is_metadata_only_assistant_row(&empty_assistant));
 
@@ -28987,6 +29015,7 @@ fn is_metadata_only_assistant_row_truth_table() {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     };
     assert!(!is_metadata_only_assistant_row(&tool_message));
 
@@ -29001,6 +29030,7 @@ fn is_metadata_only_assistant_row_truth_table() {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     };
     assert!(!is_metadata_only_assistant_row(&user_message));
 }
@@ -29050,6 +29080,7 @@ async fn metadata_only_commits_emit_one_v2_assistant_persisted_row() {
         client_message_id: None,
         thread_id: Some(thread.clone()),
         timestamp: Utc::now(),
+        source: None,
     };
     let mk_tool = |out: &str, tc_id: &str| Message {
         role: MessageRole::Tool,
@@ -29061,6 +29092,7 @@ async fn metadata_only_commits_emit_one_v2_assistant_persisted_row() {
         client_message_id: None,
         thread_id: Some(thread.clone()),
         timestamp: Utc::now(),
+        source: None,
     };
 
     // Iteration 1: assistant returns only tool_calls (empty content).
@@ -30664,6 +30696,7 @@ async fn synth_ack_not_persisted_to_jsonl_when_spawn_only() {
         client_message_id: None,
         thread_id: Some("thread-spawn-only-synth-no-persist".into()),
         timestamp: Utc::now(),
+        source: None,
     };
     manager
         .add_message_with_seq(&session_id, preamble)
@@ -30689,6 +30722,7 @@ async fn synth_ack_not_persisted_to_jsonl_when_spawn_only() {
         client_message_id: None,
         thread_id: Some("thread-spawn-only-synth-no-persist".into()),
         timestamp: Utc::now(),
+        source: None,
     };
     // Intentionally no `manager.add_message_with_seq(...)` call.
     // This is the post-fix shape — the ack never reaches JSONL.
@@ -30899,6 +30933,7 @@ async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
             client_message_id: None,
             thread_id: Some(format!("thread-{tool_name}")),
             timestamp: Utc::now(),
+            source: None,
         };
         manager
             .add_message_with_seq(&session_id, preamble)
@@ -30928,6 +30963,7 @@ async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
             client_message_id: None,
             thread_id: Some(format!("thread-{tool_name}")),
             timestamp: Utc::now(),
+            source: None,
         };
         // Production inputs at the persist site: the agent loop
         // sets `synthesized_from_spawn_only=true` whenever the
@@ -42442,6 +42478,7 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
                         client_message_id: None,
                         thread_id: None,
                         timestamp: Utc::now(),
+                        source: None,
                     },
                 )
                 .await
@@ -50173,6 +50210,537 @@ async fn should_replay_an_external_prompt_to_its_owner_after_the_side_table_forg
 }
 #[path = "session_history_tests.rs"]
 mod session_history_tests;
+
+// ===== UPCR-2026-042 `session/append_message` handler =====
+
+/// Disk-backed state with one persisted user row so assistant records have a
+/// thread to derive from. Mirrors `prg_state_with_persisted_turns`'s shape.
+async fn append_state_with_user_row(session_id: &SessionKey) -> (Arc<AppState>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager = octos_bus::SessionManager::open(tmp.path()).expect("session manager open");
+    let manager = Arc::new(tokio::sync::Mutex::new(manager));
+    {
+        let mut guard = manager.lock().await;
+        let user = Message {
+            role: MessageRole::User,
+            content: "what is the capital?".into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            client_message_id: Some("cmid-user-1".into()),
+            thread_id: Some("cmid-user-1".into()),
+            timestamp: Utc::now(),
+            source: None,
+        };
+        guard
+            .add_message(session_id, user)
+            .await
+            .expect("persist user");
+    }
+    let state = Arc::new(AppState {
+        sessions: Some(manager),
+        ..AppState::empty_for_tests()
+    });
+    (state, tmp)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_append_message_persists_records_without_a_turn() {
+    let session_id = SessionKey("local:append-1".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+
+    handle_session_append_message(
+        &ws,
+        &state,
+        None,
+        None,
+        "am1".into(),
+        SessionAppendMessageParams {
+            session_id: session_id.clone(),
+            role: "assistant".into(),
+            content: "The capital is Kyoto.".into(),
+            media: vec!["uploads/map.png".into()],
+            source: "external_record:whiteboard".into(),
+            client_message_id: Some("cmid-answer-1".into()),
+            thread_id: None,
+        },
+    )
+    .await;
+
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["id"], "am1");
+    let result = &frame["result"];
+    assert_eq!(result["session_id"], session_id.to_string());
+    assert_eq!(result["seq"], 1);
+    // The assistant record derived its thread from the session's user row.
+    assert_eq!(result["thread_id"], "cmid-user-1");
+
+    // The row is durable with its provenance tag — a fresh manager reads it
+    // back from the JSONL.
+    let sessions = state.sessions.as_ref().unwrap();
+    let guard = sessions.lock().await;
+    let session = guard.load(&session_id).await.expect("session");
+    assert_eq!(session.messages.len(), 2);
+    let assistant = session.messages.last().unwrap();
+    assert_eq!(assistant.content, "The capital is Kyoto.");
+    assert_eq!(
+        assistant.source.as_deref(),
+        Some("external_record:whiteboard")
+    );
+    assert_eq!(assistant.thread_id.as_deref(), Some("cmid-user-1"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_append_message_retry_returns_existing_seq_without_a_second_row() {
+    let session_id = SessionKey("local:append-retry".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+
+    let params = |content: &str| SessionAppendMessageParams {
+        session_id: session_id.clone(),
+        role: "assistant".into(),
+        content: content.into(),
+        media: vec![],
+        source: "external_record:whiteboard".into(),
+        client_message_id: Some("cmid-answer-1".into()),
+        thread_id: None,
+    };
+
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(&ws, &state, None, None, "am-a".into(), params("first")).await;
+    let first = recv_rpc_json(&mut rx).await;
+    assert_eq!(first["result"]["seq"], 1);
+
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(&ws, &state, None, None, "am-b".into(), params("retried")).await;
+    let retry = recv_rpc_json(&mut rx).await;
+    assert_eq!(retry["result"]["seq"], 1, "retry returns the original seq");
+
+    let sessions = state.sessions.as_ref().unwrap();
+    let guard = sessions.lock().await;
+    let session = guard.load(&session_id).await.expect("session");
+    assert_eq!(session.messages.len(), 2, "retry must not double-append");
+    assert_eq!(session.messages.last().unwrap().content, "first");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_append_message_retry_echoes_the_existing_row_binding() {
+    let session_id = SessionKey("local:append-retry-thread".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+
+    // A system record is legitimately unbound.
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(
+        &ws,
+        &state,
+        None,
+        None,
+        "am-s".into(),
+        SessionAppendMessageParams {
+            session_id: session_id.clone(),
+            role: "system".into(),
+            content: "imported note".into(),
+            media: vec![],
+            source: "external_record:import".into(),
+            client_message_id: Some("review-same-id".into()),
+            thread_id: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["seq"], 1);
+    assert_eq!(
+        frame["result"]["thread_id"],
+        serde_json::Value::Null,
+        "{frame}"
+    );
+
+    // Retrying the same cmid under a role that would root its own thread
+    // still hits the durable row — and must echo ITS binding (absent), not
+    // the retry payload's freshly stamped one.
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(
+        &ws,
+        &state,
+        None,
+        None,
+        "am-r".into(),
+        SessionAppendMessageParams {
+            session_id: session_id.clone(),
+            role: "user".into(),
+            content: "retried as user".into(),
+            media: vec![],
+            source: "external_record:import".into(),
+            client_message_id: Some("review-same-id".into()),
+            thread_id: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["seq"], 1, "retry returns the original seq");
+    assert_eq!(
+        frame["result"]["thread_id"],
+        serde_json::Value::Null,
+        "a found row with no binding stays unbound: {frame}"
+    );
+
+    let sessions = state.sessions.as_ref().unwrap();
+    let guard = sessions.lock().await;
+    let session = guard.load(&session_id).await.expect("session");
+    assert_eq!(session.messages.len(), 2, "retry must not double-append");
+    let system_row = session
+        .messages
+        .iter()
+        .find(|row| row.client_message_id.as_deref() == Some("review-same-id"))
+        .expect("durable system row");
+    assert_eq!(system_row.role, MessageRole::System);
+    assert_eq!(
+        system_row.thread_id, None,
+        "the retry must not mint a thread onto the durable row"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_append_message_user_record_roots_its_own_thread() {
+    let session_id = SessionKey("local:append-user".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+
+    handle_session_append_message(
+        &ws,
+        &state,
+        None,
+        None,
+        "am2".into(),
+        SessionAppendMessageParams {
+            session_id: session_id.clone(),
+            role: "user".into(),
+            content: "and the old one?".into(),
+            media: vec![],
+            source: "external_record:whiteboard".into(),
+            client_message_id: Some("cmid-user-2".into()),
+            thread_id: None,
+        },
+    )
+    .await;
+
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["seq"], 1);
+    assert_eq!(frame["result"]["thread_id"], "cmid-user-2");
+
+    let sessions = state.sessions.as_ref().unwrap();
+    let guard = sessions.lock().await;
+    let session = guard.load(&session_id).await.expect("session");
+    assert_eq!(
+        session.messages.last().unwrap().thread_id.as_deref(),
+        Some("cmid-user-2")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_append_message_rejects_invalid_params_with_typed_kinds() {
+    let session_id = SessionKey("local:append-invalid".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+
+    let base = SessionAppendMessageParams {
+        session_id: session_id.clone(),
+        role: "assistant".into(),
+        content: "ok".into(),
+        media: vec![],
+        source: "external_record:test".into(),
+        client_message_id: None,
+        thread_id: None,
+    };
+
+    let cases: Vec<(&str, SessionAppendMessageParams)> = vec![
+        (
+            "invalid_session_id",
+            SessionAppendMessageParams {
+                session_id: SessionKey("   ".into()),
+                ..base.clone()
+            },
+        ),
+        (
+            "invalid_role",
+            SessionAppendMessageParams {
+                role: "tool".into(),
+                ..base.clone()
+            },
+        ),
+        (
+            "invalid_content",
+            SessionAppendMessageParams {
+                content: "   ".into(),
+                ..base.clone()
+            },
+        ),
+        (
+            "invalid_source",
+            SessionAppendMessageParams {
+                source: "  ".into(),
+                ..base.clone()
+            },
+        ),
+        (
+            "invalid_thread_id",
+            SessionAppendMessageParams {
+                role: "user".into(),
+                thread_id: Some("t1".into()),
+                ..base.clone()
+            },
+        ),
+        (
+            "invalid_media",
+            SessionAppendMessageParams {
+                media: vec!["  ".into()],
+                ..base
+            },
+        ),
+    ];
+    for (kind, params) in cases {
+        let (ws, mut rx) = ws_connection_for_test(8);
+        handle_session_append_message(&ws, &state, None, None, "amx".into(), params).await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(frame["error"]["code"], -32602, "case {kind}: {frame}");
+        assert_eq!(frame["error"]["data"]["kind"], kind, "case {kind}: {frame}");
+    }
+
+    // Assistant record into a session whose only row is... a user row — the
+    // derivation succeeds, so exercise the unbound-thread refusal with a
+    // session that has NO user row.
+    let fresh = SessionKey("local:append-empty".into());
+    let tmp2 = tempfile::tempdir().expect("tempdir");
+    let manager = octos_bus::SessionManager::open(tmp2.path()).expect("open");
+    let state2 = Arc::new(AppState {
+        sessions: Some(Arc::new(tokio::sync::Mutex::new(manager))),
+        ..AppState::empty_for_tests()
+    });
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(
+        &ws,
+        &state2,
+        None,
+        None,
+        "am3".into(),
+        SessionAppendMessageParams {
+            session_id: fresh.clone(),
+            role: "assistant".into(),
+            content: "orphan answer".into(),
+            media: vec![],
+            source: "external_record:test".into(),
+            client_message_id: None,
+            thread_id: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["error"]["data"]["kind"], "unbound_thread", "{frame}");
+    // ...and an explicit thread_id rescues it (caller-supplied binding wins).
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(
+        &ws,
+        &state2,
+        None,
+        None,
+        "am4".into(),
+        SessionAppendMessageParams {
+            session_id: fresh.clone(),
+            role: "assistant".into(),
+            content: "orphan answer".into(),
+            media: vec![],
+            source: "external_record:test".into(),
+            client_message_id: None,
+            thread_id: Some("imported-thread".into()),
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["seq"], 0, "{frame}");
+    assert_eq!(frame["result"]["thread_id"], "imported-thread");
+}
+
+// ===== UPCR-2026-042 `session/append_message` context recording =====
+
+/// An out-of-band record merges into the session's context view wherever it
+/// exists: the live manager directly, otherwise the durable snapshot
+/// (loaded, merged, persisted). The row carries the `external_record` source
+/// kind and its committed seq either way.
+#[test]
+fn external_record_row_merges_into_live_and_snapshot_context_views() {
+    let session_id = SessionKey::new("api", "context-external-record");
+    let history = vec![test_message(MessageRole::User, "what is the capital?")];
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut record = test_message(MessageRole::Assistant, "Kyoto.");
+    record.source = Some("external_record:whiteboard".to_owned());
+
+    // Live branch.
+    let live = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    let registration = register_appui_session_context_manager(&session_id, &live);
+    record_appui_context_manager_external_record(dir.path(), &session_id, &record, 1);
+    let merged = live
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let item = merged
+        .ledger_items()
+        .iter()
+        .find(|item| {
+            matches!(
+                &item.kind,
+                crate::context_manager::TranscriptItemKind::AssistantFinal { content }
+                    if content == "Kyoto."
+            )
+        })
+        .expect("external record merged into the live manager");
+    assert_eq!(
+        item.source_ref
+            .as_ref()
+            .and_then(|source| source.source_seq),
+        Some(1)
+    );
+    assert_eq!(
+        item.source_ref
+            .as_ref()
+            .map(|source| source.source_event_kind.as_str()),
+        Some("external_record")
+    );
+    drop(registration);
+    // Release the test's own strong reference too — the registry holds the
+    // manager as a Weak, so `live` here would still upgrade and route the
+    // second record into the LIVE branch instead of the snapshot one.
+    drop(live);
+
+    // Snapshot branch: no live manager, but the live-branch call persisted a
+    // durable snapshot — a second record must load-merge-persist it.
+    let mut second = test_message(MessageRole::Assistant, "importer note");
+    second.source = Some("external_record:import".to_owned());
+    record_appui_context_manager_external_record(dir.path(), &session_id, &second, 2);
+    let reloaded = load_context_manager_snapshot(dir.path(), &session_id.to_string())
+        .unwrap()
+        .expect("snapshot survived the snapshot-branch merge");
+    assert!(
+        reloaded.ledger_items().iter().any(|item| {
+            matches!(
+                &item.kind,
+                crate::context_manager::TranscriptItemKind::AssistantFinal { content }
+                    if content == "Kyoto."
+            )
+        }),
+        "the first record is still in the reloaded snapshot"
+    );
+    assert!(
+        reloaded.ledger_items().iter().any(|item| {
+            matches!(
+                &item.kind,
+                crate::context_manager::TranscriptItemKind::AssistantFinal { content }
+                    if content == "importer note"
+            )
+        }),
+        "the snapshot-branch record landed in the durable snapshot"
+    );
+}
+
+/// UPCR-2026-042 review: an external record committed while a turn is
+/// running must not enter that turn's later model requests, must survive the
+/// per-iteration canonical copy-back the in-flight bridge performs, and must
+/// surface to the next turn's prompt.
+#[test]
+fn external_record_committed_mid_turn_defers_to_the_next_turn_prompt() {
+    let session_id = SessionKey::new("api", "context-external-midturn");
+    let history = vec![
+        test_message(MessageRole::User, "old request"),
+        test_message(MessageRole::Assistant, "old answer"),
+    ];
+    let manager = Arc::new(StdMutex::new(ContextManager::from_session_history(
+        session_id.to_string(),
+        None,
+        &history,
+    )));
+    // Production registers the session runtime's canonical manager, so the
+    // external-record handler routes into THIS Arc via the live branch.
+    let registration = register_appui_session_context_manager(&session_id, &manager);
+    let dir = tempfile::tempdir().unwrap();
+    let request = |phase: PromptContextPhase, iteration: u32| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".to_string(),
+        model_id: "large-context".to_string(),
+        context_window: 16_000,
+    };
+
+    // Turn 1: the in-flight bridge builds its first prompt.
+    let bridge = AppUiPromptContextBridge::new(
+        session_id.clone(),
+        dir.path().to_path_buf(),
+        manager.clone(),
+        false,
+    );
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history.clone());
+    prompt.push(test_message(MessageRole::User, "current request"));
+    bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("turn start");
+
+    // Mid-turn append, committed into the live canonical manager.
+    let mut side_note = test_message(MessageRole::User, "mid-turn side note");
+    side_note.source = Some("external_record:import".to_owned());
+    record_appui_context_manager_external_record(dir.path(), &session_id, &side_note, 2);
+
+    // A later iteration of the SAME turn must not pick the row up.
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut prompt)
+        .expect("iteration");
+    assert!(
+        !prompt
+            .iter()
+            .any(|message| message.content == "mid-turn side note"),
+        "the in-flight turn must not see an externally appended row"
+    );
+
+    // ...and the copy-back must not drop the row from canonical either.
+    assert!(
+        manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .ledger_items()
+            .iter()
+            .any(|item| matches!(
+                &item.kind,
+                crate::context_manager::TranscriptItemKind::UserInput { content, .. }
+                    if content == "mid-turn side note"
+            )),
+        "the deferred row must survive the in-flight copy-back"
+    );
+
+    drop(bridge);
+    // Turn 2 is a fresh per-turn bridge over the same canonical manager.
+    let next_turn = AppUiPromptContextBridge::new(
+        session_id.clone(),
+        dir.path().to_path_buf(),
+        manager.clone(),
+        false,
+    );
+    let mut prompt = vec![test_message(MessageRole::System, "runtime system")];
+    prompt.extend(history);
+    prompt.push(test_message(MessageRole::User, "next request"));
+    next_turn
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .expect("turn 2 start");
+    assert!(
+        prompt.iter().any(|message| {
+            message.role == MessageRole::User && message.content == "mid-turn side note"
+        }),
+        "the deferred row must surface to the next turn's prompt"
+    );
+    drop(registration);
+}
 
 #[tokio::test]
 async fn workspace_team_open_list_election_notifications_and_scope() {

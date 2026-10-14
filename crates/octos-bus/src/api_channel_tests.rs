@@ -106,6 +106,7 @@ fn assistant_tool_call_message(tool_name: &str, arguments: serde_json::Value) ->
         // `Message::assistant_with_thread`.
         thread_id: Some("test-thread".to_string()),
         timestamp: Utc::now(),
+        source: None,
     }
 }
 
@@ -564,6 +565,7 @@ fn message_info_from_history_message_hides_absolute_paths() {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     };
 
     let info = message_info_from_history_message(&message, data_dir.path(), 7);
@@ -645,6 +647,7 @@ fn build_session_result_event_normalizes_persisted_media_paths_like_history_repl
             client_message_id: None,
             thread_id: None,
             timestamp: Utc::now(),
+            source: None,
         },
         data_dir.path(),
         1,
@@ -1340,6 +1343,7 @@ async fn spawn_only_file_delivery_is_visible_to_watcher_replay_after_reconnect()
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         },
     )
     .await;
@@ -1524,6 +1528,7 @@ async fn topic_less_fallback_runs_when_candidate_topicless_file_is_empty() {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         },
     )
     .await;
@@ -1854,6 +1859,7 @@ async fn replay_committed_session_results_without_since_seq_replays_all_assistan
                     // PR F: pre-stamp for the new-write fail-closed split.
                     thread_id: Some("test-thread".to_string()),
                     timestamp: chrono::Utc::now(),
+                    source: None,
                 },
             )
             .await

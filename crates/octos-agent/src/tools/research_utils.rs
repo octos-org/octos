@@ -155,6 +155,7 @@ pub async fn extract_findings(
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     }];
 
     let config = ChatConfig {
@@ -226,6 +227,7 @@ pub async fn merge_findings(
         client_message_id: None,
         thread_id: None,
         timestamp: chrono::Utc::now(),
+        source: None,
     }];
 
     let config = ChatConfig {

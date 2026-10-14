@@ -2281,7 +2281,23 @@ impl ContextManager {
         // stamping/splicing below clears it. This is the path production takes
         // for every durable row, so the chain lives or dies here.
         let advanced = self.advanced_source_history(source_seq, message);
-        let recorded = self.record_merged_prompt_equivalent_inner(message, source_seq);
+        let recorded = self.record_merged_prompt_equivalent_inner(message, source_seq, true);
+        self.source_history = self.witnessed_source_history(advanced);
+        recorded
+    }
+
+    /// Record a record-only external row (UPCR-2026-042
+    /// `session/append_message`). Unlike the turn path, a User-role append
+    /// never closes open tool interactions: an append adds history, it does
+    /// not declare the receiving ledger's still-running tool batch dead, so
+    /// pending tool state survives the merge untouched.
+    pub(crate) fn record_external_message_merging_prompt_equivalent(
+        &mut self,
+        message: &Message,
+        source_seq: usize,
+    ) -> Vec<TranscriptItemId> {
+        let advanced = self.advanced_source_history(source_seq, message);
+        let recorded = self.record_merged_prompt_equivalent_inner(message, source_seq, false);
         self.source_history = self.witnessed_source_history(advanced);
         recorded
     }
@@ -2290,8 +2306,9 @@ impl ContextManager {
         &mut self,
         message: &Message,
         source_seq: usize,
+        close_open_tool_interactions: bool,
     ) -> Vec<TranscriptItemId> {
-        if message.role == MessageRole::User {
+        if close_open_tool_interactions && message.role == MessageRole::User {
             self.close_open_tool_interactions_as_aborted();
         }
         let source_ref = TranscriptSourceRef {
@@ -2488,13 +2505,46 @@ impl ContextManager {
         self.items.insert(items_index, item);
     }
 
-    /// Adopt durable rows that `source` merged while this scratch copy was
-    /// working from an older clone. Presence, rather than the scalar
+    /// Adopt every durable row that `source` merged while this scratch copy
+    /// was working from an older clone. Presence, rather than the scalar
     /// high-watermark, decides whether a possibly out-of-order row is new.
     pub(crate) fn adopt_source_items_after(
         &mut self,
         source: &ContextManager,
-        watermark: Option<usize>,
+    ) -> Vec<TranscriptItemId> {
+        self.adopt_source_items_selectively(source, |_| true)
+    }
+
+    /// [`Self::adopt_source_items_after`] restricted to rows tagged with
+    /// `event_kind` — the canonical copy-back fold uses it to re-apply just
+    /// the `external_record` rows an in-flight scratch never adopted.
+    pub(crate) fn adopt_source_items_with_event_kind(
+        &mut self,
+        source: &ContextManager,
+        event_kind: &str,
+    ) -> Vec<TranscriptItemId> {
+        self.adopt_source_items_selectively(source, |source_ref| {
+            source_ref.source_event_kind == event_kind
+        })
+    }
+
+    /// [`Self::adopt_source_items_after`] skipping rows tagged with
+    /// `event_kind` — the mid-turn scratch uses it for `external_record`
+    /// rows, which the in-flight turn must not see (UPCR-2026-042).
+    pub(crate) fn adopt_source_items_except_event_kind(
+        &mut self,
+        source: &ContextManager,
+        event_kind: &str,
+    ) -> Vec<TranscriptItemId> {
+        self.adopt_source_items_selectively(source, |source_ref| {
+            source_ref.source_event_kind != event_kind
+        })
+    }
+
+    fn adopt_source_items_selectively(
+        &mut self,
+        source: &ContextManager,
+        keep: impl Fn(&TranscriptSourceRef) -> bool,
     ) -> Vec<TranscriptItemId> {
         // Adoption copies another manager's source rows verbatim (its
         // `session_id` included), so this ledger can no longer say which
@@ -2502,7 +2552,6 @@ impl ContextManager {
         self.source_history = None;
         let mut adopted = Vec::new();
         let mut remapped_groups = HashMap::<String, String>::new();
-        let _ = watermark;
         let seq_of = |item: &TranscriptItem| item.source_ref.as_ref().and_then(|r| r.source_seq);
         let mut present_seqs: HashSet<usize> =
             self.ledger_items.iter().filter_map(seq_of).collect();
@@ -2510,6 +2559,9 @@ impl ContextManager {
             let Some(source_ref) = item.source_ref.as_ref() else {
                 continue;
             };
+            if !keep(source_ref) {
+                continue;
+            }
             let Some(seq) = source_ref.source_seq else {
                 continue;
             };
@@ -4276,6 +4328,7 @@ fn message(role: MessageRole, content: impl Into<String>) -> Message {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     }
 }
 
@@ -8624,7 +8677,6 @@ mod tests {
         let mut canonical =
             ContextManager::from_session_history(session_id, None, &[Message::user("earlier")]);
         let mut scratch = canonical.clone();
-        let watermark = scratch.source_high_watermark();
         scratch.record_message(&Message::user("request"));
         scratch.record_message(&Message::assistant("working"));
         scratch.record_message(&Message::user("steer: also check tests"));
@@ -8632,12 +8684,7 @@ mod tests {
             &Message::user("steer: also check tests"),
             1,
         );
-        assert_eq!(
-            scratch
-                .adopt_source_items_after(&canonical, watermark)
-                .len(),
-            1
-        );
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 1);
         canonical = scratch.clone();
         canonical.record_persisted_message_merging_prompt_equivalent(&Message::user("request"), 2);
         canonical
@@ -8697,23 +8744,116 @@ mod tests {
         let result_b = canonical
             .record_persisted_message_merging_prompt_equivalent(&Message::assistant("result B"), 2);
         canonical.mark_source_event_kind(&result_b, "background_result");
-        assert_eq!(scratch.adopt_source_items_after(&canonical, mark).len(), 1);
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 1);
         let mark = mark.max(canonical.source_high_watermark());
         assert_eq!(mark, Some(2));
 
         let result_a = canonical
             .record_persisted_message_merging_prompt_equivalent(&Message::assistant("result A"), 1);
         canonical.mark_source_event_kind(&result_a, "background_result");
-        assert_eq!(scratch.adopt_source_items_after(&canonical, mark).len(), 1);
-        assert!(
-            scratch
-                .adopt_source_items_after(&canonical, mark)
-                .is_empty()
-        );
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 1);
+        assert!(scratch.adopt_source_items_after(&canonical).is_empty());
         assert_eq!(
             source_head_hash_for_items(scratch.ledger_items()),
             source_head_hash_for_items(canonical.ledger_items())
         );
+    }
+
+    /// A record-only external user append is not a turn boundary: unlike the
+    /// turn path it must leave a still-open tool interaction pending instead
+    /// of fabricating terminal aborted outputs (UPCR-2026-042 review).
+    #[test]
+    fn external_record_user_append_leaves_open_tool_interactions_pending() {
+        let session_id = "coding:local:external-open-tools";
+        let mut canonical = ContextManager::from_session_history(
+            session_id,
+            None,
+            &[Message::user("run the release check")],
+        );
+        canonical.record_message(&assistant_tool_call("tc-check-1"));
+        assert!(
+            canonical
+                .items()
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::AssistantToolCall { .. }))
+        );
+        assert!(
+            !canonical
+                .items()
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::ToolOutput { .. }))
+        );
+
+        let mut external = Message::user("side-channel status note");
+        external.source = Some("external_record:import".into());
+        let ids = canonical.record_external_message_merging_prompt_equivalent(&external, 1);
+        canonical.mark_source_event_kind(&ids, "external_record");
+
+        assert!(canonical.items().iter().any(|item| matches!(
+            &item.kind,
+            TranscriptItemKind::UserInput { content, .. } if content == "side-channel status note"
+        )));
+        assert!(
+            !canonical
+                .items()
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptItemKind::ToolOutput { .. })),
+            "an external user append must not fabricate terminal tool outputs"
+        );
+    }
+
+    /// The mid-turn scratch adoption skips `external_record` rows so an
+    /// in-flight turn never sees them, and the copy-back fold adopts exactly
+    /// those rows so they survive the wholesale canonical replacement.
+    #[test]
+    fn adoption_can_defer_external_records_from_an_in_flight_scratch() {
+        let session_id = "coding:local:adopt-defer-external";
+        let mut canonical =
+            ContextManager::from_session_history(session_id, None, &[Message::user("request")]);
+        let mut scratch = canonical.clone();
+        scratch.record_message(&Message::assistant("working"));
+        canonical.record_persisted_message_merging_prompt_equivalent(
+            &Message::assistant("turn result"),
+            1,
+        );
+        let mut external = Message::user("side note");
+        external.source = Some("external_record:import".into());
+        let external_ids =
+            canonical.record_external_message_merging_prompt_equivalent(&external, 2);
+        canonical.mark_source_event_kind(&external_ids, "external_record");
+
+        // Mid-turn adoption: the turn row lands, the external record stays out.
+        assert_eq!(
+            scratch
+                .adopt_source_items_except_event_kind(&canonical, "external_record")
+                .len(),
+            1
+        );
+        assert!(scratch.items().iter().any(|item| matches!(
+            &item.kind,
+            TranscriptItemKind::AssistantFinal { content } if content == "turn result"
+        )));
+        assert!(!scratch.items().iter().any(|item| matches!(
+            &item.kind,
+            TranscriptItemKind::UserInput { content, .. } if content == "side note"
+        )));
+
+        // Copy-back fold: the deferred record lands in the replaced canonical.
+        let mut merged = scratch.clone();
+        assert_eq!(
+            merged
+                .adopt_source_items_with_event_kind(&canonical, "external_record")
+                .len(),
+            1
+        );
+        assert!(merged.items().iter().any(|item| matches!(
+            &item.kind,
+            TranscriptItemKind::UserInput { content, .. } if content == "side note"
+        )));
+        assert!(merged.items().iter().any(|item| matches!(
+            &item.kind,
+            TranscriptItemKind::AssistantFinal { content } if content == "turn result"
+        )));
     }
 
     #[test]
@@ -9209,7 +9349,6 @@ mod tests {
         let mut canonical =
             ContextManager::from_session_history(session_id, None, &[Message::user("request")]);
         let mut scratch = canonical.clone();
-        let watermark = scratch.source_high_watermark();
         scratch.record_message(&Message::user("steer: also check tests"));
         scratch.record_message(&Message::assistant("working"));
         canonical.record_persisted_message_merging_prompt_equivalent(
@@ -9221,19 +9360,10 @@ mod tests {
             2,
         );
         canonical.mark_source_event_kind(&background, "background_result");
-        assert_eq!(
-            scratch
-                .adopt_source_items_after(&canonical, watermark)
-                .len(),
-            2
-        );
+        assert_eq!(scratch.adopt_source_items_after(&canonical).len(), 2);
         assert_eq!(scratch.source_high_watermark(), Some(2));
         assert_eq!(scratch.source_head_hash(), canonical.source_head_hash());
-        assert!(
-            scratch
-                .adopt_source_items_after(&canonical, watermark)
-                .is_empty()
-        );
+        assert!(scratch.adopt_source_items_after(&canonical).is_empty());
     }
 }
 

@@ -456,6 +456,7 @@ pub(crate) fn block_message(block: String) -> Message {
         client_message_id: None,
         thread_id: None,
         timestamp: Utc::now(),
+        source: None,
     }
 }
 

@@ -892,6 +892,7 @@ async fn extract_one_session(
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         },
         Message {
             role: MessageRole::User,
@@ -903,6 +904,7 @@ async fn extract_one_session(
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         },
     ];
     let config = ChatConfig {
@@ -1043,6 +1045,7 @@ mod tests {
             client_message_id: Some("m1".to_string()),
             thread_id: Some("m1".to_string()),
             timestamp: chrono::Utc::now(),
+            source: None,
         };
         mgr.add_message(&key, msg.clone()).await.unwrap();
         msg.role = MessageRole::Assistant;
@@ -2136,6 +2139,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             timestamp: chrono::Utc::now(),
+            source: None,
         };
         mgr.add_message(&key, msg).await.unwrap();
         drop(mgr);

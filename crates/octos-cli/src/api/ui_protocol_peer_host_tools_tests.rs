@@ -3598,6 +3598,7 @@ async fn should_refuse_foreign_writes_to_a_host_peer_session_when_its_set_is_on_
         "turn/steer",
         "turn/interrupt",
         "session/rollback",
+        "session/append_message",
         "session/goal/set",
         "loop/create",
     ] {

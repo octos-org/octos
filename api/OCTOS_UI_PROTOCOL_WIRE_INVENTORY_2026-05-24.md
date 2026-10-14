@@ -114,6 +114,7 @@ spec and UPCR documents. The authoritative source remains code:
 | `session/btw` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `user_question/respond` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `session/rollback` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
+| `session/append_message` | shipped, UPCR-2026-042 — record-only history write (no turn, no model call) |
 | `session/fork` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `monitor/create` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `monitor/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
