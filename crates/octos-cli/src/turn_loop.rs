@@ -212,13 +212,17 @@ mod tests {
         let call = body
             .find("crate::turn_loop::next_turn_loop_step(")
             .expect("the loop calls next_turn_loop_step");
-        let call_args = &body[call..call + 400];
+        let call_args = &body[call..call + 600];
         assert!(
             call_args.contains("&mut agent_finished_rx"),
             "the drain loop must select on the agent completion channel"
         );
+        // The match on the step result sits immediately after the call;
+        // window it so a mention anywhere later in the file cannot satisfy
+        // this guard.
+        let match_window = &body[call..call + 4000];
         assert!(
-            body.contains("crate::turn_loop::TurnLoopStep::AgentFinished"),
+            match_window.contains("crate::turn_loop::TurnLoopStep::AgentFinished"),
             "the loop must terminate on AgentFinished, not only on Closed"
         );
     }

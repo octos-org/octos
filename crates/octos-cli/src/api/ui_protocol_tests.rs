@@ -23771,6 +23771,82 @@ async fn terminal_progress_event_delivers_when_the_consumer_reads() {
     assert_eq!(rx.recv().await.as_deref(), Some("terminal"));
 }
 
+/// Assembly-level regression (#2807): the drain-loop shape built from the
+/// REAL components — a saturated `PROGRESS_CHANNEL_CAPACITY` channel, the
+/// real bounded terminal send, the real step helper — always terminates on
+/// the completion signal within the send budget. Before the fix the agent
+/// task parked on the unbounded terminal send and the loop parked in
+/// `recv()` behind it forever. Whatever the interleaving (consumer drains
+/// in time and the terminal event delivers, or the budget fires and the
+/// frame sheds), the turn shape ends as `AgentFinished` and the terminal
+/// frame is either delivered or counted — never lost in limbo.
+#[tokio::test(start_paused = true)]
+async fn stalled_consumer_turn_shape_terminates_within_budget() {
+    let (progress_tx, mut progress_rx) = mpsc::channel::<String>(PROGRESS_CHANNEL_CAPACITY);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let (_interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+    let (finished_tx, mut finished_rx) = mpsc::channel::<()>(1);
+
+    // The stalled consumer's residue: a shared channel full of progress
+    // rows nobody has drained yet.
+    for i in 0..PROGRESS_CHANNEL_CAPACITY {
+        progress_tx.send(format!("row {i}")).await.unwrap();
+    }
+
+    // The agent task with the production body's exact exit shape: terminal
+    // event through the bounded helper, then the completion sender drops.
+    let agent_dropped = Arc::clone(&dropped);
+    let agent = tokio::spawn(async move {
+        deliver_terminal_progress_event(&progress_tx, &agent_dropped, "done".into()).await;
+        drop(finished_tx);
+    });
+
+    // The drain loop, with the production shape: real step helper, break on
+    // every terminal step.
+    let loop_end = tokio::spawn(async move {
+        loop {
+            match crate::turn_loop::next_turn_loop_step(
+                &mut interrupt_rx,
+                &mut progress_rx,
+                &mut finished_rx,
+                false,
+            )
+            .await
+            {
+                crate::turn_loop::TurnLoopStep::Interrupted => return ("interrupted", false),
+                crate::turn_loop::TurnLoopStep::Closed => return ("closed", false),
+                crate::turn_loop::TurnLoopStep::AgentFinished => return ("agent-finished", true),
+                crate::turn_loop::TurnLoopStep::Progress(data) => {
+                    if data == "done" {
+                        // The terminal event raced the budget and delivered.
+                        return ("terminal-delivered", true);
+                    }
+                }
+            }
+        }
+    });
+
+    let (outcome, terminated) = tokio::time::timeout(std::time::Duration::from_secs(600), loop_end)
+        .await
+        .expect("the turn shape must terminate within the send budget, not park")
+        .expect("loop task must not panic");
+    let _ = agent.await;
+    assert!(terminated, "the loop must end on a terminal step");
+    match outcome {
+        "terminal-delivered" => {
+            assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        }
+        "agent-finished" => {
+            assert_eq!(
+                dropped.load(Ordering::Relaxed),
+                1,
+                "a shed terminal frame must be counted, never lost in limbo"
+            );
+        }
+        other => panic!("unexpected loop outcome: {other}"),
+    }
+}
+
 /// The offloaded stdio lifecycle lane parks cooperatively until the host
 /// reader drains the queue, then delivers — never pinning a worker on the
 /// blocking send it replaces.
@@ -23806,8 +23882,8 @@ async fn lifecycle_offloaded_stdio_lane_drains_a_full_queue_cooperatively() {
     assert_eq!(rows, ["queued", "terminal"]);
 }
 
-/// A disconnected stdio host maps to `Closed`, mirroring the blocking
-/// `SyncSender::send` error the sync lane produces.
+/// A disconnected stdio host latches the connection exactly like the sync
+/// lane's error mapping does (#922.2): `LifecycleFailure` + `mark_failed`.
 #[tokio::test]
 async fn lifecycle_offloaded_stdio_disconnected_reports_closed() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
@@ -23816,7 +23892,11 @@ async fn lifecycle_offloaded_stdio_disconnected_reports_closed() {
     let result = ws
         .send_lifecycle_offloaded(WsMessage::Text("terminal".into()))
         .await;
-    assert!(matches!(result, Err(SendError::Closed)));
+    assert!(matches!(result, Err(SendError::LifecycleFailure(_))));
+    assert!(
+        ws.is_failed(),
+        "a dead stdio host must latch the connection"
+    );
 }
 
 /// The m14 Codex P0 fixture must dual-emit every tool call: the raw durable
@@ -31483,7 +31563,8 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
             &mut tracker,
             &mut saw_delta,
             &event,
-        );
+        )
+        .await;
     }
     // Actual production persistence is batched AFTER the whole Agent turn:
     // all earlier streamed phases are already present when these callbacks run.
@@ -31526,7 +31607,8 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
             &mut tracker,
             &mut saw_delta,
             &event,
-        );
+        )
+        .await;
     }
     let mut persisted = Vec::new();
     while let Ok(event) = events.try_recv() {

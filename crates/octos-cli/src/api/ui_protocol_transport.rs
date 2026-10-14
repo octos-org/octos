@@ -1158,17 +1158,26 @@ impl WsConnection {
     /// probe then async sleep, mirroring [`Self::send_durable_offloaded`])
     /// instead of a blocking `SyncSender::send` that pins an executor
     /// worker while the turn drain loop emits its terminal forward. The WS
-    /// lane keeps the non-blocking `try_send` shape via
-    /// [`Self::try_enqueue`], byte-identical to the sync callers.
+    /// lane delegates to [`Self::send_lifecycle`] unchanged, keeping the
+    /// #922.2 latched-failure mapping byte-identical to the sync callers.
     async fn send_lifecycle_offloaded(&self, frame: WsMessage) -> Result<(), SendError> {
+        if self.stdio_writer.is_none() {
+            return self.send_lifecycle(frame);
+        }
         if self.failed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(SendError::FatalClosed);
         }
-        let Some(writer) = self.stdio_writer.as_ref() else {
-            return self.try_enqueue(frame);
-        };
+        let writer = self
+            .stdio_writer
+            .as_ref()
+            .expect("stdio_writer checked above");
         let mut frame = frame;
         loop {
+            // Mirror send_durable_offloaded: re-check the latch every probe
+            // so a concurrently-failed connection stops spinning.
+            if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(SendError::FatalClosed);
+            }
             match writer.try_send(frame) {
                 Ok(()) => return Ok(()),
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
@@ -1176,7 +1185,19 @@ impl WsConnection {
                     tokio::time::sleep(std::time::Duration::from_millis(15)).await;
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                    return Err(SendError::Closed);
+                    // Mirror send_lifecycle's Closed arm for the stdio lane:
+                    // a dead host latches the connection, exactly like the
+                    // blocking send's error did.
+                    metrics::counter!("ws.send.error.lifecycle").increment(1);
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        reason = "closed",
+                        "lifecycle ws send failed; aborting connection"
+                    );
+                    self.mark_failed();
+                    return Err(SendError::LifecycleFailure(
+                        "writer channel closed for lifecycle frame".into(),
+                    ));
                 }
             }
         }
@@ -42794,13 +42815,51 @@ async fn run_standalone_turn(
                 // turn here instead of parking in recv() forever: the rotator
                 // and the delivery worker keep the progress channel open, so
                 // `Closed` alone never fires. The shed terminal frame is
-                // disclosed by the replay_lossy counter flushed below.
+                // disclosed by the replay_lossy counter flushed below. The
+                // closing work mirrors the error arm minus the event-carried
+                // fields (usage/sentinel data died with the shed event).
+                let lost_message =
+                    "the agent task ended without producing a deliverable terminal event";
                 warn!(
                     session = %session_id.0,
                     turn = %turn_id.0,
                     "agent task ended without a terminal event; emitting terminal_lost"
                 );
+                if let Err(error) = state.ui_protocol.workspace_teams.record_result(
+                    &session_runtime.profile.data_dir,
+                    &session_runtime.workspace_root,
+                    &session_id,
+                    &turn_id.0.to_string(),
+                    lost_message,
+                ) {
+                    tracing::warn!(%error, "failed to persist workspace peer result");
+                }
+                write_peer_result_if_peer_session(
+                    &state,
+                    &session_id,
+                    &turn_id,
+                    TurnTerminalOutcome::Errored,
+                    lost_message,
+                    final_tokens_consumed,
+                    peer_lifetime_turn.as_ref(),
+                );
+                maybe_enqueue_peer_fleet_synthesis(&state, &session_id).await;
+                maybe_enqueue_peer_fleet_synthesis_for_master(
+                    &state,
+                    &session_id,
+                    &session_runtime.profile.profile_id,
+                )
+                .await;
                 flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
+                crate::session_actor::emit_lifecycle_hook_payload(
+                    turn_end_hooks.as_ref(),
+                    &session_id,
+                    octos_agent::HookPayload::on_turn_end(
+                        turn_end_summary.clone(),
+                        Some(&turn_end_hook_ctx),
+                    ),
+                )
+                .await;
                 try_emit_terminal(
                     &turn_state,
                     TerminalReason::Errored,
@@ -42808,10 +42867,7 @@ async fn run_standalone_turn(
                     &ledger,
                     &session_id,
                     &turn_id,
-                    Some((
-                        "terminal_lost",
-                        "the turn's result could not be delivered to the stalled connection",
-                    )),
+                    Some(("terminal_lost", lost_message)),
                     None,
                     steer_buffer.as_ref(),
                     peers_root.as_deref(),
@@ -43196,7 +43252,8 @@ async fn run_standalone_turn(
                     &mut task_output_delta_tracker,
                     &mut saw_delta,
                     &event,
-                );
+                )
+                .await;
             }
         }
     }
@@ -43534,7 +43591,7 @@ async fn run_standalone_turn(
             approval_cancelled_reasons::TURN_INTERRUPTED,
         );
         for entry in cancelled {
-            let _ = send_notification_durable(
+            let _ = send_notification_durable_offloaded(
                 &ws,
                 &ledger,
                 UiNotification::ApprovalCancelled(ApprovalCancelledEvent::turn_interrupted(
@@ -43542,7 +43599,8 @@ async fn run_standalone_turn(
                     entry.approval_id,
                     entry.turn_id,
                 )),
-            );
+            )
+            .await;
         }
         // UPCR-2026-023: drain pending structured user-questions for the
         // interrupted turn, mirroring the approval drain. Dropping each
@@ -43716,7 +43774,8 @@ async fn run_standalone_turn(
                     &mut drain_tracker,
                     &mut drain_saw_delta,
                     &event,
-                );
+                )
+                .await;
             }
             // `drain_saw_delta` only matters when callers want to backfill
             // the terminal `done`'s assistant content; the drain runs
@@ -44953,7 +45012,11 @@ fn emit_progress_envelope(
 /// content on the terminal). The drain task passes a discard reference since
 /// it runs strictly after the terminal has already been emitted.
 #[allow(clippy::too_many_arguments)]
-fn forward_progress_event(
+/// #2807 — async so every durable forward parks COOPERATIVELY on the stdio
+/// lane (via the offloaded senders) instead of a blocking `SyncSender::send`
+/// that would pin an executor worker — and park this drain loop before it
+/// can ever reach the terminal gate — while a stdio host reads slowly.
+async fn forward_progress_event(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -44972,14 +45035,15 @@ fn forward_progress_event(
                 serde_json::from_value::<SessionKey>(session_id_value.clone()),
                 serde_json::from_value::<UiAgentRecord>(agent_value.clone()),
             ) {
-                let _ = send_notification_durable(
+                let _ = send_notification_durable_offloaded(
                     ws,
                     ledger,
                     UiNotification::AgentUpdated(AgentUpdatedEvent {
                         session_id: event_session_id,
                         agent,
                     }),
-                );
+                )
+                .await;
             }
         }
         return;
@@ -44988,7 +45052,9 @@ fn forward_progress_event(
     if let Some(delta) = task_output_delta_tracker.observe_progress_event(session_id, event) {
         // task/output/delta is durable: drops surface as
         // protocol/replay_lossy so the client can resync.
-        let _ = send_notification_durable(ws, ledger, UiNotification::TaskOutputDelta(delta));
+        let _ =
+            send_notification_durable_offloaded(ws, ledger, UiNotification::TaskOutputDelta(delta))
+                .await;
     }
     let mut mapping = map_progress_json(progress_context, event);
     apply_progress_contract_side_effects(
@@ -45020,11 +45086,12 @@ fn forward_progress_event(
                 let _ = send_notification_ephemeral(ws, ledger, notification);
             }
             UiNotification::ApprovalRequested(request) => {
-                if send_notification_durable(
+                if send_notification_durable_offloaded(
                     ws,
                     ledger,
                     UiNotification::ApprovalRequested(request.clone()),
                 )
+                .await
                 .is_err()
                 {
                     cancel_approval_after_request_send_failure(
@@ -45038,18 +45105,19 @@ fn forward_progress_event(
                 }
             }
             notification => {
-                let _ = send_notification_durable(ws, ledger, notification);
+                let _ = send_notification_durable_offloaded(ws, ledger, notification).await;
             }
         }
     }
     if let Some(warning) = mapping.warning {
-        let _ = send_notification_durable(ws, ledger, UiNotification::Warning(warning));
+        let _ =
+            send_notification_durable_offloaded(ws, ledger, UiNotification::Warning(warning)).await;
     }
     if let Some(status) = mapping.status {
         // Tag with this connection's id so its forwarder skips
         // the broadcast copy after the direct send below.
         let event = ledger.append_progress_from(status.event, ws.connection_id);
-        let _ = send_ledger_event_durable(ws, ledger, event.event);
+        let _ = send_ledger_event_durable_offloaded(ws, ledger, event.event).await;
     }
 }
 
