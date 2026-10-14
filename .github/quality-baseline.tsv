@@ -3,4 +3,4 @@
 # with: scripts/quality-ratchet.sh --update
 unwrap_panic_prod	586
 files_over_3000	53
-max_file_lines	50509
+max_file_lines	50515

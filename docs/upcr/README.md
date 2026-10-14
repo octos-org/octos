@@ -72,6 +72,7 @@ records.
 | 044 | Manifest-Declared Skill Actions | accepted | `..._044_SKILL_ACTIONS.md` | #1637 |
 | 045 | Skill Action Background Jobs | accepted | `..._045_SKILL_ACTION_JOBS.md` | #1637 |
 | 046 | Server-Owned Session Identity Binding for Raw Wire Ids | proposed | `..._046_SESSION_IDENTITY_BINDING.md` | #2162 |
+| 048 | Cooperative Turn-Drain Delivery With A Budgeted Terminal Shed | implemented | `..._048_STALLED_CONSUMER_TERMINATION.md` | #2810 |
 
 ## Renumbering history
 
