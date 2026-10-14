@@ -116,8 +116,8 @@ mod tests {
         drop(progress_tx);
         // Already observed: the interrupt arm is disabled; the closed progress
         // channel ends the loop instead.
-        let step = next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, &mut finished_rx, true)
-            .await;
+        let step =
+            next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, &mut finished_rx, true).await;
         assert_eq!(step, TurnLoopStep::Closed);
     }
 
