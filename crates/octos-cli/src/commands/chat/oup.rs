@@ -85,6 +85,12 @@ impl OupFrontend for TerminalFrontend {
                 _ => {}
             },
             UiNotification::ApprovalRequested(event) => {
+                // Keep privilege changes and host-tool calls out of the CLI's
+                // remembered session approval, including typed OUP fallback.
+                let once_only = matches!(
+                    event.approval_kind.as_deref(),
+                    Some("sandbox_escalation" | "host_tool")
+                );
                 let decision = self
                     .approvals
                     .request_approval(ToolApprovalRequest {
@@ -94,7 +100,7 @@ impl OupFrontend for TerminalFrontend {
                         body: event.body,
                         command: None,
                         cwd: None,
-                        once_only: false,
+                        once_only,
                         host_tool: None,
                     })
                     .await;
@@ -385,6 +391,51 @@ impl ChatCommand {
 #[cfg(test)]
 mod terminal_integrity_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_integrity_sandbox_escalation_bypasses_remembered_approval() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::{ApprovalId, ApprovalRequestedEvent, TurnId};
+        // Holding the prompt lock keeps this test off stdin. Ordinary cached
+        // approval resolves immediately; a once-only request must wait here.
+        let _prompt_guard = CHAT_PROMPT_LOCK.lock().await;
+        let frontend = TerminalFrontend {
+            json: false,
+            verbose: false,
+            approvals: CliApprovalRequester {
+                session_approved: AtomicBool::new(true),
+            },
+            segments: Default::default(),
+            input_active: AtomicBool::new(false),
+            pending_prompts: Default::default(),
+            peers: None,
+        };
+        let event = ApprovalRequestedEvent::generic(
+            SessionKey("local:fixture".into()),
+            ApprovalId::new(),
+            TurnId::new(),
+            "exec_command",
+            "Approve",
+            "fixture",
+        );
+        assert!(matches!(
+            frontend.event(UiNotification::ApprovalRequested(event.clone())).await.unwrap(),
+            Some(UiCommand::ApprovalRespond(answer)) if answer.decision == ApprovalDecision::Approve
+        ));
+        for kind in ["sandbox_escalation", "host_tool"] {
+            let mut event = event.clone();
+            event.approval_kind = Some(kind.into());
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(25),
+                    frontend.event(UiNotification::ApprovalRequested(event)),
+                )
+                .await
+                .is_err(),
+                "{kind} must wait for a fresh prompt"
+            );
+        }
+    }
 
     #[test]
     fn terminal_integrity_close_error_preserves_primary_error() {

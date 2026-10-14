@@ -423,6 +423,15 @@ impl CliApprovalRequester {
 #[cfg(any(feature = "api", test))]
 #[async_trait::async_trait]
 impl ToolApprovalRequester for CliApprovalRequester {
+    async fn request_sandbox_escalation(
+        &self,
+        mut request: ToolApprovalRequest,
+        _details: octos_core::ui_protocol::ApprovalSandboxEscalationDetails,
+    ) -> ToolApprovalDecision {
+        request.once_only = true;
+        self.request_approval(request).await
+    }
+
     async fn request_approval(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
         // Fast path: a prior `s` answer auto-resolves without prompting
         // (mirrors serve's `approval_auto_resolved`). Print a note so the
@@ -490,7 +499,11 @@ fn prompt_for_cli_approval(request: ToolApprovalRequest) -> CliApprovalAnswer {
         return CliApprovalAnswer::Deny;
     }
 
-    eprint!("Approve? [y]es once / [s]ession / [N]o ");
+    if request.once_only {
+        eprint!("Approve? [y]es once / [N]o ");
+    } else {
+        eprint!("Approve? [y]es once / [s]ession / [N]o ");
+    }
     let _ = io::stderr().flush();
     let mut answer = String::new();
     match io::stdin().read_line(&mut answer) {
