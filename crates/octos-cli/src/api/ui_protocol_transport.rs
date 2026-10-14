@@ -1154,12 +1154,12 @@ impl WsConnection {
     }
 
     /// Async twin of [`Self::send_lifecycle`] (#2807): identical error
-    /// semantics, but the stdio lane parks COOPERATIVELY (non-blocking probe
-    /// + async sleep, mirroring [`Self::send_durable_offloaded`]) instead of
-    /// a blocking `SyncSender::send` that pins an executor worker while the
-    /// turn drain loop emits its terminal forward. The WS lane keeps the
-    /// non-blocking `try_send` shape via [`Self::try_enqueue`], byte-identical
-    /// to the sync callers.
+    /// semantics, but the stdio lane parks COOPERATIVELY (non-blocking
+    /// probe then async sleep, mirroring [`Self::send_durable_offloaded`])
+    /// instead of a blocking `SyncSender::send` that pins an executor
+    /// worker while the turn drain loop emits its terminal forward. The WS
+    /// lane keeps the non-blocking `try_send` shape via
+    /// [`Self::try_enqueue`], byte-identical to the sync callers.
     async fn send_lifecycle_offloaded(&self, frame: WsMessage) -> Result<(), SendError> {
         if self.failed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(SendError::FatalClosed);
