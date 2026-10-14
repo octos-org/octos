@@ -64,6 +64,7 @@ gone.
 
 Every sweep is reversible: the workflow uploads a SHA manifest and a git bundle
 for 90 days. Restore with
+`git fetch <bundle> 'refs/remotes/origin/*:refs/remotes/origin/*'` then
 `git push origin <sha>:refs/heads/<branch>`.
 
 ## Weekly sweep vs. audit

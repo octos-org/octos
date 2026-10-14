@@ -16,10 +16,13 @@
 #   <logdir>/deleted-branches-<date>.bundle  — a self-contained git bundle so
 #       every deleted branch can be restored offline, even after GitHub GC.
 #
-# Restore a single branch:
+# Restore a single branch (the bundle stores refs as refs/remotes/origin/*):
+#   git fetch <bundle> 'refs/remotes/origin/<branch>:refs/heads/<branch>'
+#   git push <remote> refs/heads/<branch>
+# Restore every branch into local remote-tracking refs:
+#   git fetch <bundle> 'refs/remotes/origin/*:refs/remotes/origin/*'
+# ...then push any of them, or push a specific SHA from the manifest:
 #   git push <remote> <sha>:refs/heads/<branch>
-# Restore everything from the bundle:
-#   git fetch <bundle> 'refs/heads/*:refs/heads/restored/*'
 #
 # Usage:
 #   scripts/branch-cleanup.sh [--base origin/main] [--remote origin]

@@ -40,17 +40,23 @@ Nothing was deleted without a recovery path:
 /tmp/octos-branch-cleanup/backup-archive.bundle       their bundle
 ```
 
-Restore one branch:
+Durable copies are kept in `~/octos-branch-backups-2026-10/`.
+
+Restore one branch (the bundle stores refs as `refs/remotes/origin/*`):
 
 ```bash
-git push origin <sha>:refs/heads/<branch>
+git fetch ~/octos-branch-backups-2026-10/deleted-branches-*.bundle \
+  'refs/remotes/origin/<branch>:refs/heads/<branch>'
+git push origin refs/heads/<branch>
 ```
 
-Restore everything from a bundle:
+Restore every deleted branch into local remote-tracking refs, then push whichever
+you want (or push a specific SHA from the manifest):
 
 ```bash
-git fetch /tmp/octos-branch-cleanup/deleted-branches-*.bundle \
-  'refs/heads/*:refs/heads/restored/*'
+git fetch ~/octos-branch-backups-2026-10/deleted-branches-*.bundle \
+  'refs/remotes/origin/*:refs/remotes/origin/*'
+git push origin <sha>:refs/heads/<branch>
 ```
 
 ## Remaining: needs a human decision

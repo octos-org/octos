@@ -81,8 +81,9 @@ reviewers can see the increase.
 - it has no open PR.
 
 Every deletion is recoverable: the job uploads a SHA manifest and a
-self-contained `git bundle` (90-day artifact). To restore a branch:
-`git push origin <sha>:refs/heads/<branch>`.
+self-contained `git bundle` (90-day artifact). To restore a branch, fetch the
+bundle and push its SHA:
+`git fetch <bundle> 'refs/remotes/origin/*:refs/remotes/origin/*' && git push origin <sha>:refs/heads/<branch>`.
 
 Branches with **unmerged** work are never deleted automatically — they are
 listed by `scripts/branch-audit.sh` for a human to review.
