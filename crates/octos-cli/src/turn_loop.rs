@@ -194,4 +194,58 @@ mod tests {
             }
         }
     }
+
+    /// Structural guard (#2807): the production loop must feed the agent
+    /// completion channel into the step helper — without the
+    /// `AgentFinished` arm, a turn whose terminal event was shed parks in
+    /// `recv()` forever, because the rotator/worker/supervisor keep the
+    /// progress channel open past the agent task.
+    #[test]
+    fn standalone_turn_loop_feeds_the_agent_completion_signal() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/api/ui_protocol_transport.rs");
+        let text = std::fs::read_to_string(&path).expect("read ui_protocol_transport.rs");
+        let start = text
+            .find("async fn run_standalone_turn")
+            .expect("run_standalone_turn exists");
+        let body = &text[start..];
+        let call = body
+            .find("crate::turn_loop::next_turn_loop_step(")
+            .expect("the loop calls next_turn_loop_step");
+        let call_args = &body[call..call + 400];
+        assert!(
+            call_args.contains("&mut agent_finished_rx"),
+            "the drain loop must select on the agent completion channel"
+        );
+        assert!(
+            body.contains("crate::turn_loop::TurnLoopStep::AgentFinished"),
+            "the loop must terminate on AgentFinished, not only on Closed"
+        );
+    }
+
+    /// Structural guard (#2807): the agent task's directly-sent terminal
+    /// events must go through the bounded helper — a bare `send().await`
+    /// into the shared channel parks the task (and the turn's final
+    /// `agent_task.await`) indefinitely on a stalled consumer.
+    #[test]
+    fn agent_terminal_events_are_bounded_against_a_stalled_consumer() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/api/ui_protocol_transport.rs");
+        let text = std::fs::read_to_string(&path).expect("read ui_protocol_transport.rs");
+        let start = text
+            .find("let agent_task = tokio::spawn")
+            .expect("the agent task spawn exists");
+        let end = text[start..]
+            .find("let _abort_guard = AbortOnDrop")
+            .expect("the spawn block ends at the abort guard");
+        let body = &text[start..start + end];
+        assert!(
+            body.matches("deliver_terminal_progress_event(").count() == 3,
+            "all three terminal sends (error/incomplete/done) must be bounded"
+        );
+        assert!(
+            !body.contains("progress_tx_for_result.send("),
+            "no bare unbounded terminal send may remain in the agent task"
+        );
+    }
 }

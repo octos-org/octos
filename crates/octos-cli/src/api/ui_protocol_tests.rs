@@ -23724,6 +23724,101 @@ fn ws_connection_for_test(
     (WsConnection::new(tx), rx)
 }
 
+// ---- #2807 turn termination must not park on a stalled consumer ----
+
+/// The agent task's terminal event sheds and counts into the drop counter
+/// once the stalled consumer holds the progress channel past the send
+/// budget — instead of parking the task (and with it the turn) forever.
+#[tokio::test(start_paused = true)]
+async fn terminal_progress_event_sheds_and_counts_past_budget_on_stalled_channel() {
+    let (tx, mut rx) = mpsc::channel::<String>(1);
+    // The stalled consumer: the only slot is full and never drained.
+    tx.send("queued".into()).await.unwrap();
+    let dropped = Arc::new(AtomicU64::new(0));
+    let shed = {
+        let tx = tx.clone();
+        let dropped = Arc::clone(&dropped);
+        tokio::spawn(async move {
+            deliver_terminal_progress_event(&tx, &dropped, "terminal".into()).await;
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(600), shed)
+        .await
+        .expect("terminal send must shed past the budget instead of parking")
+        .expect("delivery task must not panic");
+    assert_eq!(
+        dropped.load(Ordering::Relaxed),
+        1,
+        "the shed terminal frame must be counted into the replay_lossy counter"
+    );
+    // The consumer resumes: only the queued row remains; the shed frame is
+    // gone and the channel was not closed out from under other senders.
+    assert_eq!(rx.recv().await.as_deref(), Some("queued"));
+    assert_eq!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty),
+        "helper must not close the channel"
+    );
+}
+
+/// Healthy path: the terminal event delivers untouched and counts nothing.
+#[tokio::test]
+async fn terminal_progress_event_delivers_when_the_consumer_reads() {
+    let (tx, mut rx) = mpsc::channel::<String>(1);
+    let dropped = Arc::new(AtomicU64::new(0));
+    deliver_terminal_progress_event(&tx, &dropped, "terminal".into()).await;
+    assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    assert_eq!(rx.recv().await.as_deref(), Some("terminal"));
+}
+
+/// The offloaded stdio lifecycle lane parks cooperatively until the host
+/// reader drains the queue, then delivers — never pinning a worker on the
+/// blocking send it replaces.
+#[tokio::test]
+async fn lifecycle_offloaded_stdio_lane_drains_a_full_queue_cooperatively() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    // Fill the single stdio slot first: the blocking send this lane replaces
+    // would park here forever on a host that reads nothing.
+    writer_tx
+        .send(WsMessage::Text("queued".into()))
+        .expect("fill the stdio slot");
+    let ws = WsConnection::new_stdio(writer_tx);
+    // The "host reader" resumes after a pause and drains both rows, then
+    // sees the channel close when the test drops the connection.
+    let reader = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let mut rows = Vec::new();
+        while let Ok(frame) = writer_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            if let WsMessage::Text(text) = frame {
+                rows.push(text);
+            }
+        }
+        rows
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        ws.send_lifecycle_offloaded(WsMessage::Text("terminal".into())),
+    )
+    .await
+    .expect("offloaded send must complete once the host reader drains")
+    .expect("offloaded lifecycle send must succeed on a live stdio lane");
+    let rows = reader.join().expect("reader must not panic");
+    assert_eq!(rows, ["queued", "terminal"]);
+}
+
+/// A disconnected stdio host maps to `Closed`, mirroring the blocking
+/// `SyncSender::send` error the sync lane produces.
+#[tokio::test]
+async fn lifecycle_offloaded_stdio_disconnected_reports_closed() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    let ws = WsConnection::new_stdio(writer_tx);
+    drop(writer_rx);
+    let result = ws
+        .send_lifecycle_offloaded(WsMessage::Text("terminal".into()))
+        .await;
+    assert!(matches!(result, Err(SendError::Closed)));
+}
+
 /// The m14 Codex P0 fixture must dual-emit every tool call: the raw durable
 /// notification (suppressed per-connection since #2318) AND the canonical
 /// projection/envelope payload that actually reaches clients. Without the
