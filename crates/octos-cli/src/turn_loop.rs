@@ -18,6 +18,13 @@ pub(crate) enum TurnLoopStep {
     Interrupted,
     /// A progress event payload from the agent task.
     Progress(String),
+    /// The agent task's body has ended, so its completion-sender clone was
+    /// dropped. Unlike `Closed` — which needs every progress sender dropped
+    /// and stays unreachable while the rotator, the delivery worker, and the
+    /// task supervisor keep theirs alive — this fires the moment the agent
+    /// finishes, even when its terminal event was shed by the bounded
+    /// terminal send (#2807), so the loop can always reach a terminal.
+    AgentFinished,
     /// The progress channel closed: the agent task is gone.
     Closed,
 }
@@ -32,6 +39,7 @@ pub(crate) enum TurnLoopStep {
 pub(crate) async fn next_turn_loop_step(
     interrupt_rx: &mut mpsc::Receiver<()>,
     progress_rx: &mut mpsc::Receiver<String>,
+    agent_finished_rx: &mut mpsc::Receiver<()>,
     interrupt_observed: bool,
 ) -> TurnLoopStep {
     tokio::select! {
@@ -41,6 +49,11 @@ pub(crate) async fn next_turn_loop_step(
             Some(data) => TurnLoopStep::Progress(data),
             None => TurnLoopStep::Closed,
         },
+        // Biased after progress: the agent drops its completion sender only
+        // after its terminal send resolved (delivered or shed), so a queued
+        // terminal event is always drained by the progress arm first — this
+        // arm only ends a turn whose terminal event never made it.
+        _ = agent_finished_rx.recv() => TurnLoopStep::AgentFinished,
     }
 }
 
@@ -53,11 +66,12 @@ mod tests {
     async fn interrupt_returns_immediately_without_progress_events() {
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (_progress_tx, mut progress_rx) = mpsc::channel::<String>(8);
+        let (_finished_tx, mut finished_rx) = mpsc::channel::<()>(1);
         // A "long tool with no output": nothing ever lands on progress_rx.
         interrupt_tx.send(()).await.unwrap();
         let step = tokio::time::timeout(
             Duration::from_millis(100),
-            next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, false),
+            next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, &mut finished_rx, false),
         )
         .await
         .expect("interrupt must wake the loop without any progress event");
@@ -68,11 +82,13 @@ mod tests {
     async fn progress_events_flow_when_no_interrupt() {
         let (_interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (progress_tx, mut progress_rx) = mpsc::channel::<String>(8);
+        let (_finished_tx, mut finished_rx) = mpsc::channel::<()>(1);
         progress_tx
             .send("{\"type\":\"delta\"}".into())
             .await
             .unwrap();
-        let step = next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, false).await;
+        let step =
+            next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, &mut finished_rx, false).await;
         assert_eq!(step, TurnLoopStep::Progress("{\"type\":\"delta\"}".into()));
     }
 
@@ -80,12 +96,14 @@ mod tests {
     async fn interrupt_wins_over_ready_progress() {
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (progress_tx, mut progress_rx) = mpsc::channel::<String>(8);
+        let (_finished_tx, mut finished_rx) = mpsc::channel::<()>(1);
         progress_tx
             .send("{\"type\":\"delta\"}".into())
             .await
             .unwrap();
         interrupt_tx.send(()).await.unwrap();
-        let step = next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, false).await;
+        let step =
+            next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, &mut finished_rx, false).await;
         assert_eq!(step, TurnLoopStep::Interrupted, "biased: interrupt first");
     }
 
@@ -93,12 +111,58 @@ mod tests {
     async fn observed_interrupt_is_not_reported_twice_and_closed_channel_ends_loop() {
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
         let (progress_tx, mut progress_rx) = mpsc::channel::<String>(8);
+        let (_finished_tx, mut finished_rx) = mpsc::channel::<()>(1);
         interrupt_tx.send(()).await.unwrap();
         drop(progress_tx);
         // Already observed: the interrupt arm is disabled; the closed progress
         // channel ends the loop instead.
-        let step = next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, true).await;
+        let step = next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, &mut finished_rx, true)
+            .await;
         assert_eq!(step, TurnLoopStep::Closed);
+    }
+
+    /// #2807: the agent task's completion signal ends the loop even though
+    /// the progress channel is still open — the rotator/worker/supervisor
+    /// keep their sender clones alive, so `Closed` alone never fires.
+    #[tokio::test]
+    async fn agent_finished_wakes_the_loop_without_progress_events() {
+        let (_interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+        let (_progress_tx, mut progress_rx) = mpsc::channel::<String>(8);
+        let (finished_tx, mut finished_rx) = mpsc::channel::<()>(1);
+        // The agent body ended: its completion-sender clone was dropped.
+        drop(finished_tx);
+        let step = tokio::time::timeout(
+            Duration::from_millis(100),
+            next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, &mut finished_rx, false),
+        )
+        .await
+        .expect("agent completion must wake the loop with the progress channel still open");
+        assert_eq!(step, TurnLoopStep::AgentFinished);
+    }
+
+    /// Biased after progress: a terminal event queued before the agent's
+    /// completion sender dropped is drained by the progress arm first, so
+    /// the loop never reports AgentFinished while a terminal event awaits.
+    #[tokio::test]
+    async fn queued_progress_drains_before_agent_finished() {
+        let (_interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
+        let (progress_tx, mut progress_rx) = mpsc::channel::<String>(8);
+        let (finished_tx, mut finished_rx) = mpsc::channel::<()>(1);
+        progress_tx
+            .send("{\"type\":\"done\"}".into())
+            .await
+            .unwrap();
+        drop(finished_tx);
+        let step =
+            next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, &mut finished_rx, false).await;
+        assert_eq!(
+            step,
+            TurnLoopStep::Progress("{\"type\":\"done\"}".into()),
+            "biased: queued progress (including the terminal event) first"
+        );
+        let step =
+            next_turn_loop_step(&mut interrupt_rx, &mut progress_rx, &mut finished_rx, false).await;
+        assert_eq!(step, TurnLoopStep::AgentFinished);
     }
 
     /// Structural guard: the production loop takes its next step from this
