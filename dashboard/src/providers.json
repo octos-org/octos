@@ -201,6 +201,14 @@
       ] }
     ]
   },
+  "minimax-coding": {
+    "env": "MINIMAX_CODING_API_KEY",
+    "models": [
+      { "id": "MiniMax-M3.1-Flash-Preview", "input": 0.0, "output": 0.0, "max_output": 0, "endpoints": [
+        { "id": "minimax-coding", "label": "MiniMax M Plan (Coding Plan)", "base_url": "https://api.minimax.io/v1", "api_key_env": "MINIMAX_CODING_API_KEY" }
+      ] }
+    ]
+  },
   "zai-coding": {
     "env": "ZAI_CODING_API_KEY",
     "models": [
