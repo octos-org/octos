@@ -162,6 +162,14 @@ use crate::user_store::UserRole;
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 256 * 1024;
 const PROGRESS_CHANNEL_CAPACITY: usize = 1024;
+/// #2807 — wall-clock budget for the agent task's directly-sent terminal
+/// event (the `done`/`error` JSON it sends into the shared progress
+/// channel). A consumer stalled past this forfeits the frame instead of
+/// parking turn termination indefinitely: the shed is counted into the
+/// turn's drop counter, so the turn-boundary `replay_lossy` discloses the
+/// loss and the completion-signal arm delivers the terminal. Same stall
+/// model and budget as `progress_delivery::FLUSH_DEADLINE`.
+const TERMINAL_SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 const APPUI_CONTEXT_COMPACT_RATIO_NUMERATOR: usize = 7;
 const APPUI_CONTEXT_COMPACT_RATIO_DENOMINATOR: usize = 10;
 const APPUI_CONTEXT_COMPACT_TARGET_NUMERATOR: usize = 2;
@@ -1139,6 +1147,35 @@ impl WsConnection {
                         reason = "closed",
                         "durable ws send failed; client gone"
                     );
+                    return Err(SendError::Closed);
+                }
+            }
+        }
+    }
+
+    /// Async twin of [`Self::send_lifecycle`] (#2807): identical error
+    /// semantics, but the stdio lane parks COOPERATIVELY (non-blocking probe
+    /// + async sleep, mirroring [`Self::send_durable_offloaded`]) instead of
+    /// a blocking `SyncSender::send` that pins an executor worker while the
+    /// turn drain loop emits its terminal forward. The WS lane keeps the
+    /// non-blocking `try_send` shape via [`Self::try_enqueue`], byte-identical
+    /// to the sync callers.
+    async fn send_lifecycle_offloaded(&self, frame: WsMessage) -> Result<(), SendError> {
+        if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(SendError::FatalClosed);
+        }
+        let Some(writer) = self.stdio_writer.as_ref() else {
+            return self.try_enqueue(frame);
+        };
+        let mut frame = frame;
+        loop {
+            match writer.try_send(frame) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    frame = returned;
+                    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                     return Err(SendError::Closed);
                 }
             }
@@ -41766,7 +41803,17 @@ async fn run_standalone_turn(
             .then(|| voice_user_content_for_persist.as_deref().unwrap_or(&prompt)),
         running_turn_probe(&contracts, &session_id, &turn_id),
     );
+    // #2807 — agent-completion signal for the drain loop: the agent task
+    // owns the sender, so it drops (and the loop's AgentFinished arm fires)
+    // the moment the body ends, whichever exit it takes — including a panic
+    // or an abort. Closed alone cannot do this: the rotator, the delivery
+    // worker, and the task supervisor keep their progress-sender clones
+    // alive past this task.
+    let (agent_finished_tx, mut agent_finished_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let progress_dropped_for_agent = Arc::clone(&progress_dropped);
     let agent_task = tokio::spawn(async move {
+        // Held for the whole body; dropped on every exit path.
+        let _agent_finished_tx = agent_finished_tx;
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
         // lane scope FIRST (innermost task-local), then router
@@ -42468,7 +42515,12 @@ async fn run_standalone_turn(
                             cache_write_tokens: u64::from(response.token_usage.cache_write_tokens),
                         },
                     });
-                    let _ = progress_tx_for_result.send(error.to_string()).await;
+                    deliver_terminal_progress_event(
+                        &progress_tx_for_result,
+                        &progress_dropped_for_agent,
+                        error.to_string(),
+                    )
+                    .await;
                     return;
                 }
                 let done = json!({
@@ -42496,7 +42548,12 @@ async fn run_standalone_turn(
                     "final_assistant_committed_seq": final_assistant_committed_seq,
                     "thread_id": turn_thread_id_for_done,
                 });
-                let _ = progress_tx_for_result.send(done.to_string()).await;
+                deliver_terminal_progress_event(
+                    &progress_tx_for_result,
+                    &progress_dropped_for_agent,
+                    done.to_string(),
+                )
+                .await;
             }
             Err(error) => {
                 // #1134 — signal the post-turn block that no LLM reply
@@ -42559,7 +42616,12 @@ async fn run_standalone_turn(
                     "tokens_cache": err_tokens_cache,
                     "token_usage": token_usage,
                 });
-                let _ = progress_tx_for_result.send(error.to_string()).await;
+                deliver_terminal_progress_event(
+                    &progress_tx_for_result,
+                    &progress_dropped_for_agent,
+                    error.to_string(),
+                )
+                .await;
             }
         }
     }.instrument(turn_span));
@@ -42712,6 +42774,7 @@ async fn run_standalone_turn(
         let event = match crate::turn_loop::next_turn_loop_step(
             &mut interrupt_rx,
             &mut progress_rx,
+            &mut agent_finished_rx,
             interrupt_observed,
         )
         .await
@@ -42724,6 +42787,38 @@ async fn run_standalone_turn(
                 break;
             }
             crate::turn_loop::TurnLoopStep::Closed => break,
+            crate::turn_loop::TurnLoopStep::AgentFinished => {
+                // #2807 — the agent body ended but no terminal event made it
+                // through the drain (its send was shed past
+                // TERMINAL_SEND_BUDGET, or the task panicked). Terminate the
+                // turn here instead of parking in recv() forever: the rotator
+                // and the delivery worker keep the progress channel open, so
+                // `Closed` alone never fires. The shed terminal frame is
+                // disclosed by the replay_lossy counter flushed below.
+                warn!(
+                    session = %session_id.0,
+                    turn = %turn_id.0,
+                    "agent task ended without a terminal event; emitting terminal_lost"
+                );
+                flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some((
+                        "terminal_lost",
+                        "the turn's result could not be delivered to the stalled connection",
+                    )),
+                    None,
+                    steer_buffer.as_ref(),
+                    peers_root.as_deref(),
+                )
+                .await;
+                break;
+            }
             crate::turn_loop::TurnLoopStep::Progress(data) => {
                 match serde_json::from_str::<Value>(&data) {
                     Ok(event) => event,
@@ -43534,7 +43629,8 @@ async fn run_standalone_turn(
             &session_id,
             &turn_id,
             interrupt_observed,
-        );
+        )
+        .await;
         if late > 0 {
             warn!(
                 session = %session_id.0,
@@ -44526,7 +44622,10 @@ async fn try_emit_terminal(
             let details = completion_details.unwrap_or_default();
             let tokens_in = details.tokens_in;
             let tokens_out = details.tokens_out;
-            let _ = send_notification_lifecycle(
+            // #2807 — the terminal frame goes through the offloaded lane so a
+            // stalled stdio host reader pins no executor worker while the
+            // drain loop emits it.
+            let _ = send_notification_lifecycle_offloaded(
                 ws,
                 ledger,
                 UiNotification::TurnCompleted(TurnCompletedEvent {
@@ -44547,7 +44646,8 @@ async fn try_emit_terminal(
                     // cache tokens instead of zeros.
                     token_usage: details.token_usage,
                 }),
-            );
+            )
+            .await;
             // The canonical `turn_completed` terminal reaches the client as a
             // native v2 `TurnTerminal`, projected from the lifecycle
             // `UiNotification::TurnCompleted` emitted above (see
@@ -44580,7 +44680,7 @@ async fn try_emit_terminal(
                             .session(Some(session_id.0.as_str())),
                     );
                 }
-                let _ = send_turn_error_with_details(
+                let _ = send_turn_error_with_details_offloaded(
                     ws,
                     ledger,
                     session_id,
@@ -44588,13 +44688,14 @@ async fn try_emit_terminal(
                     code,
                     message,
                     completion_details,
-                );
+                )
+                .await;
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
                 return;
             }
-            let _ = send_turn_error_with_details(
+            let _ = send_turn_error_with_details_offloaded(
                 ws,
                 ledger,
                 session_id,
@@ -44602,11 +44703,12 @@ async fn try_emit_terminal(
                 code,
                 message,
                 completion_details,
-            );
+            )
+            .await;
         }
         TerminalReason::Interrupted => {
             let (code, message) = error_payload.unwrap_or(("interrupted", "turn interrupted"));
-            let _ = send_turn_error(ws, ledger, session_id, turn_id, code, message);
+            let _ = send_turn_error_offloaded(ws, ledger, session_id, turn_id, code, message).await;
             // Outer-loop #4 (§4.2): an INTERRUPTED turn never reaches
             // `write_peer_result_if_peer_session` (it aborts the agent task
             // before the done/error event), so the peer's held slot must be
@@ -47183,7 +47285,7 @@ pub(crate) enum SteerReturnSink<'a> {
 /// gate every terminal outlet goes through. A client that sees the terminal
 /// without a preceding `turn/steer_dropped` naming its steer may conclude the
 /// steer was consumed.
-pub(crate) fn settle_leftover_steers(
+pub(crate) async fn settle_leftover_steers(
     buffer: &octos_agent::SharedSteerBuffer,
     sink: SteerReturnSink<'_>,
     session_id: &SessionKey,
@@ -47209,8 +47311,11 @@ pub(crate) fn settle_leftover_steers(
          to the client as turn/steer_dropped ahead of the terminal"
     );
     match sink {
+        // #2807 — the terminal gate runs inside the turn drain loop, so the
+        // live forward goes through the offloaded lane: a stalled stdio host
+        // reader must pin no executor worker while the turn terminates.
         SteerReturnSink::Live { ws, ledger } => {
-            let _ = send_notification_durable(ws, ledger, notification);
+            let _ = send_notification_durable_offloaded(ws, ledger, notification).await;
         }
         SteerReturnSink::LedgerOnly { ledger } => {
             let _ = ledger.append_notification(notification);
@@ -47248,12 +47353,16 @@ async fn transition_to_terminal_settling_steers(
             session_id,
             turn_id,
             matches!(transition.reason, TerminalReason::Interrupted),
-        );
+        )
+        .await;
     }
     Some(transition)
 }
 
-fn send_turn_error(
+/// #2807 — the turn drain loop's terminal forward: same event shape the
+/// sync `send_turn_error` family used to deliver, now through the offloaded
+/// lifecycle lane so a stalled stdio host reader pins no executor worker.
+async fn send_turn_error_offloaded(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -47261,10 +47370,13 @@ fn send_turn_error(
     code: impl Into<String>,
     message: impl Into<String>,
 ) -> Result<(), SendError> {
-    send_turn_error_with_details(ws, ledger, session_id, turn_id, code, message, None)
+    send_turn_error_with_details_offloaded(ws, ledger, session_id, turn_id, code, message, None)
+        .await
 }
 
-fn send_turn_error_with_details(
+/// #2807 — the turn drain loop's detailed terminal forward: same event
+/// shape, delivered through the offloaded lifecycle lane.
+async fn send_turn_error_with_details_offloaded(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -47274,7 +47386,7 @@ fn send_turn_error_with_details(
     details: Option<TurnCompletionDetails>,
 ) -> Result<(), SendError> {
     let details = details.unwrap_or_default();
-    send_notification_lifecycle(
+    send_notification_lifecycle_offloaded(
         ws,
         ledger,
         UiNotification::TurnError(TurnErrorEvent {
@@ -47287,6 +47399,7 @@ fn send_turn_error_with_details(
             partial_result: details.partial_result,
         }),
     )
+    .await
 }
 
 /// Wave4-A: build a `RouterStatusEvent` from an `AdaptiveRouter` snapshot.
@@ -47663,11 +47776,24 @@ fn direct_send_passes_capability_filter(ws: &WsConnection, event: &UiProtocolLed
     live_event_passes_capability_filter(event, features)
 }
 
-fn send_notification_lifecycle(
+/// The bookkeeping the delivery-twin result mappings report on, shared by
+/// the lifecycle and durable lanes.
+struct SendMeta {
+    cursor: UiCursor,
+    delivery_metric: Option<UiProtocolDeliveryMetric>,
+    method: String,
+}
+
+/// Shared prep of the sync/async lifecycle delivery twins (#2807): ledger
+/// append, v2 projection, capability filter, frame assembly. Returns the
+/// wire frame to enqueue plus its [`SendMeta`]. `Ok(None)` =
+/// fully handled without touching the wire (the v2 forwarder lane, or a
+/// capability-filtered event), so there is nothing to enqueue.
+fn prepare_lifecycle_send(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
-) -> Result<(), SendError> {
+) -> Result<Option<(WsMessage, SendMeta)>, SendError> {
     let features = ws.snapshot_live_features();
     if matches!(
         &notification,
@@ -47696,7 +47822,7 @@ fn send_notification_lifecycle(
         // `session/open`) nothing would deliver an untagged terminal, so it
         // keeps the direct lifecycle path below.
         ledger.append_notification(notification);
-        return Ok(());
+        return Ok(None);
     }
 
     // Tag the broadcast with the originating connection so this
@@ -47716,14 +47842,31 @@ fn send_notification_lifecycle(
     let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
     let method = ledger_event_method(&event_for_wire).to_string();
     if !live_event_passes_capability_filter(&event_for_wire, features) {
-        return Ok(());
+        return Ok(None);
     }
     let frame = frame_from_ledger(event_for_wire)
         .ok_or_else(|| SendError::LifecycleFailure(format!("serialize {method}")))?;
-    match ws.send_lifecycle(frame) {
+    Ok(Some((
+        frame,
+        SendMeta {
+            cursor,
+            delivery_metric,
+            method,
+        },
+    )))
+}
+
+/// Shared result mapping of the lifecycle delivery twins: delivery metric,
+/// durable-cursor bookkeeping, and the `delivery_failed` warn.
+fn finish_lifecycle_send(
+    ws: &WsConnection,
+    meta: SendMeta,
+    sent: Result<(), SendError>,
+) -> Result<(), SendError> {
+    match sent {
         Ok(()) => {
-            record_ui_protocol_delivery_metric(delivery_metric);
-            ws.metrics.record_durable_cursor(&cursor);
+            record_ui_protocol_delivery_metric(meta.delivery_metric);
+            ws.metrics.record_durable_cursor(&meta.cursor);
             Ok(())
         }
         Err(SendError::LifecycleFailure(reason)) => {
@@ -47731,7 +47874,7 @@ fn send_notification_lifecycle(
             // from the caller's perspective (turn aborts cleanly).
             tracing::warn!(
                 target: "octos::ui_protocol::ws",
-                method = %method,
+                method = %meta.method,
                 reason = %reason,
                 "lifecycle notification not delivered; entry remains in ledger as delivery_failed"
             );
@@ -47739,6 +47882,36 @@ fn send_notification_lifecycle(
         }
         Err(other) => Err(other),
     }
+}
+
+fn send_notification_lifecycle(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_lifecycle_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_lifecycle(frame);
+    finish_lifecycle_send(ws, meta, sent)
+}
+
+/// #2807 — async twin of [`send_notification_lifecycle`] for the turn drain
+/// loop's terminal forwards: identical prep, bookkeeping, and error
+/// semantics (keep the two in lockstep), but the enqueue goes through
+/// [`WsConnection::send_lifecycle_offloaded`], whose stdio lane parks this
+/// task cooperatively instead of pinning an executor worker on a blocking
+/// `SyncSender::send`.
+async fn send_notification_lifecycle_offloaded(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_lifecycle_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_lifecycle_offloaded(frame).await;
+    finish_lifecycle_send(ws, meta, sent)
 }
 
 fn send_notification_lifecycle_forced_backpressure_fixture(
@@ -47867,15 +48040,20 @@ fn goal_event_generation_admits(
     true
 }
 
-fn send_notification_durable(
+/// Shared prep of the sync/async durable delivery twins (#2807): goal guard,
+/// evidence recording, forwarder-lane routing, ledger append, v2 projection,
+/// capability filter, frame assembly. Returns the wire frame to enqueue plus
+/// its [`SendMeta`]. `Ok(None)` = fully handled without touching the wire,
+/// so there is nothing to enqueue.
+fn prepare_durable_send(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
-) -> Result<(), SendError> {
+) -> Result<Option<(WsMessage, SendMeta)>, SendError> {
     // #1959 — drop a goal chip event that a newer clear/update already
     // superseded for this session (see the guard's doc comment).
     if !goal_event_passes_generation_guard(&notification) {
-        return Ok(());
+        return Ok(None);
     }
     // M15-F5 (#44): mirror production supervised-task lifecycle updates into
     // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
@@ -47896,7 +48074,7 @@ fn send_notification_durable(
     ) && ws.has_live_forwarder(notification.session_id())
     {
         ledger.append_notification(notification);
-        return Ok(());
+        return Ok(None);
     }
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
@@ -47916,7 +48094,7 @@ fn send_notification_durable(
     let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
     let method = ledger_event_method(&event_for_wire).to_string();
     if !live_event_passes_capability_filter(&event_for_wire, features) {
-        return Ok(());
+        return Ok(None);
     }
     let frame = match frame_from_ledger(event_for_wire) {
         Some(frame) => frame,
@@ -47924,20 +48102,70 @@ fn send_notification_durable(
             return Err(SendError::BackpressureDrop);
         }
     };
-    match ws.send_durable(frame, &method) {
+    Ok(Some((
+        frame,
+        SendMeta {
+            cursor,
+            delivery_metric,
+            method,
+        },
+    )))
+}
+
+/// Shared result mapping of the durable delivery twins: delivery metric,
+/// durable-cursor bookkeeping, and the immediate replay_lossy on a
+/// backpressure drop.
+fn finish_durable_send(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    meta: SendMeta,
+    sent: Result<(), SendError>,
+) -> Result<(), SendError> {
+    match sent {
         Ok(()) => {
-            record_ui_protocol_delivery_metric(delivery_metric);
-            ws.metrics.record_durable_cursor(&cursor);
+            record_ui_protocol_delivery_metric(meta.delivery_metric);
+            ws.metrics.record_durable_cursor(&meta.cursor);
             Ok(())
         }
         Err(SendError::BackpressureDrop) => {
             // Best-effort: try to tell the client right away. If even the
             // lossy frame cannot enqueue, accumulate and flush later.
-            emit_replay_lossy_opportunistic(ws, ledger, &cursor.stream);
+            emit_replay_lossy_opportunistic(ws, ledger, &meta.cursor.stream);
             Err(SendError::BackpressureDrop)
         }
         Err(other) => Err(other),
     }
+}
+
+fn send_notification_durable(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_durable_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_durable(frame, &meta.method);
+    finish_durable_send(ws, ledger, meta, sent)
+}
+
+/// #2807 — async twin of [`send_notification_durable`] for the turn drain
+/// loop's durable forwards (the steer settlement inside the terminal gate):
+/// identical prep, metrics, and replay_lossy semantics — keep the two in
+/// lockstep — but the enqueue goes through
+/// [`WsConnection::send_durable_offloaded`], whose stdio lane parks THIS
+/// task cooperatively instead of pinning an executor worker on a blocking
+/// `SyncSender::send`.
+async fn send_notification_durable_offloaded(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_durable_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_durable_offloaded(frame, &meta.method).await;
+    finish_durable_send(ws, ledger, meta, sent)
 }
 
 fn send_notification_ephemeral(
@@ -48243,6 +48471,30 @@ fn emit_replay_lossy_opportunistic(
             "replay_lossy could not be queued; will retry on next send"
         );
     }
+}
+
+/// #2807 — deliver the agent task's terminal event into the shared progress
+/// channel under [`TERMINAL_SEND_BUDGET`]. On a stalled consumer the send is
+/// shed and counted into the turn's drop counter (surfaced as
+/// `replay_lossy` at the turn boundary); the drain loop's completion-signal
+/// arm then terminates the turn with `terminal_lost` instead of parking.
+async fn deliver_terminal_progress_event(
+    tx: &tokio::sync::mpsc::Sender<String>,
+    progress_dropped: &AtomicU64,
+    payload: String,
+) {
+    if tokio::time::timeout(TERMINAL_SEND_BUDGET, tx.send(payload))
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    progress_dropped.fetch_add(1, Ordering::Relaxed);
+    metrics::counter!("ws.send.drop.backpressure", "method" => "turn_terminal").increment(1);
+    tracing::warn!(
+        budget_secs = TERMINAL_SEND_BUDGET.as_secs(),
+        "terminal progress event shed past the send budget; counted into replay_lossy"
+    );
 }
 
 /// Drain any accumulated drops as a final `protocol/replay_lossy` before a

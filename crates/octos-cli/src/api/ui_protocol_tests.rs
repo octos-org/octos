@@ -43535,8 +43535,8 @@ fn ledgered_steer_dropped(
         .collect()
 }
 
-#[test]
-fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
+#[tokio::test]
+async fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = Arc::new(UiProtocolLedger::new(16));
@@ -43555,7 +43555,8 @@ fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
         &session_id,
         &turn_id,
         true,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 2);
     assert!(buffer.is_empty(), "the buffer is drained");
@@ -43580,8 +43581,8 @@ fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
     assert_eq!(ledgered[0].reason, "interrupted");
 }
 
-#[test]
-fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
+#[tokio::test]
+async fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = Arc::new(UiProtocolLedger::new(16));
@@ -43599,7 +43600,8 @@ fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
         &session_id,
         &turn_id,
         false,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 1);
     let frame = steer_dropped_frame(&writer_rx);
@@ -43607,8 +43609,8 @@ fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
     assert_eq!(frame["params"]["inputs"], json!(["late steer"]));
 }
 
-#[test]
-fn no_leftover_steers_emits_nothing() {
+#[tokio::test]
+async fn no_leftover_steers_emits_nothing() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = Arc::new(UiProtocolLedger::new(16));
@@ -43625,7 +43627,8 @@ fn no_leftover_steers_emits_nothing() {
         &session_id,
         &turn_id,
         true,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 0);
     assert!(
@@ -43656,8 +43659,8 @@ fn no_leftover_steers_emits_nothing() {
     assert_eq!(keys, vec!["session_id", "turn_id", "code", "message"]);
 }
 
-#[test]
-fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
+#[tokio::test]
+async fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
     let ws = WsConnection::new_stdio(writer_tx);
     // Simulate a dead stdio peer: the receiver is gone, so every send fails.
@@ -43677,7 +43680,8 @@ fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
         &session_id,
         &turn_id,
         true,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 1);
     let ledgered = ledgered_steer_dropped(&ledger, &session_id);
