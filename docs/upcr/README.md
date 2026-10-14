@@ -72,6 +72,7 @@ records.
 | 044 | Manifest-Declared Skill Actions | accepted | `..._044_SKILL_ACTIONS.md` | #1637 |
 | 045 | Skill Action Background Jobs | accepted | `..._045_SKILL_ACTION_JOBS.md` | #1637 |
 | 046 | Server-Owned Session Identity Binding for Raw Wire Ids | proposed | `..._046_SESSION_IDENTITY_BINDING.md` | #2162 |
+| 049 | Oversized-Frame Preview Runs Off The Executor Worker | implemented | `..._049_OVERSIZED_FRAME_PREVIEW_OFFLOAD.md` | #2446 |
 
 ## Renumbering history
 
@@ -88,7 +89,9 @@ records.
   repository's history.
 
 In flight: **042** is currently claimed by two open PRs — #2730 (record-only
-session history append) and #2761 (read-only workspace changes snapshots).
-Whichever lands first keeps the number and adds its row; the other renumbers
-per the rules above — the `check` job's lint flags the collision once the
-loser's branch updates onto main.
+session history append) and #2761 (read-only workspace changes snapshots) —
+**047** by #2801 (budgeted `monitor/expired` ledger admission), **048** by
+#2810 (cooperative turn-drain delivery), and **049** by the oversized-frame
+preview offload. Whichever lands first keeps its number and adds its row;
+the other renumbers per the rules above — the `check` job's lint flags the
+collision once the loser's branch updates onto main.
