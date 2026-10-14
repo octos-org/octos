@@ -1,0 +1,26 @@
+name: Quality gates
+
+# The code-quality half of the CI policy (docs/CI_POLICY.md).
+#
+# Formatting, clippy (-D warnings), tests, typos and the security scan are
+# already enforced by .github/workflows/ci.yml — do NOT duplicate those heavy
+# jobs here. This workflow adds the one thing ci.yml does not have: a ratchet
+# that stops pre-existing quality debt from growing. It is text-only, so it
+# needs no Rust toolchain and finishes in seconds.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ratchet:
+    name: Quality ratchet
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the quality baseline
+        run: scripts/quality-ratchet.sh
