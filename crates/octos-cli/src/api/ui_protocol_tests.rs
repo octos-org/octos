@@ -17128,8 +17128,8 @@ fn should_deliver_monitor_expired_from_the_reconcile_sweep_through_the_productio
 #[test]
 fn should_cap_monitor_expired_at_the_per_session_budget_through_the_production_sink() {
     use crate::autonomy::agent_orchestrator::{
-        AgentOrchestrator as _, InProcessAgentOrchestrator, MonitorCreateRequest,
-        MONITOR_EXPIRED_MAX_PER_WINDOW,
+        AgentOrchestrator as _, InProcessAgentOrchestrator, MONITOR_EXPIRED_MAX_PER_WINDOW,
+        MonitorCreateRequest,
     };
 
     let _guard = crate::autonomy::agent_orchestrator::monitor_expired_test_guard();
