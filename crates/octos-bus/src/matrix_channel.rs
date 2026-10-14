@@ -853,8 +853,13 @@ struct AppserviceState {
     dedup: Arc<MessageDedup>,
     bot_router: Arc<BotRouter>,
     bot_manager: Option<Arc<dyn BotManager>>,
-    /// Directory for downloaded media files (inbound images, files, audio, video).
-    media_dir: PathBuf,
+    /// Directory for downloaded media files (inbound images, files, audio,
+    /// video). `None` (the default) disables inbound media downloads — there
+    /// is deliberately no fallback location: a shared fixed path under the
+    /// temp directory would hand every local user a predictable target for
+    /// another process's private attachments. Configure via
+    /// [`MatrixChannel::with_media_dir`]. (#2802)
+    media_dir: Option<PathBuf>,
     /// When set, the bot only replies in a multi-participant room if it was
     /// explicitly addressed (mention / pill / explicit target). A 1:1 DM (the
     /// bot plus a single human) still replies to every message. Safe-by-default.
@@ -915,8 +920,9 @@ pub struct MatrixChannel {
     /// M7.3 swarm supervisor state. `None` means the supervisor contract is
     /// disabled and the channel behaves exactly like pre-M7.3 (invariant 5).
     swarm_supervisor: Option<Arc<SwarmSupervisorState>>,
-    /// Directory for downloaded media files (inbound images, files, audio, video).
-    media_dir: PathBuf,
+    /// Directory for downloaded media files (inbound images, files, audio,
+    /// video). See the `AppserviceState` field of the same name.
+    media_dir: Option<PathBuf>,
     /// Mention-only gating (see [`AppserviceState::mention_only`]). Defaults to
     /// `true`; override via [`MatrixChannel::with_mention_only`].
     mention_only: bool,
@@ -969,7 +975,7 @@ impl MatrixChannel {
             admin_allowed_senders: HashSet::new(),
             event_senders: Arc::new(RwLock::new(VecDeque::new())),
             swarm_supervisor: None,
-            media_dir: std::env::temp_dir().join("octos-matrix-media"),
+            media_dir: None,
             mention_only: true,
             dm_member_cache: Arc::new(RwLock::new(HashMap::new())),
             dm_member_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -978,7 +984,7 @@ impl MatrixChannel {
 
     /// Set the directory for downloaded media files.
     pub fn with_media_dir(mut self, media_dir: PathBuf) -> Self {
-        self.media_dir = media_dir;
+        self.media_dir = Some(media_dir);
         self
     }
 
@@ -1762,27 +1768,35 @@ async fn handle_transaction(
                     chrono::Utc::now().timestamp_millis(),
                     sanitize_inbound_filename(filename),
                 );
-                match crate::media::download_media(
-                    &state.http,
-                    &download_url,
-                    &[("Authorization", &format!("Bearer {}", state.as_token))],
-                    &state.media_dir,
-                    &unique_filename,
-                )
-                .await
-                {
-                    Ok(local_path) => {
-                        info!(
-                            mxc_url,
-                            filename,
-                            ?local_path,
-                            "downloaded Matrix media file"
-                        );
-                        media.push(local_path.to_string_lossy().into_owned());
+                if let Some(media_dir) = state.media_dir.as_deref() {
+                    match crate::media::download_media(
+                        &state.http,
+                        &download_url,
+                        &[("Authorization", &format!("Bearer {}", state.as_token))],
+                        media_dir,
+                        &unique_filename,
+                    )
+                    .await
+                    {
+                        Ok(local_path) => {
+                            info!(
+                                mxc_url,
+                                filename,
+                                ?local_path,
+                                "downloaded Matrix media file"
+                            );
+                            media.push(local_path.to_string_lossy().into_owned());
+                        }
+                        Err(e) => {
+                            warn!(mxc_url, error = %e, "failed to download Matrix media file, continuing without media");
+                        }
                     }
-                    Err(e) => {
-                        warn!(mxc_url, error = %e, "failed to download Matrix media file, continuing without media");
-                    }
+                } else {
+                    warn!(
+                        mxc_url,
+                        filename,
+                        "media_dir not configured; dropping inbound media (set it via with_media_dir)"
+                    );
                 }
             }
         }

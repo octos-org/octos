@@ -153,7 +153,7 @@ libc = "0.2"
 # Safe openat/mkdirat for the #1976 write-grant component-wise confined walk
 # (closes the ancestor-symlink TOCTOU under the workspace-wide deny(unsafe_code)
 # lint — rustix wraps the raw syscalls in a safe API). Already vendored
-# transitively; pinned here as a direct dep of octos-agent.
+# transitively; pinned here as a direct dep of octos-agent and octos-bus.
 rustix = { version = "1", features = ["fs"] }
 # LRU cache
 lru = "0.16"

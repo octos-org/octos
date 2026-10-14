@@ -35,7 +35,7 @@ fn make_test_state(inbound_tx: mpsc::Sender<InboundMessage>) -> AppserviceState 
         dedup: Arc::new(MessageDedup::new()),
         bot_router: Arc::new(BotRouter::new(None)),
         bot_manager: None,
-        media_dir: std::env::temp_dir().join("octos-matrix-test-media"),
+        media_dir: Some(std::env::temp_dir().join("octos-matrix-test-media")),
         // Existing transaction tests exercise routing/enqueue without the
         // mention gate; enable it explicitly in the gate's own tests.
         mention_only: false,
@@ -935,6 +935,87 @@ async fn media_download_redirect_does_not_leak_as_token() {
 }
 
 #[tokio::test]
+async fn inbound_media_without_a_configured_media_dir_downloads_nothing() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    // Counting homeserver: any download attempt here means the channel fell
+    // back to some location it was never given (#2802).
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let hit = downloads.clone();
+    let homeserver = Router::new().route(
+        "/_matrix/media/v3/download/{server}/{media_id}",
+        get(move || {
+            let hit = hit.clone();
+            async move {
+                hit.fetch_add(1, Ordering::SeqCst);
+                vec![9u8; 16]
+            }
+        }),
+    );
+    let homeserver_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let homeserver_addr = homeserver_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(homeserver_listener, homeserver).await.unwrap();
+    });
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
+    let mut state = make_test_state(inbound_tx);
+    state.http = reqwest::Client::new();
+    state.homeserver = format!("http://{homeserver_addr}");
+    // The channel default: no media dir configured at all.
+    state.media_dir = None;
+
+    let app = Router::new()
+        .route(
+            "/_matrix/app/v1/transactions/{txn_id}",
+            put(handle_transaction),
+        )
+        .with_state(state);
+
+    let body = json!({
+        "events": [{
+            "type": "m.room.message",
+            "sender": "@alice:elsewhere.org",
+            "room_id": "!room:localhost",
+            "event_id": "$ev_unconfigured_media",
+            "content": {
+                "msgtype": "m.image",
+                "body": "",
+                "filename": "notes.txt",
+                "url": "mxc://localhost/ABC123"
+            }
+        }]
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/_matrix/app/v1/transactions/txn_unconfigured_media")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test_token")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The message still arrives (text-only degrade), but nothing was
+    // downloaded into any implicit location.
+    let msg = inbound_rx.try_recv().unwrap();
+    assert!(
+        msg.media.is_empty(),
+        "unconfigured media dir must yield no media: {:?}",
+        msg.media
+    );
+    assert_eq!(
+        downloads.load(Ordering::SeqCst),
+        0,
+        "an unconfigured channel must not attempt the download"
+    );
+}
+
+#[tokio::test]
 async fn inbound_media_filename_is_sanitized() {
     use axum::body::Body;
     use axum::http::Request;
@@ -956,7 +1037,7 @@ async fn inbound_media_filename_is_sanitized() {
     state.http = ch.http.clone();
     state.homeserver = format!("http://{homeserver_addr}");
     let media_dir = tempfile::TempDir::new().unwrap();
-    state.media_dir = media_dir.path().to_path_buf();
+    state.media_dir = Some(media_dir.path().to_path_buf());
 
     let app = Router::new()
         .route(
@@ -1857,7 +1938,7 @@ async fn should_download_media_and_attach_path_when_inbound_image_event() {
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundMessage>(16);
     let mut state = make_test_state(inbound_tx);
     state.homeserver = homeserver;
-    state.media_dir = media_dir.path().to_path_buf();
+    state.media_dir = Some(media_dir.path().to_path_buf());
 
     let app = Router::new()
         .route(
@@ -1924,7 +2005,7 @@ async fn should_deliver_text_only_when_media_download_fails() {
     let mut state = make_test_state(inbound_tx);
     // Unreachable homeserver — download must fail, message must still flow.
     state.homeserver = "http://127.0.0.1:1".to_string();
-    state.media_dir = media_dir.path().to_path_buf();
+    state.media_dir = Some(media_dir.path().to_path_buf());
 
     let app = Router::new()
         .route(
