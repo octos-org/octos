@@ -196,3 +196,11 @@ tsconfig.tsbuildinfo
 # `git add -A` here otherwise sweeps hundreds of artifact files — and any
 # workspace dirs the soaks `git init` — into a commit.
 /scratchpad/
+
+# CI policy documents — tracked despite the global `*.md` ignore above.
+# The PR template and CODEOWNERS must be tracked for GitHub to pick them up.
+!docs/CI_POLICY.md
+!docs/reports/
+!docs/reports/**
+!.github/BRANCH_LIFECYCLE.md
+!.github/pull_request_template.md

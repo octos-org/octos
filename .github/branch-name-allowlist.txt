@@ -1,0 +1,8 @@
+# Branch names exempted from the naming check in ci-branch-naming.yml.
+# One name per line, no 'origin/' prefix. Keep this list short and shrinking:
+# it exists only for branches that predate the policy and are still open.
+#
+# Review this file whenever a PR is merged — remove the line with the branch.
+
+improve_truncate_utf8
+chris/multi-channel-instances
