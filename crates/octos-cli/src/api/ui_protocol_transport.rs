@@ -170,6 +170,13 @@ const PROGRESS_CHANNEL_CAPACITY: usize = 1024;
 /// loss and the completion-signal arm delivers the terminal. Same stall
 /// model and budget as `progress_delivery::FLUSH_DEADLINE`.
 const TERMINAL_SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// #2815 — wall-clock budget for the agent task's own approval/question
+/// prompt sends (`approval/requested`, `approval/decided`,
+/// `approval/auto_resolved`, `user_question/requested`). These run on the
+/// agent task while it holds the turn's completion sender, so a send that
+/// parks past this budget sheds instead of parking the whole turn forever
+/// — the same stall model as [`TERMINAL_SEND_BUDGET`].
+const PROMPT_SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 const APPUI_CONTEXT_COMPACT_RATIO_NUMERATOR: usize = 7;
 const APPUI_CONTEXT_COMPACT_RATIO_DENOMINATOR: usize = 10;
 const APPUI_CONTEXT_COMPACT_TARGET_NUMERATOR: usize = 2;
@@ -6549,11 +6556,12 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
             // closed) we still apply the recorded decision — the runtime
             // already trusts the policy. Per FIX-04, `approval/auto_resolved`
             // is durable: drops surface as `protocol/replay_lossy`.
-            let _ = send_notification_durable(
+            let _ = send_notification_durable_offloaded_budgeted(
                 &self.ws,
                 &self.ledger,
                 UiNotification::ApprovalAutoResolved(auto),
-            );
+            )
+            .await;
 
             // FIX-07: build + emit the canonical `approval/decided` record.
             // `decided_by` is empty because the decision is system-issued
@@ -6585,11 +6593,12 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
                     );
                 }
             }
-            let _ = send_notification_durable(
+            let _ = send_notification_durable_offloaded_budgeted(
                 &self.ws,
                 &self.ledger,
                 UiNotification::ApprovalDecided(decided_event),
-            );
+            )
+            .await;
 
             return match hit.decision {
                 ApprovalDecision::Approve => ToolApprovalDecision::Approve,
@@ -6704,11 +6713,13 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
 
         // Approvals are durable: if the WS drop strands the request, the
         // ledger still records it and the client can rehydrate.
-        if let Err(err) = send_notification_durable(
+        if let Err(err) = send_notification_durable_offloaded_budgeted(
             &self.ws,
             &self.ledger,
             UiNotification::ApprovalRequested(event),
-        ) {
+        )
+        .await
+        {
             match err {
                 SendError::Closed | SendError::FatalClosed => {
                     // Keep the approval pending: a reconnecting client replays
@@ -6762,11 +6773,12 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
 }
 
 /// #2811 — async so the cancel notification enqueues through the same
-/// offloaded durable lane the calling arms use. The reachable error set
-/// (WS backpressure, or a dead/latched stdio lane) returns without
-/// waiting — this is consistency with the arms, not a new wait path; the
-/// cooperative park only matters if a live-but-full stdio queue ever
-/// reaches it.
+/// budgeted offloaded durable lane the calling arms use (#2815): a send
+/// that failed on a stalled consumer left the very same queue full, so an
+/// unbudgeted cooperative park here would move the hang one frame later.
+/// The `approval/cancelled` ledger row is appended by `prepare_durable_send`
+/// before the enqueue attempt, so a shed cancel frame still reaches a
+/// reconnecting client via replay.
 async fn cancel_approval_after_request_send_failure(
     contracts: &UiProtocolContractStores,
     ws: &WsConnection,
@@ -6784,7 +6796,7 @@ async fn cancel_approval_after_request_send_failure(
         return;
     };
 
-    let _ = send_notification_durable_offloaded(
+    let _ = send_notification_durable_offloaded_budgeted(
         ws,
         ledger,
         UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
@@ -7074,11 +7086,13 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
         // still records it and a reconnecting client can rehydrate. We cancel
         // the pending entry and degrade to the fallback so the turn continues
         // rather than hanging on a dead channel.
-        if let Err(err) = send_notification_durable(
+        if let Err(err) = send_notification_durable_offloaded_budgeted(
             &self.ws,
             &self.ledger,
             UiNotification::UserQuestionRequested(event),
-        ) {
+        )
+        .await
+        {
             // Explicit send-failure cancellation records the precise reason;
             // disarm the guard so its `Drop` does not also fire (a no-op on a
             // now-cancelled entry, but cleaner to skip).
@@ -48293,6 +48307,60 @@ async fn send_notification_durable_offloaded(
         return Ok(());
     };
     let sent = ws.send_durable_offloaded(frame, &meta.method).await;
+    finish_durable_send(ws, ledger, meta, sent)
+}
+
+/// #2815 — budgeted twin of [`send_notification_durable_offloaded`] for the
+/// agent task's own approval/question prompt sends. The caller parks the
+/// agent task — the one task that holds the turn's completion sender — so a
+/// full stdio queue must not hold it past [`PROMPT_SEND_BUDGET`]: past the
+/// budget the send sheds as [`SendError::BackpressureDrop`], the same shape
+/// a full WS queue produces instantly, and the callers' existing
+/// fail-closed arms (cancel + deny / fallback) run. The shed flows through
+/// `finish_durable_send`'s backpressure accounting, so the lossy frame is
+/// disclosed immediately. Dropping the inner future is safe: the offloaded
+/// lane is cancellable at every await with an atomic enqueue (#2065).
+async fn send_notification_durable_offloaded_budgeted(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_durable_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = match tokio::time::timeout(
+        PROMPT_SEND_BUDGET,
+        ws.send_durable_offloaded(frame, &meta.method),
+    )
+    .await
+    {
+        Ok(sent) => sent,
+        Err(_elapsed) => {
+            // A concurrent lifecycle failure may have latched the
+            // connection during the park; report the latch instead of
+            // masking it as backpressure, so the caller's keep-pending arm
+            // sees the same `FatalClosed` the probe loop would have
+            // returned (no drop accounting, mirroring `send_durable`'s
+            // latched arm).
+            if ws.failed.load(Ordering::Acquire) {
+                return Err(SendError::FatalClosed);
+            }
+            // Mirror send_durable's BackpressureDrop accounting: the count
+            // lands in the accumulator first, then finish_durable_send's
+            // immediate replay_lossy attempt discloses it (or re-queues the
+            // count when the lossy frame cannot enqueue either).
+            ws.metrics.dropped_count.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("ws.send.drop.backpressure", "method" => meta.method.clone())
+                .increment(1);
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                method = %meta.method,
+                budget_secs = PROMPT_SEND_BUDGET.as_secs(),
+                "durable prompt send shed past the send budget on a stalled consumer"
+            );
+            Err(SendError::BackpressureDrop)
+        }
+    };
     finish_durable_send(ws, ledger, meta, sent)
 }
 
