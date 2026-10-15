@@ -74,6 +74,7 @@ records.
 | 046 | Server-Owned Session Identity Binding for Raw Wire Ids | proposed | `..._046_SESSION_IDENTITY_BINDING.md` | #2162 |
 | 048 | Cooperative Turn-Drain Delivery With A Budgeted Terminal Shed | implemented | `..._048_STALLED_CONSUMER_TERMINATION.md` | #2810 |
 | 050 | Turn-Task Delivery Residue — the Last Sync Durable Sends, Unified Lifecycle Error Shapes, and Real Usage for Shed Turns | implemented | `..._050_TURN_TASK_DELIVERY_RESIDUE.md` | #2811 |
+| 051 | Agent-Task Prompt Sends — Budgeted Cooperative Delivery for Approvals and Questions | implemented | `..._051_AGENT_PROMPT_SEND_BUDGET.md` | #2815 |
 
 ## Renumbering history
 
@@ -91,9 +92,8 @@ records.
 
 In flight: **042** is currently claimed by two open PRs — #2730 (record-only
 session history append) and #2761 (read-only workspace changes snapshots) —
-**047** by #2801 (budgeted `monitor/expired` ledger admission), **049** by
-#2812 (oversized-frame hydrate-preview offload), and **050** by the #2811
-residue PR (turn-task delivery residue). Whichever lands first keeps its
-number and adds its row; the other renumbers per the rules above — the
-`check` job's lint flags the collision once the loser's branch updates onto
-main.
+**047** by #2801 (budgeted `monitor/expired` ledger admission), and **049**
+by #2812 (oversized-frame hydrate-preview offload). Whichever lands first
+keeps its number and adds its row; the other renumbers per the rules
+above — the `check` job's lint flags the collision once the loser's branch
+updates onto main.

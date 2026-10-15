@@ -469,3 +469,254 @@ fn terminal_lost_arm_folds_the_live_tracker_spend_before_the_peer_result() {
         "usage must fold before the peer-result write consumes it"
     );
 }
+
+// ---- #2815 / UPCR-2026-051 — the agent task's prompt sends are budgeted ----
+//
+// `request_approval` / `request_user_question` run on the agent task and
+// enqueued their prompt frames through the blocking durable send: a stalled
+// `octos serve --stdio` host filled the bounded writer queue and parked the
+// agent task outside every budget — pinning an executor worker and holding
+// the completion sender, so the drain loop never observed `AgentFinished`
+// and the turn hung forever (the #2803/#2807 hang shape one task over).
+
+/// Outer cap for the stalled-prompt tests. The bounded path spends at most
+/// two prompt budgets (the `approval/cancelled` follow-up sheds on the same
+/// full queue); the cap only has to separate "bounded" from "forever", so
+/// it stays generous for the slower CI shards.
+const STALLED_PROMPT_BUDGET_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A real serve-runtime fixture for the stalled-prompt tests: a bootstrapped
+/// dev profile under a tempdir, a non-peer session key, and default contract
+/// stores. The requester paths only need the runtime's data dir and the
+/// state handle — no LLM, no live session manager.
+struct StalledPromptFx {
+    _tmp: tempfile::TempDir,
+    state: Arc<AppState>,
+    peers_root: PathBuf,
+    session_id: SessionKey,
+    turn_id: TurnId,
+    contracts: Arc<UiProtocolContractStores>,
+}
+
+async fn stalled_prompt_fixture() -> StalledPromptFx {
+    let tmp = tempfile::tempdir().unwrap();
+    let profile = crate::profiles::UserProfile {
+        id: "dev".to_string(),
+        name: "Dev".to_string(),
+        enabled: true,
+        data_dir: None,
+        parent_id: None,
+        public_subdomain: None,
+        config: crate::profiles::ProfileConfig {
+            llm: Some(crate::profiles::LlmProfileConfig {
+                primary: Some(crate::profiles::LlmModelSelectionConfig {
+                    family_id: Some("openai".to_string()),
+                    model_id: Some("gpt-4o-mini".to_string()),
+                    route: Some(crate::profiles::LlmRouteConfig {
+                        route_id: None,
+                        label: None,
+                        base_url: None,
+                        api_key_env: Some("STALLED_PROMPT_TEST_KEY".to_string()),
+                        api_type: None,
+                    }),
+                    ..Default::default()
+                }),
+                fallbacks: Vec::new(),
+            }),
+            env_vars: [(
+                "STALLED_PROMPT_TEST_KEY".to_string(),
+                "test-key".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        },
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let runtime = crate::runtime::ProfileRuntime::bootstrap(
+        &profile,
+        &data_dir,
+        None,
+        crate::runtime::BootstrapRole::Serve,
+    )
+    .await
+    .expect("bootstrap dev runtime");
+    let mut state = AppState::empty_for_tests();
+    state.profiles.insert("dev".to_string(), runtime.clone());
+    StalledPromptFx {
+        peers_root: runtime.data_dir.join("peers"),
+        session_id: SessionKey::with_profile_topic("dev", "api", "stalled-prompt", "system"),
+        turn_id: TurnId::new(),
+        contracts: Arc::new(UiProtocolContractStores::default()),
+        state: Arc::new(state),
+        _tmp: tmp,
+    }
+}
+
+/// A REAL stdio-lane connection whose bounded writer queue is full with no
+/// reader — the exact shape a stalled `octos serve --stdio` host presents
+/// to the agent task. The receiver is returned untouched so a test can
+/// prove the shed frames never landed.
+fn full_stalled_stdio_connection() -> (WsConnection, std::sync::mpsc::Receiver<WsMessage>) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<WsMessage>(WS_WRITER_CHANNEL_CAPACITY);
+    for _ in 0..WS_WRITER_CHANNEL_CAPACITY {
+        tx.send(WsMessage::Text("stall".into()))
+            .expect("filling to capacity never blocks");
+    }
+    (WsConnection::new_stdio(tx), rx)
+}
+
+/// #2815 — the budgeted prompt lane sheds a full stdio queue past the send
+/// budget as a backpressure drop (the same shape a full WS queue produces
+/// instantly), and the loss lands in the replay_lossy accumulator.
+#[tokio::test(start_paused = true)]
+async fn budgeted_prompt_send_sheds_past_the_budget_on_a_full_stdio_queue() {
+    let (writer_tx, _writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    writer_tx
+        .send(WsMessage::Text("queued".into()))
+        .expect("fill the stdio slot");
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = UiProtocolLedger::new(16);
+    let sent =
+        send_notification_durable_offloaded_budgeted(&ws, &ledger, stall_probe_notification())
+            .await;
+    assert!(
+        matches!(sent, Err(SendError::BackpressureDrop)),
+        "the shed must surface as a backpressure drop, got {sent:?}"
+    );
+    assert_eq!(
+        ws.metrics.dropped_count.load(Ordering::Relaxed),
+        1,
+        "the shed must land in the replay_lossy accumulator"
+    );
+}
+
+/// Healthy host: the budgeted prompt lane delivers untouched and counts
+/// nothing.
+#[tokio::test]
+async fn budgeted_prompt_send_delivers_when_the_host_reads() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = UiProtocolLedger::new(16);
+    send_notification_durable_offloaded_budgeted(&ws, &ledger, stall_probe_notification())
+        .await
+        .expect("delivery on an empty queue");
+    assert_eq!(ws.metrics.dropped_count.load(Ordering::Relaxed), 0);
+    let frame = writer_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the probe frame must land");
+    match frame {
+        WsMessage::Text(text) => assert!(
+            text.contains("stall_probe"),
+            "the delivered frame must carry the probe warning: {text}"
+        ),
+        other => panic!("unexpected non-text frame: {other:?}"),
+    }
+}
+
+/// The smallest durable notification shape the budgeted-lane unit tests
+/// can drive.
+fn stall_probe_notification() -> UiNotification {
+    UiNotification::Warning(octos_core::ui_protocol::WarningEvent {
+        session_id: SessionKey("local:stall-budget".into()),
+        turn_id: None,
+        code: "stall_probe".to_owned(),
+        message: "probe".to_owned(),
+    })
+}
+
+/// #2815 — a stalled stdio host must not park the agent task's approval
+/// prompt outside every budget: the send sheds, the fail-closed arm cancels
+/// the pending approval, and the tool call is denied. Before the budget the
+/// blocking `SyncSender::send` parked the task (and with it the turn's
+/// completion signal) forever on exactly this fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_stdio_queue_sheds_the_agent_approval_prompt_within_budget() {
+    use octos_agent::ToolApprovalRequester as _;
+    let fx = stalled_prompt_fixture().await;
+    let (ws, _rx) = full_stalled_stdio_connection();
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let requester = UiProtocolApprovalRequester {
+        ws,
+        ledger,
+        contracts: Arc::clone(&fx.contracts),
+        state: Arc::clone(&fx.state),
+        peers_root: fx.peers_root.clone(),
+        session_id: fx.session_id.clone(),
+        turn_id: fx.turn_id.clone(),
+        features: ConnectionUiFeatures::default(),
+    };
+    let request = octos_agent::ToolApprovalRequest {
+        tool_id: "call-1".to_owned(),
+        tool_name: "shell".to_owned(),
+        title: "Run a shell command".to_owned(),
+        body: "rm -rf ./build-cache".to_owned(),
+        command: Some("rm -rf ./build-cache".to_owned()),
+        cwd: None,
+        once_only: false,
+        host_tool: None,
+    };
+    let handle = tokio::spawn(async move { requester.request_approval(request).await });
+    let decision = tokio::time::timeout(STALLED_PROMPT_BUDGET_CAP, handle)
+        .await
+        .expect("the approval prompt send must shed past its budget instead of parking the agent task forever")
+        .expect("requester task must not panic");
+    assert_eq!(
+        decision,
+        octos_agent::ToolApprovalDecision::Deny,
+        "a shed approval request fails closed"
+    );
+    assert!(
+        fx.contracts
+            .approvals
+            .pending_for_session(&fx.session_id)
+            .is_empty(),
+        "the pending approval must be cancelled after the shed"
+    );
+}
+
+/// #2815 — the same bound for the agent task's question prompt: on a
+/// stalled stdio host the send sheds and the tool degrades to the
+/// `Unsupported` fallback (cancelling the pending question) instead of
+/// parking the turn forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_stdio_queue_sheds_the_agent_question_prompt_within_budget() {
+    use octos_agent::UserQuestionRequester as _;
+    let fx = stalled_prompt_fixture().await;
+    let (ws, _rx) = full_stalled_stdio_connection();
+    let ledger = Arc::new(UiProtocolLedger::new(64));
+    let requester = SessionUserQuestionRequester {
+        ws,
+        ledger,
+        contracts: Arc::clone(&fx.contracts),
+        state: Arc::clone(&fx.state),
+        peers_root: fx.peers_root.clone(),
+        session_id: fx.session_id.clone(),
+        turn_id: fx.turn_id.clone(),
+    };
+    let request = octos_agent::UserQuestionRequest {
+        questions: Vec::new(),
+        title: "Pick a datastore".to_owned(),
+        body: "Postgres or SQLite?".to_owned(),
+    };
+    let handle = tokio::spawn(async move { requester.request_user_question(request).await });
+    let outcome = tokio::time::timeout(STALLED_PROMPT_BUDGET_CAP, handle)
+        .await
+        .expect("the question prompt send must shed past its budget instead of parking the agent task forever")
+        .expect("requester task must not panic");
+    assert_eq!(
+        outcome,
+        octos_agent::UserQuestionOutcome::Unsupported,
+        "a shed question request degrades to the fallback"
+    );
+    assert!(
+        fx.contracts
+            .user_questions
+            .pending_for_session(&fx.session_id)
+            .is_empty(),
+        "the pending question must be cancelled after the shed"
+    );
+}
