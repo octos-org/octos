@@ -42843,8 +42843,8 @@ async fn run_standalone_turn(
                 // closing work mirrors the error arm minus the event-carried
                 // fields (the goal sentinel died with the shed event; the
                 // usage below charges the live tracker instead, #2811).
-                final_tokens_consumed = final_tokens_consumed
-                    .saturating_add(tracker_live_spend(&token_tracker));
+                final_tokens_consumed =
+                    final_tokens_consumed.saturating_add(tracker_live_spend(&token_tracker));
                 let lost_message =
                     "the agent task ended without producing a deliverable terminal event";
                 warn!(
