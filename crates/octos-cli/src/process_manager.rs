@@ -1117,9 +1117,10 @@ impl ProcessManager {
         let data_dir = self.profile_store.resolve_data_dir(profile);
         let auth_dir = data_dir.join("whatsapp-auth");
         let media_dir = data_dir.join("whatsapp-media");
-        std::fs::create_dir_all(&auth_dir)?;
-        // Bridge media is private session data; create it owner-only like
-        // the bus's own media dirs (#2426).
+        // Bridge credentials are at least as sensitive as the attachments;
+        // both directories are owner-only and refused if foreign-owned
+        // (#2426, #2802).
+        octos_bus::media::ensure_private_dir(&auth_dir)?;
         octos_bus::media::ensure_private_dir(&media_dir)?;
 
         let node = find_node()?;
