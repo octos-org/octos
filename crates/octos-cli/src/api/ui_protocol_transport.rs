@@ -6776,8 +6776,9 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
 /// budgeted offloaded durable lane the calling arms use (#2815): a send
 /// that failed on a stalled consumer left the very same queue full, so an
 /// unbudgeted cooperative park here would move the hang one frame later.
-/// The ledger row is already recorded by `cancel_pending_approval`, so a
-/// shed cancel frame still reaches a reconnecting client via replay.
+/// The `approval/cancelled` ledger row is appended by `prepare_durable_send`
+/// before the enqueue attempt, so a shed cancel frame still reaches a
+/// reconnecting client via replay.
 async fn cancel_approval_after_request_send_failure(
     contracts: &UiProtocolContractStores,
     ws: &WsConnection,
@@ -48309,6 +48310,15 @@ async fn send_notification_durable_offloaded_budgeted(
     {
         Ok(sent) => sent,
         Err(_elapsed) => {
+            // A concurrent lifecycle failure may have latched the
+            // connection during the park; report the latch instead of
+            // masking it as backpressure, so the caller's keep-pending arm
+            // sees the same `FatalClosed` the probe loop would have
+            // returned (no drop accounting, mirroring `send_durable`'s
+            // latched arm).
+            if ws.failed.load(Ordering::Acquire) {
+                return Err(SendError::FatalClosed);
+            }
             // Mirror send_durable's BackpressureDrop accounting: the count
             // lands in the accumulator first, then finish_durable_send's
             // immediate replay_lossy attempt discloses it (or re-queues the

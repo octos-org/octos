@@ -617,6 +617,29 @@ async fn budgeted_prompt_send_delivers_when_the_host_reads() {
     }
 }
 
+/// A disconnected stdio lane reports `Closed` through the budgeted prompt
+/// lane — the keep-pending arm's trigger — exactly like the blocking
+/// send's error did, with no drop accounting.
+#[tokio::test]
+async fn budgeted_prompt_send_reports_closed_on_a_disconnected_queue() {
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    let ws = WsConnection::new_stdio(writer_tx);
+    drop(writer_rx);
+    let ledger = UiProtocolLedger::new(16);
+    let sent =
+        send_notification_durable_offloaded_budgeted(&ws, &ledger, stall_probe_notification())
+            .await;
+    assert!(
+        matches!(sent, Err(SendError::Closed)),
+        "a disconnected lane must surface as Closed, got {sent:?}"
+    );
+    assert_eq!(
+        ws.metrics.dropped_count.load(Ordering::Relaxed),
+        0,
+        "a Closed lane is not a drop; the keep-pending arm replays the ledger row"
+    );
+}
+
 /// The smallest durable notification shape the budgeted-lane unit tests
 /// can drive.
 fn stall_probe_notification() -> UiNotification {

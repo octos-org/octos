@@ -59,17 +59,26 @@ exists for) and the blocking `SyncSender::send` parks the **agent task**:
    accumulator (surfaced as `protocol/replay_lossy`), the
    `ws.send.drop.backpressure` counter tagged with the frame's method,
    and a warning with the budget — so a shed prompt is disclosed, never
-   silent. Ledger rows are appended before the send (the durable path's
-   existing prep), so a shed frame still reaches a reconnecting client
-   via replay.
+   silent. A concurrent lifecycle failure that latches the connection
+   during the park is reported as `FatalClosed` (the keep-pending arm's
+   trigger) rather than masked as backpressure. Ledger rows are appended
+   before the send (the durable path's existing prep in
+   `prepare_durable_send`), so a shed frame still reaches a reconnecting
+   client via replay. The budget is the terminal budget's stall model,
+   not a host-liveness probe: a live host that reads slower than the
+   turn produces progress can hold the queue saturated past the budget
+   and forfeits the live prompt the same way a stalled host does. The WS
+   lane already forfeits it instantly under the same saturation, the
+   ledger row still replays, and the shed is disclosed — the bounded
+   turn is the point of the surface.
 3. **The cancel follow-up rides the same budget.** The
    `approval/cancelled` frame sent after a failed `approval/requested`
    (UPCR-2026-050 §1's cooperative enqueue) moves from the unbudgeted
    offloaded lane to the budgeted one: a shed prompt left the very same
    queue full, so an unbudgeted cooperative park in the cancel path would
-   move the hang one frame later. The cancellation is recorded by
-   `cancel_pending_approval` before the send, so a shed cancel frame is
-   still delivered by replay.
+   move the hang one frame later. The `approval/cancelled` ledger row is
+   appended by `prepare_durable_send` before the enqueue attempt, so a
+   shed cancel frame is still delivered by replay.
 
 ## Why this record exists
 
