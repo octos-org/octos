@@ -73,6 +73,7 @@ records.
 | 045 | Skill Action Background Jobs | accepted | `..._045_SKILL_ACTION_JOBS.md` | #1637 |
 | 046 | Server-Owned Session Identity Binding for Raw Wire Ids | proposed | `..._046_SESSION_IDENTITY_BINDING.md` | #2162 |
 | 048 | Cooperative Turn-Drain Delivery With A Budgeted Terminal Shed | implemented | `..._048_STALLED_CONSUMER_TERMINATION.md` | #2810 |
+| 049 | Oversized-Frame Preview Runs Off The Executor Worker | implemented | `..._049_OVERSIZED_FRAME_PREVIEW_OFFLOAD.md` | #2812 |
 | 050 | Turn-Task Delivery Residue — the Last Sync Durable Sends, Unified Lifecycle Error Shapes, and Real Usage for Shed Turns | implemented | `..._050_TURN_TASK_DELIVERY_RESIDUE.md` | #2811 |
 | 051 | Agent-Task Prompt Sends — Budgeted Cooperative Delivery for Approvals and Questions | implemented | `..._051_AGENT_PROMPT_SEND_BUDGET.md` | #2815 |
 
