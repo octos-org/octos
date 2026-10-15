@@ -1165,7 +1165,12 @@ impl WsConnection {
             return self.send_lifecycle(frame);
         }
         if self.failed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(SendError::FatalClosed);
+            // #2811 — mirror `send_lifecycle`'s FatalClosed arm (#924 BLOCK
+            // 2): surface the lifecycle-shape error so the offloaded twin's
+            // error semantics really are identical to the sync callers'.
+            return Err(SendError::LifecycleFailure(
+                "connection already latched as failed".into(),
+            ));
         }
         let writer = self
             .stdio_writer
@@ -1176,7 +1181,9 @@ impl WsConnection {
             // Mirror send_durable_offloaded: re-check the latch every probe
             // so a concurrently-failed connection stops spinning.
             if self.failed.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(SendError::FatalClosed);
+                return Err(SendError::LifecycleFailure(
+                    "connection already latched as failed".into(),
+                ));
             }
             match writer.try_send(frame) {
                 Ok(()) => return Ok(()),
@@ -6721,7 +6728,8 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
                         &self.session_id,
                         &approval_id,
                         &self.turn_id,
-                    );
+                    )
+                    .await;
                     // Explicit cancel already ran; disarm so `Drop` does not
                     // re-cancel (a no-op on a now-cancelled entry, but cleaner).
                     waiter_guard.disarm();
@@ -6753,7 +6761,13 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
     }
 }
 
-fn cancel_approval_after_request_send_failure(
+/// #2811 — async so the cancel notification enqueues through the same
+/// offloaded durable lane the calling arms use. The reachable error set
+/// (WS backpressure, or a dead/latched stdio lane) returns without
+/// waiting — this is consistency with the arms, not a new wait path; the
+/// cooperative park only matters if a live-but-full stdio queue ever
+/// reaches it.
+async fn cancel_approval_after_request_send_failure(
     contracts: &UiProtocolContractStores,
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
@@ -6770,7 +6784,7 @@ fn cancel_approval_after_request_send_failure(
         return;
     };
 
-    let _ = send_notification_durable(
+    let _ = send_notification_durable_offloaded(
         ws,
         ledger,
         UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
@@ -6780,7 +6794,8 @@ fn cancel_approval_after_request_send_failure(
             turn_id: cancelled.turn_id,
             reason: APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED.to_owned(),
         }),
-    );
+    )
+    .await;
 }
 
 /// RAII drop-guard around the approval requester's wait on `response_rx`
@@ -35622,7 +35637,8 @@ async fn run_m9_fixture_turn(
                     &session_id,
                     &approval_id,
                     &turn_id,
-                );
+                )
+                .await;
                 M9FixtureOutcome::Errored {
                     code: "approval_send_failed",
                     message: format!("approval/requested notification not delivered: {error:?}"),
@@ -38628,28 +38644,37 @@ async fn run_interactive_sentinel_completion(
     }
 }
 
+/// #2811 — the live tracker's accumulated input+output spend: the fallback
+/// usage source for a turn whose terminal usage payload never reached the
+/// drain loop (interrupted, or the terminal event was shed past the send
+/// budget). Mirrors input/output tokens only (no cache) — same accounting
+/// surface `interrupted_goal_charge` has always used.
+fn tracker_live_spend(tracker: &octos_agent::TokenTracker) -> u64 {
+    u64::from(
+        tracker
+            .input_tokens
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ) + u64::from(
+        tracker
+            .output_tokens
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// #1969 — resolve the token charge for a turn that may have been INTERRUPTED.
 /// The AppUI drain loop breaks on interrupt before the done/error arm folds the
 /// turn's usage into `folded`, so an interrupted goal/peer turn would charge 0.
 /// When interrupted with nothing folded, fall back to the live `tracker` (which
 /// accumulated usage as the turn ran) so the partial spend still charges. A
 /// non-interrupted turn — or one that already folded a nonzero total — is
-/// unchanged. The tracker mirrors input/output tokens only (no cache).
+/// unchanged.
 fn interrupted_goal_charge(
     interrupt_observed: bool,
     folded: u64,
     tracker: &octos_agent::TokenTracker,
 ) -> u64 {
     if interrupt_observed && folded == 0 {
-        u64::from(
-            tracker
-                .input_tokens
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ) + u64::from(
-            tracker
-                .output_tokens
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        tracker_live_spend(tracker)
     } else {
         folded
     }
@@ -39433,7 +39458,7 @@ async fn run_standalone_turn(
     // first token. No-op when this profile has no `AdaptiveRouter`
     // attached (single-provider or `enabled = false`).
     let adaptive_router_ref = session_runtime.profile.adaptive_router.clone();
-    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
+    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref()).await;
 
     // Wave4-A: subscribe to the AdaptiveRouter's broadcast channel and
     // forward `FailoverEvent`s as `router/failover` notifications for
@@ -42817,7 +42842,10 @@ async fn run_standalone_turn(
                 // `Closed` alone never fires. The shed terminal frame is
                 // disclosed by the replay_lossy counter flushed below. The
                 // closing work mirrors the error arm minus the event-carried
-                // fields (usage/sentinel data died with the shed event).
+                // fields (the goal sentinel died with the shed event; the
+                // usage below charges the live tracker instead, #2811).
+                final_tokens_consumed =
+                    final_tokens_consumed.saturating_add(tracker_live_spend(&token_tracker));
                 let lost_message =
                     "the agent task ended without producing a deliverable terminal event";
                 warn!(
@@ -43718,7 +43746,7 @@ async fn run_standalone_turn(
     // `turn/completed` so clients see the actual provider that ran
     // the turn + any breaker / lane-score deltas. No-op when no
     // AdaptiveRouter is attached.
-    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
+    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref()).await;
 
     // Wave4-A (Codex P1): tear down the failover forwarder task AND
     // await its JoinHandle so the detached task cannot outlive the
@@ -45101,7 +45129,8 @@ async fn forward_progress_event(
                         &request.session_id,
                         &request.approval_id,
                         &request.turn_id,
-                    );
+                    )
+                    .await;
                 }
             }
             notification => {
@@ -47523,8 +47552,13 @@ pub(crate) fn build_router_status_event(
 /// Durable delivery still ledgers the frame for reconnect-replay but
 /// degrades gracefully under push pressure.
 ///
+/// #2811 — the enqueue goes through the offloaded durable lane: both
+/// call sites run on the turn task (pre-turn and post-loop), so a full
+/// stdio queue parks this task cooperatively instead of pinning an
+/// executor worker on a blocking `SyncSender::send`.
+///
 /// No-op when `router` is `None`.
-fn emit_router_status_durable(
+async fn emit_router_status_durable(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -47536,7 +47570,7 @@ fn emit_router_status_durable(
     let event = build_router_status_event(session_id, router);
     let notif = UiNotification::RouterStatus(event);
     let method = notif.method().to_string();
-    if let Err(error) = send_notification_durable(ws, ledger, notif) {
+    if let Err(error) = send_notification_durable_offloaded(ws, ledger, notif).await {
         tracing::debug!(
             target: "octos::ui_protocol::ws",
             method = %method,

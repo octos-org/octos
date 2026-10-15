@@ -24507,7 +24507,8 @@ async fn approval_request_backpressure_cancels_pending_runtime_waiter() {
         &session_id,
         &approval_id,
         &turn_id,
-    );
+    )
+    .await;
 
     assert!(
         response_rx.await.is_err(),
@@ -35216,9 +35217,9 @@ fn review_specialist_config_rejects_invalid_keys_and_duplicates() {
 /// Mock provider for router-emission tests: never called, just lets
 /// `AdaptiveRouter::new` accept two slots so the lane-scoring + breaker
 /// snapshot paths fire end-to-end.
-struct Wave4AStubProvider {
-    name: &'static str,
-    model: &'static str,
+pub(crate) struct Wave4AStubProvider {
+    pub(crate) name: &'static str,
+    pub(crate) model: &'static str,
 }
 
 #[async_trait::async_trait]
