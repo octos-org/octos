@@ -18,7 +18,10 @@ concurrency:
   # superseded run leaves that lane with no verdict (the twentieth DX
   # audit found this third cancellation face #2749 had missed).
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-  queue: ${{ github.event_name == 'pull_request' && 1 || 'max' }}
+  # NOTE: no `queue` field here BY VALIDITY — the queue + cancel-in-progress
+  # combination is a workflow-validation error (BH3GEI's blocking finding on
+  # #2749; the same expression form failed the ci.yml validation). The
+  # multi-pending for main pushes is the tracked follow-up.
 
 jobs:
   confinement:
