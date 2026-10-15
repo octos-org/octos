@@ -211,11 +211,47 @@ async fn lifecycle_offloaded_latched_matches_the_sync_lifecycle_failure_shape() 
 }
 
 /// #2811 — the router/status durable emit parks cooperatively on a full
-/// stdio queue and delivers once the host reader drains, instead of
-/// pinning the turn task on the blocking send it replaced (the sync send
-/// this lane replaces can never return while the queue stays full).
+/// stdio queue: the park is cancellable at its await, so an aborted turn
+/// task never stays pinned the way the blocking `SyncSender::send` this
+/// lane replaces would (a blocking send survives `abort()` and would blow
+/// the join bound here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_status_offloaded_park_is_cancellable_on_a_full_stdio_queue() {
+    let (writer_tx, _writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    writer_tx
+        .send(WsMessage::Text("queued".into()))
+        .expect("fill the stdio slot");
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let router = Arc::new(octos_llm::AdaptiveRouter::new(
+        vec![Arc::new(super::tests::Wave4AStubProvider {
+            name: "zai",
+            model: "glm-5-turbo",
+        }) as Arc<dyn octos_llm::LlmProvider>],
+        &[],
+        octos_llm::AdaptiveConfig::default(),
+    ));
+    let session_id = SessionKey("local:router-status-offload".into());
+    let driver = tokio::spawn(async move {
+        emit_router_status_durable(&ws, &ledger, &session_id, Some(&router)).await;
+    });
+    // Let the driver reach its park inside the full queue, then cancel it.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    driver.abort();
+    // `Cancelled` is the expected join outcome; the bound under test is
+    // that the abort completes promptly instead of waiting on a blocked
+    // thread, which the timeout below enforces.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+        .await
+        .expect("the cooperative park must be cancellable, not a blocked thread");
+}
+
+/// #2811 — the router/status durable emit delivers on a full stdio queue
+/// once the host reader drains: the frame waits for capacity (never-drop
+/// durable semantics, identical to the blocking send it replaced) without
+/// requiring the caller to park on it.
 #[tokio::test]
-async fn router_status_durable_delivers_on_a_full_stdio_queue_cooperatively() {
+async fn router_status_durable_delivers_on_a_full_stdio_queue() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
     writer_tx
         .send(WsMessage::Text("queued".into()))
@@ -253,6 +289,9 @@ async fn router_status_durable_delivers_on_a_full_stdio_queue_cooperatively() {
     )
     .await
     .expect("router/status emit must complete once the host reader drains");
+    // Drop the connection first so the reader's recv_timeout exits via
+    // Disconnected instead of burning its full 5s timeout tail.
+    drop(ws);
     let rows = reader.join().expect("reader must not panic");
     assert_eq!(rows.len(), 2, "queued row + the router/status frame");
     assert!(
@@ -263,12 +302,65 @@ async fn router_status_durable_delivers_on_a_full_stdio_queue_cooperatively() {
 }
 
 /// #2811 — the approval-cancel path after a failed request send goes
-/// through the offloaded durable lane: on a full stdio queue it delivers
-/// the `approval/cancelled` frame once the host reader drains and releases
-/// the runtime waiter, instead of pinning the caller on the blocking send
-/// it replaced.
+/// through the offloaded durable lane. On a full stdio queue the store
+/// cancel still lands and the frame delivers once the host reader drains;
+/// the cooperative park is also cancellable — a blocking send here would
+/// survive `abort()` and blow the join bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_cancel_after_send_failure_cancels_store_and_park_is_cancellable() {
+    let (writer_tx, _writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
+    writer_tx
+        .send(WsMessage::Text("queued".into()))
+        .expect("fill the stdio slot");
+    let ws = WsConnection::new_stdio(writer_tx);
+    let ledger = Arc::new(UiProtocolLedger::new(16));
+    let contracts = Arc::new(UiProtocolContractStores::default());
+    let session_id = SessionKey("local:cancel-offload".into());
+    let turn_id = TurnId::new();
+    let approval_id = ApprovalId::new();
+    let request = ApprovalRequestedEvent::generic(
+        session_id.clone(),
+        approval_id.clone(),
+        turn_id.clone(),
+        "shell",
+        "Run command",
+        "cargo test",
+    );
+    let mut response_rx = contracts.approvals.request_runtime(request);
+    let driver = tokio::spawn(async move {
+        cancel_approval_after_request_send_failure(
+            &contracts,
+            &ws,
+            &ledger,
+            &session_id,
+            &approval_id,
+            &turn_id,
+        )
+        .await;
+    });
+    // Let the driver cancel the store entry and reach its park inside the
+    // full queue, then cancel the task itself.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        matches!(
+            response_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ),
+        "the store cancel must have landed before the driver reaches the send park"
+    );
+    driver.abort();
+    // `Cancelled` is the expected join outcome; the bound under test is
+    // that the abort completes promptly instead of waiting on a blocked
+    // thread, which the timeout below enforces.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+        .await
+        .expect("the cooperative park must be cancellable, not a blocked thread");
+}
+
+/// #2811 — the approval-cancel notification delivers on a full stdio
+/// queue once the host reader drains, and releases the runtime waiter.
 #[tokio::test]
-async fn approval_cancel_after_send_failure_delivers_on_a_full_stdio_queue_cooperatively() {
+async fn approval_cancel_after_send_failure_delivers_on_a_full_stdio_queue() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
     writer_tx
         .send(WsMessage::Text("queued".into()))
@@ -315,6 +407,9 @@ async fn approval_cancel_after_send_failure_delivers_on_a_full_stdio_queue_coope
         response_rx.await.is_err(),
         "cancelling the pending approval drops the runtime sender"
     );
+    // Drop the connection first so the reader's recv_timeout exits via
+    // Disconnected instead of burning its full 5s timeout tail.
+    drop(ws);
     let rows = reader.join().expect("reader must not panic");
     assert_eq!(rows.len(), 2, "queued row + the approval/cancelled frame");
     assert!(
@@ -352,6 +447,12 @@ fn terminal_lost_arm_folds_the_live_tracker_spend_before_the_peer_result() {
     let start = text
         .find("TurnLoopStep::AgentFinished => {")
         .expect("the drain loop's completion arm exists");
+    assert_eq!(
+        text.matches("TurnLoopStep::AgentFinished => {").count(),
+        1,
+        "the guard anchors on the drain loop's completion arm; a second \
+         occurrence would re-anchor it silently"
+    );
     let end = text[start..]
         .find("TurnLoopStep::Progress(data)")
         .map(|offset| start + offset)

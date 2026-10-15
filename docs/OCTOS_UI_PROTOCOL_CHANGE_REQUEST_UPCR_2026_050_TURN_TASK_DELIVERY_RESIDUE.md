@@ -1,7 +1,7 @@
 # UPCR-2026-050: turn-task delivery residue — the last sync durable sends, unified lifecycle error shapes, and real usage for shed turns
 
 - **Request id**: UPCR-2026-050
-- **Date**: 2026-10-15
+- **Date**: 2026-10-14
 - **Status**: implemented
 - **Implements**: #2811, the four residue faces the #2810 review rounds
   verified as remaining after UPCR-2026-048
@@ -21,7 +21,7 @@ kept the old behavior:
    queue was full.
 2. The approval-cancel path after a failed `approval/requested` send still
    enqueued its `approval/cancelled` frame through the blocking durable
-   send, from async arms that were otherwise already offloaded.
+   send, from async call sites.
 3. The offloaded lifecycle lane reported an already-latched connection as
    a bare `FatalClosed`, while the sync `send_lifecycle` twin maps the
    same state to `LifecycleFailure("connection already latched as
@@ -42,6 +42,14 @@ kept the old behavior:
    delivers once the host reader drains. The WS lane keeps its
    non-blocking semantics unchanged. Frame shapes, ledger classification,
    ordering, and the error handling at every call site are unchanged.
+   Two deliberate nuances: the cancel path's reachable error set (WS
+   backpressure, or a dead/latched stdio lane) returns without waiting,
+   so its offloaded enqueue is consistency with the calling arms rather
+   than a new wait path; and a cooperative park is cancellable at its
+   await, so an abort of the turn task mid-park skips the enqueue where
+   the old blocking send would have completed it — the ledger row is
+   already appended in that window and reconnect-replay delivers it, the
+   same recovery every UPCR-2026-048 offloaded send relies on.
 2. **Unified latched error shape.** The offloaded lifecycle lane maps an
    already-latched connection to the same
    `LifecycleFailure("connection already latched as failed")` the sync
@@ -67,12 +75,24 @@ and its test modules, and the completeness gate
 file as protocol-visible. §1–§2 add no protocol surface and change no
 client-visible frame; §3 changes which number the internal usage
 accounting surfaces record for a shed turn. The delivery and error-shape
-changes complete UPCR-2026-048's contract (every send the turn task makes
-is cooperative), so governance records them alongside it rather than as a
-new behavioral surface.
+changes extend UPCR-2026-048's cooperative-delivery contract to the
+turn-closing sequence (the drain-loop body itself was already converted),
+so governance records them alongside it rather than as a new behavioral
+surface.
 
 ## Non-goals
 
+- The agent task's own approval/question send surface: `request_approval`
+  still enqueues `approval/requested`, `approval/decided`, and
+  `approval/auto_resolved` through the sync blocking durable send, and
+  `request_user_question` does the same for its frames. A stalled stdio
+  host that filled the queue can park the agent task on those sends with
+  no send budget — which also suppresses the UPCR-2026-048 completion
+  signal, so the turn cannot even reach `terminal_lost`. That is the same
+  hazard family, but a different task with its own delivery-semantics
+  surface (the closed/failed arms' keep-pending-vs-cancel behavior), so
+  it is recorded as follow-up work (#2815) rather than folded into this
+  record.
 - Converting the remaining pre-loop sync durable sends inside
   `run_standalone_turn` (the pre-turn context-lifecycle rows, the voice
   no-speech progress rows, the turn/started lifecycle send, and the peer

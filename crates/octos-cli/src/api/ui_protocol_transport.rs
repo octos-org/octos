@@ -6761,11 +6761,12 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
     }
 }
 
-/// #2811 — async so the cancel notification goes through the offloaded
-/// durable lane, matching the async arms that call this: a full stdio
-/// queue parks cooperatively instead of pinning an executor worker. The
-/// path only runs when the request send already failed, so the lane is
-/// typically dead or latched and the send returns without parking.
+/// #2811 — async so the cancel notification enqueues through the same
+/// offloaded durable lane the calling arms use. The reachable error set
+/// (WS backpressure, or a dead/latched stdio lane) returns without
+/// waiting — this is consistency with the arms, not a new wait path; the
+/// cooperative park only matters if a live-but-full stdio queue ever
+/// reaches it.
 async fn cancel_approval_after_request_send_failure(
     contracts: &UiProtocolContractStores,
     ws: &WsConnection,
