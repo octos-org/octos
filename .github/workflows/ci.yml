@@ -12,7 +12,22 @@ on:
 # Release artifacts are built by release.yml, not this workflow.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # The two policies are mutually exclusive per event, expressed in one block:
+  # - PR runs: cancel-in-progress (the head moves fast; the latest is what
+  #   matters) with the single pending slot (the coalescing).
+  # - Main pushes: NO cancellation + queue:max — a cancelled required leg
+  #   makes the aggregation report "cancelled" and the gate reads it as a
+  #   failure (the main green was stolen twice in one day), and the default
+  #   single pending slot let a third push cancel a queued second, so that
+  #   commit never received a verdict (BH3GEI's P2).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # NOTE: no `queue` field here BY VALIDITY — `queue` combined with
+  # cancel-in-progress: true is a workflow-validation error (BH3GEI's
+  # blocking finding; the expression form emitted `queue: 1` on PR events,
+  # failing every validation). The main-push multi-pending (BH3GEI's P2-2)
+  # needs the separate-policy route (a split workflow or the org-level
+  # setting) and is tracked as the follow-up; until then a third push
+  # supersedes a queued second on main.
 
 permissions:
   contents: read
