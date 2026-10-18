@@ -1350,9 +1350,15 @@ fn decode_ddg_url(raw: &str) -> String {
 /// the cap on the binary's own scope-internal concurrency stays at the
 /// configured value, so total chromiums = N × cap.
 fn max_browsers() -> usize {
-    std::env::var("DEEP_SEARCH_MAX_BROWSERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    max_browsers_from(std::env::var("DEEP_SEARCH_MAX_BROWSERS").ok().as_deref())
+}
+
+/// Pure core of [`max_browsers`]: parse + clamp one raw override value.
+/// Tests exercise this directly instead of mutating the process-global
+/// environment — the two env-mutating tests raced each other under the
+/// parallel test harness and red the ARM64 nightly (#2824).
+fn max_browsers_from(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
         .map(|n| n.clamp(1, 16))
         .unwrap_or(3)
 }
@@ -4024,49 +4030,25 @@ A second paragraph elaborates on alternatives [2]."
 
     #[test]
     fn max_browsers_default_is_three() {
-        // Avoid clobbering a real env var the developer set.
-        let prev = std::env::var("DEEP_SEARCH_MAX_BROWSERS").ok();
-        // SAFETY: tests are single-threaded by default.
-        unsafe {
-            std::env::remove_var("DEEP_SEARCH_MAX_BROWSERS");
-        }
-        assert_eq!(max_browsers(), 3);
-        // Restore for other tests.
-        if let Some(v) = prev {
-            unsafe {
-                std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", v);
-            }
-        }
+        // Injected input, not the process env: env-mutating tests raced
+        // each other under the parallel harness (#2824).
+        assert_eq!(max_browsers_from(None), 3);
     }
 
     #[test]
     fn max_browsers_clamps_to_range() {
-        let prev = std::env::var("DEEP_SEARCH_MAX_BROWSERS").ok();
-        unsafe {
-            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "0");
-        }
-        assert_eq!(max_browsers(), 1, "clamps zero to 1");
-        unsafe {
-            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "100");
-        }
-        assert_eq!(max_browsers(), 16, "clamps high to 16");
-        unsafe {
-            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "5");
-        }
-        assert_eq!(max_browsers(), 5, "passes through valid value");
-        unsafe {
-            std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", "not-a-number");
-        }
-        assert_eq!(max_browsers(), 3, "falls back to default on parse fail");
-        // Cleanup.
-        unsafe {
-            std::env::remove_var("DEEP_SEARCH_MAX_BROWSERS");
-        }
-        if let Some(v) = prev {
-            unsafe {
-                std::env::set_var("DEEP_SEARCH_MAX_BROWSERS", v);
-            }
-        }
+        assert_eq!(max_browsers_from(Some("0")), 1, "clamps zero to 1");
+        assert_eq!(max_browsers_from(Some("100")), 16, "clamps high to 16");
+        assert_eq!(
+            max_browsers_from(Some("5")),
+            5,
+            "passes through valid value"
+        );
+        assert_eq!(
+            max_browsers_from(Some("not-a-number")),
+            3,
+            "falls back to default on parse fail"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
