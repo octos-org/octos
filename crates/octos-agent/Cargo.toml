@@ -41,7 +41,7 @@ reqwest = { workspace = true }
 # MCP over the official rmcp SDK. Client: stdio + streamable-HTTP + OAuth 2.1.
 # Server (`octos mcp-serve`): `server` + `transport-io` (stdio handler) and
 # `transport-streamable-http-server` (the tower service the CLI mounts in axum).
-rmcp = { version = "1.8", default-features = false, features = [
+rmcp = { version = "2.1", default-features = false, features = [
     "client",
     "server",
     "auth",
