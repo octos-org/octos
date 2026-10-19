@@ -312,11 +312,7 @@ async fn render_pdf_pages_as_images(pdf_path: &Path) -> Result<Vec<String>, Stri
 }
 
 fn render_pdf_pages_as_images_blocking(pdf_path: &Path) -> Result<Vec<String>, String> {
-    let output_dir = octos_bus::file_handle::temp_upload_root().join("pdf-page-images");
-    // #2817: same private-dir hardening as the upload handlers above — the
-    // rendered pages are private session data.
-    octos_bus::media::ensure_private_dir(&output_dir)
-        .map_err(|error| format!("failed to create rendered-page directory: {error}"))?;
+    let output_dir = prepare_pdf_output_dir(&octos_bus::file_handle::temp_upload_root())?;
 
     let prefix_name = format!("{}-{}-page", uuid::Uuid::now_v7(), safe_file_stem(pdf_path));
     let output_prefix = output_dir.join(&prefix_name);
@@ -345,6 +341,17 @@ fn render_pdf_pages_as_images_blocking(pdf_path: &Path) -> Result<Vec<String>, S
     }
 
     collect_rendered_pdf_pages(&output_dir, &prefix_name)
+}
+
+fn prepare_pdf_output_dir(upload_root: &Path) -> Result<PathBuf, String> {
+    let output_dir = upload_root.join("pdf-page-images");
+    // PDF rendering can bypass the upload handlers. Validate the root first so
+    // a foreign-owned root is rejected before creating any private page data.
+    octos_bus::media::ensure_private_dir(upload_root)
+        .and_then(|()| octos_bus::media::ensure_private_dir(&output_dir))
+        .map_err(|error| format!("failed to create rendered-page directory: {error}"))?;
+
+    Ok(output_dir)
 }
 
 fn collect_rendered_pdf_pages(output_dir: &Path, prefix_name: &str) -> Result<Vec<String>, String> {
@@ -552,6 +559,29 @@ async fn transcribe_via_skill(voice_binary: &Path, input_json: &str) -> eyre::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn pdf_output_preparation_tightens_existing_upload_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("uploads");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let output = prepare_pdf_output_dir(&root).unwrap();
+
+        assert_eq!(output, root.join("pdf-page-images"));
+        for dir in [&root, &output] {
+            assert_eq!(
+                std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{} must be private before rendering",
+                dir.display()
+            );
+        }
+    }
     use chrono::Utc;
 
     fn inbound_with_media(content: &str, media: Vec<&str>) -> InboundMessage {
