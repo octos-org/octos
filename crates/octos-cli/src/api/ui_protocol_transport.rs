@@ -48743,3 +48743,7 @@ mod oversized_frame_tests;
 #[cfg(test)]
 #[path = "ui_protocol_peer_host_tools_tests.rs"]
 mod peer_host_tools_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_shell_alias_tests.rs"]
+mod shell_alias_tests;
