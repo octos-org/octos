@@ -14,11 +14,11 @@ on:
 
 concurrency:
   group: nightly-${{ github.ref }}
-  # A scheduled nightly superseded by a main push loses the entire night's
-  # verdict — and the reconcile step then reports success on a run with no
-  # test signal. Queue with multiple pending slots: `cancel-in-progress:
-  # false` alone keeps only ONE pending run, so a third arrival cancels the
-  # queued second (BH3GEI's P2). Every queued night gets its verdict.
+  # Preserve active runs and queue up to 100 pending runs per ref. This
+  # prevents supersession by scheduled, manual, or workflow-file push runs;
+  # it does not prevent timeouts, runner failures, or manual cancellation.
+  # The 10-09 ARM/Windows legs hit their timeouts. Distinguishing those
+  # outcomes in reconciliation remains a separate follow-up.
   queue: max
 
 permissions:
