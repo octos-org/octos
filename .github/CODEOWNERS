@@ -1,0 +1,32 @@
+# CODEOWNERS — who must review what.
+#
+# Note: these are *review requests*, not a merge gate, until
+# "Require review from Code Owners" is enabled in the main branch protection
+# (see scripts/setup-branch-protection.sh). There are no org teams configured
+# for octos-org, so individual handles are used. Adjust to current maintainers.
+#
+# Only sensitive paths get an owner. A `*` default would request the same two
+# people on every PR; that is noise, not ownership.
+
+# Build/CI configuration and the branch lifecycle machine.
+/.github/                 @ymote @BH3GEI
+/scripts/branch-audit.sh  @ymote
+/scripts/branch-cleanup.sh @ymote @BH3GEI
+/scripts/quality-ratchet.sh @ymote
+/.github/CODEOWNERS       @BH3GEI
+
+# Workspace dependency graph / lint policy.
+/Cargo.toml               @ymote @BH3GEI
+
+# Core runtime crates.
+/crates/octos-core/       @ymote @BH3GEI
+/crates/octos-agent/      @ymote @BH3GEI
+/crates/octos-llm/        @ymote @BH3GEI
+
+# Security-sensitive surfaces.
+/SECURITY.md              @BH3GEI
+/crates/octos-sandbox/    @BH3GEI @ymote
+/crates/octos-bus/        @ymote @BH3GEI
+
+# Documentation set.
+/docs/                    @ymote

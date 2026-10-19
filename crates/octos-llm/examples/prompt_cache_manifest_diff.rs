@@ -93,7 +93,7 @@ mod tests {
     use super::*;
 
     fn manifest(hash: &str) -> Value {
-        json!({"schema": "octos.provider-cache-input-manifest.v1", "provider": "test", "model": "test",
+        json!({"schema": "octos.provider-cache-input-manifest.v2", "provider": "test", "model": "test",
             "epoch_id": hash, "stable_prefix_hash": hash, "conversation_hash": hash, "input_hash": hash,
             "stable_segments": [], "conversation_segments": [], "normalized_bytes": 0})
     }

@@ -853,8 +853,13 @@ struct AppserviceState {
     dedup: Arc<MessageDedup>,
     bot_router: Arc<BotRouter>,
     bot_manager: Option<Arc<dyn BotManager>>,
-    /// Directory for downloaded media files (inbound images, files, audio, video).
-    media_dir: PathBuf,
+    /// Directory for downloaded media files (inbound images, files, audio,
+    /// video). `None` (the default) disables inbound media downloads — there
+    /// is deliberately no fallback location: a shared fixed path under the
+    /// temp directory would hand every local user a predictable target for
+    /// another process's private attachments. Configure via
+    /// [`MatrixChannel::with_media_dir`]. (#2802)
+    media_dir: Option<PathBuf>,
     /// When set, the bot only replies in a multi-participant room if it was
     /// explicitly addressed (mention / pill / explicit target). A 1:1 DM (the
     /// bot plus a single human) still replies to every message. Safe-by-default.
@@ -915,8 +920,9 @@ pub struct MatrixChannel {
     /// M7.3 swarm supervisor state. `None` means the supervisor contract is
     /// disabled and the channel behaves exactly like pre-M7.3 (invariant 5).
     swarm_supervisor: Option<Arc<SwarmSupervisorState>>,
-    /// Directory for downloaded media files (inbound images, files, audio, video).
-    media_dir: PathBuf,
+    /// Directory for downloaded media files (inbound images, files, audio,
+    /// video). See the `AppserviceState` field of the same name.
+    media_dir: Option<PathBuf>,
     /// Mention-only gating (see [`AppserviceState::mention_only`]). Defaults to
     /// `true`; override via [`MatrixChannel::with_mention_only`].
     mention_only: bool,
@@ -924,6 +930,17 @@ pub struct MatrixChannel {
     dm_member_cache: Arc<RwLock<HashMap<String, (MembershipCounts, Instant)>>>,
     /// Generation counter paired with `dm_member_cache` (see `AppserviceState`).
     dm_member_cache_generation: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// HTTP client for appservice-to-homeserver requests. Redirects are not
+/// followed: a 30x must surface as a failed request instead of silently
+/// re-issuing it at another origin, mirroring the user-channel client
+/// (`matrix_http_client` in `matrix_user_channel.rs`).
+fn appservice_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build Matrix appservice HTTP client")
 }
 
 impl MatrixChannel {
@@ -950,7 +967,7 @@ impl MatrixChannel {
             bot_user_id,
             port,
             shutdown,
-            http: reqwest::Client::new(),
+            http: appservice_http_client(),
             registered_users: Arc::new(RwLock::new(HashSet::new())),
             dedup: Arc::new(MessageDedup::new()),
             bot_router: Arc::new(BotRouter::new(None)),
@@ -958,7 +975,7 @@ impl MatrixChannel {
             admin_allowed_senders: HashSet::new(),
             event_senders: Arc::new(RwLock::new(VecDeque::new())),
             swarm_supervisor: None,
-            media_dir: std::env::temp_dir().join("octos-matrix-media"),
+            media_dir: None,
             mention_only: true,
             dm_member_cache: Arc::new(RwLock::new(HashMap::new())),
             dm_member_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -967,7 +984,7 @@ impl MatrixChannel {
 
     /// Set the directory for downloaded media files.
     pub fn with_media_dir(mut self, media_dir: PathBuf) -> Self {
-        self.media_dir = media_dir;
+        self.media_dir = Some(media_dir);
         self
     }
 
@@ -1182,6 +1199,84 @@ pub(crate) fn percent_encode_path(s: &str) -> String {
         }
     }
     encoded
+}
+
+/// Byte cap on the user-controlled part of an inbound media filename. The
+/// ~21-byte `matrix_{ts}_` prefix must still fit every filesystem's 255-byte
+/// NAME_MAX, multi-byte scripts included.
+const MAX_INBOUND_FILENAME_BYTES: usize = 200;
+
+/// Reduce a user-controlled inbound media filename to a single safe path
+/// component. Matrix is the only channel that stores a sender-chosen name
+/// verbatim; this makes the storage explicitly safe instead of relying on
+/// the `matrix_{ts}_` prefix to defuse path separators by accident (#2426).
+/// The prefix keeps names unique only to the millisecond: two same-named
+/// attachments within the same millisecond still overwrite, as before.
+fn sanitize_inbound_filename(name: &str) -> String {
+    // Only the final path component survives: absolute paths and `..`
+    // traversal collapse to a plain name.
+    let name = name.rsplit(['/', '\\']).next().unwrap_or("");
+    // NTFS alternate data streams ride a `:` separator, and the remaining
+    // characters are illegal in Windows filenames; control characters are
+    // illegal everywhere.
+    let name: String = name
+        .chars()
+        .map(|c| if "<>:\"|?*".contains(c) { '_' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
+    // Windows ignores trailing dots and spaces when naming files, so a
+    // name like "evil..." could not be opened or deleted by name there.
+    let name = name.trim_end_matches(['.', ' ']);
+    // Windows rejects reserved device names even with an extension
+    // ("CON.txt"); mark them instead of failing the write.
+    let stem = name.split('.').next().unwrap_or("");
+    let reserved = matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    );
+    let name = if reserved {
+        format!("_{name}")
+    } else {
+        name.to_string()
+    };
+
+    // Cap runaway names by bytes (NAME_MAX is a byte limit) while keeping
+    // the extension recognizable. The trailing-dot/space trim above
+    // guarantees `ext` is non-empty here.
+    let name = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.len() + 1 < MAX_INBOUND_FILENAME_BYTES => {
+            let keep = MAX_INBOUND_FILENAME_BYTES - ext.len() - 1;
+            format!("{}.{ext}", octos_core::truncated_utf8(stem, keep, ""))
+        }
+        _ => octos_core::truncated_utf8(&name, MAX_INBOUND_FILENAME_BYTES, ""),
+    };
+
+    if name.is_empty() {
+        "file".to_string()
+    } else {
+        name
+    }
 }
 
 /// Reject an outbound media file whose on-disk size exceeds `cap`, by reading
@@ -1671,29 +1766,37 @@ async fn handle_transaction(
                 let unique_filename = format!(
                     "matrix_{}_{}",
                     chrono::Utc::now().timestamp_millis(),
-                    filename,
+                    sanitize_inbound_filename(filename),
                 );
-                match crate::media::download_media(
-                    &state.http,
-                    &download_url,
-                    &[("Authorization", &format!("Bearer {}", state.as_token))],
-                    &state.media_dir,
-                    &unique_filename,
-                )
-                .await
-                {
-                    Ok(local_path) => {
-                        info!(
-                            mxc_url,
-                            filename,
-                            ?local_path,
-                            "downloaded Matrix media file"
-                        );
-                        media.push(local_path.to_string_lossy().into_owned());
+                if let Some(media_dir) = state.media_dir.as_deref() {
+                    match crate::media::download_media(
+                        &state.http,
+                        &download_url,
+                        &[("Authorization", &format!("Bearer {}", state.as_token))],
+                        media_dir,
+                        &unique_filename,
+                    )
+                    .await
+                    {
+                        Ok(local_path) => {
+                            info!(
+                                mxc_url,
+                                filename,
+                                ?local_path,
+                                "downloaded Matrix media file"
+                            );
+                            media.push(local_path.to_string_lossy().into_owned());
+                        }
+                        Err(e) => {
+                            warn!(mxc_url, error = %e, "failed to download Matrix media file, continuing without media");
+                        }
                     }
-                    Err(e) => {
-                        warn!(mxc_url, error = %e, "failed to download Matrix media file, continuing without media");
-                    }
+                } else {
+                    warn!(
+                        mxc_url,
+                        filename,
+                        "media_dir not configured; dropping inbound media (set it via with_media_dir)"
+                    );
                 }
             }
         }

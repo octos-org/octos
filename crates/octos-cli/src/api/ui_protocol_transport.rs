@@ -164,6 +164,21 @@ use crate::user_store::UserRole;
 
 const MAX_DIFF_PREVIEW_BYTES: usize = 256 * 1024;
 const PROGRESS_CHANNEL_CAPACITY: usize = 1024;
+/// #2807 — wall-clock budget for the agent task's directly-sent terminal
+/// event (the `done`/`error` JSON it sends into the shared progress
+/// channel). A consumer stalled past this forfeits the frame instead of
+/// parking turn termination indefinitely: the shed is counted into the
+/// turn's drop counter, so the turn-boundary `replay_lossy` discloses the
+/// loss and the completion-signal arm delivers the terminal. Same stall
+/// model and budget as `progress_delivery::FLUSH_DEADLINE`.
+const TERMINAL_SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// #2815 — wall-clock budget for the agent task's own approval/question
+/// prompt sends (`approval/requested`, `approval/decided`,
+/// `approval/auto_resolved`, `user_question/requested`). These run on the
+/// agent task while it holds the turn's completion sender, so a send that
+/// parks past this budget sheds instead of parking the whole turn forever
+/// — the same stall model as [`TERMINAL_SEND_BUDGET`].
+const PROMPT_SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 const APPUI_CONTEXT_COMPACT_RATIO_NUMERATOR: usize = 7;
 const APPUI_CONTEXT_COMPACT_RATIO_DENOMINATOR: usize = 10;
 const APPUI_CONTEXT_COMPACT_TARGET_NUMERATOR: usize = 2;
@@ -1142,6 +1157,63 @@ impl WsConnection {
                         "durable ws send failed; client gone"
                     );
                     return Err(SendError::Closed);
+                }
+            }
+        }
+    }
+
+    /// Async twin of [`Self::send_lifecycle`] (#2807): identical error
+    /// semantics, but the stdio lane parks COOPERATIVELY (non-blocking
+    /// probe then async sleep, mirroring [`Self::send_durable_offloaded`])
+    /// instead of a blocking `SyncSender::send` that pins an executor
+    /// worker while the turn drain loop emits its terminal forward. The WS
+    /// lane delegates to [`Self::send_lifecycle`] unchanged, keeping the
+    /// #922.2 latched-failure mapping byte-identical to the sync callers.
+    async fn send_lifecycle_offloaded(&self, frame: WsMessage) -> Result<(), SendError> {
+        if self.stdio_writer.is_none() {
+            return self.send_lifecycle(frame);
+        }
+        if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            // #2811 — mirror `send_lifecycle`'s FatalClosed arm (#924 BLOCK
+            // 2): surface the lifecycle-shape error so the offloaded twin's
+            // error semantics really are identical to the sync callers'.
+            return Err(SendError::LifecycleFailure(
+                "connection already latched as failed".into(),
+            ));
+        }
+        let writer = self
+            .stdio_writer
+            .as_ref()
+            .expect("stdio_writer checked above");
+        let mut frame = frame;
+        loop {
+            // Mirror send_durable_offloaded: re-check the latch every probe
+            // so a concurrently-failed connection stops spinning.
+            if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(SendError::LifecycleFailure(
+                    "connection already latched as failed".into(),
+                ));
+            }
+            match writer.try_send(frame) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    frame = returned;
+                    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    // Mirror send_lifecycle's Closed arm for the stdio lane:
+                    // a dead host latches the connection, exactly like the
+                    // blocking send's error did.
+                    metrics::counter!("ws.send.error.lifecycle").increment(1);
+                    tracing::warn!(
+                        target: "octos::ui_protocol::ws",
+                        reason = "closed",
+                        "lifecycle ws send failed; aborting connection"
+                    );
+                    self.mark_failed();
+                    return Err(SendError::LifecycleFailure(
+                        "writer channel closed for lifecycle frame".into(),
+                    ));
                 }
             }
         }
@@ -3187,6 +3259,45 @@ fn session_workspaces() -> Arc<SessionWorkspaceStore> {
         .clone()
 }
 
+/// #2162 — server-owned binding from a successfully opened session's wire id
+/// to the profile the open resolved it under. `session/open` accepts a raw
+/// id (no embedded profile) plus an explicit `profile_id`, but follow-up
+/// methods resolve the profile from the id, the connection's auth scope, or
+/// the routed host — an unscoped admin connection supplies none of those, so
+/// a session that just opened successfully reports `unknown_session` on
+/// hydrate and `_main` (unresolved) on status. Every successful open records
+/// the resolved profile here — reopening the same wire id under another
+/// profile rebinds it (last open owns the wire id) — and the lookup paths
+/// consult it as the weakest tier after id / connection / routed profiles.
+/// Per-process only: after a serve restart the binding is gone and lookups
+/// degrade to today's behavior.
+#[derive(Default)]
+struct SessionOpenProfileStore {
+    entries: std::sync::Mutex<HashMap<SessionKey, String>>,
+}
+
+impl SessionOpenProfileStore {
+    fn record(&self, session_id: SessionKey, profile_id: &str) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(session_id, profile_id.to_owned());
+    }
+
+    fn lookup(&self, session_id: &SessionKey) -> Option<String> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(session_id)
+            .cloned()
+    }
+}
+
+fn session_open_profiles() -> &'static SessionOpenProfileStore {
+    static SESSION_OPEN_PROFILES: OnceLock<SessionOpenProfileStore> = OnceLock::new();
+    SESSION_OPEN_PROFILES.get_or_init(SessionOpenProfileStore::default)
+}
+
 /// Register a `peer-<slug>` session's wire key so `peer_send_input` can resolve
 /// it, and re-home any injections queued against the peer's PREVIOUS wire key
 /// onto this one (#436 P1 #1 reconnect). No-op for non-peer / unprofiled
@@ -4388,7 +4499,19 @@ async fn handle_session_compact(
     let Some(session_id) = params.session_id.clone() else {
         return Err(RpcError::invalid_params("session_id is required"));
     };
-    let profile_id = raw_profile_id(&params, connection_profile_id);
+    let profile_id = match raw_profile_id(&params, connection_profile_id) {
+        // #2162: a raw id carries no profile and an unscoped connection
+        // supplies none either — without this, compact would bootstrap a
+        // fresh `_main` runtime and compact the wrong profile's session.
+        // Consult the open binding first, the same tier the sessions-manager
+        // lookup uses.
+        profile if profile == MAIN_PROFILE_ID && nonempty(params.profile_id.clone()).is_none() => {
+            session_open_profiles()
+                .lookup(&session_id)
+                .unwrap_or(profile)
+        }
+        profile => profile,
+    };
     let Some(profile_runtime) = ensure_session_profile_runtime(state, Some(&profile_id)).await?
     else {
         return Err(runtime_unavailable_error(format!(
@@ -6543,11 +6666,12 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
             // closed) we still apply the recorded decision — the runtime
             // already trusts the policy. Per FIX-04, `approval/auto_resolved`
             // is durable: drops surface as `protocol/replay_lossy`.
-            let _ = send_notification_durable(
+            let _ = send_notification_durable_offloaded_budgeted(
                 &self.ws,
                 &self.ledger,
                 UiNotification::ApprovalAutoResolved(auto),
-            );
+            )
+            .await;
 
             // FIX-07: build + emit the canonical `approval/decided` record.
             // `decided_by` is empty because the decision is system-issued
@@ -6579,11 +6703,12 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
                     );
                 }
             }
-            let _ = send_notification_durable(
+            let _ = send_notification_durable_offloaded_budgeted(
                 &self.ws,
                 &self.ledger,
                 UiNotification::ApprovalDecided(decided_event),
-            );
+            )
+            .await;
 
             return match hit.decision {
                 ApprovalDecision::Approve => ToolApprovalDecision::Approve,
@@ -6698,11 +6823,13 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
 
         // Approvals are durable: if the WS drop strands the request, the
         // ledger still records it and the client can rehydrate.
-        if let Err(err) = send_notification_durable(
+        if let Err(err) = send_notification_durable_offloaded_budgeted(
             &self.ws,
             &self.ledger,
             UiNotification::ApprovalRequested(event),
-        ) {
+        )
+        .await
+        {
             match err {
                 SendError::Closed | SendError::FatalClosed => {
                     // Keep the approval pending: a reconnecting client replays
@@ -6722,7 +6849,8 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
                         &self.session_id,
                         &approval_id,
                         &self.turn_id,
-                    );
+                    )
+                    .await;
                     // Explicit cancel already ran; disarm so `Drop` does not
                     // re-cancel (a no-op on a now-cancelled entry, but cleaner).
                     waiter_guard.disarm();
@@ -6754,7 +6882,14 @@ impl octos_agent::ToolApprovalRequester for UiProtocolApprovalRequester {
     }
 }
 
-fn cancel_approval_after_request_send_failure(
+/// #2811 — async so the cancel notification enqueues through the same
+/// budgeted offloaded durable lane the calling arms use (#2815): a send
+/// that failed on a stalled consumer left the very same queue full, so an
+/// unbudgeted cooperative park here would move the hang one frame later.
+/// The `approval/cancelled` ledger row is appended by `prepare_durable_send`
+/// before the enqueue attempt, so a shed cancel frame still reaches a
+/// reconnecting client via replay.
+async fn cancel_approval_after_request_send_failure(
     contracts: &UiProtocolContractStores,
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
@@ -6771,7 +6906,7 @@ fn cancel_approval_after_request_send_failure(
         return;
     };
 
-    let _ = send_notification_durable(
+    let _ = send_notification_durable_offloaded_budgeted(
         ws,
         ledger,
         UiNotification::ApprovalCancelled(ApprovalCancelledEvent {
@@ -6781,7 +6916,8 @@ fn cancel_approval_after_request_send_failure(
             turn_id: cancelled.turn_id,
             reason: APPROVAL_CANCELLED_REASON_REQUEST_SEND_FAILED.to_owned(),
         }),
-    );
+    )
+    .await;
 }
 
 /// RAII drop-guard around the approval requester's wait on `response_rx`
@@ -7060,11 +7196,13 @@ impl octos_agent::UserQuestionRequester for SessionUserQuestionRequester {
         // still records it and a reconnecting client can rehydrate. We cancel
         // the pending entry and degrade to the fallback so the turn continues
         // rather than hanging on a dead channel.
-        if let Err(err) = send_notification_durable(
+        if let Err(err) = send_notification_durable_offloaded_budgeted(
             &self.ws,
             &self.ledger,
             UiNotification::UserQuestionRequested(event),
-        ) {
+        )
+        .await
+        {
             // Explicit send-failure cancellation records the precise reason;
             // disarm the guard so its `Drop` does not also fire (a no-op on a
             // now-cancelled entry, but cleaner to skip).
@@ -7942,9 +8080,7 @@ async fn ui_protocol_connection(
                     &active_turns,
                     &connection_turns,
                     connection_profile_id,
-                    // gap #2: fall back to the session-open profile when the
-                    // connection supplied no routing profile (admin / unscoped).
-                    routed_profile_id.or(session_open_profile_id.as_deref()),
+                    routed_profile_id,
                     features,
                     id,
                     params,
@@ -8100,11 +8236,7 @@ async fn ui_protocol_connection(
                     &ledger,
                     &active_turns,
                     connection_profile_id,
-                    // gap #2: fall back to the session-open profile when the
-                    // connection supplied no routing profile (admin / unscoped)
-                    // so the aside reads and bills the SAME profile the open
-                    // resolved to.
-                    routed_profile_id.or(session_open_profile_id.as_deref()),
+                    routed_profile_id,
                     id,
                     params,
                 )
@@ -12361,7 +12493,19 @@ async fn raw_session_status_result(
     let Some(session_id) = params.session_id.clone() else {
         return Err(RpcError::invalid_params("session_id is required"));
     };
-    let profile_id = raw_profile_id(&params, connection_profile_id);
+    let profile_id = match raw_profile_id(&params, connection_profile_id) {
+        // #2162: a raw id carries no profile and an unscoped connection
+        // supplies none either, so the `_main` fallback below reports a
+        // session that opened under another profile as unresolved. Consult
+        // the open binding first — the same tier the sessions-manager
+        // lookup uses.
+        profile if profile == MAIN_PROFILE_ID && nonempty(params.profile_id.clone()).is_none() => {
+            session_open_profiles()
+                .lookup(&session_id)
+                .unwrap_or(profile)
+        }
+        profile => profile,
+    };
     let profile = state
         .profile_store
         .as_ref()
@@ -24032,6 +24176,21 @@ async fn open_session_result(
         context_snapshot_for_features(opened.context, opened.context_state, features);
     opened.context = context;
     opened.context_state = context_state;
+    // #2162: a raw wire id opened under an explicit profile is otherwise
+    // unaddressable by later lookups on an unscoped connection — record the
+    // profile this open resolved so hydrate/status route to the same
+    // identity the open materialized. Keyed by the id the reply echoes (what
+    // the client will send back); success-only, mirroring the WS loop's
+    // per-connection `resolved_open_profile` cell (which cannot scope one
+    // id per session on a multi-session socket). Only the case where the
+    // binding is load-bearing is recorded: a canonical id resolves through
+    // its own embedded profile, and a profile-less open shares the _main /
+    // process-wide manager with every lookup already — recording either
+    // would only add stale entries, and a profile-less reopen of a raw id
+    // would steal an existing binding onto `_main`.
+    if opened.active_profile_id.is_some() && opened.session_id.profile_id().is_none() {
+        session_open_profiles().record(opened.session_id.clone(), &ledger_profile_id);
+    }
     Ok(SessionOpenOutcome {
         result: SessionOpenResult::new(opened),
         replay,
@@ -25446,10 +25605,15 @@ pub(crate) async fn resolve_sessions_for_lookup(
     routed_profile_id: Option<&str>,
     session_id: &SessionKey,
 ) -> Option<Arc<tokio::sync::Mutex<octos_bus::SessionManager>>> {
+    // #2162: last resort for a raw id on an unscoped, un-routed connection —
+    // the profile a successful `session/open` resolved it under. Never
+    // overrides the explicit scopes below.
+    let open_binding_profile = session_open_profiles().lookup(session_id);
     let active_profile_id = session_id
         .profile_id()
         .or(connection_profile_id)
-        .or(routed_profile_id);
+        .or(routed_profile_id)
+        .or(open_binding_profile.as_deref());
     if let Some(profile_runtime) = resolve_session_profile_runtime(state, active_profile_id) {
         let workspace_profile_id = workspace_profile_scope(active_profile_id, session_id);
         let hint = session_workspaces().runtime_hint(&workspace_profile_id, session_id);
@@ -26142,7 +26306,13 @@ async fn resolve_voice_admission_runtime(
     session_id: &SessionKey,
     connection_profile_id: Option<&str>,
 ) -> Result<Arc<crate::runtime::SessionRuntime>, RpcError> {
-    let active_profile_id = session_id.profile_id().or(connection_profile_id);
+    let open_binding_profile = session_open_profiles().lookup(session_id);
+    let active_profile_id = session_id
+        .profile_id()
+        .or(connection_profile_id)
+        // #2162: a raw id on an unscoped connection — the profile the
+        // session's `session/open` resolved under.
+        .or(open_binding_profile.as_deref());
     if let Some(profile_id) = active_profile_id {
         ensure_known_profile(state, profile_id)?;
     }
@@ -26604,7 +26774,10 @@ async fn handle_turn_start_with_accept(
                 connection_profile_id
                     .or(routed_profile_id)
                     .map(ToOwned::to_owned)
-            });
+            })
+            // #2162: a raw id on an unscoped, un-routed connection — the
+            // profile the session's `session/open` resolved under.
+            .or_else(|| session_open_profiles().lookup(&params.session_id));
         if let Some(profile_id) = active_profile_id.as_deref() {
             if let Err(error) = ensure_known_profile(state, profile_id) {
                 let _ = send_rpc_error(ws, Some(id), error);
@@ -30988,6 +31161,30 @@ async fn handle_session_fork(
         }
     };
 
+    // #2162: `fork_child` of a raw parent id yields a raw child id, which
+    // — like a raw open — no later lookup can route on its own. Bind the
+    // child to the profile the parent resolved under, with the same guard
+    // as `session/open`'s record (a canonical child carries its own
+    // profile; an unmaterialized runtime leaves parent and lookups on the
+    // shared process-wide manager).
+    let resolved_profile_id = params
+        .session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            connection_profile_id
+                .or(routed_profile_id)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| session_open_profiles().lookup(&params.session_id));
+    if new_key.profile_id().is_none() {
+        if let Some(profile_id) = resolved_profile_id.as_deref() {
+            if resolve_session_profile_runtime(state, Some(profile_id)).is_some() {
+                session_open_profiles().record(new_key.clone(), profile_id);
+            }
+        }
+    }
+
     let result = octos_core::ui_protocol::SessionForkResult {
         new_session_id: new_key,
         parent_session_id: params.session_id,
@@ -31834,13 +32031,15 @@ async fn handle_session_btw(
 
     // ONE profile resolution shared by transcript AND provider, with
     // `resolve_sessions_for_lookup`'s exact precedence (session key →
-    // connection → routed; the ws arm threads its session-open fallback in
-    // through `routed_profile_id`) — a divergent pair would read one
-    // profile's transcript and bill another profile's provider.
+    // connection → routed → the #2162 open binding) — a divergent pair
+    // would read one profile's transcript and bill another profile's
+    // provider.
+    let open_binding_profile = session_open_profiles().lookup(&session_id);
     let active_profile_id = session_id
         .profile_id()
         .or(connection_profile_id)
         .or(routed_profile_id)
+        .or(open_binding_profile.as_deref())
         .map(ToOwned::to_owned);
 
     // Transcript tail from the same store turn persistence writes to
@@ -35885,7 +36084,8 @@ async fn run_m9_fixture_turn(
                     &session_id,
                     &approval_id,
                     &turn_id,
-                );
+                )
+                .await;
                 M9FixtureOutcome::Errored {
                     code: "approval_send_failed",
                     message: format!("approval/requested notification not delivered: {error:?}"),
@@ -38893,28 +39093,37 @@ async fn run_interactive_sentinel_completion(
     }
 }
 
+/// #2811 — the live tracker's accumulated input+output spend: the fallback
+/// usage source for a turn whose terminal usage payload never reached the
+/// drain loop (interrupted, or the terminal event was shed past the send
+/// budget). Mirrors input/output tokens only (no cache) — same accounting
+/// surface `interrupted_goal_charge` has always used.
+fn tracker_live_spend(tracker: &octos_agent::TokenTracker) -> u64 {
+    u64::from(
+        tracker
+            .input_tokens
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ) + u64::from(
+        tracker
+            .output_tokens
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// #1969 — resolve the token charge for a turn that may have been INTERRUPTED.
 /// The AppUI drain loop breaks on interrupt before the done/error arm folds the
 /// turn's usage into `folded`, so an interrupted goal/peer turn would charge 0.
 /// When interrupted with nothing folded, fall back to the live `tracker` (which
 /// accumulated usage as the turn ran) so the partial spend still charges. A
 /// non-interrupted turn — or one that already folded a nonzero total — is
-/// unchanged. The tracker mirrors input/output tokens only (no cache).
+/// unchanged.
 fn interrupted_goal_charge(
     interrupt_observed: bool,
     folded: u64,
     tracker: &octos_agent::TokenTracker,
 ) -> u64 {
     if interrupt_observed && folded == 0 {
-        u64::from(
-            tracker
-                .input_tokens
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ) + u64::from(
-            tracker
-                .output_tokens
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        tracker_live_spend(tracker)
     } else {
         folded
     }
@@ -39698,7 +39907,7 @@ async fn run_standalone_turn(
     // first token. No-op when this profile has no `AdaptiveRouter`
     // attached (single-provider or `enabled = false`).
     let adaptive_router_ref = session_runtime.profile.adaptive_router.clone();
-    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
+    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref()).await;
 
     // Wave4-A: subscribe to the AdaptiveRouter's broadcast channel and
     // forward `FailoverEvent`s as `router/failover` notifications for
@@ -42089,7 +42298,17 @@ async fn run_standalone_turn(
             .then(|| voice_user_content_for_persist.as_deref().unwrap_or(&prompt)),
         running_turn_probe(&contracts, &session_id, &turn_id),
     );
+    // #2807 — agent-completion signal for the drain loop: the agent task
+    // owns the sender, so it drops (and the loop's AgentFinished arm fires)
+    // the moment the body ends, whichever exit it takes — including a panic
+    // or an abort. Closed alone cannot do this: the rotator, the delivery
+    // worker, and the task supervisor keep their progress-sender clones
+    // alive past this task.
+    let (agent_finished_tx, mut agent_finished_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let progress_dropped_for_agent = Arc::clone(&progress_dropped);
     let agent_task = tokio::spawn(async move {
+        // Held for the whole body; dropped on every exit path.
+        let _agent_finished_tx = agent_finished_tx;
         let start = std::time::Instant::now();
         // RFC-3 (#1292): wrap the agent.process_message future in the
         // lane scope FIRST (innermost task-local), then router
@@ -42791,7 +43010,12 @@ async fn run_standalone_turn(
                             cache_write_tokens: u64::from(response.token_usage.cache_write_tokens),
                         },
                     });
-                    let _ = progress_tx_for_result.send(error.to_string()).await;
+                    deliver_terminal_progress_event(
+                        &progress_tx_for_result,
+                        &progress_dropped_for_agent,
+                        error.to_string(),
+                    )
+                    .await;
                     return;
                 }
                 let done = json!({
@@ -42819,7 +43043,12 @@ async fn run_standalone_turn(
                     "final_assistant_committed_seq": final_assistant_committed_seq,
                     "thread_id": turn_thread_id_for_done,
                 });
-                let _ = progress_tx_for_result.send(done.to_string()).await;
+                deliver_terminal_progress_event(
+                    &progress_tx_for_result,
+                    &progress_dropped_for_agent,
+                    done.to_string(),
+                )
+                .await;
             }
             Err(error) => {
                 // #1134 — signal the post-turn block that no LLM reply
@@ -42882,7 +43111,12 @@ async fn run_standalone_turn(
                     "tokens_cache": err_tokens_cache,
                     "token_usage": token_usage,
                 });
-                let _ = progress_tx_for_result.send(error.to_string()).await;
+                deliver_terminal_progress_event(
+                    &progress_tx_for_result,
+                    &progress_dropped_for_agent,
+                    error.to_string(),
+                )
+                .await;
             }
         }
     }.instrument(turn_span));
@@ -43035,6 +43269,7 @@ async fn run_standalone_turn(
         let event = match crate::turn_loop::next_turn_loop_step(
             &mut interrupt_rx,
             &mut progress_rx,
+            &mut agent_finished_rx,
             interrupt_observed,
         )
         .await
@@ -43047,6 +43282,76 @@ async fn run_standalone_turn(
                 break;
             }
             crate::turn_loop::TurnLoopStep::Closed => break,
+            crate::turn_loop::TurnLoopStep::AgentFinished => {
+                // #2807 — the agent body ended but no terminal event made it
+                // through the drain (its send was shed past
+                // TERMINAL_SEND_BUDGET, or the task panicked). Terminate the
+                // turn here instead of parking in recv() forever: the rotator
+                // and the delivery worker keep the progress channel open, so
+                // `Closed` alone never fires. The shed terminal frame is
+                // disclosed by the replay_lossy counter flushed below. The
+                // closing work mirrors the error arm minus the event-carried
+                // fields (the goal sentinel died with the shed event; the
+                // usage below charges the live tracker instead, #2811).
+                final_tokens_consumed =
+                    final_tokens_consumed.saturating_add(tracker_live_spend(&token_tracker));
+                let lost_message =
+                    "the agent task ended without producing a deliverable terminal event";
+                warn!(
+                    session = %session_id.0,
+                    turn = %turn_id.0,
+                    "agent task ended without a terminal event; emitting terminal_lost"
+                );
+                if let Err(error) = state.ui_protocol.workspace_teams.record_result(
+                    &session_runtime.profile.data_dir,
+                    &session_runtime.workspace_root,
+                    &session_id,
+                    &turn_id.0.to_string(),
+                    lost_message,
+                ) {
+                    tracing::warn!(%error, "failed to persist workspace peer result");
+                }
+                write_peer_result_if_peer_session(
+                    &state,
+                    &session_id,
+                    &turn_id,
+                    TurnTerminalOutcome::Errored,
+                    lost_message,
+                    final_tokens_consumed,
+                    peer_lifetime_turn.as_ref(),
+                );
+                maybe_enqueue_peer_fleet_synthesis(&state, &session_id).await;
+                maybe_enqueue_peer_fleet_synthesis_for_master(
+                    &state,
+                    &session_id,
+                    &session_runtime.profile.profile_id,
+                )
+                .await;
+                flush_replay_lossy(&ws, &ledger, &session_id, &progress_dropped);
+                crate::session_actor::emit_lifecycle_hook_payload(
+                    turn_end_hooks.as_ref(),
+                    &session_id,
+                    octos_agent::HookPayload::on_turn_end(
+                        turn_end_summary.clone(),
+                        Some(&turn_end_hook_ctx),
+                    ),
+                )
+                .await;
+                try_emit_terminal(
+                    &turn_state,
+                    TerminalReason::Errored,
+                    &ws,
+                    &ledger,
+                    &session_id,
+                    &turn_id,
+                    Some(("terminal_lost", lost_message)),
+                    None,
+                    steer_buffer.as_ref(),
+                    peers_root.as_deref(),
+                )
+                .await;
+                break;
+            }
             crate::turn_loop::TurnLoopStep::Progress(data) => {
                 match serde_json::from_str::<Value>(&data) {
                     Ok(event) => event,
@@ -43424,7 +43729,8 @@ async fn run_standalone_turn(
                     &mut task_output_delta_tracker,
                     &mut saw_delta,
                     &event,
-                );
+                )
+                .await;
             }
         }
     }
@@ -43762,7 +44068,7 @@ async fn run_standalone_turn(
             approval_cancelled_reasons::TURN_INTERRUPTED,
         );
         for entry in cancelled {
-            let _ = send_notification_durable(
+            let _ = send_notification_durable_offloaded(
                 &ws,
                 &ledger,
                 UiNotification::ApprovalCancelled(ApprovalCancelledEvent::turn_interrupted(
@@ -43770,7 +44076,8 @@ async fn run_standalone_turn(
                     entry.approval_id,
                     entry.turn_id,
                 )),
-            );
+            )
+            .await;
         }
         // UPCR-2026-023: drain pending structured user-questions for the
         // interrupted turn, mirroring the approval drain. Dropping each
@@ -43857,7 +44164,8 @@ async fn run_standalone_turn(
             &session_id,
             &turn_id,
             interrupt_observed,
-        );
+        )
+        .await;
         if late > 0 {
             warn!(
                 session = %session_id.0,
@@ -43887,7 +44195,7 @@ async fn run_standalone_turn(
     // `turn/completed` so clients see the actual provider that ran
     // the turn + any breaker / lane-score deltas. No-op when no
     // AdaptiveRouter is attached.
-    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref());
+    emit_router_status_durable(&ws, &ledger, &session_id, adaptive_router_ref.as_ref()).await;
 
     // Wave4-A (Codex P1): tear down the failover forwarder task AND
     // await its JoinHandle so the detached task cannot outlive the
@@ -43943,7 +44251,8 @@ async fn run_standalone_turn(
                     &mut drain_tracker,
                     &mut drain_saw_delta,
                     &event,
-                );
+                )
+                .await;
             }
             // `drain_saw_delta` only matters when callers want to backfill
             // the terminal `done`'s assistant content; the drain runs
@@ -44849,7 +45158,10 @@ async fn try_emit_terminal(
             let details = completion_details.unwrap_or_default();
             let tokens_in = details.tokens_in;
             let tokens_out = details.tokens_out;
-            let _ = send_notification_lifecycle(
+            // #2807 — the terminal frame goes through the offloaded lane so a
+            // stalled stdio host reader pins no executor worker while the
+            // drain loop emits it.
+            let _ = send_notification_lifecycle_offloaded(
                 ws,
                 ledger,
                 UiNotification::TurnCompleted(TurnCompletedEvent {
@@ -44870,7 +45182,8 @@ async fn try_emit_terminal(
                     // cache tokens instead of zeros.
                     token_usage: details.token_usage,
                 }),
-            );
+            )
+            .await;
             // The canonical `turn_completed` terminal reaches the client as a
             // native v2 `TurnTerminal`, projected from the lifecycle
             // `UiNotification::TurnCompleted` emitted above (see
@@ -44903,7 +45216,7 @@ async fn try_emit_terminal(
                             .session(Some(session_id.0.as_str())),
                     );
                 }
-                let _ = send_turn_error_with_details(
+                let _ = send_turn_error_with_details_offloaded(
                     ws,
                     ledger,
                     session_id,
@@ -44911,13 +45224,14 @@ async fn try_emit_terminal(
                     code,
                     message,
                     completion_details,
-                );
+                )
+                .await;
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
                 return;
             }
-            let _ = send_turn_error_with_details(
+            let _ = send_turn_error_with_details_offloaded(
                 ws,
                 ledger,
                 session_id,
@@ -44925,11 +45239,12 @@ async fn try_emit_terminal(
                 code,
                 message,
                 completion_details,
-            );
+            )
+            .await;
         }
         TerminalReason::Interrupted => {
             let (code, message) = error_payload.unwrap_or(("interrupted", "turn interrupted"));
-            let _ = send_turn_error(ws, ledger, session_id, turn_id, code, message);
+            let _ = send_turn_error_offloaded(ws, ledger, session_id, turn_id, code, message).await;
             // Outer-loop #4 (§4.2): an INTERRUPTED turn never reaches
             // `write_peer_result_if_peer_session` (it aborts the agent task
             // before the done/error event), so the peer's held slot must be
@@ -45174,7 +45489,11 @@ fn emit_progress_envelope(
 /// content on the terminal). The drain task passes a discard reference since
 /// it runs strictly after the terminal has already been emitted.
 #[allow(clippy::too_many_arguments)]
-fn forward_progress_event(
+/// #2807 — async so every durable forward parks COOPERATIVELY on the stdio
+/// lane (via the offloaded senders) instead of a blocking `SyncSender::send`
+/// that would pin an executor worker — and park this drain loop before it
+/// can ever reach the terminal gate — while a stdio host reads slowly.
+async fn forward_progress_event(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -45193,14 +45512,15 @@ fn forward_progress_event(
                 serde_json::from_value::<SessionKey>(session_id_value.clone()),
                 serde_json::from_value::<UiAgentRecord>(agent_value.clone()),
             ) {
-                let _ = send_notification_durable(
+                let _ = send_notification_durable_offloaded(
                     ws,
                     ledger,
                     UiNotification::AgentUpdated(AgentUpdatedEvent {
                         session_id: event_session_id,
                         agent,
                     }),
-                );
+                )
+                .await;
             }
         }
         return;
@@ -45209,7 +45529,9 @@ fn forward_progress_event(
     if let Some(delta) = task_output_delta_tracker.observe_progress_event(session_id, event) {
         // task/output/delta is durable: drops surface as
         // protocol/replay_lossy so the client can resync.
-        let _ = send_notification_durable(ws, ledger, UiNotification::TaskOutputDelta(delta));
+        let _ =
+            send_notification_durable_offloaded(ws, ledger, UiNotification::TaskOutputDelta(delta))
+                .await;
     }
     let mut mapping = map_progress_json(progress_context, event);
     apply_progress_contract_side_effects(
@@ -45241,11 +45563,12 @@ fn forward_progress_event(
                 let _ = send_notification_ephemeral(ws, ledger, notification);
             }
             UiNotification::ApprovalRequested(request) => {
-                if send_notification_durable(
+                if send_notification_durable_offloaded(
                     ws,
                     ledger,
                     UiNotification::ApprovalRequested(request.clone()),
                 )
+                .await
                 .is_err()
                 {
                     cancel_approval_after_request_send_failure(
@@ -45255,22 +45578,24 @@ fn forward_progress_event(
                         &request.session_id,
                         &request.approval_id,
                         &request.turn_id,
-                    );
+                    )
+                    .await;
                 }
             }
             notification => {
-                let _ = send_notification_durable(ws, ledger, notification);
+                let _ = send_notification_durable_offloaded(ws, ledger, notification).await;
             }
         }
     }
     if let Some(warning) = mapping.warning {
-        let _ = send_notification_durable(ws, ledger, UiNotification::Warning(warning));
+        let _ =
+            send_notification_durable_offloaded(ws, ledger, UiNotification::Warning(warning)).await;
     }
     if let Some(status) = mapping.status {
         // Tag with this connection's id so its forwarder skips
         // the broadcast copy after the direct send below.
         let event = ledger.append_progress_from(status.event, ws.connection_id);
-        let _ = send_ledger_event_durable(ws, ledger, event.event);
+        let _ = send_ledger_event_durable_offloaded(ws, ledger, event.event).await;
     }
 }
 
@@ -46158,6 +46483,32 @@ fn preview_oversized_frame(text: String) -> String {
     if text.len() <= MAX_TEXT_FRAME_BYTES {
         return text;
     }
+    // #2446: the truncation below is hundreds of ms of pure CPU per multi-MB
+    // frame (parse + measure + full-tree walk + up to two full
+    // serializations; the structural fallback re-serializes per round), and
+    // every outbound frame flows through here on the connection task's
+    // executor — inlined, every task sharing that worker starves for the
+    // whole stretch. Hand the stretch to the runtime: `block_in_place`
+    // parks this worker's scheduler so other tasks migrate while the
+    // truncation runs. `block_in_place` is only legal on a multi-threaded
+    // runtime worker — not on current-thread runtimes (panics), not inside
+    // a LocalSet (panics even under a multi-threaded handle; no LocalSet
+    // exists in this workspace today) — so anything else keeps the inline
+    // path. The output is byte-identical either way, only where it runs
+    // changes; if every worker is inside this preview at once, tasks wait
+    // just like the old inline behavior (never worse).
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| preview_uncapped_frame(text))
+        }
+        _ => preview_uncapped_frame(text),
+    }
+}
+
+/// The over-cap truncation itself (input guaranteed above
+/// [`MAX_TEXT_FRAME_BYTES`]). Synchronous and CPU-bound by design — see
+/// [`preview_oversized_frame`] for the offload contract.
+fn preview_uncapped_frame(text: String) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
         // Not parseable as JSON -> cannot rewrite; return unchanged. The
         // caller (`frame_text_within_cap`) drops it as still-over-cap.
@@ -47506,7 +47857,7 @@ pub(crate) enum SteerReturnSink<'a> {
 /// gate every terminal outlet goes through. A client that sees the terminal
 /// without a preceding `turn/steer_dropped` naming its steer may conclude the
 /// steer was consumed.
-pub(crate) fn settle_leftover_steers(
+pub(crate) async fn settle_leftover_steers(
     buffer: &octos_agent::SharedSteerBuffer,
     sink: SteerReturnSink<'_>,
     session_id: &SessionKey,
@@ -47532,8 +47883,11 @@ pub(crate) fn settle_leftover_steers(
          to the client as turn/steer_dropped ahead of the terminal"
     );
     match sink {
+        // #2807 — the terminal gate runs inside the turn drain loop, so the
+        // live forward goes through the offloaded lane: a stalled stdio host
+        // reader must pin no executor worker while the turn terminates.
         SteerReturnSink::Live { ws, ledger } => {
-            let _ = send_notification_durable(ws, ledger, notification);
+            let _ = send_notification_durable_offloaded(ws, ledger, notification).await;
         }
         SteerReturnSink::LedgerOnly { ledger } => {
             let _ = ledger.append_notification(notification);
@@ -47571,12 +47925,16 @@ async fn transition_to_terminal_settling_steers(
             session_id,
             turn_id,
             matches!(transition.reason, TerminalReason::Interrupted),
-        );
+        )
+        .await;
     }
     Some(transition)
 }
 
-fn send_turn_error(
+/// #2807 — the turn drain loop's terminal forward: same event shape the
+/// sync `send_turn_error` family used to deliver, now through the offloaded
+/// lifecycle lane so a stalled stdio host reader pins no executor worker.
+async fn send_turn_error_offloaded(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -47584,10 +47942,13 @@ fn send_turn_error(
     code: impl Into<String>,
     message: impl Into<String>,
 ) -> Result<(), SendError> {
-    send_turn_error_with_details(ws, ledger, session_id, turn_id, code, message, None)
+    send_turn_error_with_details_offloaded(ws, ledger, session_id, turn_id, code, message, None)
+        .await
 }
 
-fn send_turn_error_with_details(
+/// #2807 — the turn drain loop's detailed terminal forward: same event
+/// shape, delivered through the offloaded lifecycle lane.
+async fn send_turn_error_with_details_offloaded(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -47597,7 +47958,7 @@ fn send_turn_error_with_details(
     details: Option<TurnCompletionDetails>,
 ) -> Result<(), SendError> {
     let details = details.unwrap_or_default();
-    send_notification_lifecycle(
+    send_notification_lifecycle_offloaded(
         ws,
         ledger,
         UiNotification::TurnError(TurnErrorEvent {
@@ -47610,6 +47971,7 @@ fn send_turn_error_with_details(
             partial_result: details.partial_result,
         }),
     )
+    .await
 }
 
 /// Wave4-A: build a `RouterStatusEvent` from an `AdaptiveRouter` snapshot.
@@ -47639,8 +48001,13 @@ pub(crate) fn build_router_status_event(
 /// Durable delivery still ledgers the frame for reconnect-replay but
 /// degrades gracefully under push pressure.
 ///
+/// #2811 — the enqueue goes through the offloaded durable lane: both
+/// call sites run on the turn task (pre-turn and post-loop), so a full
+/// stdio queue parks this task cooperatively instead of pinning an
+/// executor worker on a blocking `SyncSender::send`.
+///
 /// No-op when `router` is `None`.
-fn emit_router_status_durable(
+async fn emit_router_status_durable(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -47652,7 +48019,7 @@ fn emit_router_status_durable(
     let event = build_router_status_event(session_id, router);
     let notif = UiNotification::RouterStatus(event);
     let method = notif.method().to_string();
-    if let Err(error) = send_notification_durable(ws, ledger, notif) {
+    if let Err(error) = send_notification_durable_offloaded(ws, ledger, notif).await {
         tracing::debug!(
             target: "octos::ui_protocol::ws",
             method = %method,
@@ -47986,11 +48353,24 @@ fn direct_send_passes_capability_filter(ws: &WsConnection, event: &UiProtocolLed
     live_event_passes_capability_filter(event, features)
 }
 
-fn send_notification_lifecycle(
+/// The bookkeeping the delivery-twin result mappings report on, shared by
+/// the lifecycle and durable lanes.
+struct SendMeta {
+    cursor: UiCursor,
+    delivery_metric: Option<UiProtocolDeliveryMetric>,
+    method: String,
+}
+
+/// Shared prep of the sync/async lifecycle delivery twins (#2807): ledger
+/// append, v2 projection, capability filter, frame assembly. Returns the
+/// wire frame to enqueue plus its [`SendMeta`]. `Ok(None)` =
+/// fully handled without touching the wire (the v2 forwarder lane, or a
+/// capability-filtered event), so there is nothing to enqueue.
+fn prepare_lifecycle_send(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
-) -> Result<(), SendError> {
+) -> Result<Option<(WsMessage, SendMeta)>, SendError> {
     let features = ws.snapshot_live_features();
     if matches!(
         &notification,
@@ -48019,7 +48399,7 @@ fn send_notification_lifecycle(
         // `session/open`) nothing would deliver an untagged terminal, so it
         // keeps the direct lifecycle path below.
         ledger.append_notification(notification);
-        return Ok(());
+        return Ok(None);
     }
 
     // Tag the broadcast with the originating connection so this
@@ -48039,14 +48419,31 @@ fn send_notification_lifecycle(
     let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
     let method = ledger_event_method(&event_for_wire).to_string();
     if !live_event_passes_capability_filter(&event_for_wire, features) {
-        return Ok(());
+        return Ok(None);
     }
     let frame = frame_from_ledger(event_for_wire)
         .ok_or_else(|| SendError::LifecycleFailure(format!("serialize {method}")))?;
-    match ws.send_lifecycle(frame) {
+    Ok(Some((
+        frame,
+        SendMeta {
+            cursor,
+            delivery_metric,
+            method,
+        },
+    )))
+}
+
+/// Shared result mapping of the lifecycle delivery twins: delivery metric,
+/// durable-cursor bookkeeping, and the `delivery_failed` warn.
+fn finish_lifecycle_send(
+    ws: &WsConnection,
+    meta: SendMeta,
+    sent: Result<(), SendError>,
+) -> Result<(), SendError> {
+    match sent {
         Ok(()) => {
-            record_ui_protocol_delivery_metric(delivery_metric);
-            ws.metrics.record_durable_cursor(&cursor);
+            record_ui_protocol_delivery_metric(meta.delivery_metric);
+            ws.metrics.record_durable_cursor(&meta.cursor);
             Ok(())
         }
         Err(SendError::LifecycleFailure(reason)) => {
@@ -48054,7 +48451,7 @@ fn send_notification_lifecycle(
             // from the caller's perspective (turn aborts cleanly).
             tracing::warn!(
                 target: "octos::ui_protocol::ws",
-                method = %method,
+                method = %meta.method,
                 reason = %reason,
                 "lifecycle notification not delivered; entry remains in ledger as delivery_failed"
             );
@@ -48062,6 +48459,36 @@ fn send_notification_lifecycle(
         }
         Err(other) => Err(other),
     }
+}
+
+fn send_notification_lifecycle(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_lifecycle_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_lifecycle(frame);
+    finish_lifecycle_send(ws, meta, sent)
+}
+
+/// #2807 — async twin of [`send_notification_lifecycle`] for the turn drain
+/// loop's terminal forwards: identical prep, bookkeeping, and error
+/// semantics (keep the two in lockstep), but the enqueue goes through
+/// [`WsConnection::send_lifecycle_offloaded`], whose stdio lane parks this
+/// task cooperatively instead of pinning an executor worker on a blocking
+/// `SyncSender::send`.
+async fn send_notification_lifecycle_offloaded(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_lifecycle_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_lifecycle_offloaded(frame).await;
+    finish_lifecycle_send(ws, meta, sent)
 }
 
 fn send_notification_lifecycle_forced_backpressure_fixture(
@@ -48190,15 +48617,20 @@ fn goal_event_generation_admits(
     true
 }
 
-fn send_notification_durable(
+/// Shared prep of the sync/async durable delivery twins (#2807): goal guard,
+/// evidence recording, forwarder-lane routing, ledger append, v2 projection,
+/// capability filter, frame assembly. Returns the wire frame to enqueue plus
+/// its [`SendMeta`]. `Ok(None)` = fully handled without touching the wire,
+/// so there is nothing to enqueue.
+fn prepare_durable_send(
     ws: &WsConnection,
     ledger: &UiProtocolLedger,
     notification: UiNotification,
-) -> Result<(), SendError> {
+) -> Result<Option<(WsMessage, SendMeta)>, SendError> {
     // #1959 — drop a goal chip event that a newer clear/update already
     // superseded for this session (see the guard's doc comment).
     if !goal_event_passes_generation_guard(&notification) {
-        return Ok(());
+        return Ok(None);
     }
     // M15-F5 (#44): mirror production supervised-task lifecycle updates into
     // the `task-ledger.jsonl` evidence ledger. NO-OP unless the live tmux soak
@@ -48219,7 +48651,7 @@ fn send_notification_durable(
     ) && ws.has_live_forwarder(notification.session_id())
     {
         ledger.append_notification(notification);
-        return Ok(());
+        return Ok(None);
     }
     let event = ledger.append_notification_from(notification, ws.connection_id);
     let cursor = event.cursor.clone();
@@ -48239,7 +48671,7 @@ fn send_notification_durable(
     let delivery_metric = ui_protocol_delivery_metric(&event_for_wire);
     let method = ledger_event_method(&event_for_wire).to_string();
     if !live_event_passes_capability_filter(&event_for_wire, features) {
-        return Ok(());
+        return Ok(None);
     }
     let frame = match frame_from_ledger(event_for_wire) {
         Some(frame) => frame,
@@ -48247,20 +48679,124 @@ fn send_notification_durable(
             return Err(SendError::BackpressureDrop);
         }
     };
-    match ws.send_durable(frame, &method) {
+    Ok(Some((
+        frame,
+        SendMeta {
+            cursor,
+            delivery_metric,
+            method,
+        },
+    )))
+}
+
+/// Shared result mapping of the durable delivery twins: delivery metric,
+/// durable-cursor bookkeeping, and the immediate replay_lossy on a
+/// backpressure drop.
+fn finish_durable_send(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    meta: SendMeta,
+    sent: Result<(), SendError>,
+) -> Result<(), SendError> {
+    match sent {
         Ok(()) => {
-            record_ui_protocol_delivery_metric(delivery_metric);
-            ws.metrics.record_durable_cursor(&cursor);
+            record_ui_protocol_delivery_metric(meta.delivery_metric);
+            ws.metrics.record_durable_cursor(&meta.cursor);
             Ok(())
         }
         Err(SendError::BackpressureDrop) => {
             // Best-effort: try to tell the client right away. If even the
             // lossy frame cannot enqueue, accumulate and flush later.
-            emit_replay_lossy_opportunistic(ws, ledger, &cursor.stream);
+            emit_replay_lossy_opportunistic(ws, ledger, &meta.cursor.stream);
             Err(SendError::BackpressureDrop)
         }
         Err(other) => Err(other),
     }
+}
+
+fn send_notification_durable(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_durable_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_durable(frame, &meta.method);
+    finish_durable_send(ws, ledger, meta, sent)
+}
+
+/// #2807 — async twin of [`send_notification_durable`] for the turn drain
+/// loop's durable forwards (the steer settlement inside the terminal gate):
+/// identical prep, metrics, and replay_lossy semantics — keep the two in
+/// lockstep — but the enqueue goes through
+/// [`WsConnection::send_durable_offloaded`], whose stdio lane parks THIS
+/// task cooperatively instead of pinning an executor worker on a blocking
+/// `SyncSender::send`.
+async fn send_notification_durable_offloaded(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_durable_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = ws.send_durable_offloaded(frame, &meta.method).await;
+    finish_durable_send(ws, ledger, meta, sent)
+}
+
+/// #2815 — budgeted twin of [`send_notification_durable_offloaded`] for the
+/// agent task's own approval/question prompt sends. The caller parks the
+/// agent task — the one task that holds the turn's completion sender — so a
+/// full stdio queue must not hold it past [`PROMPT_SEND_BUDGET`]: past the
+/// budget the send sheds as [`SendError::BackpressureDrop`], the same shape
+/// a full WS queue produces instantly, and the callers' existing
+/// fail-closed arms (cancel + deny / fallback) run. The shed flows through
+/// `finish_durable_send`'s backpressure accounting, so the lossy frame is
+/// disclosed immediately. Dropping the inner future is safe: the offloaded
+/// lane is cancellable at every await with an atomic enqueue (#2065).
+async fn send_notification_durable_offloaded_budgeted(
+    ws: &WsConnection,
+    ledger: &UiProtocolLedger,
+    notification: UiNotification,
+) -> Result<(), SendError> {
+    let Some((frame, meta)) = prepare_durable_send(ws, ledger, notification)? else {
+        return Ok(());
+    };
+    let sent = match tokio::time::timeout(
+        PROMPT_SEND_BUDGET,
+        ws.send_durable_offloaded(frame, &meta.method),
+    )
+    .await
+    {
+        Ok(sent) => sent,
+        Err(_elapsed) => {
+            // A concurrent lifecycle failure may have latched the
+            // connection during the park; report the latch instead of
+            // masking it as backpressure, so the caller's keep-pending arm
+            // sees the same `FatalClosed` the probe loop would have
+            // returned (no drop accounting, mirroring `send_durable`'s
+            // latched arm).
+            if ws.failed.load(Ordering::Acquire) {
+                return Err(SendError::FatalClosed);
+            }
+            // Mirror send_durable's BackpressureDrop accounting: the count
+            // lands in the accumulator first, then finish_durable_send's
+            // immediate replay_lossy attempt discloses it (or re-queues the
+            // count when the lossy frame cannot enqueue either).
+            ws.metrics.dropped_count.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("ws.send.drop.backpressure", "method" => meta.method.clone())
+                .increment(1);
+            tracing::warn!(
+                target: "octos::ui_protocol::ws",
+                method = %meta.method,
+                budget_secs = PROMPT_SEND_BUDGET.as_secs(),
+                "durable prompt send shed past the send budget on a stalled consumer"
+            );
+            Err(SendError::BackpressureDrop)
+        }
+    };
+    finish_durable_send(ws, ledger, meta, sent)
 }
 
 fn send_notification_ephemeral(
@@ -48568,6 +49104,30 @@ fn emit_replay_lossy_opportunistic(
     }
 }
 
+/// #2807 — deliver the agent task's terminal event into the shared progress
+/// channel under [`TERMINAL_SEND_BUDGET`]. On a stalled consumer the send is
+/// shed and counted into the turn's drop counter (surfaced as
+/// `replay_lossy` at the turn boundary); the drain loop's completion-signal
+/// arm then terminates the turn with `terminal_lost` instead of parking.
+async fn deliver_terminal_progress_event(
+    tx: &tokio::sync::mpsc::Sender<String>,
+    progress_dropped: &AtomicU64,
+    payload: String,
+) {
+    if tokio::time::timeout(TERMINAL_SEND_BUDGET, tx.send(payload))
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    progress_dropped.fetch_add(1, Ordering::Relaxed);
+    metrics::counter!("ws.send.drop.backpressure", "method" => "turn_terminal").increment(1);
+    tracing::warn!(
+        budget_secs = TERMINAL_SEND_BUDGET.as_secs(),
+        "terminal progress event shed past the send budget; counted into replay_lossy"
+    );
+}
+
 /// Drain any accumulated drops as a final `protocol/replay_lossy` before a
 /// turn boundary. Intended to be called just before `turn/completed` or
 /// `turn/error` so the client knows the cursor is incomplete.
@@ -48597,8 +49157,20 @@ mod peer_purge;
 mod tests;
 
 #[cfg(test)]
+#[path = "ui_protocol_monitor_expired_tests.rs"]
+mod monitor_expired_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_stalled_consumer_tests.rs"]
+mod stalled_consumer_tests;
+
+#[cfg(test)]
 #[path = "ui_protocol_host_app_peer_tests.rs"]
 mod host_app_peer_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_oversized_frame_tests.rs"]
+mod oversized_frame_tests;
 
 #[cfg(test)]
 #[path = "ui_protocol_peer_host_tools_tests.rs"]

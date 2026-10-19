@@ -431,3 +431,107 @@ jobs:
     with:
       tag: ${{ inputs.tag || github.ref_name }}
     secrets: inherit
+
+  distribution-alignment:
+    name: Verify distribution alignment
+    needs: [verify-release, package-publishers]
+    # The release above is already public by the time the publishers run, so
+    # once npm or Homebrew red, every install channel silently keeps serving
+    # the previous version while the release advertises the new one (v2.0.3
+    # shipped with npm still on latest=2.0.2). This gate runs even when the
+    # publishers failed and holds the release workflow to the observable
+    # distribution state (#2798).
+    if: ${{ !cancelled() && (github.event_name == 'push' || inputs.tag != '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      # The tap formula is served from main, not from the tag.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Check npm dist-tag and Homebrew formula against the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          PUBLISHERS: ${{ needs.package-publishers.result }}
+          PUBLISH_ENABLED: ${{ vars.PUBLISH_PACKAGES == 'true' }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          if [ "$PUBLISH_ENABLED" != "true" ]; then
+            echo "::notice::PUBLISH_PACKAGES is not 'true' — package publishing is disabled, alignment not checked."
+            exit 0
+          fi
+          fail=0
+          # When the publishers claim success, a misaligned channel is what the
+          # gate is for (it fails the run). When they did not, their failure is
+          # already the gate signal and the live checks below are diagnostics
+          # only — re-running an old release after a newer one superseded it
+          # would otherwise always red here (latest and the formula have moved
+          # on), and its "re-run" advice could never succeed.
+          level=error
+          if [ "$PUBLISHERS" = "skipped" ]; then
+            echo "::error::package publishers did not run — an upstream job failed and the release is public without verified distributions. Fix the failing job above; re-running the publishers alone will not align it."
+            fail=1
+            level=warning
+          elif [ "$PUBLISHERS" != "success" ]; then
+            echo "::error::package publishers concluded '${PUBLISHERS}' — the release is public while its npm/Homebrew distribution did not complete; re-run 'Publish npm and Homebrew packages' for ${TAG} if no newer release has superseded it."
+            fail=1
+            level=warning
+          fi
+          # Same dist-tag rule as the npm publish step: stable → latest,
+          # prerelease → its label (2.0.3-rc.11 → rc).
+          case "$version" in
+            *-*) dist_tag="${version#*-}"; dist_tag="${dist_tag%%.*}" ;;
+            *)   dist_tag="latest" ;;
+          esac
+          published=""
+          for attempt in 1 2 3; do
+            published=$(npm view "@octos-org/octos@${version}" version 2>/dev/null || true)
+            [ "$published" = "$version" ] && break
+            [ "$attempt" = 3 ] || sleep 10
+          done
+          if [ "$published" != "$version" ]; then
+            echo "::${level}::@octos-org/octos@${version} is not visible on npm — the ${dist_tag} dist-tag still serves the previous version."
+            [ "$level" = error ] && fail=1
+          else
+            tagged=$(npm view "@octos-org/octos" dist-tags --json 2>/dev/null | jq -r --arg tag "$dist_tag" '.[$tag] // ""' || true)
+            if [ "$tagged" != "$version" ]; then
+              echo "::${level}::npm dist-tag '${dist_tag}' points at '${tagged:-none}', not ${version}."
+              [ "$level" = error ] && fail=1
+            fi
+          fi
+          # The Homebrew publisher only runs for stable tags — mirror that gate,
+          # then hold the tap formula to the published bytes.
+          case "$TAG" in
+            *-*) ;;
+            *)
+              mkdir -p formula-shas
+              formula_version=$(awk 'match($0, /^  version "(.+)"$/) { print substr($0, RSTART + 11, RLENGTH - 12); exit }' Formula/octos.rb)
+              if [ "$formula_version" != "$version" ]; then
+                echo "::${level}::Formula/octos.rb is at version ${formula_version:-none}, not ${version}."
+                [ "$level" = error ] && fail=1
+              elif gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+                  --pattern 'octos-bundle-*.tar.gz.sha256' --dir formula-shas --clobber >/dev/null; then
+                for triple in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+                  want=$(awk '{print $1}' "formula-shas/octos-bundle-${triple}.tar.gz.sha256")
+                  got=$(awk -v triple="$triple" '
+                    index($0, "octos-bundle-" triple ".tar.gz") { hit = 1; next }
+                    hit && match($0, /sha256 "[0-9a-f]+"/) { print substr($0, RSTART + 8, RLENGTH - 9); exit }
+                  ' Formula/octos.rb)
+                  if [ "$got" != "$want" ]; then
+                    echo "::${level}::Formula/octos.rb sha256 for ${triple} (${got:-none}) does not match the published octos-bundle-${triple}.tar.gz.sha256 (${want})."
+                    [ "$level" = error ] && fail=1
+                  fi
+                done
+              else
+                echo "::${level}::could not download the ${TAG} checksum sidecars from the release."
+                [ "$level" = error ] && fail=1
+              fi
+              ;;
+          esac
+          [ "$fail" = 0 ] || exit 1

@@ -2525,6 +2525,8 @@ Palpo 在启动时读取 `appservices/octos-registration.yaml`。当 Matrix 用�
 | `sender_localpart` | `sender_localpart: octosbot` | `"sender_localpart": "octosbot"` |
 | server name | `regex: "@octosbot:your\\.server\\.name"` | `"server_name": "your.server.name"` |
 
+事务重试按 `txn_id` 在滚动窗口内去重（最近 1,000 个事务 ID，60 秒）。窗口之外到达的重试会重新执行；对于持有上述 `hs_token` 的可信 homeserver，这是可接受的。
+
 ### 16.5 故障排除
 
 | 症状 | 原因 | 解决方法 |
