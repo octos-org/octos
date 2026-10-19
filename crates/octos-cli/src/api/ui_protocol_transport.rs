@@ -31340,8 +31340,8 @@ async fn handle_session_append_message(
                 .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
         ),
         MessageRole::Assistant => requested_thread_id.clone(),
-        MessageRole::System => None,
-        MessageRole::Tool => unreachable!("tool role rejected above"),
+        // Tool messages were rejected above; neither role starts a thread.
+        MessageRole::System | MessageRole::Tool => None,
     };
 
     let Some(sessions) = resolve_sessions_for_lookup(
