@@ -516,6 +516,46 @@ impl LlmProvider for SuccessProvider {
     }
 }
 
+/// [`SuccessProvider`] with a gate: every `chat` parks on the returned
+/// [`Notify`] until it fires (one release per agent turn), then ends the turn.
+/// Pins an attempt mid-flight so a test can interleave pool calls against a
+/// live attempt — an instantly-finishing provider lets a whole run settle
+/// between two dispatches, and the launch CAS then answers `RejectedNotReady`
+/// for a terminal child (the correct answer to a different question), which
+/// flaked `dispatch_double_launch_is_rejected` in CI.
+pub struct GatedProvider {
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl GatedProvider {
+    /// Returns the provider and the gate; `notify_one` on the gate lets the
+    /// parked attempt finish. Firing before the first `chat` is also safe (the
+    /// permit is stored and consumed by the first park).
+    pub fn new() -> (Self, Arc<tokio::sync::Notify>) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        (
+            Self {
+                release: gate.clone(),
+            },
+            gate,
+        )
+    }
+}
+
+#[async_trait]
+impl LlmProvider for GatedProvider {
+    async fn chat(&self, _m: &[Message], _t: &[ToolSpec], _c: &ChatConfig) -> Result<ChatResponse> {
+        self.release.notified().await;
+        Ok(end_turn("done, nothing to write"))
+    }
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
 /// Writes `path` via the `write_file` tool on the first turn, then ends.
 pub struct WriteFileProvider {
     pub path: String,

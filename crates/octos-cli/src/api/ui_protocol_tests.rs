@@ -4619,6 +4619,63 @@ fn appui_prompt_context_bridge_reports_live_context_state_when_negotiated() {
 }
 
 #[test]
+fn appui_prompt_context_bridge_retains_one_shot_reflection_at_original_position() {
+    let session_id = SessionKey::new("api", "checkpoint-once");
+    let manager = Arc::new(StdMutex::new(ContextManager::new(
+        session_id.to_string(),
+        None,
+    )));
+    let dir = tempfile::tempdir().unwrap();
+    let bridge =
+        AppUiPromptContextBridge::new(session_id, dir.path().to_path_buf(), manager.clone(), false);
+    let mut prompt = vec![
+        Message::system("stable runtime"),
+        Message::user("finish deck"),
+    ];
+    let request = |phase, iteration| PromptContextRequest {
+        phase,
+        iteration,
+        provider_name: "test".into(),
+        model_id: "large-context".into(),
+        context_window: 200_000,
+    };
+    bridge
+        .prepare_prompt(request(PromptContextPhase::TurnStart, 1), &mut prompt)
+        .unwrap();
+    let checkpoint = "<context_event kind=\"convergence_checkpoint\" authority=\"background\">p36-v9 complete</context_event>";
+    prompt.push(Message::user(checkpoint));
+    prompt.push(Message::assistant("new clean artwork requested"));
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 2), &mut prompt)
+        .unwrap();
+    let original = prompt.iter().position(|m| m.content == checkpoint).unwrap();
+    prompt.push(Message::assistant("clean artwork received"));
+    bridge
+        .prepare_prompt(request(PromptContextPhase::Iteration, 3), &mut prompt)
+        .unwrap();
+    assert_eq!(
+        prompt
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.content == checkpoint)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>(),
+        vec![original]
+    );
+    assert_eq!(prompt.last().unwrap().content, "clean artwork received");
+    let reloaded = ContextManager::from_snapshot(manager.lock().unwrap().snapshot());
+    assert_eq!(
+        reloaded
+            .for_prompt(&PromptBuildPolicy::default())
+            .messages
+            .iter()
+            .filter(|m| m.content == checkpoint)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn appui_prompt_context_bridge_preserves_current_user_turn() {
     let session_id = SessionKey::new("api", "context-current-user");
     let history = vec![
@@ -24496,7 +24553,8 @@ async fn approval_request_backpressure_cancels_pending_runtime_waiter() {
         &session_id,
         &approval_id,
         &turn_id,
-    );
+    )
+    .await;
 
     assert!(
         response_rx.await.is_err(),
@@ -26238,12 +26296,9 @@ async fn session_rollback_survives_reload_from_disk() {
 }
 
 /// A stale context ledger must not resurrect rolled-back turns. The
-/// ledger coverage check is a high-watermark `>=` (deliberately
-/// slice-tolerant, because turn paths pass bounded history slices), so
-/// after a rollback shrinks durable history a pre-rollback ledger still
-/// "covers" it, gets Loaded verbatim, and the next model prompt would
-/// contain the very turns the user rewound away. `session/rollback` must
-/// rebuild + persist the context ledger from the trimmed history.
+/// Exact source-history coverage rejects a pre-rollback ledger on resume.
+/// The rollback handler also rebuilds and persists immediately, retiring
+/// summaries and cache state before any later turn resumes.
 #[tokio::test(flavor = "current_thread")]
 async fn session_rollback_rebuilds_context_ledger() {
     let session_id = SessionKey("local:rollback-ctx-ledger".into());
@@ -29121,7 +29176,7 @@ async fn bounded_channel_reporter_emits_typed_thread_id_on_progress_events() {
         .with_thread_id(Some("turn-pr-f-A".to_string()));
     reporter.report(octos_agent::ProgressEvent::Thinking { iteration: 0 });
 
-    let event = rx.try_recv().expect("event must be available");
+    let event = rx.recv().await.expect("event must be available");
     let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
     assert_eq!(
         parsed["thread_id"], "turn-pr-f-A",
@@ -29132,7 +29187,7 @@ async fn bounded_channel_reporter_emits_typed_thread_id_on_progress_events() {
     let (tx2, mut rx2) = tokio::sync::mpsc::channel::<String>(8);
     let unbound = BoundedChannelReporter::new(tx2, dropped);
     unbound.report(octos_agent::ProgressEvent::Thinking { iteration: 1 });
-    let event = rx2.try_recv().expect("event must be available");
+    let event = rx2.recv().await.expect("event must be available");
     let parsed: serde_json::Value = serde_json::from_str(&event).expect("valid json");
     assert!(
         parsed.get("thread_id").is_none(),
@@ -31342,7 +31397,11 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
     );
     assert_eq!(response.assistant_segments.final_iteration, 4);
     if progress_mode == 2 {
-        assert!(progress_dropped.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            progress_dropped.load(Ordering::SeqCst),
+            0,
+            "a full transport queue must not discard tool/identity events"
+        );
     }
     let (ws, _writer) = ws_connection_for_test(512);
     let context = ProgressMappingContext::new(session.clone(), turn_id);
@@ -31351,7 +31410,9 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
     let mut saw_delta = false;
     let mut expected_stream_ids = Vec::new();
     let mut delayed_progress = Vec::new();
-    while let Ok(json) = rx.try_recv() {
+    while let Ok(Some(json)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+    {
         let event: Value = serde_json::from_str(&json).unwrap();
         if progress_mode == 4 {
             delayed_progress.push(event);
@@ -31374,7 +31435,8 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
             &mut tracker,
             &mut saw_delta,
             &event,
-        );
+        )
+        .await;
     }
     // Actual production persistence is batched AFTER the whole Agent turn:
     // all earlier streamed phases are already present when these callbacks run.
@@ -31417,7 +31479,8 @@ async fn assert_batched_assistant_commits_keep_iteration_identity(progress_mode:
             &mut tracker,
             &mut saw_delta,
             &event,
-        );
+        )
+        .await;
     }
     let mut persisted = Vec::new();
     while let Ok(event) = events.try_recv() {
@@ -34695,6 +34758,322 @@ async fn appui_explicit_cwd_remains_a_transcript_store_hint() {
     );
 }
 
+/// #2162: `session/open` with a raw wire id plus an explicit `profile_id`
+/// succeeds on an unscoped connection, but the id itself carries no profile
+/// — later lookups must still land in the open's profile manager, not fall
+/// through to the legacy global one (`unknown_session`).
+///
+/// The binding registry is process-global, so every test below keys its
+/// sessions on ids unique to that test.
+#[tokio::test]
+async fn appui_raw_open_profile_binding_keeps_the_session_addressable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "raw-open-binding";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "binding-addressable");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("open binding tier resolves the session manager");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "lookup must land in the profile the open resolved",
+    );
+    assert!(
+        sessions.lock().await.session_known(&raw_id),
+        "the session open created must be known under its raw wire id",
+    );
+}
+
+/// #2162: `session/status/read` for a raw id on an unscoped connection must
+/// resolve the open's profile instead of reporting `_main` as unresolved.
+#[tokio::test]
+async fn raw_session_status_read_resolves_open_profile_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "raw-open-status";
+    let (state, _profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "binding-status");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let status = raw_session_status_result(
+        &state,
+        &RpcRequest::<Value>::new(
+            "status-after-raw-open",
+            APPUI_METHOD_SESSION_STATUS_READ,
+            json!({ "session_id": raw_id.0 }),
+        ),
+        ConnectionUiFeatures::default(),
+        None,
+    )
+    .await
+    .expect("status/read must resolve the open binding, not _main");
+    assert_eq!(status["profile_id"], json!(profile_id));
+}
+
+/// #2162 round 2: reopening the same raw wire id under another profile
+/// rebinds it — the last open owns the wire id.
+#[tokio::test]
+async fn appui_reopen_raw_id_under_new_profile_rebinds_the_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (state, first_runtime) = state_with_profile(temp.path(), "rebind-first").await;
+    let second_dir = tempfile::tempdir().expect("tempdir");
+    let (_second_state, second_runtime) =
+        state_with_profile(second_dir.path(), "rebind-second").await;
+    let mut state_inner = Arc::try_unwrap(state)
+        .map_err(|_| "state Arc must be unique for test setup")
+        .expect("unique Arc");
+    state_inner
+        .profiles
+        .insert("rebind-second".into(), second_runtime.clone());
+    let state = Arc::new(state_inner);
+
+    let raw_id = SessionKey::new("api", "rebind-target");
+    let open = |profile_id: &'static str| {
+        let state = state.clone();
+        let raw_id = raw_id.clone();
+        async move {
+            open_session_result(
+                &state,
+                &UiProtocolLedger::new(16),
+                &PendingApprovalStore::default(),
+                &PendingQuestionStore::default(),
+                ConnectionId::next(),
+                None,
+                None,
+                ConnectionUiFeatures::default(),
+                SessionOpenParams {
+                    client_commands: None,
+                    session_id: raw_id,
+                    topic: None,
+                    profile_id: Some(profile_id.to_owned()),
+                    cwd: None,
+                    sandbox: None,
+                    after: None,
+                },
+            )
+            .await
+            .expect("raw-id session/open with an explicit profile must succeed")
+        }
+    };
+    open("rebind-first").await;
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("first binding resolves");
+    assert_eq!(sessions.lock().await.data_dir(), first_runtime.data_dir);
+
+    open("rebind-second").await;
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("rebound binding resolves");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        second_runtime.data_dir,
+        "the last open owns the wire id",
+    );
+}
+
+/// #2162 round 2: a profile-less reopen of a raw id must not steal an
+/// existing binding onto `_main` — the open itself resolved the session
+/// through the binding and shares one manager with the lookups either way.
+#[tokio::test]
+async fn appui_profileless_reopen_keeps_the_existing_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "no-steal";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "no-steal-target");
+    for params_profile in [Some(profile_id.to_owned()), None] {
+        open_session_result(
+            &state,
+            &UiProtocolLedger::new(16),
+            &PendingApprovalStore::default(),
+            &PendingQuestionStore::default(),
+            ConnectionId::next(),
+            None,
+            None,
+            ConnectionUiFeatures::default(),
+            SessionOpenParams {
+                client_commands: None,
+                session_id: raw_id.clone(),
+                topic: None,
+                profile_id: params_profile,
+                cwd: None,
+                sandbox: None,
+                after: None,
+            },
+        )
+        .await
+        .expect("session/open must succeed");
+    }
+
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &raw_id)
+        .await
+        .expect("binding survives the profile-less reopen");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "the profile-less reopen must not rebind the wire id to _main",
+    );
+}
+
+/// #2162 round 2: a connection's authenticated profile outranks the binding
+/// — profile-scoped connections keep their existing isolation.
+#[tokio::test]
+async fn appui_connection_profile_outranks_the_open_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "binding-shadowed";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "shadowed-target");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let sessions = resolve_sessions_for_lookup(&state, Some("other-profile"), None, &raw_id)
+        .await
+        .expect("connection-profile lookup resolves");
+    assert_ne!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "the connection profile must win over the open binding",
+    );
+}
+
+/// #2162 round 2 (review MAJOR 2): forking a raw-id parent yields a raw
+/// child id — the child must be bound to the profile the parent resolved
+/// under, or the fork mints another half-usable identity.
+#[tokio::test]
+async fn appui_fork_binds_a_raw_child_to_the_parent_profile() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let profile_id = "fork-bind";
+    let (state, profile_runtime) = state_with_profile(temp.path(), profile_id).await;
+
+    let raw_id = SessionKey::new("api", "fork-parent");
+    open_session_result(
+        &state,
+        &UiProtocolLedger::new(16),
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        ConnectionId::next(),
+        None,
+        None,
+        ConnectionUiFeatures::default(),
+        SessionOpenParams {
+            client_commands: None,
+            session_id: raw_id.clone(),
+            topic: None,
+            profile_id: Some(profile_id.into()),
+            cwd: None,
+            sandbox: None,
+            after: None,
+        },
+    )
+    .await
+    .expect("raw-id session/open with an explicit profile must succeed");
+
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_fork(
+        &ws,
+        &state,
+        None,
+        None,
+        "fork-bind-1".into(),
+        octos_core::ui_protocol::SessionForkParams {
+            session_id: raw_id.clone(),
+            new_chat_id: "kid".into(),
+            copy_messages: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    let child = frame
+        .get("result")
+        .and_then(|result| result.get("new_session_id"))
+        .and_then(Value::as_str)
+        .expect("fork must succeed and echo the child id")
+        .to_owned();
+
+    let child_key = SessionKey(child);
+    assert!(
+        child_key.profile_id().is_none(),
+        "the parent is a raw id, so the child must be raw too",
+    );
+    let sessions = resolve_sessions_for_lookup(&state, None, None, &child_key)
+        .await
+        .expect("child binding resolves the session manager");
+    assert_eq!(
+        sessions.lock().await.data_dir(),
+        profile_runtime.data_dir,
+        "the fork child must land in the parent's profile manager",
+    );
+    assert!(
+        sessions.lock().await.session_known(&child_key),
+        "the fork child must be known under its raw wire id",
+    );
+}
+
 #[tokio::test]
 async fn should_keep_profile_transcript_store_with_fresh_cache_after_no_cwd_reseed() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -34884,9 +35263,9 @@ fn review_specialist_config_rejects_invalid_keys_and_duplicates() {
 /// Mock provider for router-emission tests: never called, just lets
 /// `AdaptiveRouter::new` accept two slots so the lane-scoring + breaker
 /// snapshot paths fire end-to-end.
-struct Wave4AStubProvider {
-    name: &'static str,
-    model: &'static str,
+pub(crate) struct Wave4AStubProvider {
+    pub(crate) name: &'static str,
+    pub(crate) model: &'static str,
 }
 
 #[async_trait::async_trait]
@@ -42168,15 +42547,12 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
     );
 }
 
-/// LLM stub for the end-to-end mid-turn steer test. Call 0 announces it
-/// entered (so the test can steer while the model is "streaming"), waits
-/// for the go-signal, then returns a FINAL answer; the pending steer must
-/// force a second round whose request carries the steer as a plain
-/// `role: user` message after the recorded first answer.
+/// Emits visible text, then stalls indefinitely. Steering must wake this
+/// stream without a completion signal and preserve the emitted text before
+/// the new user message in the next request and durable history.
 struct GatedSteerLlm {
     call_count: std::sync::atomic::AtomicUsize,
-    entered: tokio::sync::Notify,
-    proceed: tokio::sync::Notify,
+    entered: Arc<tokio::sync::Notify>,
     observed: StdMutex<Vec<Vec<(MessageRole, String)>>>,
 }
 
@@ -42184,10 +42560,20 @@ struct GatedSteerLlm {
 impl octos_llm::LlmProvider for GatedSteerLlm {
     async fn chat(
         &self,
-        messages: &[Message],
+        _messages: &[Message],
         _tools: &[octos_llm::ToolSpec],
         _config: &octos_llm::ChatConfig,
     ) -> eyre::Result<octos_llm::ChatResponse> {
+        eyre::bail!("steering must continue streaming, not fall back to chat")
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatStream> {
+        use futures::StreamExt;
         self.observed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -42198,25 +42584,23 @@ impl octos_llm::LlmProvider for GatedSteerLlm {
                     .collect(),
             );
         let call = self.call_count.fetch_add(1, Ordering::SeqCst);
-        let content = if call == 0 {
-            self.entered.notify_one();
-            self.proceed.notified().await;
-            "first answer"
+        if call == 0 {
+            let entered = self.entered.clone();
+            Ok(Box::pin(
+                futures::stream::iter(vec![octos_llm::StreamEvent::TextDelta(
+                    "first answer".into(),
+                )])
+                .chain(futures::stream::poll_fn(move |_| {
+                    entered.notify_one();
+                    std::task::Poll::Pending
+                })),
+            ))
         } else {
-            "second answer"
-        };
-        Ok(octos_llm::ChatResponse {
-            content: Some(content.to_string()),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            stop_reason: octos_llm::StopReason::EndTurn,
-            usage: octos_llm::TokenUsage {
-                input_tokens: 8,
-                output_tokens: 4,
-                ..Default::default()
-            },
-            provider_index: None,
-        })
+            Ok(Box::pin(futures::stream::iter(vec![
+                octos_llm::StreamEvent::TextDelta("second answer".into()),
+                octos_llm::StreamEvent::Done(octos_llm::StopReason::EndTurn),
+            ])))
+        }
     }
 
     fn model_id(&self) -> &str {
@@ -42229,7 +42613,7 @@ impl octos_llm::LlmProvider for GatedSteerLlm {
 }
 
 /// End-to-end over the REAL turn runtime: `turn/start` runs a turn; while
-/// the model produces its final answer a `turn/steer` lands in the ACTIVE
+/// the model stalls after partial text a `turn/steer` lands in the ACTIVE
 /// turn; the loop runs ONE more round whose LLM request carries the steer
 /// (drained before the call, plain user role, after the recorded first
 /// answer), and the steer row persists into durable history exactly once,
@@ -42239,8 +42623,7 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
     let temp = tempfile::TempDir::new().expect("temp dir");
     let provider = Arc::new(GatedSteerLlm {
         call_count: std::sync::atomic::AtomicUsize::new(0),
-        entered: tokio::sync::Notify::new(),
-        proceed: tokio::sync::Notify::new(),
+        entered: Arc::new(tokio::sync::Notify::new()),
         observed: StdMutex::new(Vec::new()),
     });
     let (state, profile_runtime) =
@@ -42313,8 +42696,7 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
         "steer must land in the ACTIVE turn"
     );
 
-    // Release the model; the pending steer must force a second round.
-    provider.proceed.notify_one();
+    // There is no release signal: the steer must wake the stalled stream.
     for _ in 0..300 {
         let terminal = {
             let registry = active_turns.lock().await;
@@ -42331,7 +42713,7 @@ async fn turn_steer_end_to_end_injects_before_next_llm_call_and_persists_once() 
     assert_eq!(
         provider.call_count.load(Ordering::SeqCst),
         2,
-        "steer after the final answer must force exactly one more round"
+        "steer during a stalled stream must force exactly one more round"
     );
 
     // The second request carries: recorded first answer, then the steer as
@@ -43202,8 +43584,8 @@ fn ledgered_steer_dropped(
         .collect()
 }
 
-#[test]
-fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
+#[tokio::test]
+async fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = Arc::new(UiProtocolLedger::new(16));
@@ -43222,7 +43604,8 @@ fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
         &session_id,
         &turn_id,
         true,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 2);
     assert!(buffer.is_empty(), "the buffer is drained");
@@ -43247,8 +43630,8 @@ fn leftover_steers_at_turn_end_are_returned_as_turn_steer_dropped() {
     assert_eq!(ledgered[0].reason, "interrupted");
 }
 
-#[test]
-fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
+#[tokio::test]
+async fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = Arc::new(UiProtocolLedger::new(16));
@@ -43266,7 +43649,8 @@ fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
         &session_id,
         &turn_id,
         false,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 1);
     let frame = steer_dropped_frame(&writer_rx);
@@ -43274,8 +43658,8 @@ fn leftover_steers_after_normal_end_are_labelled_turn_ended() {
     assert_eq!(frame["params"]["inputs"], json!(["late steer"]));
 }
 
-#[test]
-fn no_leftover_steers_emits_nothing() {
+#[tokio::test]
+async fn no_leftover_steers_emits_nothing() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(4);
     let ws = WsConnection::new_stdio(writer_tx);
     let ledger = Arc::new(UiProtocolLedger::new(16));
@@ -43292,7 +43676,8 @@ fn no_leftover_steers_emits_nothing() {
         &session_id,
         &turn_id,
         true,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 0);
     assert!(
@@ -43323,8 +43708,8 @@ fn no_leftover_steers_emits_nothing() {
     assert_eq!(keys, vec!["session_id", "turn_id", "code", "message"]);
 }
 
-#[test]
-fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
+#[tokio::test]
+async fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
     let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<WsMessage>(1);
     let ws = WsConnection::new_stdio(writer_tx);
     // Simulate a dead stdio peer: the receiver is gone, so every send fails.
@@ -43344,7 +43729,8 @@ fn leftover_steers_are_ledgered_even_when_connection_write_fails() {
         &session_id,
         &turn_id,
         true,
-    );
+    )
+    .await;
 
     assert_eq!(returned, 1);
     let ledgered = ledgered_steer_dropped(&ledger, &session_id);
@@ -44823,6 +45209,244 @@ fn should_merge_late_background_result_into_current_session_manager_not_stale_tu
         seqs_of(&persisted),
         vec![Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)]
     );
+}
+
+/// Exercise the RPC handler and the real OpenAI-compatible HTTP client. The
+/// two routes deliberately have different models and credentials, so a primary
+/// fallback cannot look like successful peer compaction.
+async fn manual_compaction_model_case(case: &str, topic: &str, lane: Option<&str>, llm: bool) {
+    use axum::{Json, Router, http::HeaderMap, http::Uri, routing::post};
+
+    let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let requests = captured.clone();
+    let router = Router::new().fallback(post(
+        move |uri: Uri, headers: HeaderMap, Json(body): Json<Value>| {
+            let requests = requests.clone();
+            async move {
+                requests.lock().unwrap().push((
+                    uri.path().to_owned(),
+                    headers
+                        .get("authorization")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                    body.clone(),
+                ));
+                Json(json!({
+                    "id": "compaction-fixture", "object": "chat.completion", "created": 0,
+                    "model": body["model"],
+                    "choices": [{"index": 0, "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "COMPACTION_ROUTE_SUMMARY"}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+                }))
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile_id = format!("compact-model-{case}");
+    let profile_dir = dir.path().join("profiles").join(&profile_id).join("data");
+    let mut config = config_with_lane("strong");
+    config.bypass_auth_store = true;
+    config.api_key_env = Some("COMPACTION_PRIMARY_TEST_KEY".to_owned());
+    config.env_vars.insert(
+        "COMPACTION_PRIMARY_TEST_KEY".into(),
+        "primary-fixture-key".into(),
+    );
+    config.sub_providers[0].base_url = Some(format!("{base}/peer/v1"));
+    if lane == Some("unbuildable") {
+        config.sub_providers[0].key = "unbuildable".into();
+        config.sub_providers[0].provider = "unsupported-compaction-test-provider".into();
+    }
+    let primary = crate::commands::chat::create_provider_with_api_type(
+        "openai",
+        &config,
+        Some("gpt-4o".into()),
+        Some(format!("{base}/primary/v1")),
+        Some("openai"),
+    )
+    .unwrap();
+    let mut profile = make_m11e_profile_with_llm_and_sandbox(
+        &profile_id,
+        &profile_dir,
+        primary,
+        octos_agent::SandboxConfig::default(),
+    )
+    .await;
+    Arc::get_mut(&mut profile).unwrap().config = config;
+    let peer_dir = stage_peer_dir_with(&profile_dir.join("peers"), "compactor");
+    if let Some(lane) = lane {
+        std::fs::write(peer_dir.join("model"), lane).unwrap();
+    }
+    if let Some((slug, context_id)) = crate::peers::app_binding::parse_context_topic(topic) {
+        use crate::peers::app_binding::{
+            PeerContextBinding, PeerHostBinding, context_memory_namespace, write_context_binding,
+            write_host_binding_in,
+        };
+        let cwd = dir.path().join("workspace");
+        let context_cwd = cwd.join("contexts").join(context_id);
+        std::fs::create_dir_all(&context_cwd).unwrap();
+        let namespace = "app/compactor/test";
+        write_host_binding_in(
+            &peer_dir,
+            &PeerHostBinding {
+                version: 1,
+                cwd: dunce::canonicalize(&cwd).unwrap(),
+                memory_namespace: namespace.into(),
+                token_sha256: crate::peers::app_binding::token_digest("fixture-host-token"),
+            },
+        )
+        .unwrap();
+        write_context_binding(
+            &profile_dir.join("peers"),
+            slug,
+            context_id,
+            &PeerContextBinding {
+                version: 1,
+                cwd: dunce::canonicalize(&context_cwd).unwrap(),
+                memory_namespace: context_memory_namespace(namespace, context_id),
+                closed: false,
+                share_history: None,
+                read_parent: false,
+            },
+        )
+        .unwrap();
+    }
+    let state = Arc::new(AppState {
+        profiles: HashMap::from([(profile_id.clone(), profile.clone())]),
+        llm_compaction: llm,
+        ..AppState::empty_for_tests()
+    });
+    let session = SessionKey::with_profile_topic(&profile_id, "api", "test", topic);
+    let runtime = state
+        .session_cache
+        .get_or_init(&profile, session.clone(), None)
+        .await
+        .unwrap();
+    // Enough closed turns to compact with either provider's context window;
+    // no real credentials, environment mutation, or external network requests.
+    let history: Vec<Message> = (0..60)
+        .map(|index| {
+            test_message(
+                if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                format!("history {index}: {}", "prior context ".repeat(800)),
+            )
+        })
+        .collect();
+    runtime
+        .sessions
+        .lock()
+        .await
+        .get_or_create(&session)
+        .await
+        .messages = history;
+    let (writer, _reader) = mpsc::channel(32);
+    let ws = WsConnection::new(writer);
+    let result = handle_session_compact(
+        &ws,
+        &state,
+        &Arc::new(UiProtocolLedger::new(32)),
+        ConnectionUiFeatures::default(),
+        Some(&profile_id),
+        &RpcRequest::new(
+            "compact",
+            APPUI_METHOD_SESSION_COMPACT,
+            json!({"session_id": session}),
+        ),
+    )
+    .await
+    .unwrap();
+    server.abort();
+
+    let requests = captured.lock().unwrap();
+    assert_eq!(result["compacted"], true, "{case}: {result}");
+    if !llm {
+        assert!(
+            requests.is_empty(),
+            "heuristic compaction must not call either model"
+        );
+        return;
+    }
+    assert_eq!(requests.len(), 1, "exactly one summary call: {case}");
+    let use_peer = topic != "ordinary" && lane == Some("strong");
+    let (path, authorization, body) = &requests[0];
+    assert_eq!(
+        path,
+        if use_peer {
+            "/peer/v1/chat/completions"
+        } else {
+            "/primary/v1/chat/completions"
+        },
+        "{case}"
+    );
+    assert_eq!(
+        authorization,
+        if use_peer {
+            "Bearer sk-peer-lane-test"
+        } else {
+            "Bearer primary-fixture-key"
+        },
+        "{case}"
+    );
+    assert_eq!(
+        body["model"],
+        if use_peer { "gpt-4o-mini" } else { "gpt-4o" },
+        "{case}"
+    );
+    let snapshot = crate::context_manager::load_context_manager_snapshot(
+        &runtime.sessions_root,
+        &session.to_string(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        snapshot
+            .for_prompt(&PromptBuildPolicy::default())
+            .messages
+            .iter()
+            .any(|message| message.content.contains("COMPACTION_ROUTE_SUMMARY")),
+        "the selected model's summary must survive reload"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_peer_model_when_manually_compacting_peer_session() {
+    manual_compaction_model_case("peer", "peer-compactor", Some("strong"), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_owner_peer_model_when_manually_compacting_request_context() {
+    manual_compaction_model_case("context", "peerctx-compactor.request", Some("strong"), true)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_primary_model_when_manually_compacting_ordinary_session() {
+    manual_compaction_model_case("ordinary", "ordinary", Some("strong"), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_use_primary_model_when_manual_compaction_peer_lane_is_unavailable() {
+    for (case, lane) in [
+        ("absent", None),
+        ("unknown", Some("missing")),
+        ("invalid", Some("unbuildable")),
+    ] {
+        manual_compaction_model_case(case, "peer-compactor", lane, true).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn should_skip_model_when_manually_compacting_with_heuristic_mode() {
+    manual_compaction_model_case("heuristic", "peer-compactor", Some("strong"), false).await;
 }
 
 struct ManualCompactTinyProvider;
@@ -49675,4 +50299,264 @@ async fn workspace_team_open_list_election_notifications_and_scope() {
     for (_, handle) in forwarders.lock().await.drain() {
         handle.abort();
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_rollback_retires_context_transitions_and_resumes_new_branch() {
+    let session_id = SessionKey("local:rollback-context-transitions".into());
+    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+    let data_dir = {
+        let mut sessions = state.sessions.as_ref().unwrap().lock().await;
+        let data_dir = sessions.data_dir();
+        let history = sessions.get_or_create(&session_id).await.messages.clone();
+        let mut context =
+            ContextManager::from_session_history(session_id.to_string(), None, &history[..4]);
+        context.reconcile_prompt_cache_epoch("fixture", "old-model", "stable", &[]);
+        persist_context_manager_snapshot(&data_dir, &session_id.to_string(), &context).unwrap();
+        for (seq, row) in history.iter().enumerate().skip(4) {
+            context.record_persisted_message_merging_prompt_equivalent(row, seq);
+        }
+        context.compact_context(
+            "LATER-SUMMARY-REMOVE",
+            crate::context_manager::CompactContextPolicy {
+                keep_recent_items: 2,
+                ..Default::default()
+            },
+        );
+        assert!(!context.compactions().is_empty());
+        crate::context_manager::persist_context_manager_incremental(
+            &data_dir,
+            &session_id.to_string(),
+            &context,
+        )
+        .unwrap();
+        data_dir
+    };
+    let ledger = event_ledger(&state).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_rollback(
+        &ws,
+        &state,
+        &ledger,
+        &active_turns_registry(),
+        None,
+        None,
+        "rewind-transitions".into(),
+        SessionRollbackParams {
+            session_id: session_id.clone(),
+            num_turns: 1,
+        },
+    )
+    .await;
+    let response = recv_rpc_json(&mut rx).await;
+    assert!(response.get("error").is_none(), "{response}");
+    // Inspect the actual persisted reset directly, not a fallback rebuild.
+    let context =
+        crate::context_manager::load_context_manager_snapshot(&data_dir, &session_id.to_string())
+            .unwrap()
+            .unwrap();
+    assert!(
+        context.compactions().is_empty(),
+        "rewind must retire later compaction metadata"
+    );
+    assert!(
+        context.cache_epoch().is_none(),
+        "rewind must retire the later cache epoch"
+    );
+    assert!(
+        !serde_json::to_string(&context.snapshot())
+            .unwrap()
+            .contains("LATER-SUMMARY-REMOVE")
+    );
+    let manager = Arc::new(StdMutex::new(context));
+    let mut sessions = octos_bus::SessionManager::open(&data_dir).unwrap();
+    let trimmed = sessions.get_or_create(&session_id).await.messages.clone();
+    assert_eq!(trimmed.len(), 4);
+    assert!(
+        trimmed
+            .iter()
+            .all(|message| message.content != "turn 3" && message.content != "reply 3")
+    );
+    let mut batch =
+        postturn_context_batch::AppUiContextCommitBatch::new(&data_dir, &manager, &session_id);
+    for row in [
+        Message::user_rooting_thread("NEW-BRANCH", octos_core::ClientMessageId::new("branch")),
+        Message::assistant_with_thread("NEW-RESULT", octos_core::ThreadId::new("branch")),
+    ] {
+        let seq = sessions
+            .add_message_with_seq(&session_id, row.clone())
+            .await
+            .unwrap();
+        batch.record(&row, seq);
+    }
+    manager
+        .lock()
+        .unwrap()
+        .reconcile_prompt_cache_epoch("fixture", "new-model", "stable", &[]);
+    batch.finish().unwrap();
+    drop(sessions);
+    let mut resumed_sessions = octos_bus::SessionManager::open(&data_dir).unwrap();
+    let resumed_history = resumed_sessions
+        .get_or_create(&session_id)
+        .await
+        .messages
+        .clone();
+    let (mut resumed, status) =
+        load_or_rebuild_context_manager(&data_dir, session_id.to_string(), None, &resumed_history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
+    assert_eq!(
+        resumed_history.len(),
+        6,
+        "new branch reuses the rolled-back sequence positions"
+    );
+    assert_eq!(resumed.cache_epoch().unwrap().model, "new-model");
+    let frame = resumed.for_prompt(&PromptBuildPolicy::default());
+    assert!(
+        frame
+            .messages
+            .iter()
+            .any(|message| message.content == "NEW-RESULT")
+    );
+    assert!(
+        frame
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("turn 3")
+                && !message.content.contains("reply 3")
+                && !message.content.contains("LATER-SUMMARY-REMOVE"))
+    );
+    resumed.compact_context(
+        "NEW-BRANCH-SUMMARY",
+        crate::context_manager::CompactContextPolicy {
+            keep_recent_items: 2,
+            ..Default::default()
+        },
+    );
+    persist_context_manager_snapshot(&data_dir, &session_id.to_string(), &resumed).unwrap();
+    let (after_full, status) =
+        load_or_rebuild_context_manager(&data_dir, session_id.to_string(), None, &resumed_history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
+    assert_eq!(after_full.compactions(), resumed.compactions());
+    assert_eq!(after_full.cache_epoch(), resumed.cache_epoch());
+    assert!(
+        !serde_json::to_string(&after_full.snapshot())
+            .unwrap()
+            .contains("LATER-SUMMARY-REMOVE")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_resume_rejects_future_context_after_interrupted_rollback_checkpoint() {
+    let session_id = SessionKey("local:rollback-checkpoint-window".into());
+    let (state, _tmp) = prg_state_with_persisted_turns(&session_id, 3).await;
+    let data_dir = {
+        let mut sessions = state.sessions.as_ref().unwrap().lock().await;
+        let data_dir = sessions.data_dir();
+        let history = sessions.get_or_create(&session_id).await.messages.clone();
+        let mut context =
+            ContextManager::from_session_history(session_id.to_string(), None, &history);
+        context.reconcile_prompt_cache_epoch("fixture", "future-model", "stable", &[]);
+        context.compact_context(
+            "FUTURE-SUMMARY",
+            crate::context_manager::CompactContextPolicy {
+                keep_recent_items: 2,
+                ..Default::default()
+            },
+        );
+        persist_context_manager_snapshot(&data_dir, &session_id.to_string(), &context).unwrap();
+        context.record_context_event(
+            crate::context_manager::ContextEventKind::GoalSnapshot,
+            "goal",
+            "FUTURE-FACT",
+        );
+        crate::context_manager::persist_context_manager_incremental(
+            &data_dir,
+            &session_id.to_string(),
+            &context,
+        )
+        .unwrap();
+        // The actual rollback API commits its marker before the handler resets
+        // context. Simulate a crash at precisely that boundary.
+        sessions
+            .rollback_last_n_user_turns(&session_id, 1)
+            .await
+            .unwrap();
+        data_dir
+    };
+    let mut restarted_sessions = octos_bus::SessionManager::open(&data_dir).unwrap();
+    let history = restarted_sessions
+        .get_or_create(&session_id)
+        .await
+        .messages
+        .clone();
+    assert_eq!(history.len(), 4);
+    // Exercise normal session-open context hydration, not a manual reset.
+    appui_context_open_snapshot(&data_dir, &session_id, &history, None);
+    let restored =
+        crate::context_manager::load_context_manager_snapshot(&data_dir, &session_id.to_string())
+            .unwrap()
+            .unwrap();
+    assert!(restored.compactions().is_empty());
+    assert!(restored.cache_epoch().is_none());
+    let state_json = serde_json::to_string(&restored.snapshot()).unwrap();
+    for dropped in [
+        "FUTURE-SUMMARY",
+        "FUTURE-FACT",
+        "turn 3",
+        "reply 3",
+        "future-model",
+    ] {
+        assert!(
+            !state_json.contains(dropped),
+            "dropped context resurrected: {dropped}"
+        );
+    }
+    let (_, status) =
+        load_or_rebuild_context_manager(&data_dir, session_id.to_string(), None, &history);
+    assert_eq!(
+        status,
+        crate::context_manager::ContextLedgerLoadStatus::Loaded
+    );
+}
+
+#[tokio::test]
+async fn should_shed_reported_critical_events_over_the_wire_budget() {
+    use octos_agent::ProgressReporter as _;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reporter = BoundedChannelReporter::new(tx, dropped.clone());
+    // The real producer path: ProgressEvent → event_to_json → delivery
+    // queue. 64 × 128 KiB tool arguments ≈ 8 MiB, twice the queued-critical
+    // budget, with the consumer stalled (channel(1), never read).
+    let body = "x".repeat(128 * 1024);
+    for i in 0..64 {
+        reporter.report(octos_agent::ProgressEvent::ToolStarted {
+            name: "write".into(),
+            tool_id: format!("t{i}"),
+            arguments: Some(serde_json::json!({"body": body})),
+        });
+    }
+    drop(reporter);
+    let mut received = 0;
+    while let Some(row) = rx.recv().await {
+        let row: serde_json::Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(row["type"], "tool_start");
+        received += 1;
+    }
+    let shed = dropped.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        shed > 0,
+        "reported critical events beyond the wire budget must be shed"
+    );
+    assert_eq!(
+        received + shed as usize,
+        64,
+        "shed accounting must conserve events"
+    );
 }

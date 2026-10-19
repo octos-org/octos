@@ -1,0 +1,50 @@
+name: Branch naming
+
+# Enforce the branch naming convention on every PR. A predictable namespace is
+# what makes the automated stale-branch sweep (cleanup-stale-branches.yml) safe:
+# tooling can reason about prefixes instead of guessing from free-form names.
+# See .github/BRANCH_LIFECYCLE.md.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  branch-name:
+    name: Branch name
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the head branch name
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          # <type>/<description>, lower-case, see .github/BRANCH_LIFECYCLE.md
+          re='^(feat|feature|fix|hotfix|docs|ci|chore|refactor|release|test|perf|review|codex|appcard)/[a-z0-9][a-z0-9._-]*$'
+          # bots and the merge queue own their namespaces
+          bot='^(dependabot|renovate|gh-readonly-queue)/'
+
+          if [[ "$BRANCH" =~ $re || "$BRANCH" =~ $bot ]]; then
+            echo "branch name ok: $BRANCH"
+            exit 0
+          fi
+
+          if [ -f .github/branch-name-allowlist.txt ] \
+             && grep -qxF "$BRANCH" .github/branch-name-allowlist.txt; then
+            echo "branch name is on the legacy allowlist: $BRANCH"
+            exit 0
+          fi
+
+          echo "::error::Branch '$BRANCH' does not follow the naming convention."
+          echo "Valid forms:"
+          echo "  feat/<issue>-<slug>     fix/<issue>-<slug>     docs/<slug>"
+          echo "  refactor/<area>-<goal>  ci/<slug>              chore/<slug>"
+          echo "  test/<slug>  perf/<slug>  release/<version>  hotfix/<slug>"
+          echo "Lower-case; after the '/' start with a letter/digit and use [a-z0-9._-]."
+          echo "Legacy exceptions go in .github/branch-name-allowlist.txt (reviewed)."
+          exit 1

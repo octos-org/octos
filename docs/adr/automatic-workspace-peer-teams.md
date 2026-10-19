@@ -225,3 +225,41 @@ latest gathered results are limited to 16 KiB per member. Agents coordinate
 file ownership through messages; concurrent conflicting file edits are not
 automatically merged.
 
+
+## Amendment (2026-10-10): the join-failure trade-off, recorded
+
+The original text left the join-failure behavior unstated; the
+implementation initially made `session/open` fail closed on any
+workspace-team join error. That is **no longer true**: as of the
+#2741 fix, a join failure **degrades** — the session opens fully
+usable (the memory/skills/history bindings are durable, not
+team-gated), the team features (shared history, team messaging) are
+absent, and the reason is logged. This is a deliberate fail-open on
+the team-join leg only: the alternative (the fail-closed refusal)
+bricks long-lived workspaces, because the members are
+lifetime-accumulating with a **hard cap of 1024 (`MAX_MEMBERS`,
+workspace_team.rs) and no GC** — every open past the cap would
+permanently fail, recoverable only by hand-editing team.json.
+
+Accepted residual risks, now on the record:
+- A corrupted/tampered team.json degrades silently (the operator must
+  watch the logs).
+- A team whose every seat is live-connected still cannot admit new
+  members; those joins degrade to opened-outside-the-team (the
+  sessions keep working).
+
+Amendment (2026-10-11): the accumulate side is fixed. A join at the
+1024 cap first evicts the stalest members with no live connection and
+no turn in flight (oldest `joined_at_ms` first, exactly enough to
+admit the joiner; a connected or turn-active member is never evicted)
+and warns the operator. Seat numbers derive from the highest existing
+seat, so a freed number is never reused while its old holder is still
+listed. An evicted leader's role falls to the earliest survivor with
+a `leadership_epoch` bump, fencing a coordinator evicted mid-flight.
+Admissions at 75% of the cap warn before the pressure starts.
+
+Accepted residual risk on the record: the turn-active check is a
+snapshot taken at the joining open, so a drained turn that starts
+between that snapshot and the eviction can still lose its
+team-recorded result (the session's own transcript is unaffected; the
+member rejoins with a fresh seat on its next open).

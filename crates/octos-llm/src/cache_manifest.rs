@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{PromptCacheContext, TokenUsage, current_router_context};
 
-const SCHEMA: &str = "octos.provider-cache-input-manifest.v1";
+const SCHEMA: &str = "octos.provider-cache-input-manifest.v2";
 const OBSERVATION_SCHEMA: &str = "octos.provider-cache-observation.v1";
 const DEFAULT_OBSERVER_CAPACITY: usize = 1_024;
 const MAX_OBSERVER_CAPACITY: usize = 16_384;
@@ -424,7 +424,7 @@ impl PromptCacheInputManifest {
         let conversation_segments = fingerprint_segments(conversation);
         let stable_prefix_hash = hash_segments(&stable_segments);
         let conversation_hash = hash_segments(&conversation_segments);
-        let input_hash = hash_value(&json!({
+        let input_hash = hash_value(json!({
             "schema": SCHEMA,
             "provider": provider,
             "model": model,
@@ -607,7 +607,7 @@ pub fn record_prompt_cache_usage(
 }
 
 fn request_key_hash(identity: &CorrelationIdentity, manifest: &PromptCacheInputManifest) -> String {
-    hash_value(&json!({
+    hash_value(json!({
         "schema": "octos.prompt-cache-observation-key.v1",
         "session_hash": identity.session_hash,
         "turn_hash": identity.turn_hash,
@@ -854,7 +854,7 @@ fn process_salt() -> &'static str {
 }
 
 fn hash_identifier(value: &str) -> String {
-    hash_value(&json!({
+    hash_value(json!({
         "schema": "octos.prompt-cache-observer-identifier.v2",
         "salt": process_salt(),
         "value": value,
@@ -928,11 +928,33 @@ fn collapse_marker_wrapper(value: &mut Value) {
     }
 }
 
+/// Return `value` with object keys sorted deeply. `serde_json::to_vec` emits
+/// keys in the Map backend's order — sorted (BTreeMap) without the
+/// `preserve_order` feature, insertion order (IndexMap) with it — so hashing
+/// the raw serialization would fingerprint the same logical input
+/// differently depending on the build graph's feature unification. Sorting
+/// the keys pins the bytes to the content; reordering preserves byte length,
+/// so segment byte accounting is unchanged.
+fn canonical_object_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map
+                .into_iter()
+                .map(|(key, item)| (key, canonical_object_keys(item)))
+                .collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(entries.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(canonical_object_keys).collect()),
+        other => other,
+    }
+}
+
 fn fingerprint_segments(values: Vec<(String, Value)>) -> Vec<PromptCacheInputSegment> {
     values
         .into_iter()
         .map(|(kind, value)| {
-            let bytes = serde_json::to_vec(&value).unwrap_or_default();
+            let bytes = serde_json::to_vec(&canonical_object_keys(value)).unwrap_or_default();
             PromptCacheInputSegment {
                 kind,
                 hash: hash_bytes(&bytes),
@@ -943,7 +965,7 @@ fn fingerprint_segments(values: Vec<(String, Value)>) -> Vec<PromptCacheInputSeg
 }
 
 fn hash_segments(segments: &[PromptCacheInputSegment]) -> String {
-    hash_value(&json!(
+    hash_value(json!(
         segments
             .iter()
             .map(|segment| (&segment.kind, &segment.hash))
@@ -951,8 +973,8 @@ fn hash_segments(segments: &[PromptCacheInputSegment]) -> String {
     ))
 }
 
-fn hash_value(value: &Value) -> String {
-    hash_bytes(&serde_json::to_vec(value).unwrap_or_default())
+fn hash_value(value: Value) -> String {
+    hash_bytes(&serde_json::to_vec(&canonical_object_keys(value)).unwrap_or_default())
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -994,6 +1016,74 @@ mod tests {
                 .map(|(index, text)| (format!("message:{index}"), json!({"text": text})))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn should_fingerprint_identical_inputs_alike_regardless_of_object_key_order() {
+        // serde_json serializes objects in the Map backend's order: sorted
+        // (BTreeMap) without the `preserve_order` feature, insertion order
+        // (IndexMap) with it. The fingerprint must depend on the logical
+        // content only, so the same payload inserted in two key orders must
+        // produce one identity in either build shape. The regression only
+        // shows red in a `preserve_order`-on build (the workspace-unified
+        // lane); per-crate standalone runs use the sorted backend and pass
+        // either way.
+        let forward = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}],
+            "metadata": {"turn": 3, "lane": "serving"}
+        });
+        let mut reversed = serde_json::Map::new();
+        reversed.insert("metadata".to_owned(), json!({"lane": "serving", "turn": 3}));
+        reversed.insert(
+            "content".to_owned(),
+            json!([{"text": "hello", "type": "text"}]),
+        );
+        reversed.insert("role".to_owned(), json!("user"));
+
+        let forward_manifest = PromptCacheInputManifest::from_normalized_segments(
+            "provider",
+            "model",
+            Some("epoch"),
+            vec![("system".to_owned(), forward)],
+            vec![],
+        );
+        let reversed_manifest = PromptCacheInputManifest::from_normalized_segments(
+            "provider",
+            "model",
+            Some("epoch"),
+            vec![("system".to_owned(), serde_json::Value::Object(reversed))],
+            vec![],
+        );
+
+        assert_eq!(forward_manifest.input_hash, reversed_manifest.input_hash);
+        assert_eq!(
+            forward_manifest.normalized_bytes,
+            reversed_manifest.normalized_bytes
+        );
+    }
+
+    #[test]
+    fn should_fingerprint_array_order_as_significant() {
+        // Only object keys are canonicalized. Arrays carry semantic order on
+        // the wire (content blocks, tool results), so reordering array
+        // elements must change the fingerprint in every build shape.
+        let first = PromptCacheInputManifest::from_normalized_segments(
+            "provider",
+            "model",
+            Some("epoch"),
+            vec![("system".to_owned(), json!({"order": ["a", "b"]}))],
+            vec![],
+        );
+        let second = PromptCacheInputManifest::from_normalized_segments(
+            "provider",
+            "model",
+            Some("epoch"),
+            vec![("system".to_owned(), json!({"order": ["b", "a"]}))],
+            vec![],
+        );
+
+        assert_ne!(first.input_hash, second.input_hash);
     }
 
     #[test]
@@ -1147,7 +1237,7 @@ mod tests {
         assert!(first.starts_with("sha256:"));
         // The unsalted v1 construction is enumerable offline for low-entropy
         // channel identifiers; the salted hash must not reproduce it.
-        let unsalted_v1 = hash_value(&json!({
+        let unsalted_v1 = hash_value(json!({
             "schema": "octos.prompt-cache-observer-identifier.v1",
             "value": identifier,
         }));
@@ -1207,7 +1297,7 @@ mod tests {
         );
 
         let mut serializer = base.clone();
-        serializer.schema = "octos.provider-cache-input-manifest.v2".to_owned();
+        serializer.schema = "octos.provider-cache-input-manifest.v3".to_owned();
         assert_eq!(
             classify_transition(&base, &serializer).1.as_deref(),
             Some("provider_serializer_changed")

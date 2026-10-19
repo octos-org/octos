@@ -13,9 +13,7 @@ use tracing::{Instrument, info, info_span, warn};
 
 use super::activity::{ActivityTrackingReporter, LoopActivityState};
 use super::budget::BudgetStop;
-use super::convergence::{
-    CheckpointReason, ConvergenceController, active_tokens, is_checkpoint_context,
-};
+use super::convergence::{CheckpointReason, ConvergenceController, active_tokens};
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
 use super::loop_state::{LoopDecision, LoopRetryState, SHELL_SPIRAL_VARIANT};
 use super::message_repair::sanitize_tool_call_id;
@@ -82,6 +80,31 @@ impl TurnOutputLog {
             self.push(message);
         }
     }
+}
+
+fn attach_conversation_progress(
+    error: eyre::Report,
+    turn: &LoopTurnState,
+    log: &TurnOutputLog,
+) -> eyre::Report {
+    let message = error.to_string();
+    let partial = ConversationResponse {
+        content: String::new(),
+        reasoning_content: None,
+        provider_metadata: None,
+        token_usage: turn.total_usage().clone(),
+        estimated_spend_usd: turn.priced_spend(),
+        files_modified: Vec::new(),
+        files_to_send: Vec::new(),
+        streamed: false,
+        messages: log.messages.clone(),
+        assistant_segments: log.provenance.clone(),
+        tool_results: Vec::new(),
+        synthesized_from_spawn_only: false,
+        pending_approval: None,
+    };
+    attach_partial_usage(error, turn.total_usage().clone())
+        .wrap_err(super::FailedConversationProgress { partial, message })
 }
 
 /// Prepended to the user content on a live video-call turn so the model treats
@@ -860,11 +883,16 @@ impl Agent {
         }
     }
 
-    /// Whether a mid-turn steer input is pending (codex `has_pending_input`,
-    /// `turn.rs:304-318`). Read in the EndTurn arm so
-    /// `needs_follow_up = model_wants_more || buffer_nonempty` — a steer
-    /// landing after the model's final answer forces one more round.
-    fn steer_input_pending(&self) -> bool {
+    /// Wake a pending model request when new user input arrives.
+    pub(super) async fn wait_for_steer_input(&self) {
+        match self.steer_buffer.as_ref() {
+            Some(buffer) => buffer.wait_for_input().await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    /// Whether user input needs another model round or should defer tool admission.
+    pub(super) fn steer_input_pending(&self) -> bool {
         self.steer_buffer
             .as_ref()
             .is_some_and(|buffer| !buffer.is_empty())
@@ -1241,20 +1269,14 @@ impl Agent {
                     // Codex-parity steer drain (turn.rs:225-233): fold any
                     // mid-turn injected user inputs into the conversation at
                     // the TOP of each iteration, BEFORE the next LLM call,
-                    // in FIFO order. Steering never interrupts an in-flight
-                    // round — inputs buffered while the model streams are
-                    // picked up here, after the previous round's tool
-                    // results are recorded.
+                    // in FIFO order. New input wakes sampling and defers
+                    // unstarted tools; already-running tools settle first.
+                    // Their results are recorded before input is drained.
                     self.drain_pending_steer_input(&mut messages, &mut turn_output_log)
                         .await;
-                    // The previous checkpoint summary is transient working
-                    // memory, not durable conversation history. Remove it
-                    // before prompt repair/compaction and re-inject only the
-                    // controller's latest summary below.
-                    messages.retain(|message| {
-                        !(message.role == MessageRole::User
-                            && is_checkpoint_context(&message.content))
-                    });
+                    // Reflections stay at their original chronological position.
+                    // Re-appending an old checkpoint as the newest row makes
+                    // completed work look pending and invalidates prefix reuse.
                     // #1691 grace: when the budget stop is converted into one
                     // FINAL action call, that call must be the model's, not a
                     // convergence reflection (which would `continue` straight
@@ -1336,7 +1358,7 @@ impl Agent {
                     // #1969: a heartbeat interrupt/stall is an error EXIT too —
                     // carry the turn's accumulated usage out with it.
                     if let Err(e) = self.beat_heartbeat(iteration) {
-                        return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                        return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                     }
                     self.reporter()
                         .report(ProgressEvent::Thinking { iteration });
@@ -1406,7 +1428,7 @@ impl Agent {
                     // content"): a System row here would rewrite the stable
                     // prefix at every checkpoint (Anthropic hoists all System
                     // rows into `system`; exact-prefix caches key on it).
-                    if let Some(context) = convergence.context_message() {
+                    if let Some(context) = convergence.take_context_message() {
                         messages.push(Message::user(context));
                     }
                     let total_usage = turn.total_usage().clone();
@@ -1592,7 +1614,7 @@ impl Agent {
                                 if let Some(sink) = &self.voice_failure_sink {
                                     let _ = sink.send(crate::TurnFailure::EmptyResponse);
                                 }
-                                return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                                return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                             }
                             // Empty response after retries -- try once more (adaptive router
                             // may select a different provider on this second attempt).
@@ -1618,7 +1640,7 @@ impl Agent {
                                 Ok(r) => r,
                                 Err(e) => {
                                     if self.failfast_llm_bail(&e) {
-                                        return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                                        return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                                     }
                                     match self.handle_loop_error_with_dispatch(
                                         &e,
@@ -1627,7 +1649,7 @@ impl Agent {
                                         &mut messages,
                                     ) {
                                         LoopErrorAction::Retry => continue,
-                                        LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                        LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                                     }
                                 }
                             }
@@ -1706,7 +1728,7 @@ impl Agent {
                                 ));
                             }
                             if self.failfast_llm_bail(&e) {
-                                return Err(attach_partial_usage(e, turn.total_usage().clone()));
+                                return Err(attach_conversation_progress(e, &turn, &turn_output_log));
                             }
                             match self.handle_loop_error_with_dispatch(
                                 &e,
@@ -1715,7 +1737,7 @@ impl Agent {
                                 &mut messages,
                             ) {
                                 LoopErrorAction::Retry => continue,
-                                LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                             }
                         }
                     };
@@ -1790,25 +1812,6 @@ impl Agent {
                     match response.stop_reason {
                         StopReason::EndTurn | StopReason::StopSequence => {
                             let content = response.content.clone().unwrap_or_default();
-                            // #2359: the grace call is exempt — a veto here
-                            // would only convert the synthesis into the canned
-                            // budget-stop message, with no budget left to act
-                            // on the verdict (same reasoning as the
-                            // convergence-checkpoint exemption above).
-                            if !grace_iteration
-                                && !self
-                                    .verifier_allows_termination(
-                                        &mut messages,
-                                        turn_ledger.as_mut(),
-                                        &content,
-                                        iteration,
-                                        &mut turn,
-                                        tracker,
-                                    )
-                                    .await?
-                            {
-                                continue;
-                            }
                             // Codex-parity follow-up gate (turn.rs:304-318):
                             // `needs_follow_up = model_needs_follow_up ||
                             // has_pending_input`. The model produced its
@@ -1832,6 +1835,25 @@ impl Agent {
                                      instead of terminating the turn"
                                 );
                                 continue 'agent_loop;
+                            }
+                            // #2359: the grace call is exempt — a veto here
+                            // would only convert the synthesis into the canned
+                            // budget-stop message, with no budget left to act
+                            // on the verdict (same reasoning as the
+                            // convergence-checkpoint exemption above).
+                            if !grace_iteration
+                                && !self
+                                    .verifier_allows_termination(
+                                        &mut messages,
+                                        turn_ledger.as_mut(),
+                                        &content,
+                                        iteration,
+                                        &mut turn,
+                                        tracker,
+                                    )
+                                    .await?
+                            {
+                                continue;
                             }
                             self.emit_cost_update(&turn, &response, attributed_cost);
                             return Ok(ConversationResponse {
@@ -2159,7 +2181,7 @@ impl Agent {
                                         &mut messages,
                                     ) {
                                         LoopErrorAction::Retry => continue,
-                                        LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                        LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                                     }
                                 }
                             };
@@ -2243,7 +2265,7 @@ impl Agent {
                                     &mut messages,
                                 ) {
                                     LoopErrorAction::Retry => continue,
-                                    LoopErrorAction::Bail => return Err(attach_partial_usage(e, turn.total_usage().clone())),
+                                    LoopErrorAction::Bail => return Err(attach_conversation_progress(e, &turn, &turn_output_log)),
                                 }
                             }
 

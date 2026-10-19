@@ -1,7 +1,10 @@
-# UPCR-2026-022: Session Sandbox Narrowing
+# UPCR-2026-043: Session Sandbox Narrowing
 
 Status: proposed
 Date: 2026-05-25
+
+Formerly filed as UPCR-2026-022; renumbered to the next free number to resolve a
+duplicate-numbering collision (see [the UPCR registry](upcr/README.md)).
 
 ## Summary
 

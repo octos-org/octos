@@ -877,10 +877,7 @@ fn test_spawn_input_schema_dynamic_with_router() {
         desc.contains("Fast and cheap"),
         "should include user description"
     );
-    assert!(
-        desc.contains("128k max ctx"),
-        "should include context window"
-    );
+    assert!(desc.contains("ctx=128k"), "should include context window");
 
     // Enum should contain both key and key/model forms
     let enum_vals: Vec<&str> = model_prop["enum"]

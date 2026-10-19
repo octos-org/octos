@@ -1449,21 +1449,9 @@ pub fn llm_compaction_summary_with_budget(
     let plan = latest_plan_snapshot(messages);
     let transcript = render_transcript(messages);
     crate::summarizer::run_llm_call_blocking(async move {
-        // Give the call the model's FULL output budget, not a small
-        // summary-size heuristic. Reasoning models spend tokens on
-        // `reasoning_content` before emitting the summary `content`; capping at
-        // a small budget starves the summary and returns empty content (a
-        // silent heuristic fallback). Mirrors codex, which sets no output cap on
-        // its compaction turn — the system prompt keeps the summary concise.
-        let config = ChatConfig {
-            max_tokens: Some(provider.max_output_tokens().min(budget_tokens.max(1))),
-            // Low but non-zero: a factual handoff summary, lightly deterministic.
-            temperature: Some(0.2),
-            // One-shot: the transcript is summarized exactly once and its
-            // prefix never replayed, so cache writes would be pure premium.
-            cache_retention: octos_llm::CacheRetention::None,
-            ..Default::default()
-        };
+        // The visible summary budget is not the generation budget: reasoning
+        // consumes output tokens before any handoff text is produced.
+        let config = compaction_chat_config(provider.max_output_tokens(), budget_tokens);
         let request = vec![
             Message::system(LLM_COMPACTION_SYSTEM_PROMPT),
             Message::user(transcript),
@@ -1475,6 +1463,11 @@ pub fn llm_compaction_summary_with_budget(
                 .filter(|content| !content.is_empty())
                 .map(|content| {
                     let summary = prepend_plan_block(content, plan, PLAN_SNAPSHOT_MAX_BYTES);
+                    tracing::info!(
+                        compaction_path = "llm", summary_budget_tokens = budget_tokens,
+                        output_budget_tokens = ?config.max_tokens,
+                        "context compaction summary generated"
+                    );
                     cap_summary_to_budget(&summary, budget_tokens)
                 }),
             Ok(Err(error)) => {
@@ -1490,6 +1483,16 @@ pub fn llm_compaction_summary_with_budget(
             }
         }
     })
+}
+
+fn compaction_chat_config(model_max_output: u32, summary_budget: u32) -> ChatConfig {
+    ChatConfig {
+        max_tokens: Some(model_max_output.max(1).min(summary_budget.max(16_384))),
+        reasoning_effort: Some(octos_llm::ReasoningEffort::Low),
+        temperature: Some(0.2),
+        cache_retention: octos_llm::CacheRetention::None,
+        ..Default::default()
+    }
 }
 
 fn cap_summary_to_budget(summary: &str, budget_tokens: u32) -> String {
@@ -1559,6 +1562,22 @@ mod tests {
         assert!(rendered.contains("tool_result_for: call_1"));
         assert!(rendered.contains("reasoning: [present but intentionally omitted]"));
         assert!(!rendered.contains("private chain of thought"));
+    }
+
+    #[test]
+    fn should_reserve_reasoning_headroom_separately_from_summary_size() {
+        let config = compaction_chat_config(32_768, 512);
+        assert_eq!(config.max_tokens, Some(16_384));
+        assert_eq!(
+            config.reasoning_effort,
+            Some(octos_llm::ReasoningEffort::Low)
+        );
+        assert_eq!(compaction_chat_config(4_096, 512).max_tokens, Some(4_096));
+        assert_eq!(
+            compaction_chat_config(100_000, 20_000).max_tokens,
+            Some(20_000)
+        );
+        assert!(cap_summary_to_budget(&"a".repeat(10_000), 512).len() <= 2_048);
     }
 
     #[test]

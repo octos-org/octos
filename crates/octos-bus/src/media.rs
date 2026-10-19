@@ -38,6 +38,64 @@ pub async fn download_media(
     download_media_with_cap(client, url, headers, dest_dir, filename, max_media_bytes()).await
 }
 
+/// Create a media directory owner-only (0700 on Unix): inbound attachments
+/// are private session data, so the default (0777 & ~umask) would expose
+/// them to every local user. A pre-existing directory with loose group/other
+/// bits (e.g. from an older release) is tightened on the way through; that
+/// tightening is best-effort, since a chmod failure must not turn a usable
+/// download into a hard error. A directory owned by another account is
+/// refused outright: at 0700 the mode check alone passes, yet every byte
+/// written there would land in the other owner's hands. The owner check is
+/// Unix-only (the non-Unix target has no uid equivalent and just creates the
+/// directory). (#2426, #2802)
+pub fn ensure_private_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .wrap_err_with(|| format!("failed to create private dir: {}", path.display()))?;
+        let euid = rustix::process::geteuid().as_raw();
+        // The final component is judged without following symlinks: a link
+        // planted by another user must be refused by its own ownership, not
+        // the target's (#2802).
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            check_private_dir_owner(path, &meta, euid)?;
+        }
+        if let Ok(meta) = std::fs::metadata(path)
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)
+        .wrap_err_with(|| format!("failed to create private dir: {}", path.display()))
+}
+
+/// The ownership half of [`ensure_private_dir`]: refuse a directory that
+/// belongs to another account, whatever its mode bits. Split out as a pure
+/// decision so the refusal (unreachable from an unprivileged test fixture)
+/// still gets a regression pin. (#2802)
+#[cfg(unix)]
+fn check_private_dir_owner(path: &Path, meta: &std::fs::Metadata, euid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if meta.uid() != euid {
+        eyre::bail!(
+            "private dir {} is owned by uid {}, but this process runs as uid {euid}; \
+             refusing to write private data into a directory we do not control",
+            path.display(),
+            meta.uid(),
+        );
+    }
+    Ok(())
+}
+
 /// [`download_media`] with an explicit byte cap (for deterministic testing).
 pub async fn download_media_with_cap(
     client: &Client,
@@ -47,8 +105,7 @@ pub async fn download_media_with_cap(
     filename: &str,
     cap: u64,
 ) -> Result<PathBuf> {
-    std::fs::create_dir_all(dest_dir)
-        .wrap_err_with(|| format!("failed to create media dir: {}", dest_dir.display()))?;
+    ensure_private_dir(dest_dir)?;
 
     let dest = dest_dir.join(filename);
 
@@ -151,6 +208,118 @@ mod tests {
         assert_eq!(std::fs::metadata(ok.unwrap()).unwrap().len(), 1024);
 
         handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_media_creates_owner_only_media_dir() {
+        use axum::Router;
+        use axum::routing::get;
+        use std::os::unix::fs::PermissionsExt;
+
+        let app = Router::new().route("/f", get(|| async { vec![1u8; 8] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("media");
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/f");
+
+        download_media_with_cap(&client, &url, &[], &nested, "ok.bin", 4096)
+            .await
+            .unwrap();
+
+        // Inbound attachments are private session data; the directory must
+        // not be created world-traversable (#2426).
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "media dir must be owner-only, got {:o}",
+            mode & 0o777
+        );
+
+        handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_media_tightens_loose_media_dir() {
+        use axum::Router;
+        use axum::routing::get;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let app = Router::new().route("/f", get(|| async { vec![1u8; 8] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("media");
+        // Simulate a directory left loose by an older release.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(&nested)
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/f");
+        download_media_with_cap(&client, &url, &[], &nested, "ok.bin", 4096)
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "loose media dir must be tightened, got {:o}",
+            mode & 0o777
+        );
+
+        handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_owner_check_refuses_only_foreign_ownership() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let euid = rustix::process::geteuid().as_raw();
+        let foreign = if euid == 0 { 1 } else { euid - 1 };
+        let meta = std::fs::metadata(dir.path()).unwrap();
+
+        check_private_dir_owner(dir.path(), &meta, euid).unwrap();
+        let error = check_private_dir_owner(dir.path(), &meta, foreign).unwrap_err();
+        assert!(
+            error.to_string().contains("owned by uid"),
+            "refusal should name the ownership mismatch: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_accepts_owned_dirs_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("creds");
+
+        // Fresh creation lands owner-only…
+        ensure_private_dir(&nested).unwrap();
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "got {:o}", mode & 0o777);
+
+        // …and a pre-existing owner-only directory passes the owner check
+        // (the #2802 refusal targets directories owned by someone else).
+        ensure_private_dir(&nested).unwrap();
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "got {:o}", mode & 0o777);
     }
 
     #[test]

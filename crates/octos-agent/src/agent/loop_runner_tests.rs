@@ -1649,8 +1649,8 @@ fn message_shape(messages: &[Message]) -> Vec<(MessageRole, String)> {
         .collect()
 }
 
-/// Message shape without the transient reflection envelope, which the loop
-/// strips and re-appends after the new durable rows on every iteration.
+/// Message shape without internal reflection envelopes, for comparing
+/// user/tool rows independently from checkpoint content.
 fn durable_shape(messages: &[Message]) -> Vec<(MessageRole, String)> {
     message_shape(messages)
         .into_iter()
@@ -1768,6 +1768,29 @@ async fn should_fire_call_checkpoints_after_exactly_n_completed_action_calls_whe
     };
     assert!(tail(4).starts_with(CHECKPOINT_ENVELOPE_OPEN) && tail(4).contains("REFLECTION ONE"));
     assert!(tail(8).starts_with(CHECKPOINT_ENVELOPE_OPEN) && tail(8).contains("REFLECTION TWO"));
+    let first_position = requests[4]
+        .0
+        .iter()
+        .position(|m| m.content.contains("REFLECTION ONE"))
+        .unwrap();
+    for (index, (messages, _)) in requests.iter().enumerate().skip(4) {
+        let positions = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.content.contains("REFLECTION ONE"))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions,
+            vec![first_position],
+            "checkpoint replayed or moved in request {index}"
+        );
+    }
+    assert!(
+        !tail(5).contains("REFLECTION ONE"),
+        "completed checkpoint must not become newest instruction again"
+    );
+    assert!(message_shape(&requests[5].0).starts_with(&message_shape(&requests[4].0)));
 }
 
 /// Simulates an `AdaptiveRouter` whose per-call slot selection flaps:
@@ -7705,6 +7728,120 @@ async fn user_prompt_submit_hook_deny_blocks_turn_before_llm() {
     );
 }
 
+// A real, unfinished stream: the user input must wake it before Done or a
+// stream timeout. One process_message invocation continues with the new input.
+struct SteerableStallProvider {
+    calls: AtomicUsize,
+    observed: ObservedRolePrompts,
+    waiting: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl LlmProvider for SteerableStallProvider {
+    async fn chat(
+        &self,
+        _: &[Message],
+        _: &[octos_llm::ToolSpec],
+        _: &octos_llm::ChatConfig,
+    ) -> Result<ChatResponse> {
+        eyre::bail!("steering must not fall back or retry the old prompt")
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _: &[octos_llm::ToolSpec],
+        _: &octos_llm::ChatConfig,
+    ) -> Result<octos_llm::ChatStream> {
+        use futures::StreamExt;
+        self.observed.lock().unwrap().push(
+            messages
+                .iter()
+                .map(|m| (m.role, m.content.clone()))
+                .collect(),
+        );
+        if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+            let waiting = self.waiting.clone();
+            Ok(Box::pin(
+                futures::stream::iter(vec![octos_llm::StreamEvent::TextDelta(
+                    "Before correction".into(),
+                )])
+                .chain(futures::stream::poll_fn(move |_| {
+                    waiting.notify_one();
+                    std::task::Poll::Pending
+                })),
+            ))
+        } else {
+            Ok(Box::pin(futures::stream::iter(vec![
+                octos_llm::StreamEvent::TextDelta("Applied correction".into()),
+                octos_llm::StreamEvent::Done(StopReason::EndTurn),
+            ])))
+        }
+    }
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn steering_resumes_same_turn_without_waiting_for_model_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let buffer = Arc::new(crate::steering::SteerBuffer::default());
+    let waiting = Arc::new(tokio::sync::Notify::new());
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(SteerableStallProvider {
+        calls: AtomicUsize::new(0),
+        observed: observed.clone(),
+        waiting: waiting.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("steered"),
+        provider,
+        ToolRegistry::with_builtins(dir.path()),
+        memory,
+    )
+    .with_steer_buffer(buffer.clone());
+    let work = agent.process_message("original task", &[], vec![]);
+    let input = async {
+        waiting.notified().await;
+        buffer.push("correct course now".into());
+    };
+    let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(work, input)
+    })
+    .await
+    .expect("the first stream never completes: steering must wake it");
+    let result = result.unwrap();
+    assert_eq!(result.content, "Applied correction");
+    let observed = observed.lock().unwrap();
+    assert_eq!(
+        observed.len(),
+        2,
+        "one preempted request and one corrected request"
+    );
+    let second = &observed[1];
+    let visible = second
+        .iter()
+        .position(|(role, text)| *role == MessageRole::Assistant && text == "Before correction")
+        .unwrap();
+    let input = second
+        .iter()
+        .position(|(role, text)| *role == MessageRole::User && text == "correct course now")
+        .unwrap();
+    assert!(visible < input);
+    assert_eq!(
+        result
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User && m.content == "correct course now")
+            .count(),
+        1
+    );
+}
+
 // --- Mid-turn steer injection (codex `TurnState.pending_input` parity) ---
 
 /// Per-request prompt capture: `(role, content)` per message, one vec per
@@ -9079,4 +9216,148 @@ async fn malformed_exhaustion_error_carries_marker() {
         text.contains("feedback_limit=3 observed_malformed=4"),
         "carries the limit/observed payload: {text}"
     );
+}
+
+struct RequestTimeoutAfterTool {
+    calls: AtomicUsize,
+    fail_count: usize,
+    listener: tokio::net::TcpListener,
+    seen: StdMutex<Vec<Vec<Message>>>,
+}
+
+#[async_trait]
+impl LlmProvider for RequestTimeoutAfterTool {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        use eyre::WrapErr;
+        let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        self.seen.lock().unwrap().push(messages.to_vec());
+        if call == 0 {
+            return Ok(tool_use(
+                vec![ToolCall {
+                    id: "call_persisted".into(),
+                    name: "persist_artifact".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: None,
+                }],
+                20,
+                10,
+            ));
+        }
+        if call <= self.fail_count {
+            // The socket accepts a connection but never sends HTTP headers:
+            // this exercises the real wrapped reqwest pre-stream timeout.
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(15))
+                .build()?
+                .get(format!("http://{}/", self.listener.local_addr()?))
+                .send()
+                .await
+                .wrap_err("failed to send streaming request")?;
+            unreachable!("fixture cannot send HTTP response headers");
+        }
+        Ok(end_turn("artifact already saved; continued", 30, 10))
+    }
+    fn model_id(&self) -> &str {
+        "transport-fixture"
+    }
+    fn provider_name(&self) -> &str {
+        "same-lane"
+    }
+}
+
+async fn assert_request_timeout_preserves_completed_tool(fail_count: usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(RequestTimeoutAfterTool {
+        calls: AtomicUsize::new(0),
+        fail_count,
+        listener: tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        seen: StdMutex::new(Vec::new()),
+    });
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = ToolRegistry::new();
+    tools.register(CountingEchoTool {
+        name: "persist_artifact",
+        output: "p36-v9 is durable",
+        calls: tool_calls.clone(),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("transport-recovery"),
+        provider.clone(),
+        tools,
+        memory,
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    });
+    let result = agent
+        .process_message("write artifact then continue", &[], vec![])
+        .await;
+    assert_eq!(
+        tool_calls.load(AtomicOrdering::SeqCst),
+        1,
+        "completed side effect must not replay"
+    );
+    for request in provider.seen.lock().unwrap().iter().skip(1) {
+        assert!(
+            request.iter().any(|m| m.role == MessageRole::Tool
+                && m.tool_call_id.as_deref() == Some("call_persisted")
+                && m.content.contains("p36-v9 is durable")),
+            "retry lost completed result"
+        );
+    }
+    if fail_count == 1 {
+        assert_eq!(result.unwrap().content, "artifact already saved; continued");
+        assert_eq!(provider.calls.load(AtomicOrdering::SeqCst), 3);
+    } else {
+        let error = result.unwrap_err();
+        assert_eq!(
+            HarnessError::classify_report(&error, None).variant_name(),
+            "timeout"
+        );
+        let partial = &error
+            .downcast_ref::<crate::FailedConversationProgress>()
+            .expect("completed work carried to host")
+            .partial;
+        assert!(
+            partial.content.is_empty(),
+            "failure is not a fabricated final answer"
+        );
+        assert_eq!(
+            partial
+                .messages
+                .iter()
+                .filter(|m| m.role == MessageRole::Tool)
+                .count(),
+            1
+        );
+        assert!(
+            partial
+                .messages
+                .iter()
+                .any(|m| m.content.contains("p36-v9 is durable"))
+        );
+        assert_eq!(partial.token_usage.input_tokens, 20);
+        assert_eq!(
+            provider.calls.load(AtomicOrdering::SeqCst),
+            5,
+            "three bounded retries after first timeout"
+        );
+    }
+}
+
+#[tokio::test]
+async fn should_retry_request_timeout_in_same_turn_without_repeating_completed_tool() {
+    assert_request_timeout_preserves_completed_tool(1).await;
+}
+
+#[tokio::test]
+async fn should_preserve_completed_tool_rows_when_request_timeout_retries_exhaust() {
+    assert_request_timeout_preserves_completed_tool(100).await;
 }

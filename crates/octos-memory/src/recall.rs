@@ -16,7 +16,7 @@
 //! callers (agent tools, UI protocol, FFI) already run on blocking-safe
 //! threads or wrap it in `spawn_blocking`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -375,9 +375,15 @@ impl RecallStore {
                         }
                     }
                     // Records written after the dump (same generation ⇒ no
-                    // vectors involved) are indexed BM25-only.
+                    // vectors involved) are indexed BM25-only. The layout set
+                    // is built once: a linear walk per record is
+                    // O(records × layout) — ~1.5×10⁸ comparisons at the
+                    // ADR's 15k × 10k scale — and threatens the <1 s
+                    // cold-start budget (#2390).
+                    let mut laid_out: HashSet<&str> = HashSet::with_capacity(m.layout.len());
+                    laid_out.extend(m.layout.iter().map(|(id, _)| id.as_str()));
                     for r in &records {
-                        if !m.layout.iter().any(|(id, _)| id == &r.id) {
+                        if !laid_out.contains(r.id.as_str()) {
                             index.insert(&r.id, &r.index_text(), None);
                         }
                     }
@@ -1904,5 +1910,41 @@ mod tests {
         store.mark_promoted(&["doc:mail:m".to_string()]).unwrap();
         assert!(store.nominate(1, 5).unwrap().is_empty());
         assert_eq!(store.sources(), vec!["bank", "calendar", "mail"]);
+    }
+
+    #[test]
+    fn should_index_post_dump_records_when_reloading_a_matching_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+            store
+                .upsert(
+                    vec![doc("a", "alpha", "first thing", 1)],
+                    vec![Some(vec![1.0, 0.0, 0.0, 0.0])],
+                )
+                .unwrap();
+            store.persist_index().unwrap();
+            // After the dump: committed to redb, vector-less (so the stored
+            // generation does not move), and never dumped. The next open must
+            // reload the persisted graph and still index this record BM25-only.
+            store
+                .upsert(vec![doc("b", "beta", "second thing", 1)], vec![None])
+                .unwrap();
+        }
+        let store = RecallStore::open(dir.path(), cfg(4)).unwrap();
+        let s = store.stats();
+        assert!(s.graph_persisted, "manifest reload must be taken");
+        assert_eq!((s.records, s.vectors_resident), (2, 1));
+        let hits = store
+            .search(
+                "second",
+                None,
+                &SearchFilter {
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits[0].id, "doc:mail:b");
     }
 }

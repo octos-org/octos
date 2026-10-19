@@ -179,13 +179,9 @@ async fn erase_transcript_in(root: &Path, session: &SessionKey, errors: &mut Vec
         Some(&format!(".migrated.{encoded_topic}")),
         errors,
     );
-    // The per-turn context-manager snapshot (verbatim conversation content).
-    match remove_tree_within(
-        root,
-        &crate::context_manager::context_ledger_path(root, &session.0),
-    ) {
-        Ok(true) => removed += 1,
-        Ok(false) => {}
+    // Snapshots and current/orphaned journals contain verbatim conversation.
+    match crate::context_manager::remove_context_manager_store(root, &session.0) {
+        Ok(count) => removed += count,
         Err(error) => errors.push(format!("context ledger {session}: {error}")),
     }
     if let Err(error) =
