@@ -20,9 +20,9 @@ use super::{
     ConfigureToolTool, DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool,
     ImageGenerationTool, ListDirTool, ReadFileTool, RequestUserInputTool, ResumeAgentTool,
     SendInputTool, ShellTool, SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore, ToolResult,
-    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool, WebFetchTool,
-    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
-    WriteStdinTool,
+    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool,
+    WatchExternalJobTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool,
+    WorkspaceShowTool, WriteFileTool, WriteStdinTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -1499,6 +1499,13 @@ impl ToolRegistry {
                 .with_bash_file_writes(permissions.bash_file_writes),
         );
         registry.register(WriteStdinTool);
+        registry.register(
+            WatchExternalJobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope),
+        );
+        registry.mark_spawn_only(
+            "watch_external_job",
+            Some(super::watch_external_job::START_MESSAGE.into()),
+        );
         registry.register(UpdatePlanTool);
         registry.register(RequestUserInputTool);
         // UPCR-2026-023: structured AskUserQuestion. The synchronous,
@@ -1659,6 +1666,7 @@ impl ToolRegistry {
         // doesn't keep running commands under the old project root.
         "bash",
         "read_file",
+        "watch_external_job",
         "write_file",
         "apply_patch",
         "edit_file",
@@ -1715,6 +1723,15 @@ impl ToolRegistry {
         registry.sandbox = sandbox.clone();
         registry.filesystem_scope = permissions.filesystem_scope;
         // Re-register cwd-bound tools with the new workspace
+        registry.register(
+            WatchExternalJobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope),
+        );
+        if self.is_spawn_only("watch_external_job") {
+            registry.mark_spawn_only(
+                "watch_external_job",
+                Some(super::watch_external_job::START_MESSAGE.into()),
+            );
+        }
         registry.register(
             ShellTool::new(cwd)
                 .with_shared_sandbox(sandbox.clone())

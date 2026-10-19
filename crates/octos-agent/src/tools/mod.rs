@@ -793,6 +793,15 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether the spawn-only executor may retry a failed result whose text
+    /// resembles a transient transport error. Observers of already submitted
+    /// jobs opt out: a terminal receipt is evidence, even when the external
+    /// job's error text says "connection refused". Re-executing the observer
+    /// would delay that notification and reset its observation deadline.
+    fn retry_background_on_transient_error(&self) -> bool {
+        true
+    }
+
     /// Whether this tool BLOCKS on human input (e.g. `ask_user_question`
     /// awaits the [`USER_QUESTION_CTX`] requester until the client answers,
     /// exactly as the approval gate blocks on [`TOOL_APPROVAL_CTX`]). Such a
@@ -889,6 +898,7 @@ pub mod shell;
 pub(crate) mod site_crawl;
 pub mod spawn;
 pub mod synthesize_research;
+pub mod watch_external_job;
 pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
@@ -967,6 +977,7 @@ pub use send_file::SendFileTool;
 pub use shell::ShellTool;
 pub use spawn::{BackgroundResultKind, BackgroundResultPayload, SpawnTool};
 pub use synthesize_research::SynthesizeResearchTool;
+pub use watch_external_job::WatchExternalJobTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
