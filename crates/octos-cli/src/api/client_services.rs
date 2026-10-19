@@ -37,7 +37,9 @@ struct Service {
 #[serde(deny_unknown_fields)]
 pub struct Update {
     provider: String,
-    enabled: bool,
+    /// Accepted from older clients; key presence now determines activation.
+    #[serde(default, rename = "enabled")]
+    _legacy_enabled: Option<bool>,
     #[serde(default)]
     params: BTreeMap<String, String>,
     /// Omitted retains this capability's current key; empty explicitly removes it.
@@ -166,7 +168,12 @@ impl Vault {
                 },
             )
             .map_err(|_| fail())?;
-        serde_json::from_slice(&plain).map_err(|_| fail())
+        let mut services: Services = serde_json::from_slice(&plain).map_err(|_| fail())?;
+        // Upgrade existing saved/off records without changing keys or revisions.
+        for service in services.values_mut() {
+            service.enabled = !service.key.trim().is_empty();
+        }
+        Ok(services)
     }
     fn write(&self, owner: &str, value: &Services) -> Result<(), Failure> {
         let cipher = self.cipher()?;
@@ -256,17 +263,11 @@ fn update(services: &mut Services, capability: &str, body: Update) -> Result<(),
         }
         None => old.map(|s| s.key.clone()).unwrap_or_default(),
     };
-    if body.enabled && key.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Enabled service requires your own credential",
-        ));
-    }
     services.insert(
         capability.into(),
         Service {
             provider: body.provider,
-            enabled: body.enabled,
+            enabled: !key.is_empty(),
             params: body.params,
             key,
             revision: uuid::Uuid::new_v4().to_string(),
@@ -513,7 +514,7 @@ mod tests {
     fn input(revision: Option<String>) -> Update {
         Update {
             provider: "typesafe".into(),
-            enabled: true,
+            _legacy_enabled: Some(true),
             params: BTreeMap::new(),
             key: Some("synthetic-owner-key".into()),
             expected_revision: revision,
@@ -546,10 +547,10 @@ mod tests {
         let mut services = BTreeMap::new();
         let mut missing = input(None);
         missing.key = None;
-        assert_eq!(
-            update(&mut services, "admission", missing).unwrap_err().0,
-            StatusCode::BAD_REQUEST
-        );
+        let mut empty = BTreeMap::new();
+        update(&mut empty, "admission", missing).unwrap();
+        assert!(empty["admission"].key.is_empty());
+        assert!(!empty["admission"].enabled);
         update(&mut services, "admission", input(None)).unwrap();
         assert_eq!(
             update(&mut services, "admission", input(None))
@@ -634,7 +635,7 @@ mod tests {
         assert_eq!(value["services"]["admission"]["key"], "synthetic-owner-key");
         let revision = value["services"]["admission"]["revision"].as_str().unwrap();
         let mut disabled = input(Some(revision.into()));
-        disabled.enabled = false;
+        disabled._legacy_enabled = Some(false);
         put(
             State(state.clone()),
             HeaderMap::new(),
@@ -653,7 +654,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(snapshot["services"]["admission"]["enabled"], false);
+        assert_eq!(snapshot["services"]["admission"]["enabled"], true);
         assert_eq!(
             snapshot["services"]["admission"]["key"],
             "synthetic-owner-key"
@@ -679,6 +680,36 @@ mod tests {
             .await
             .unwrap();
         assert!(!String::from_utf8_lossy(&after_body).contains("synthetic-owner-key"));
+    }
+    #[test]
+    fn client_services_key_presence_controls_activation_and_upgrades_old_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::new(dir.path());
+        let mut services = BTreeMap::new();
+        let mut new_key = input(None);
+        new_key._legacy_enabled = Some(false);
+        update(&mut services, "admission", new_key).unwrap();
+        assert!(services["admission"].enabled);
+        let revision = services["admission"].revision.clone();
+        services.get_mut("admission").unwrap().enabled = false;
+        vault.write("alice", &services).unwrap();
+        let original = std::fs::read(vault.file("alice")).unwrap();
+        let restored = vault.read("alice").unwrap();
+        assert!(restored["admission"].enabled);
+        assert_eq!(restored["admission"].revision, revision);
+        assert_eq!(restored["admission"].key, "synthetic-owner-key");
+        assert_eq!(metadata(&restored)["admission"]["enabled"], true);
+        assert_eq!(std::fs::read(vault.file("alice")).unwrap(), original);
+        let mut clear = input(Some(revision));
+        clear.key = Some(String::new());
+        clear._legacy_enabled = Some(true);
+        update(&mut services, "admission", clear).unwrap();
+        assert!(!services["admission"].enabled);
+        assert!(services["admission"].key.is_empty());
+        // An inconsistent old flag cannot activate an empty credential.
+        services.get_mut("admission").unwrap().enabled = true;
+        vault.write("alice", &services).unwrap();
+        assert!(!vault.read("alice").unwrap()["admission"].enabled);
     }
     #[test]
     fn client_services_lock_serializes_separate_store_instances() {
