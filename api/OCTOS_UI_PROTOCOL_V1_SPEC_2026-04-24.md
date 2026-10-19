@@ -2440,6 +2440,12 @@ Optional typed fields from accepted `UPCR-2026-001`:
   Optional display hints such as labels, default decision, danger state, and
   monospace fields.
 
+For clients negotiating `approval.typed.v1`, shell command approvals from
+`shell`, `bash`, and `exec_command` use `approval_kind: "command"` and
+`typed_details.command` when a command or working directory is available.
+The aliases preserve the same command-line, sanitized working-directory, and
+tool-call-id fields. This does not grant additional approval scope.
+
 Compatibility rules:
 
 - Generic `title` and `body` remain mandatory fallback text for v1alpha1.
