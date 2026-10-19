@@ -2662,7 +2662,13 @@ async fn handle_upload(
         );
         let _ = tokio::fs::remove_file(&upload_dir).await;
     }
-    if let Err(e) = tokio::fs::create_dir_all(&upload_dir).await {
+    // #2817: the shared `/tmp/octos-uploads` root is created private (0700)
+    // and refused if a foreign account owns it — the same face #2805 fixed
+    // for the media dirs. Hardening the root first also refuses a planted
+    // root before the tenant subdir is created inside it.
+    if let Err(e) = crate::media::ensure_private_dir(&upload_root)
+        .and_then(|()| crate::media::ensure_private_dir(&upload_dir))
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("mkdir failed: {e}"),

@@ -1923,12 +1923,17 @@ pub async fn upload(
 
     // Determine upload directory (per-tenant subdir).
     let upload_dir = std::env::temp_dir().join("octos-uploads").join(&profile_id);
-    tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to create upload dir: {e}"),
-        )
-    })?;
+    // #2817: private (0700) creation + foreign-owner refusal, mirroring
+    // #2805's media-dir hardening; the root is hardened first so a planted
+    // root is refused before anything is created inside it.
+    octos_bus::media::ensure_private_dir(&octos_bus::file_handle::temp_upload_root())
+        .and_then(|()| octos_bus::media::ensure_private_dir(&upload_dir))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to create upload dir: {e}"),
+            )
+        })?;
 
     let mut paths = Vec::new();
     let mut seen_names = std::collections::HashSet::new();

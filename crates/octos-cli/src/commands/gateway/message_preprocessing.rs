@@ -313,7 +313,9 @@ async fn render_pdf_pages_as_images(pdf_path: &Path) -> Result<Vec<String>, Stri
 
 fn render_pdf_pages_as_images_blocking(pdf_path: &Path) -> Result<Vec<String>, String> {
     let output_dir = octos_bus::file_handle::temp_upload_root().join("pdf-page-images");
-    std::fs::create_dir_all(&output_dir)
+    // #2817: same private-dir hardening as the upload handlers above — the
+    // rendered pages are private session data.
+    octos_bus::media::ensure_private_dir(&output_dir)
         .map_err(|error| format!("failed to create rendered-page directory: {error}"))?;
 
     let prefix_name = format!("{}-{}-page", uuid::Uuid::now_v7(), safe_file_stem(pdf_path));
