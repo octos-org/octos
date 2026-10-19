@@ -20,7 +20,7 @@ environment-variable export operation.
 | `GET /api/my/client-services` | Metadata: provider, parameters, enabled, revision, has_credential, execution_target |
 | `PUT /api/my/client-services/{capability}` | Save a capability with an expected revision |
 | `DELETE /api/my/client-services/{capability}` | Delete with an expected revision |
-| `POST /api/my/client-services/sync` | Explicitly return the owner's enabled client credentials |
+| `POST /api/my/client-services/sync` | Explicitly return the owner's configured client credentials |
 | `POST /api/my/client-services/{capability}/relay` | Relay a client-initiated request using its own credential |
 
 Capabilities are `asr`, `tts`, and `admission`. The compatibility field
@@ -40,7 +40,9 @@ credentials are never implicitly borrowed from another capability.
 DELETE requires `{ "expected_revision": "..." }`. Responses use the envelope
 `{ "profile_id": "...", "services": { ... } }`. Ordinary reads and mutations
 return metadata only, without key previews. Only explicit authenticated POST
-sync returns raw keys, and only for enabled client services. All successful
+sync returns raw keys, including disabled services for explicit draft tests. The enabled flag is
+preserved; ordinary runtime snapshots must exclude disabled services and may
+not activate a service merely because a credential exists. All successful
 responses carry `Cache-Control: no-store, max-age=0` and `Pragma: no-cache`.
 Do not log or cache sync bodies. TLS is the host deployment's responsibility.
 

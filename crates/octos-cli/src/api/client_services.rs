@@ -370,8 +370,10 @@ pub async fn sync(
     let _guard = MUTATION.lock().map_err(|_| fail())?;
     let _file_guard = vault.lock()?;
     let services = vault.read(&owner)?;
-    let enabled: BTreeMap<_, _> = services.iter().filter(|(_, s)| s.enabled && !s.key.is_empty()).map(|(id, s)| (id, json!({"provider":s.provider,"enabled":true,"params":s.params,"key":s.key,"revision":s.revision,"execution_target":"client"}))).collect();
-    Ok(response(json!({"profile_id": owner, "services": enabled})))
+    let configured: BTreeMap<_, _> = services.iter().filter(|(_, s)| !s.key.is_empty()).map(|(id, s)| (id, json!({"provider":s.provider,"enabled":s.enabled,"params":s.params,"key":s.key,"revision":s.revision,"execution_target":"client"}))).collect();
+    Ok(response(
+        json!({"profile_id": owner, "services": configured}),
+    ))
 }
 
 /// A caller-supplied draft/synchronized credential. Never look up inherited or
@@ -631,6 +633,34 @@ mod tests {
         let value: Value = serde_json::from_slice(&alice_body).unwrap();
         assert_eq!(value["services"]["admission"]["key"], "synthetic-owner-key");
         let revision = value["services"]["admission"]["revision"].as_str().unwrap();
+        let mut disabled = input(Some(revision.into()));
+        disabled.enabled = false;
+        put(
+            State(state.clone()),
+            HeaderMap::new(),
+            Extension(alice()),
+            Path("admission".into()),
+            Json(disabled),
+        )
+        .await
+        .unwrap();
+        let result = sync(State(state.clone()), HeaderMap::new(), Extension(alice()))
+            .await
+            .unwrap();
+        let snapshot: Value = serde_json::from_slice(
+            &axum::body::to_bytes(result.into_body(), 100_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["services"]["admission"]["enabled"], false);
+        assert_eq!(
+            snapshot["services"]["admission"]["key"],
+            "synthetic-owner-key"
+        );
+        let revision = snapshot["services"]["admission"]["revision"]
+            .as_str()
+            .unwrap();
         delete(
             State(state.clone()),
             HeaderMap::new(),
