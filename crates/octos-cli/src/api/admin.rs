@@ -1421,6 +1421,13 @@ fn resolve_saved_key(
         }
     };
 
+    let Some(axum::Extension(authenticated)) = identity else {
+        return Err((StatusCode::UNAUTHORIZED, "not authenticated".into()));
+    };
+    if !super::auth_handlers::is_authorized_for_profile(state, authenticated, &profile_id) {
+        return Err((StatusCode::FORBIDDEN, "profile access denied".into()));
+    }
+
     let profile = ps
         .get(&profile_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -5711,6 +5718,31 @@ mod register_flow_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_services_provider_probe_rejects_another_owners_saved_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(crate::profiles::ProfileStore::open_unified(dir.path()).unwrap());
+        let state = super::AppState {
+            profile_store: Some(store),
+            ..super::AppState::empty_for_tests()
+        };
+        let identity = Some(axum::Extension(super::super::router::AuthIdentity::User {
+            id: "alice".into(),
+            role: crate::user_store::UserRole::User,
+        }));
+        let request: super::TestProviderRequest = serde_json::from_value(serde_json::json!({
+            "provider": "google", "profile_id": "bob", "api_key_env": "GEMINI_API_KEY"
+        }))
+        .unwrap();
+        assert_eq!(
+            super::resolve_saved_key(&state, &identity, &request)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::FORBIDDEN
+        );
+    }
+
     use super::*;
     use tokio::io::AsyncWriteExt;
 

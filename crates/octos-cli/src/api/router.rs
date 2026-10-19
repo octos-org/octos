@@ -18,6 +18,7 @@ use super::admin_audit;
 use super::admin_setup;
 use super::auth_handlers;
 use super::bilibili;
+use super::client_services;
 use super::events_harness;
 use super::frps_plugin;
 use super::handlers;
@@ -397,6 +398,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // User self-service endpoints (user or admin auth)
     let my_api = Router::new()
+        .route("/api/my/client-services", get(client_services::list))
+        .route("/api/my/client-services/sync", post(client_services::sync))
+        .route(
+            "/api/my/client-services/{capability}",
+            put(client_services::put).delete(client_services::delete),
+        )
         .route("/api/my/profile", get(auth_handlers::my_profile))
         .route("/api/my/profile", put(auth_handlers::update_my_profile))
         .route("/api/my/profile/qr", get(auth_handlers::my_profile_qr))

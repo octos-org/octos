@@ -12,6 +12,7 @@ pub mod admin_audit;
 pub mod admin_setup;
 pub mod auth_handlers;
 mod bilibili;
+pub mod client_services;
 pub(crate) mod coding_tool_contract;
 mod cron_panel;
 mod events;
