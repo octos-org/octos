@@ -14899,13 +14899,11 @@ fn approval_types_the_shell_aliases_like_shell() {
         );
         let wire = serde_json::to_value(&typed).unwrap();
         assert_eq!(
-            wire["typed_details"]["command"]["command_line"],
-            "rm -rf build",
+            wire["typed_details"]["command"]["command_line"], "rm -rf build",
             "{tool}"
         );
         assert_eq!(
-            wire["typed_details"]["command"]["cwd"],
-            "/workspace/octos",
+            wire["typed_details"]["command"]["cwd"], "/workspace/octos",
             "{tool}"
         );
     }
