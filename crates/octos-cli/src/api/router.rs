@@ -401,6 +401,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/client-services", get(client_services::list))
         .route("/api/my/client-services/sync", post(client_services::sync))
         .route(
+            "/api/my/client-services/{capability}/relay",
+            post(client_services::relay).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
             "/api/my/client-services/{capability}",
             put(client_services::put).delete(client_services::delete),
         )

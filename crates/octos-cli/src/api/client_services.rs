@@ -1,5 +1,5 @@
-//! Owner-scoped configuration for services executed directly by a client.
-//! No provider requests and no inheritance from host or parent credentials.
+//! Owner-scoped BYOK configuration, synchronization and restricted browser relay.
+//! No inheritance from host or parent credentials.
 use super::{AppState, router::AuthIdentity};
 use axum::{
     Extension, Json,
@@ -374,6 +374,137 @@ pub async fn sync(
     Ok(response(json!({"profile_id": owner, "services": enabled})))
 }
 
+/// A caller-supplied draft/synchronized credential. Never look up inherited or
+/// platform credentials and never accept an arbitrary URL or forwarded headers.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayRequest {
+    provider: String,
+    key: String,
+    #[serde(default)]
+    params: BTreeMap<String, String>,
+    payload: Value,
+}
+fn build_relay_request(
+    client: &reqwest::Client,
+    capability: &str,
+    input: &RelayRequest,
+) -> Result<reqwest::RequestBuilder, Failure> {
+    let invalid = || {
+        (
+            StatusCode::BAD_REQUEST,
+            "Unsupported BYOK relay configuration",
+        )
+    };
+    if input.key.trim().is_empty()
+        || input.key.len() > 8192
+        || input.key.contains(['\r', '\n'])
+        || input.params.len() > 16
+        || input
+            .params
+            .iter()
+            .any(|(k, v)| k.len() > 80 || v.len() > 1024 || v.contains(['\r', '\n']))
+    {
+        return Err(invalid());
+    }
+    let endpoint = match (capability, input.provider.as_str()) {
+        ("asr", "volcano") => {
+            "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
+        }
+        ("tts", "volcano") => "https://openspeech.bytedance.com/api/v3/tts/unidirectional",
+        ("admission", "typesafe") => "https://api.typesafe.ai/v1/systemone",
+        _ => return Err(invalid()),
+    };
+    let mut request = client.post(endpoint).json(&input.payload);
+    if capability == "admission" {
+        request = request.bearer_auth(input.key.trim());
+    } else {
+        if input
+            .params
+            .get("auth_mode")
+            .is_some_and(|v| v != "api-key")
+            || input.params.get("app_id").is_some_and(|v| !v.is_empty())
+        {
+            return Err(invalid());
+        }
+        let resource = input
+            .params
+            .get("resource_id")
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(invalid)?;
+        request = request
+            .header("X-Api-Key", input.key.trim())
+            .header("X-Api-Resource-Id", resource)
+            .header("X-Api-Request-Id", uuid::Uuid::new_v4().to_string());
+        if capability == "asr" {
+            request = request.header("X-Api-Sequence", "-1");
+        }
+    }
+    Ok(request)
+}
+/// Browser compatibility fallback; authenticated and bounded, with no retries.
+/// Supplier status lives inside the envelope so a supplier 401 is never treated
+/// as an expired Octos session. Raw supplier error bodies are never returned.
+pub async fn relay(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(identity): Extension<AuthIdentity>,
+    Path(capability): Path<String>,
+    Json(input): Json<RelayRequest>,
+) -> Result<Response, Failure> {
+    let _ = context(&state, &identity, &headers)?;
+    static CLIENT: std::sync::LazyLock<Result<reqwest::Client, reqwest::Error>> =
+        std::sync::LazyLock::new(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+        });
+    let client = CLIENT.as_ref().map_err(|_| fail())?;
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+    let _slot = SLOTS.try_acquire().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BYOK relay busy; retry later",
+        )
+    })?;
+    let request = build_relay_request(client, &capability, &input)?;
+    relay_response(request).await
+}
+async fn relay_response(request: reqwest::RequestBuilder) -> Result<Response, Failure> {
+    let mut upstream = request
+        .send()
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "BYOK supplier connection failed"))?;
+    let status = upstream.status().as_u16();
+    if !upstream.status().is_success() {
+        return Ok(response(json!({"status":status,"body":"","code":null})));
+    }
+    let code = upstream
+        .headers()
+        .get("X-Api-Status-Code")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.len() <= 8 && v.bytes().all(|c| c.is_ascii_digit()))
+        .map(str::to_owned);
+    const LIMIT: usize = 12 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = upstream.chunk().await.map_err(|_| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "BYOK supplier response interrupted",
+        )
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > LIMIT {
+            return Err((StatusCode::BAD_GATEWAY, "BYOK supplier response too large"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(bytes)
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "Invalid BYOK supplier response"))?;
+    Ok(response(json!({"status":status,"body":body,"code":code})))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +662,140 @@ mod tests {
         );
         drop(guard);
         assert!(second.lock().is_ok());
+    }
+    #[test]
+    fn client_services_relay_restricts_targets_and_new_key_auth() {
+        for (capability, provider, host) in [
+            ("tts", "volcano", "openspeech.bytedance.com"),
+            ("asr", "volcano", "openspeech.bytedance.com"),
+            ("admission", "typesafe", "api.typesafe.ai"),
+        ] {
+            let input = RelayRequest {
+                provider: provider.into(),
+                key: "synthetic-owner-key".into(),
+                params: BTreeMap::from([
+                    ("auth_mode".into(), "api-key".into()),
+                    ("resource_id".into(), "resource".into()),
+                ]),
+                payload: json!({"text":"hello"}),
+            };
+            let request = build_relay_request(&reqwest::Client::new(), capability, &input)
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(request.url().host_str(), Some(host));
+            assert_eq!(request.method(), reqwest::Method::POST);
+            assert!(!request.headers().contains_key("cookie"));
+            assert!(!request.headers().contains_key("x-api-access-key"));
+            if capability == "admission" {
+                assert_eq!(
+                    request.headers()["authorization"],
+                    "Bearer synthetic-owner-key"
+                );
+            } else {
+                assert_eq!(request.headers()["x-api-key"], "synthetic-owner-key");
+                assert!(!request.headers().contains_key("authorization"));
+            }
+        }
+        let mut input = RelayRequest {
+            provider: "volcano".into(),
+            key: "synthetic-owner-key".into(),
+            params: BTreeMap::from([("resource_id".into(), "resource".into())]),
+            payload: json!({}),
+        };
+        assert!(build_relay_request(&reqwest::Client::new(), "tts", &input).is_ok());
+        input.params.insert("auth_mode".into(), "legacy".into());
+        assert!(build_relay_request(&reqwest::Client::new(), "tts", &input).is_err());
+        input.params.clear();
+        input.provider = "https://127.0.0.1/".into();
+        assert!(build_relay_request(&reqwest::Client::new(), "tts", &input).is_err());
+        input.provider = "azure".into();
+        assert!(build_relay_request(&reqwest::Client::new(), "asr", &input).is_err());
+        input.provider = "typesafe".into();
+        input.key.clear();
+        assert!(build_relay_request(&reqwest::Client::new(), "admission", &input).is_err());
+        input.key = "bad\r\nkey".into();
+        assert!(build_relay_request(&reqwest::Client::new(), "admission", &input).is_err());
+        assert!(
+            serde_json::from_value::<RelayRequest>(
+                json!({"provider":"typesafe", "key":"key", "payload":{}, "url":"http://127.0.0.1"})
+            )
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn client_services_relay_sanitizes_errors_and_preserves_success_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/ok",
+                axum::routing::post(|| async {
+                    (
+                        [("x-api-status-code", "20000000")],
+                        "{\"result\":{\"text\":\"hello\"}}",
+                    )
+                }),
+            )
+            .route(
+                "/bad",
+                axum::routing::post(|| async {
+                    (StatusCode::UNAUTHORIZED, "echoed-secret-must-not-leak")
+                }),
+            )
+            .route(
+                "/slow",
+                axum::routing::post(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    "late"
+                }),
+            )
+            .route(
+                "/large",
+                axum::routing::post(|| async { "x".repeat(12 * 1024 * 1024 + 1) }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let result = relay_response(client.post(format!("http://{addr}/ok")))
+            .await
+            .unwrap();
+        assert_eq!(result.headers()["cache-control"], "no-store, max-age=0");
+        let value: Value = serde_json::from_slice(
+            &axum::body::to_bytes(result.into_body(), 100_000)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["code"], "20000000");
+        assert!(value["body"].as_str().unwrap().contains("hello"));
+        let result = relay_response(client.post(format!("http://{addr}/bad")))
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(result.into_body(), 100_000)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("echoed-secret"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["status"],
+            401
+        );
+        assert!(
+            relay_response(
+                client
+                    .post(format!("http://{addr}/slow"))
+                    .timeout(std::time::Duration::from_millis(30))
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            relay_response(client.post(format!("http://{addr}/large")))
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 }

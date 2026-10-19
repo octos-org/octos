@@ -324,7 +324,7 @@ Goal 记录 Agent 要完成什么，Loop 安排周期性轮次，Monitor 观察�
 - [OUP 协议规范](api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md)
 - [OUP 类型与编解码](crates/octos-core/src/ui_protocol.rs)
 - [运行时架构](docs/ARCHITECTURE.md)
-- [客户端直连服务配置](docs/CLIENT_SERVICE_CONFIGURATION.md)
+- [BYOK 服务配置与网页转发](docs/CLIENT_SERVICE_CONFIGURATION.md)
 - [Harness 开发者接口](docs/OCTOS_HARNESS_DEVELOPER_INTERFACE.md)
 - [产物与工作流集成指南](docs/OCTOS_HARNESS_DEVELOPER_GUIDE.md)
 - [Harness 兼容性与版本管理](docs/OCTOS_HARNESS_ABI_VERSIONING.md)

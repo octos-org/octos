@@ -387,7 +387,7 @@ Follow one Calendar request through admission, Tokio tasks, a host tool and its 
 - [OUP specification](api/OCTOS_UI_PROTOCOL_V1_SPEC_2026-04-24.md)
 - [OUP types and codecs](crates/octos-core/src/ui_protocol.rs)
 - [Runtime architecture](docs/ARCHITECTURE.md)
-- [Client-executed service configuration](docs/CLIENT_SERVICE_CONFIGURATION.md)
+- [BYOK service configuration and browser relay](docs/CLIENT_SERVICE_CONFIGURATION.md)
 - [Harness developer interface](docs/OCTOS_HARNESS_DEVELOPER_INTERFACE.md)
 - [Artifact and workflow integration guide](docs/OCTOS_HARNESS_DEVELOPER_GUIDE.md)
 - [Harness compatibility and versioning](docs/OCTOS_HARNESS_ABI_VERSIONING.md)
