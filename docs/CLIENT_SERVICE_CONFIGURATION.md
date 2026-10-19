@@ -52,7 +52,9 @@ errors. A missing credential must never trigger a host-funded fallback.
 
 Secrets live under `<registry root>/client-service-secrets/`, outside the profile
 runtime workspace. Records use ChaCha20-Poly1305 with the owner as associated
-data and atomic replacement. The directory is 0700; encrypted record files and
+data and atomic replacement. An OS file lock covers revision checks and
+replacement across separate Octos instances sharing a registry; contention
+returns 503 for an explicit retry. The directory is 0700; encrypted record files and
 `master.key` are created with 0600. A master key with unsafe permissions is
 refused. Platforms without enforced Unix file permissions fail explicitly.
 This is an encrypted file vault, not an OS Keychain integration. The master key

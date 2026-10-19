@@ -99,6 +99,28 @@ impl Vault {
             root: home.join("client-service-secrets"),
         }
     }
+    /// Separate Octos instances can share one registry. Hold an OS lock
+    /// across the revision check and atomic replacement, not just a Rust mutex.
+    fn lock(&self) -> Result<std::fs::File, Failure> {
+        private_dir(&self.root)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(self.root.join("store.lock"))
+            .map_err(|_| fail())?;
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Client service storage busy; retry",
+            )
+        })?;
+        Ok(file)
+    }
     fn file(&self, owner: &str) -> PathBuf {
         self.root
             .join(format!("{:x}.enc", Sha256::digest(owner.as_bytes())))
@@ -288,6 +310,7 @@ pub async fn list(
 ) -> Result<Response, Failure> {
     let (vault, owner) = context(&state, &identity, &headers)?;
     let _guard = MUTATION.lock().map_err(|_| fail())?;
+    let _file_guard = vault.lock()?;
     Ok(response(
         json!({"profile_id": owner, "services": metadata(&vault.read(&owner)?)}),
     ))
@@ -301,6 +324,7 @@ pub async fn put(
 ) -> Result<Response, Failure> {
     let (vault, owner) = context(&state, &identity, &headers)?;
     let _guard = MUTATION.lock().map_err(|_| fail())?;
+    let _file_guard = vault.lock()?;
     let mut services = vault.read(&owner)?;
     update(&mut services, &capability, body)?;
     vault.write(&owner, &services)?;
@@ -320,6 +344,7 @@ pub async fn delete(
         return Err((StatusCode::BAD_REQUEST, "Invalid capability"));
     }
     let _guard = MUTATION.lock().map_err(|_| fail())?;
+    let _file_guard = vault.lock()?;
     let mut services = vault.read(&owner)?;
     if services.get(&capability).map(|s| s.revision.as_str())
         != Some(body.expected_revision.as_str())
@@ -343,6 +368,7 @@ pub async fn sync(
 ) -> Result<Response, Failure> {
     let (vault, owner) = context(&state, &identity, &headers)?;
     let _guard = MUTATION.lock().map_err(|_| fail())?;
+    let _file_guard = vault.lock()?;
     let services = vault.read(&owner)?;
     let enabled: BTreeMap<_, _> = services.iter().filter(|(_, s)| s.enabled && !s.key.is_empty()).map(|(id, s)| (id, json!({"provider":s.provider,"enabled":true,"params":s.params,"key":s.key,"revision":s.revision,"execution_target":"client"}))).collect();
     Ok(response(json!({"profile_id": owner, "services": enabled})))
@@ -492,5 +518,18 @@ mod tests {
             .await
             .unwrap();
         assert!(!String::from_utf8_lossy(&after_body).contains("synthetic-owner-key"));
+    }
+    #[test]
+    fn client_services_lock_serializes_separate_store_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Vault::new(dir.path());
+        let second = Vault::new(dir.path());
+        let guard = first.lock().unwrap();
+        assert_eq!(
+            second.lock().unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(guard);
+        assert!(second.lock().is_ok());
     }
 }
