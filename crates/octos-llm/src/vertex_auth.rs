@@ -300,6 +300,7 @@ mod tests {
     // RS256 backend unless a crypto feature is enabled, and `encode` panics
     // at runtime — no prior test signed with a valid key, so the breakage
     // shipped green. This test fails (panic) on a backend-less build.
+    // spellchecker:off — base64 key material below is not prose.
     const PINNED_TEST_RSA_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCkxPv87cQlcZbl
 6rgPrwTFA2UHerRSllVTpJgahzOSGjUwrq7Uzn+CN6sHZ3YG3zfRIugLywsQOx09
@@ -337,6 +338,7 @@ N0xM7KYmxsUEIn2JtMcbXpO2jgKxVfrFyS68sSAXlNpPucutjIl1uEt4Ax+DqiRb
 gmypi0fz/je9wh2Z/jP8XFyUI/f6DIFviB5hONC3Tta9SymJd61dBA3upKjsFKdd
 nQIDAQAB
 -----END PUBLIC KEY-----"#;
+    // spellchecker:on
 
     #[test]
     fn should_sign_and_verify_rs256_assertion_with_pinned_key() {

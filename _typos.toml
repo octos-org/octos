@@ -1,0 +1,13 @@
+# Inline spellchecker directives (the reference pattern from
+# crate-ci/typos docs/reference.md) so test fixtures that embed non-prose
+# content — pinned base64 keys, blobs — can opt their block out without
+# excluding the whole file. Adds ignore-only behavior; nothing else changes.
+[default]
+extend-ignore-re = [
+    # Ignore lines that end with `# spellchecker:disable-line`
+    "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$",
+    # Ignore the line after `# spellchecker:ignore-next-line`:
+    "(#|//)\\s*spellchecker:ignore-next-line\\n.*",
+    # Ignore blocks between `# spellchecker:off` and `# spellchecker:on`
+    "(?s)(#|//)\\s*spellchecker:off.*?\\n\\s*(#|//)\\s*spellchecker:on",
+]
