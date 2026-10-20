@@ -97,6 +97,7 @@ pub(super) struct ConvergenceController {
     pending_reason: Option<CheckpointReason>,
     pending_reflection: Option<String>,
     checkpoints: u32,
+    last_diagnostic_action: Option<u32>,
 }
 
 impl ConvergenceController {
@@ -146,6 +147,7 @@ impl ConvergenceController {
             pending_reason: None,
             pending_reflection: None,
             checkpoints: 0,
+            last_diagnostic_action: None,
         }
     }
 
@@ -159,6 +161,34 @@ impl ConvergenceController {
     /// response, never for a checkpoint's reflection call.
     pub(super) fn record_action_call(&mut self) {
         self.completed_action_calls = self.completed_action_calls.saturating_add(1);
+    }
+
+    /// Repeated edits/polls get evidence on the next ordinary action call,
+    /// not an extra tools-disabled model round. Coalesce across files so a
+    /// batch rebuilding many layouts cannot create a diagnostic storm.
+    pub(super) fn diagnostic_notice(
+        &mut self,
+        reason: &CheckpointReason,
+        evidence: &str,
+        usage: &TokenUsage,
+    ) -> Option<String> {
+        if self.last_diagnostic_action.is_some_and(|last| {
+            self.completed_action_calls.saturating_sub(last) < self.llm_call_interval.max(10)
+        }) {
+            return None;
+        }
+        self.last_diagnostic_action = Some(self.completed_action_calls);
+        self.rearm(usage);
+        Some(format!(
+            "{CHECKPOINT_CONTEXT_OPEN}\nObserved repeated work: {}.\n\
+             Use the next action to inspect a current check or run a distinct, bounded diagnosis \
+             if the same defect remains. Revisions alone do not prove failure or progress. \
+             Job completion does not certify quality. Retain unresolved findings; do not claim \
+             a pass without current evidence. Do not switch models or abandon the task because \
+             of this notice. Continue independent work while registered jobs run.\n\
+             {evidence}\n{CHECKPOINT_CONTEXT_CLOSE}",
+            reason.describe()
+        ))
     }
 
     /// Called at the top of a loop iteration, BEFORE its action call. The call
@@ -602,5 +632,39 @@ mod tests {
         assert_eq!(controller.checkpoints(), 0);
         assert!(controller.due(&usage).is_none());
         assert!(controller.take_context_message().is_none());
+    }
+    #[test]
+    fn should_coalesce_churn_diagnostics_without_spending_reflection_calls() {
+        let mut controller = new_controller(20, 100_000);
+        let usage = TokenUsage::default();
+        let reason = CheckpointReason::FileChurn {
+            path: "layout.json".into(),
+            edits: 5,
+            escalation: false,
+        };
+        assert!(
+            controller
+                .diagnostic_notice(&reason, "unverified", &usage)
+                .is_some()
+        );
+        for _ in 0..19 {
+            controller.record_action_call();
+            assert!(
+                controller
+                    .diagnostic_notice(&reason, "unverified", &usage)
+                    .is_none()
+            );
+        }
+        controller.record_action_call();
+        assert!(
+            controller
+                .diagnostic_notice(&reason, "still unverified", &usage)
+                .is_some()
+        );
+        assert_eq!(
+            controller.checkpoints(),
+            0,
+            "diagnostic notes are not successful reviews"
+        );
     }
 }

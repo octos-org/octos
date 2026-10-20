@@ -12,7 +12,8 @@ task independent: presentation-specific checks belong to the shared skill.
   expose incomplete observation rather than treating missing events as proof.
 - Associate observations with the workspace/turn, not a particular shell process
   when concurrent workers make attribution ambiguous. Do not widen file scope.
-- At convergence checkpoints, read optional `.octos/progress.json` evidence.
+- At convergence checkpoints, read `.octos/progress.json` evidence and adapter
+  reports in `.octos/tool-progress/*.json`.
   Check reports identify their input artifact hashes and findings. Validate
   confinement, hashes, report status and freshness. These checks establish
   evidence consistency, not the correctness of an arbitrary user-written test
@@ -23,8 +24,46 @@ task independent: presentation-specific checks belong to the shared skill.
 - Repeated edits trigger scoped diagnosis, never a forced quality pass, a model
   substitution, or automatic task abandonment. Preserve ordinary tasks that do
   not supply a progress contract.
-- Use durable job receipts with `watch_external_job` for completion. Its result
-  is a job outcome, not artifact acceptance.
+- Automatically register durable job receipts returned through the adapter
+  metadata contract with `watch_external_job`. Its result is a job outcome,
+  not artifact acceptance.
+
+## Closing the first-trial integration gap (PR #2842)
+
+The first full-deck trial did not use the optional helper or watcher. It made
+65 reflection calls and published no index; passing the isolated smoke tests
+did not establish full-workflow effectiveness.
+
+The follow-up improves three specific behaviors:
+
+1. Tool results carrying `octos_external_job` register the existing native
+   watcher through the ordinary dispatcher, without another model call.
+   The integration test `real_shell_receipt_automatically_registers_one_watch`
+   uses an actual shell result; duplicate receipt observations share one watch.
+   Session policies, hooks, path confinement and background-task limits apply.
+2. Tool adapters publish hash-bound operation reports directly, without a
+   model-authored plan/index. `should_discover_adapter_report_without_model_index_and_not_call_it_quality`
+   proves discovery, stale rejection and unchanged-input deduplication.
+   Operations use `kind: "operation"`; their execution success is **not** a
+   content/visual check pass. `role: "output"` bindings are freshness-checked
+   but do not make a changed timestamp or job id look like new input progress.
+3. File-churn diagnostics accompany an ordinary action request. They do not
+   spend a tools-disabled reflection call and are coalesced across files for
+   at least 20 action calls by default. Periodic checks remain available when
+   evidence is missing or stale. Existing asynchronous-peer polling behavior
+   remains unchanged. `should_coalesce_churn_diagnostics_without_spending_reflection_calls`
+   pins the bounded cadence.
+
+The service-side Python example is
+[`receipt_adapter.py`](../examples/external-jobs/receipt_adapter.py). The KDN
+tool service calls it for every job; the same adapter/helper files go to both
+experimental arms. No fixed slide text, layouts or quality judgments are
+introduced. Preserve trial 1 and record the new release as a different version
+before comparing requests and delivered quality.
+
+Automatic reports are bounded to 64 files of 256 KiB each. Adapters should
+replace a small, stable set of latest-operation reports, not append one report
+per job forever. Individual outcomes remain in their durable job receipts.
 
 ## Optional report format
 

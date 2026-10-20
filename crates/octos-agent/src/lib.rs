@@ -13,6 +13,7 @@ pub use agent::result_md_owner_content_is_peer;
 pub mod agents;
 pub mod approval;
 pub mod arc_task;
+mod automatic_jobs;
 pub mod behaviour;
 pub mod bootstrap;
 pub mod bridge;

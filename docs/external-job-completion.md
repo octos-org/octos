@@ -31,6 +31,34 @@ content or automatically deliver its files.
 
 ## Agent use
 
+### Automatic registration from a tool adapter
+
+Adapters should emit the following in `ToolResult.structured_metadata`:
+
+```json
+{"octos_external_job":{"schema_version":1,"receipt_path":"requests/tool-jobs/render-123.json","job_id":"render-123","request_sha256":"the-immutable-request-hash","status":"running"}}
+```
+
+Shell/bash/exec_command adapters may instead print this as a complete JSON
+object, or a compact JSON event line within the last 32 output lines. The
+kernel recognizes this explicit envelope; it never guesses jobs from prose
+or arbitrary `read_file` content. Receipt paths must be workspace-relative,
+without traversal. Only queued/pending/running jobs register a watch.
+
+Registration happens through the existing tool dispatcher, preserving hook,
+provider/host policy, typed permissions, session ownership and supervisor
+limits. The original tool result includes the native task handle; no invented
+assistant tool call is added to the conversation. The same receipt/id/request
+tuple is registered at most once per registry. Failed registration releases
+the claim; a watch that later times out can still be explicitly re-watched.
+Registry rebinding/restart clears the in-memory claims.
+
+The integration suite includes an actual shell command that emits the receipt
+twice, then independently replaces it on completion. It requires one native
+task and one terminal notification, with no model-authored watch call.
+
+### Explicit registration
+
 After submitting the job once, call:
 
 ```json
@@ -71,8 +99,9 @@ without the agent loop awaits the final result instead of returning a handle.
 
 This version supports local receipts, including receipts synchronized by a
 remote-job adapter. It does not discover arbitrary HTTP jobs or interrupt
-unrelated foreground commands. Existing workflows must use the watcher to gain
-completion notifications; installing it does not rewrite old sleep loops.
+unrelated foreground commands. Existing adapters must emit the receipt
+envelope, or the agent must explicitly register a watch. It does not rewrite
+arbitrary shell programs or restart observers from an unreturned receipt.
 
 ## Verification
 

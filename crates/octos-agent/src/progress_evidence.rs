@@ -17,6 +17,10 @@ pub struct EvidenceDelta {
     pub current_failures: usize,
     pub stale: usize,
     pub improved: bool,
+    /// A new, hash-bound tool operation finished. This is activity, not a
+    /// content/quality check pass, and only suppresses periodic reminders.
+    pub activity_advanced: bool,
+    pub completed_operations: Vec<String>,
     pub newly_passed: Vec<String>,
     pub resolved: Vec<String>,
     pub open_findings: Vec<String>,
@@ -43,6 +47,8 @@ struct Report {
     schema_version: u32,
     check_id: String,
     status: String,
+    #[serde(default = "default_kind")]
+    kind: String,
     artifacts: Vec<Artifact>,
     #[serde(default)]
     findings: Vec<Finding>,
@@ -51,6 +57,8 @@ struct Report {
 struct Artifact {
     path: String,
     sha256: String,
+    #[serde(default = "default_role")]
+    role: String,
 }
 #[derive(Deserialize)]
 struct Finding {
@@ -60,13 +68,23 @@ struct Finding {
 #[derive(Clone)]
 struct CheckState {
     status: String,
+    kind: String,
+    artifact_fingerprint: String,
     findings: BTreeMap<String, String>,
+}
+
+fn default_kind() -> String {
+    "check".into()
+}
+fn default_role() -> String {
+    "input".into()
 }
 
 pub struct ProgressEvidence {
     root: ConfinedRoot,
     previous: BTreeMap<String, CheckState>,
     cache: HashMap<PathBuf, (String, String)>,
+    had_index: bool,
 }
 
 fn valid_id(id: &str) -> bool {
@@ -109,6 +127,7 @@ impl ProgressEvidence {
             root: ConfinedRoot::new(root)?,
             previous: BTreeMap::new(),
             cache: HashMap::new(),
+            had_index: false,
         })
     }
 
@@ -165,6 +184,7 @@ impl ProgressEvidence {
         if report.schema_version != 1
             || report.check_id != check.id
             || !matches!(report.status.as_str(), "pass" | "fail" | "unknown")
+            || !matches!(report.kind.as_str(), "check" | "operation")
             || report.artifacts.is_empty()
             || report.artifacts.len() > 16
             || report.findings.len() > 128
@@ -172,13 +192,21 @@ impl ProgressEvidence {
             return Err(io::Error::other("invalid check report"));
         }
         let mut paths = BTreeSet::new();
+        let mut bindings = BTreeSet::new();
         for artifact in report.artifacts {
-            if !valid_hash(&artifact.sha256)
+            if !matches!(artifact.role.as_str(), "input" | "output")
+                || !valid_hash(&artifact.sha256)
                 || !paths.insert(artifact.path.clone())
                 || self.artifact_hash(Path::new(&artifact.path), budget)? != artifact.sha256
             {
                 return Err(io::Error::other("stale artifact binding"));
             }
+            if artifact.role == "input" {
+                bindings.insert((artifact.path, artifact.sha256));
+            }
+        }
+        if bindings.is_empty() {
+            return Err(io::Error::other("report requires an input binding"));
         }
         let mut findings = BTreeMap::new();
         for finding in report.findings {
@@ -194,8 +222,50 @@ impl ProgressEvidence {
         }
         Ok(CheckState {
             status: report.status,
+            kind: report.kind,
+            artifact_fingerprint: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&bindings).map_err(io::Error::other)?)
+            ),
             findings,
         })
+    }
+
+    /// Adapters publish reports at the tool boundary; no model-authored index
+    /// is needed. Every discovered report still passes the same confined
+    /// identity, size, artifact hash and freshness validation as an index ref.
+    fn automatic_checks(&self) -> io::Result<Vec<CheckRef>> {
+        for relative in [".octos", ".octos/tool-progress"] {
+            let meta = match self.root.path.join(relative).symlink_metadata() {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+                Err(e) => return Err(e),
+            };
+            if !meta.is_dir() || meta.is_symlink() {
+                return Err(io::Error::other(
+                    "automatic report directory must not be a symlink",
+                ));
+            }
+        }
+        let mut checks = Vec::new();
+        for entry in std::fs::read_dir(self.root.path.join(".octos/tool-progress"))?.take(65) {
+            let entry = entry?;
+            if checks.len() >= 64 {
+                return Err(io::Error::other("automatic report bound exceeded"));
+            }
+            let relative = Path::new(".octos/tool-progress").join(entry.file_name());
+            if relative.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = self.root.read(&relative, MAX_REPORT)?;
+            let report: Report = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            checks.push(CheckRef {
+                id: report.check_id,
+                report: relative.to_string_lossy().into_owned(),
+                sha256: format!("{:x}", Sha256::digest(bytes)),
+            });
+        }
+        Ok(checks)
     }
 
     pub fn refresh(&mut self) -> EvidenceDelta {
@@ -207,10 +277,8 @@ impl ProgressEvidence {
             .root
             .read(Path::new(".octos/progress.json"), MAX_REPORT)
         {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound && self.previous.is_empty() => {
-                return delta;
-            }
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(_) => {
                 delta.stale = 1;
                 delta
@@ -219,13 +287,29 @@ impl ProgressEvidence {
                 return delta;
             }
         };
-        delta.available = true;
-        let index: Index = match serde_json::from_slice(&bytes) {
-            Ok(index) => index,
-            Err(_) => {
-                delta.stale = 1;
-                delta.invalid_checks.push("invalid-index".into());
-                return delta;
+        let mut index: Index = match bytes {
+            Some(bytes) => {
+                self.had_index = true;
+                match serde_json::from_slice(&bytes) {
+                    Ok(index) => index,
+                    Err(_) => {
+                        delta.stale = 1;
+                        delta.invalid_checks.push("invalid-index".into());
+                        return delta;
+                    }
+                }
+            }
+            None => {
+                if self.had_index {
+                    delta.stale += 1;
+                    delta
+                        .invalid_checks
+                        .push("missing-or-unreadable-index".into());
+                }
+                Index {
+                    schema_version: 1,
+                    checks: vec![],
+                }
             }
         };
         if index.schema_version != 1 || index.checks.len() > 64 {
@@ -233,6 +317,16 @@ impl ProgressEvidence {
             delta.invalid_checks.push("invalid-index".into());
             return delta;
         }
+        match self.automatic_checks() {
+            Ok(checks) => index.checks.extend(checks),
+            Err(_) => {
+                delta.stale += 1;
+                delta
+                    .invalid_checks
+                    .push("invalid-automatic-reports".into());
+            }
+        }
+        delta.available = !index.checks.is_empty();
         let mut budget = MAX_HASH_BUDGET;
         let mut seen = BTreeSet::new();
         let mut current = BTreeSet::new();
@@ -256,9 +350,18 @@ impl ProgressEvidence {
                         }
                     }
                     if state.status == "pass" && !state.findings.values().any(|v| v == "open") {
-                        delta.current_passes += 1;
-                        if previous.is_none_or(|p| p.status != "pass") {
-                            delta.newly_passed.push(check.id.clone());
+                        if state.kind == "operation" {
+                            if previous.is_none_or(|p| {
+                                p.status != "pass"
+                                    || p.artifact_fingerprint != state.artifact_fingerprint
+                            }) {
+                                delta.completed_operations.push(check.id.clone());
+                            }
+                        } else {
+                            delta.current_passes += 1;
+                            if previous.is_none_or(|p| p.status != "pass") {
+                                delta.newly_passed.push(check.id.clone());
+                            }
                         }
                     } else if state.status == "fail" || state.findings.values().any(|v| v == "open")
                     {
@@ -271,9 +374,10 @@ impl ProgressEvidence {
                         let key = format!("{}:{id}", check.id);
                         if status == "open" {
                             delta.open_findings.push(key);
-                        } else if previous
-                            .and_then(|p| p.findings.get(id))
-                            .is_some_and(|s| s == "open")
+                        } else if state.kind == "check"
+                            && previous
+                                .and_then(|p| p.findings.get(id))
+                                .is_some_and(|s| s == "open")
                         {
                             delta.resolved.push(key);
                         }
@@ -307,6 +411,10 @@ impl ProgressEvidence {
         delta.improved = delta.stale == 0
             && delta.removed_checks.is_empty()
             && (!delta.newly_passed.is_empty() || !delta.resolved.is_empty());
+        delta.activity_advanced = delta.stale == 0
+            && delta.removed_checks.is_empty()
+            && delta.current_failures == 0
+            && !delta.completed_operations.is_empty();
         delta
     }
 }
@@ -316,6 +424,59 @@ mod tests {
     use super::*;
     use serde_json::json;
     use sha2::{Digest, Sha256};
+    #[test]
+    fn should_discover_adapter_report_without_model_index_and_not_call_it_quality() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".octos/tool-progress")).unwrap();
+        std::fs::write(dir.path().join("source.txt"), "v1").unwrap();
+        std::fs::write(dir.path().join("receipt.json"), "first").unwrap();
+        let report = dir.path().join(".octos/tool-progress/render.json");
+        let publish =
+            |input: &str, output: &str| {
+                std::fs::write(&report,serde_json::to_vec(&json!({
+                "schema_version":1,"check_id":"tool-operation/render","kind":"operation",
+                "status":"pass","artifacts":[
+                    {"path":"source.txt","sha256":hash(input.as_bytes()),"role":"input"},
+                    {"path":"receipt.json","sha256":hash(output.as_bytes()),"role":"output"}],
+                "findings":[]
+            })).unwrap()).unwrap();
+            };
+        publish("v1", "first");
+        let mut evidence = ProgressEvidence::new(dir.path()).unwrap();
+        let first = evidence.refresh();
+        assert!(first.activity_advanced);
+        assert!(!first.improved);
+        assert_eq!(first.current_passes, 0);
+        assert!(!evidence.refresh().activity_advanced);
+        // Timestamp/id/output-only churn must not count as more progress.
+        std::fs::write(dir.path().join("receipt.json"), "second").unwrap();
+        publish("v1", "second");
+        assert!(!evidence.refresh().activity_advanced);
+        std::fs::write(dir.path().join("source.txt"), "v2").unwrap();
+        assert!(
+            !evidence.refresh().activity_advanced,
+            "stale render is not progress"
+        );
+        publish("v2", "second");
+        assert!(evidence.refresh().activity_advanced);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn should_reject_symlinked_automatic_report_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".octos")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".octos/tool-progress"))
+            .unwrap();
+        let state = ProgressEvidence::new(dir.path()).unwrap().refresh();
+        assert!(!state.activity_advanced);
+        assert!(
+            state
+                .invalid_checks
+                .contains(&"invalid-automatic-reports".to_string())
+        );
+    }
     fn hash(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
     }

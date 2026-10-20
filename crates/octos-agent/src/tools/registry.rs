@@ -241,6 +241,7 @@ pub struct ToolRegistry {
     supervisor: Arc<TaskSupervisor>,
     /// Set to true when any spawn_only tool is actually invoked in this agent run.
     spawn_only_invoked: Arc<std::sync::atomic::AtomicBool>,
+    automatic_job_claims: std::sync::Mutex<HashSet<String>>,
     /// #1148 codex P2: shared live catalog cell used by `tool_search` /
     /// `tool_suggest`. Updated on every mutation (`register`,
     /// `register_arc`, `apply_policy`, `mark_spawn_only`, etc.) so
@@ -328,6 +329,7 @@ impl ToolRegistry {
             background_result_sender: None,
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            automatic_job_claims: std::sync::Mutex::new(HashSet::new()),
             live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: None,
@@ -614,6 +616,24 @@ impl ToolRegistry {
     /// Reset the spawn_only_invoked flag (call at start of each agent run).
     pub fn reset_spawn_only_invoked(&self) {
         self.spawn_only_invoked.store(false, Ordering::SeqCst);
+    }
+
+    /// Registry/session-local deduplication, bounded and independent of model
+    /// calls. Rebinding/snapshotting a workspace starts with fresh claims.
+    pub(crate) fn claim_automatic_job(&self, key: &str) -> bool {
+        let Ok(mut claims) = self.automatic_job_claims.lock() else {
+            return false;
+        };
+        if claims.len() >= 512 {
+            return false;
+        }
+        claims.insert(key.to_string())
+    }
+
+    pub(crate) fn release_automatic_job(&self, key: &str) {
+        if let Ok(mut claims) = self.automatic_job_claims.lock() {
+            claims.remove(key);
+        }
     }
 
     /// Check if a tool came from a plugin binary.
@@ -1192,6 +1212,7 @@ impl ToolRegistry {
             // wiring installed on the parent.
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            automatic_job_claims: std::sync::Mutex::new(HashSet::new()),
             live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: self.output_dir_hint.clone(),

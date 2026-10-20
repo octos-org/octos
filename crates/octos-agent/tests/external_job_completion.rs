@@ -13,6 +13,163 @@ use octos_memory::EpisodeStore;
 use serde_json::json;
 use tempfile::TempDir;
 
+struct SubmitReceipt;
+
+#[async_trait]
+impl octos_agent::tools::Tool for SubmitReceipt {
+    fn name(&self) -> &str {
+        "submit_fixture"
+    }
+    fn description(&self) -> &str {
+        "Returns an independently submitted external job receipt."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        json!({"type":"object"})
+    }
+    async fn execute(&self, _: &serde_json::Value) -> eyre::Result<octos_agent::tools::ToolResult> {
+        Ok(octos_agent::tools::ToolResult {
+            success: true,
+            output: "Job submitted.".into(),
+            structured_metadata: Some(json!({"octos_external_job":{
+                "schema_version":1, "receipt_path":"job.json", "job_id":"render-1",
+                "request_sha256":"request-1", "status":"running"
+            }})),
+            ..Default::default()
+        })
+    }
+}
+
+struct SubmitTwice(std::sync::atomic::AtomicUsize, bool);
+#[async_trait]
+impl LlmProvider for SubmitTwice {
+    async fn chat(
+        &self,
+        _: &[Message],
+        _: &[ToolSpec],
+        _: &ChatConfig,
+    ) -> eyre::Result<ChatResponse> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ChatResponse {
+            content: (n >= 2).then(|| "Continue independent work.".into()),
+            reasoning_content: None,
+            tool_calls: if n < 2 {
+                vec![ToolCall {
+                    id: format!("submit-{n}"),
+                    name: if self.1 { "shell" } else { "submit_fixture" }.into(),
+                    arguments: if self.1 {
+                        json!({"command":r#"printf '%s\n' '{"octos_external_job":{"schema_version":1,"receipt_path":"job.json","job_id":"render-1","request_sha256":"request-1","status":"running"}}'"#})
+                    } else {
+                        json!({"attempt":n})
+                    },
+                    metadata: None,
+                }]
+            } else {
+                vec![]
+            },
+            stop_reason: if n < 2 {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            },
+            usage: Default::default(),
+            provider_index: None,
+        })
+    }
+    fn context_window(&self) -> u32 {
+        128_000
+    }
+    fn model_id(&self) -> &str {
+        "auto-job-test"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn tool_receipt_automatically_registers_one_watch_without_model_cooperation() {
+    run_automatic_receipt(false, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_shell_receipt_automatically_registers_one_watch() {
+    run_automatic_receipt(true, false).await;
+}
+
+#[tokio::test]
+async fn automatic_watch_respects_provider_denial() {
+    run_automatic_receipt(false, true).await;
+}
+
+async fn run_automatic_receipt(shell: bool, denied: bool) {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("job.json"),
+        json!({
+            "id":"render-1","request_sha256":"request-1","status":"running"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut registry = ToolRegistry::with_builtins(dir.path());
+    registry.register(SubmitReceipt);
+    if denied {
+        registry.set_provider_policy(octos_agent::tools::policy::ToolPolicy {
+            deny: vec!["watch_external_job".into()],
+            ..Default::default()
+        });
+    }
+    registry.set_session_key("auto-owner".into());
+    let supervisor = registry.supervisor();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    registry.set_background_result_sender(Arc::new(move |payload| {
+        let tx = tx.clone();
+        Box::pin(async move { tx.send(payload).is_ok() })
+    }));
+    let provider = Arc::new(SubmitTwice(0.into(), shell));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("auto-job"), provider.clone(), registry, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            suppress_auto_send_files: true,
+            ..Default::default()
+        });
+    let result = agent
+        .process_message("Submit work.", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+    if denied {
+        assert!(supervisor.get_tasks_for_session("auto-owner").is_empty());
+        assert!(rx.try_recv().is_err());
+        return;
+    }
+    assert_eq!(supervisor.get_tasks_for_session("auto-owner").len(), 1);
+    assert!(
+        result
+            .messages
+            .iter()
+            .filter(|m| m.role == octos_core::MessageRole::Tool)
+            .any(|m| m.content.contains("automatically"))
+    );
+    std::fs::write(
+        dir.path().join("next.json"),
+        json!({
+            "id":"render-1","request_sha256":"request-1","status":"completed"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::rename(dir.path().join("next.json"), dir.path().join("job.json")).unwrap();
+    let payload = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(payload.terminal_status, Some(TaskStatus::Completed));
+    assert!(rx.try_recv().is_err());
+}
+
 struct WatchThenFinish(std::sync::atomic::AtomicBool);
 
 #[async_trait]

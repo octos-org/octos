@@ -204,7 +204,7 @@ impl LoopDetector {
         let escalation_note = if signal.escalation {
             " This is a repeated threshold breach; inspect the unresolved evidence and choose a different root-cause test before another patch."
         } else {
-            " The harness will run a tools-disabled synthesis checkpoint before more edits."
+            " The harness will attach current evidence to the next ordinary action."
         };
         self.pending_file_churn = Some(signal);
         Some(format!(

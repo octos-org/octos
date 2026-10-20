@@ -1483,9 +1483,18 @@ impl Agent {
                         // A periodic reminder need not consume another model
                         // request when current checks demonstrate new progress.
                         // Churn/polling triggers always receive focused diagnosis.
-                        if evidence.improved && !matches!(reason, CheckpointReason::FileChurn { .. } | CheckpointReason::PeerPolling { .. }) {
+                        if matches!(reason, CheckpointReason::FileChurn { .. }) {
+                            if let Some(notice) = convergence.diagnostic_notice(&reason, &measured, &total_usage) {
+                                messages.push(Message::user(notice));
+                                tracing::info!("repeated-work diagnostic attached to ordinary action; no reflection request");
+                            } else {
+                                tracing::debug!("repeated-work diagnostic coalesced");
+                            }
+                        } else if !matches!(reason, CheckpointReason::PeerPolling { .. })
+                            && (evidence.improved || evidence.activity_advanced) {
                             convergence.rearm(&total_usage);
-                            tracing::info!("periodic reflection skipped after fresh check improvement");
+                            tracing::info!(verified_improvement = evidence.improved,
+                                "periodic reflection skipped after fresh check improvement or completed operation");
                         } else {
                         self.reporter().report(ProgressEvent::AgentProgress {
                             iteration,
@@ -2221,7 +2230,7 @@ impl Agent {
                             if let Some(churn) = loop_detector.take_file_churn_signal() {
                                 self.reporter().report(ProgressEvent::LlmStatus {
                                     message: format!(
-                                        "File churn: {} edits to {}{}; synthesizing before continuing",
+                                        "File churn: {} edits to {}{}; evidence attached to next action",
                                         churn.edits,
                                         churn.path,
                                         if churn.escalation {

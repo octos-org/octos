@@ -2712,7 +2712,7 @@ impl Agent {
         let mut success_by_id: Vec<(String, bool)> = Vec::with_capacity(results.len());
 
         for (
-            message,
+            mut message,
             tool_files_modified,
             tool_files_to_send,
             tool_tokens,
@@ -2721,6 +2721,53 @@ impl Agent {
             _cascades,
         ) in results
         {
+            let original = response
+                .tool_calls
+                .iter()
+                .find(|call| message.tool_call_id.as_deref() == Some(call.id.as_str()));
+            if let Some(call) = original
+                && call.name != "watch_external_job"
+                && self.tools.is_spawn_only("watch_external_job")
+                && let Some(job) = crate::automatic_jobs::receipt(
+                    &call.name,
+                    &message.content,
+                    tool_structured_metadata.as_ref().map(|(_, value)| value),
+                )
+            {
+                let key = job.key();
+                if self.tools.claim_automatic_job(&key) {
+                    let watch = octos_core::ToolCall {
+                        id: format!("{}-auto-watch", call.id),
+                        name: "watch_external_job".into(),
+                        arguments: job.arguments(),
+                        metadata: None,
+                    };
+                    // Reuse the existing dispatcher, including hooks, host /
+                    // provider policy, typed permissions, session ownership,
+                    // cancellation and terminal notification routing.
+                    match self
+                        .spawn_tool_task(&watch, true, &turn_attachment_ctx)
+                        .await
+                    {
+                        Ok((handle, _, _, _, true, _, _)) => {
+                            tracing::info!(origin_tool=%call.name, "external job watch registered automatically");
+                            message.content.push_str("\n[Runtime] External job watch registered automatically. Continue independent work; completion arrives as a notification. ");
+                            message.content.push_str(&handle.content);
+                        }
+                        Ok((refused, _, _, _, _, _, _)) => {
+                            self.tools.release_automatic_job(&key);
+                            message
+                                .content
+                                .push_str("\n[Runtime] Automatic job observation unavailable: ");
+                            message.content.push_str(&refused.content);
+                        }
+                        Err(error) => {
+                            self.tools.release_automatic_job(&key);
+                            tracing::warn!(%error,"automatic job watcher registration failed");
+                        }
+                    }
+                }
+            }
             // Pair every executed tool result with its `tool_call_id` so
             // downstream gating logic does not need to guess at the
             // identity from content shape.
