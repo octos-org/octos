@@ -67,7 +67,10 @@ impl ConfinedRoot {
             }
             std::fs::File::from(openat(
                 &parent,
-                parts.last().unwrap().as_os_str(),
+                parts
+                    .last()
+                    .ok_or_else(|| io::Error::other("empty relative path"))?
+                    .as_os_str(),
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
             )?)
