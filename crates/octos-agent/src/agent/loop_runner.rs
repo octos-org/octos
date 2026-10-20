@@ -1259,7 +1259,15 @@ impl Agent {
                                 );
                             }
                         }
-                        HookResult::Allow | HookResult::Error(_) | HookResult::Modified(_) => {}
+                        // #2329: a tripped user_prompt_submit guard surfaces
+                        // as GuardUnavailable. Turn-level gates deliberately
+                        // stay surfaced-continue (a flaky prompt hook must
+                        // not brick every turn); the trip is logged by the
+                        // executor and recoverable via re_arm.
+                        HookResult::Allow
+                        | HookResult::Error(_)
+                        | HookResult::GuardUnavailable(_)
+                        | HookResult::Modified(_) => {}
                     }
                 }
 

@@ -2,7 +2,10 @@
 //!
 //! Supports tool, LLM, session, and background-task lifecycle events.
 //! Before-hooks can deny operations (exit code 1). Circuit breaker auto-disables
-//! hooks after consecutive failures.
+//! hooks after consecutive failures. #2329: on guard-class (before-)events a
+//! breaker-disabled hook surfaces `HookResult::GuardUnavailable` instead of
+//! silently allowing — tool-call and spawn-verify gates fail closed, and
+//! recovery is explicit via [`HookExecutor::re_arm`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -714,6 +717,14 @@ pub enum HookResult {
     Context(Vec<String>),
     /// A hook encountered an error (does not block).
     Error(String),
+    /// A guard-class (before-event) hook was disabled by the circuit breaker
+    /// after repeated infrastructure failures (#2329). The availability
+    /// breaker must never silently strip a deny gate, so guard events surface
+    /// this outcome instead of [`Self::Allow`]. Callers decide the policy:
+    /// tool-call gates must fail closed (block the call with this reason);
+    /// turn-level events may keep their existing surfaced-continue behavior.
+    /// Recovery is explicit via [`HookExecutor::re_arm`] (or a fresh session).
+    GuardUnavailable(String),
     /// One or more AFTER-hooks exited 1 WITH output — the feedback channel
     /// working as designed (a checker reporting diagnostics), distinct from
     /// [`Self::Error`] infrastructure failures (missing binary, timeout,
@@ -867,6 +878,25 @@ impl HookExecutor {
         }
     }
 
+    /// Explicitly reset circuit-breaker failure counters — the recovery path
+    /// for a tripped guard (#2329): since #2329 a guard-class event surfaces
+    /// `HookResult::GuardUnavailable` (fail closed) instead of silently
+    /// running without its deny gate, so recovery must be deliberate. Pass
+    /// `Some(key)` to re-arm one session (the key is the same session scope
+    /// the breaker uses: session id, else cwd, else `""`) or `None` to
+    /// re-arm every session sharing this executor. Debounce windows are left
+    /// untouched — re-arming a security breaker must not also lift the
+    /// advisory run-rate limiter.
+    pub fn re_arm(&self, session_key: Option<&str>) {
+        let mut map = self.session_state.lock().unwrap();
+        match session_key {
+            Some(key) => {
+                map.remove(key);
+            }
+            None => map.clear(),
+        }
+    }
+
     /// Debounce gate for an after-event hook: true if it last COMPLETED within
     /// the window for this session (→ skip). The window is measured from the
     /// previous run's completion, not its start, because the check itself
@@ -972,6 +1002,20 @@ impl HookExecutor {
         let mut injected_contexts: Vec<String> = Vec::new();
         let mut feedback: Vec<String> = Vec::new();
 
+        // #2329: guard-class events can DENY, so a breaker-disabled hook on
+        // one of them is a silently stripped security control. Track the
+        // first tripped guard hook and surface `GuardUnavailable` at the end
+        // (feedback/last_error still win — a fresh failure is more actionable
+        // than a repeat of the trip).
+        let is_guard_event = matches!(
+            event,
+            HookEvent::UserPromptSubmit
+                | HookEvent::BeforeToolCall
+                | HookEvent::BeforeLlmCall
+                | HookEvent::BeforeSpawnVerify
+        );
+        let mut guard_disabled: Option<String> = None;
+
         // #2153: breaker + debounce state is scoped to this session key so a
         // flaky hook (or a rapid edit burst) in one session never disables or
         // throttles the hook for another session sharing this Arc executor.
@@ -1038,6 +1082,19 @@ impl HookExecutor {
                         "hook disabled after {} consecutive failures",
                         self.failure_threshold
                     );
+                }
+                // #2329: for guard-class (before-)events the disabled hook is
+                // a stripped deny gate, not a saved retry — surface it as
+                // GuardUnavailable so callers can fail closed. After-events
+                // keep the silent skip (availability for advisory checkers).
+                if is_guard_event && guard_disabled.is_none() {
+                    guard_disabled = Some(format!(
+                        "guard hook {:?} was disabled after {} consecutive \
+                         infrastructure failures; fail closed until the hook is \
+                         fixed and the breaker is re-armed (`HookExecutor::re_arm`) \
+                         or the session restarts",
+                        hook.command, self.failure_threshold
+                    ));
                 }
                 continue;
             }
@@ -1178,6 +1235,10 @@ impl HookExecutor {
             HookResult::Feedback(feedback)
         } else if let Some(err) = last_error {
             HookResult::Error(err)
+        } else if let Some(reason) = guard_disabled {
+            // #2329: no fresh failure this call — the outcome IS the tripped
+            // guard. Never silently degrade to Allow on a guard event.
+            HookResult::GuardUnavailable(reason)
         } else if !injected_contexts.is_empty() {
             HookResult::Context(injected_contexts)
         } else {
@@ -2559,7 +2620,9 @@ mod tests {
     #[cfg(unix)]
     async fn should_apply_circuit_breaker_to_user_prompt_submit_hook() {
         // Generic error exit (code 3) counts as a failure; after the threshold
-        // the hook is disabled and the executor returns Allow (fail-open).
+        // the hook is disabled. #2329: user_prompt_submit is a guard-class
+        // (before-)event, so the disabled gate surfaces as GuardUnavailable
+        // (fail-closed signal) instead of a silent Allow.
         let executor = HookExecutor::with_threshold(
             vec![user_prompt_hook(vec!["sh", "-c", "exit 3"], 1000)],
             3,
@@ -2569,7 +2632,107 @@ mod tests {
             executor.run(HookEvent::UserPromptSubmit, &payload).await;
         }
         let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
+        match result {
+            HookResult::GuardUnavailable(msg) => {
+                assert!(
+                    msg.contains("disabled after 3 consecutive infrastructure failures"),
+                    "message should name the breaker trip: {msg}"
+                );
+            }
+            other => panic!("expected GuardUnavailable, got {other:?}"),
+        }
+    }
+
+    fn before_tool_hook(command: Vec<&str>, timeout_ms: u64) -> HookConfig {
+        HookConfig {
+            event: HookEvent::BeforeToolCall,
+            command: command.into_iter().map(String::from).collect(),
+            timeout_ms,
+            tool_filter: vec![],
+            path_filter: vec![],
+            requires_bin: None,
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_fail_closed_with_guard_unavailable_when_before_tool_call_hook_trips_breaker() {
+        // #2329: the availability breaker must not silently strip a deny
+        // gate. Three infra failures trip the breaker; the next call returns
+        // GuardUnavailable (callers block the tool call fail-closed) instead
+        // of Allow.
+        let executor = HookExecutor::with_threshold(
+            vec![before_tool_hook(vec!["sh", "-c", "exit 3"], 1000)],
+            3,
+        );
+        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None);
+        for _ in 0..3 {
+            let r = executor.run(HookEvent::BeforeToolCall, &payload).await;
+            assert!(
+                matches!(r, HookResult::Error(_)),
+                "expected Error while counting failures, got {r:?}"
+            );
+        }
+        let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
+        match result {
+            HookResult::GuardUnavailable(msg) => {
+                assert!(
+                    msg.contains("disabled after 3 consecutive infrastructure failures"),
+                    "message should name the trip and recovery: {msg}"
+                );
+            }
+            other => panic!("expected GuardUnavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_keep_after_tool_call_breaker_fail_open() {
+        // #2329 scoping: after-events are advisory checkers, not deny gates.
+        // Their breaker keeps today's availability behavior — a tripped hook
+        // is skipped silently and the event still comes back Allow (an
+        // after-hook with empty output + nonzero exit is the infra-failure
+        // shape that counts toward the breaker, #2129 review finding 1).
+        let executor = HookExecutor::with_threshold(
+            vec![HookConfig {
+                event: HookEvent::AfterToolCall,
+                command: vec!["sh".into(), "-c".into(), "exit 3".into()],
+                timeout_ms: 1000,
+                tool_filter: vec![],
+                path_filter: vec![],
+                requires_bin: None,
+            }],
+            2,
+        );
+        let payload =
+            HookPayload::after_tool("shell", "tc1", String::new(), true, 5, None, None, None);
+        for _ in 0..2 {
+            executor.run(HookEvent::AfterToolCall, &payload).await;
+        }
+        let result = executor.run(HookEvent::AfterToolCall, &payload).await;
         assert_eq!(result, HookResult::Allow);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_re_arm_tripped_guard_breaker_explicitly() {
+        // #2329: recovery from a tripped guard breaker is explicit. re_arm
+        // clears the failure counters, so the hook runs (and errors) again
+        // instead of staying disabled.
+        let executor = HookExecutor::with_threshold(
+            vec![before_tool_hook(vec!["sh", "-c", "exit 3"], 1000)],
+            3,
+        );
+        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None);
+        for _ in 0..4 {
+            executor.run(HookEvent::BeforeToolCall, &payload).await;
+        }
+        executor.re_arm(None);
+        let r = executor.run(HookEvent::BeforeToolCall, &payload).await;
+        assert!(
+            matches!(r, HookResult::Error(_)),
+            "after re_arm the hook runs again, got {r:?}"
+        );
     }
 
     #[tokio::test]
