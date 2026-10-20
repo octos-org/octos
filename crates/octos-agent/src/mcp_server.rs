@@ -45,7 +45,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
+    CallToolRequestParams, CallToolResult, ContentBlock, Implementation, ListToolsResult,
     PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
@@ -487,7 +487,7 @@ fn value_to_call_tool_result(value: Value) -> CallToolResult {
         .get("isError")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let content = vec![Content::text(text)];
+    let content = vec![ContentBlock::text(text)];
     if is_error {
         CallToolResult::error(content)
     } else {
