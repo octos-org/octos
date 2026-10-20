@@ -7,6 +7,10 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
+
+use crate::progress_evidence::{EvidenceDelta, ProgressEvidence};
+use crate::workspace_progress::WorkspaceProgress;
 
 /// Soft "no-progress" hint appended to a tool result when the same
 /// (name, args, result) triple has been seen 3 times in a row. The
@@ -58,8 +62,8 @@ pub const DOOM_LOOP_THRESHOLD: usize = 3;
 pub struct FileChurnSignal {
     pub path: String,
     pub edits: usize,
-    /// The second threshold asks the provider/router to move away from the
-    /// current model where a stronger/healthier alternative is available.
+    /// The second threshold requests a different diagnostic approach. It does
+    /// not authorize changing the user's selected model/provider.
     pub escalation: bool,
 }
 
@@ -80,7 +84,7 @@ pub struct LoopDetector {
     doom_last_signature: Option<u64>,
     /// #1765: length of the current consecutive-identical-call streak.
     doom_streak: usize,
-    /// Successful mutating calls per logical file path. This catches CSS/edit
+    /// Observed revisions (or explicit-tool fallback calls) per logical file path. This catches CSS/edit
     /// spirals whose replacement text changes on every call and therefore
     /// evades exact argument hashing.
     file_mutations: HashMap<String, usize>,
@@ -89,6 +93,9 @@ pub struct LoopDetector {
     /// An unchanged asynchronous peer snapshot requests reflection, not a
     /// fabricated final or an abort before its next read can observe progress.
     pending_peer_polling: Option<String>,
+    workspace: Option<WorkspaceProgress>,
+    workspace_attempted: bool,
+    evidence: Option<ProgressEvidence>,
 }
 
 impl LoopDetector {
@@ -108,12 +115,64 @@ impl LoopDetector {
                 .unwrap_or(5),
             pending_file_churn: None,
             pending_peer_polling: None,
+            workspace: None,
+            workspace_attempted: false,
+            evidence: None,
         }
+    }
+
+    /// Start once, off the async executor. Native notifications then limit
+    /// hashing to changed source-size files; no full-tree scan per tool call.
+    pub async fn observe_workspace(&mut self, root: &Path) {
+        if self.workspace_attempted {
+            return;
+        }
+        self.workspace_attempted = true;
+        self.evidence = ProgressEvidence::new(root).ok();
+        let root = root.to_path_buf();
+        match tokio::task::spawn_blocking(move || WorkspaceProgress::new(&root)).await {
+            Ok(Ok(observer)) => self.workspace = Some(observer),
+            _ => tracing::warn!(
+                "workspace change observation unavailable; explicit-tool fallback only"
+            ),
+        }
+    }
+
+    pub fn refresh_workspace(&mut self) {
+        let changes = self
+            .workspace
+            .as_mut()
+            .map(WorkspaceProgress::drain)
+            .unwrap_or_default();
+        for path in changes {
+            let path = path.to_string_lossy().into_owned();
+            if let Some(hint) = self.record_changed_path(path) {
+                tracing::info!(hint, "workspace file churn observed");
+            }
+        }
+    }
+
+    pub fn evidence_delta(&mut self) -> EvidenceDelta {
+        self.evidence
+            .as_mut()
+            .map(ProgressEvidence::refresh)
+            .unwrap_or_default()
+    }
+
+    pub fn change_summary(&self) -> String {
+        let mut changes: Vec<_> = self.file_mutations.iter().collect();
+        changes.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let changes: Vec<_> = changes.into_iter().take(12).map(|(path, revisions)| {
+            serde_json::json!({"path": octos_core::truncated_utf8(path, 256, "…"), "observed_revisions": revisions})
+        }).collect();
+        serde_json::json!({"changes":changes,
+            "observation":"workspace changes, not attribution to a particular actor; source-size files only",
+            "incomplete": self.workspace.as_ref().is_none_or(WorkspaceProgress::incomplete)}).to_string()
     }
 
     /// Record a successful file-mutating tool call. Returns a model-facing
     /// hint at the first threshold and again at each threshold multiple. The
-    /// second and later firings request provider/model escalation, but never
+    /// second and later firings request root-cause diagnosis, but never
     /// terminate the user turn.
     pub fn record_file_mutation(
         &mut self,
@@ -121,10 +180,16 @@ impl LoopDetector {
         args: &serde_json::Value,
         success: bool,
     ) -> Option<String> {
-        if !success {
+        // With an observer, actual byte changes are the authority, including
+        // writes by failed commands. Do not double-count explicit tool hints.
+        if self.workspace.is_some() || !success {
             return None;
         }
         let path = mutation_path(tool_name, args)?;
+        self.record_changed_path(path)
+    }
+
+    fn record_changed_path(&mut self, path: String) -> Option<String> {
         let edits = self.file_mutations.entry(path.clone()).or_default();
         *edits += 1;
         if *edits < self.file_churn_threshold || *edits % self.file_churn_threshold != 0 {
@@ -137,7 +202,7 @@ impl LoopDetector {
             escalation: *edits >= self.file_churn_threshold.saturating_mul(2),
         };
         let escalation_note = if signal.escalation {
-            " This is a repeated threshold breach; the harness will request a provider/model escalation."
+            " This is a repeated threshold breach; inspect the unresolved evidence and choose a different root-cause test before another patch."
         } else {
             " The harness will run a tools-disabled synthesis checkpoint before more edits."
         };
@@ -149,6 +214,7 @@ impl LoopDetector {
     }
 
     pub fn take_file_churn_signal(&mut self) -> Option<FileChurnSignal> {
+        self.refresh_workspace();
         self.pending_file_churn.take()
     }
 
@@ -410,6 +476,46 @@ mod tests {
                 escalation: false,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn should_count_shell_revisions_without_double_counting_explicit_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("generator.py"), "initial").unwrap();
+        let mut detector = detector_with_churn_threshold(3);
+        detector.observe_workspace(dir.path()).await;
+        for revision in 1..=3 {
+            std::fs::write(
+                dir.path().join("generator.py"),
+                format!("revision {revision}"),
+            )
+            .unwrap();
+            // Native events can arrive after the process returns. Production
+            // drains on tool/model boundaries; the test waits for that event.
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            while detector
+                .file_mutations
+                .get("generator.py")
+                .copied()
+                .unwrap_or(0)
+                < revision
+                && std::time::Instant::now() < end
+            {
+                detector.refresh_workspace();
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+            assert_eq!(detector.file_mutations.get("generator.py"), Some(&revision));
+            assert!(
+                detector
+                    .record_file_mutation("edit_file", &json!({"path":"generator.py"}), true)
+                    .is_none()
+            );
+        }
+        let signal = detector
+            .take_file_churn_signal()
+            .expect("third actual revision triggers diagnosis");
+        assert_eq!(signal.edits, 3);
+        assert_eq!(signal.path, "generator.py");
     }
 
     #[test]

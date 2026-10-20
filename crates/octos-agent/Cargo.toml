@@ -36,6 +36,7 @@ which = { workspace = true }
 dunce = "1"
 regex = { workspace = true }
 ignore = { workspace = true }
+notify = "8.2.0"
 futures = { workspace = true }
 reqwest = { workspace = true }
 # MCP over the official rmcp SDK. Client: stdio + streamable-HTTP + OAuth 2.1.

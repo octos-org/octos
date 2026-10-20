@@ -40,6 +40,7 @@ pub mod plugins;
 pub mod policy;
 pub mod profile;
 pub mod progress;
+pub mod progress_evidence;
 pub mod prompt_context;
 pub mod prompt_guard;
 pub mod prompt_layer;
@@ -68,6 +69,7 @@ pub mod validators;
 pub mod workspace_contract;
 pub mod workspace_git;
 pub mod workspace_policy;
+pub mod workspace_progress;
 /// #48b — stable prefix marking that a turn terminated because the
 /// malformed tool-call self-correction budget was exhausted. The CLI's
 /// terminal-error path `starts_with` this marker to emit the

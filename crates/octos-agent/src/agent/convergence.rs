@@ -208,7 +208,7 @@ impl ConvergenceController {
                 ..
             }
         ) {
-            "\nThis is a repeated churn breach. If you cannot identify a substantially different, root-cause-driven approach, the next action must be to pause and ask the user for direction instead of editing again."
+            "\nThis is repeated revision of the same artifact, not proof of failure. Compare the supplied current/stale checks and unresolved findings. If the same defect remains unverified, choose a distinct diagnostic or a small root-cause experiment before another patch. Do not change model, invent a quality pass, or abandon the task because a counter fired."
         } else {
             ""
         };
@@ -218,7 +218,7 @@ impl ConvergenceController {
              1. the user's actual goal and what is already complete;\n\
              2. concrete evidence gathered and changes made;\n\
              3. failures, uncertainty, or repeated work (especially repeated edits);\n\
-             4. whether the current approach is converging;\n\
+             4. which specific finding was resolved, reopened or remains unverified, with its current artifact/check reference;\n\
              5. the smallest 1–3 next actions, or COMPLETE if the goal is satisfied.\n\
              Be concise and factual. Do not address the user and do not call tools.{}",
             reason.describe(),
@@ -241,17 +241,34 @@ impl ConvergenceController {
         reflection_usage: Option<&TokenUsage>,
         reflection: String,
     ) {
-        self.checkpoints = self.checkpoints.saturating_add(1);
-        self.action_calls_at_checkpoint = self.completed_action_calls;
+        let valid = reflection_usage.is_some() && !reflection.trim().is_empty();
+        self.complete_review(usage, reflection_usage, reflection, valid);
+    }
+
+    pub(super) fn complete_review(
+        &mut self,
+        usage: &TokenUsage,
+        reflection_usage: Option<&TokenUsage>,
+        reflection: String,
+        valid: bool,
+    ) {
+        if valid {
+            self.checkpoints = self.checkpoints.saturating_add(1);
+        }
         if let Some(reflection_usage) = reflection_usage {
             self.reflection_active_tokens = self
                 .reflection_active_tokens
                 .saturating_add(active_tokens(reflection_usage));
         }
-        self.active_tokens_at_checkpoint = self.action_active_tokens(usage);
-        self.last_checkpoint_at = Instant::now();
+        self.rearm(usage);
         let reflection = reflection.trim();
         self.pending_reflection = (!reflection.is_empty()).then(|| reflection.to_string());
+    }
+
+    pub(super) fn rearm(&mut self, usage: &TokenUsage) {
+        self.action_calls_at_checkpoint = self.completed_action_calls;
+        self.active_tokens_at_checkpoint = self.action_active_tokens(usage);
+        self.last_checkpoint_at = Instant::now();
     }
 
     /// Turn-cumulative active tokens minus what the reflection calls consumed.
@@ -554,5 +571,36 @@ mod tests {
     fn elapsed_format_is_compact_for_ui_status() {
         assert_eq!(format_elapsed(Duration::from_secs(9)), "9s");
         assert_eq!(format_elapsed(Duration::from_secs(125)), "2m05s");
+    }
+    #[test]
+    fn should_not_count_incomplete_reflection_as_completed_review() {
+        let mut controller = new_controller(3, 10000);
+        let usage = TokenUsage::default();
+        record_action_calls(&mut controller, 3);
+        controller.complete_review(
+            &usage,
+            Some(&usage),
+            "Incomplete; inspect evidence".into(),
+            false,
+        );
+        assert_eq!(controller.checkpoints(), 0);
+        assert!(controller.due(&usage).is_none());
+        assert!(
+            controller
+                .take_context_message()
+                .unwrap()
+                .contains("Incomplete")
+        );
+    }
+
+    #[test]
+    fn should_rearm_verified_progress_without_counting_a_model_review() {
+        let mut controller = new_controller(3, 10000);
+        let usage = TokenUsage::default();
+        record_action_calls(&mut controller, 3);
+        controller.rearm(&usage);
+        assert_eq!(controller.checkpoints(), 0);
+        assert!(controller.due(&usage).is_none());
+        assert!(controller.take_context_message().is_none());
     }
 }
