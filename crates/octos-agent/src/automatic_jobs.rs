@@ -1,12 +1,12 @@
 //! Explicit adapter metadata, never prose/path guessing, opts an already
 //! submitted job into the ordinary permission-checked background watcher.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Component, Path};
 
 const MAX_ENVELOPE: usize = 256 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct JobReceipt {
     schema_version: u32,
@@ -17,6 +17,9 @@ pub(crate) struct JobReceipt {
 }
 
 impl JobReceipt {
+    pub fn metadata(&self) -> Value {
+        json!({"octos_external_job": self})
+    }
     pub fn arguments(&self) -> Value {
         json!({"receipt_path":self.receipt_path,"job_id":self.job_id,
                "request_sha256":self.request_sha256,"timeout_secs":1800})

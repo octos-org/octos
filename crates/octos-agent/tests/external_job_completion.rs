@@ -13,6 +13,8 @@ use octos_memory::EpisodeStore;
 use serde_json::json;
 use tempfile::TempDir;
 
+const REQUEST_HASH: &str = "f4cc1eb28f9c95a491d8183c4eaea7cc07d43e9a65f26c9a4b63b76fb7ea296f";
+
 struct SubmitReceipt;
 
 #[async_trait]
@@ -32,7 +34,7 @@ impl octos_agent::tools::Tool for SubmitReceipt {
             output: "Job submitted.".into(),
             structured_metadata: Some(json!({"octos_external_job":{
                 "schema_version":1, "receipt_path":"job.json", "job_id":"render-1",
-                "request_sha256":"request-1", "status":"running"
+                "request_sha256":REQUEST_HASH, "status":"running"
             }})),
             ..Default::default()
         })
@@ -57,7 +59,11 @@ impl LlmProvider for SubmitTwice {
                     id: format!("submit-{n}"),
                     name: if self.1 { "shell" } else { "submit_fixture" }.into(),
                     arguments: if self.1 {
-                        json!({"command":r#"printf '%s\n' '{"octos_external_job":{"schema_version":1,"receipt_path":"job.json","job_id":"render-1","request_sha256":"request-1","status":"running"}}'"#})
+                        json!({"command":format!(
+                            "printf '%s\\n' '{}'",
+                            json!({"octos_external_job":{"schema_version":1,"receipt_path":"job.json",
+                                "job_id":"render-1","request_sha256":REQUEST_HASH,"status":"running"}})
+                        )})
                     } else {
                         json!({"attempt":n})
                     },
@@ -107,7 +113,7 @@ async fn run_automatic_receipt(shell: bool, denied: bool) {
     std::fs::write(
         dir.path().join("job.json"),
         json!({
-            "id":"render-1","request_sha256":"request-1","status":"running"
+            "id":"render-1","request_sha256":REQUEST_HASH,"status":"running"
         })
         .to_string(),
     )
@@ -146,6 +152,16 @@ async fn run_automatic_receipt(shell: bool, denied: bool) {
         return;
     }
     assert_eq!(supervisor.get_tasks_for_session("auto-owner").len(), 1);
+    if shell {
+        // Operational binding must survive internally without disabling the
+        // ordinary model-facing output sanitizer.
+        assert!(
+            result
+                .messages
+                .iter()
+                .all(|m| !m.content.contains(REQUEST_HASH))
+        );
+    }
     assert!(
         result
             .messages
@@ -156,7 +172,7 @@ async fn run_automatic_receipt(shell: bool, denied: bool) {
     std::fs::write(
         dir.path().join("next.json"),
         json!({
-            "id":"render-1","request_sha256":"request-1","status":"completed"
+            "id":"render-1","request_sha256":REQUEST_HASH,"status":"completed"
         })
         .to_string(),
     )

@@ -111,3 +111,12 @@ the foreground, an independent producer replaces the receipt, and the native
 supervisor and result sender notify the parent without another polling call.
 The suite also covers failure, cancellation, identity, bounded waiting, partial
 receipts, workspace rebinding, policy denial, and symlink escapes.
+
+### Operational metadata and output redaction
+
+The execution layer captures the validated receipt envelope before text is
+truncated or sanitized for the model. This is necessary because ordinary
+output sanitization redacts 64-character hex strings, including SHA-256.
+Watcher identity must use the original hash; model-facing text keeps the
+existing redaction behavior. The real-shell regression test uses a full
+SHA-256 and verifies both successful notification and redacted model output.

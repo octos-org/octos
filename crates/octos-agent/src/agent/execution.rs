@@ -2391,6 +2391,29 @@ impl Agent {
                 }
             };
 
+            // Preserve the validated operational receipt before model-facing
+            // truncation/redaction. In particular, the sanitizer replaces real
+            // SHA-256 strings; using that text would corrupt watcher identity.
+            // The ordinary text sanitizer and all dispatch policies still apply.
+            let tool_structured_metadata = match (
+                crate::automatic_jobs::receipt(
+                    &tc_name,
+                    &content,
+                    tool_structured_metadata.as_ref(),
+                ),
+                tool_structured_metadata,
+            ) {
+                (Some(job), Some(serde_json::Value::Object(mut metadata))) => {
+                    metadata.insert(
+                        "octos_external_job".into(),
+                        job.metadata()["octos_external_job"].clone(),
+                    );
+                    Some(serde_json::Value::Object(metadata))
+                }
+                (Some(job), None) => Some(job.metadata()),
+                (_, metadata) => metadata,
+            };
+
             // After-tool hooks. Hook FEEDBACK (a checker reporting
             // diagnostics — see HookResult::Feedback) reaches the model:
             // appended to the tool message below AFTER truncation so it
