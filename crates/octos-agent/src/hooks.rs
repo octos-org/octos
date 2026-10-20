@@ -888,7 +888,13 @@ impl HookExecutor {
     /// untouched — re-arming a security breaker must not also lift the
     /// advisory run-rate limiter.
     pub fn re_arm(&self, session_key: Option<&str>) {
-        let mut map = self.session_state.lock().unwrap();
+        // Poison-tolerant lock (no unwrap — the quality ratchet counts
+        // prod-side unwraps): a panic elsewhere while holding the map must
+        // not turn the recovery path itself into an unwrap.
+        let mut map = self
+            .session_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match session_key {
             Some(key) => {
                 map.remove(key);
@@ -2643,98 +2649,6 @@ mod tests {
         }
     }
 
-    fn before_tool_hook(command: Vec<&str>, timeout_ms: u64) -> HookConfig {
-        HookConfig {
-            event: HookEvent::BeforeToolCall,
-            command: command.into_iter().map(String::from).collect(),
-            timeout_ms,
-            tool_filter: vec![],
-            path_filter: vec![],
-            requires_bin: None,
-        }
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn should_fail_closed_with_guard_unavailable_when_before_tool_call_hook_trips_breaker() {
-        // #2329: the availability breaker must not silently strip a deny
-        // gate. Three infra failures trip the breaker; the next call returns
-        // GuardUnavailable (callers block the tool call fail-closed) instead
-        // of Allow.
-        let executor = HookExecutor::with_threshold(
-            vec![before_tool_hook(vec!["sh", "-c", "exit 3"], 1000)],
-            3,
-        );
-        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None);
-        for _ in 0..3 {
-            let r = executor.run(HookEvent::BeforeToolCall, &payload).await;
-            assert!(
-                matches!(r, HookResult::Error(_)),
-                "expected Error while counting failures, got {r:?}"
-            );
-        }
-        let result = executor.run(HookEvent::BeforeToolCall, &payload).await;
-        match result {
-            HookResult::GuardUnavailable(msg) => {
-                assert!(
-                    msg.contains("disabled after 3 consecutive infrastructure failures"),
-                    "message should name the trip and recovery: {msg}"
-                );
-            }
-            other => panic!("expected GuardUnavailable, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn should_keep_after_tool_call_breaker_fail_open() {
-        // #2329 scoping: after-events are advisory checkers, not deny gates.
-        // Their breaker keeps today's availability behavior — a tripped hook
-        // is skipped silently and the event still comes back Allow (an
-        // after-hook with empty output + nonzero exit is the infra-failure
-        // shape that counts toward the breaker, #2129 review finding 1).
-        let executor = HookExecutor::with_threshold(
-            vec![HookConfig {
-                event: HookEvent::AfterToolCall,
-                command: vec!["sh".into(), "-c".into(), "exit 3".into()],
-                timeout_ms: 1000,
-                tool_filter: vec![],
-                path_filter: vec![],
-                requires_bin: None,
-            }],
-            2,
-        );
-        let payload =
-            HookPayload::after_tool("shell", "tc1", String::new(), true, 5, None, None, None);
-        for _ in 0..2 {
-            executor.run(HookEvent::AfterToolCall, &payload).await;
-        }
-        let result = executor.run(HookEvent::AfterToolCall, &payload).await;
-        assert_eq!(result, HookResult::Allow);
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn should_re_arm_tripped_guard_breaker_explicitly() {
-        // #2329: recovery from a tripped guard breaker is explicit. re_arm
-        // clears the failure counters, so the hook runs (and errors) again
-        // instead of staying disabled.
-        let executor = HookExecutor::with_threshold(
-            vec![before_tool_hook(vec!["sh", "-c", "exit 3"], 1000)],
-            3,
-        );
-        let payload = HookPayload::before_tool("shell", serde_json::json!({}), "tc1", None);
-        for _ in 0..4 {
-            executor.run(HookEvent::BeforeToolCall, &payload).await;
-        }
-        executor.re_arm(None);
-        let r = executor.run(HookEvent::BeforeToolCall, &payload).await;
-        assert!(
-            matches!(r, HookResult::Error(_)),
-            "after re_arm the hook runs again, got {r:?}"
-        );
-    }
-
     #[tokio::test]
     async fn should_be_noop_when_no_user_prompt_submit_hook_configured() {
         // Backwards-compat: an executor with only other events never fires for
@@ -3040,3 +2954,6 @@ mod tests {
         }
     }
 }
+
+#[path = "hooks_guard_tests.rs"]
+mod guard_tests;
