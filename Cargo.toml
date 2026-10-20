@@ -94,9 +94,11 @@ cbc = { version = "0.1", features = ["alloc"] }
 rand = "0.8"
 secrecy = { version = "0.10", features = ["serde"] }
 subtle = "2"
-# JWT signing for Google service-account (Vertex AI) auth. Uses `ring`
-# (already in tree via rustls) for RS256 — no OpenSSL.
-jsonwebtoken = "10.3"
+# JWT signing for Google service-account (Vertex AI) auth. v10 moved the
+# crypto backends behind optional features — `rust_crypto` (pure-Rust
+# RustCrypto: the `rsa` crate) provides RS256; with no backend selected
+# `encode` panics at runtime (#2764 review). No OpenSSL.
+jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 # Error handling (dora-rs pattern)
 eyre = "0.6"
 color-eyre = "0.6"
@@ -124,8 +126,11 @@ rusqlite = { version = "0.40.1", features = ["bundled", "fallible_uint"] }
 bincode = "1"
 # Vector search
 hnsw_rs = "0.3"
-# Git (native, feature-gated)
-gix = { version = "0.83", default-features = false, features = ["max-performance-safe", "revision", "blob-diff"] }
+# Git (native, feature-gated). `sha1` is explicit because gix-hash 0.25
+# flipped its default feature set to empty and gix 0.83 only reaches hashing
+# through its default-gated `sha1` facade — dropped by
+# `default-features = false` (#2764 review).
+gix = { version = "0.83", default-features = false, features = ["sha1", "max-performance-safe", "revision", "blob-diff"] }
 # AST parsing (feature-gated)
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
