@@ -2955,5 +2955,6 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 #[path = "hooks_guard_tests.rs"]
 mod guard_tests;
