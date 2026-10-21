@@ -382,7 +382,8 @@ impl ProgressEvidence {
                             report: check.report.clone(),
                         });
                         if previous.is_none_or(|p| {
-                            p.status != "fail"
+                            (p.status != "fail" && !p.findings.values().any(|v| v == "open"))
+                                || p.kind != state.kind
                                 || p.artifact_fingerprint != state.artifact_fingerprint
                                 || p.findings != state.findings
                         }) {
@@ -484,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn should_identify_failures_and_allow_unrelated_activity_after_acknowledgement() {
+    fn should_identify_failures_and_allow_unrelated_activity_after_observation() {
         let dir = fixture();
         publish(&dir, "fail", "original");
         let mut evidence = ProgressEvidence::new(dir.path()).unwrap();
@@ -515,6 +516,18 @@ mod tests {
             !evidence.refresh().activity_advanced,
             "unchanged reports are not fresh work"
         );
+    }
+
+    #[test]
+    fn should_not_rediscover_an_unchanged_open_finding_on_an_unknown_report() {
+        let dir = fixture();
+        publish(&dir, "unknown", "original");
+        set_findings(&dir, json!([{"id":"pending", "status":"open"}]));
+        let mut evidence = ProgressEvidence::new(dir.path()).unwrap();
+        assert_eq!(evidence.refresh().new_failures, vec!["copy"]);
+        let unchanged = evidence.refresh();
+        assert_eq!(unchanged.current_failures, 1);
+        assert!(unchanged.new_failures.is_empty());
     }
 
     #[cfg(unix)]
