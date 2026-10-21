@@ -42309,6 +42309,19 @@ async fn run_standalone_turn(
     // alive past this task.
     let (agent_finished_tx, mut agent_finished_rx) = tokio::sync::mpsc::channel::<()>(1);
     let progress_dropped_for_agent = Arc::clone(&progress_dropped);
+    // #2831 interrupt-path handles: the bindings below are moved into the
+    // agent task, but the outer task's interrupt path needs the final prompt
+    // text and the persist handles to commit the dispatched prompt before
+    // the interrupted terminal emits.
+    let interrupted_turn_prompt = (!skip_internal_user_persist).then(|| {
+        voice_user_content_for_persist
+            .clone()
+            .unwrap_or_else(|| prompt.clone())
+    });
+    let interrupt_persist_sessions = sessions.clone();
+    let interrupt_persist_thread = turn_thread_id_for_persist.clone();
+    let interrupt_persist_context_manager = context_manager_for_result.clone();
+    let interrupt_persist_context_data_dir = context_data_dir_for_result.clone();
     let agent_task = tokio::spawn(async move {
         // Held for the whole body; dropped on every exit path.
         let _agent_finished_tx = agent_finished_tx;
@@ -43995,6 +44008,23 @@ async fn run_standalone_turn(
         // gets `peer/tool/cancel`, and a non-read call is an unknown outcome
         // that is not resent.
         crate::peers::host_tools::cancel_host_calls_for_turn(&session_id, &turn_id.0.to_string());
+        // #2831: the abort above killed the agent task before its
+        // end-of-turn persist loop could run, so the dispatched prompt was
+        // never durable and reload discarded its source-less ledger twin.
+        // Commit it before the terminal; a dying task that already
+        // persisted it (mid-persist interrupt race) is recognized under
+        // the session lock and skipped.
+        if let Some(prompt_text) = interrupted_turn_prompt.as_deref() {
+            postturn_context_batch::persist_interrupted_turn_prompt(
+                &interrupt_persist_sessions,
+                &session_id,
+                &interrupt_persist_thread,
+                prompt_text,
+                &interrupt_persist_context_data_dir,
+                &interrupt_persist_context_manager,
+            )
+            .await;
+        }
         // #1707 round 5 (board item #7): a terminal mirror that lands AFTER
         // this interrupt (task-status re-forward, restart replay into a
         // fresh runtime) must not re-enter the session as a
