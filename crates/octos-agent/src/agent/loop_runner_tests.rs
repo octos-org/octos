@@ -854,7 +854,7 @@ impl LlmProvider for ConfigRecordingProvider {
 }
 
 #[tokio::test]
-async fn should_diagnose_file_churn_on_action_calls_without_extra_reflections() {
+async fn should_finish_distinct_revisions_without_spurious_churn_diagnostics() {
     let dir = tempfile::tempdir().unwrap();
     let requests = Arc::new(StdMutex::new(Vec::new()));
     let mut responses = (0..12).map(|index| tool_use(vec![ToolCall {
@@ -890,7 +890,7 @@ async fn should_diagnose_file_churn_on_action_calls_without_extra_reflections() 
             .iter()
             .all(|(_, _, cfg)| !matches!(cfg.tool_choice, octos_llm::ToolChoice::None))
     );
-    assert!(requests.iter().any(|(messages, _, _)| {
+    assert!(!requests.iter().any(|(messages, _, _)| {
         messages
             .iter()
             .any(|m| m.content.contains("Observed repeated work"))
@@ -898,6 +898,45 @@ async fn should_diagnose_file_churn_on_action_calls_without_extra_reflections() 
     assert_eq!(
         std::fs::read_to_string(dir.path().join("layout.json")).unwrap(),
         "revision 11"
+    );
+}
+
+#[tokio::test]
+async fn should_run_event_only_without_extra_requests_or_verification_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let mut responses = (0..25).map(|index| tool_use(vec![ToolCall {
+        id: format!("write-{index}"), name: "write_file".into(),
+        arguments: serde_json::json!({"path":"result.txt","content":format!("step {index}")}),
+        metadata: None,
+    }], 10, 5)).collect::<Vec<_>>();
+    responses.push(end_turn("COMPLETE", 10, 5));
+    let provider = Arc::new(ConfigRecordingProvider::new(responses, requests.clone()));
+    let mut tools = ToolRegistry::new();
+    tools.register(crate::tools::WriteFileTool::new(dir.path()));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("event-only"), provider, tools, memory)
+        .with_config(AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        })
+        .with_convergence_intervals(2, 1000, std::time::Duration::from_secs(3600))
+        .with_periodic_reflections(false);
+    let result = agent
+        .process_message("Complete the fixture.", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "COMPLETE");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("result.txt")).unwrap(),
+        "step 24"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 26);
+    assert!(
+        requests
+            .iter()
+            .all(|(_, _, c)| !matches!(c.tool_choice, ToolChoice::None))
     );
 }
 
@@ -4964,6 +5003,15 @@ async fn verifier_repeating_note_changes_next_planner_action() {
 
 #[tokio::test]
 async fn verifier_ready_to_answer_gates_endturn_after_problem_signal() {
+    assert_verifier_ready_gate(true).await;
+}
+
+#[tokio::test]
+async fn event_only_preserves_required_verifier_ready_gate() {
+    assert_verifier_ready_gate(false).await;
+}
+
+async fn assert_verifier_ready_gate(periodic_reflections: bool) {
     let dir = tempfile::tempdir().unwrap();
     let planner = Arc::new(PrematureEndPlanner {
         calls: AtomicUsize::new(0),
@@ -4985,6 +5033,7 @@ async fn verifier_ready_to_answer_gates_endturn_after_problem_signal() {
         tools,
         memory,
     )
+    .with_periodic_reflections(periodic_reflections)
     .with_config(AgentConfig {
         max_iterations: 8,
         save_episodes: false,

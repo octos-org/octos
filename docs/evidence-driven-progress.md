@@ -21,7 +21,7 @@ task independent: presentation-specific checks belong to the shared skill.
 - Feed measured changes and current/stale checks into reflection. Do not record
   empty or truncated reflection as a successful review. Periodic checkpoints
   with fresh, improved evidence can proceed without another model call.
-- Repeated edits trigger scoped diagnosis, never a forced quality pass, a model
+- Repeated returns to earlier file contents trigger scoped diagnosis, never a forced quality pass, a model
   substitution, or automatic task abandonment. Preserve ordinary tasks that do
   not supply a progress contract.
 - Automatically register durable job receipts returned through the adapter
@@ -115,3 +115,41 @@ plus a separate comparison using common generated images to isolate conversion.
 Record first-delivery quality, completeness, requests, tokens, actual cost,
 render work, waiting and wall time. Old Pi transport-recovery time is not a
 clean timing baseline. Do not claim a winner before reviewing final artifacts.
+
+## Task-independent follow-up (2026-10-21)
+
+Serves PR #2842 and Phase 3C's repeated-work requirement. The live trace showed
+that raw edit counts did not establish a loop: a model repeatedly reclassified
+preferences as defects, and vague failed-report totals caused unrelated work.
+No slide numbers, layout rules, or domain acceptance checks are added to the kernel.
+
+- Observe bounded recent content fingerprints. Emit the existing coalesced
+  diagnostic only after recurring returns to earlier bytes. Distinct revisions,
+  no-op writes, a single rollback, and patch arguments without an observed
+  after-state do not prove a cycle. The signal remains advisory: intentional
+  experiments and regressions can require returning to old states.
+- Report failed check/operation IDs, kinds, and source report paths. A known
+  failure remains open but does not suppress activity recognition for an
+  unrelated completed operation. A new failure still receives attention.
+- `OCTOS_CONVERGENCE_MODE=event_only` disables timer/token/call-count advisory
+  reflections. Explicit cycle/peer events, permissions, validation, budgets,
+  and task execution remain active. `periodic` retains the previous default.
+  Embedders may use `Agent::with_periodic_reflections(false)`. This is an
+  independently testable policy, not a quality verdict or a verification bypass.
+- Child/join notifications explicitly retain their delivery scope. Already
+  incorporated outcomes are not a fresh assignment to audit/rebuild everything.
+  Novel contradictory results and unfulfilled dependencies still need handling.
+  This does not discard notifications or assert that the runtime can infer
+  semantic consumption of arbitrary shell output.
+
+Proof includes real shell state oscillation, distinct-revision and no-op negative
+cases, exact request counts without a verification contract, and failure
+provenance/activity isolation. Current fingerprint history is per turn (retained
+through in-turn compaction); cross-process semantic decision memory is not
+claimed. Existing durable report/session histories are unchanged.
+
+The live evaluation uses coding, data processing, and evidence synthesis inputs,
+with isolated old-Octos, fixed-periodic, fixed-event-only, and Pi runs. Same model,
+reasoning effort, task inputs, and per-task requirements; no producer feedback.
+External scoring is kept outside producer workspaces. Record success and output
+quality alongside requests/time. Small trials do not prove general superiority.

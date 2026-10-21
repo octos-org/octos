@@ -66,11 +66,13 @@ impl CheckpointReason {
                 escalation,
             } => {
                 let escalation_note = if *escalation {
-                    "; provider/model escalation requested"
+                    "; repeated return to earlier states"
                 } else {
                     ""
                 };
-                format!("{path} was modified {edits} times{escalation_note}")
+                format!(
+                    "{path} returned to an earlier content state after {edits} revisions{escalation_note}"
+                )
             }
         }
     }
@@ -98,6 +100,7 @@ pub(super) struct ConvergenceController {
     pending_reflection: Option<String>,
     checkpoints: u32,
     last_diagnostic_action: Option<u32>,
+    pub(super) periodic_enabled: bool,
 }
 
 impl ConvergenceController {
@@ -120,12 +123,23 @@ impl ConvergenceController {
             10,
             86_400,
         ));
-        Self::new(
+        let mut controller = Self::new(
             started_at,
             llm_call_interval,
             active_token_interval,
             elapsed_interval,
-        )
+        );
+        // Keep the existing default while comparing the event-only policy.
+        // This controls advisory reflections, never required validation or budgets.
+        controller.periodic_enabled = match std::env::var("OCTOS_CONVERGENCE_MODE").as_deref() {
+            Ok("event_only") => false,
+            Ok("periodic") | Err(_) => true,
+            Ok(other) => {
+                tracing::warn!(value = other, "unknown convergence mode; using periodic");
+                true
+            }
+        };
+        controller
     }
 
     pub(super) fn new(
@@ -148,6 +162,7 @@ impl ConvergenceController {
             pending_reflection: None,
             checkpoints: 0,
             last_diagnostic_action: None,
+            periodic_enabled: true,
         }
     }
 
@@ -181,11 +196,12 @@ impl ConvergenceController {
         self.rearm(usage);
         Some(format!(
             "{CHECKPOINT_CONTEXT_OPEN}\nObserved repeated work: {}.\n\
-             Use the next action to inspect a current check or run a distinct, bounded diagnosis \
-             if the same defect remains. Revisions alone do not prove failure or progress. \
-             Job completion does not certify quality. Retain unresolved findings; do not claim \
-             a pass without current evidence. Do not switch models or abandon the task because \
-             of this notice. Continue independent work while registered jobs run.\n\
+             This is an observed state cycle, not a quality verdict. Compare the earlier \
+             decision and its actual result before repeating it. If the return is intentional \
+             (for example a rollback or a distinct experiment), continue the task. Otherwise \
+             choose one different, bounded diagnostic. Do not invent new requirements, reopen \
+             settled decisions without a concrete reason, or change models because of this notice. \
+             Existing verification requirements still apply.\n\
              {evidence}\n{CHECKPOINT_CONTEXT_CLOSE}",
             reason.describe()
         ))
@@ -201,6 +217,9 @@ impl ConvergenceController {
             return Some(reason);
         }
 
+        if !self.periodic_enabled {
+            return None;
+        }
         // Thresholds count completed ACTION calls and ACTION tokens only: a
         // checkpoint's own reflection call is real spend for the turn but is
         // never recorded as an action call and its tokens are subtracted.
@@ -369,6 +388,35 @@ mod tests {
         for _ in 0..count {
             controller.record_action_call();
         }
+    }
+
+    #[test]
+    fn should_allow_event_only_mode_without_a_verifier_or_periodic_requests() {
+        let mut controller = new_controller(2, 1000);
+        controller.periodic_enabled = false;
+        record_action_calls(&mut controller, 100);
+        let usage = TokenUsage {
+            input_tokens: 500_000,
+            ..Default::default()
+        };
+        assert!(controller.due(&usage).is_none());
+        controller.force(CheckpointReason::PeerPolling {
+            tool_name: "peer_gather".into(),
+        });
+        assert!(matches!(
+            controller.due(&usage),
+            Some(CheckpointReason::PeerPolling { .. })
+        ));
+    }
+
+    #[test]
+    fn should_not_request_a_model_change_when_observing_repeated_states() {
+        let reason = CheckpointReason::FileChurn {
+            path: "source.txt".into(),
+            edits: 10,
+            escalation: true,
+        };
+        assert!(!reason.describe().contains("provider/model"));
     }
 
     #[test]

@@ -15,6 +15,8 @@ pub struct EvidenceDelta {
     pub available: bool,
     pub current_passes: usize,
     pub current_failures: usize,
+    pub failures: Vec<FailureEvidence>,
+    pub new_failures: Vec<String>,
     pub stale: usize,
     pub improved: bool,
     /// A new, hash-bound tool operation finished. This is activity, not a
@@ -27,6 +29,14 @@ pub struct EvidenceDelta {
     pub invalid_checks: Vec<String>,
     pub removed_checks: Vec<String>,
     pub scope: &'static str,
+}
+
+/// Provenance for a failing report; operation failures are not artifact defects.
+#[derive(Debug, Serialize)]
+pub struct FailureEvidence {
+    pub id: String,
+    pub kind: String,
+    pub report: String,
 }
 
 #[derive(Deserialize)]
@@ -366,6 +376,18 @@ impl ProgressEvidence {
                     } else if state.status == "fail" || state.findings.values().any(|v| v == "open")
                     {
                         delta.current_failures += 1;
+                        delta.failures.push(FailureEvidence {
+                            id: check.id.clone(),
+                            kind: state.kind.clone(),
+                            report: check.report.clone(),
+                        });
+                        if previous.is_none_or(|p| {
+                            p.status != "fail"
+                                || p.artifact_fingerprint != state.artifact_fingerprint
+                                || p.findings != state.findings
+                        }) {
+                            delta.new_failures.push(check.id.clone());
+                        }
                         if state.status == "pass" {
                             state.status = "fail".into();
                         }
@@ -413,7 +435,7 @@ impl ProgressEvidence {
             && (!delta.newly_passed.is_empty() || !delta.resolved.is_empty());
         delta.activity_advanced = delta.stale == 0
             && delta.removed_checks.is_empty()
-            && delta.current_failures == 0
+            && delta.new_failures.is_empty()
             && !delta.completed_operations.is_empty();
         delta
     }
@@ -459,6 +481,40 @@ mod tests {
         );
         publish("v2", "second");
         assert!(evidence.refresh().activity_advanced);
+    }
+
+    #[test]
+    fn should_identify_failures_and_allow_unrelated_activity_after_acknowledgement() {
+        let dir = fixture();
+        publish(&dir, "fail", "original");
+        let mut evidence = ProgressEvidence::new(dir.path()).unwrap();
+        let first = evidence.refresh();
+        assert_eq!(first.failures[0].id, "copy");
+        assert_eq!(first.failures[0].report, "report.json");
+        assert_eq!(first.failures[0].kind, "check");
+        assert_eq!(first.new_failures, vec!["copy"]);
+        std::fs::create_dir_all(dir.path().join(".octos/tool-progress")).unwrap();
+        let bytes = serde_json::to_vec(&json!({"schema_version":1,
+            "check_id":"tool-operation/build","kind":"operation","status":"pass",
+            "artifacts":[{"path":"artifact.txt","sha256":hash(b"original")}],
+            "findings":[]}))
+        .unwrap();
+        std::fs::write(dir.path().join(".octos/tool-progress/build.json"), bytes).unwrap();
+        let next = evidence.refresh();
+        assert_eq!(next.current_failures, 1, "the known failure is not erased");
+        assert!(next.new_failures.is_empty());
+        assert!(
+            next.activity_advanced,
+            "unrelated work can advance despite a known failure"
+        );
+        assert!(
+            !next.improved,
+            "operation completion does not certify quality"
+        );
+        assert!(
+            !evidence.refresh().activity_advanced,
+            "unchanged reports are not fresh work"
+        );
     }
 
     #[cfg(unix)]

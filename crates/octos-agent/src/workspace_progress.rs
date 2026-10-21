@@ -177,6 +177,11 @@ impl WorkspaceProgress {
         self.incomplete.load(Ordering::Relaxed)
     }
 
+    /// The last observed content hash, without another read or exposing contents.
+    pub(crate) fn observed_fingerprint(&self, relative: &Path) -> Option<[u8; 32]> {
+        self.fingerprints.get(relative).copied()
+    }
+
     fn fingerprint(&self, relative: &Path, budget: &mut u64) -> io::Result<[u8; 32]> {
         let bytes = self.root.read(relative, MAX_SOURCE_BYTES.min(*budget))?;
         *budget = budget.saturating_sub(bytes.len() as u64);

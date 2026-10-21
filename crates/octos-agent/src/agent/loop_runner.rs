@@ -1138,6 +1138,9 @@ impl Agent {
                     ),
                     None => ConvergenceController::from_env(turn_started_at),
                 };
+                if let Some(enabled) = self.periodic_reflections {
+                    convergence.periodic_enabled = enabled;
+                }
                 // M6.2: per-turn retry-bucket state machine. Lives alongside
                 // `LoopTurnState` rather than inside it so the file boundary
                 // from issue #489 stays exact.

@@ -509,6 +509,7 @@ pub struct Agent {
     /// `(llm_call_interval, active_token_interval, elapsed_interval)`.
     /// `None` reads the `OCTOS_CONVERGENCE_*` environment defaults.
     pub(super) convergence_intervals: Option<(u32, u64, std::time::Duration)>,
+    pub(super) periodic_reflections: Option<bool>,
     /// Guard C (issue #607): nesting depth this agent's tool calls
     /// inherit via `ToolContext.spawn_depth`. The session-actor's
     /// top-level agent leaves this at 0; sub-agents created by the
@@ -676,6 +677,7 @@ impl Agent {
             parent_session_key: None,
             prompt_cache_epoch_id: None,
             convergence_intervals: None,
+            periodic_reflections: None,
             spawn_depth: 0,
             sandbox_config: None,
             prompt_context_manager: None,
@@ -763,6 +765,7 @@ impl Agent {
             parent_session_key: None,
             prompt_cache_epoch_id: None,
             convergence_intervals: None,
+            periodic_reflections: None,
             spawn_depth: 0,
             sandbox_config: None,
             prompt_context_manager: None,
@@ -1094,6 +1097,13 @@ impl Agent {
     ) -> Self {
         self.convergence_intervals =
             Some((llm_call_interval, active_token_interval, elapsed_interval));
+        self
+    }
+
+    /// Override periodic advisory reflections for an embedded agent. Event-driven
+    /// diagnostics, validation requirements and budgets are unaffected.
+    pub fn with_periodic_reflections(mut self, enabled: bool) -> Self {
+        self.periodic_reflections = Some(enabled);
         self
     }
 
