@@ -417,6 +417,8 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::MEMORY_SEARCH
         | methods::MEMORY_LOAD
         | methods::MEMORY_INGEST
+        | methods::MEMORY_REQUEST
+        | methods::MEMORY_PROMOTE
         | methods::CRON_LIST
         | methods::CRON_TOGGLE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
         methods::AGENT_LIST
@@ -1321,8 +1323,12 @@ pub mod methods {
     /// rides along. Counts a visit (heat).
     pub const MEMORY_LOAD: &str = "memory/load";
     /// Ingest app records (documents / episodes) into the Recall index.
-    /// The only memory WRITE method; knowledge pages are refused here.
+    /// Knowledge pages are refused here; explicit requests use MEMORY_REQUEST.
     pub const MEMORY_INGEST: &str = "memory/ingest";
+    /// Admit an explicit user remember/correct/forget request without a turn.
+    pub const MEMORY_REQUEST: &str = "memory/request";
+    /// Nominate eligible app documents into background consolidation.
+    pub const MEMORY_PROMOTE: &str = "memory/promote";
     /// Replaces `GET /api/my/cron` — cron panel job listing.
     pub const CRON_LIST: &str = "cron/list";
     /// Replaces `PUT /api/my/cron/{job_id}/enabled` — cron job toggle.
@@ -1506,6 +1512,8 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::MEMORY_SEARCH,
     methods::MEMORY_LOAD,
     methods::MEMORY_INGEST,
+    methods::MEMORY_REQUEST,
+    methods::MEMORY_PROMOTE,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -1642,6 +1650,8 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::MEMORY_SEARCH,
     methods::MEMORY_LOAD,
     methods::MEMORY_INGEST,
+    methods::MEMORY_REQUEST,
+    methods::MEMORY_PROMOTE,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -3921,6 +3931,67 @@ pub struct MemoryIngestResult {
     pub embedded: usize,
 }
 
+/// Explicit user memory requests are bounded and never silently truncated.
+pub const MEMORY_REQUEST_MAX_CONTENT_BYTES: usize = 16 * 1024;
+pub const MEMORY_PROMOTE_DEFAULT_LIMIT: usize = 20;
+pub const MEMORY_PROMOTE_MAX_LIMIT: usize = 100;
+pub const MEMORY_PROMOTE_MAX_SOURCES: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRequestOperation {
+    Remember,
+    Correct,
+    Forget,
+}
+
+/// Authenticated profile only. Neither origin nor identity is caller-supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRequestParams {
+    pub request_id: String,
+    pub operation: MemoryRequestOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRequestStatus {
+    Accepted,
+}
+
+/// Acceptance is durable admission, not consolidation completion. The refresh
+/// flag reports configuration, not a completion SLA or current worker health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRequestResult {
+    pub request_id: String,
+    pub operation: MemoryRequestOperation,
+    pub status: MemoryRequestStatus,
+    pub refresh_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryPromoteParams {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_visits: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// Record ids staged for background consolidation, not newly saved Knowledge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPromoteResult {
+    pub record_ids: Vec<String>,
+    pub count: usize,
+    pub refresh_enabled: bool,
+}
+
 /// Params for `cron/list`. Empty today; the struct exists so `{}` /
 /// `null` params decode uniformly (mirrors [`SystemStatusGetParams`];
 /// the wire `params` MEMBER must still be present).
@@ -4387,6 +4458,8 @@ pub enum UiCommand {
     MemorySearch(MemorySearchParams),
     MemoryLoad(MemoryLoadParams),
     MemoryIngest(MemoryIngestParams),
+    MemoryRequest(MemoryRequestParams),
+    MemoryPromote(MemoryPromoteParams),
     CronList(CronListParams),
     CronToggle(CronToggleParams),
     // ---- Wave4-A: adaptive router controls ----
@@ -4446,6 +4519,8 @@ impl UiCommand {
             Self::MemorySearch(_) => methods::MEMORY_SEARCH,
             Self::MemoryLoad(_) => methods::MEMORY_LOAD,
             Self::MemoryIngest(_) => methods::MEMORY_INGEST,
+            Self::MemoryRequest(_) => methods::MEMORY_REQUEST,
+            Self::MemoryPromote(_) => methods::MEMORY_PROMOTE,
             Self::CronList(_) => methods::CRON_LIST,
             Self::CronToggle(_) => methods::CRON_TOGGLE,
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
@@ -4506,6 +4581,8 @@ impl UiCommand {
             Self::MemorySearch(params) => serde_json::to_value(params),
             Self::MemoryLoad(params) => serde_json::to_value(params),
             Self::MemoryIngest(params) => serde_json::to_value(params),
+            Self::MemoryRequest(params) => serde_json::to_value(params),
+            Self::MemoryPromote(params) => serde_json::to_value(params),
             Self::CronList(params) => serde_json::to_value(params),
             Self::CronToggle(params) => serde_json::to_value(params),
             Self::RouterSetMode(params) => serde_json::to_value(params),
@@ -4611,6 +4688,8 @@ impl UiCommand {
             methods::MEMORY_SEARCH => Ok(Self::MemorySearch(decode_params(method, params)?)),
             methods::MEMORY_LOAD => Ok(Self::MemoryLoad(decode_params(method, params)?)),
             methods::MEMORY_INGEST => Ok(Self::MemoryIngest(decode_params(method, params)?)),
+            methods::MEMORY_REQUEST => Ok(Self::MemoryRequest(decode_params(method, params)?)),
+            methods::MEMORY_PROMOTE => Ok(Self::MemoryPromote(decode_params(method, params)?)),
             methods::CRON_LIST => Ok(Self::CronList(decode_optional_params(method, params)?)),
             methods::CRON_TOGGLE => Ok(Self::CronToggle(decode_params(method, params)?)),
             methods::ROUTER_SET_MODE => Ok(Self::RouterSetMode(decode_params(method, params)?)),

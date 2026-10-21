@@ -3778,6 +3778,10 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         methods::MEMORY_ENTITY => json!({ "name": "probe-entity" }),
         methods::MEMORY_SEARCH => json!({ "query": "probe" }),
         methods::MEMORY_LOAD => json!({ "id": "doc:probe:1" }),
+        methods::MEMORY_REQUEST => {
+            json!({"request_id": "probe", "operation": "remember", "content": "Prefers diagrams."})
+        }
+        methods::MEMORY_PROMOTE => json!({}),
         methods::MEMORY_INGEST => json!({
             "records": [{
                 "id": "doc:probe:1",
@@ -21731,6 +21735,8 @@ fn session_ingress_callable_method_matches_the_deny_surfaces() {
         octos_core::ui_protocol::methods::MEMORY_SEARCH,
         octos_core::ui_protocol::methods::MEMORY_LOAD,
         octos_core::ui_protocol::methods::MEMORY_INGEST,
+        octos_core::ui_protocol::methods::MEMORY_REQUEST,
+        octos_core::ui_protocol::methods::MEMORY_PROMOTE,
         octos_core::ui_protocol::methods::CRON_LIST,
         octos_core::ui_protocol::methods::CRON_TOGGLE,
         octos_core::ui_protocol::methods::SESSION_FORK,
@@ -50218,3 +50224,6 @@ async fn should_shed_reported_critical_events_over_the_wire_budget() {
         "shed accounting must conserve events"
     );
 }
+
+#[path = "ui_protocol_memory_request_tests.rs"]
+mod app_memory_tests;

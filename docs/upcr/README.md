@@ -78,6 +78,7 @@ records.
 | 049 | Oversized-Frame Preview Runs Off The Executor Worker | implemented | `..._049_OVERSIZED_FRAME_PREVIEW_OFFLOAD.md` | #2812 |
 | 050 | Turn-Task Delivery Residue — the Last Sync Durable Sends, Unified Lifecycle Error Shapes, and Real Usage for Shed Turns | implemented | `..._050_TURN_TASK_DELIVERY_RESIDUE.md` | #2811 |
 | 051 | Agent-Task Prompt Sends — Budgeted Cooperative Delivery for Approvals and Questions | implemented | `..._051_AGENT_PROMPT_SEND_BUDGET.md` | #2815 |
+| 052 | Application Memory Requests and Document Promotion | proposed (implemented in PR #2848; pending upstream review) | `..._052_APP_MEMORY_ACCESS.md` | — |
 
 ## Renumbering history
 

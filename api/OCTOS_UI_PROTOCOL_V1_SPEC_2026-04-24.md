@@ -526,7 +526,8 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
 - `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
-- `memory/search`, `memory/load`, `memory/ingest` (Recall/Knowledge index —
+- `memory/search`, `memory/load`, `memory/ingest`, `memory/request`,
+  `memory/promote` (Recall/Knowledge index —
   `docs/adr/personal-memory-tiers.md`; auth-bound like `memory/overview`,
   refused for session-ingress credentials)
 
@@ -2276,8 +2277,7 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 #### `memory/ingest`
 
 - Gate: `auxiliary.rest_to_ws.v1`
-- Replaces: nothing — new surface, and the ONLY memory write on the
-  protocol. Apps (Mail, Calendar, contacts, notes) push derived records
+- Replaces: nothing — new Recall ingestion surface on the protocol. Apps (Mail, Calendar, contacts, notes) push derived records
   into the profile's Recall index; the apps remain the record of truth.
   Runs on the same authenticated path as `memory/overview` (identity
   required, `/api/my/*` profile resolution); session-ingress credentials
@@ -2318,6 +2318,80 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
   `invalid_params` per the validation above; `runtime_unavailable` as
   for `memory/search`; `internal_error` when embedding or the index
   write fails.
+
+#### `memory/request`
+
+Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_052_APP_MEMORY_ACCESS.md).
+
+- Gate: `auxiliary.rest_to_ws.v1`. Requires authenticated `/api/my/*`
+  profile resolution, exactly as `memory/ingest`. Session-ingress and
+  host-managed external credentials cannot use it. Identity, origin, local
+  paths and profile selection are not request fields; unknown fields reject.
+- Params: `MemoryRequestParams` — `{ request_id, operation, content?, entry_id? }`.
+  `request_id` is 1–128 ASCII letters/digits or `-_.:`. `operation` is
+  `remember`, `correct` or `forget`:
+  - `remember`: non-blank `content`, no `entry_id`;
+  - `correct`: non-blank `content` and an existing live MEMORY.md `entry_id`;
+  - `forget`: existing live MEMORY.md `entry_id` only, no free-text content.
+  Entry ids are `^m` + six `[a-z2-7]` characters, never file paths. Content
+  is at most 16,384 UTF-8 bytes, rejected rather than truncated when oversized;
+  the existing note content guard applies. The operation produces host-authored
+  user_request, correction (with replaces_id), or id-bound forget notes.
+- Result: `MemoryRequestResult` — `{ request_id, operation, status: "accepted",
+  refresh_enabled }`. Acceptance means durable admission, NOT that memory has
+  changed. `refresh_enabled` reports configuration, not worker health or a
+  completion deadline. With refresh disabled, the request remains staged.
+- Retries: ids are scoped to the resolved profile. Same id and the same
+  operation/target/content reuse acceptance; different payloads fail with
+  `invalid_params` and `data.kind = "request_id_conflict"`. Check retries
+  before target existence, so an already honored forget can be retried.
+  A host correction whose target no longer exists in live memory, the archive
+  or pending-confirm candidates is retired before the merge, without a model
+  call; its reason is recorded in the consolidation outcome. Retrying its
+  accepted request does not recreate it.
+  Content-free hash receipts survive staging consumption and process restart;
+  no automatic receipt expiry is introduced. Prepared notes are private,
+  durable before receipts and atomically published into existing staging;
+  retry recovers an interrupted publication. This does not add a completion
+  status query or guarantee that an unrelated in-flight extraction cannot
+  reintroduce information.
+- Errors: `auth_unavailable` as for ingest; `invalid_params` for the rules above;
+  `resource_not_found` with `resource_type = "memory_entry"` if the target is
+  absent in the caller's profile (including an id belonging only to another
+  profile); `runtime_unavailable` as for search; `internal_error` for storage
+  failures. No internal path or memory body is returned in storage errors.
+- No turn or model call runs in this handler. Existing background consolidation
+  owns all actual changes. Applications must submit explicit user requests,
+  not treat arbitrary app/model observations as user-authorized operations.
+
+#### `memory/promote`
+
+- Gate and authentication: same as `memory/request`.
+- Params: `MemoryPromoteParams` — `{ sources?: string[], min_visits?: number,
+  limit?: number }`. Empty sources means all sources IN THIS PROFILE, not
+  access to other accounts. At most 32 source labels, each 1–128 UTF-8 bytes,
+  without surrounding whitespace or control characters. `min_visits` defaults
+  to 2 and always requires at least one real load even when set to 0.
+  `limit` defaults to 20; explicit values outside 1–100 reject.
+- Only unpromoted Document records meeting the load threshold qualify. Source
+  filtering occurs before ranking and limiting. Existing heat ordering and
+  already-promoted behavior are preserved. Concurrent nomination calls through
+  the shared store serialize through staging and marking.
+- Result: `MemoryPromoteResult` — `{ record_ids: string[], count,
+  refresh_enabled }`. Zero staged records returns an empty list/count 0; the existing note guard
+  may also reject eligible records, which are not counted.
+  Returned ids mean staged, not saved as Knowledge. Notes contain title,
+  abstract and provenance; stored body text is not included. Updating a
+  previously promoted document does not make it eligible again.
+- The handler neither calls a model nor starts a new scheduler. The app or
+  controller explicitly invokes it after genuine retrieval; it must not fake
+  loads to bypass eligibility. Existing background refresh processes staged
+  host notes (normally checked on its 90-second debounce, subject to config,
+  budget and failures). As with the existing CLI, publication and marking are
+  separate writes; a process failure between them is not an exactly-once
+  promotion guarantee.
+- Errors: auth/runtime errors as above; `invalid_params` for bounds or malformed
+  labels; `internal_error` if nomination/staging persistence fails.
 
 #### `cron/list`
 

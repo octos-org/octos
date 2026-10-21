@@ -1,7 +1,11 @@
 //! UI Protocol v1 WebSocket transport.
 
+#[path = "ui_protocol_memory_requests.rs"]
+mod memory_requests;
 #[path = "ui_protocol_workspace_team.rs"]
 mod workspace_team_rpc;
+use memory_requests::{handle_memory_promote, handle_memory_request};
+
 use crate::peers::workspace_team;
 
 use std::{
@@ -618,6 +622,8 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     octos_core::ui_protocol::methods::MEMORY_SEARCH,
     octos_core::ui_protocol::methods::MEMORY_LOAD,
     octos_core::ui_protocol::methods::MEMORY_INGEST,
+    octos_core::ui_protocol::methods::MEMORY_REQUEST,
+    octos_core::ui_protocol::methods::MEMORY_PROMOTE,
     octos_core::ui_protocol::methods::CRON_LIST,
     octos_core::ui_protocol::methods::CRON_TOGGLE,
     octos_core::ui_protocol::methods::SMART_HOME_STATUS_GET,
@@ -8473,6 +8479,30 @@ async fn ui_protocol_connection(
                 )
                 .await;
             }
+            UiCommand::MemoryRequest(params) => {
+                handle_memory_request(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
+            UiCommand::MemoryPromote(params) => {
+                handle_memory_promote(
+                    &ws,
+                    &state,
+                    &connection_headers,
+                    connection_identity.as_ref(),
+                    true,
+                    id,
+                    params,
+                )
+                .await;
+            }
             UiCommand::MemoryIngest(params) => {
                 handle_memory_ingest(
                     &ws,
@@ -9378,6 +9408,30 @@ where
                 UiCommand::MemoryLoad(params) => {
                     handle_memory_load(&ws, &state, &connection_headers, None, false, id, params)
                         .await;
+                }
+                UiCommand::MemoryRequest(params) => {
+                    handle_memory_request(
+                        &ws,
+                        &state,
+                        &connection_headers,
+                        None,
+                        false,
+                        id,
+                        params,
+                    )
+                    .await;
+                }
+                UiCommand::MemoryPromote(params) => {
+                    handle_memory_promote(
+                        &ws,
+                        &state,
+                        &connection_headers,
+                        None,
+                        false,
+                        id,
+                        params,
+                    )
+                    .await;
                 }
                 UiCommand::MemoryIngest(params) => {
                     handle_memory_ingest(&ws, &state, &connection_headers, None, false, id, params)
@@ -22164,6 +22218,8 @@ fn route_rpc_command(
         | octos_core::ui_protocol::methods::MEMORY_SEARCH
         | octos_core::ui_protocol::methods::MEMORY_LOAD
         | octos_core::ui_protocol::methods::MEMORY_INGEST
+        | octos_core::ui_protocol::methods::MEMORY_REQUEST
+        | octos_core::ui_protocol::methods::MEMORY_PROMOTE
         | octos_core::ui_protocol::methods::CRON_LIST
         | octos_core::ui_protocol::methods::CRON_TOGGLE => Some(features.auxiliary_rest_to_ws_v1),
         // UPCR-2026-023: `user_question/respond` is strict opt-in. A client
@@ -22324,6 +22380,8 @@ fn session_ingress_callable_method(method: &str) -> bool {
             | octos_core::ui_protocol::methods::MEMORY_SEARCH
             | octos_core::ui_protocol::methods::MEMORY_LOAD
             | octos_core::ui_protocol::methods::MEMORY_INGEST
+            | octos_core::ui_protocol::methods::MEMORY_REQUEST
+            | octos_core::ui_protocol::methods::MEMORY_PROMOTE
             | octos_core::ui_protocol::methods::CRON_LIST
             | octos_core::ui_protocol::methods::CRON_TOGGLE
             | octos_core::ui_protocol::methods::SESSION_FORK
@@ -22361,6 +22419,8 @@ fn validate_session_ingress_command_scope(
         | UiCommand::MemorySearch(_)
         | UiCommand::MemoryLoad(_)
         | UiCommand::MemoryIngest(_)
+        | UiCommand::MemoryRequest(_)
+        | UiCommand::MemoryPromote(_)
         | UiCommand::CronList(_)
         | UiCommand::CronToggle(_)
         | UiCommand::SessionFork(_)
@@ -34511,7 +34571,7 @@ fn validate_memory_ingest(params: MemoryIngestParams) -> Result<ValidatedMemoryI
     })
 }
 
-/// `memory/ingest` — the one memory WRITE method. Validates, embeds
+/// `memory/ingest` — Recall ingestion. Validates, embeds
 /// server-side when asked (default) and possible — only the records
 /// `RecallStore::needs_vectors` flags, so an unchanged batch is never
 /// re-embedded — upserts into the profile's `RecallStore` and persists

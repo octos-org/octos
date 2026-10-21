@@ -148,6 +148,7 @@ pub struct RecallStats {
 }
 
 pub struct RecallStore {
+    promotion_lock: tokio::sync::Mutex<()>,
     db: Arc<Database>,
     dir: PathBuf,
     config: RecallConfig,
@@ -216,6 +217,7 @@ impl RecallStore {
             txn.commit()?;
         }
         let mut store = Self {
+            promotion_lock: tokio::sync::Mutex::new(()),
             db: Arc::new(db),
             dir,
             config,
@@ -1129,12 +1131,31 @@ impl RecallStore {
     /// Documents hot enough to be worth distilling into Knowledge: not yet
     /// promoted, visited at least `min_visits` times, hottest first.
     pub fn nominate(&self, min_visits: u32, limit: usize) -> Result<Vec<Record>> {
+        self.nominate_from_sources(min_visits, limit, &[])
+    }
+
+    /// Serialize selection through marking across concurrent promotion callers.
+    /// The database already excludes a second process opening this store.
+    pub async fn lock_promotion(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.promotion_lock.lock().await
+    }
+
+    /// Source filtering happens before ranking and limiting. Empty = all.
+    pub fn nominate_from_sources(
+        &self,
+        min_visits: u32,
+        limit: usize,
+        sources: &[String],
+    ) -> Result<Vec<Record>> {
         let now = Utc::now();
         let ids: Vec<String> = {
             let meta = self.meta.read().unwrap();
             meta.iter()
                 .filter(|(_, m)| {
-                    m.kind == RecordKind::Document && !m.promoted && m.visits >= min_visits.max(1)
+                    m.kind == RecordKind::Document
+                        && !m.promoted
+                        && m.visits >= min_visits.max(1)
+                        && (sources.is_empty() || sources.contains(&m.source))
                 })
                 .map(|(id, _)| id.clone())
                 .collect()

@@ -516,6 +516,8 @@ fn should_allow_external_clients_only_the_allowlisted_methods() {
         "session/delete",
         "session/title.set",
         "memory/ingest",
+        "memory/request",
+        "memory/promote",
         "memory/search",
         "content/delete",
         "session/files.list",

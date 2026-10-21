@@ -903,48 +903,7 @@ impl MemoryStore {
     /// prompts. One `create_new` file per note — concurrent sessions can
     /// never clobber each other. The note id is the uuidv7 filename stem.
     pub async fn write_staging_note(&self, note: &StagingNote) -> Result<PathBuf> {
-        // Write-time threat gate (#1585). Staged notes are consolidated
-        // into MEMORY.md, which rides the system prompt of every future
-        // session — and non-sensitive note BODIES are copied verbatim into
-        // the consolidation prompt itself.
-        //
-        // Forget notes must still be able to QUOTE the poison they remove,
-        // but the round-1 "exemption is safe" argument was FALSE: a quoted
-        // body reaches the consolidation prompt and can steer the model
-        // into emitting regex-clean hostile adds (codex round-2 P1). So a
-        // threat-flagged forget is ACCEPTED but FORCED SENSITIVE — the
-        // sensitive-first pass parks its body Rust-side before any
-        // provider call, so it never rides a prompt. This also covers
-        // model-origin forget notes (codex round-2 P3).
-        let mut forced: Option<StagingNote> = None;
-        if let Some(threat) = crate::guard::first_threat(&note.content) {
-            // Only HOST forgets ride the force-sensitive path: the
-            // downstream sensitive-park backstop requires origin == Host,
-            // so a model/channel-origin forget would still reach prompts
-            // (codex round-3 P3). The shipped memory_note tool already
-            // refuses kind=forget from models; this hardens the public API.
-            if note.kind == NoteKind::Forget && note.origin == NoteOrigin::Host {
-                if !note.sensitive {
-                    let mut hardened = note.clone();
-                    hardened.sensitive = true;
-                    forced = Some(hardened);
-                }
-            } else {
-                eyre::bail!(
-                    "memory note rejected by the content guard ({threat}); \
-                     rephrase without instruction-like or exfiltration phrasing"
-                );
-            }
-        }
-        // `replaces_id` is interpolated into the consolidation prompt
-        // header — enforce the strict id shape at the boundary, not just
-        // in the tool (codex round-2 P2).
-        if let Some(ref id) = note.replaces_id {
-            if !is_valid_entry_id(id) {
-                eyre::bail!("invalid replaces_id '{id}': expected ^m followed by 6 of [a-z2-7]");
-            }
-        }
-        let note = forced.as_ref().unwrap_or(note);
+        let note = note.checked()?;
         let dir = self.staging_notes_dir();
         tokio::fs::create_dir_all(&dir)
             .await
@@ -1031,7 +990,7 @@ pub enum NoteKind {
 }
 
 impl NoteKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             NoteKind::UserRequest => "user_request",
             NoteKind::Correction => "correction",
@@ -1082,9 +1041,58 @@ pub struct StagingNote {
 }
 
 impl StagingNote {
+    pub(crate) fn checked(&self) -> Result<std::borrow::Cow<'_, Self>> {
+        // Write-time threat gate (#1585). Staged notes are consolidated
+        // into MEMORY.md, which rides the system prompt of every future
+        // session — and non-sensitive note BODIES are copied verbatim into
+        // the consolidation prompt itself.
+        //
+        // Forget notes must still be able to QUOTE the poison they remove,
+        // but the round-1 "exemption is safe" argument was FALSE: a quoted
+        // body reaches the consolidation prompt and can steer the model
+        // into emitting regex-clean hostile adds (codex round-2 P1). So a
+        // threat-flagged forget is ACCEPTED but FORCED SENSITIVE — the
+        // sensitive-first pass parks its body Rust-side before any
+        // provider call, so it never rides a prompt. This also covers
+        // model-origin forget notes (codex round-2 P3).
+        let note = self;
+        let mut forced: Option<StagingNote> = None;
+        if let Some(threat) = crate::guard::first_threat(&note.content) {
+            // Only HOST forgets ride the force-sensitive path: the
+            // downstream sensitive-park backstop requires origin == Host,
+            // so a model/channel-origin forget would still reach prompts
+            // (codex round-3 P3). The shipped memory_note tool already
+            // refuses kind=forget from models; this hardens the public API.
+            if note.kind == NoteKind::Forget && note.origin == NoteOrigin::Host {
+                if !note.sensitive {
+                    let mut hardened = note.clone();
+                    hardened.sensitive = true;
+                    forced = Some(hardened);
+                }
+            } else {
+                eyre::bail!(
+                    "memory note rejected by the content guard ({threat}); \
+                     rephrase without instruction-like or exfiltration phrasing"
+                );
+            }
+        }
+        // `replaces_id` is interpolated into the consolidation prompt
+        // header — enforce the strict id shape at the boundary, not just
+        // in the tool (codex round-2 P2).
+        if let Some(ref id) = note.replaces_id {
+            if !is_valid_entry_id(id) {
+                eyre::bail!("invalid replaces_id '{id}': expected ^m followed by 6 of [a-z2-7]");
+            }
+        }
+        Ok(match forced {
+            Some(note) => std::borrow::Cow::Owned(note),
+            None => std::borrow::Cow::Borrowed(note),
+        })
+    }
+
     /// Render as frontmatter + body. String values are JSON-encoded so
     /// multi-line / CJK / quote-bearing content can't corrupt the header.
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let mut fm = String::from("---\n");
         fm.push_str(&format!("origin: {}\n", self.origin.as_str()));
         fm.push_str(&format!("kind: {}\n", self.kind.as_str()));
