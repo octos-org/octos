@@ -8,7 +8,7 @@
 //! prompt or tool-schema content.
 
 use octos_core::Message;
-use octos_llm::{PromptCacheContext, SemanticCheckpointHint, ToolSpec};
+use octos_llm::{PromptCacheContext, SemanticCheckpointHint, ToolSpec, canonical_object_keys};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -83,10 +83,11 @@ pub(super) fn fingerprint_prompt(messages: &[Message], tools: &[ToolSpec]) -> Pr
             "tool_call_id": message.tool_call_id,
             "reasoning_content": message.reasoning_content,
         });
+        let estimated_tokens = estimate_json_tokens(&stable);
         let segment = PromptSegmentFingerprint {
             kind: format!("message:{}", message.role.as_str()),
-            hash: hash_json(&stable),
-            estimated_tokens: estimate_json_tokens(&stable),
+            hash: hash_json(stable),
+            estimated_tokens,
         };
         if in_leading_system_run && message.role == octos_core::MessageRole::System {
             system_segments.push(segment);
@@ -106,17 +107,18 @@ pub(super) fn fingerprint_prompt(messages: &[Message], tools: &[ToolSpec]) -> Pr
                 "description": tool.description,
                 "input_schema": tool.input_schema,
             });
+            let estimated_tokens = estimate_json_tokens(&stable);
             PromptSegmentFingerprint {
                 kind: format!("tool:{}", tool.name),
-                hash: hash_json(&stable),
-                estimated_tokens: estimate_json_tokens(&stable),
+                hash: hash_json(stable),
+                estimated_tokens,
             }
         })
         .collect::<Vec<_>>();
 
     let stable_prefix_hash = hash_segments(system_segments.iter().chain(tool_segments.iter()));
     let conversation_hash = hash_segments(conversation_segments.iter());
-    let input_hash = hash_json(&json!({
+    let input_hash = hash_json(json!({
         "schema": PROMPT_FINGERPRINT_SCHEMA,
         "stable_prefix_hash": stable_prefix_hash,
         "conversation_hash": conversation_hash,
@@ -157,7 +159,7 @@ pub(super) fn build_prompt_cache_context(
     // Never put a raw session/channel/user id on the provider wire. The
     // deterministic hash is stable across turns and bounded below OpenAI's
     // documented 64-character prompt_cache_key limit.
-    let affinity_hash = hash_json(&json!({
+    let affinity_hash = hash_json(json!({
         "schema": PROMPT_FINGERPRINT_SCHEMA,
         "session": session_key.unwrap_or("anonymous"),
     }));
@@ -176,7 +178,7 @@ pub(super) fn build_prompt_cache_context(
     let epoch_id = authoritative_epoch_id
         .map(str::to_owned)
         .unwrap_or_else(|| {
-            hash_json(&json!({
+            hash_json(json!({
                 "schema": "octos.prompt-cache-epoch.v1",
                 "session": session_key.unwrap_or("anonymous"),
                 "stable_prefix_hash": fingerprint.stable_prefix_hash,
@@ -201,7 +203,7 @@ pub(super) fn build_prompt_cache_context(
             .enumerate()
             .filter_map(|(index, (segment, boundary_kind))| {
                 prefix_tokens = prefix_tokens.saturating_add(segment.estimated_tokens);
-                rolling_hash = hash_json(&json!({
+                rolling_hash = hash_json(json!({
                     "previous": rolling_hash,
                     "kind": segment.kind,
                     "segment": segment.hash,
@@ -350,7 +352,7 @@ pub(super) fn compare_prompt_prefixes(
 }
 
 fn hash_segments<'a>(segments: impl Iterator<Item = &'a PromptSegmentFingerprint>) -> String {
-    hash_json(&Value::Array(
+    hash_json(Value::Array(
         segments
             .map(|segment| {
                 json!({
@@ -368,8 +370,14 @@ fn estimate_json_tokens(value: &Value) -> usize {
         .unwrap_or(1)
 }
 
-fn hash_json(value: &Value) -> String {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
+/// Canonicalize before hashing: the fingerprint inputs embed foreign JSON
+/// (provider tool-call arguments, registered tool schemas) whose key order
+/// octos does not choose, and with serde_json's `preserve_order` feature on —
+/// the octos-cli build graph's shape — `to_vec` would otherwise fingerprint
+/// that order, splitting one logical input across cache identities (the
+/// octos-agent face of the #2633 key-order class).
+fn hash_json(value: Value) -> String {
+    let bytes = serde_json::to_vec(&canonical_object_keys(value)).unwrap_or_default();
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
 }
@@ -452,6 +460,119 @@ mod tests {
         );
         assert!(hosted.semantic_boundaries.is_empty());
         assert_eq!(hosted.affinity_key, context.affinity_key);
+    }
+
+    #[test]
+    fn foreign_json_key_order_does_not_split_the_cache_identity() {
+        // Provider tool-call arguments and registered tool schemas arrive as
+        // foreign JSON whose key order octos does not choose. With
+        // serde_json's `preserve_order` feature — unified on for the whole
+        // workspace build through octos-cli's agent-client-protocol
+        // dependency, so the `cargo test --workspace` CI lane runs this
+        // order-sensitive — the same logical payload under two key orders
+        // previously hashed to two identities, splitting the cache on a
+        // serialization difference. The standalone per-crate lane's sorted
+        // backend canonicalizes either way; to reproduce the order-sensitive
+        // shape in isolation, run with
+        // `-F serde_json/preserve_order`.
+        let mut first = Message::assistant("");
+        first.tool_calls = Some(vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"path": "a", "options": {"depth": 2, "follow": true}}),
+            metadata: None,
+        }]);
+        let mut second = Message::assistant("");
+        second.tool_calls = Some(vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "read".to_owned(),
+            arguments: serde_json::from_value(json!({
+                "options": {"follow": true, "depth": 2},
+                "path": "a",
+            }))
+            .unwrap(),
+            metadata: None,
+        }]);
+
+        let forward_schema = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "depth": {"type": "number"}},
+        });
+        let reversed_schema = serde_json::from_value(json!({
+            "properties": {"depth": {"type": "number"}, "path": {"type": "string"}},
+            "type": "object",
+        }))
+        .unwrap();
+
+        let left = fingerprint_prompt(
+            &[first],
+            &[ToolSpec {
+                name: "read".to_owned(),
+                description: "read".to_owned(),
+                input_schema: forward_schema,
+            }],
+        );
+        let right = fingerprint_prompt(
+            &[second],
+            &[ToolSpec {
+                name: "read".to_owned(),
+                description: "read".to_owned(),
+                input_schema: reversed_schema,
+            }],
+        );
+
+        assert_eq!(left.input_hash, right.input_hash);
+        assert_eq!(left.stable_prefix_hash, right.stable_prefix_hash);
+        assert_eq!(left.conversation_hash, right.conversation_hash);
+    }
+
+    #[test]
+    fn array_element_order_remains_part_of_the_identity() {
+        // Only object keys are canonicalized. Arrays carry wire semantics
+        // (content blocks, argument lists), so reordering one must change
+        // the identity in every build shape.
+        let mut first = Message::assistant("");
+        first.tool_calls = Some(vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"paths": ["a", "b"]}),
+            metadata: None,
+        }]);
+        let mut second = Message::assistant("");
+        second.tool_calls = Some(vec![ToolCall {
+            id: "call_1".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"paths": ["b", "a"]}),
+            metadata: None,
+        }]);
+
+        assert_ne!(
+            fingerprint_prompt(&[first], &[]).input_hash,
+            fingerprint_prompt(&[second], &[]).input_hash
+        );
+    }
+
+    #[test]
+    fn the_wire_affinity_key_is_pinned_for_a_fixed_session() {
+        // affinity_key is the one value that reaches the provider wire
+        // (OpenAI's prompt_cache_key). Its literal happens to be byte-identical
+        // under both serde_json backends because "schema" sorts before
+        // "session"; pin the digest so a future edit that could reintroduce a
+        // build-shape dependence (a key sorting before "schema", a nested
+        // object) has to be a conscious wire-contract decision.
+        let fingerprint = fingerprint_prompt(&[Message::user("x")], &[]);
+        let context = build_prompt_cache_context(
+            &fingerprint,
+            &[Message::user("x")],
+            Some("fixed-session"),
+            None,
+            false,
+        );
+
+        assert_eq!(
+            context.affinity_key,
+            "octos-660c00211854e5b54c69ba97e33e9dd0cf886218679a667080152723b4"
+        );
     }
 
     #[test]
