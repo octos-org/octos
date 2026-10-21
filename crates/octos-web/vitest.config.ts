@@ -13,8 +13,9 @@ export default defineConfig({
     ],
     // The fixture-replay engine is allocation-light and entirely
     // synchronous; a single thread is faster than the pool overhead.
-    pool: 'threads',
-    poolOptions: { threads: { singleThread: true } },
+    // vitest 3+ removed poolOptions.threads.singleThread —
+    // fileParallelism: false is the documented equivalent.
+    fileParallelism: false,
     // Fail fast on accidental CI hangs.
     testTimeout: 5_000,
     // Reporters: keep CI logs minimal; use verbose locally via `npx vitest`.
