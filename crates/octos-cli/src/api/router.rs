@@ -947,10 +947,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .merge(metrics_route)
         .merge(auth_api)
         .route(
-            "/api/register/setup-script/{id}/{auth_token}",
-            get(admin::register_setup_script_public),
-        )
-        .route(
             "/api/preview-signed/{token}",
             get(handlers::serve_signed_preview_root),
         )
