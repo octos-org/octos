@@ -1263,10 +1263,15 @@ mod tests {
 
         let active = Arc::new(AtomicUsize::new(0));
         let max = Arc::new(AtomicUsize::new(0));
+        // Hold long enough that scheduler jitter on shared runners cannot
+        // stagger the two capped workers past each other: with a 150ms hold
+        // a loaded Windows runner observed max=1 (start offsets alone
+        // exceeded the window). The cap-2 overlap assertion needs the
+        // window wider than seconds-level dispatch noise.
         let provider = Arc::new(ConcurrencyProvider {
             active: active.clone(),
             max: max.clone(),
-            hold: Duration::from_millis(150),
+            hold: Duration::from_millis(2000),
         });
 
         let work = TempDir::new().unwrap();
