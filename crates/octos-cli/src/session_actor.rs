@@ -2341,6 +2341,17 @@ pub(crate) async fn emit_lifecycle_hook_payload(
                 "lifecycle hook failed"
             );
         }
+        // #2329: on_resume / on_turn_end are observe-only (not guard-class),
+        // so a breaker trip never produces GuardUnavailable here; the arm
+        // exists for exhaustiveness and mirrors the infra-error handling.
+        HookResult::GuardUnavailable(reason) => {
+            warn!(
+                session = %session_key,
+                event = ?event,
+                reason,
+                "lifecycle guard hook is breaker-disabled; continuing"
+            );
+        }
     }
 }
 
