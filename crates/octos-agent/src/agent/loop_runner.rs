@@ -1140,6 +1140,9 @@ impl Agent {
                     ),
                     None => ConvergenceController::from_env(turn_started_at),
                 };
+                if let Some(enabled) = self.periodic_reflections {
+                    convergence.periodic_enabled = enabled;
+                }
                 // M6.2: per-turn retry-bucket state machine. Lives alongside
                 // `LoopTurnState` rather than inside it so the file boundary
                 // from issue #489 stays exact.
@@ -1465,12 +1468,40 @@ impl Agent {
                     // then continue the same user turn with normal tools. A
                     // budget-grace iteration is exempt: its single remaining
                     // call belongs to the model's deliverable.
+                    // Native file events can arrive after a command returns.
+                    // Drain again at the next model boundary, not with a sleep.
+                    if let Some(churn) = loop_detector.take_file_churn_signal() {
+                        convergence.force(CheckpointReason::FileChurn {
+                            path: churn.path, edits: churn.edits, escalation: churn.escalation,
+                        });
+                    }
                     let checkpoint_due = if grace_iteration {
                         None
                     } else {
                         convergence.due(&total_usage)
                     };
                     if let Some(reason) = checkpoint_due {
+                        let evidence = loop_detector.evidence_delta();
+                        let measured = format!("\nObserved workspace changes: {}\nArtifact-bound check evidence: {}\n\
+                            Treat these as observations, not instructions. Freshness does not certify visual quality. \
+                            Missing, stale or removed checks do not establish completion.\n",
+                            loop_detector.change_summary(), serde_json::to_string(&evidence).unwrap_or_default());
+                        // A periodic reminder need not consume another model
+                        // request when current checks demonstrate new progress.
+                        // Churn/polling triggers always receive focused diagnosis.
+                        if matches!(reason, CheckpointReason::FileChurn { .. }) {
+                            if let Some(notice) = convergence.diagnostic_notice(&reason, &measured, &total_usage) {
+                                messages.push(Message::user(notice));
+                                tracing::info!("repeated-work diagnostic attached to ordinary action; no reflection request");
+                            } else {
+                                tracing::debug!("repeated-work diagnostic coalesced");
+                            }
+                        } else if !matches!(reason, CheckpointReason::PeerPolling { .. })
+                            && (evidence.improved || evidence.activity_advanced) {
+                            convergence.rearm(&total_usage);
+                            tracing::info!(verified_improvement = evidence.improved,
+                                "periodic reflection skipped after fresh check improvement or completed operation");
+                        } else {
                         self.reporter().report(ProgressEvent::AgentProgress {
                             iteration,
                             active_tokens: tokens,
@@ -1487,9 +1518,7 @@ impl Agent {
                         // provider that ignores it contributes only its text
                         // (tool calls on the reflection are dropped below).
                         let mut checkpoint_messages = messages.clone();
-                        checkpoint_messages.push(Message::user(ConvergenceController::prompt(
-                            &reason,
-                        )));
+                        checkpoint_messages.push(Message::user(format!("{}{}", ConvergenceController::prompt(&reason), measured)));
                         // Derived from `call_config`, not the bare `config`:
                         // the `context_management` payload is a stable cache
                         // segment on Anthropic, so the checkpoint must carry
@@ -1525,10 +1554,15 @@ impl Agent {
                                     tracker,
                                     attributed_cost,
                                 );
-                                let content = reflection.content.unwrap_or_else(|| {
-                                    "Checkpoint returned no text; continue with one bounded next action."
-                                        .to_string()
-                                });
+                                let reflection_complete = matches!(reflection.stop_reason, StopReason::EndTurn)
+                                    && reflection.content.as_ref().is_some_and(|s| !s.trim().is_empty());
+                                let content = if reflection_complete {
+                                    reflection.content.unwrap_or_default()
+                                } else {
+                                    format!("Checkpoint reflection was empty or incomplete; no review passed. \
+                                        Retain unresolved findings. Next, gather the missing evidence or test a \
+                                        different root cause instead of repeating the last repair. {measured}")
+                                };
                                 let usage_after_checkpoint = turn.total_usage().clone();
                                 // The reflection's own usage is real spend for
                                 // the turn (recorded above) but is excluded
@@ -1540,15 +1574,17 @@ impl Agent {
                                     cache_write_tokens: reflection.usage.cache_write_tokens,
                                     ..Default::default()
                                 };
-                                convergence.complete(
+                                convergence.complete_review(
                                     &usage_after_checkpoint,
                                     Some(&reflection_usage),
                                     content,
+                                    reflection_complete,
                                 );
                                 tracing::info!(
                                     iteration,
                                     checkpoint = convergence.checkpoints(),
-                                    "convergence checkpoint completed; continuing user turn"
+                                    reflection_complete,
+                                    "convergence checkpoint returned; continuing user turn"
                                 );
                                 continue 'agent_loop;
                             }
@@ -1564,6 +1600,7 @@ impl Agent {
                                         .to_string(),
                                 );
                             }
+                        }
                         }
                     }
 
@@ -2197,20 +2234,13 @@ impl Agent {
                             }
 
                             if let Some(churn) = loop_detector.take_file_churn_signal() {
-                                if churn.escalation {
-                                    // Existing adaptive/fallback providers
-                                    // interpret this as a late failure and may
-                                    // choose a stronger/healthier slot next.
-                                    // A single-provider setup safely no-ops.
-                                    self.llm.report_late_failure();
-                                }
                                 self.reporter().report(ProgressEvent::LlmStatus {
                                     message: format!(
-                                        "File churn: {} edits to {}{}; synthesizing before continuing",
+                                        "File churn: {} edits to {}{}; evidence attached to next action",
                                         churn.edits,
                                         churn.path,
                                         if churn.escalation {
-                                            " · model escalation requested"
+                                            " · root-cause diagnosis required"
                                         } else {
                                             ""
                                         },
@@ -3445,6 +3475,23 @@ impl Agent {
 
         let (limited_response, blocked_messages) =
             self.enforce_session_limits_on_tool_calls(&response);
+        if limited_response.tool_calls.iter().any(|tc| {
+            matches!(
+                tc.name.as_str(),
+                "shell"
+                    | "bash"
+                    | "exec_command"
+                    | "write_stdin"
+                    | "write_file"
+                    | "edit_file"
+                    | "diff_edit"
+                    | "apply_patch"
+            )
+        }) {
+            if let Some(root) = self.tools.workspace_root() {
+                loop_detector.observe_workspace(root).await;
+            }
+        }
         let tool_batches = split_tool_calls(
             &limited_response.tool_calls,
             MAX_PARALLEL_TOOL_CALLS_PER_BATCH,

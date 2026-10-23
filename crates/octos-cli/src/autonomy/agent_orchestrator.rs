@@ -19660,6 +19660,8 @@ fn coalesced_children_note(continuation: &QueuedMasterContinuation) -> String {
     )
 }
 
+const TERMINAL_DELIVERY_SCOPE: &str = "This is a delivery event, not a new user request. Compare these exact child outcomes with what the current task has already incorporated. Continue remaining authorized work when the result enables it, and disclose new failures. If the outcomes are already incorporated, do not restart completed work, rerun broad checks, or invent follow-up requirements. Reopen settled work only for a new contradictory result, a changed requirement, or a still-unfulfilled dependency. A terminal child status alone does not establish task success.";
+
 pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation) -> String {
     // #1697 — the objective is rendered separately (escaped, fenced) in the
     // GoalContinue arm; keep it out of the raw metadata list there so the
@@ -19679,7 +19681,7 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
     };
     match &continuation.reason {
         MasterContinuationReason::ChildCompleted => format!(
-            "[system-internal]\nA supervised child agent finished.\n\nChild agent: {child}\nGroup: {group}\nMetadata:\n{metadata}\n\nGive the user a concise progress update. Mention what this child completed, whether follow-up work remains, and reference artifacts only when metadata or visible task state provides them.{coalesced}",
+            "[system-internal]\nA supervised child agent finished.\n\nChild agent: {child}\nGroup: {group}\nMetadata:\n{metadata}\n\nGive the user a concise progress update. Mention what this child completed, whether follow-up work remains, and reference artifacts only when metadata or visible task state provides them.{coalesced}\n\n{TERMINAL_DELIVERY_SCOPE}",
             child = continuation
                 .child_agent_id
                 .as_ref()
@@ -19689,7 +19691,7 @@ pub(crate) fn master_continuation_prompt(continuation: &QueuedMasterContinuation
             coalesced = coalesced_children_note(continuation),
         ),
         MasterContinuationReason::ScatterJoinComplete => format!(
-            "[system-internal]\nAll supervised child agents in this scatter-join group are terminal.\n\nGroup: {group}\nMetadata:\n{metadata}\n\nProduce the joined answer for the user. Summarize each child result, call out unresolved failures or missing artifacts, and state the next concrete action if one is required.{coalesced}",
+            "[system-internal]\nAll supervised child agents in this scatter-join group are terminal.\n\nGroup: {group}\nMetadata:\n{metadata}\n\nProduce the joined answer for the user. Summarize each child result, call out unresolved failures or missing artifacts, and state the next concrete action if one is required.{coalesced}\n\n{TERMINAL_DELIVERY_SCOPE}",
             group = continuation.group_id.as_str(),
             coalesced = coalesced_children_note(continuation),
         ),
@@ -47877,6 +47879,17 @@ mod tests {
             !prompt.contains("unique") && !prompt.contains("true total"),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn terminal_notifications_should_not_request_a_fresh_task_audit() {
+        for scatter in [false, true] {
+            let item = coalesce_item_for_test("already-returned-result", scatter, 1);
+            let prompt = master_continuation_prompt(&item);
+            assert!(prompt.contains("delivery event, not a new user request"));
+            assert!(prompt.contains("already incorporated"));
+            assert!(prompt.contains("new contradictory result"));
+        }
     }
 
     #[test]

@@ -66,11 +66,13 @@ impl CheckpointReason {
                 escalation,
             } => {
                 let escalation_note = if *escalation {
-                    "; provider/model escalation requested"
+                    "; repeated return to earlier states"
                 } else {
                     ""
                 };
-                format!("{path} was modified {edits} times{escalation_note}")
+                format!(
+                    "{path} returned to an earlier content state after {edits} revisions{escalation_note}"
+                )
             }
         }
     }
@@ -97,6 +99,8 @@ pub(super) struct ConvergenceController {
     pending_reason: Option<CheckpointReason>,
     pending_reflection: Option<String>,
     checkpoints: u32,
+    last_diagnostic_action: Option<u32>,
+    pub(super) periodic_enabled: bool,
 }
 
 impl ConvergenceController {
@@ -119,12 +123,23 @@ impl ConvergenceController {
             10,
             86_400,
         ));
-        Self::new(
+        let mut controller = Self::new(
             started_at,
             llm_call_interval,
             active_token_interval,
             elapsed_interval,
-        )
+        );
+        // Keep the existing default while comparing the event-only policy.
+        // This controls advisory reflections, never required validation or budgets.
+        controller.periodic_enabled = match std::env::var("OCTOS_CONVERGENCE_MODE").as_deref() {
+            Ok("event_only") => false,
+            Ok("periodic") | Err(_) => true,
+            Ok(other) => {
+                tracing::warn!(value = other, "unknown convergence mode; using periodic");
+                true
+            }
+        };
+        controller
     }
 
     pub(super) fn new(
@@ -146,6 +161,8 @@ impl ConvergenceController {
             pending_reason: None,
             pending_reflection: None,
             checkpoints: 0,
+            last_diagnostic_action: None,
+            periodic_enabled: true,
         }
     }
 
@@ -161,6 +178,35 @@ impl ConvergenceController {
         self.completed_action_calls = self.completed_action_calls.saturating_add(1);
     }
 
+    /// Repeated edits/polls get evidence on the next ordinary action call,
+    /// not an extra tools-disabled model round. Coalesce across files so a
+    /// batch rebuilding many layouts cannot create a diagnostic storm.
+    pub(super) fn diagnostic_notice(
+        &mut self,
+        reason: &CheckpointReason,
+        evidence: &str,
+        usage: &TokenUsage,
+    ) -> Option<String> {
+        if self.last_diagnostic_action.is_some_and(|last| {
+            self.completed_action_calls.saturating_sub(last) < self.llm_call_interval.max(10)
+        }) {
+            return None;
+        }
+        self.last_diagnostic_action = Some(self.completed_action_calls);
+        self.rearm(usage);
+        Some(format!(
+            "{CHECKPOINT_CONTEXT_OPEN}\nObserved repeated work: {}.\n\
+             This is an observed state cycle, not a quality verdict. Compare the earlier \
+             decision and its actual result before repeating it. If the return is intentional \
+             (for example a rollback or a distinct experiment), continue the task. Otherwise \
+             choose one different, bounded diagnostic. Do not invent new requirements, reopen \
+             settled decisions without a concrete reason, or change models because of this notice. \
+             Existing verification requirements still apply.\n\
+             {evidence}\n{CHECKPOINT_CONTEXT_CLOSE}",
+            reason.describe()
+        ))
+    }
+
     /// Called at the top of a loop iteration, BEFORE its action call. The call
     /// axis therefore counts COMPLETED action calls (via
     /// [`Self::record_action_call`]), never the pre-call iteration index, so
@@ -171,6 +217,9 @@ impl ConvergenceController {
             return Some(reason);
         }
 
+        if !self.periodic_enabled {
+            return None;
+        }
         // Thresholds count completed ACTION calls and ACTION tokens only: a
         // checkpoint's own reflection call is real spend for the turn but is
         // never recorded as an action call and its tokens are subtracted.
@@ -208,7 +257,7 @@ impl ConvergenceController {
                 ..
             }
         ) {
-            "\nThis is a repeated churn breach. If you cannot identify a substantially different, root-cause-driven approach, the next action must be to pause and ask the user for direction instead of editing again."
+            "\nThis is repeated revision of the same artifact, not proof of failure. Compare the supplied current/stale checks and unresolved findings. If the same defect remains unverified, choose a distinct diagnostic or a small root-cause experiment before another patch. Do not change model, invent a quality pass, or abandon the task because a counter fired."
         } else {
             ""
         };
@@ -218,7 +267,7 @@ impl ConvergenceController {
              1. the user's actual goal and what is already complete;\n\
              2. concrete evidence gathered and changes made;\n\
              3. failures, uncertainty, or repeated work (especially repeated edits);\n\
-             4. whether the current approach is converging;\n\
+             4. which specific finding was resolved, reopened or remains unverified, with its current artifact/check reference;\n\
              5. the smallest 1–3 next actions, or COMPLETE if the goal is satisfied.\n\
              Be concise and factual. Do not address the user and do not call tools.{}",
             reason.describe(),
@@ -241,17 +290,34 @@ impl ConvergenceController {
         reflection_usage: Option<&TokenUsage>,
         reflection: String,
     ) {
-        self.checkpoints = self.checkpoints.saturating_add(1);
-        self.action_calls_at_checkpoint = self.completed_action_calls;
+        let valid = reflection_usage.is_some() && !reflection.trim().is_empty();
+        self.complete_review(usage, reflection_usage, reflection, valid);
+    }
+
+    pub(super) fn complete_review(
+        &mut self,
+        usage: &TokenUsage,
+        reflection_usage: Option<&TokenUsage>,
+        reflection: String,
+        valid: bool,
+    ) {
+        if valid {
+            self.checkpoints = self.checkpoints.saturating_add(1);
+        }
         if let Some(reflection_usage) = reflection_usage {
             self.reflection_active_tokens = self
                 .reflection_active_tokens
                 .saturating_add(active_tokens(reflection_usage));
         }
-        self.active_tokens_at_checkpoint = self.action_active_tokens(usage);
-        self.last_checkpoint_at = Instant::now();
+        self.rearm(usage);
         let reflection = reflection.trim();
         self.pending_reflection = (!reflection.is_empty()).then(|| reflection.to_string());
+    }
+
+    pub(super) fn rearm(&mut self, usage: &TokenUsage) {
+        self.action_calls_at_checkpoint = self.completed_action_calls;
+        self.active_tokens_at_checkpoint = self.action_active_tokens(usage);
+        self.last_checkpoint_at = Instant::now();
     }
 
     /// Turn-cumulative active tokens minus what the reflection calls consumed.
@@ -322,6 +388,35 @@ mod tests {
         for _ in 0..count {
             controller.record_action_call();
         }
+    }
+
+    #[test]
+    fn should_allow_event_only_mode_without_a_verifier_or_periodic_requests() {
+        let mut controller = new_controller(2, 1000);
+        controller.periodic_enabled = false;
+        record_action_calls(&mut controller, 100);
+        let usage = TokenUsage {
+            input_tokens: 500_000,
+            ..Default::default()
+        };
+        assert!(controller.due(&usage).is_none());
+        controller.force(CheckpointReason::PeerPolling {
+            tool_name: "peer_gather".into(),
+        });
+        assert!(matches!(
+            controller.due(&usage),
+            Some(CheckpointReason::PeerPolling { .. })
+        ));
+    }
+
+    #[test]
+    fn should_not_request_a_model_change_when_observing_repeated_states() {
+        let reason = CheckpointReason::FileChurn {
+            path: "source.txt".into(),
+            edits: 10,
+            escalation: true,
+        };
+        assert!(!reason.describe().contains("provider/model"));
     }
 
     #[test]
@@ -554,5 +649,70 @@ mod tests {
     fn elapsed_format_is_compact_for_ui_status() {
         assert_eq!(format_elapsed(Duration::from_secs(9)), "9s");
         assert_eq!(format_elapsed(Duration::from_secs(125)), "2m05s");
+    }
+    #[test]
+    fn should_not_count_incomplete_reflection_as_completed_review() {
+        let mut controller = new_controller(3, 10000);
+        let usage = TokenUsage::default();
+        record_action_calls(&mut controller, 3);
+        controller.complete_review(
+            &usage,
+            Some(&usage),
+            "Incomplete; inspect evidence".into(),
+            false,
+        );
+        assert_eq!(controller.checkpoints(), 0);
+        assert!(controller.due(&usage).is_none());
+        assert!(
+            controller
+                .take_context_message()
+                .unwrap()
+                .contains("Incomplete")
+        );
+    }
+
+    #[test]
+    fn should_rearm_verified_progress_without_counting_a_model_review() {
+        let mut controller = new_controller(3, 10000);
+        let usage = TokenUsage::default();
+        record_action_calls(&mut controller, 3);
+        controller.rearm(&usage);
+        assert_eq!(controller.checkpoints(), 0);
+        assert!(controller.due(&usage).is_none());
+        assert!(controller.take_context_message().is_none());
+    }
+    #[test]
+    fn should_coalesce_churn_diagnostics_without_spending_reflection_calls() {
+        let mut controller = new_controller(20, 100_000);
+        let usage = TokenUsage::default();
+        let reason = CheckpointReason::FileChurn {
+            path: "layout.json".into(),
+            edits: 5,
+            escalation: false,
+        };
+        assert!(
+            controller
+                .diagnostic_notice(&reason, "unverified", &usage)
+                .is_some()
+        );
+        for _ in 0..19 {
+            controller.record_action_call();
+            assert!(
+                controller
+                    .diagnostic_notice(&reason, "unverified", &usage)
+                    .is_none()
+            );
+        }
+        controller.record_action_call();
+        assert!(
+            controller
+                .diagnostic_notice(&reason, "still unverified", &usage)
+                .is_some()
+        );
+        assert_eq!(
+            controller.checkpoints(),
+            0,
+            "diagnostic notes are not successful reviews"
+        );
     }
 }

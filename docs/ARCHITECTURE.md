@@ -5,6 +5,7 @@
 octos is a 25-member Rust workspace (Edition 2024, rust-version 1.85.0) providing both a coding agent CLI and a multi-channel messaging gateway. Pure Rust TLS via rustls (no OpenSSL). Error handling via `eyre`/`color-eyre`.
 
 For the background-task delivery model used by web chat, see [SESSION_EVENT_ARCHITECTURE.md](SESSION_EVENT_ARCHITECTURE.md).
+For external services that publish durable job receipts, see [external job completion](external-job-completion.md).
 For the next hardening/generalization round after the runtime refactor, see [OCTOS_RUNTIME_PHASE2.md](OCTOS_RUNTIME_PHASE2.md).
 
 **Workspace members**:
