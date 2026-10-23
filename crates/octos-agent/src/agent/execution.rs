@@ -1245,6 +1245,9 @@ impl Agent {
                     // Retry once on transient failure (e.g. ominix-api restart)
                     if let Ok(ref r) = result {
                         if !r.success
+                            && bg_tools
+                                .get(&bg_name)
+                                .is_some_and(|tool| tool.retry_background_on_transient_error())
                             && (r.output.contains("error sending request")
                                 || r.output.contains("connection refused"))
                         {

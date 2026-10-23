@@ -190,6 +190,7 @@ pub const TOOL_GROUPS: &[ToolGroupInfo] = &[
         description: "File operations: read, write, edit, and diff-edit files",
         tools: &[
             "read_file",
+            "watch_external_job",
             "write_file",
             "apply_patch",
             "edit_file",
