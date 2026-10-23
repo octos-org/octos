@@ -789,6 +789,41 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  # Branch protection requires the `test-octos-cli (unit|integration|oup)`
+  # contexts — but those check names only come into existence once GitHub
+  # expands the matrix, and on a research-only PR the whole job is skipped at
+  # its job-level `if`, so the matrix never expands and the required contexts
+  # sit at "expected" forever. That dead-end is why research-only PRs
+  # (#2832, #2645, #2310) could only be merged with an admin bypass ("3 of 10
+  # required status checks are expected"). This non-matrix gate always
+  # reports a single stable context: green when the matrix ran green, and
+  # green on an intentional research-only skip; anything else (failure,
+  # cancellation, or a skip without the research-only flag) is red. Point the
+  # branch-protection ruleset at this one context instead of the three matrix
+  # contexts so enforcement no longer depends on matrix expansion.
+  test-octos-cli-gate:
+    name: test-octos-cli-gate
+    needs: [scope, test-octos-cli]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify test-octos-cli outcome
+        env:
+          RESULT: ${{ needs.test-octos-cli.result }}
+          RESEARCH_ONLY: ${{ needs.scope.outputs.research_only }}
+        run: |
+          echo "test-octos-cli: ${RESULT}, research_only: ${RESEARCH_ONLY}"
+          if [ "$RESULT" = success ]; then
+            exit 0
+          fi
+          if [ "$RESULT" = skipped ] && [ "$RESEARCH_ONLY" = true ]; then
+            echo "research-only PR: test-octos-cli skipped by design; gate green"
+            exit 0
+          fi
+          echo "::error::test-octos-cli finished with ${RESULT} (research_only=${RESEARCH_ONLY})"
+          exit 1
+
   # Lightweight check that exercises the `matrix` feature gate. The default
   # `FEATURES` env above intentionally omits `matrix` to keep the main `check`
   # job lean, but the Dockerfile and several release configurations enable it.
