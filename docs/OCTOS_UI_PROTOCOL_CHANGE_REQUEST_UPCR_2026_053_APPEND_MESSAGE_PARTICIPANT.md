@@ -5,7 +5,7 @@
 - Request id: `UPCR-2026-053`
 - Date: 2026-10-23
 - Target protocol: `octos-ui/v1alpha1`
-- Status: proposed (draft implementation)
+- Status: implemented (#2859)
 - Scope: additive optional `participant` on `session/append_message` and on
   persisted `Message` rows; memory extraction shows it; extraction and
   consolidation rules keep participant scope; negotiated feature
