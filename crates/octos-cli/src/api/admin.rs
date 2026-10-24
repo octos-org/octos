@@ -4759,7 +4759,9 @@ pub async fn register_tenant(
     }
 
     // Fail before creating the tenant if this node has no tunnel relay.
-    let server = required_frps_server(&state)?;
+    // (#2344: the value no longer leaves this handler — the registration
+    // email and response no longer embed setup commands.)
+    required_frps_server(&state)?;
 
     let ssh_port = store
         .next_ssh_port()
@@ -4895,6 +4897,48 @@ pub async fn register_setup_script(
     Ok(script)
 }
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn build_register_setup_script(
+    tenant: &crate::tenant::TenantConfig,
+    domain: &str,
+    server: &str,
+) -> String {
+    let install_url = "https://github.com/octos-org/octos/releases/latest/download/install.sh";
+    format!(
+        r#"#!/usr/bin/env bash
+# Setup script for {subdomain}.{domain}
+# Downloads and runs install.sh as a managed tenant bootstrap.
+# Per-tenant tunnel token is embedded — no shared FRPS token needed.
+set -euo pipefail
+
+curl -fsSL "{install_url}" | bash -s -- \
+    --tunnel \
+    --auth-token "{auth_token}" \
+    --port {local_port} \
+    --tenant-name "{subdomain}" \
+    --frps-token "{tunnel_token}" \
+    --ssh-port {ssh_port} \
+    --domain "{domain}" \
+    --frps-server "{server}"
+"#,
+        subdomain = tenant.subdomain,
+        domain = domain,
+        install_url = install_url,
+        auth_token = tenant.auth_token,
+        local_port = tenant.local_port,
+        tunnel_token = tenant.tunnel_token,
+        ssh_port = tenant.ssh_port,
+        server = server,
+    )
+}
+
+/// Minimal HTML escaping for values interpolated into email HTML.
 fn build_register_setup_email(
     tenant: &crate::tenant::TenantConfig,
     domain: &str,
@@ -4975,8 +5019,7 @@ mod register_setup_script_tests {
             updated_at: Utc::now(),
         };
 
-        let (_subject, html) =
-            build_register_setup_email(&tenant, "octos-cloud.org", "relay.example.com");
+        let (_subject, html) = build_register_setup_email(&tenant, "octos-cloud.org");
 
         // #2344: the email must not embed the credential-bearing setup URL
         // or the persistent dashboard token at all.
@@ -5187,16 +5230,10 @@ mod register_flow_tests {
         assert_eq!(resp.0.ssh_port, 6001);
         assert_eq!(resp.0.dashboard_url, "https://macmini.octos-cloud.org");
         assert!(!resp.0.auth_token.is_empty());
-        assert!(
-            resp.0
-                .setup_command_unix
-                .contains("https://octos-cloud.org/api/register/setup-script/macmini/")
-        );
-        assert!(!resp.0.setup_command_unix.contains("FRPS_TOKEN=<shared"));
-        assert!(resp.0.setup_command_windows.contains("-TenantName"));
-        assert!(resp.0.setup_command_windows.contains("macmini"));
-        assert!(resp.0.setup_command_windows.contains("-FrpsToken"));
-        assert!(!resp.0.setup_command_windows.contains("shared-frps-token"));
+        // #2344: the response no longer carries copy-paste setup commands —
+        // the setup script is delivered over the authenticated
+        // GET /api/register/setup-script endpoint instead.
+        assert!(!format!("{:?}", resp.0).contains("/api/register/setup-script/macmini/"));
     }
 
     // ── Duplicate tenant name ───────────────────────────────────────

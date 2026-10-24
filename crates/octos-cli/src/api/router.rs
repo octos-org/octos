@@ -1770,7 +1770,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_register_setup_script_route_bypasses_user_auth() {
+    async fn removed_public_setup_script_route_returns_404() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(TenantStore::open(dir.path()).unwrap());
         let now = Utc::now();
@@ -1821,9 +1821,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.text().await.unwrap();
-        assert!(body.contains("install.sh"));
+        // #2344: the credential-bearing public route was REMOVED — any
+        // request to it must 404 (no redirect, no content), for every
+        // caller, authenticated or not.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         server.abort();
     }
