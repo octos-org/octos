@@ -9,7 +9,10 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::Deserialize;
 
-use super::{Tool, ToolResult};
+use super::{
+    ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, Tool, ToolApprovalDecision, ToolApprovalRequest,
+    ToolResult,
+};
 
 pub struct ManageSkillsTool {
     skills_dir: PathBuf,
@@ -52,6 +55,20 @@ impl Tool for ManageSkillsTool {
         &["gateway"]
     }
 
+    // Mutating actions block on the interactive approval bridge; a human may
+    // legitimately take longer than any dispatch timeout (same contract as
+    // the other approval-gated tools).
+    fn blocks_on_human_input(&self) -> bool {
+        true
+    }
+
+    // Approval-gated tools are Exclusive: nothing else runs while the human
+    // decides, and the mutation itself is serialized against every other
+    // tool call (mirrors shell/edit_file/write_file).
+    fn concurrency_class(&self) -> ConcurrencyClass {
+        ConcurrencyClass::Exclusive
+    }
+
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -89,6 +106,66 @@ impl Tool for ManageSkillsTool {
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let input: Input =
             serde_json::from_value(args.clone()).map_err(|e| eyre::eyre!("invalid input: {e}"))?;
+
+        // #2321: install/update/remove are mutating, supply-chain-facing
+        // actions — installs clone arbitrary repositories and their
+        // lifecycle commands run on this machine at install time — so they
+        // block on an interactive approval. list/search stay ungated. No
+        // approval bridge (headless path) ⇒ fail closed rather than run
+        // unapproved.
+        if matches!(input.action.as_str(), "install" | "update" | "remove") {
+            let requester = TOOL_APPROVAL_CTX.try_with(Clone::clone).ok();
+            let Some(requester) = requester else {
+                tracing::warn!(
+                    action = %input.action,
+                    "skill mutation requires approval — denied (no interactive approval available)"
+                );
+                return Ok(ToolResult {
+                    output: format!(
+                        "Skill {} requires interactive approval and was denied: no interactive approval channel is available. The user can run `octos skills {}` themselves instead.",
+                        input.action, input.action
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            };
+            let tool_id = TOOL_CTX
+                .try_with(|inner| inner.tool_id.clone())
+                .unwrap_or_default();
+            let decision = requester
+                .request_approval(ToolApprovalRequest {
+                    tool_id,
+                    tool_name: self.name().to_owned(),
+                    title: format!("Approve skill {}", input.action),
+                    body: match input.action.as_str() {
+                        "remove" => format!(
+                            "Remove skill '{}' from the installed skills directory.",
+                            input.name.as_deref().unwrap_or_default()
+                        ),
+                        _ => format!(
+                            "{} skill from '{}': installs third-party code whose lifecycle commands run on this machine at install time.",
+                            input.action,
+                            input.repo.as_deref().unwrap_or_default()
+                        ),
+                    },
+                    command: None,
+                    cwd: None,
+                    once_only: false,
+                    host_tool: None,
+                })
+                .await;
+            if matches!(decision, ToolApprovalDecision::Deny) {
+                tracing::warn!(action = %input.action, "skill mutation denied by interactive approval");
+                return Ok(ToolResult {
+                    output: format!(
+                        "Skill {} was denied by interactive approval. Do not retry without the user asking again.",
+                        input.action
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        }
 
         let skills_dir = self.skills_dir.clone();
 
@@ -1066,14 +1143,37 @@ mod tests {
         assert!(result.output.contains("No skills installed"));
     }
 
+    use crate::tools::ToolApprovalRequester;
+
+    struct FixedDecisionRequester {
+        decision: ToolApprovalDecision,
+    }
+
+    #[async_trait]
+    impl ToolApprovalRequester for FixedDecisionRequester {
+        async fn request_approval(&self, _request: ToolApprovalRequest) -> ToolApprovalDecision {
+            // ToolApprovalDecision is Copy — returning the field directly
+            // avoids the clippy::clone_on_copy hit under -D warnings.
+            self.decision
+        }
+    }
+
     #[tokio::test]
     async fn remove_rejects_traversal() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = ManageSkillsTool::new(tmp.path());
-        let result = tool
-            .execute(&serde_json::json!({"action": "remove", "name": "../../etc"}))
-            .await
-            .unwrap();
+        // Mutating actions pass the confirmation gate first; traversal
+        // validation still runs inside the gated path.
+        let requester = std::sync::Arc::new(FixedDecisionRequester {
+            decision: ToolApprovalDecision::Approve,
+        });
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester, async {
+                tool.execute(&serde_json::json!({"action": "remove", "name": "../../etc"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
         assert!(!result.success);
         assert!(result.output.contains("Invalid"));
     }
@@ -1082,12 +1182,68 @@ mod tests {
     async fn install_missing_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let tool = ManageSkillsTool::new(tmp.path());
+        let requester = std::sync::Arc::new(FixedDecisionRequester {
+            decision: ToolApprovalDecision::Approve,
+        });
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester, async {
+                tool.execute(&serde_json::json!({"action": "install"}))
+                    .await
+                    .unwrap()
+            })
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("repo is required"));
+    }
+
+    #[tokio::test]
+    async fn install_without_approval_bridge_denies_fail_closed() {
+        // #2321: no TOOL_APPROVAL_CTX scoped (headless path) ⇒ a mutating
+        // action must NOT run.
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ManageSkillsTool::new(tmp.path());
         let result = tool
-            .execute(&serde_json::json!({"action": "install"}))
+            .execute(&serde_json::json!({
+                "action": "install",
+                "repo": "evil/repo"
+            }))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.output.contains("repo is required"));
+        assert!(result.output.contains("requires interactive approval"));
+    }
+
+    #[tokio::test]
+    async fn install_denied_by_interactive_approval_does_not_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ManageSkillsTool::new(tmp.path());
+        let requester = std::sync::Arc::new(FixedDecisionRequester {
+            decision: ToolApprovalDecision::Deny,
+        });
+        let result = TOOL_APPROVAL_CTX
+            .scope(requester, async {
+                tool.execute(&serde_json::json!({
+                    "action": "install",
+                    "repo": "evil/repo"
+                }))
+                .await
+                .unwrap()
+            })
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("denied by interactive approval"));
+    }
+
+    #[tokio::test]
+    async fn list_and_search_stay_ungated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = ManageSkillsTool::new(tmp.path());
+        // No bridge scoped — read-only actions must not require one.
+        let listed = tool
+            .execute(&serde_json::json!({"action": "list"}))
+            .await
+            .unwrap();
+        assert!(listed.success);
     }
 
     #[tokio::test]
