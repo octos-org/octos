@@ -10246,8 +10246,11 @@ const LLM_MODEL_HINTS_KNOWN: &[&str] = &[
     "uses_completion_tokens",
     "fixed_temperature",
     "lacks_vision",
+    "lacks_video",
+    "retain_tool_images",
     "merge_system_messages",
     "reasoning_style",
+    "reasoning_history",
 ];
 /// Fields a client may plausibly send on this RPC that are REAL but owned
 /// by a different contract tier. They get a dedicated typed error pointing

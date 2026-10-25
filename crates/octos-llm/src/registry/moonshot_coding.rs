@@ -11,8 +11,8 @@ use super::{CreateParams, ProviderEntry};
 /// targets the subscription coding endpoint `https://api.kimi.com/coding/v1`
 /// (OpenAI-compatible) rather than `api.moonshot.ai`, and its keys are the
 /// `sk-kimi-…` coding-plan keys, which the standard Moonshot endpoints reject.
-/// The plan exposes `k3` (Kimi K3 — up to 1M context on higher tiers, low/high/
-/// max thinking) plus `kimi-for-coding` / `kimi-for-coding-highspeed`.
+/// Model ids, wire contracts, and limits are declared in `model_catalog.json`.
+/// This includes K3.1 Pro, K3 and the `kimi-for-coding*` aliases.
 pub const ENTRY: ProviderEntry = ProviderEntry {
     name: "moonshot-coding",
     aliases: &["kimi-coding"],

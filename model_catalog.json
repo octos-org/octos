@@ -2109,7 +2109,116 @@
           "base_url": "https://api.kimi.com/coding/v1",
           "api_key_env": "KIMI_API_KEY"
         }
-      ]
+      ],
+      "model_hints": {
+        "fixed_temperature": true,
+        "reasoning_style": "effort_low_high_max",
+        "reasoning_history": "preserve_or_placeholder"
+      }
+    },
+    {
+      "provider": "moonshot-coding/kimi-for-coding",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.0,
+      "cost_out": 0.0,
+      "context_window": 1048576,
+      "max_output": 0,
+      "endpoints": [
+        {
+          "id": "moonshot-coding",
+          "label": "Kimi Coding Plan",
+          "base_url": "https://api.kimi.com/coding/v1",
+          "api_key_env": "KIMI_API_KEY"
+        }
+      ],
+      "model_hints": {
+        "fixed_temperature": true,
+        "reasoning_style": "effort_low_high_max",
+        "reasoning_history": "preserve_or_placeholder"
+      }
+    },
+    {
+      "provider": "moonshot-coding/k3-256k",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.0,
+      "cost_out": 0.0,
+      "context_window": 262144,
+      "max_output": 131072,
+      "endpoints": [
+        {
+          "id": "moonshot-coding",
+          "label": "Kimi Coding Plan",
+          "base_url": "https://api.kimi.com/coding/v1",
+          "api_key_env": "KIMI_API_KEY"
+        }
+      ],
+      "model_hints": {
+        "fixed_temperature": true,
+        "reasoning_style": "effort_low_high_max",
+        "reasoning_history": "preserve_or_placeholder"
+      }
+    },
+    {
+      "provider": "moonshot-coding/k3.1-pro-highspeed",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.0,
+      "cost_out": 0.0,
+      "context_window": 1048576,
+      "max_output": 0,
+      "endpoints": [
+        {
+          "id": "moonshot-coding",
+          "label": "Kimi Coding Plan",
+          "base_url": "https://api.kimi.com/coding/v1",
+          "api_key_env": "KIMI_API_KEY"
+        }
+      ],
+      "model_hints": {
+        "fixed_temperature": true,
+        "reasoning_style": "effort_low_high_max",
+        "reasoning_history": "preserve"
+      }
+    },
+    {
+      "provider": "moonshot-coding/k3.1-pro",
+      "type": "strong",
+      "stability": 1.0,
+      "tool_avg_ms": 0,
+      "p95_ms": 0,
+      "score": 0.0,
+      "ds_output": 0,
+      "cost_in": 0.0,
+      "cost_out": 0.0,
+      "context_window": 1048576,
+      "max_output": 0,
+      "endpoints": [
+        {
+          "id": "moonshot-coding",
+          "label": "Kimi Coding Plan",
+          "base_url": "https://api.kimi.com/coding/v1",
+          "api_key_env": "KIMI_API_KEY"
+        }
+      ],
+      "model_hints": {
+        "fixed_temperature": true,
+        "reasoning_style": "effort_low_high_max",
+        "reasoning_history": "preserve"
+      }
     },
     {
       "provider": "moonshot-coding/kimi-for-coding-highspeed",
@@ -2130,7 +2239,12 @@
           "base_url": "https://api.kimi.com/coding/v1",
           "api_key_env": "KIMI_API_KEY"
         }
-      ]
+      ],
+      "model_hints": {
+        "fixed_temperature": true,
+        "reasoning_style": "none",
+        "reasoning_history": "preserve_or_placeholder"
+      }
     },
     {
       "provider": "zai-coding/glm-5.3",

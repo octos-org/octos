@@ -283,6 +283,13 @@ Current M9 sandbox-parity decision:
   [UPCR-2026-017](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_017_RUNTIME_PROFILE_INSPECTION.md).
   They let TUI and other non-web clients render dashboard-equivalent login,
   provider, model, MCP, tool, and runtime status from server truth.
+  `profile/llm/upsert` accepts the optional
+  `selection.model_hints.reasoning_history` enum (`omit`, `preserve`,
+  `preserve_with_tools`, `preserve_or_placeholder`). Absent/null inherits the
+  selected route's continuation policy; an explicit value survives persistence
+  and readback. `lacks_video` and `retain_tool_images` are also accepted model
+  hints, matching the provider configuration. These fields do not change tool
+  permissions or select a different model/endpoint.
 - The additive local solo onboarding and permission-policy inspection methods
   (`profile/local/create`, `permission/profile/list`,
   `permission/profile/set`, and the extended `session/status/read` runtime

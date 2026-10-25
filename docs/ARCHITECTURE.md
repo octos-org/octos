@@ -267,16 +267,47 @@ pub struct CreateParams {
 
 ### ModelHints (OpenAI provider)
 
-Auto-detected from model name at construction, overridable via config `model_hints`:
+Known wire contracts are declared beside the model id in `model_catalog.json`
+(`model_hints`, `context_window`, `max_output`). `ModelHints::detect` and context
+lookup consume that same entry. Legacy models without a declared contract retain
+name-based defaults. Route config `model_hints` can override those defaults.
 
 ```rust
 pub struct ModelHints {
     pub uses_completion_tokens: bool,  // o-series, gpt-5, gpt-4.1
     pub fixed_temperature: bool,       // o-series, kimi-k2.5
-    pub lacks_vision: bool,            // deepseek, minimax, mistral, yi-
+    pub lacks_vision: bool,            // explicit text-only endpoint override
+    pub lacks_video: bool,
+    pub retain_tool_images: bool,
     pub merge_system_messages: bool,   // default: true
+    pub reasoning_style: ReasoningStyle,
+    pub reasoning_history: Option<ReasoningHistory>,
 }
 ```
+
+`reasoning_history` governs assistant history serialization independently of
+temperature and effort: `preserve`, `preserve_with_tools`, or `omit`.
+`preserve_or_placeholder` retains the legacy Kimi fallback for imported history
+without reasoning; it never replaces actual returned reasoning. K3.1 uses
+`preserve`, without inventing missing reasoning. An absent/null field in an old
+profile inherits the route's policy. Legacy DeepSeek proxy profiles that set
+`reasoning_style: effort_and_thinking_toggle` still opt into tool continuation;
+an explicit history policy takes precedence.
+
+When adding a model, declare its wire behavior and limits in its catalog row,
+then exercise the registry-to-HTTP contract test. Do not add another model-name
+branch to message serialization. Coding-plan models are explicitly selected via
+`moonshot-coding`; their subscription credentials must not be auto-routed to the
+regular Moonshot API. Existing family defaults are unchanged. Limits of zero
+mean unknown, not zero capacity: the K3.1 output limit remains unspecified until
+verified; the configured request cap still applies. Coding-plan zero dollar
+prices denote subscription accounting, not free usage.
+
+Kimi declarations follow the [Coding Plan model table](https://www.kimi.com/code/docs/en/kimi-code/models.html)
+and [K3.1 continuation contract](https://platform.kimi.com/docs/guide/kimi-k3-1-pro-quickstart).
+`tests/kimi_model_contract.rs` checks all coding catalog entries, the destination,
+sampling/effort fields, streamed tool calls, and serialized/restored history.
+It requires no real API key or billable calls.
 
 ### SSE Streaming
 

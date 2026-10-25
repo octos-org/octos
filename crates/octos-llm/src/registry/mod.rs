@@ -21,6 +21,52 @@ const CANONICAL_MODEL_CATALOG: &str = include_str!(concat!(
     "/../../model_catalog.json"
 ));
 
+/// Wire behavior and limits live beside the catalog model id. Adding an alias
+/// must not require another name check in the request serializer or context code.
+#[derive(serde::Deserialize)]
+pub(crate) struct ModelContract {
+    provider: String,
+    #[serde(default)]
+    pub context_window: u32,
+    #[serde(default)]
+    pub max_output: u32,
+    pub model_hints: ModelHints,
+}
+
+pub(crate) fn catalog_model_contract(model: &str) -> Option<&'static ModelContract> {
+    static CONTRACTS: OnceLock<Vec<ModelContract>> = OnceLock::new();
+    let contracts = CONTRACTS.get_or_init(|| {
+        // Only explicitly declared contracts participate. Legacy model rows
+        // continue to use their existing provider defaults/name heuristics.
+        let catalog: serde_json::Value = serde_json::from_str(CANONICAL_MODEL_CATALOG)
+            .expect("compiled model catalog must be valid JSON");
+        catalog["models"]
+            .as_array()
+            .expect("catalog models array")
+            .iter()
+            .filter(|row| row.get("model_hints").is_some())
+            .map(|row| serde_json::from_value(row.clone()).expect("valid catalog model contract"))
+            .collect()
+    });
+    let model = model.to_lowercase();
+    if let Some((family, id)) = model.split_once('/') {
+        let family = family.split('@').next().unwrap_or(family);
+        contracts
+            .iter()
+            .find(|c| c.provider == format!("{family}/{id}"))
+    } else {
+        // Bare ids are accepted only when unambiguous; qualified ids never
+        // borrow another provider's contract merely because a name overlaps.
+        let mut matches = contracts.iter().filter(|c| {
+            c.provider
+                .split_once('/')
+                .is_some_and(|(_, id)| id == model)
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+}
+
 /// `family -> default model`, built once from the rows flagged `"default": true`.
 ///
 /// A family's default used to be a `&'static str` on each `ProviderEntry`, which

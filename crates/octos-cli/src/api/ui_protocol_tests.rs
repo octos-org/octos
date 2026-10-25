@@ -1672,7 +1672,12 @@ async fn llm_upsert_round_trips_typed_inference_fields() {
                     "top_p": 0.9,
                     "context_window": 16384,
                     "reasoning_effort": "high",
-                    "model_hints": { "uses_completion_tokens": true }
+                    "model_hints": {
+                        "uses_completion_tokens": true,
+                        "reasoning_history": "preserve",
+                        "retain_tool_images": true,
+                        "lacks_video": true
+                    }
                 },
                 "set_primary": true
             }),
@@ -1732,6 +1737,12 @@ async fn llm_upsert_round_trips_typed_inference_fields() {
         Some(octos_llm::ReasoningEffort::High)
     );
     assert!(primary.model_hints.as_ref().unwrap().uses_completion_tokens);
+    assert_eq!(
+        primary.model_hints.as_ref().unwrap().reasoning_history,
+        Some(octos_llm::openai::ReasoningHistory::Preserve)
+    );
+    assert!(primary.model_hints.as_ref().unwrap().retain_tool_images);
+    assert!(primary.model_hints.as_ref().unwrap().lacks_video);
 
     // The list projection round-trips every configured field — and stays
     // truthful: a client must be able to tell saved values from inherited.
@@ -1753,6 +1764,15 @@ async fn llm_upsert_round_trips_typed_inference_fields() {
         primary_json["model_hints"]["uses_completion_tokens"],
         json!(true)
     );
+    assert_eq!(
+        primary_json["model_hints"]["reasoning_history"],
+        json!("preserve")
+    );
+    assert_eq!(
+        primary_json["model_hints"]["retain_tool_images"],
+        json!(true)
+    );
+    assert_eq!(primary_json["model_hints"]["lacks_video"], json!(true));
     assert_eq!(primary_json["cost_per_m"], json!(1.5));
 
     // Re-upsert the same address WITHOUT the inference fields: absent ≡

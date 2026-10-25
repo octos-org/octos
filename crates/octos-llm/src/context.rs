@@ -106,6 +106,11 @@ fn catalog_lookup_in(map: &HashMap<String, CatalogModel>, model_id: &str) -> Opt
     if let Some(entry) = map.get(&m) {
         return Some((entry.context_window, entry.max_output));
     }
+    // An old runtime catalog may know only `k3`. Its fuzzy match must not
+    // override the exact contract for `k3-256k` or a newly added `k3.1-pro`.
+    if let Some(contract) = crate::registry::catalog_model_contract(&m) {
+        return Some((contract.context_window as u64, contract.max_output as u64));
+    }
     // Deterministic substring match, mirroring pricing.rs so both agree:
     //   1. Among keys the model id CONTAINS (families the id extends), the
     //      LONGEST (most specific) wins.
@@ -135,6 +140,11 @@ pub fn context_window_tokens(model_id: &str) -> u32 {
             return ctx as u32;
         }
     }
+    if let Some(contract) = crate::registry::catalog_model_contract(model_id)
+        && contract.context_window > 0
+    {
+        return contract.context_window;
+    }
     // Model-specific defaults for known long-context models when the catalog
     // is unavailable or lacks the exact variant (e.g. deepseek-v4-flash, which
     // has no dedicated catalog lane). DeepSeek V4, MiniMax M3 and Kimi K3 are
@@ -161,6 +171,11 @@ pub fn max_output_tokens(model_id: &str) -> u32 {
         if max_out > 0 {
             return max_out as u32;
         }
+    }
+    if let Some(contract) = crate::registry::catalog_model_contract(model_id)
+        && contract.max_output > 0
+    {
+        return contract.max_output;
     }
     // Model-specific defaults when catalog is unavailable.
     // Use the model's native max output to avoid truncation.
@@ -679,12 +694,21 @@ mod tests {
         assert_eq!(max_output_tokens("moonshot/kimi-k3"), 131_072);
         // The coding plan's bare `k3` / `kimi-for-coding*` ids are also 1M.
         assert_eq!(context_window_tokens("k3"), 1_048_576);
-        assert_eq!(
-            context_window_tokens("kimi-for-coding-highspeed"),
-            1_048_576
-        );
+        assert_eq!(context_window_tokens("kimi-for-coding-highspeed"), 262_144);
         // Guard: a substring `k3` in an unrelated model is NOT the coding plan.
         assert_eq!(context_window_tokens("mock-k3000"), 128_000);
+    }
+
+    #[test]
+    fn should_prefer_declared_contract_over_stale_catalog_fuzzy_matches() {
+        let mut entries = vec![("moonshot-coding/k3".to_owned(), 1_048_576, 131_072)];
+        let map = build_catalog_map(&entries);
+        assert_eq!(catalog_lookup_in(&map, "k3-256k"), Some((262_144, 131_072)));
+        assert_eq!(catalog_lookup_in(&map, "k3.1-pro"), Some((1_048_576, 0)));
+        // An explicit runtime limit for a plan/tier still takes precedence.
+        entries.push(("moonshot-coding/k3.1-pro".to_owned(), 262_144, 32_768));
+        let map = build_catalog_map(&entries);
+        assert_eq!(catalog_lookup_in(&map, "k3.1-pro"), Some((262_144, 32_768)));
     }
 
     #[test]
