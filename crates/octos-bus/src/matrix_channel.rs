@@ -872,6 +872,12 @@ struct AppserviceState {
     /// membership-event invalidation so an in-flight fetch that predates the
     /// event cannot reinsert stale counts (see `room_member_counts`).
     dm_member_cache_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Senders whose messages are dropped before any handler sees them
+    /// (#1546). The `is_managed_user` guard only covers the bot itself and
+    /// its virtual users; two INDEPENDENT bots in one room both replying
+    /// with `m.text` loop forever. The operator lists the peer bot IDs here
+    /// and this channel stops hearing them.
+    ignored_senders: HashSet<String>,
 }
 
 fn error_json_response(
@@ -914,6 +920,10 @@ pub struct MatrixChannel {
     bot_manager: std::sync::OnceLock<Arc<dyn BotManager>>,
     /// Operator override users for break-glass bot management.
     admin_allowed_senders: HashSet<String>,
+    /// Senders whose inbound messages are dropped unconditionally (#1546) —
+    /// typically the user IDs of OTHER bots sharing a room, to break
+    /// bot-to-bot reply loops. See [`Self::with_ignored_senders`].
+    ignored_senders: HashSet<String>,
     /// Bounded FIFO of event_id → sender_user_id so edit_message can reuse the correct identity
     /// without growing unbounded over a long-lived gateway process.
     event_senders: Arc<RwLock<VecDeque<(String, String)>>>,
@@ -973,6 +983,7 @@ impl MatrixChannel {
             bot_router: Arc::new(BotRouter::new(None)),
             bot_manager: std::sync::OnceLock::new(),
             admin_allowed_senders: HashSet::new(),
+            ignored_senders: HashSet::new(),
             event_senders: Arc::new(RwLock::new(VecDeque::new())),
             swarm_supervisor: None,
             media_dir: None,
@@ -1007,6 +1018,16 @@ impl MatrixChannel {
 
     pub fn is_operator_sender(&self, sender: &str) -> bool {
         self.admin_allowed_senders.contains(sender)
+    }
+
+    /// Drop every inbound message from the given senders before any handler
+    /// runs (#1546). The `is_managed_user` guard already covers this bot and
+    /// its virtual users; this closes the remaining bot-to-bot loop — two
+    /// independent bots in one room each replying to the other's `m.text`
+    /// with `m.text` never terminate. List the peer bot user IDs here.
+    pub fn with_ignored_senders(mut self, ignored_senders: Vec<String>) -> Self {
+        self.ignored_senders = ignored_senders.into_iter().collect();
+        self
     }
 
     /// Configure a `BotRouter` with persistence at `{data_dir}/matrix-bot-routes.json`.
@@ -1717,6 +1738,13 @@ async fn handle_transaction(
             &server_suffix,
             &state.user_prefix,
         ) {
+            continue;
+        }
+
+        // #1546: also drop messages from operator-configured senders
+        // (typically other bots) so bot-to-bot `m.text` reply loops
+        // terminate instead of running until the room or process dies.
+        if state.ignored_senders.contains(sender) {
             continue;
         }
 
@@ -2524,6 +2552,7 @@ impl Channel for MatrixChannel {
             mention_only: self.mention_only,
             dm_member_cache: self.dm_member_cache.clone(),
             dm_member_cache_generation: self.dm_member_cache_generation.clone(),
+            ignored_senders: self.ignored_senders.clone(),
         };
 
         let app = Router::new()
