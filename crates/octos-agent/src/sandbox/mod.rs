@@ -1563,6 +1563,12 @@ mod tests {
     // (`C:\\...`) fails the Docker path validator. Gate off Windows.
     #[cfg(not(target_os = "windows"))]
     #[test]
+    // #1987: the Docker fenced-workspace ro-mount assumes Unix path
+    // semantics — on a Windows host the cwd (`C:\...`) fails the Docker
+    // path validator (`:` is rejected) before any `:/workspace:ro` suffix
+    // can appear. Gate off Windows, mirroring the macOS-fence test below.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
     fn fence_degrades_docker_mount_to_ro() {
         // #1976 honest degradation: Docker mounts are concrete too — a
         // fenced workspace mounts `:ro` (fail closed for the shell).
