@@ -80,7 +80,7 @@ use octos_core::ui_protocol::{
     UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
     UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
     UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
-    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionCancelledEvent, UserQuestionRequestedEvent,
     UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
     hydrate_sections, progress_kinds, thread_status,
 };
@@ -37276,11 +37276,23 @@ async fn run_m9_fixture_turn(
             // instead of leaking until its waiter guard drops with
             // `waiter_dropped`, and a reconnect never re-shows a question for
             // the dead turn.
-            contracts.user_questions.cancel_pending_for_turn(
+            for cancelled_question in contracts.user_questions.cancel_pending_for_turn(
                 &session_id,
                 &turn_id,
                 approval_cancelled_reasons::TURN_INTERRUPTED,
-            );
+            ) {
+                let _ = send_notification_durable(
+                    &ws,
+                    &ledger,
+                    UiNotification::UserQuestionCancelled(
+                        UserQuestionCancelledEvent::turn_interrupted(
+                            session_id.clone(),
+                            cancelled_question.question_id,
+                            cancelled_question.turn_id,
+                        ),
+                    ),
+                );
+            }
             try_emit_terminal(
                 &turn_state,
                 TerminalReason::Interrupted,
@@ -45152,11 +45164,24 @@ async fn run_standalone_turn(
         // `Cancelled` outcome; the turn then terminates via the
         // `turn/error code=interrupted` emitted below (Phase-1 reuses the
         // terminal path rather than a dedicated question-cancelled signal).
-        contracts.user_questions.cancel_pending_for_turn(
+        for cancelled_question in contracts.user_questions.cancel_pending_for_turn(
             &session_id,
             &turn_id,
             approval_cancelled_reasons::TURN_INTERRUPTED,
-        );
+        ) {
+            let _ = send_notification_durable_offloaded(
+                &ws,
+                &ledger,
+                UiNotification::UserQuestionCancelled(
+                    UserQuestionCancelledEvent::turn_interrupted(
+                        session_id.clone(),
+                        cancelled_question.question_id,
+                        cancelled_question.turn_id,
+                    ),
+                ),
+            )
+            .await;
+        }
         // Handler is awaiting our terminal emission + ack. Emit exactly once.
         try_emit_terminal(
             &turn_state,
@@ -50112,6 +50137,7 @@ fn ledger_event_cursor(event: &UiProtocolLedgerEvent) -> Option<UiCursor> {
             | UiNotification::ApprovalAutoResolved(_)
             | UiNotification::ApprovalDecided(_)
             | UiNotification::ApprovalCancelled(_)
+            | UiNotification::UserQuestionCancelled(_)
             // UPCR-2026-023: structured user-questions are non-cursor-bearing
             // (like approval/requested); the durable ledger cursor on the
             // surrounding LedgeredUiProtocolEvent is authoritative for replay.
