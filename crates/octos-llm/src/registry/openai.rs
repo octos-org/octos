@@ -62,6 +62,7 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     if let Some(url) = p.base_url {
         provider = provider.with_base_url(&url);
     }
+    provider = provider.with_media_transport(p.media_transport.unwrap_or_default());
     if let Some(hints) = p.model_hints {
         provider = provider.with_hints(hints);
     }

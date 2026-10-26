@@ -38,6 +38,7 @@ pub mod catalog;
 pub mod error;
 pub mod high_level;
 pub mod host;
+pub mod media_transport;
 pub mod middleware;
 
 pub mod anthropic;

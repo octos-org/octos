@@ -90,6 +90,11 @@ pub struct Config {
     #[serde(default)]
     pub model_hints: Option<octos_llm::openai::ModelHints>,
 
+    /// Image upload/reference adapter for this route. Auto selects only known
+    /// official endpoints; custom proxies must opt in explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_transport: Option<octos_llm::media_transport::MediaTransportMode>,
+
     /// API protocol type: "openai" (default) or "anthropic".
     /// When set to "anthropic", the Anthropic Messages API format is used
     /// regardless of the provider name (for Anthropic-compatible proxies).
@@ -482,6 +487,8 @@ pub struct FallbackModel {
     /// Override auto-detected model hints for this fallback.
     #[serde(default)]
     pub model_hints: Option<octos_llm::openai::ModelHints>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_transport: Option<octos_llm::media_transport::MediaTransportMode>,
     /// API protocol type: "openai" or "anthropic". Overrides provider default.
     #[serde(default)]
     pub api_type: Option<String>,

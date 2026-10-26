@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::media_transport::{ImageTransport, MediaTransportMode};
 use crate::vision;
 
 use crate::cache_manifest::{
@@ -40,6 +41,12 @@ pub struct ModelHints {
     /// Model lacks vision/multimodal support (images stripped from requests).
     #[serde(default)]
     pub lacks_vision: bool,
+
+    /// Whether this model accepts uploaded image references on a capable
+    /// endpoint. None inherits support from the provider adapter; false keeps
+    /// the same pixels inline. This does not select a provider protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_file_references: Option<bool>,
 
     /// Model takes images but not video (`video_url` parts stripped, the
     /// file named in a note instead). Not inferred from the model name, for
@@ -115,6 +122,7 @@ impl Default for ModelHints {
             uses_completion_tokens: false,
             fixed_temperature: false,
             lacks_vision: false,
+            image_file_references: None,
             lacks_video: false,
             retain_tool_images: false,
             merge_system_messages: true,
@@ -223,6 +231,7 @@ impl ModelHints {
             uses_completion_tokens,
             fixed_temperature,
             lacks_vision,
+            image_file_references: None,
             lacks_video: false,
             retain_tool_images: false,
             merge_system_messages: true,
@@ -324,6 +333,7 @@ pub struct OpenAIProvider {
     /// explicit opt-in/out must survive either builder-call order (mirrors
     /// `AnthropicProvider::prompt_caching_override`).
     prompt_cache_affinity_override: Option<bool>,
+    media_transport: MediaTransportMode,
 }
 
 const OFFICIAL_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -358,6 +368,7 @@ impl OpenAIProvider {
             provider_label: "openai".to_string(),
             prompt_cache_affinity: true,
             prompt_cache_affinity_override: None,
+            media_transport: MediaTransportMode::Auto,
         }
     }
 
@@ -445,6 +456,9 @@ impl OpenAIProvider {
 
     /// Override the auto-detected model hints.
     pub fn with_hints(mut self, mut hints: ModelHints) -> Self {
+        if hints.image_file_references.is_none() {
+            hints.image_file_references = self.hints.image_file_references;
+        }
         // Old/partial profiles do not know this field. They must not erase a
         // route's continuation contract when overriding unrelated options.
         if hints.reasoning_history.is_none() {
@@ -458,6 +472,14 @@ impl OpenAIProvider {
                 };
         }
         self.hints = hints;
+        self
+    }
+
+    /// Select an image transport for this route. Auto enables only declared
+    /// official endpoints; custom proxies opt in explicitly. No model-name
+    /// matching is involved, and changing the base URL cannot reuse old IDs.
+    pub fn with_media_transport(mut self, mode: MediaTransportMode) -> Self {
+        self.media_transport = mode;
         self
     }
 
@@ -485,20 +507,11 @@ impl OpenAIProvider {
     /// image-modality fallback can re-send a rebuilt (text-only) request
     /// without duplicating the wire setup.
     async fn post_chat(&self, request: &OpenAIRequest<'_>) -> Result<reqwest::Response> {
-        self.client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(
-                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
-            ))
-            .json(request)
-            .send()
+        let body = serde_json::to_value(request).wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::SerializeRequest)
+        })?;
+        self.send_with_media(&self.client, body)
             .await
-            .inspect_err(|error| crate::provider::log_android_transport_failure(error, false))
             .wrap_err_with(|| {
                 crate::provider::transport_error_message(
                     false,
@@ -528,17 +541,8 @@ impl OpenAIProvider {
         // Stream client: no total timeout, so a long healthy generation is not
         // cut off. Stalls are bounded by the client's per-read timeout and the
         // agent's stream-timeout guards (see build_streaming_http_client).
-        self.stream_client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
+        self.send_with_media(&self.stream_client, body)
             .await
-            .inspect_err(|error| crate::provider::log_android_transport_failure(error, true))
             .wrap_err_with(|| {
                 crate::provider::transport_error_message(
                     true,
@@ -547,6 +551,25 @@ impl OpenAIProvider {
                     crate::provider::ApiStyle::OpenAiChatCompletions,
                 )
             })
+    }
+
+    async fn send_with_media(
+        &self,
+        client: &Client,
+        body: serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        ImageTransport::new(
+            &self.base_url,
+            self.api_key.expose_secret(),
+            self.media_transport,
+            &self.client,
+        )
+        .send(
+            client,
+            body,
+            !self.hints.lacks_vision && self.hints.image_file_references != Some(false),
+        )
+        .await
     }
 
     /// Lane-attributed wording for operational failures (see
@@ -2101,6 +2124,7 @@ mod tests {
     #[test]
     fn test_model_hints_serde_roundtrip() {
         let hints = ModelHints {
+            image_file_references: None,
             uses_completion_tokens: true,
             fixed_temperature: false,
             lacks_vision: true,
@@ -2991,6 +3015,7 @@ mod tests {
     #[test]
     fn test_with_hints_overrides_detection() {
         let p = OpenAIProvider::new("key", "gpt-4o").with_hints(ModelHints {
+            image_file_references: None,
             uses_completion_tokens: true,
             fixed_temperature: true,
             lacks_vision: true,

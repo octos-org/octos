@@ -5686,6 +5686,7 @@ dependencies = [
  "dirs",
  "eyre",
  "futures",
+ "http",
  "jsonwebtoken",
  "libc",
  "metrics",

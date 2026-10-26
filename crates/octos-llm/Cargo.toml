@@ -19,6 +19,7 @@ libc = { workspace = true }
 octos-core = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+http = "1"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -307,6 +307,7 @@ Goal 记录 Agent 要完成什么，Loop 安排周期性轮次，Monitor 观察�
   `profile/llm/test` 和 `profile/llm/select` 支持发现、配置、连接测试与选择。
 - **配置工作流通道：** 已公告的 `profile/sub_providers/*` 方法管理逐节点路由使用的
   命名提供者通道；修改在对应运行时重新构建后生效。
+- **复用图片上传：** [媒体传输层](docs/ARCHITECTURE.md#image-transport)让同一进程的 worker 共享图片引用，端点适配器与模型能力独立配置。
 - **检查路由：** `router/status` 和 `router/failover` 提供路由事件；
   `router/get_metrics` 与 `router/set_mode` 提供已公告的指标查询和控制接口。
 

@@ -146,6 +146,8 @@ pub struct CreateParams {
     pub base_url: Option<String>,
     /// Config-level hint overrides (`None` → auto-detect from model name).
     pub model_hints: Option<ModelHints>,
+    /// Provider-route image transport policy, separate from model capabilities.
+    pub media_transport: Option<crate::media_transport::MediaTransportMode>,
     /// HTTP request timeout in seconds (`None` → provider default).
     pub llm_timeout_secs: Option<u64>,
     /// HTTP connect timeout in seconds (`None` → provider default).

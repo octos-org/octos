@@ -4703,6 +4703,7 @@ mod tests {
                 family_id: Some("deepseek".into()),
                 model_id: Some("deepseek-v4-pro".into()),
                 route: Some(crate::profiles::LlmRouteConfig {
+                    media_transport: None,
                     route_id: None,
                     label: None,
                     base_url: None,

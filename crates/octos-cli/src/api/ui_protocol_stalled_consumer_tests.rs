@@ -513,6 +513,7 @@ async fn stalled_prompt_fixture() -> StalledPromptFx {
                     family_id: Some("openai".to_string()),
                     model_id: Some("gpt-4o-mini".to_string()),
                     route: Some(crate::profiles::LlmRouteConfig {
+                        media_transport: None,
                         route_id: None,
                         label: None,
                         base_url: None,

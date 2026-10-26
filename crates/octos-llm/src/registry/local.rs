@@ -60,6 +60,7 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let mut provider = OpenAIProvider::new(&key, &model)
         .with_provider_label("local")
         .with_base_url(&url);
+    provider = provider.with_media_transport(p.media_transport.unwrap_or_default());
     if let Some(hints) = p.model_hints {
         provider = provider.with_hints(hints);
     }
@@ -89,6 +90,7 @@ mod tests {
             model: None,
             base_url: None,
             model_hints: None,
+            media_transport: None,
             llm_timeout_secs: None,
             llm_connect_timeout_secs: None,
         }

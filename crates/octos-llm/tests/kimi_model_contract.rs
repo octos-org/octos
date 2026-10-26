@@ -41,6 +41,7 @@ async fn should_send_complete_kimi_contract_through_registry_after_resume() {
                 model: Some(model.into()),
                 base_url: Some(server.uri()),
                 model_hints: hints,
+                media_transport: None,
                 llm_timeout_secs: None,
                 llm_connect_timeout_secs: None,
             })
@@ -135,6 +136,7 @@ async fn should_preserve_streamed_kimi_state_through_tool_result_and_resume() {
             model: Some(model.into()),
             base_url: Some(server.uri()),
             model_hints: None,
+            media_transport: None,
             llm_timeout_secs: None,
             llm_connect_timeout_secs: None,
         })

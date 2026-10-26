@@ -1120,6 +1120,7 @@ pub async fn test_provider(
             model: Some(req.model.clone()),
             base_url: req.base_url.clone(),
             model_hints: None,
+            media_transport: None,
             llm_timeout_secs: None,
             llm_connect_timeout_secs: None,
         };

@@ -365,6 +365,7 @@ for interactive work and configure separate provider lanes for workflow nodes.
 - **Configure workflow lanes:** the advertised `profile/sub_providers/*`
   methods manage named provider lanes for per-node routing. Changes take effect
   when the corresponding runtime is rebuilt.
+- **Reuse image uploads:** [provider-scoped media transport](docs/ARCHITECTURE.md#image-transport) shares image references across workers in one process, with separate endpoint adapters and model capabilities.
 - **Inspect routing:** `router/status` and `router/failover` expose routing
   events; `router/get_metrics` and `router/set_mode` provide the advertised
   metrics and control surface.

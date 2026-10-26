@@ -2330,6 +2330,7 @@ mod tests {
                         family_id: Some("openai".to_string()),
                         model_id: Some("gpt-4o-mini".to_string()),
                         route: Some(LlmRouteConfig {
+                            media_transport: None,
                             route_id: None,
                             label: None,
                             base_url: None,
@@ -2428,6 +2429,7 @@ mod tests {
                         family_id: Some("openai".to_string()),
                         model_id: Some("gpt-4o-mini".to_string()),
                         route: Some(LlmRouteConfig {
+                            media_transport: None,
                             route_id: None,
                             label: None,
                             base_url: None,
@@ -2519,6 +2521,7 @@ mod tests {
                         family_id: Some("openai".to_string()),
                         model_id: Some("gpt-4o-mini".to_string()),
                         route: Some(LlmRouteConfig {
+                            media_transport: None,
                             route_id: None,
                             label: None,
                             base_url: None,
@@ -2584,6 +2587,7 @@ mod tests {
                         family_id: Some("openai".to_string()),
                         model_id: Some("gpt-4o-mini".to_string()),
                         route: Some(LlmRouteConfig {
+                            media_transport: None,
                             route_id: None,
                             label: None,
                             base_url: None,

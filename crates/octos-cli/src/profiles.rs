@@ -884,6 +884,9 @@ pub struct LlmModelSelectionConfig {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmRouteConfig {
+    /// Image transport policy for this endpoint/account, not a model-name rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_transport: Option<octos_llm::media_transport::MediaTransportMode>,
     /// Stable route ID from the catalog (e.g. "official", "autodl", "wisemodel").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_id: Option<String>,
@@ -2938,6 +2941,7 @@ pub(crate) fn config_from_profile(
                 .as_ref()
                 .and_then(|route| route.api_key_env.clone()),
             model_hints: fb.model_hints.clone(),
+            media_transport: fb.route.as_ref().and_then(|route| route.media_transport),
             api_type: fb.route.as_ref().and_then(|route| route.api_type.clone()),
             cost_per_m: fb.cost_per_m,
             strong: fb.strong.unwrap_or_else(crate::config::default_true),
@@ -2999,6 +3003,9 @@ pub(crate) fn config_from_profile(
         // Fields not configured through profiles — use defaults
         version: None,
         model_hints: primary.and_then(|selection| selection.model_hints.clone()),
+        media_transport: primary
+            .and_then(|selection| selection.route.as_ref())
+            .and_then(|route| route.media_transport),
         // OLP #29 S2b: thread the profile's [[mcp_servers]] into the runtime
         // config so the gateway actually spawns them and registers their
         // tools (was hard-zeroed: profile-level MCP config never took effect).
@@ -3633,6 +3640,7 @@ mod tests {
             family_id: Some(family_id.into()),
             model_id: Some(model_id.into()),
             route: Some(LlmRouteConfig {
+                media_transport: None,
                 route_id: None,
                 label: None,
                 base_url: base_url.map(str::to_string),
@@ -4200,6 +4208,7 @@ mod tests {
                         family_id: Some("minimax".into()),
                         model_id: Some("MiniMax-M2.5-highspeed".into()),
                         route: Some(LlmRouteConfig {
+                            media_transport: None,
                             route_id: Some("wisemodel".into()),
                             label: Some("WiseModel".into()),
                             base_url: Some("https://api.wisemodel.cn/v1".into()),
@@ -4251,6 +4260,9 @@ mod tests {
                         model_id: Some("kimi-k2.5".into()),
                         route: Some(LlmRouteConfig {
                             route_id: Some("autodl".into()),
+                            media_transport: Some(
+                                octos_llm::media_transport::MediaTransportMode::MoonshotFiles,
+                            ),
                             label: Some("AutoDL".into()),
                             base_url: Some("https://www.autodl.art/api/v1".into()),
                             api_key_env: Some("AUTODL_API_KEY".into()),
@@ -4260,6 +4272,7 @@ mod tests {
                             uses_completion_tokens: true,
                             fixed_temperature: false,
                             lacks_vision: false,
+                            image_file_references: Some(false),
                             lacks_video: false,
                             retain_tool_images: false,
                             merge_system_messages: false,
@@ -4280,6 +4293,9 @@ mod tests {
                         model_id: Some("MiniMax-M2.5-highspeed".into()),
                         route: Some(LlmRouteConfig {
                             route_id: Some("wisemodel".into()),
+                            media_transport: Some(
+                                octos_llm::media_transport::MediaTransportMode::Inline,
+                            ),
                             label: Some("WiseModel".into()),
                             base_url: Some("https://api.wisemodel.cn/v1".into()),
                             api_key_env: Some("WISEMODEL_API_KEY".into()),
@@ -4289,6 +4305,7 @@ mod tests {
                             uses_completion_tokens: false,
                             fixed_temperature: false,
                             lacks_vision: false,
+                            image_file_references: Some(false),
                             lacks_video: false,
                             retain_tool_images: false,
                             merge_system_messages: true,
@@ -4327,6 +4344,18 @@ mod tests {
                 .as_ref()
                 .map(|h| h.uses_completion_tokens),
             Some(true)
+        );
+        assert_eq!(
+            config.media_transport,
+            Some(octos_llm::media_transport::MediaTransportMode::MoonshotFiles)
+        );
+        assert_eq!(
+            config.model_hints.as_ref().unwrap().image_file_references,
+            Some(false)
+        );
+        assert_eq!(
+            config.fallback_models[0].media_transport,
+            Some(octos_llm::media_transport::MediaTransportMode::Inline)
         );
         assert_eq!(config.fallback_models.len(), 1);
         assert_eq!(config.fallback_models[0].provider.as_str(), "minimax");
