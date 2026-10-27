@@ -127,10 +127,9 @@ pub fn slides_creation_reply(project_name: &str) -> String {
 }
 
 /// Embedded slides system prompt. Compiled into the binary at build time --
-/// there is intentionally no runtime override path. The slides workflow is
-/// opinionated (mofa_slides + script.js + style toml convention) and should
-/// not drift per deployment; updates ship via the normal Rust build path so
-/// every host runs an identical contract.
+/// the template provides authoring and tool guidance. The model owns planning
+/// and visual review; session permissions and explicit workspace policies remain
+/// separate. Updates to this default ship through the normal Rust build path.
 ///
 /// Placeholders substituted at render time:
 ///   - `{project_name}` -- the topic name from `/new slides <name>`

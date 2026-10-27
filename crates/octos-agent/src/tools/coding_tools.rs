@@ -1802,7 +1802,15 @@ async fn wait_agent_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Resul
     };
     let timeout_ms = input.timeout_ms.unwrap_or(30_000).min(3_600_000);
     let started = Instant::now();
+    let mut refresh_at = started;
     let mut statuses = loop {
+        if Instant::now() >= refresh_at {
+            // The worker may belong to an earlier turn's supervisor. Its
+            // completion updates the shared ledger, not this restored copy.
+            // Refresh owned rows only; never import another session's tasks.
+            supervisor.refresh_from_persistence()?;
+            refresh_at = Instant::now() + Duration::from_millis(500);
+        }
         let (statuses, all_terminal) =
             collect_agent_statuses(supervisor, &targets, ctx.parent_session_key.as_deref());
         let has_unknown = statuses.iter().any(|status| status["status"] == "unknown");
@@ -3917,6 +3925,50 @@ mod background_handle_contract {
             task_supervisor: Some(Arc::new(crate::TaskSupervisor::new())),
             ..ToolContext::zero()
         }
+    }
+
+    #[tokio::test]
+    async fn waiting_restored_task_observes_later_durable_completion() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.jsonl");
+        let mut ctx = context();
+        ctx.parent_session_key = Some("session-a".into());
+        let supervisor = ctx.task_supervisor.as_ref().unwrap();
+        supervisor.enable_persistence(&path).unwrap();
+        let id = supervisor.register("work", "restored", Some("session-a"));
+        supervisor.mark_running(&id);
+        let mut completed = supervisor.get_task(&id).unwrap();
+        // Simulate a terminal update from the task's original supervisor,
+        // without touching the waiting turn's stale in-memory task snapshot.
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            completed.status = crate::TaskStatus::Completed;
+            completed.runtime_state = crate::task_supervisor::TaskRuntimeState::Completed;
+            completed.updated_at = chrono::Utc::now();
+            completed.completed_at = Some(completed.updated_at);
+            completed.final_output = Some("verified result".into());
+            completed.output_files = vec!["result.txt".into()];
+            let row = json!({"schema_version":1,"task":completed});
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            fs2::FileExt::lock_exclusive(&file).unwrap();
+            writeln!(file, "{row}").unwrap();
+        });
+        let result = wait_agent_body(
+            &WaitAgentTool,
+            &json!({
+                "target":id,"timeout_ms":2000,"include_output":true
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        writer.await.unwrap();
+        let value: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(result.success);
+        assert_eq!(value["agents"][0]["status"], "completed");
+        assert_eq!(value["agents"][0]["output"], "verified result");
+        assert_eq!(value["agents"][0]["output_files"][0], "result.txt");
     }
 
     #[tokio::test]

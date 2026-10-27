@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use octos_core::{AgentId, MessageRole, TaskContext, TaskKind, ToolCall};
@@ -104,12 +105,317 @@ struct ScriptedProvider {
     responses: StdMutex<Vec<ChatResponse>>,
 }
 
+fn install_delivery_test_contract(root: &std::path::Path) {
+    let mut policy = crate::workspace_policy::WorkspacePolicy::for_session();
+    policy.spawn_tasks.clear();
+    let mut text = toml::to_string(&policy).unwrap();
+    text.push_str("\n[[validation.validators]]\nid = \"delivery.required_file\"\nrequired = true\nphase = \"delivery\"\nkind = \"file_exists\"\npath = \"exports/result.txt\"\nmin_bytes = 1\n");
+    std::fs::write(root.join(".octos-workspace.toml"), text).unwrap();
+}
+
+async fn delivery_test_agent(root: &std::path::Path, responses: Vec<ChatResponse>) -> Agent {
+    let provider = Arc::new(ScriptedProvider::new(responses));
+    let memory = Arc::new(EpisodeStore::open(root.join("memory")).await.unwrap());
+    Agent::new(
+        AgentId::new("delivery-test"),
+        provider,
+        ToolRegistry::with_builtins(root),
+        memory,
+    )
+    .with_config(AgentConfig {
+        max_iterations: 8,
+        save_episodes: false,
+        ..Default::default()
+    })
+}
+
+fn delivery_write_response() -> ChatResponse {
+    tool_use(
+        vec![ToolCall {
+            id: "repair-file".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path":"exports/result.txt","content":"actual output"}),
+            metadata: None,
+        }],
+        10,
+        10,
+    )
+}
+
+#[tokio::test]
+async fn completed_delivery_failure_is_progress_without_resetting_explicit_budgets() {
+    let dir = tempfile::tempdir().unwrap();
+    install_delivery_test_contract(dir.path());
+    let agent = delivery_test_agent(dir.path(), vec![]).await;
+    let contract = super::super::delivery_contract::DeliveryContract::load(dir.path(), 0)
+        .unwrap()
+        .unwrap();
+    let started = Instant::now() - Duration::from_secs(600);
+    let activity = LoopActivityState::new(started);
+    assert!(matches!(
+        agent.check_budget(1, started, &TokenUsage::default(), &activity),
+        Some(BudgetStop::IdleProgressTimeout { .. })
+    ));
+
+    // Represent the last observed progress predating a slow host check.
+    // A real failure must remain failure, but its arrival is new progress.
+    let failure = contract.check(&agent, &[], &activity).await.unwrap_err();
+    assert!(failure.contains("delivery.required_file"));
+    assert!(
+        agent
+            .check_budget(1, started, &TokenUsage::default(), &activity)
+            .is_none()
+    );
+    assert!(matches!(
+        agent.check_budget(8, started, &TokenUsage::default(), &activity),
+        Some(BudgetStop::MaxIterations { limit: 8 })
+    ));
+
+    // No later progress still times out; completed validation does not turn
+    // off idle detection for the rest of the task.
+    activity.set_last_activity_at(started);
+    assert!(matches!(
+        agent.check_budget(1, started, &TokenUsage::default(), &activity),
+        Some(BudgetStop::IdleProgressTimeout { .. })
+    ));
+}
+
+#[tokio::test]
+async fn delivery_contract_blocks_chat_claim_and_repairs_without_plugin() {
+    let dir = tempfile::tempdir().unwrap();
+    install_delivery_test_contract(dir.path());
+    let agent = delivery_test_agent(
+        dir.path(),
+        vec![
+            end_turn("Finished without doing the work", 10, 10),
+            delivery_write_response(),
+            end_turn("Finished after repair", 10, 10),
+        ],
+    )
+    .await;
+    let result = agent
+        .process_message("Create result.txt", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "Finished after repair");
+    assert!(dir.path().join("exports/result.txt").exists());
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.content.contains("delivery.required_file")),
+        "Real failing validator feedback must persist in the ordinary conversation"
+    );
+}
+
+#[tokio::test]
+async fn delivery_contract_blocks_root_task_claim_and_repairs_without_managed_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    install_delivery_test_contract(dir.path());
+    let agent = delivery_test_agent(
+        dir.path(),
+        vec![
+            end_turn("Finished without doing the work", 10, 10),
+            delivery_write_response(),
+            end_turn("Finished after repair", 10, 10),
+        ],
+    )
+    .await;
+    let task = Task::new(
+        TaskKind::Custom {
+            name: "delivery".into(),
+            params: serde_json::json!({}),
+        },
+        TaskContext {
+            working_dir: dir.path().into(),
+            ..Default::default()
+        },
+    );
+    let result = agent.run_task(&task).await.unwrap();
+    assert!(result.success);
+    assert!(dir.path().join("exports/result.txt").exists());
+}
+
 impl ScriptedProvider {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: StdMutex::new(responses.into_iter().rev().collect()),
         }
     }
+}
+
+#[tokio::test]
+async fn delivery_contract_cannot_be_waived_by_budget_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    install_delivery_test_contract(dir.path());
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_use(
+            vec![ToolCall {
+                id: "fetch".into(),
+                name: "fetch_paper".into(),
+                arguments: serde_json::json!({}),
+                metadata: None,
+            }],
+            10,
+            10,
+        ),
+        end_turn("Everything is ready for delivery", 10, 10),
+    ]));
+    let mut tools = ToolRegistry::with_builtins(dir.path());
+    tools.register(StaticResultTool::new("fetch_paper",
+        "This is a real substantive research result containing the original paper abstract, methods and experiment results; the final artifact still does not exist.",
+        true,Arc::new(AtomicUsize::new(0))));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("grace-delivery"), provider, tools, memory).with_config(
+        AgentConfig {
+            max_iterations: 1,
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    let result = agent
+        .process_message("Research and produce file", &[], vec![])
+        .await
+        .unwrap();
+    assert!(
+        result.content.contains("NOT ACCEPTED"),
+        "{}",
+        result.content
+    );
+    assert!(result.files_to_send.is_empty());
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.content.contains("delivery.required_file"))
+    );
+}
+
+#[tokio::test]
+async fn delivery_contract_malformed_policy_does_not_silently_disable_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".octos-workspace.toml"),
+        "this is not valid TOML",
+    )
+    .unwrap();
+    let agent = delivery_test_agent(dir.path(), vec![end_turn("Finished", 10, 10)]).await;
+    assert!(agent.process_message("Deliver", &[], vec![]).await.is_err());
+}
+
+#[tokio::test]
+async fn delivery_contract_is_pinned_even_when_model_removes_required_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    install_delivery_test_contract(dir.path());
+    let weak = toml::to_string(&crate::workspace_policy::WorkspacePolicy::for_session()).unwrap();
+    let agent = delivery_test_agent(
+        dir.path(),
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "weaken".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({"path":".octos-workspace.toml","content":weak}),
+                    metadata: None,
+                }],
+                10,
+                10,
+            ),
+            end_turn("I removed the check", 10, 10),
+            delivery_write_response(),
+            end_turn("Now genuinely finished", 10, 10),
+        ],
+    )
+    .await;
+    let result = agent
+        .process_message("Produce the required file", &[], vec![])
+        .await
+        .unwrap();
+    assert_eq!(result.content, "Now genuinely finished");
+    assert!(dir.path().join("exports/result.txt").exists());
+}
+
+#[tokio::test]
+async fn delivery_contract_does_not_require_whole_deck_from_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    install_delivery_test_contract(dir.path());
+    let agent = delivery_test_agent(dir.path(), vec![end_turn("Page work finished", 10, 10)])
+        .await
+        .with_spawn_depth(1);
+    let task = Task::new(
+        TaskKind::Custom {
+            name: "page".into(),
+            params: serde_json::json!({}),
+        },
+        TaskContext {
+            working_dir: dir.path().into(),
+            ..Default::default()
+        },
+    );
+    assert!(agent.run_task(&task).await.unwrap().success);
+    assert!(!dir.path().join("exports/result.txt").exists());
+}
+
+#[tokio::test]
+async fn delivery_contract_rechecks_artifact_after_previous_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    install_delivery_test_contract(dir.path());
+    std::fs::create_dir(dir.path().join("exports")).unwrap();
+    std::fs::write(dir.path().join("exports/result.txt"), "valid").unwrap();
+    let agent = delivery_test_agent(
+        dir.path(),
+        vec![
+            end_turn("First pass", 10, 10),
+            end_turn("Still valid", 10, 10),
+            delivery_write_response(),
+            end_turn("Repaired", 10, 10),
+        ],
+    )
+    .await;
+    assert_eq!(
+        agent
+            .process_message("Deliver", &[], vec![])
+            .await
+            .unwrap()
+            .content,
+        "First pass"
+    );
+    std::fs::write(dir.path().join("exports/result.txt"), "").unwrap();
+    assert_eq!(
+        agent
+            .process_message("Check again", &[], vec![])
+            .await
+            .unwrap()
+            .content,
+        "Repaired"
+    );
+}
+
+#[tokio::test]
+async fn delivery_contract_required_command_exposes_actual_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut policy = crate::workspace_policy::WorkspacePolicy::for_session();
+    policy.spawn_tasks.clear();
+    let mut text = toml::to_string(&policy).unwrap();
+    text.push_str("\n[[validation.validators]]\nid=\"delivery.command\"\nrequired=true\nphase=\"delivery\"\nkind=\"command\"\ncmd=\"python3\"\nargs=[\"-c\", \"import pathlib,sys; ok=pathlib.Path('exports/result.txt').exists(); print('Missing real exported artifact',file=sys.stderr); sys.exit(0 if ok else 1)\"]\n");
+    std::fs::write(dir.path().join(".octos-workspace.toml"), text).unwrap();
+    let agent = delivery_test_agent(
+        dir.path(),
+        vec![
+            end_turn("Done", 10, 10),
+            delivery_write_response(),
+            end_turn("Fixed", 10, 10),
+        ],
+    )
+    .await;
+    let result = agent.process_message("Deliver", &[], vec![]).await.unwrap();
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Missing real exported artifact"))
+    );
+    assert_eq!(result.content, "Fixed");
 }
 
 #[async_trait]
@@ -803,6 +1109,65 @@ impl LlmProvider for RequestRecordingProvider {
 }
 
 const CHECKPOINT_ENVELOPE_OPEN: &str = "<context_event kind=\"convergence_checkpoint\"";
+
+#[tokio::test]
+async fn tool_artifact_locator_reaches_next_model_call_without_exposing_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let digest = "abcdef01".repeat(8);
+    let locator = format!("reports/{digest}/result.json");
+    let secret = "1234abcd".repeat(8);
+    std::fs::write(
+        dir.path().join("evidence.json"),
+        serde_json::json!({"report": locator, "sha256": digest, "api_key": secret}).to_string(),
+    )
+    .unwrap();
+    let requests: RecordedRequests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![
+            tool_use(
+                vec![ToolCall {
+                    id: "read-evidence".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path":"evidence.json"}),
+                    metadata: None,
+                }],
+                10,
+                10,
+            ),
+            end_turn("Read evidence", 10, 10),
+        ],
+        requests.clone(),
+    ));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("locator-test"),
+        provider,
+        ToolRegistry::with_builtins(dir.path()),
+        memory,
+    )
+    .with_config(AgentConfig {
+        max_iterations: 4,
+        save_episodes: false,
+        ..Default::default()
+    });
+    agent
+        .process_message("Read evidence.json", &[], vec![])
+        .await
+        .unwrap();
+    let calls = requests.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    let visible = calls[1]
+        .0
+        .iter()
+        .filter(|m| m.role == MessageRole::Tool)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(visible.contains(&locator), "{visible}");
+    assert!(visible.contains(&digest), "{visible}");
+    assert!(!visible.contains(&secret), "{visible}");
+    assert!(visible.contains("[credential-redacted]"), "{visible}");
+}
 
 /// `(messages, tools, config)` of every provider request, in call order.
 type RecordedConfigRequests =

@@ -32,6 +32,9 @@ const EVENTS_FILE_NAME: &str = "supervisor-events.jsonl";
 /// newer `schema_version` instead of misreading it (see `load_snapshot`).
 const EVENTS_ROTATED_FILE_NAME: &str = "supervisor-events.jsonl.old";
 const EVENTS_LOCK_FILE_NAME: &str = "supervisor-events.lock";
+// Keep this inode stable: the OS releases its advisory lock even on SIGKILL.
+// The old create-new marker remains for compatibility with older writers.
+const EVENTS_GUARD_FILE_NAME: &str = "supervisor-events.guard";
 const SNAPSHOT_FILE_NAME: &str = "supervisor-snapshot.json";
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const APPEND_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1138,12 +1141,55 @@ pub struct SupervisorStore {
 #[derive(Debug)]
 struct SupervisorAppendLock {
     path: PathBuf,
+    _guard: File,
 }
 
 impl Drop for SupervisorAppendLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+fn recover_abandoned_append_marker(path: &Path) -> io::Result<bool> {
+    // Caller owns the stable advisory guard. A v2 marker cannot belong to a
+    // live new writer while that guard is ours. Legacy writers did not flock;
+    // reclaim their marker only when the OS positively reports a dead owner.
+    let marker = match fs::read_to_string(path) {
+        Ok(marker) => marker,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    let guarded = marker.lines().any(|line| line == "protocol=advisory-v1");
+    let dead_legacy_owner = marker
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(append_lock_owner_is_dead);
+    if !guarded && !dead_legacy_owner {
+        return Ok(false);
+    }
+    // Never unlink a marker replaced since we inspected it.
+    if fs::read_to_string(path)? != marker {
+        return Ok(false);
+    }
+    fs::remove_file(path)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn append_lock_owner_is_dead(pid: u32) -> bool {
+    use rustix::process::{Pid, test_kill_process};
+    let Some(pid) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
+        return false;
+    };
+    matches!(test_kill_process(pid), Err(rustix::io::Errno::SRCH))
+}
+
+#[cfg(not(unix))]
+fn append_lock_owner_is_dead(_pid: u32) -> bool {
+    // Advisory-v1 markers recover on all platforms. Unknown legacy ownership
+    // must remain conservative when a safe PID probe is unavailable.
+    false
 }
 
 impl SupervisorStore {
@@ -2411,14 +2457,56 @@ impl SupervisorStore {
         self.ensure_root_dir()?;
         let path = self.root_dir.join(EVENTS_LOCK_FILE_NAME);
         let deadline = Instant::now() + APPEND_LOCK_TIMEOUT;
+        let guard = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root_dir.join(EVENTS_GUARD_FILE_NAME))?;
         loop {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    writeln!(file, "pid={}", std::process::id())?;
-                    return Ok(SupervisorAppendLock { path });
+            match fs2::FileExt::try_lock_exclusive(&guard) {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "supervisor append guard is busy",
+                        ));
+                    }
+                    std::thread::sleep(APPEND_LOCK_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Publish a fully initialized marker atomically. A crash between file
+        // creation and writing the PID must not strand an unidentifiable lock.
+        let prepared = self
+            .root_dir
+            .join(format!(".supervisor-lock-{}.tmp", uuid::Uuid::new_v4()));
+        fs::write(
+            &prepared,
+            format!("pid={}\nprotocol=advisory-v1\n", std::process::id()),
+        )?;
+        loop {
+            match fs::hard_link(&prepared, &path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&prepared);
+                    return Ok(SupervisorAppendLock {
+                        path,
+                        _guard: guard,
+                    });
                 }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                    match recover_abandoned_append_marker(&path) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(error) => {
+                            let _ = fs::remove_file(&prepared);
+                            return Err(error);
+                        }
+                    }
                     if Instant::now() >= deadline {
+                        let _ = fs::remove_file(&prepared);
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!(
@@ -2429,7 +2517,10 @@ impl SupervisorStore {
                     }
                     std::thread::sleep(APPEND_LOCK_RETRY_DELAY);
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    let _ = fs::remove_file(&prepared);
+                    return Err(err);
+                }
             }
         }
     }
@@ -3099,6 +3190,119 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn supervisor_append_lock_subprocess_holder() {
+        let Some(root) = std::env::var_os("OCTOS_TEST_APPEND_LOCK_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let store = SupervisorStore::new(&root);
+        let _lock = store.acquire_append_lock().unwrap();
+        fs::write(root.join("holder-ready"), "ready").unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn supervisor_append_lock_recovers_after_killed_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "autonomy::supervisor_store::tests::supervisor_append_lock_subprocess_holder",
+                "--nocapture",
+            ])
+            .env("OCTOS_TEST_APPEND_LOCK_ROOT", dir.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.path().join("holder-ready").exists() && Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("holder exited: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ready = dir.path().join("holder-ready").exists();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(ready, "holder did not acquire the real OS lock");
+        assert!(dir.path().join(EVENTS_LOCK_FILE_NAME).exists());
+        let start = Instant::now();
+        let store = SupervisorStore::new(dir.path());
+        let lock = store.acquire_append_lock().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        drop(lock);
+        assert!(!dir.path().join(EVENTS_LOCK_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn supervisor_append_lock_preserves_live_or_unknown_legacy_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(EVENTS_LOCK_FILE_NAME);
+        for marker in [
+            format!("pid={}\n", std::process::id()),
+            String::new(),
+            "pid=0\n".into(),
+            "pid=4294967295\n".into(),
+        ] {
+            fs::write(&path, &marker).unwrap();
+            assert!(!recover_abandoned_append_marker(&path).unwrap());
+            assert_eq!(fs::read_to_string(&path).unwrap(), marker);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervisor_append_lock_recovers_dead_legacy_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        fs::write(
+            dir.path().join(EVENTS_LOCK_FILE_NAME),
+            format!("pid={pid}\n"),
+        )
+        .unwrap();
+        let store = SupervisorStore::new(dir.path());
+        drop(store.acquire_append_lock().unwrap());
+    }
+
+    #[test]
+    fn supervisor_append_lock_serializes_competing_recoverers() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(EVENTS_LOCK_FILE_NAME),
+            "pid=1\nprotocol=advisory-v1\n",
+        )
+        .unwrap();
+        let active = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let store = SupervisorStore::new(dir.path());
+                let active = active.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..20 {
+                        let _lock = store.acquire_append_lock().unwrap();
+                        assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                        std::thread::yield_now();
+                        assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 

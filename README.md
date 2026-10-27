@@ -22,6 +22,9 @@ client and an automated controller operate that runtime.
 [Build with Octos](#build-with-octos) · [Control through OUP](#control-through-oup) ·
 [Documentation](https://octos-org.github.io/octos/) · [中文](README-zh.md)
 
+Artifact workflows can opt into [root delivery checks](docs/workspace-delivery-validation.md)
+that validate actual outputs before a root agent completes, including script-generated files.
+
 <a id="start-here"></a>
 <a id="quick-start"></a>
 

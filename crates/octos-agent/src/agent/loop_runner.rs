@@ -985,6 +985,12 @@ impl Agent {
         attachments: TurnAttachmentContext,
         tracker: Option<&TokenTracker>,
     ) -> Result<ConversationResponse> {
+        let delivery_contract = self
+            .tools
+            .workspace_root()
+            .map(|root| super::delivery_contract::DeliveryContract::load(root, self.spawn_depth))
+            .transpose()?
+            .flatten();
         let activity = Arc::new(LoopActivityState::new(Instant::now()));
         let activity_reporter = Arc::new(ActivityTrackingReporter::new(
             activity.clone(),
@@ -1855,6 +1861,36 @@ impl Agent {
                                 );
                                 continue 'agent_loop;
                             }
+                            if let Some(contract) = &delivery_contract {
+                                if let Err(reason) = contract.check(self, &files_to_send, &activity).await {
+                                    let mut attempted = Message::assistant(content.clone());
+                                    attempted.reasoning_content = response.reasoning_content.clone();
+                                    messages.push(attempted.clone());
+                                    turn_output_log.push(attempted);
+                                    let feedback = super::delivery_contract::feedback(&reason);
+                                    messages.push(feedback.clone());
+                                    turn_output_log.push(feedback.clone());
+                                    if grace_iteration {
+                                        self.emit_cost_update(&turn, &response, attributed_cost);
+                                        return Ok(ConversationResponse {
+                                            content: feedback.content,
+                                            reasoning_content: None,
+                                            provider_metadata: None,
+                                            token_usage: turn.total_usage().clone(),
+                                            estimated_spend_usd: turn.priced_spend(),
+                                            files_modified,
+                                            files_to_send: vec![],
+                                            streamed,
+                                            assistant_segments: turn_output_log.provenance.clone(),
+                                            messages: turn_output_log.messages,
+                                            tool_results: tool_structured_metadata.clone(),
+                                            synthesized_from_spawn_only: false,
+                                            pending_approval: None,
+                                        });
+                                    }
+                                    continue 'agent_loop;
+                                }
+                            }
                             // #2359: the grace call is exempt — a veto here
                             // would only convert the synthesis into the canned
                             // budget-stop message, with no budget left to act
@@ -2673,6 +2709,10 @@ impl Agent {
         task: &Task,
         tracker: Option<&TokenTracker>,
     ) -> Result<TaskResult> {
+        let delivery_contract = super::delivery_contract::DeliveryContract::load(
+            &task.context.working_dir,
+            self.spawn_depth,
+        )?;
         let task_start = Instant::now();
         let span = info_span!(
             "task",
@@ -2940,6 +2980,29 @@ impl Agent {
                         let final_response =
                             response_with_max_token_fragments(&response, &max_token_fragments);
                         let proposed = final_response.content.clone().unwrap_or_default();
+                        if let Some(contract) = &delivery_contract {
+                            if let Err(reason) = contract.check(self, &files_to_send, &activity).await {
+                                let mut attempted = Message::assistant(proposed.clone());
+                                attempted.reasoning_content = final_response.reasoning_content.clone();
+                                messages.push(attempted);
+                                let feedback = super::delivery_contract::feedback(&reason);
+                                messages.push(feedback.clone());
+                                if grace_iteration {
+                                    let mut result = self.build_result(
+                                        &final_response, turn.total_usage().clone(),
+                                        files_modified, vec![],
+                                    );
+                                    result.success = false;
+                                    result.output = feedback.content;
+                                    self.reporter().report(ProgressEvent::TaskCompleted {
+                                        success: false, iterations: iteration,
+                                        duration: task_start.elapsed(),
+                                    });
+                                    return Ok(result);
+                                }
+                                continue;
+                            }
+                        }
                         // #2359: the grace call is exempt — a veto here would
                         // only convert the synthesis into the canned
                         // budget-stop output, with no budget left to act on

@@ -1,5 +1,84 @@
 use super::*;
 
+#[test]
+fn task_ledger_recovers_legacy_concatenated_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tasks.jsonl");
+    let (mut first, mut second) = terminal_timestamp_rows();
+    first.id = "first".into();
+    second.id = "second".into();
+    let encode = |task| {
+        serde_json::to_string(&PersistedTaskRecord {
+            schema_version: CURRENT_TASK_LEDGER_SCHEMA,
+            task,
+        })
+        .unwrap()
+    };
+    std::fs::write(&path, format!("{}{}\n", encode(first), encode(second))).unwrap();
+    let restored = TaskSupervisor::load_persisted_tasks(&path).unwrap();
+    assert_eq!(restored.len(), 2);
+    assert!(restored.contains_key("first"));
+    assert!(restored.contains_key("second"));
+}
+
+#[test]
+fn task_ledger_seals_torn_tail_before_new_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tasks.jsonl");
+    std::fs::write(&path, "{\"task\":").unwrap();
+    let (_, task) = terminal_timestamp_rows();
+    let id = task.id.clone();
+    let json = serde_json::to_string(&PersistedTaskRecord {
+        schema_version: CURRENT_TASK_LEDGER_SCHEMA,
+        task,
+    })
+    .unwrap();
+    TaskSupervisor::append_persisted_task(&path, &json).unwrap();
+    let restored = TaskSupervisor::load_persisted_tasks(&path).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert!(restored.contains_key(&id));
+}
+
+#[test]
+fn task_ledger_concurrent_writers_keep_one_complete_record_per_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tasks.jsonl");
+    let (_, template) = terminal_timestamp_rows();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let handles: Vec<_> = (0..8)
+        .map(|worker| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            let template = template.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..80 {
+                    let mut task = template.clone();
+                    task.id = format!("worker-{worker}-{i}");
+                    let json = serde_json::to_string(&PersistedTaskRecord {
+                        schema_version: CURRENT_TASK_LEDGER_SCHEMA,
+                        task,
+                    })
+                    .unwrap();
+                    TaskSupervisor::append_persisted_task(&path, &json).unwrap();
+                }
+            })
+        })
+        .collect();
+    for thread in handles {
+        thread.join().unwrap();
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.lines().count(), 640);
+    for line in text.lines() {
+        serde_json::from_str::<PersistedTaskRecord>(line).unwrap();
+    }
+    assert_eq!(
+        TaskSupervisor::load_persisted_tasks(&path).unwrap().len(),
+        640
+    );
+}
+
 /// #1723: `record_final_output` fires `on_change` so the roster mirror
 /// (`upsert_background_task_agent` → `set_agent_output_if_empty`) re-runs
 /// with `final_output` present. It is called AFTER `mark_completed`, so the

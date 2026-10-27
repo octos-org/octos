@@ -20,6 +20,9 @@ Octos 的核心架构是 **可复用的内核 + 可编程的协议边界**。应
 [构建应用](#基于-octos-构建应用) · [通过 OUP 控制内核](#通过-oup-控制内核) ·
 [文档](https://octos-org.github.io/octos/zh/) · [English](README.md)
 
+交付文件的工作流可启用[根任务交付检查](docs/workspace-delivery-validation.md)，
+在主代理完成前验证真实输出，也覆盖脚本直接生成的文件。
+
 [OctoSense 集成源码导读](docs/octosense-integration-walkthrough.md)
 用一个日历请求串起请求准入、Tokio 任务、宿主工具调用和答案返回，
 并说明 app peer、人与系统 agent 的会话、存储边界，以及排查 OctoSense 时应阅读的源码版本。

@@ -1878,7 +1878,7 @@ mod tests {
         // whole-file rewrite must refuse (the model would write redaction
         // placeholders over real content).
         let dir = tempfile::tempdir().unwrap();
-        let secret = format!("before\n{}\nafter\n", "a".repeat(64)); // 64+ hex chars => redacted
+        let secret = format!("before\napi_key={}\nafter\n", "a".repeat(64));
         std::fs::write(dir.path().join("secrets.env"), &secret).unwrap();
         let read = ReadFileTool::new(dir.path()).with_window_enforcement(true);
         let ctx = ctx_with_session("redacted");

@@ -625,6 +625,7 @@ pub async fn run_declared_validators_with_output(
         .filter(|v| match phase {
             ValidatorPhase::TurnEnd => v.phase == ValidatorPhaseKind::TurnEnd,
             ValidatorPhase::Completion => v.phase == ValidatorPhaseKind::Completion,
+            ValidatorPhase::Delivery => v.phase == ValidatorPhaseKind::Delivery,
         })
         .cloned()
         .collect();
@@ -667,7 +668,21 @@ pub async fn run_declared_validators_with_output(
     if !failures.is_empty() {
         let joined = failures
             .iter()
-            .map(|o| format!("{}: {}", o.validator_id, o.reason))
+            .map(|o| {
+                let detail = o.stderr.as_deref().unwrap_or("");
+                let evidence = o
+                    .evidence_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                format!(
+                    "{}: {}\n{}\nEvidence: {}",
+                    o.validator_id,
+                    o.reason,
+                    octos_core::truncated_utf8(detail, 2000, "…"),
+                    evidence
+                )
+            })
             .collect::<Vec<_>>()
             .join("; ");
         return Err(format!("required validator failure: {joined}"));

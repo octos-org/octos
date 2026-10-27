@@ -20,31 +20,29 @@ pub fn build() -> WorkflowInstance {
     WorkflowInstance {
         kind: WorkflowKind::Slides,
         label: "Slides deliverable".to_string(),
-        ack_message: "Slides generation has started in the background. Only the final deck will be delivered once the workspace contract is satisfied.".to_string(),
+        ack_message: "Slides work has started in the background. The producer will create, inspect and deliver the presentation.".to_string(),
         current_phase: WorkflowPhase::new("design"),
         allowed_tools: vec![
             "mofa_slides".into(),
-            "read_file".into(),
-            "write_file".into(),
-            "edit_file".into(),
-            "shell".into(),
+            "mofa_make".into(),
+            "mofa_describe_content_type".into(),
+            "group:fs".into(),
+            "group:runtime".into(),
+            "view_image".into(),
             "glob".into(),
+            "grep".into(),
+            "discover_tools".into(),
+            "run_tool".into(),
             "check_background_tasks".into(),
             "check_workspace_contract".into(),
         ],
-        limits: WorkflowLimits {
-            max_search_passes: None,
-            max_pipeline_runs: None,
-            max_dialogue_lines: Some(24),
-            target_audio_minutes: None,
-            max_generate_calls: Some(1),
-        },
+        limits: WorkflowLimits::default(),
         terminal_output: WorkflowTerminalOutput {
             deliver_final_artifact_only: true,
             forbid_intermediate_files: true,
             required_artifact_kind: "presentation".into(),
         },
-        additional_instructions: "You are a background slides producer. Follow the runtime-owned phases in order: design, generate_deck, deliver_result. Write the slide script first, validate it before generation, call mofa_slides once, and deliver only the final deck artifact. Do not send intermediate previews, scratch PNGs, or alternate deck exports.\n\nM8 Runtime Parity W2.E: at the end of each phase, call check_workspace_contract once and surface the typed result back to the user as a single-line confirmation of the form \"\u{2713} <phase> phase: validators passed (<n>/<n>)\" — for example \"\u{2713} design phase: validators passed (3/3)\". If a phase's validators reject the artifacts, instead emit \"\u{2717} <phase> phase: validators failed (<failed>/<total>) — <reason>\" before moving on.".to_string(),
+        additional_instructions: "You are a background slides producer. Own planning, authoring, visual review and repairs according to the user's brief. Choose the installed authoring and inspection tools that fit the task. Read actual rendered PPTX images alongside native text and structural measurements; batch related repairs and reuse valid evidence for unchanged content. Use task notifications for long-running tools. An optional reviewer supplies evidence, not mandatory approval or a prescribed repair sequence. Workspace checks report mechanical artifact state and do not establish visual quality. Report the checks actually performed and material limitations. Runtime delivers the final deck; keep inspection images and scratch exports available for your own review without sending them as final deliverables.".to_string(),
     }
 }
 
@@ -101,11 +99,7 @@ pub fn workspace_policy() -> WorkspacePolicy {
             ],
         },
         validation: ValidationPolicy {
-            on_turn_end: vec![
-                "file_exists:script.js".into(),
-                "file_exists:memory.md".into(),
-                "file_exists:changelog.md".into(),
-            ],
+            on_turn_end: Vec::new(),
             on_source_change: Vec::new(),
             // Path-based `file_exists` checks were removed: the deck
             // lands under `<workspace>/skill-output/slides/<slug>/` via
@@ -180,22 +174,53 @@ mod tests {
     }
 
     #[test]
-    fn slides_workflow_surfaces_per_phase_validator_status() {
-        // M8 Runtime Parity W2.E: the spawned worker must surface a
-        // typed phase-completion line — frontend test selectors and
-        // the live e2e spec rely on this exact shape.
+    fn should_allow_artifact_review_tools_without_unrelated_delivery_tools() {
         let workflow = build();
-        assert!(
-            workflow
-                .additional_instructions
-                .contains("phase: validators passed"),
-            "missing phase-validator hint: {}",
-            workflow.additional_instructions
-        );
-        assert!(
-            workflow.additional_instructions.contains("\u{2713}"),
-            "missing checkmark in phase confirmation"
-        );
+        let policy = octos_agent::tools::ToolPolicy {
+            allow: workflow.allowed_tools,
+            ..Default::default()
+        };
+        for tool in [
+            "read_file",
+            "view_image",
+            "edit_file",
+            "exec_command",
+            "write_stdin",
+            "watch_external_job",
+            "mofa_make",
+            "check_workspace_contract",
+        ] {
+            assert!(
+                policy.is_allowed(tool),
+                "missing artifact review capability: {tool}"
+            );
+        }
+        for tool in ["send_email", "mofa_publish"] {
+            assert!(
+                !policy.is_allowed(tool),
+                "unrelated capability exposed: {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_keep_explicit_tool_denials_effective_during_slide_review() {
+        let policy = octos_agent::tools::ToolPolicy {
+            allow: build().allowed_tools,
+            deny: vec!["view_image".into(), "group:runtime".into()],
+            ..Default::default()
+        };
+        assert!(policy.is_allowed("read_file"));
+        for tool in ["view_image", "shell", "exec_command", "write_stdin"] {
+            assert!(!policy.is_allowed(tool));
+        }
+    }
+
+    #[test]
+    fn should_leave_generation_and_review_budgets_to_the_session() {
+        let workflow = build();
+        assert_eq!(workflow.limits.max_generate_calls, None);
+        assert_eq!(workflow.limits.max_dialogue_lines, None);
     }
 
     #[test]
@@ -205,12 +230,9 @@ mod tests {
             policy.workspace.kind,
             octos_agent::WorkspacePolicyKind::Slides
         );
-        assert!(
-            policy
-                .validation
-                .on_turn_end
-                .contains(&"file_exists:script.js".to_string())
-        );
+        // Model-selected authoring routes need not create a specific script
+        // language or boilerplate journals to inspect and deliver a PPTX.
+        assert!(policy.validation.on_turn_end.is_empty());
         // `on_completion` no longer declares project-relative
         // `file_exists` checks — the deck lands under
         // `<workspace>/skill-output/...` via the host's plugin

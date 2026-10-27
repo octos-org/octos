@@ -105,6 +105,7 @@ const NON_SILENT_SAMPLE_FLOOR: f32 = 0.01;
 pub enum ValidatorPhase {
     TurnEnd,
     Completion,
+    Delivery,
 }
 
 impl ValidatorPhase {
@@ -112,6 +113,7 @@ impl ValidatorPhase {
         match self {
             Self::TurnEnd => "turn_end",
             Self::Completion => "completion",
+            Self::Delivery => "delivery",
         }
     }
 }
@@ -121,6 +123,7 @@ impl From<ValidatorPhaseKind> for ValidatorPhase {
         match value {
             ValidatorPhaseKind::TurnEnd => Self::TurnEnd,
             ValidatorPhaseKind::Completion => Self::Completion,
+            ValidatorPhaseKind::Delivery => Self::Delivery,
         }
     }
 }
