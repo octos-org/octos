@@ -230,9 +230,27 @@ pub async fn nominate_for_promotion(
     limit: usize,
     session_key: Option<String>,
 ) -> Result<Vec<Record>> {
+    nominate_for_promotion_from_sources(bank, recall, min_visits, limit, session_key, &[]).await
+}
+
+/// App-scoped selection; the source labels narrow data, never confer authority.
+/// Existing callers retain the unfiltered behavior through the wrapper above.
+pub async fn nominate_for_promotion_from_sources(
+    bank: &MemoryStore,
+    recall: &Arc<RecallStore>,
+    min_visits: u32,
+    limit: usize,
+    session_key: Option<String>,
+    sources: &[String],
+) -> Result<Vec<Record>> {
+    let _promotion = recall.lock_promotion().await;
     let candidates = {
         let recall = recall.clone();
-        tokio::task::spawn_blocking(move || recall.nominate(min_visits, limit)).await??
+        let sources = sources.to_vec();
+        tokio::task::spawn_blocking(move || {
+            recall.nominate_from_sources(min_visits, limit, &sources)
+        })
+        .await??
     };
     let mut promoted = Vec::new();
     for r in candidates {
@@ -357,5 +375,53 @@ mod tests {
                 .is_empty(),
             "never promoted twice"
         );
+    }
+}
+
+#[cfg(test)]
+mod app_promotion_tests {
+    use super::*;
+    use octos_memory::{RecallConfig, RecordKind};
+
+    #[tokio::test]
+    async fn filtered_promotion_limits_after_filter_and_concurrent_calls_do_not_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = MemoryStore::open(dir.path()).await.unwrap();
+        let recall = Arc::new(RecallStore::open(dir.path(), RecallConfig::default()).unwrap());
+        let records = ["mail", "reader", "unread"]
+            .into_iter()
+            .map(|source| {
+                Record::new(
+                    format!("doc:{source}:1"),
+                    RecordKind::Document,
+                    source,
+                    chrono::Utc::now(),
+                    "A document",
+                    "A reading experience",
+                )
+            })
+            .collect::<Vec<_>>();
+        recall.upsert(records, vec![None; 3]).unwrap();
+        for _ in 0..4 {
+            recall.touch("doc:mail:1").unwrap();
+        }
+        recall.touch("doc:reader:1").unwrap();
+        assert_eq!(
+            recall
+                .nominate_from_sources(0, 1, &["unread".into()])
+                .unwrap()
+                .len(),
+            0
+        );
+        let sources = vec!["reader".into()];
+        let (a, b) = tokio::join!(
+            nominate_for_promotion_from_sources(&bank, &recall, 1, 1, None, &sources),
+            nominate_for_promotion_from_sources(&bank, &recall, 1, 1, None, &sources)
+        );
+        let promoted = a.unwrap().into_iter().chain(b.unwrap()).collect::<Vec<_>>();
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].id, "doc:reader:1");
+        assert_eq!(bank.count_staging_notes().await, 1);
+        assert_eq!(recall.nominate(1, 20).unwrap()[0].id, "doc:mail:1");
     }
 }

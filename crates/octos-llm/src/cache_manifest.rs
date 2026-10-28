@@ -935,7 +935,11 @@ fn collapse_marker_wrapper(value: &mut Value) {
 /// differently depending on the build graph's feature unification. Sorting
 /// the keys pins the bytes to the content; reordering preserves byte length,
 /// so segment byte accounting is unchanged.
-fn canonical_object_keys(value: Value) -> Value {
+///
+/// Exported for sibling prompt-cache hashing that must pin the same bytes to
+/// the same content (octos-agent's fingerprint identities hash foreign JSON
+/// through this before digesting).
+pub fn canonical_object_keys(value: Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut entries: Vec<(String, Value)> = map

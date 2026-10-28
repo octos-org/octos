@@ -125,7 +125,9 @@ spec and UPCR documents. The authoritative source remains code:
 | `memory/entity` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `memory/search` | shipped; Recall/Knowledge index search (docs/adr/personal-memory-tiers.md, 2026-09-16) |
 | `memory/load` | shipped; Recall/Knowledge record load + bank page (docs/adr/personal-memory-tiers.md, 2026-09-16) |
-| `memory/ingest` | shipped; the only memory write — app records into the Recall index (docs/adr/personal-memory-tiers.md, 2026-09-16) |
+| `memory/ingest` | shipped; app records into the Recall index (docs/adr/personal-memory-tiers.md, 2026-09-16) |
+| `memory/request` | explicit authenticated remember/correct/forget admission; accepted is not completion |
+| `memory/promote` | authenticated source-filtered Document nomination into existing consolidation |
 | `cron/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `cron/toggle` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `launch/resolve` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |

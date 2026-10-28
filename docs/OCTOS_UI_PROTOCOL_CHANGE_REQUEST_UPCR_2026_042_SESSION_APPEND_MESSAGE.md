@@ -49,9 +49,12 @@ Params (`SessionAppendMessageParams`):
   idempotent retry: nothing is appended and the EXISTING row's seq is
   returned. The existence scan runs inside the same per-key persist lock as
   the append (the `persist_system_note_once` pattern), so a retry racing the
-  original can never double-append. Two honest scopes on this guarantee:
-  the scan sees the session's LOADED window, so a retry of a row sealed
-  beyond the load budget appends a duplicate; and the namespace is shared
+  original can never double-append. The scan checks live rows outside
+  the resident window using the existing full-history loader when necessary,
+  without retaining that full transcript in the cache. The bounded view is
+  refreshed under the lock first, so independent canonical producers cannot
+  leave retry lookup or sequence derivation on a stale manager mirror. This adds a full read
+  and transient allocation for partial sessions. The namespace remains shared
   with turn-written rows, so a caller reusing a turn's `client_message_id`
   gets the turn row's seq back with nothing appended — mint distinct ids per
   producer. Assistant retries whose deriving user row is no longer visible
@@ -138,3 +141,16 @@ skip_serializing_if)` field on `Message`. Legacy JSONL rows parse unchanged
   `session/messages_page` read sees them with `source`, a retry returns the
   same seq, and a second connection receives the live projection envelope
   (proving no agent loop was involved: the serve cannot run turns at all).
+
+
+### Full-history retry compatibility
+
+`session.append_message.full_history_retry.v1` advertises the stronger retry
+behavior. Request and verify this feature before replaying uncertain old
+writes; method availability alone is insufficient for older servers. No new
+wire fields, messages or permission rules are introduced. A retry returns the
+original row's thread binding even when that row is outside the loaded window
+or legitimately has no binding. Live-history semantics remain unchanged:
+rolled-back/deleted rows are not permanent receipts, and first live row wins
+within the session's shared client-message namespace. This does not promise
+cross-process writer serialization or permission to recreate a deleted session.

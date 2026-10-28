@@ -1746,10 +1746,12 @@ impl GatewayRuntime {
                                 // A hot-reloaded config prompt replaces the
                                 // PRE-memory half only; the built post half
                                 // (skills/tool prefs) stays.
-                                self.system_prompt
+                                let mut parts = self
+                                    .system_prompt
                                     .write()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .pre_memory = prompt;
+                                    .unwrap_or_else(|e| e.into_inner());
+                                parts.pre_memory = prompt;
+                                parts.uses_bundled_base = false;
                                 info!(
                                     "System prompt updated via hot-reload (new actors will use it)"
                                 );

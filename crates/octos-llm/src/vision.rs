@@ -4,6 +4,7 @@ use std::path::Path;
 
 use base64::Engine;
 use eyre::{Result, WrapErr};
+use sha2::{Digest, Sha256};
 
 /// The most a media file may weigh to be encoded inline: base64 grows it by
 /// a third and every provider caps a request well under this.
@@ -121,8 +122,8 @@ pub fn reject_symlink_ancestors(resolved: &Path, workspace_root: &Path) -> std::
 /// actually ships (PNG / JPEG / GIF / WEBP — the extensions `is_image`
 /// accepts). Mirrors the raster arms of the tool-time
 /// `detect_image_format`: BMP and SVG are refused at tool time and never
-/// reach a request. The extension only decides the MIME label; this sniff
-/// decides whether arbitrary bytes may leave under an image label at all.
+/// reach a request. Bytes determine both the MIME label and whether the
+/// payload may leave under an image label at all.
 fn is_sniffed_image(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
         || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
@@ -141,6 +142,7 @@ fn is_sniffed_video_container(bytes: &[u8]) -> bool {
 /// Encode an image file as base64 and return (mime_type, base64_data).
 pub fn encode_image(path: &str, scope_root: Option<&Path>) -> Result<(String, String)> {
     let bytes = read_media_no_follow(path, scope_root)?;
+    verify_snapshot(path, &bytes)?;
     // The tool sniffed a recognised image header when it ran; the file may
     // have been swapped since. Re-sniff so arbitrary payload cannot leave
     // the machine labelled image/png.
@@ -150,22 +152,107 @@ pub fn encode_image(path: &str, scope_root: Option<&Path>) -> Result<(String, St
         );
     }
 
-    let ext = Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("jpg")
-        .to_lowercase();
-
-    let mime = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        _ => "image/jpeg",
-    };
+    let mime = image_mime(&bytes).expect("sniffed image has a MIME type");
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok((mime.to_string(), encoded))
+}
+
+/// MIME derived from bytes, never an untrusted filename or server label.
+pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+const SNAPSHOT_PREFIX: &str = "octos-image-snapshot-";
+
+/// Freeze already-authorized media before the tool result enters history.
+/// Private, read-only copies survive process restart; the original path is
+/// never reread by a later request. Hosts may remove these with the transcript.
+pub fn snapshot_image(path: &str, scope_root: Option<&Path>) -> Result<std::path::PathBuf> {
+    let bytes = read_media_no_follow(path, scope_root)?;
+    if is_snapshot(path) {
+        verify_snapshot(path, &bytes)?;
+        return Ok(path.into());
+    }
+    snapshot_image_bytes(&bytes)
+}
+
+pub fn snapshot_image_bytes(bytes: &[u8]) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+    eyre::ensure!(
+        bytes.len() as u64 <= MAX_MEDIA_BYTES,
+        "image exceeds {MAX_MEDIA_BYTES} bytes"
+    );
+    let extension = match image_mime(bytes) {
+        Some("image/png") => "png",
+        Some("image/jpeg") => "jpg",
+        Some("image/gif") => "gif",
+        Some("image/webp") => "webp",
+        _ => eyre::bail!("unsupported or invalid image bytes"),
+    };
+    // Keep these with persistent application data rather than OS temp files:
+    // a resumed/rewound transcript still refers to the original bytes.
+    let root = dirs::data_local_dir()
+        .ok_or_else(|| eyre::eyre!("no local application-data directory for media snapshots"))?
+        .join("octos")
+        .join("model-media");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&root)?;
+    eyre::ensure!(
+        !std::fs::symlink_metadata(&root)?.file_type().is_symlink(),
+        "media snapshot directory must not be a symlink"
+    );
+    let directory = tempfile::Builder::new()
+        .prefix(SNAPSHOT_PREFIX)
+        .tempdir_in(root)?;
+    let path = directory
+        .path()
+        .join(format!("{:x}.{extension}", Sha256::digest(bytes)));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let mut permissions = file.metadata()?.permissions();
+    permissions.set_readonly(true);
+    file.set_permissions(permissions)?;
+    let _ = directory.keep();
+    Ok(path)
+}
+
+fn is_snapshot(path: &str) -> bool {
+    Path::new(path)
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name.to_string_lossy().starts_with(SNAPSHOT_PREFIX))
+}
+
+fn verify_snapshot(path: &str, bytes: &[u8]) -> Result<()> {
+    if is_snapshot(path) {
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        eyre::ensure!(
+            Path::new(path).file_stem().and_then(|s| s.to_str()) == Some(digest.as_str()),
+            "image snapshot content changed; refusing to replace historical pixels"
+        );
+    }
+    Ok(())
 }
 
 /// Check if a file path looks like an image file.
@@ -282,8 +369,7 @@ mod tests {
     #[test]
     fn test_encode_image_mime_types() {
         let dir = tempfile::tempdir().unwrap();
-        // Real headers: the extension only labels the MIME, the bytes must
-        // still sniff as an image (#2480).
+        // MIME follows the bytes, including incorrect or missing extensions.
         let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0];
         let png = tiny_png();
         let gif = b"GIF89a".to_vec();
@@ -295,9 +381,8 @@ mod tests {
             ("png", png.clone(), "image/png"),
             ("gif", gif, "image/gif"),
             ("webp", webp, "image/webp"),
-            // Unknown extensions still encode when the bytes are an image —
-            // the MIME falls back to image/jpeg.
-            ("unknown", png, "image/jpeg"), // fallback
+            ("unknown", png.clone(), "image/png"),
+            ("mislabelled.jpg", png, "image/png"),
         ] {
             let path = dir.path().join(format!("test.{ext}"));
             std::fs::write(&path, &bytes).unwrap();
@@ -310,6 +395,23 @@ mod tests {
     fn test_encode_image_nonexistent_file() {
         let result = encode_image("/nonexistent/path/image.png", None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn should_reject_tampered_snapshot_instead_of_changing_historical_pixels() {
+        let dir = tempfile::Builder::new()
+            .prefix(SNAPSHOT_PREFIX)
+            .tempdir()
+            .unwrap();
+        let original = tiny_png();
+        let path = dir
+            .path()
+            .join(format!("{:x}.png", Sha256::digest(&original)));
+        std::fs::write(&path, &original).unwrap();
+        assert!(encode_image(path.to_str().unwrap(), None).is_ok());
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nreplacement").unwrap();
+        let error = encode_image(path.to_str().unwrap(), None).unwrap_err();
+        assert!(error.to_string().contains("snapshot content changed"));
     }
 
     #[test]

@@ -27,6 +27,9 @@ pub mod pending;
 pub mod prompt;
 pub mod staging;
 
+#[cfg(test)]
+mod app_pipeline_tests;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -130,7 +133,7 @@ pub struct ConsolidateOutcome {
     pub superseded: Vec<String>,
     pub archived: Vec<String>,
     pub hard_deleted: Vec<String>,
-    /// Staging items the model dropped, with reasons.
+    /// Staging items dropped by the model or retired Rust-side, with reasons.
     pub dropped: Vec<(String, String)>,
     /// Staging files deleted after a successful apply.
     pub consumed_staging_files: usize,
@@ -455,6 +458,44 @@ pub async fn run_consolidation(
         }
         !deferred_sensitive
     });
+
+    // A host correction cannot update an entry that has already been deleted.
+    // Forget processing above deliberately protects host notes from broad
+    // content scrubbing; retire only explicitly targeted, now-orphaned
+    // corrections here so they cannot keep failing the merge indefinitely.
+    // Archives and pending candidates may still restore an entry: preserve
+    // their asks rather than treating absence from MEMORY.md alone as deletion.
+    let mut obsolete_corrections = HashSet::new();
+    for note in &batch.notes {
+        if note.origin != NoteOrigin::Host || note.kind != NoteKind::Correction {
+            continue;
+        }
+        let Some(target) = note.replaces_id.as_deref() else {
+            continue;
+        };
+        if entries.iter().any(|e| e.id == target)
+            || waiting.iter().any(|pending| {
+                pending
+                    .candidates
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|candidate| candidate.entry_id == target)
+            })
+            || apply::archive_names_id(memory_dir, target)?
+        {
+            continue;
+        }
+        apply::remove_file_if_exists(&note.path)?;
+        obsolete_corrections.insert(note.path.clone());
+        outcome.dropped.push((
+            note.id.clone(),
+            "correction cancelled: target no longer exists".to_string(),
+        ));
+    }
+    batch
+        .notes
+        .retain(|note| !obsolete_corrections.contains(&note.path));
 
     // --- 3. skip early when nothing is consumable ------------------------
     // (Also the stop line when the caller disallowed the merge: every

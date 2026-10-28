@@ -302,6 +302,19 @@ pub const UI_PROTOCOL_FEATURE_PLAN_TODOS_V1: &str = "plan.todos.v1";
 /// return the playback URL).
 pub const UI_PROTOCOL_FEATURE_SMART_HOME_V1: &str = "smart_home.v1";
 
+/// Record-only retries check the full live transcript, including sealed
+/// history outside the resident window, and echo the original thread binding.
+/// Clients must not infer this guarantee from method availability alone.
+pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1: &str =
+    "session.append_message.full_history_retry.v1";
+
+/// UPCR-2026-053: `session/append_message` persists `participant` and memory
+/// extraction keeps its scope. Older servers silently ignore the field, so
+/// clients must not send it as the only record of who spoke unless this is
+/// acknowledged.
+pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1: &str =
+    "session.append_message.participant.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -337,6 +350,8 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
+    UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+    UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
 ];
 
 /// The features an `octos serve --stdio` connection has without negotiating.
@@ -417,6 +432,8 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::MEMORY_SEARCH
         | methods::MEMORY_LOAD
         | methods::MEMORY_INGEST
+        | methods::MEMORY_REQUEST
+        | methods::MEMORY_PROMOTE
         | methods::CRON_LIST
         | methods::CRON_TOGGLE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
         methods::AGENT_LIST
@@ -1321,8 +1338,12 @@ pub mod methods {
     /// rides along. Counts a visit (heat).
     pub const MEMORY_LOAD: &str = "memory/load";
     /// Ingest app records (documents / episodes) into the Recall index.
-    /// The only memory WRITE method; knowledge pages are refused here.
+    /// Knowledge pages are refused here; explicit requests use MEMORY_REQUEST.
     pub const MEMORY_INGEST: &str = "memory/ingest";
+    /// Admit an explicit user remember/correct/forget request without a turn.
+    pub const MEMORY_REQUEST: &str = "memory/request";
+    /// Nominate eligible app documents into background consolidation.
+    pub const MEMORY_PROMOTE: &str = "memory/promote";
     /// Replaces `GET /api/my/cron` — cron panel job listing.
     pub const CRON_LIST: &str = "cron/list";
     /// Replaces `PUT /api/my/cron/{job_id}/enabled` — cron job toggle.
@@ -1506,6 +1527,8 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::MEMORY_SEARCH,
     methods::MEMORY_LOAD,
     methods::MEMORY_INGEST,
+    methods::MEMORY_REQUEST,
+    methods::MEMORY_PROMOTE,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -1642,6 +1665,8 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::MEMORY_SEARCH,
     methods::MEMORY_LOAD,
     methods::MEMORY_INGEST,
+    methods::MEMORY_REQUEST,
+    methods::MEMORY_PROMOTE,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -1735,6 +1760,8 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
             UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
             UI_PROTOCOL_FEATURE_SMART_HOME_V1,
+            UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
         ])
     }
 
@@ -1760,7 +1787,13 @@ impl UiProtocolCapabilities {
                 .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1)
                 // `context.state.v1` adds a notification kind legacy clients
                 // cannot decode, so it is never claimed without a request.
-                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1),
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1)
+                // This slice is also the serde default for legacy peers that
+                // omit capabilities. Never infer safe replay on an old peer.
+                .filter(|feature| {
+                    *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
+                })
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1),
         );
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
@@ -3246,6 +3279,13 @@ pub struct SessionAppendMessageParams {
     /// thread) and `system` (rows are not thread-scoped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// UPCR-2026-053 — who spoke, when several participants share one side
+    /// of the conversation (e.g. two preset tutors answering one person).
+    /// `user` and `assistant` rows only; one line, no brackets or control
+    /// characters, at most [`crate::MESSAGE_PARTICIPANT_MAX_BYTES`] bytes.
+    /// Persisted on the row and shown to memory extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<String>,
 }
 
 /// Result for `session/append_message`. `thread_id` echoes the resolved
@@ -3921,6 +3961,67 @@ pub struct MemoryIngestResult {
     pub embedded: usize,
 }
 
+/// Explicit user memory requests are bounded and never silently truncated.
+pub const MEMORY_REQUEST_MAX_CONTENT_BYTES: usize = 16 * 1024;
+pub const MEMORY_PROMOTE_DEFAULT_LIMIT: usize = 20;
+pub const MEMORY_PROMOTE_MAX_LIMIT: usize = 100;
+pub const MEMORY_PROMOTE_MAX_SOURCES: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRequestOperation {
+    Remember,
+    Correct,
+    Forget,
+}
+
+/// Authenticated profile only. Neither origin nor identity is caller-supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRequestParams {
+    pub request_id: String,
+    pub operation: MemoryRequestOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRequestStatus {
+    Accepted,
+}
+
+/// Acceptance is durable admission, not consolidation completion. The refresh
+/// flag reports configuration, not a completion SLA or current worker health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRequestResult {
+    pub request_id: String,
+    pub operation: MemoryRequestOperation,
+    pub status: MemoryRequestStatus,
+    pub refresh_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryPromoteParams {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_visits: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// Record ids staged for background consolidation, not newly saved Knowledge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryPromoteResult {
+    pub record_ids: Vec<String>,
+    pub count: usize,
+    pub refresh_enabled: bool,
+}
+
 /// Params for `cron/list`. Empty today; the struct exists so `{}` /
 /// `null` params decode uniformly (mirrors [`SystemStatusGetParams`];
 /// the wire `params` MEMBER must still be present).
@@ -4387,6 +4488,8 @@ pub enum UiCommand {
     MemorySearch(MemorySearchParams),
     MemoryLoad(MemoryLoadParams),
     MemoryIngest(MemoryIngestParams),
+    MemoryRequest(MemoryRequestParams),
+    MemoryPromote(MemoryPromoteParams),
     CronList(CronListParams),
     CronToggle(CronToggleParams),
     // ---- Wave4-A: adaptive router controls ----
@@ -4446,6 +4549,8 @@ impl UiCommand {
             Self::MemorySearch(_) => methods::MEMORY_SEARCH,
             Self::MemoryLoad(_) => methods::MEMORY_LOAD,
             Self::MemoryIngest(_) => methods::MEMORY_INGEST,
+            Self::MemoryRequest(_) => methods::MEMORY_REQUEST,
+            Self::MemoryPromote(_) => methods::MEMORY_PROMOTE,
             Self::CronList(_) => methods::CRON_LIST,
             Self::CronToggle(_) => methods::CRON_TOGGLE,
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
@@ -4506,6 +4611,8 @@ impl UiCommand {
             Self::MemorySearch(params) => serde_json::to_value(params),
             Self::MemoryLoad(params) => serde_json::to_value(params),
             Self::MemoryIngest(params) => serde_json::to_value(params),
+            Self::MemoryRequest(params) => serde_json::to_value(params),
+            Self::MemoryPromote(params) => serde_json::to_value(params),
             Self::CronList(params) => serde_json::to_value(params),
             Self::CronToggle(params) => serde_json::to_value(params),
             Self::RouterSetMode(params) => serde_json::to_value(params),
@@ -4611,6 +4718,8 @@ impl UiCommand {
             methods::MEMORY_SEARCH => Ok(Self::MemorySearch(decode_params(method, params)?)),
             methods::MEMORY_LOAD => Ok(Self::MemoryLoad(decode_params(method, params)?)),
             methods::MEMORY_INGEST => Ok(Self::MemoryIngest(decode_params(method, params)?)),
+            methods::MEMORY_REQUEST => Ok(Self::MemoryRequest(decode_params(method, params)?)),
+            methods::MEMORY_PROMOTE => Ok(Self::MemoryPromote(decode_params(method, params)?)),
             methods::CRON_LIST => Ok(Self::CronList(decode_optional_params(method, params)?)),
             methods::CRON_TOGGLE => Ok(Self::CronToggle(decode_params(method, params)?)),
             methods::ROUTER_SET_MODE => Ok(Self::RouterSetMode(decode_params(method, params)?)),

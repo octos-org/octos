@@ -1191,6 +1191,7 @@ async fn plan_dynamic_tasks(
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::User,
@@ -1203,6 +1204,7 @@ async fn plan_dynamic_tasks(
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     ];
 

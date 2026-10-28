@@ -20,9 +20,9 @@ use super::{
     ConfigureToolTool, DiffEditTool, EditFileTool, ExecCommandTool, GlobTool, GrepTool,
     ImageGenerationTool, ListDirTool, ReadFileTool, RequestUserInputTool, ResumeAgentTool,
     SendInputTool, ShellTool, SpawnAgentTool, Tool, ToolCatalogEntry, ToolConfigStore, ToolResult,
-    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool, WebFetchTool,
-    WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool, WorkspaceShowTool, WriteFileTool,
-    WriteStdinTool,
+    ToolSearchTool, ToolSuggestTool, UpdatePlanTool, ViewImageTool, WaitAgentTool,
+    WatchExternalJobTool, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool,
+    WorkspaceShowTool, WriteFileTool, WriteStdinTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -182,6 +182,8 @@ pub const RESERVED_BUILTIN_TOOL_NAMES: &[&str] = &[
     "view_video",
     "tool_search",
     "configure_tool",
+    "discover_tools",
+    "run_tool",
 ];
 
 /// Registry of available tools.
@@ -241,6 +243,7 @@ pub struct ToolRegistry {
     supervisor: Arc<TaskSupervisor>,
     /// Set to true when any spawn_only tool is actually invoked in this agent run.
     spawn_only_invoked: Arc<std::sync::atomic::AtomicBool>,
+    automatic_job_claims: std::sync::Mutex<HashSet<String>>,
     /// #1148 codex P2: shared live catalog cell used by `tool_search` /
     /// `tool_suggest`. Updated on every mutation (`register`,
     /// `register_arc`, `apply_policy`, `mark_spawn_only`, etc.) so
@@ -275,6 +278,12 @@ pub struct ToolRegistry {
     /// (`mofa_slides`, `mofa_cards`, ...): the dispatcher is the ONLY
     /// supported LLM entry-point.
     internal_hidden: HashSet<String>,
+    /// O-015-A (#2862 regression): names removed from the model-visible
+    /// dispatch surface while staying REGISTERED — the external-turn confine
+    /// keeps the dispatch gateway pair alive (the surface gate requires them)
+    /// but hides them from the external client, which must reach kernel
+    /// surfaces only through its allowlist.
+    dispatch_surface_excluded: HashSet<String>,
     /// #1607: the session sandbox handed to the shell/exec/bash tools at
     /// construction. Stored (not just handed off and dropped) so the
     /// Agent-internal project-root validator path
@@ -294,6 +303,15 @@ pub struct ToolRegistry {
     /// visibility checks and discovery, and refused by `execute_with_context`.
     /// It only ever narrows: it never adds a tool the registry lacks.
     host_tool_allowlist: std::sync::RwLock<Option<Arc<HashSet<String>>>>,
+    /// #2865: tool names granted DIRECT model-callable status on top of the
+    /// fixed dispatch surface — host-owned peer app tools. A registered app
+    /// tool that is not on the fixed `DIRECT` list would otherwise vanish
+    /// from the peer's roster once the dispatch gateway is active (it is
+    /// neither in `DIRECT` nor reachable through it), breaking the peer's
+    /// documented tool contract. Populated by the host-peer registration
+    /// path via [`Self::grant_direct_surface`]; never widens any other
+    /// session's surface.
+    direct_surface_extra: std::collections::HashSet<String>,
 }
 
 /// Default per-tool execution-timeout backstop (seconds) for the registry
@@ -328,11 +346,14 @@ impl ToolRegistry {
             background_result_sender: None,
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            automatic_job_claims: std::sync::Mutex::new(HashSet::new()),
             live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: None,
             tool_timeout_secs: DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS,
             internal_hidden: HashSet::new(),
+            dispatch_surface_excluded: HashSet::new(),
+            direct_surface_extra: std::collections::HashSet::new(),
             filesystem_scope: FilesystemScope::Workspace,
             // #1607: default to a no-op sandbox. Constructors that receive a
             // real sandbox (`with_builtins_and_permissions`,
@@ -616,6 +637,24 @@ impl ToolRegistry {
         self.spawn_only_invoked.store(false, Ordering::SeqCst);
     }
 
+    /// Registry/session-local deduplication, bounded and independent of model
+    /// calls. Rebinding/snapshotting a workspace starts with fresh claims.
+    pub(crate) fn claim_automatic_job(&self, key: &str) -> bool {
+        let Ok(mut claims) = self.automatic_job_claims.lock() else {
+            return false;
+        };
+        if claims.len() >= 512 {
+            return false;
+        }
+        claims.insert(key.to_string())
+    }
+
+    pub(crate) fn release_automatic_job(&self, key: &str) {
+        if let Ok(mut claims) = self.automatic_job_claims.lock() {
+            claims.remove(key);
+        }
+    }
+
     /// Check if a tool came from a plugin binary.
     pub fn is_plugin(&self, name: &str) -> bool {
         self.plugin_tools.contains(name)
@@ -722,6 +761,34 @@ impl ToolRegistry {
     ///
     /// Used by the validator runner's lightweight dispatcher to capture a
     /// snapshot of available tools without cloning the full registry.
+    /// O-015-A (#2862 regression, serve_host_managed face): the external-turn
+    /// confine pass. Keeps allowlisted BUILTIN tools and the dispatch gateway
+    /// pair; drops everything else (host-routed tools by origin, non-
+    /// allowlisted builtins). Keeping the gateway pair is the load-bearing
+    /// part: the dispatcher surface gate is only active while run_tool and
+    /// discover_tools are registered, so a confine that dropped them flipped
+    /// the registry to pre-dispatcher semantics and re-exposed every builtin
+    /// an external client should not see over the host's own compact surface.
+    pub fn retain_external_turn_surface(&mut self, allowlisted: impl Fn(&str) -> bool) {
+        let keep: std::collections::HashSet<String> = self
+            .tool_names()
+            .into_iter()
+            .filter(|name| {
+                (allowlisted(name) && self.origin(name) == Some(ToolOrigin::Builtin))
+                    || self.is_dispatch_gateway(name)
+            })
+            .collect();
+        self.tools.retain(|name, _| keep.contains(name));
+        // The gateway pair stays registered (the surface gate needs it) but
+        // leaves the external client's model surface: the allowlist does not
+        // grant direct kernel-dispatch access.
+        for gateway in ["run_tool", "discover_tools"] {
+            if !allowlisted(gateway) {
+                self.exclude_from_dispatch_surface(gateway);
+            }
+        }
+    }
+
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
     }
@@ -804,7 +871,75 @@ impl ToolRegistry {
         if self.internal_hidden.contains(name) {
             return false;
         }
-        self.is_tool_visible_post_activation(name)
+        self.is_tool_visible_post_activation(name) && self.dispatch_surface_includes(name)
+    }
+
+    fn dispatch_surface_includes(&self, name: &str) -> bool {
+        // Exclusion is an independent external-turn boundary, not merely a
+        // modifier of the fixed DIRECT surface. It must still apply when a
+        // durable host list leaves only one gateway and thereby deactivates
+        // the pair check below.
+        if self.dispatch_surface_excluded.contains(name) {
+            return false;
+        }
+        !(self.is_dispatch_gateway("run_tool")
+            && self.is_dispatch_gateway("discover_tools")
+            && self.is_tool_visible_post_activation("run_tool")
+            && self.is_tool_visible_post_activation("discover_tools"))
+            || super::dispatcher::DIRECT.contains(&name)
+            || self.direct_surface_extra.contains(name)
+    }
+
+    /// O-015-A (#2862 regression): keep `name` registered but remove it from
+    /// the model-visible dispatch surface. The external-turn confine uses
+    /// this for the dispatch gateway pair — the pair must stay registered
+    /// (the surface gate requires it) while an external client must reach
+    /// kernel surfaces only through its allowlist.
+    pub fn exclude_from_dispatch_surface(&mut self, name: &str) {
+        self.dispatch_surface_excluded.insert(name.to_string());
+    }
+
+    /// Whether [`Self::exclude_from_dispatch_surface`] has hidden `name`
+    /// from the model-visible dispatch surface (it may still be registered
+    /// for runtime plumbing).
+    pub fn is_excluded_from_dispatch_surface(&self, name: &str) -> bool {
+        self.dispatch_surface_excluded.contains(name)
+    }
+
+    /// Grant a tool DIRECT model-callable status on top of the fixed
+    /// dispatch surface (#2865): host-owned peer app tools are registered
+    /// into the peer session's registry, and without this grant the dispatch
+    /// gateway would keep them out of the peer's roster entirely. Only
+    /// widens the surface of THIS registry (one peer session); discovery and
+    /// `run_tool` remain available for everything else. An explicit
+    /// [`Self::exclude_from_dispatch_surface`] still wins over this grant.
+    pub fn grant_direct_surface(&mut self, name: impl Into<String>) {
+        self.direct_surface_extra.insert(name.into());
+    }
+
+    /// Includes optional tools reachable via the fixed gateway.
+    pub fn is_tool_model_reachable(&self, name: &str) -> bool {
+        self.is_tool_visible(name)
+            || (self.is_dispatch_gateway("run_tool")
+                && self.is_tool_visible("run_tool")
+                && self.is_tool_visible_post_activation(name)
+                && self.get(name).is_some_and(|tool| tool.is_available()))
+    }
+
+    pub(super) fn dispatch_catalog(
+        &self,
+        permissions: &super::ToolPermissions,
+    ) -> Vec<(String, String)> {
+        self.tools
+            .values()
+            .filter(|tool| {
+                self.is_tool_visible_post_activation(tool.name())
+                    && tool.is_available()
+                    && permissions.is_tool_allowed(tool.name())
+                    && !self.is_dispatch_gateway(tool.name())
+            })
+            .map(|tool| (tool.name().to_string(), tool.description().to_string()))
+            .collect()
     }
 
     /// Visibility predicate shared with [`is_tool_visible`] that applies the
@@ -853,11 +988,9 @@ impl ToolRegistry {
         }
         let allowlist = self.host_tool_allowlist_snapshot();
 
-        // RFC-0 (#1289): every enabled tool is emitted every turn. The only
-        // exclusions remaining are internal-hidden tools (mofa_make
-        // dispatcher targets), provider-policy denials, and context-filter
-        // misses. There is no longer any recency-based (LRU) deferral nor an
-        // `activate_tools` meta-tool description to inject.
+        // The runtime advertises the common tools and fixed gateways. Native
+        // implementations remain registered for authorized discovery/execution.
+        // Explicit host lists excluding a gateway retain their exact tool list.
         let mut specs: Vec<ToolSpec> = self
             .tools
             .values()
@@ -880,6 +1013,7 @@ impl ToolRegistry {
                 })
             })
             .filter(|t| self.active_context_allows(t.as_ref()))
+            .filter(|t| self.dispatch_surface_includes(t.name()))
             .map(|t| ToolSpec {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
@@ -1038,12 +1172,12 @@ impl ToolRegistry {
     ///   preserves today's behaviour byte-for-byte.
     /// - [`crate::profile::ProfileTools::AllowList`] — keeps tools whose
     ///   names match the allow list (plain name, `group:<id>`, or
-    ///   `<prefix>*` wildcard). Any tool marked `spawn_only` is retained
-    ///   regardless — they carry background-execution wiring the runtime
-    ///   depends on.
+    ///   `<prefix>*` wildcard). Host-installed `spawn_only` wiring is retained
+    ///   unless its tool opts out via `preserve_background_registration`;
+    ///   built-in optional observers are filtered normally.
     /// - [`crate::profile::ProfileTools::DenyList`] — drops tools matching
     ///   any deny list entry (same matching rules). Spawn-only tools are
-    ///   likewise preserved.
+    ///   likewise preserved unless the tool opts out.
     ///
     /// The filter runs in-place. Cache invalidation is handled by
     /// [`ToolRegistry::retain`]. Intended to be called as a post-build
@@ -1051,6 +1185,16 @@ impl ToolRegistry {
     pub fn filter_by_profile(&mut self, tools: &crate::profile::ProfileTools) {
         use crate::profile::ProfileTools;
 
+        let preserved: HashSet<String> = self
+            .spawn_only
+            .iter()
+            .filter(|name| {
+                self.tools
+                    .get(*name)
+                    .is_some_and(|tool| tool.preserve_background_registration())
+            })
+            .cloned()
+            .collect();
         match tools {
             ProfileTools::Default => {
                 // No-op — the default mode is the behaviour-parity path.
@@ -1068,10 +1212,9 @@ impl ToolRegistry {
                     );
                     return;
                 }
-                let spawn_only = self.spawn_only.clone();
                 let allow_entries: Vec<String> = allow.clone();
                 self.retain(|name| {
-                    spawn_only.contains(name)
+                    preserved.contains(name)
                         || allow_entries
                             .iter()
                             .any(|entry| policy::entry_matches(entry, name))
@@ -1081,10 +1224,9 @@ impl ToolRegistry {
                 if deny.is_empty() {
                     return;
                 }
-                let spawn_only = self.spawn_only.clone();
                 let deny_entries: Vec<String> = deny.clone();
                 self.retain(|name| {
-                    spawn_only.contains(name)
+                    preserved.contains(name)
                         || !deny_entries
                             .iter()
                             .any(|entry| policy::entry_matches(entry, name))
@@ -1182,6 +1324,10 @@ impl ToolRegistry {
             cached_specs: std::sync::Mutex::new(None),
             plugin_tools: self.plugin_tools.clone(),
             non_builtin_origins: self.non_builtin_origins.clone(),
+            // Carried: a snapshot serving a turn must keep the same
+            // direct-surface grants as the registry it was snapshotted
+            // from (host-owned peer app tools stay model-direct).
+            direct_surface_extra: self.direct_surface_extra.clone(),
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
             background_result_sender: None,
@@ -1192,6 +1338,7 @@ impl ToolRegistry {
             // wiring installed on the parent.
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            automatic_job_claims: std::sync::Mutex::new(HashSet::new()),
             live_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
             session_key: None,
             output_dir_hint: self.output_dir_hint.clone(),
@@ -1211,6 +1358,7 @@ impl ToolRegistry {
             // #2605: a snapshot (a per-turn registry, a spawned child's
             // parent roster) keeps the host's list: it must never widen.
             host_tool_allowlist: std::sync::RwLock::new(self.host_tool_allowlist_snapshot()),
+            dispatch_surface_excluded: self.dispatch_surface_excluded.clone(),
         };
         // #1148 codex P2: the cloned `tool_search` / `tool_suggest`
         // Arcs still point to the PARENT's catalog cell. Re-register
@@ -1327,6 +1475,24 @@ impl ToolRegistry {
         name: &str,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
+        let resolved;
+        let (name, args) = if name == "run_tool" && self.is_dispatch_gateway(name) {
+            resolved = self.resolve_dispatch_call(
+                &octos_core::ToolCall {
+                    id: ctx.tool_id.clone(),
+                    name: name.to_string(),
+                    arguments: args.clone(),
+                    metadata: None,
+                },
+                &ctx.permissions,
+            )?;
+            (resolved.name.as_str(), &resolved.arguments)
+        } else {
+            (name, args)
+        };
+        if name == "discover_tools" && self.is_dispatch_gateway(name) {
+            return self.discover_tools(args, &ctx.permissions);
+        }
         if !self.host_tool_allowlist_permits(name) {
             eyre::bail!("tool '{}' is not in this session's tool list", name);
         }
@@ -1499,6 +1665,13 @@ impl ToolRegistry {
                 .with_bash_file_writes(permissions.bash_file_writes),
         );
         registry.register(WriteStdinTool);
+        registry.register(
+            WatchExternalJobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope),
+        );
+        registry.mark_spawn_only(
+            "watch_external_job",
+            Some(super::watch_external_job::START_MESSAGE.into()),
+        );
         registry.register(UpdatePlanTool);
         registry.register(RequestUserInputTool);
         // UPCR-2026-023: structured AskUserQuestion. The synchronous,
@@ -1588,6 +1761,10 @@ impl ToolRegistry {
         // found" miss. Follow-up to wire a real backend lives on
         // issue #1149.
         registry.register(ImageGenerationTool::new());
+        // Standard runtime interface. Host/profile filters still authorize
+        // both gateways and targets; no selectable legacy presentation mode.
+        registry.register(super::dispatcher::DiscoverTools);
+        registry.register(super::dispatcher::RunTool);
         // Final refresh so the catalog reflects the just-registered
         // search/suggest tools too (cosmetic — they show up in their
         // own search results).
@@ -1595,7 +1772,7 @@ impl ToolRegistry {
         registry
     }
 
-    /// Snapshot of every currently model-visible tool as a [`ToolCatalogEntry`]
+    /// Snapshot of every currently authorized, available tool as a [`ToolCatalogEntry`]
     /// list. Used by `with_builtins` to wire `tool_search` / `tool_suggest`
     /// against the effective coding tool contract.
     pub fn catalog_snapshot(&self) -> Vec<ToolCatalogEntry> {
@@ -1619,6 +1796,7 @@ impl ToolRegistry {
                 })
             })
             .filter(|tool| self.active_context_allows(tool.as_ref()))
+            .filter(|tool| tool.is_available())
             .map(|tool| {
                 ToolCatalogEntry::new(
                     tool.name(),
@@ -1659,6 +1837,7 @@ impl ToolRegistry {
         // doesn't keep running commands under the old project root.
         "bash",
         "read_file",
+        "watch_external_job",
         "write_file",
         "apply_patch",
         "edit_file",
@@ -1715,6 +1894,17 @@ impl ToolRegistry {
         registry.sandbox = sandbox.clone();
         registry.filesystem_scope = permissions.filesystem_scope;
         // Re-register cwd-bound tools with the new workspace
+        if self.get("watch_external_job").is_some() {
+            registry.register(
+                WatchExternalJobTool::new(cwd).with_filesystem_scope(permissions.filesystem_scope),
+            );
+            if self.is_spawn_only("watch_external_job") {
+                registry.mark_spawn_only(
+                    "watch_external_job",
+                    Some(super::watch_external_job::START_MESSAGE.into()),
+                );
+            }
+        }
         registry.register(
             ShellTool::new(cwd)
                 .with_shared_sandbox(sandbox.clone())
@@ -2265,7 +2455,7 @@ mod registry_dispatch_tests {
         // a tool the provider policy hid from the LLM's tool list.
         let mut reg = make_registry();
         // After make_registry, "shell" exists.
-        assert!(reg.is_tool_visible("shell"));
+        assert!(reg.is_tool_model_reachable("shell"));
 
         let policy = ToolPolicy {
             deny: vec!["shell".to_string()],
@@ -3031,28 +3221,22 @@ mod profile_filter_tests {
     }
 
     #[test]
-    fn coding_full_profile_produces_same_registry_as_default_builtins() {
-        // Behaviour parity gate: applying the built-in `coding-full`
-        // profile to a builtin registry must leave the registry IDENTICAL
-        // to what the no-flag default path produced before the lean
-        // `coding` default landed. This is the critical regression guard
-        // called out in the M8.3 issue, retargeted at the unfiltered
-        // escape hatch now that `coding` itself carries an allow list
-        // (see `crate::profile::tests` for the lean-narrowing pins).
+    fn coding_profile_produces_same_registry_as_default_builtins() {
+        // Default coding retains the authorized implementations and fixed interface.
         use crate::profile::ProfileDefinition;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let reference = ToolRegistry::with_builtins(dir.path());
         let reference_names = builtin_names(&reference);
 
-        let full = ProfileDefinition::builtin("coding-full").expect("coding-full builtin");
+        let full = ProfileDefinition::builtin("coding").expect("coding builtin");
         let mut profiled = ToolRegistry::with_builtins(dir.path());
         full.apply_to_registry(&mut profiled);
 
         let profiled_names = builtin_names(&profiled);
         assert_eq!(
             reference_names, profiled_names,
-            "coding-full profile must preserve behaviour parity with the default path",
+            "coding profile must preserve behaviour parity with the default path",
         );
     }
 
