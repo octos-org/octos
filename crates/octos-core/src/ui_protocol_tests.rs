@@ -620,6 +620,8 @@ fn session_open_result_includes_capabilities_field() {
         if *feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2
             || *feature == UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1
             || *feature == UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
+            || *feature == UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
+            || *feature == UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1
         {
             continue;
         }
@@ -942,6 +944,8 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "memory/search",
             "memory/load",
             "memory/ingest",
+            "memory/request",
+            "memory/promote",
             "cron/list",
             "cron/toggle",
             "router/set_mode",
@@ -1080,6 +1084,8 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "memory/search",
             "memory/load",
             "memory/ingest",
+            "memory/request",
+            "memory/promote",
             "cron/list",
             "cron/toggle",
             "router/set_mode",
@@ -1176,6 +1182,8 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "memory/search",
                 "memory/load",
                 "memory/ingest",
+            "memory/request",
+            "memory/promote",
                 "cron/list",
                 "cron/toggle",
                 "router/set_mode",
@@ -4870,6 +4878,7 @@ fn upcr_042_append_message_round_trips_through_rpc_envelope() {
         source: "external_record:whiteboard".to_owned(),
         client_message_id: Some("cmid-1".to_owned()),
         thread_id: Some("cmid-0".to_owned()),
+        participant: None,
     });
     let rpc = append
         .clone()
@@ -4889,6 +4898,7 @@ fn upcr_042_append_message_round_trips_through_rpc_envelope() {
         source: "external_record:import".to_owned(),
         client_message_id: None,
         thread_id: None,
+        participant: None,
     };
     let json = serde_json::to_value(&bare).expect("params json");
     assert!(json.get("client_message_id").is_none());
@@ -5046,6 +5056,19 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
             methods::MEMORY_INGEST,
         ),
         (
+            UiCommand::MemoryRequest(MemoryRequestParams {
+                request_id: "req1".into(),
+                operation: MemoryRequestOperation::Remember,
+                content: Some("Likes diagrams.".into()),
+                entry_id: None,
+            }),
+            methods::MEMORY_REQUEST,
+        ),
+        (
+            UiCommand::MemoryPromote(MemoryPromoteParams::default()),
+            methods::MEMORY_PROMOTE,
+        ),
+        (
             UiCommand::CronList(CronListParams::default()),
             methods::CRON_LIST,
         ),
@@ -5059,14 +5082,14 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
     ];
     assert_eq!(
         cases.len(),
-        20,
-        "20 UiCommand arms cover the 20 auxiliary methods \
+        22,
+        "22 UiCommand arms cover the 22 auxiliary methods \
              (`session/list`, `session/snapshot`, `session/messages_page`, \
              `session/status.get`, `session/files.list`, `session/tasks.list`, \
              `session/workspace.get`, `session/title.set`, `session/delete`, \
              `system/status.get`, `content/list`, `content/delete`, \
              `content/bulk_delete`, `memory/overview`, `memory/entity`, \
-             `memory/search`, `memory/load`, `memory/ingest`, \
+             `memory/search`, `memory/load`, `memory/ingest`, `memory/request`, `memory/promote`, \
              `cron/list`, `cron/toggle`) — `content/delete` and \
              `content/bulk_delete` are distinct methods"
     );
@@ -5279,6 +5302,8 @@ fn aux_rest_to_ws_v1_methods_are_capability_gated() {
         methods::MEMORY_SEARCH,
         methods::MEMORY_LOAD,
         methods::MEMORY_INGEST,
+        methods::MEMORY_REQUEST,
+        methods::MEMORY_PROMOTE,
         methods::CRON_LIST,
         methods::CRON_TOGGLE,
     ] {
@@ -5310,6 +5335,8 @@ fn aux_rest_to_ws_v1_methods_are_capability_gated() {
         methods::MEMORY_SEARCH,
         methods::MEMORY_LOAD,
         methods::MEMORY_INGEST,
+        methods::MEMORY_REQUEST,
+        methods::MEMORY_PROMOTE,
         methods::CRON_LIST,
         methods::CRON_TOGGLE,
     ] {
@@ -7375,4 +7402,67 @@ fn assert_spec_v2_projection_examples_match_rust_wire_types(spec: &str) {
         ],
         "publish every current payload tag exactly as serialized"
     );
+}
+
+#[test]
+fn memory_requests_refuse_caller_identity_and_origin_fields() {
+    for extra in ["origin", "profile_id", "sensitive", "data_dir"] {
+        let mut params = serde_json::json!({"request_id":"r", "operation":"remember", "content":"Likes graphs."});
+        params[extra] = serde_json::json!("host");
+        assert!(
+            UiCommand::from_rpc_request(RpcRequest::new("r", methods::MEMORY_REQUEST, params))
+                .is_err()
+        );
+    }
+    assert!(
+        serde_json::from_value::<MemoryRequestParams>(serde_json::json!({
+            "request_id":"r", "operation":"delete_everything"
+        }))
+        .is_err()
+    );
+    assert_eq!(
+        serde_json::to_value(MemoryRequestResult {
+            request_id: "r".into(),
+            operation: MemoryRequestOperation::Remember,
+            status: MemoryRequestStatus::Accepted,
+            refresh_enabled: false
+        })
+        .unwrap()["status"],
+        "accepted"
+    );
+}
+
+#[test]
+fn full_history_append_retry_feature_is_explicitly_negotiated() {
+    let feature = UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1;
+    assert!(
+        !UiProtocolCapabilities::first_server_slice()
+            .supported_features
+            .iter()
+            .any(|f| f == feature)
+    );
+    assert!(
+        UiProtocolCapabilities::full_protocol()
+            .supported_features
+            .iter()
+            .any(|f| f == feature)
+    );
+    let advertised = UiProtocolCapabilities::for_negotiated_features(&[feature.to_owned()]);
+    assert!(advertised.supported_features.iter().any(|f| f == feature));
+    let legacy = UiProtocolCapabilities::for_negotiated_features(std::iter::empty::<&str>());
+    assert!(!legacy.supported_features.iter().any(|f| f == feature));
+}
+
+#[test]
+fn should_advertise_append_participant_only_when_negotiated() {
+    let feature = UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1;
+    let has = |caps: UiProtocolCapabilities| caps.supported_features.iter().any(|f| f == feature);
+    assert!(!has(UiProtocolCapabilities::first_server_slice()));
+    assert!(has(UiProtocolCapabilities::full_protocol()));
+    assert!(has(UiProtocolCapabilities::for_negotiated_features(&[
+        feature.to_owned()
+    ])));
+    assert!(!has(UiProtocolCapabilities::for_negotiated_features(
+        std::iter::empty::<&str>()
+    )));
 }

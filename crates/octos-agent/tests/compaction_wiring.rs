@@ -42,6 +42,7 @@ fn system_msg(content: &str) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -57,6 +58,7 @@ fn user_msg(content: &str) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -72,6 +74,7 @@ fn assistant_msg(content: &str) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 

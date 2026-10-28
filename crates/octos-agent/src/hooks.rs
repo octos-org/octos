@@ -278,6 +278,17 @@ fn sanitize_payload(
                         kept.insert(key.to_string(), v.clone());
                     }
                 }
+                // Batch reads contain paths, never file contents. Retain every
+                // path for path-filtered hooks; do not silently skip a denied
+                // member because it was inside read_file.files.
+                if let Some(files) = obj.get("files").and_then(serde_json::Value::as_array) {
+                    kept.insert("files".into(), serde_json::json!(files.iter().map(|file| {
+                        serde_json::json!({"path": file.get("path").or_else(|| file.get("filePath")).and_then(serde_json::Value::as_str)})
+                    }).collect::<Vec<_>>()));
+                }
+                if let Some(path) = obj.get("filePath").and_then(serde_json::Value::as_str) {
+                    kept.insert("path".into(), serde_json::json!(path));
+                }
             }
             kept.insert("redacted".into(), serde_json::Value::Bool(true));
             kept.insert("reason".into(), serde_json::json!("sensitive tool"));
@@ -1002,14 +1013,16 @@ impl HookExecutor {
             if matches!(event, HookEvent::BeforeToolCall | HookEvent::AfterToolCall)
                 && !self.path_filters[i].is_empty()
             {
-                let tool_path = payload_ref.arguments.as_ref().and_then(extract_tool_path);
-                let Some(tool_path) = tool_path else {
-                    continue;
-                };
-                let candidate = std::path::Path::new(&tool_path);
-                let matched = self.path_filters[i]
-                    .iter()
-                    .any(|pat| pat.matches_path(candidate));
+                let paths = payload_ref
+                    .arguments
+                    .as_ref()
+                    .map(extract_tool_paths)
+                    .unwrap_or_default();
+                let matched = paths.iter().any(|path| {
+                    self.path_filters[i]
+                        .iter()
+                        .any(|pat| pat.matches_path(std::path::Path::new(path)))
+                });
                 if !matched {
                     continue;
                 }
@@ -1324,6 +1337,14 @@ fn extract_tool_path(args: &serde_json::Value) -> Option<String> {
         .and_then(|obj| obj.get("path"))
         .and_then(|v| v.as_str())
         .map(str::to_owned)
+}
+
+fn extract_tool_paths(args: &serde_json::Value) -> Vec<String> {
+    let mut paths: Vec<_> = extract_tool_path(args).into_iter().collect();
+    if let Some(files) = args.get("files").and_then(serde_json::Value::as_array) {
+        paths.extend(files.iter().filter_map(extract_tool_path));
+    }
+    paths
 }
 
 /// Expand leading `~` or `~/` to the user's home directory.
@@ -2137,6 +2158,31 @@ mod tests {
             path_filter: patterns.into_iter().map(String::from).collect(),
             requires_bin: None,
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn should_deny_batch_read_when_any_path_matches_hook() {
+        let executor = HookExecutor::new(vec![hook_with_path_filter(
+            HookEvent::BeforeToolCall,
+            vec!["**/private.txt"],
+        )]);
+        let payload = HookPayload::before_tool(
+            "read_file",
+            serde_json::json!({"files":[
+                {"path":"public/a.txt"}, {"filePath":"secrets/private.txt"}
+            ]}),
+            "batch",
+            None,
+        );
+        assert_eq!(
+            extract_tool_paths(payload.arguments.as_ref().unwrap()).len(),
+            2
+        );
+        assert!(matches!(
+            executor.run(HookEvent::BeforeToolCall, &payload).await,
+            HookResult::Deny(_)
+        ));
     }
 
     #[tokio::test]

@@ -116,6 +116,7 @@ async fn bootstrap_with_profile_root(
                 crate::commands::load_profile_prompt_template(&tool_profile.name, template)
             {
                 runtime.prompt_parts.pre_memory = template;
+                runtime.prompt_parts.uses_bundled_base = false;
                 runtime.system_prompt = runtime.prompt_parts.joined();
             }
         }

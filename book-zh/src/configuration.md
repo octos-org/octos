@@ -224,6 +224,50 @@ Origin 应使用 HTTPS。浏览器认证 token 按 Origin 存储；URL 变化后
 打开公开 Origin 并在该页面重新登录，在 localhost 登录不会自动认证
 另一个公开 Origin。
 
+## 运行时工具配置
+
+`octos chat` 和 `octos acp` 在启动时解析运行时 profile，用于控制工具授权和
+agent 设置。模型请求使用固定的常用工具与调用入口；其他工具的 schema
+通过发现操作返回，不再全部附加到每次请求中。
+
+内置配置：
+
+| 配置 | 工具访问 |
+|------|----------|
+| `coding`（默认） | 四个常用工具加 `discover_tools` / `run_tool`；所有已注册且获授权的其他能力可通过发现操作访问。 |
+| `swarm` | 相同的固定接口，并为协作工作流设置显式允许列表。 |
+
+直接运行 `octos chat` 即使用标准接口。自定义 profile 仍然配置权限、模型
+偏好和 agent 设置。旧的工具展示变体及其开关已移除；访问其他获授权工具
+无需选择特殊 profile。
+
+项目配置可写入 `~/.octos/profiles/<name>/profile.json`，或通过 `--profile`
+传入路径。允许列表支持 `group:<id>`、精确名称和 `prefix*` 通配符：
+
+```json
+{
+  "name": "coding-project",
+  "version": 1,
+  "tools": {
+    "mode": "allow_list",
+    "tools": ["group:fs", "group:runtime", "group:search", "group:memory",
+              "spawn", "ask_user_question", "group:web"]
+  },
+  "agents": ["research-worker", "repo-editor"]
+}
+```
+
+注意：
+
+- profile 筛选在插件、技能和 MCP 注册之后运行，对这些工具与内置工具
+  同样生效。标记为 `spawn_only` 的工具不由此筛选移除；`run_pipeline`
+  在注册时根据 profile 允许列表控制。
+- `spawn` worker 根据自身的有效 profile 和权限建立工具注册表，也使用
+  标准固定调用接口。
+- `config.json` 中的 `tool_policy` 仍然生效，可进一步收窄权限；拒绝优先。
+- `octos gateway` / `octos serve` 同样使用标准调用接口；host 和会话限制
+  继续决定哪些能力可用。
+
 ## 人工审批规则
 
 命中规则的工具调用会暂停当前轮次，直到授权的人在渠道上批准或拒绝（Matrix 优先；Robrix 等能力客户端渲染原生的 批准/拒绝 按钮，其他客户端显示文本回退）：

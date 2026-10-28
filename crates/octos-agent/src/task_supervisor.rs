@@ -282,6 +282,9 @@ pub struct BackgroundTask {
     pub child_session_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_terminal_state: Option<ChildSessionTerminalState>,
+    /// Contract-persistence acknowledgement, independent of result delivery.
+    /// None means no join outcome was observed (e.g. no optional lifecycle
+    /// channel); it does not mean that the parent is absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_join_state: Option<ChildSessionJoinState>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -312,9 +315,9 @@ pub struct BackgroundTask {
     /// unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_output: Option<String>,
-    /// True when the current `Failed` status came from an OBSERVER — the
-    /// harness-event bridge (`apply_harness_event`) classifying a mid-run
-    /// error as fatal — rather than from the task's owner (the spawn join /
+    /// True when the current `Failed` status came from an OBSERVER — such as
+    /// older harness-event bridges classifying a mid-run error as fatal —
+    /// rather than from the task's owner (the spawn join /
     /// completer that actually watches the worker finish). Observer verdicts
     /// are provisional: the owner's `mark_completed` may override them (the
     /// worker demonstrably survived), while owner-reported failures and
@@ -2216,6 +2219,32 @@ impl TaskSupervisor {
         }
     }
 
+    /// Register a native child with its ledger lineage and the originating
+    /// master's workspace in the first durable row. Completion output paths
+    /// may point at child directories; they must not change the workspace
+    /// used to route or coalesce the master's continuation notifications.
+    /// A failed first write refuses registration before publishing the task.
+    pub fn try_register_with_lineage_and_workspace(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        session_key: Option<&str>,
+        task_ledger_path: Option<&str>,
+        workspace_scope: Option<&str>,
+    ) -> Result<String, RegisterTaskError> {
+        self.register_full_with_workspace(
+            tool_name,
+            tool_call_id,
+            session_key,
+            task_ledger_path,
+            None,
+            None,
+            None,
+            workspace_scope,
+            true,
+        )
+    }
+
     /// Register a new background task with optional ledger-path lineage and
     /// the original tool input. The tool input is preserved so failure
     /// signals can include it without re-walking the message history.
@@ -3025,8 +3054,8 @@ impl TaskSupervisor {
     /// can observe it.
     ///
     /// One exception: an OBSERVER-derived `Failed`
-    /// ([`Self::mark_failed_observed`], set by the harness-event bridge for a
-    /// mid-run fail-fast classification) IS overridden — the caller here is
+    /// ([`Self::mark_failed_observed`], including records persisted by older
+    /// harness-event bridges) IS overridden — the caller here is
     /// the owner that watched the worker actually finish, so its completion
     /// corrects the premature verdict.
     pub fn mark_completed(&self, task_id: &str, output_files: Vec<String>) {
@@ -3034,7 +3063,7 @@ impl TaskSupervisor {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
                 if task.status.is_terminal() {
-                    // An OBSERVER-derived `Failed` (harness-event bridge
+                    // An OBSERVER-derived `Failed` (an older bridge
                     // classified a mid-run error as fatal while the worker
                     // loop kept running) is provisional, not authoritative —
                     // the caller of mark_completed IS the owner watching the
@@ -3179,12 +3208,12 @@ impl TaskSupervisor {
     }
 
     /// [`Self::mark_failed`] for OBSERVERS — reporters that classified a
-    /// mid-run signal as fatal without watching the worker actually stop
-    /// (today: the harness-event bridge in [`Self::apply_harness_event`]).
+    /// mid-run signal as fatal without watching the worker actually stop.
     /// The failure is recorded and propagated exactly like an owner failure,
     /// but stamped `failed_by_observer` so the owner's later
     /// [`Self::mark_completed`] may override it when the worker demonstrably
-    /// survived and finished (mini4 `review-octos-web-v3` regression).
+    /// survived and finished. Diagnostic harness Error events must not use
+    /// this API: they do not establish that the worker has terminated.
     pub fn mark_failed_observed(&self, task_id: &str, error: String) {
         self.mark_failed_inner(task_id, error, true)
     }
@@ -3524,25 +3553,33 @@ impl TaskSupervisor {
         }
     }
 
-    /// Record the child-session contract outcome for a task.
+    /// Record the child-session terminal outcome and any observed contract join.
+    /// `None` leaves the join unobserved when no lifecycle channel is configured;
+    /// it must neither invent an orphan nor erase an earlier observed join.
     pub fn mark_child_session_outcome(
         &self,
         task_id: &str,
         terminal_state: ChildSessionTerminalState,
-        join_state: ChildSessionJoinState,
+        join_state: impl Into<Option<ChildSessionJoinState>>,
     ) {
+        let join_state = join_state.into();
         let failure_action = child_failure_action_for_terminal_state(&terminal_state);
         let kind_label = child_terminal_kind_label(&terminal_state);
-        let outcome_label = child_join_outcome_label(&join_state);
+        let outcome_label = join_state
+            .as_ref()
+            .map(child_join_outcome_label)
+            .unwrap_or("unobserved");
         let snapshot = {
             let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(task) = tasks.get_mut(task_id) {
                 task.child_terminal_state = Some(terminal_state);
-                task.child_join_state = Some(join_state.clone());
-                task.child_joined_at = match join_state {
-                    ChildSessionJoinState::Joined => Some(Utc::now()),
-                    ChildSessionJoinState::Orphaned => None,
-                };
+                if let Some(ref join_state) = join_state {
+                    task.child_join_state = Some(join_state.clone());
+                    task.child_joined_at = match join_state {
+                        ChildSessionJoinState::Joined => Some(Utc::now()),
+                        ChildSessionJoinState::Orphaned => None,
+                    };
+                }
                 task.child_failure_action = failure_action;
                 task.updated_at = Utc::now();
                 Some(task.clone())
@@ -3554,7 +3591,7 @@ impl TaskSupervisor {
             self.persist_snapshot(task);
             self.notify_change(task);
             record_child_session_lifecycle(kind_label, outcome_label);
-            if matches!(join_state, ChildSessionJoinState::Orphaned) {
+            if matches!(join_state, Some(ChildSessionJoinState::Orphaned)) {
                 record_child_session_orphan("terminal_event_not_joined");
             }
         }
@@ -3708,32 +3745,19 @@ impl TaskSupervisor {
                     Some(runtime_detail.to_string()),
                 );
             }
-            HarnessEventPayload::Error { data } => {
-                // Structured error events are diagnostic — record them in the
-                // runtime detail but only transition to Failed when the
-                // recovery hint marks the variant as non-retryable.
+            HarnessEventPayload::Error { .. } => {
+                // Error classifications describe a failing call, not the
+                // lifetime of its worker. Even `bug`/`fail_fast` events can
+                // precede loop repair or transport fallback. Publishing a
+                // terminal failure here can schedule a second worker while
+                // the original still writes the same outputs. Keep the
+                // diagnostic visible; an explicit Failure event or the
+                // owner's join result supplies the terminal verdict.
                 self.mark_runtime_state(
                     task_id,
-                    TaskRuntimeState::ExecutingTool,
+                    snapshot.runtime_state,
                     Some(runtime_detail.to_string()),
                 );
-                // Tool-scoped errors (a tool CALL errored — `tool_execution`,
-                // `plugin_*`) are loop-recoverable by design: the agent loop
-                // feeds the error back to the model and KEEPS RUNNING, so
-                // their `fail_fast` hint scopes to the call, not the task.
-                // Failing the task here painted healthy workers as dead
-                // (mini4 `unknown tool: write_file` — chip went red while the
-                // worker went on to complete successfully). The owner join
-                // path reports the true terminal state; the detail above
-                // keeps the error visible to operators.
-                let tool_scoped =
-                    crate::harness_errors::HarnessError::variant_is_tool_scoped(&data.variant);
-                if !tool_scoped && matches!(data.recovery.as_str(), "fail_fast" | "bug") {
-                    // This is an OBSERVER verdict — the loop may still
-                    // survive (retry lanes, non-streaming fallback), so mark
-                    // it overridable by the owner's completion.
-                    self.mark_failed_observed(task_id, data.message.clone());
-                }
             }
         }
 

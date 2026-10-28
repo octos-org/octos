@@ -29,6 +29,7 @@ fn user_with_image(text: &str, image_path: &str) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 

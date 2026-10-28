@@ -235,8 +235,12 @@ export async function getSessionTasks(page: Page, sessionId: string): Promise<Se
   }, { sessionId });
 }
 
-export async function getSessionMessagesText(page: Page, sessionId: string): Promise<string> {
-  return page.evaluate(async ({ sessionId: sid }) => {
+export async function getSessionMessagesText(
+  page: Page,
+  sessionId: string,
+  role?: 'assistant' | 'user',
+): Promise<string> {
+  return page.evaluate(async ({ sessionId: sid, role: requiredRole }) => {
     const token =
       localStorage.getItem('octos_session_token') ||
       localStorage.getItem('octos_auth_token') ||
@@ -262,10 +266,11 @@ export async function getSessionMessagesText(page: Page, sessionId: string): Pro
     }
 
     return messages
+      .filter((message) => !requiredRole || message?.role === requiredRole)
       .map((message) => (typeof message?.content === 'string' ? message.content : ''))
       .filter((content): content is string => Boolean(content))
       .join('\n');
-  }, { sessionId });
+  }, { sessionId, role });
 }
 
 export async function findSessionIdByMessageText(
@@ -302,7 +307,8 @@ export async function waitForChildSessionTasksToSettle(
 
     if (
       childTasks.length > 0 &&
-      childTasks.every((task) => task.child_terminal_state && task.child_join_state)
+      childTasks.every((task) => task.child_terminal_state &&
+        ['completed', 'failed', 'cancelled'].includes(task.status || ''))
     ) {
       return childTasks;
     }

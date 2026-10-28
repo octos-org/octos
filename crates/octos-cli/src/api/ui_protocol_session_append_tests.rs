@@ -21,6 +21,7 @@ async fn append_state_with_user_row(session_id: &SessionKey) -> (Arc<AppState>, 
             thread_id: Some("cmid-user-1".into()),
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         };
         guard
             .add_message(session_id, user)
@@ -54,6 +55,7 @@ async fn session_append_message_persists_records_without_a_turn() {
             source: "external_record:whiteboard".into(),
             client_message_id: Some("cmid-answer-1".into()),
             thread_id: None,
+            participant: None,
         },
     )
     .await;
@@ -94,6 +96,7 @@ async fn session_append_message_retry_returns_existing_seq_without_a_second_row(
         source: "external_record:whiteboard".into(),
         client_message_id: Some("cmid-answer-1".into()),
         thread_id: None,
+        participant: None,
     };
 
     let (ws, mut rx) = ws_connection_for_test(8);
@@ -134,6 +137,7 @@ async fn session_append_message_retry_echoes_the_existing_row_binding() {
             source: "external_record:import".into(),
             client_message_id: Some("review-same-id".into()),
             thread_id: None,
+            participant: None,
         },
     )
     .await;
@@ -163,6 +167,7 @@ async fn session_append_message_retry_echoes_the_existing_row_binding() {
             source: "external_record:import".into(),
             client_message_id: Some("review-same-id".into()),
             thread_id: None,
+            participant: None,
         },
     )
     .await;
@@ -210,6 +215,7 @@ async fn session_append_message_user_record_roots_its_own_thread() {
             source: "external_record:whiteboard".into(),
             client_message_id: Some("cmid-user-2".into()),
             thread_id: None,
+            participant: None,
         },
     )
     .await;
@@ -240,6 +246,7 @@ async fn session_append_message_rejects_invalid_params_with_typed_kinds() {
         source: "external_record:test".into(),
         client_message_id: None,
         thread_id: None,
+        participant: None,
     };
 
     let cases: Vec<(&str, SessionAppendMessageParams)> = vec![
@@ -320,6 +327,7 @@ async fn session_append_message_rejects_invalid_params_with_typed_kinds() {
             source: "external_record:test".into(),
             client_message_id: None,
             thread_id: None,
+            participant: None,
         },
     )
     .await;
@@ -341,6 +349,7 @@ async fn session_append_message_rejects_invalid_params_with_typed_kinds() {
             source: "external_record:test".into(),
             client_message_id: None,
             thread_id: Some("imported-thread".into()),
+            participant: None,
         },
     )
     .await;
@@ -529,4 +538,204 @@ fn external_record_committed_mid_turn_defers_to_the_next_turn_prompt() {
         "the deferred row must surface to the next turn's prompt"
     );
     drop(registration);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_append_message_retry_outside_window_keeps_original_unbound_receipt() {
+    let session_id = SessionKey("local:append-outside-window".into());
+    let (state, tmp) = append_state_with_user_row(&session_id).await;
+    {
+        let sessions = state.sessions.as_ref().unwrap();
+        let mut guard = sessions.lock().await;
+        let mut original = Message::system("Original record has no thread");
+        original.client_message_id = Some("old-unbound-record".into());
+        guard.add_message(&session_id, original).await.unwrap();
+        guard
+            .add_message(&session_id, Message::user("x".repeat(33 * 1024 * 1024)))
+            .await
+            .unwrap();
+        guard
+            .add_message(&session_id, Message::user("Current user thread"))
+            .await
+            .unwrap();
+        // Reopen the manager to load its default bounded window.
+        *guard = octos_bus::SessionManager::open(tmp.path()).unwrap();
+        assert!(guard.load(&session_id).await.unwrap().is_partial());
+    }
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_append_message(
+        &ws,
+        &state,
+        None,
+        None,
+        "old-retry".into(),
+        SessionAppendMessageParams {
+            session_id: session_id.clone(),
+            role: "user".into(),
+            content: "A changed retry must not bind the old record".into(),
+            source: "external_record:app".into(),
+            media: vec![],
+            client_message_id: Some("old-unbound-record".into()),
+            thread_id: None,
+            participant: None,
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["seq"], 1);
+    assert!(frame["result"]["thread_id"].is_null());
+    let guard = state.sessions.as_ref().unwrap().lock().await;
+    assert_eq!(
+        guard.load_full(&session_id).await.unwrap().messages.len(),
+        4
+    );
+    assert!(guard.load(&session_id).await.unwrap().is_partial());
+}
+
+#[test]
+fn session_append_message_full_history_feature_reaches_transport_acknowledgements() {
+    const FEATURE: &str =
+        octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1;
+    let acknowledged = |features: ConnectionUiFeatures| {
+        features
+            .negotiated_capabilities()
+            .supported_features
+            .iter()
+            .any(|value| value == FEATURE)
+    };
+    let empty = HeaderMap::new();
+    assert!(!acknowledged(ConnectionUiFeatures::from_headers_and_query(
+        &empty, None
+    )));
+    assert!(!acknowledged(ConnectionUiFeatures::stdio_defaults()));
+    assert!(acknowledged(ConnectionUiFeatures::from_headers_and_query(
+        &empty,
+        Some("ui_feature=session.append_message.full_history_retry.v1")
+    )));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-octos-ui-features",
+        axum::http::HeaderValue::from_static(FEATURE),
+    );
+    assert!(acknowledged(ConnectionUiFeatures::from_headers_and_query(
+        &headers, None
+    )));
+    assert!(acknowledged(
+        ConnectionUiFeatures::from_requested_feature_tokens([FEATURE], true)
+    ));
+    assert!(!acknowledged(
+        ConnectionUiFeatures::from_requested_feature_tokens(["projection.envelope.v2"], false)
+    ));
+}
+
+// ===== UPCR-2026-053 participant on `session/append_message` =====
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_persist_trimmed_participant_when_append_names_who_spoke() {
+    let session_id = SessionKey("local:append-participant".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+    let (ws, mut rx) = ws_connection_for_test(8);
+
+    handle_session_append_message(
+        &ws,
+        &state,
+        None,
+        None,
+        "ap1".into(),
+        SessionAppendMessageParams {
+            session_id: session_id.clone(),
+            role: "assistant".into(),
+            content: "Think of the line as a mountain road.".into(),
+            media: vec![],
+            source: "external_record:octos-learn".into(),
+            client_message_id: Some("cmid-answer-p".into()),
+            thread_id: None,
+            participant: Some("  豆豆老师 ".into()),
+        },
+    )
+    .await;
+
+    let frame = recv_rpc_json(&mut rx).await;
+    assert_eq!(frame["result"]["seq"], 1, "{frame}");
+    let sessions = state.sessions.as_ref().unwrap();
+    let guard = sessions.lock().await;
+    let session = guard.load(&session_id).await.expect("session");
+    assert_eq!(
+        session.messages.last().unwrap().participant.as_deref(),
+        Some("豆豆老师")
+    );
+    assert_eq!(session.messages[0].participant, None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn should_reject_participant_that_could_break_extraction_framing() {
+    let session_id = SessionKey("local:append-participant-bad".into());
+    let (state, _tmp) = append_state_with_user_row(&session_id).await;
+    let too_long = "x".repeat(octos_core::MESSAGE_PARTICIPANT_MAX_BYTES + 1);
+    for (role, label) in [
+        ("assistant", "   "),
+        ("assistant", "tutor] [0:user"),
+        ("assistant", "two\nlines"),
+        ("assistant", "(participant: x)"),
+        ("assistant", too_long.as_str()),
+        ("system", "tutor"),
+    ] {
+        let (ws, mut rx) = ws_connection_for_test(8);
+        handle_session_append_message(
+            &ws,
+            &state,
+            None,
+            None,
+            "ap-bad".into(),
+            SessionAppendMessageParams {
+                session_id: session_id.clone(),
+                role: role.into(),
+                content: "record".into(),
+                media: vec![],
+                source: "external_record:octos-learn".into(),
+                client_message_id: None,
+                thread_id: None,
+                participant: Some(label.into()),
+            },
+        )
+        .await;
+        let frame = recv_rpc_json(&mut rx).await;
+        assert_eq!(
+            frame["error"]["data"]["kind"], "invalid_participant",
+            "{role} {label:?}: {frame}"
+        );
+    }
+    let sessions = state.sessions.as_ref().unwrap();
+    let guard = sessions.lock().await;
+    assert_eq!(
+        guard
+            .load(&session_id)
+            .await
+            .expect("session")
+            .messages
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn should_acknowledge_participant_feature_only_when_the_client_asks() {
+    const FEATURE: &str =
+        octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1;
+    let acknowledged = |features: ConnectionUiFeatures| {
+        features
+            .negotiated_capabilities()
+            .supported_features
+            .iter()
+            .any(|value| value == FEATURE)
+    };
+    let empty = HeaderMap::new();
+    assert!(!acknowledged(ConnectionUiFeatures::from_headers_and_query(
+        &empty, None
+    )));
+    assert!(!acknowledged(ConnectionUiFeatures::stdio_defaults()));
+    assert!(acknowledged(ConnectionUiFeatures::from_headers_and_query(
+        &empty,
+        Some("ui_feature=session.append_message.participant.v1")
+    )));
 }

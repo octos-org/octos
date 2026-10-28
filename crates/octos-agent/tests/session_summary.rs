@@ -33,6 +33,7 @@ fn user(content: &str) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -48,6 +49,7 @@ fn assistant(content: &str) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 

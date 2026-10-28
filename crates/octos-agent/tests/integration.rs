@@ -179,9 +179,8 @@ async fn test_agent_max_iterations() {
         .process_message("loop forever", &[], vec![])
         .await
         .unwrap();
-    // Regression: the bare "Reached max iterations." stub was replaced
-    // with an actionable message that names the iteration count and
-    // hints at `run_pipeline` as the canonical multi-step research path.
+    // A budget stop names the limit and preserves partial work. It must
+    // not recommend starting another pipeline/worker to reset that budget.
     // See `crates/octos-agent/src/agent/budget.rs::BudgetStop::message`.
     assert!(
         resp.content.contains('3'),
@@ -194,8 +193,11 @@ async fn test_agent_max_iterations() {
         resp.content
     );
     assert!(
-        resp.content.contains("run_pipeline"),
-        "expected a hint about 'run_pipeline' in: {}",
+        resp.content.contains("Preserve any partial artifacts")
+            && resp.content.contains("authorized budget")
+            && resp.content.contains("do not automatically re-spawn")
+            && !resp.content.contains("run_pipeline"),
+        "expected budget-preserving recovery guidance in: {}",
         resp.content
     );
 }
@@ -263,6 +265,7 @@ async fn test_context_trimming() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         })
         .collect();
 

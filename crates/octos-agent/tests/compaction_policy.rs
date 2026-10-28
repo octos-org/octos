@@ -71,6 +71,7 @@ fn user_msg(content: &str) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -86,6 +87,7 @@ fn assistant_msg(content: &str) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -106,6 +108,7 @@ fn assistant_tool_call(tool_name: &str, tool_id: &str, args: serde_json::Value) 
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -121,6 +124,7 @@ fn tool_result(tool_id: &str, content: &str) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -136,6 +140,7 @@ fn system_msg(content: &str) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
