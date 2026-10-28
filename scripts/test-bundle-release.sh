@@ -33,7 +33,7 @@ make_fake_release_tree() {
     local dir="$1"
     mkdir -p "$dir/target/release"
     for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email \
-        account_manager voice clock weather smart_home; do
+        account_manager voice clock weather office smart_home; do
         echo "fake $b" >"$dir/target/release/$b"
     done
     echo '{}' >"$dir/model_catalog.json"

@@ -5974,6 +5974,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "office"
+version = "1.0.0"
+dependencies = [
+ "eyre",
+ "image",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "zip",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

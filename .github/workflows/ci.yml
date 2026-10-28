@@ -28,7 +28,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_VERSION: "1.97.1"
   FEATURES: "api,telegram,discord,dingtalk,whatsapp,feishu,twilio,wecom,wecom-bot,audio_mp3"
-  SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p smart-home -p skill-evolve"
+  SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p office -p smart-home -p skill-evolve"
 
 jobs:
   dashboard:

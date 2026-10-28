@@ -24,6 +24,7 @@ BINARIES=(
   voice
   clock
   weather
+  office
   smart_home
 )
 

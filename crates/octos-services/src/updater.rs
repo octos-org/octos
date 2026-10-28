@@ -33,6 +33,7 @@ const BUNDLE_ENTRIES: &[&str] = &[
     "voice",
     "clock",
     "weather",
+    "office",
     "smart_home",
     "model_catalog.json",
 ];
