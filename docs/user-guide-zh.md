@@ -2434,6 +2434,7 @@ Matrix 频道字段说明：
 | `user_prefix` | 此应用服务管理的桥接用户 ID 前缀。 |
 | `port` | Octos 监听来自 Palpo 的应用服务事件的端口。监听默认只绑 `127.0.0.1`；跨容器部署用 `OCTOS_MATRIX_APPSERVICE_BIND` 覆盖绑定地址（见下方 compose 文件）。 |
 | `allowed_senders` | 允许与机器人对话的 Matrix 用户 ID。空数组 = 允许所有人。 |
+| `ignored_senders` | 消息在进入任何处理逻辑前就被丢弃的 Matrix 用户 ID（用于打断机器人互相触发）。只过滤消息事件，不过滤邀请。 |
 | `mention_only` | 可选，默认 `true`。在真正的 1:1 私聊之外，机器人只在被显式寻址时才回复（`m.mentions` 条目、MXID pill/提及、或客户端指定的 target）。真正的 1:1 私聊——1 个人类 + 该应用服务在此房间仅管理 1 个机器人（以应用服务自己的房间映射为准）——始终回复。多机器人房间即使只有 1 个人类也要求提及，避免所有机器人同时应答。设为 `false` 则在所有房间回复每条消息（带 `org.octos.explicit_room` 标记的消息仍走门控）。 |
 
 #### 5. Docker Compose

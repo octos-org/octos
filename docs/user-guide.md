@@ -2558,6 +2558,7 @@ Matrix channel fields:
 | `user_prefix` | Prefix for bridged user IDs managed by this appservice. |
 | `port` | Port Octos listens on for appservice events from Palpo. The listener binds `127.0.0.1` by default; cross-container deployments override the bind address with `OCTOS_MATRIX_APPSERVICE_BIND` (see the compose file below). |
 | `allowed_senders` | Matrix user IDs that may talk to the bot. Empty array = allow all. |
+| `ignored_senders` | Matrix user IDs whose messages are dropped before any handler runs (breaks bot-to-bot loops). Applies to message events only — invites are not filtered. |
 | `mention_only` | Optional, default `true`. Outside a true 1:1 DM, a bot only replies when explicitly addressed (an `m.mentions` entry, an MXID pill/mention, or a client-supplied target). A true 1:1 DM — a single human plus a single managed bot in the room, counted from the appservice's own room map — always replies. Rooms with multiple managed bots require a mention even when only one human is present, so bots don't all answer every message. Set to `false` to make the bot reply to every message in every room (messages carrying `org.octos.explicit_room` are still gated). |
 
 #### 5. Docker Compose
