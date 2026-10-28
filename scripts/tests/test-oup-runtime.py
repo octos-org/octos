@@ -603,6 +603,22 @@ class RuntimeContract(unittest.TestCase):
             finally:
                 release.set()
                 client.close()
+            # #2831: the interrupted turn's dispatched prompt must have
+            # reached durable history even though the agent task was aborted
+            # before its end-of-turn persist loop ran — a fresh connection
+            # (after the first runtime released the data-dir lock) replays it.
+            reconnected = self.oup_connect(directory, env, args, "interrupt-reconnect")
+            try:
+                self.oup_open(reconnected, directory, session)
+                hydrated = reconnected.rpc("session/hydrate", {
+                    "session_id": session, "include": ["messages"],
+                })["result"]
+            finally:
+                reconnected.close()
+            user_rows = [row["content"] for row in hydrated["messages"]
+                         if row["role"] == "user"]
+            self.assertEqual(user_rows.count("Wait for cancellation."), 1,
+                             "the interrupted prompt must replay exactly once")
 
     def test_oup_peer_result_survives_restart_and_reuse(self):
         with self.fixture("oup-peer", [reply("PEER_FINAL"), reply("PEER_REUSED_FINAL")]) as (
