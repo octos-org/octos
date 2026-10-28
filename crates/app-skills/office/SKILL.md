@@ -1,6 +1,6 @@
 ---
 name: office
-description: Generate Word DOCX and Excel XLSX files locally. Use for Word documents, reports with tables or images, spreadsheets, workbooks, formulas, and formatted cells. No external runtime or network is needed.
+description: Generate Word DOCX, Excel XLSX, and PowerPoint PPTX files locally. Use for Word documents, spreadsheets, formulas, formatted cells, presentations, slides, and decks with bullet points or images. No external runtime or network is needed.
 version: 1.0.0
 author: octos
 always: false
@@ -55,3 +55,18 @@ A cell can be a JSON string, number, or boolean, or an object with:
 - `number_format`: Excel number format such as `0.00`, `0%`, or `#,##0.00`.
 
 Formulas are marked for recalculation when the workbook opens. No LibreOffice or other external program is required.
+
+## PPTX
+
+```json
+{
+  "kind": "pptx",
+  "output": "reports/q3-deck.pptx",
+  "slides": [
+    {"title": "Q3 summary", "bullets": ["Revenue increased", "East and West grew"]},
+    {"title": "Regional sales", "bullets": ["East: 120", "West: 140"], "image": {"path": "charts/q3.png", "width_inches": 5.5}}
+  ]
+}
+```
+
+Each slide has an editable title and bullet paragraphs. The optional image is placed to the right of the text, preserving its aspect ratio.

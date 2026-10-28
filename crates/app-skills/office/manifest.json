@@ -2,19 +2,19 @@
   "name": "office",
   "version": "1.0.0",
   "author": "octos",
-  "description": "Generate DOCX and XLSX files locally in the session workspace, without Python, Node, LibreOffice, or network access",
+  "description": "Generate DOCX, XLSX, and PPTX files locally in the session workspace, without Python, Node, LibreOffice, or network access",
   "timeout_secs": 60,
   "requires_network": false,
   "env": ["OCTOS_SESSION_WORKSPACE"],
   "tools": [
     {
       "name": "office_generate",
-      "description": "Create a Word DOCX (title, paragraphs, tables, PNG/JPEG images) or Excel XLSX (multiple sheets, values, formulas, bold/fill/number formats). Output and image paths are workspace-relative unless already inside the workspace. Existing files are never overwritten.",
+      "description": "Create Word DOCX, Excel XLSX, or PowerPoint PPTX (multiple slides with titles, bullet points, and optional PNG/JPEG images). Output and image paths are workspace-relative unless already inside the workspace. Existing files are never overwritten.",
       "input_schema": {
         "type": "object",
         "properties": {
-          "kind": {"type": "string", "enum": ["docx", "xlsx"]},
-          "output": {"type": "string", "description": "Output filename inside the workspace, ending in .docx or .xlsx"},
+          "kind": {"type": "string", "enum": ["docx", "xlsx", "pptx"]},
+          "output": {"type": "string", "description": "Output filename inside the workspace, ending in .docx, .xlsx, or .pptx"},
           "title": {"type": "string", "description": "DOCX title"},
           "paragraphs": {"type": "array", "items": {"type": "string"}},
           "tables": {
@@ -46,6 +46,26 @@
               },
               "required": ["name", "rows"]
             }
+          },
+          "slides": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "title": {"type": "string"},
+                "bullets": {"type": "array", "items": {"type": "string"}},
+                "image": {
+                  "type": "object",
+                  "properties": {
+                    "path": {"type": "string", "description": "PNG or JPEG inside the workspace"},
+                    "width_inches": {"type": "number", "exclusiveMinimum": 0, "maximum": 20}
+                  },
+                  "required": ["path"]
+                }
+              },
+              "required": ["title"]
+            }
           }
         },
         "required": ["kind", "output"],
@@ -59,6 +79,11 @@
             "type": "object",
             "if": {"properties": {"kind": {"const": "xlsx"}}},
             "then": {"required": ["sheets"]}
+          },
+          {
+            "type": "object",
+            "if": {"properties": {"kind": {"const": "pptx"}}},
+            "then": {"required": ["slides"]}
           }
         ]
       }
