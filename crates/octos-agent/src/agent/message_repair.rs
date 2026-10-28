@@ -487,6 +487,7 @@ pub(crate) fn synthesize_missing_tool_results(messages: &mut Vec<Message>) -> bo
                     thread_id: None,
                     timestamp: messages[i].timestamp,
                     source: None,
+                    participant: None,
                 },
             );
             synthesised_under_this_assistant.insert(id.clone());
@@ -581,6 +582,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -596,6 +598,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -621,6 +624,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -636,6 +640,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -834,6 +839,7 @@ mod tests {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             user("thanks"),
         ];
@@ -952,6 +958,7 @@ mod tests {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             user("继续追问"),
         ];
@@ -1051,6 +1058,7 @@ mod tests {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             user("next"),
         ];
@@ -1176,6 +1184,7 @@ mod tests {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             user("继续追问"),
             assistant_with_tools(&["call_0_120"]),
@@ -1190,6 +1199,7 @@ mod tests {
                 thread_id: None,
                 timestamp: chrono::Utc::now(),
                 source: None,
+                participant: None,
             },
             user("trailing"),
         ];

@@ -341,6 +341,17 @@ fn build_report(cmd: &DoctorCommand, with_network: bool) -> Result<Report> {
             // never claims it.
             .filter(|feature| {
                 *feature != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
+            })
+            // Full-history retry is acknowledged only when requested, too.
+            // Its absence from the no-header baseline is not protocol skew.
+            .filter(|feature| {
+                *feature
+                    != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
+            })
+            // Same for the participant field (UPCR-2026-053).
+            .filter(|feature| {
+                *feature
+                    != octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1
             }),
     ));
 

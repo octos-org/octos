@@ -243,6 +243,15 @@ reload, or build a different interface over the same stored session.
 
 ### Tools, permissions, and human input
 
+Run `octos chat` to use the standard fixed tool interface: four common tools
+plus `discover_tools` / `run_tool`. Optional tool schemas arrive in conversation
+results without changing the advertised tool list. Authorized capabilities,
+batched reads, images and agent coordination remain available.
+See [dispatcher usage](docs/fixed-tool-dispatcher.md) and the
+[capability audit](docs/tool-capabilities.md).
+[External-job receipts](docs/external-job-completion.md) can register background
+completion notifications without model polling.
+
 The kernel executes filesystem, shell, web, and MCP tools under the host's tool
 policy and platform sandbox configuration. Host-configured lifecycle hooks can
 participate around model calls and tool execution. OUP exposes execution and
@@ -390,6 +399,7 @@ Follow one Calendar request through admission, Tokio tasks, a host tool and its 
 - [Harness developer interface](docs/OCTOS_HARNESS_DEVELOPER_INTERFACE.md)
 - [Artifact and workflow integration guide](docs/OCTOS_HARNESS_DEVELOPER_GUIDE.md)
 - [Harness compatibility and versioning](docs/OCTOS_HARNESS_ABI_VERSIONING.md)
+- [Progress feedback and opt-in periodic reflection](docs/event-driven-reflection.md)
 - [Documentation site](https://octos-org.github.io/octos/)
 
 ## Contributing

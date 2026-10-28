@@ -659,7 +659,7 @@ pub struct ToolResult {
 |---|---|---|
 | **read_file** | path, start_line?, end_line? | Line numbers (NNN\|), 100KB truncation, symlink rejection |
 | **write_file** | path, content | Creates parent dirs, returns file_modified |
-| **edit_file** | path, old_string, new_string | Exact match required, error on 0 or >1 occurrences |
+| **edit_file** | path + old_string/new_string, or edits array | Ordered replacements in one file; unique exact match preferred, guarded fuzzy fallback; all matches must succeed before writing |
 | **diff_edit** | path, diff | Unified diff with fuzzy matching (+-3 lines), reverse hunk application |
 | **glob** | pattern, limit=100 | Rejects absolute paths and `..`, relative results |
 | **grep** | pattern, file_pattern?, limit=50, context=0, ignore_case=false | .gitignore-aware via `ignore::WalkBuilder`, regex with `(?i)` flag |
@@ -687,6 +687,34 @@ pub struct ToolResult {
 | **workspace_log** | project, limit? | Git `log --oneline --all -n <limit>` for a workspace project (e.g. `slides/my-deck`, `sites/blog`). Default `limit=20`, capped at 100. Source: `tools/workspace_history.rs:101`. |
 | **workspace_show** | project, commit, file | Read a file at a specific commit (`git show <commit>:<file>`). All three fields required. Source: `tools/workspace_history.rs:199`. |
 | **workspace_diff** | project, from_commit, to_commit?, file? | Diff two commits (`from_commit..to_commit`); `to_commit` defaults to `HEAD`; `file` optionally scopes the diff. Source: `tools/workspace_history.rs:322`. |
+
+`edit_file` accepts multiple replacements in one invocation. For an illustrative
+`settings.ts` file:
+
+```json
+{
+  "path": "settings.ts",
+  "edits": [
+    {"old_string": "const retries = 1;", "new_string": "const retries = 3;"},
+    {"old_string": "const timeout = 100;", "new_string": "const timeout = 500;"}
+  ]
+}
+```
+
+Use either `edits` or the existing top-level `old_string`/`new_string` pair.
+Each replacement sees the preceding replacements' staged content. If any
+match is missing, ambiguous, or rejected by a matching guard, none are written.
+The final write retains the single-edit filesystem policy and write fences;
+this is not a guarantee against filesystem or power failures. Formatting,
+file-state invalidation, and the workspace snapshot happen once after success.
+
+Gateway/OUP sessions project the bundled base prompt once at construction,
+using their policy-filtered tool catalog. Unavailable specialist sections are
+omitted; operator prompts, workspace instructions, skills, and verification
+guidance are preserved. Tool use does not reorder this system prefix per turn.
+OUP omits initially empty memory, goal, and self-only peer-team snapshots;
+later clearing transitions remain durable and model-visible across compaction
+and resume. This changes prompt projection, not authorization or stored chat.
 
 **Registration**: Core tools registered in `ToolRegistry::with_builtins()` (all modes). Browser is always compiled. Message, spawn, send_file, and cron are registered only in gateway mode (`gateway.rs`).
 

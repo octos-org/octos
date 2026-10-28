@@ -665,6 +665,7 @@ impl McpSessionDispatch for RealSessionDispatch {
                         thread_id: None,
                         timestamp: chrono::Utc::now(),
                         source: None,
+                        participant: None,
                     }],
                     ..Default::default()
                 },
