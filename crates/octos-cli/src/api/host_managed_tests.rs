@@ -967,6 +967,12 @@ fn should_drop_plugin_and_mcp_tools_with_allowlisted_names_from_an_external_turn
     assert!(registry.get("read_file").is_some());
     assert!(registry.get("shell").is_none());
     for name in registry.tool_names() {
+        // #2862 follow-up (O-015-A): the dispatch gateway pair stays
+        // registered to keep the surface gate alive but is excluded from the
+        // model-visible surface — not a hole, an enforcement move.
+        if registry.is_excluded_from_dispatch_surface(&name) {
+            continue;
+        }
         assert!(super::external_turn_tool_allowed(&name), "{name}");
         assert_eq!(registry.origin(&name), Some(ToolOrigin::Builtin), "{name}");
     }
