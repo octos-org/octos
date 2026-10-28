@@ -775,10 +775,12 @@ fn maybe_install_binary(dir: &std::path::Path) {
 }
 
 /// Attempt the source-build fallback for a Cargo-backed skill. Returns
-/// `true` when a build was attempted and succeeded (the produced binary is
-/// copied to `dir/main`). Gated behind the operator opt-in: building from
-/// source executes the cloned repository's `build.rs` (#2321), so without
-/// `OCTOS_SKILLS_CARGO_BUILD=1` this logs and declines without spawning.
+/// `true` only when a binary was actually installed to `dir/main` — a build
+/// that succeeds without producing a located binary must fall through to the
+/// lazy launcher, exactly like a failed build. Gated behind the operator
+/// opt-in: building from source executes the cloned repository's `build.rs`
+/// (#2321), so without `OCTOS_SKILLS_CARGO_BUILD=1` this logs and declines
+/// without spawning.
 fn maybe_cargo_build_with(dir: &std::path::Path, opted_in: bool) -> bool {
     if !opted_in {
         tracing::info!(
@@ -815,13 +817,21 @@ fn maybe_cargo_build_with(dir: &std::path::Path, opted_in: bool) -> bool {
                                 std::fs::Permissions::from_mode(0o755),
                             );
                         }
-                        break;
+                        // Only a real install counts: if the name heuristic
+                        // fails to locate the produced binary, the caller
+                        // must still get the lazy launcher, not a silent
+                        // no-executable skill.
+                        return true;
                     }
                 }
             }
         }
     }
-    true
+    tracing::warn!(
+        "cargo build succeeded but no binary was located under target/release; \
+         falling back to the lazy launcher"
+    );
+    false
 }
 
 fn has_installed_skill_executable(dir: &std::path::Path, dir_name: &str) -> bool {
@@ -1050,6 +1060,35 @@ mod tests {
             "cargo must not be spawned without the opt-in"
         );
         assert!(!dir.join("main").exists());
+    }
+
+    #[test]
+    fn cargo_build_that_produces_no_located_binary_falls_back_to_the_launcher() {
+        // Review finding on this PR: a successful `cargo build` that the
+        // name-scan heuristic cannot map to a produced binary must return
+        // `false` (so the caller installs the lazy launcher), not `true`.
+        // Pinned with a real opt-in build of a workspace-shaped skill: the
+        // root manifest has no `name` line at all, the member crate builds
+        // to target/release/<member>, and no scan line matches it.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("skill-src");
+        std::fs::create_dir_all(dir.join("member/src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[workspace]\nmembers = [\"member\"]\nresolver = \"2\"\n").unwrap();
+        std::fs::write(
+            dir.join("member/Cargo.toml"),
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("member/src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("manifest.json"), r#"{"binaries": {}}"#).unwrap();
+        assert!(
+            !maybe_cargo_build_with(&dir, true),
+            "no binary was copied to dir/main, so the fallback must run"
+        );
+        assert!(
+            !dir.join("main").exists(),
+            "the copy path must not have fired for the renamed binary"
+        );
     }
 
     #[test]
