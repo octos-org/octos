@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 /// end-of-turn persist loop; an interrupt aborts that task first, so the
 /// dispatched, acknowledged prompt used to vanish from durable history and
 /// the context ledger then discarded its source-less twin on reload
-/// (#2831). Called on the interrupt path before the terminal emits.
+/// (#2831). Called before the terminal emits on interrupt, connection-close,
+/// provider-error and lost-terminal paths (#2881).
 ///
 /// The dying task persists `response.messages` under the same session
 /// manager lock, so the lock serializes the two live writers: any User row

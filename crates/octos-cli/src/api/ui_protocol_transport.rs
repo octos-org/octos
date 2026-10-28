@@ -26,7 +26,7 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, Uri};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use octos_agent::{
     Agent, BackgroundResultKind, BackgroundResultPayload, PromptContextManager, PromptContextPhase,
     PromptContextReport, PromptContextRequest, ToolApprovalDecision, ToolApprovalRequest,
@@ -2241,6 +2241,48 @@ fn m9_fixture_echo_literal(prompt: &str) -> Option<String> {
     (!literal.is_empty()).then(|| literal.to_owned())
 }
 
+/// Retained by the registry so connection cleanup can finish durability even
+/// after aborting the outer turn task. Joining the agent first prevents its
+/// normal persist loop from racing a fallback append.
+struct DispatchedTurnPrompt {
+    text: String,
+    sessions: Arc<TokioMutex<octos_bus::SessionManager>>,
+    thread_id: String,
+    data_dir: std::path::PathBuf,
+    context: Arc<StdMutex<ContextManager>>,
+    agent_abort: AbortHandle,
+    agent_finished: futures::future::Shared<futures::future::BoxFuture<'static, ()>>,
+}
+
+impl DispatchedTurnPrompt {
+    async fn abort_and_wait(&self, outer_abort: Option<&AbortHandle>) {
+        // Canonical appends use spawn_blocking: aborting their async owner
+        // mid-append would release the session lock before the disk write
+        // finishes. Let any current commit finish before cancelling either
+        // task, and prevent the agent from starting another commit meanwhile.
+        let sessions = self.sessions.lock().await;
+        if let Some(outer_abort) = outer_abort {
+            outer_abort.abort();
+        }
+        self.agent_abort.abort();
+        self.agent_finished.clone().await;
+        drop(sessions);
+    }
+
+    async fn persist(&self, session: &SessionKey) {
+        self.agent_finished.clone().await;
+        postturn_context_batch::persist_interrupted_turn_prompt(
+            &self.sessions,
+            session,
+            &self.thread_id,
+            &self.text,
+            &self.data_dir,
+            &self.context,
+        )
+        .await;
+    }
+}
+
 struct ActiveTurn {
     turn_id: TurnId,
     /// Resolved profile the turn was admitted under (canonical: absent maps
@@ -2263,6 +2305,7 @@ struct ActiveTurn {
     /// codex's `ActiveTurnNotSteerable` for review/compact turn kinds.
     steer: Option<octos_agent::SharedSteerBuffer>,
     abort: AbortHandle,
+    dispatched_prompt: Option<Arc<DispatchedTurnPrompt>>,
     /// The connection whose request started the turn (`turn/start`,
     /// `review/start`); `None` for server-initiated turns (continuations).
     /// `octos serve --host-managed` lets an external connection steer,
@@ -26622,6 +26665,7 @@ async fn handle_review_start(
             active.insert(
                 session_id.clone(),
                 ActiveTurn {
+                    dispatched_prompt: None,
                     turn_id: turn_id.clone(),
                     profile_id: profile_for_stamp.clone(),
                     state: turn_state.clone(),
@@ -27384,6 +27428,7 @@ async fn handle_turn_start_with_accept(
             active.insert(
                 session_id.clone(),
                 ActiveTurn {
+                    dispatched_prompt: None,
                     turn_id: turn_id.clone(),
                     profile_id: profile_for_stamp.clone(),
                     state: turn_state.clone(),
@@ -28239,6 +28284,7 @@ async fn maybe_spawn_appui_master_continuation_runner(
     active.insert(
         session_id.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             turn_id: turn_id.clone(),
             profile_id: profile_id.clone(),
             state: turn_state.clone(),
@@ -42857,10 +42903,9 @@ async fn run_standalone_turn(
     // alive past this task.
     let (agent_finished_tx, mut agent_finished_rx) = tokio::sync::mpsc::channel::<()>(1);
     let progress_dropped_for_agent = Arc::clone(&progress_dropped);
-    // #2831 interrupt-path handles: the bindings below are moved into the
-    // agent task, but the outer task's interrupt path needs the final prompt
-    // text and the persist handles to commit the dispatched prompt before
-    // the interrupted terminal emits.
+    // Keep the finalized prompt and persistence handles outside the agent
+    // task for abnormal exits. Internal continuations retain their existing
+    // do-not-persist semantics (#2831, #2881).
     let interrupted_turn_prompt = (!skip_internal_user_persist).then(|| {
         voice_user_content_for_persist
             .clone()
@@ -42870,6 +42915,10 @@ async fn run_standalone_turn(
     let interrupt_persist_thread = turn_thread_id_for_persist.clone();
     let interrupt_persist_context_manager = context_manager_for_result.clone();
     let interrupt_persist_context_data_dir = context_data_dir_for_result.clone();
+    // Publish the prompt and child-task handles atomically with dispatch.
+    // Connection cleanup holds this registry lock while aborting the turn.
+    let registry = active_turns_registry();
+    let mut active = registry.lock().await;
     let agent_task = tokio::spawn(async move {
         // Held for the whole body; dropped on every exit path.
         let _agent_finished_tx = agent_finished_tx;
@@ -43684,9 +43733,32 @@ async fn run_standalone_turn(
             }
         }
     }.instrument(turn_span));
+    let agent_abort = agent_task.abort_handle();
     let _abort_guard = AbortOnDrop {
-        abort: agent_task.abort_handle(),
+        abort: agent_abort.clone(),
     };
+    let agent_finished = async move {
+        let _ = agent_task.await;
+    }
+    .boxed()
+    .shared();
+    let dispatched_prompt = interrupted_turn_prompt.map(|text| {
+        Arc::new(DispatchedTurnPrompt {
+            text,
+            sessions: interrupt_persist_sessions,
+            thread_id: interrupt_persist_thread,
+            data_dir: interrupt_persist_context_data_dir,
+            context: interrupt_persist_context_manager,
+            agent_abort: agent_abort.clone(),
+            agent_finished: agent_finished.clone(),
+        })
+    });
+    if let Some(entry) = active.get_mut(&session_id)
+        && Arc::ptr_eq(&entry.state, &turn_state)
+    {
+        entry.dispatched_prompt = dispatched_prompt.clone();
+    }
+    drop(active);
 
     let mut saw_delta = false;
     let mut task_output_delta_tracker = TaskOutputDeltaTracker::default();
@@ -43847,6 +43919,9 @@ async fn run_standalone_turn(
             }
             crate::turn_loop::TurnLoopStep::Closed => break,
             crate::turn_loop::TurnLoopStep::AgentFinished => {
+                if let Some(prompt) = dispatched_prompt.as_ref() {
+                    prompt.persist(&session_id).await;
+                }
                 // #2807 — the agent body ended but no terminal event made it
                 // through the drain (its send was shed past
                 // TERMINAL_SEND_BUDGET, or the task panicked). Terminate the
@@ -44091,6 +44166,9 @@ async fn run_standalone_turn(
                 break;
             }
             Some("error") => {
+                if let Some(prompt) = dispatched_prompt.as_ref() {
+                    prompt.persist(&session_id).await;
+                }
                 let message = event
                     .get("message")
                     .and_then(Value::as_str)
@@ -44537,7 +44615,11 @@ async fn run_standalone_turn(
             warn!(%error, "failed to record interrupted peer lifetime");
         }
         // Stop the agent so any in-flight LLM/tool await unblocks promptly.
-        agent_task.abort();
+        if let Some(prompt) = dispatched_prompt.as_ref() {
+            prompt.abort_and_wait(None).await;
+        } else {
+            agent_abort.abort();
+        }
         // Esc/`/stop`/`turn/interrupt` did not used to break a still-running
         // `spawn_only` background task (e.g. `run_pipeline` / `deep_research`):
         // those detach into their OWN `tokio::spawn` whose `JoinHandle` is
@@ -44552,7 +44634,7 @@ async fn run_standalone_turn(
         // terminal tasks return `AlreadyTerminal` and are skipped.
         cancel_session_spawn_only_tasks(&tool_registry.supervisor(), &session_id);
         // UPCR-2026-035: host-routed calls run in their own tool tasks, which
-        // `agent_task.abort()` does not reach. End their waits now: the host
+        // `agent_abort.abort()` does not reach. End their waits now: the host
         // gets `peer/tool/cancel`, and a non-read call is an unknown outcome
         // that is not resent.
         crate::peers::host_tools::cancel_host_calls_for_turn(&session_id, &turn_id.0.to_string());
@@ -44562,16 +44644,8 @@ async fn run_standalone_turn(
         // Commit it before the terminal; a dying task that already
         // persisted it (mid-persist interrupt race) is recognized under
         // the session lock and skipped.
-        if let Some(prompt_text) = interrupted_turn_prompt.as_deref() {
-            postturn_context_batch::persist_interrupted_turn_prompt(
-                &interrupt_persist_sessions,
-                &session_id,
-                &interrupt_persist_thread,
-                prompt_text,
-                &interrupt_persist_context_data_dir,
-                &interrupt_persist_context_manager,
-            )
-            .await;
+        if let Some(prompt) = dispatched_prompt.as_ref() {
+            prompt.persist(&session_id).await;
         }
         // #1707 round 5 (board item #7): a terminal mirror that lands AFTER
         // this interrupt (task-status re-forward, restart replay into a
@@ -44722,7 +44796,7 @@ async fn run_standalone_turn(
         .await;
     }
 
-    let _ = agent_task.await;
+    agent_finished.await;
 
     // `turn/steer` turn-end residual: the loop keeps the turn alive for
     // steers that land BEFORE its final EndTurn check, but a steer accepted
@@ -46842,7 +46916,12 @@ async fn abort_connection_turns(
             if let Some(active) = active.remove(&session_id) {
                 aborted_state = Some(active.state.clone());
                 aborted_steer = active.steer.clone();
-                active.abort.abort();
+                if let Some(prompt) = active.dispatched_prompt {
+                    prompt.abort_and_wait(Some(&active.abort)).await;
+                    prompt.persist(&session_id).await;
+                } else {
+                    active.abort.abort();
+                }
             }
         }
         release_peer_build_cache_slot(

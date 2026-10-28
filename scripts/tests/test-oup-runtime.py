@@ -78,6 +78,10 @@ class FixtureProvider:
                     release = response.pop("_wait_for", None)
                     if release is not None and not release.wait(timeout=20):
                         raise TimeoutError("test did not release its blocked provider response")
+                    status = response.pop("_status", None)
+                    if status is not None:
+                        self.send_error(status, "fixture provider refusal")
+                        return
                     choice = {"index": 0, **response}
                     if request.get("stream"):
                         delta = dict(response["message"])
@@ -245,7 +249,7 @@ class RuntimeContract(unittest.TestCase):
                     "XDG_RUNTIME_DIR": socket_dir.name,
                     "TMPDIR": str(temporary), "TMP": str(temporary), "TEMP": str(temporary),
                     "OUP_FIXTURE_KEY": "fake-local-fixture-only", "NO_COLOR": "1",
-                    "NO_PROXY": "*", "RUST_LOG": "warn"})
+                    "NO_PROXY": "*", "RUST_LOG": "warn", "OCTOS_NO_MODEL_DOWNLOAD": "1"})
         args = ["--data-dir", str(directory / "data"), "--cwd", str(workspace),
                 "--config", str(config)]
         try:
@@ -619,6 +623,58 @@ class RuntimeContract(unittest.TestCase):
                          if row["role"] == "user"]
             self.assertEqual(user_rows.count("Wait for cancellation."), 1,
                              "the interrupted prompt must replay exactly once")
+
+    def test_oup_connection_closed_prompt_survives_restart(self):
+        release = threading.Event()
+        delayed = reply("This disconnected response must not complete the turn.")
+        delayed["_wait_for"] = release
+        with self.fixture("oup-disconnect", [delayed]) as (directory, provider, env, args):
+            session = "oup-ci:local:runtime-disconnect"
+            prompt = "Keep this prompt after the connection closes."
+            client = self.oup_connect(directory, env, args, "disconnect")
+            try:
+                self.oup_profile(client, provider)
+                self.oup_open(client, directory, session)
+                turn = str(uuid.uuid4())
+                accepted = client.rpc("turn/start", {"session_id": session, "turn_id": turn,
+                                                    "input": [{"kind": "text", "text": prompt}]})
+                self.assertEqual(accepted.get("result"), {"accepted": True})
+                self.assertTrue(provider.received.wait(timeout=10))
+            finally:
+                # EOF exercises the same abort_connection_turns path as a
+                # WebSocket close, while the provider is still blocked.
+                try:
+                    client.close()
+                finally:
+                    release.set()
+            self.assert_prompt_after_restart(directory, env, args, session, prompt)
+
+    def test_oup_provider_error_prompt_survives_restart(self):
+        with self.fixture("oup-provider-error", [{"_status": 401}]) as (directory, provider, env, args):
+            session = "oup-ci:local:runtime-provider-error"
+            prompt = "Keep this prompt after the provider refuses it."
+            client = self.oup_connect(directory, env, args, "provider-error")
+            try:
+                self.oup_profile(client, provider)
+                self.oup_open(client, directory, session)
+                terminal = self.oup_turn(client, session, prompt)
+                self.assertEqual(terminal["payload"]["data"]["outcome"], "errored")
+            finally:
+                client.close()
+            self.assert_prompt_after_restart(directory, env, args, session, prompt)
+
+    def assert_prompt_after_restart(self, directory, env, args, session, prompt):
+        client = self.oup_connect(directory, env, args, "reconnected")
+        try:
+            self.oup_open(client, directory, session)
+            hydrated = client.rpc("session/hydrate", {
+                "session_id": session, "include": ["messages"],
+            })["result"]
+            user_rows = [row["content"] for row in hydrated["messages"] if row["role"] == "user"]
+            self.assertEqual(user_rows.count(prompt), 1,
+                             "the terminated turn's prompt must replay exactly once")
+        finally:
+            client.close()
 
     def test_oup_peer_result_survives_restart_and_reuse(self):
         with self.fixture("oup-peer", [reply("PEER_FINAL"), reply("PEER_REUSED_FINAL")]) as (
