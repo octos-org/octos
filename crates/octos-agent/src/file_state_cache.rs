@@ -15,8 +15,10 @@
 //!   caller-supplied `current_mtime`.
 //! - `invalidate` drops an entry and recovers its byte allotment.
 //! - `clear` drops every entry and resets `total_size_bytes` to 0.
-//! - `clone_for_subagent` produces an independent snapshot so parent and
-//!   delegate agents cannot race.
+//! - A new model context starts with `empty_for_new_context`: another
+//!   context's read records are not evidence that this context saw the body.
+//! - `clone_for_subagent` is a legacy independent snapshot operation; copied
+//!   entries are valid only when the same visible read results are retained.
 //!
 //! The cache is intentionally wrapped in internal mutability (a single
 //! `Mutex`) so tools can consult it through an `Arc<FileStateCache>` without
@@ -132,8 +134,8 @@ impl Inner {
 
 /// LRU cache of file-state entries with mtime-based invalidation.
 ///
-/// Cloning (or [`FileStateCache::clone_for_subagent`]) yields a **deep copy**
-/// so parent and subagent cannot race each other's entries.
+/// Cloning yields a deep snapshot; it does not establish what another model
+/// context has seen. Use [`FileStateCache::empty_for_new_context`] for children.
 #[derive(Debug)]
 pub struct FileStateCache {
     max_entries: usize,
@@ -310,10 +312,22 @@ impl FileStateCache {
         seeded
     }
 
-    /// Return a deep-copied cache for a subagent.
+    /// Preserve cache policy while starting a context with no read knowledge.
+    /// Use at independent child boundaries, including sanitized context forks.
+    pub fn empty_for_new_context(&self) -> Self {
+        Self {
+            max_entries: self.max_entries,
+            max_total_bytes: self.max_total_bytes,
+            inner: Mutex::new(Inner::new()),
+        }
+    }
+
+    /// Return a deep-copied snapshot (legacy method name).
     ///
     /// The child's writes/invalidations do not race the parent. The caps are
-    /// copied verbatim. Use this at spawn/delegate boundaries.
+    /// copied verbatim. This does NOT make the read claims valid for a new
+    /// transcript. Independent spawned contexts must use
+    /// [`Self::empty_for_new_context`] instead.
     pub fn clone_for_subagent(&self) -> Self {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = Inner {
@@ -599,6 +613,25 @@ mod tests {
         parent.put(mk_entry("/c", mtime, 5));
         assert!(parent.peek(Path::new("/c")).is_some());
         assert!(child.peek(Path::new("/c")).is_none());
+    }
+
+    #[test]
+    fn new_context_preserves_policy_but_inherits_no_read_knowledge() {
+        let parent = FileStateCache::builder()
+            .max_entries(7)
+            .max_total_bytes(4096)
+            .build();
+        let mtime = SystemTime::now();
+        parent.put(mk_entry("/instructions", mtime, 100));
+        let child = parent.empty_for_new_context();
+        assert_eq!(child.max_entries(), 7);
+        assert_eq!(child.max_total_bytes(), 4096);
+        assert!(child.is_empty());
+        assert_eq!(child.total_size_bytes(), 0);
+        child.put(mk_entry("/child-read", mtime, 50));
+        assert!(parent.peek(Path::new("/child-read")).is_none());
+        assert!(parent.peek(Path::new("/instructions")).is_some());
+        assert!(child.empty_for_new_context().is_empty());
     }
 
     #[test]

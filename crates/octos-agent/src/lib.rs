@@ -13,6 +13,7 @@ pub use agent::result_md_owner_content_is_peer;
 pub mod agents;
 pub mod approval;
 pub mod arc_task;
+mod automatic_jobs;
 pub mod behaviour;
 pub mod bootstrap;
 pub mod bridge;
@@ -389,19 +390,21 @@ mod tests {
         let dir = setup_test_dir();
         let registry = ToolRegistry::with_builtins(dir.path());
 
-        // Should have all builtin tools
-        let specs = registry.specs();
-        let names: Vec<_> = specs.iter().map(|s| s.name.as_str()).collect();
-
-        assert!(names.contains(&"shell"));
-        assert!(names.contains(&"read_file"));
-        assert!(names.contains(&"write_file"));
-        assert!(names.contains(&"edit_file"));
-        assert!(names.contains(&"glob"));
-        assert!(names.contains(&"grep"));
-        assert!(names.contains(&"list_dir"));
-        assert!(names.contains(&"web_search"));
-        assert!(names.contains(&"web_fetch"));
+        assert_eq!(registry.specs().len(), 6);
+        for name in [
+            "shell",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "glob",
+            "grep",
+            "list_dir",
+            "web_search",
+            "web_fetch",
+        ] {
+            assert!(registry.get(name).is_some());
+            assert!(registry.is_tool_model_reachable(name));
+        }
     }
 
     #[tokio::test]
@@ -504,22 +507,17 @@ mod tests {
     async fn test_context_filter_restricts_specs() {
         let dir = setup_test_dir();
         let mut registry = ToolRegistry::with_builtins(dir.path());
-        let all_count = registry.specs().len();
-
-        // Only allow tools tagged "search"
-        registry.set_context_filter(vec!["search".to_string()]);
-        let specs = registry.specs();
-        let names: Vec<_> = specs.iter().map(|s| s.name.as_str()).collect();
-
-        // grep and glob have "search" tag — should be included
-        assert!(names.contains(&"grep"));
-        assert!(names.contains(&"glob"));
-        // web_search has "web" tag only — should be filtered out
-        assert!(!names.contains(&"web_search"));
-        // shell has "runtime","code" tags — should be filtered out
-        assert!(!names.contains(&"shell"));
-        // Filtered count should be less than total
-        assert!(specs.len() < all_count);
+        registry.set_context_filter(vec!["search".into()]);
+        assert!(registry.is_tool_model_reachable("grep"));
+        assert!(registry.is_tool_model_reachable("glob"));
+        assert!(!registry.is_tool_model_reachable("web_search"));
+        assert!(!registry.is_tool_model_reachable("shell"));
+        assert!(
+            registry
+                .specs()
+                .iter()
+                .all(|spec| ["discover_tools", "run_tool"].contains(&spec.name.as_str()))
+        );
     }
 
     #[tokio::test]
@@ -578,6 +576,7 @@ mod tests {
         let dir = setup_test_dir();
         let mut registry = ToolRegistry::with_builtins(dir.path());
         let all_count = registry.specs().len();
+        let registered_count = registry.len();
 
         // Set provider policy that denies diff_edit and web_search
         let policy: ToolPolicy = serde_json::from_value(serde_json::json!({
@@ -590,9 +589,15 @@ mod tests {
         let names: Vec<_> = filtered.iter().map(|s| s.name.as_str()).collect();
         assert!(!names.contains(&"diff_edit"));
         assert!(!names.contains(&"web_search"));
-        assert!(names.contains(&"shell"));
+        assert!(registry.is_tool_model_reachable("shell"));
         assert!(names.contains(&"read_file"));
-        assert_eq!(filtered.len(), all_count - 2);
+        assert_eq!(
+            filtered.len(),
+            all_count,
+            "denying optional tools does not change gateway schemas"
+        );
+        assert!(!registry.is_tool_model_reachable("diff_edit"));
+        assert!(!registry.is_tool_model_reachable("web_search"));
 
         // Allowed tools can still be executed
         let result = registry
@@ -608,6 +613,6 @@ mod tests {
         }
 
         // Tools still registered internally (len unchanged)
-        assert_eq!(registry.len(), all_count);
+        assert_eq!(registry.len(), registered_count);
     }
 }

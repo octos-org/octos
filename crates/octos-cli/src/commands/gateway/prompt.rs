@@ -6,6 +6,8 @@ use octos_agent::SkillsLoader;
 
 use crate::persona_service::PersonaService;
 
+const BUNDLED_PROMPT: &str = include_str!("../../prompts/gateway_default.txt");
+
 pub const SLASH_COMMANDS_SEGMENT_NAME: &str = "slash_commands";
 const SLASH_COMMANDS_HEADER: &str = "## Slash Commands";
 const MAX_CLIENT_COMMANDS: usize = 64;
@@ -42,15 +44,209 @@ pub struct GatewayPromptParts {
     pub pre_memory: String,
     /// Everything after it (active skills, skills summary, tool prefs).
     pub post_memory: String,
+    /// Only the bundled base may be projected by tool availability. Operator
+    /// prompts and appended workspace/persona/skill instructions stay verbatim.
+    pub uses_bundled_base: bool,
 }
 
 impl GatewayPromptParts {
+    /// Project once when constructing the session, after tool policy is bound.
+    /// Never rebuild this prefix per model request or based on recent tool use.
+    pub fn pre_memory_for_registry(&self, registry: &octos_agent::ToolRegistry) -> String {
+        self.project_available_rules(|name| registry.is_tool_model_reachable(name))
+    }
+
+    #[cfg(test)]
+    fn pre_memory_for_tools(&self, tools: &[octos_llm::ToolSpec]) -> String {
+        self.project_available_rules(|name| tools.iter().any(|tool| tool.name == name))
+    }
+
+    fn project_available_rules(&self, available: impl Fn(&str) -> bool) -> String {
+        if !self.uses_bundled_base {
+            return self.pre_memory.clone();
+        }
+        let Some(suffix) = self.pre_memory.strip_prefix(BUNDLED_PROMPT) else {
+            // A later operator override replaced the base.
+            return self.pre_memory.clone();
+        };
+        let research_available = [
+            "search",
+            "deep_crawl",
+            "web_search",
+            "web_fetch",
+            "news_fetch",
+            "get_weather",
+            "get_time",
+            "podcast_generate",
+            "podcast_voices",
+            "voice_synthesize",
+        ]
+        .iter()
+        .any(|name| available(name));
+        let mut projected = String::new();
+        for (index, section) in BUNDLED_PROMPT.split("\n## ").enumerate() {
+            if index == 0 {
+                projected.push_str(section);
+                continue;
+            }
+            let heading = section.lines().next().unwrap_or_default();
+            let keep = match heading {
+                "Research & Search Rules" => research_available,
+                "Rich Card Rendering (capable clients)" => available("send_app_card"),
+                "Pipelines" => available("run_pipeline"),
+                "Background Tasks" => [
+                    "spawn",
+                    "check_background_tasks",
+                    "check_workspace_contract",
+                ]
+                .iter()
+                .any(|name| available(name)),
+                "Scheduled Tasks (Cron)" => available("cron"),
+                "Other Rules" => available("message") || available("save_memory"),
+                _ => true, // Keep core rules and future sections by default.
+            };
+            if keep {
+                projected.push_str("\n## ");
+                projected.push_str(section);
+            }
+        }
+        projected.push_str(suffix);
+        projected
+    }
+
     /// The joined prompt WITHOUT a memory block — for read-only consumers
     /// (length logging, tests) that don't build agents.
     pub fn joined(&self) -> String {
         let mut out = self.pre_memory.clone();
         out.push_str(&self.post_memory);
         out
+    }
+}
+
+#[cfg(test)]
+mod capability_projection_tests {
+    use super::*;
+
+    fn specs(names: &[&str]) -> Vec<octos_llm::ToolSpec> {
+        names
+            .iter()
+            .map(|name| octos_llm::ToolSpec {
+                name: (*name).into(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+            })
+            .collect()
+    }
+
+    fn bundled() -> GatewayPromptParts {
+        GatewayPromptParts {
+            pre_memory: format!(
+                "{BUNDLED_PROMPT}\n\nCurrent date: fixed\n## Research & Search Rules\nWorkspace instructions: preserve me."
+            ),
+            post_memory: "\n## Available Skills\nPreserve skill guidance.".into(),
+            uses_bundled_base: true,
+        }
+    }
+
+    #[test]
+    fn dispatcher_keeps_rules_for_callable_optional_tools_and_honors_host_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = octos_agent::ToolRegistry::with_builtins(dir.path());
+        assert!(!registry.is_tool_visible("web_search"));
+        let parts = bundled();
+        let rules = parts.pre_memory_for_registry(&registry);
+        assert!(
+            rules.contains("podcast_generate"),
+            "research rules remain for discovered web tools"
+        );
+        registry.set_host_tool_allowlist(Some(&["read_file".into()]));
+        let restricted = parts.pre_memory_for_registry(&registry);
+        assert!(!restricted.contains("podcast_generate"));
+        assert!(restricted.contains("Workspace instructions: preserve me."));
+    }
+
+    #[test]
+    fn coding_catalog_drops_irrelevant_bundled_rules_but_preserves_core_and_suffix() {
+        let parts = bundled();
+        let before = parts.joined();
+        let tools = specs(&["read_file", "write_file", "edit_file", "bash"]);
+        let projected = parts.pre_memory_for_tools(&tools);
+        for absent in [
+            "podcast_generate",
+            "run_pipeline",
+            "send_app_card",
+            "## Background Tasks",
+            "## Scheduled Tasks",
+        ] {
+            assert!(!projected.contains(absent), "{absent}");
+        }
+        for kept in [
+            "## Coding And Shell Rules",
+            "## Grounding Rules",
+            "## Cancellation",
+            "Validation:",
+            "do NOT invent",
+            "Workspace instructions: preserve me.",
+        ] {
+            assert!(projected.contains(kept), "{kept}");
+        }
+        assert!(projected.ends_with("Workspace instructions: preserve me."));
+        assert_eq!(
+            parts.joined(),
+            before,
+            "projection never mutates the stored base or skills"
+        );
+        let mut reversed = tools.clone();
+        reversed.reverse();
+        assert_eq!(
+            projected,
+            parts.pre_memory_for_tools(&reversed),
+            "catalog order cannot churn the prefix"
+        );
+        assert!(projected.len() * 100 < parts.pre_memory.len() * 60);
+        eprintln!(
+            "bundled coding prompt bytes: {} -> {}",
+            BUNDLED_PROMPT.len(),
+            projected.len() - (parts.pre_memory.len() - BUNDLED_PROMPT.len())
+        );
+    }
+
+    #[test]
+    fn full_catalog_preserves_bundled_behavior_exactly() {
+        let parts = bundled();
+        assert_eq!(
+            parts.pre_memory_for_tools(&specs(&[
+                "search",
+                "send_app_card",
+                "run_pipeline",
+                "spawn",
+                "cron",
+                "message",
+            ])),
+            parts.pre_memory
+        );
+    }
+
+    #[test]
+    fn custom_prompts_and_overrides_are_never_filtered() {
+        let mut parts = bundled();
+        parts.uses_bundled_base = false;
+        assert_eq!(parts.pre_memory_for_tools(&[]), parts.pre_memory);
+        parts.uses_bundled_base = true;
+        parts.pre_memory = "## Background Tasks\nOperator override".into();
+        assert_eq!(parts.pre_memory_for_tools(&[]), parts.pre_memory);
+    }
+
+    #[test]
+    fn specialist_guidance_follows_capabilities_not_a_four_tool_mode() {
+        let parts = bundled();
+        let projected = parts.pre_memory_for_tools(&specs(&["cron", "web_search"]));
+        assert!(projected.contains("## Scheduled Tasks (Cron)"));
+        assert!(projected.contains("**Research failure discipline.**"));
+        assert!(!projected.contains("## Rich Card Rendering"));
+        assert!(!projected.contains("## Background Tasks"));
+        let verifier_only = parts.pre_memory_for_tools(&specs(&["check_workspace_contract"]));
+        assert!(verifier_only.contains("Do not claim completion, failure, or file delivery"));
     }
 }
 
@@ -125,7 +321,7 @@ pub async fn build_system_prompt(
     skills_loader: &SkillsLoader,
     tool_config: &octos_agent::ToolConfigStore,
 ) -> GatewayPromptParts {
-    let compiled = include_str!("../../prompts/gateway_default.txt");
+    let compiled = BUNDLED_PROMPT;
     let runtime = super::super::load_prompt("gateway", compiled);
     let mut prompt = base.unwrap_or(&runtime).to_string();
 
@@ -204,6 +400,7 @@ pub async fn build_system_prompt(
     GatewayPromptParts {
         pre_memory,
         post_memory: prompt,
+        uses_bundled_base: base.is_none() && runtime == compiled,
     }
 }
 

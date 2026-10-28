@@ -919,7 +919,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return the output. Use this to run tests, build code, or interact with the filesystem."
+        "Execute a shell command. Truncated output includes a full log path for read_file/grep."
     }
 
     fn tags(&self) -> &[&str] {
@@ -1203,6 +1203,7 @@ impl Tool for ShellTool {
         apply_build_cache_env(&mut cmd, slot.as_deref());
         apply_harness_event_sink_env(&mut cmd, ctx);
 
+        let capture = super::command_output::CommandOutput::new(effective_cwd)?;
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -1217,9 +1218,10 @@ impl Tool for ShellTool {
 
         // The waiter owns both the child and the claim usage. Dropping the
         // caller's future detaches this waiter, so release still waits for exit.
+        let captured = capture.clone();
         let waiter = tokio::spawn(async move {
             let _usage_guard = usage_guard;
-            child.wait_with_output().await
+            super::command_output::wait_with_capture(child, captured).await
         });
         let result = timeout(timeout_duration, async {
             waiter.await.map_err(std::io::Error::other)?
@@ -1228,42 +1230,28 @@ impl Tool for ShellTool {
 
         match result {
             Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let exit_code = output.status.code().unwrap_or(-1);
-
-                let mut result_text = String::new();
-
-                if !stdout.is_empty() {
-                    result_text.push_str(&stdout);
-                }
-
-                if !stderr.is_empty() {
-                    if !result_text.is_empty() {
-                        result_text.push_str("\n--- stderr ---\n");
-                    }
-                    result_text.push_str(&stderr);
-                }
-
+                let mut view = capture.view(false);
+                let exit_code = output.code().unwrap_or(-1);
+                let mut result_text =
+                    view.render(octos_core::tool_output_limit(self.name()).saturating_sub(2048));
                 if result_text.is_empty() {
                     result_text = "(no output)".to_string();
                 }
 
-                // Sandbox-denial scan runs on the FULL text (the denial line
-                // may be exactly what truncation cuts); the hint is appended
-                // after truncation so it survives the cut.
+                // Scan the retained output tail for sandbox denials. Earlier
+                // diagnostics remain available through the full log.
                 let denial_hint = crate::sandbox::sandbox_denial_hint(
                     !self.sandbox.is_noop(),
-                    output.status.success(),
+                    output.success(),
                     &result_text,
                 );
 
                 // Truncate if too long (reserve space for exit code suffix)
                 let exit_suffix = format!("\n\nExit code: {exit_code}");
-                const MAX_OUTPUT: usize = 50000;
+                let max_output = octos_core::tool_output_limit(self.name());
                 octos_core::truncate_utf8(
                     &mut result_text,
-                    MAX_OUTPUT - exit_suffix.len(),
+                    max_output - exit_suffix.len(),
                     "\n... (output truncated)",
                 );
 
@@ -1293,18 +1281,29 @@ impl Tool for ShellTool {
 
                 Ok(ToolResult {
                     output: result_text,
-                    success: output.status.success(),
+                    success: output.success(),
+                    structured_metadata: Some(view.metadata()),
                     ..Default::default()
                 })
             }
-            Ok(Err(e)) => Ok(ToolResult {
-                output: format!("Failed to execute command: {e}"),
-                success: false,
-                ..Default::default()
-            }),
+            Ok(Err(e)) => {
+                capture.record_error(&e);
+                let mut view = capture.view(false);
+                Ok(ToolResult {
+                    output: format!(
+                        "Failed to execute command: {e}\n{}",
+                        view.render(
+                            octos_core::tool_output_limit(self.name()).saturating_sub(2048)
+                        )
+                    ),
+                    success: false,
+                    structured_metadata: Some(view.metadata()),
+                    ..Default::default()
+                })
+            }
             Err(_) => {
                 // Graceful shutdown: SIGTERM first, then SIGKILL after grace period.
-                // wait_with_output() consumed the Child, so we kill via PID.
+                // wait_with_capture() consumed the Child, so we kill via PID.
                 // Use negative PID to target the entire process group.
                 #[cfg(unix)]
                 if let Some(pid) = child_pid {
@@ -1353,12 +1352,19 @@ impl Tool for ShellTool {
                         .args(["/F", "/T", "/PID", &pid.to_string()])
                         .status();
                 }
+                capture.record_error("command timed out; output may be incomplete");
+                let mut view = capture.view(false);
                 Ok(ToolResult {
                     output: format!(
-                        "Command timed out after {} seconds",
-                        timeout_duration.as_secs()
+                        "Command timed out after {} seconds\n{}\nFull output: {}",
+                        timeout_duration.as_secs(),
+                        view.render(
+                            octos_core::tool_output_limit(self.name()).saturating_sub(2048)
+                        ),
+                        view.path.display()
                     ),
                     success: false,
+                    structured_metadata: Some(view.metadata()),
                     ..Default::default()
                 })
             }

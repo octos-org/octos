@@ -65,6 +65,17 @@ struct EditFileInput {
     /// #1767: `filePath` is the industry-convention alias.
     #[serde(alias = "filePath")]
     path: String,
+    #[serde(default, alias = "oldString")]
+    old_string: Option<String>,
+    #[serde(default, alias = "newString")]
+    new_string: Option<String>,
+    #[serde(default)]
+    edits: Option<Vec<Replacement>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Replacement {
     #[serde(alias = "oldString")]
     old_string: String,
     #[serde(alias = "newString")]
@@ -78,7 +89,7 @@ impl Tool for EditFileTool {
     }
 
     fn description(&self) -> &str {
-        "Edit a file by replacing a string with a new string. An exact match of old_string is preferred; when none exists, whitespace-, indentation- and escape-tolerant fuzzy matching is tried as a fallback. The old_string must identify a single location."
+        "Edit one file. For multiple replacements, use edits: [{old_string, new_string}, ...] in one call. Edits apply in order to the evolving content; all must succeed before writing. Alternatively supply a single old_string/new_string pair. Each match must be unique; exact matching is preferred, with guarded whitespace/indentation/escape fallbacks."
     }
 
     fn tags(&self) -> &[&str] {
@@ -105,10 +116,26 @@ impl Tool for EditFileTool {
                 },
                 "new_string": {
                     "type": "string",
-                    "description": "The string to replace it with (alias: newString)"
+                    "description": "Replacement text (alias: newString)"
+                },
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "Ordered replacements in the same file. Use instead of the top-level old_string/new_string pair. A failed match leaves the file unchanged.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": { "type": "string", "minLength": 1 },
+                            "new_string": { "type": "string" }
+                        },
+                        "required": ["old_string", "new_string"],
+                        "additionalProperties": false
+                    }
                 }
             },
-            "required": ["path", "old_string", "new_string"]
+            // Keep a flat, typed schema for providers that reject oneOf/not.
+            // The mutually exclusive input forms are checked below.
+            "required": ["path"]
         })
     }
 
@@ -126,6 +153,17 @@ impl Tool for EditFileTool {
     ) -> Result<ToolResult> {
         let input: EditFileInput =
             super::args::parse_tool_args(self.name(), &self.input_schema(), args)?;
+
+        let is_batch = input.edits.is_some();
+        let edits = match (input.old_string, input.new_string, input.edits) {
+            (Some(old_string), Some(new_string), None) if args.get("edits").is_none() =>
+                vec![Replacement { old_string, new_string }],
+            (None, None, Some(edits)) if !edits.is_empty()
+                && ["old_string", "new_string", "oldString", "newString"].iter().all(|key| args.get(key).is_none()) => edits,
+            _ => return Err(super::ToolInputError::new(
+                "edit_file expects either old_string and new_string, or a non-empty edits array; do not mix the two forms."
+            ).into()),
+        };
 
         if !self.file_access.allows_write() {
             return Ok(ToolResult {
@@ -233,90 +271,31 @@ impl Tool for EditFileTool {
             }
         };
 
-        if input.old_string.is_empty() {
-            return Ok(ToolResult {
-                output: "old_string must not be empty".to_string(),
-                success: false,
-                ..Default::default()
-            });
-        }
-
-        // #1771: cascading replacer chain — exact match first, then
-        // increasingly whitespace/indentation/escape-tolerant fallbacks.
-        let (range, replacer_name) = match super::replacer::find_replacement(
-            &content,
-            &input.old_string,
-        ) {
-            super::replacer::ChainOutcome::Match { range, replacer } => (range, replacer),
-            super::replacer::ChainOutcome::Ambiguous { count, replacer } => {
-                return Ok(ToolResult {
-                    output: format!(
-                        "Found {count} occurrences of the string (via {replacer} replacer). Please provide more context to make the match unique.",
-                    ),
-                    success: false,
-                    ..Default::default()
-                });
+        let mut new_content = content;
+        let mut replacers = Vec::with_capacity(edits.len());
+        for (index, edit) in edits.iter().enumerate() {
+            match stage_replacement(&new_content, edit) {
+                Ok((staged, replacer)) => {
+                    new_content = staged;
+                    replacers.push(replacer);
+                }
+                Err(reason) => {
+                    return Ok(ToolResult {
+                        output: if is_batch {
+                            format!(
+                                "Edit {} of {} failed: {reason} No changes were written.",
+                                index + 1,
+                                edits.len()
+                            )
+                        } else {
+                            reason
+                        },
+                        success: false,
+                        ..Default::default()
+                    });
+                }
             }
-            super::replacer::ChainOutcome::NoMatch => {
-                return Ok(ToolResult {
-                    output: format!(
-                        "String not found in file. No exact match, and no fuzzy match via the line-trimmed, whitespace-normalized, indentation-flexible, escape-normalized or block-anchor replacers.\n\nSearched for:\n```\n{}\n```",
-                        input.old_string
-                    ),
-                    success: false,
-                    ..Default::default()
-                });
-            }
-        };
-
-        // When the match came from the escape_normalized replacer, BOTH call
-        // strings carry the same double-escaping pathology — interpret
-        // new_string (and the guard's needle) with the same unescape rules
-        // that made old_string match. Splicing new_string verbatim would
-        // write literal `\n` text into the file as code, and guarding
-        // against the still-escaped old_string (1 physical line) would
-        // falsely reject every legitimate multi-line match (#1771 review).
-        let (guard_needle, splice_new) = if replacer_name == "escape_normalized" {
-            (
-                super::replacer::unescape_find(&input.old_string),
-                super::replacer::unescape_find(&input.new_string),
-            )
-        } else {
-            (input.old_string.clone(), input.new_string.clone())
-        };
-
-        // Safety guard: a fuzzy matcher must never silently swallow far more
-        // of the file than the old_string described.
-        let matched_text = &content[range.clone()];
-        if super::replacer::is_disproportionate_match(matched_text, &guard_needle) {
-            return Ok(ToolResult {
-                output: format!(
-                    "Fuzzy match rejected as disproportionate: the {replacer_name} replacer matched {} lines / {} bytes for an old_string of {} lines / {} bytes. Provide more context so the match is precise.",
-                    matched_text.lines().count(),
-                    matched_text.len(),
-                    guard_needle.lines().count(),
-                    guard_needle.len(),
-                ),
-                success: false,
-                ..Default::default()
-            });
         }
-
-        if replacer_name != "exact" {
-            tracing::info!(
-                replacer = replacer_name,
-                path = %input.path,
-                "edit_file fuzzy match succeeded"
-            );
-        }
-
-        // Perform replacement by byte range — the fuzzy-matched span may
-        // occur elsewhere as a plain substring, so a string replacen could
-        // hit the wrong occurrence.
-        let mut new_content = String::with_capacity(content.len() - range.len() + splice_new.len());
-        new_content.push_str(&content[..range.start]);
-        new_content.push_str(&splice_new);
-        new_content.push_str(&content[range.end..]);
 
         // Write back. A fenced edit rewrites the SAME confined handle opened
         // above (truncate + write from offset 0) — no re-open, so no
@@ -381,7 +360,27 @@ impl Tool for EditFileTool {
 
         // Report which replacer produced the match. The exact-match wording
         // is kept identical to the historical output for compatibility.
-        let output = if replacer_name == "exact" {
+        let fuzzy: Vec<_> = replacers
+            .iter()
+            .copied()
+            .filter(|name| *name != "exact")
+            .collect();
+        if !fuzzy.is_empty() {
+            tracing::info!(replacers = ?fuzzy, path = %input.path, "edit_file fuzzy match succeeded");
+        }
+        let replacer_name = replacers[0];
+        let output = if is_batch {
+            format!(
+                "Successfully edited {} ({} replacements{})",
+                input.path,
+                edits.len(),
+                if fuzzy.is_empty() {
+                    String::new()
+                } else {
+                    format!("; fuzzy match via {}", fuzzy.join(", "))
+                }
+            )
+        } else if replacer_name == "exact" {
             format!("Successfully edited {}", input.path)
         } else {
             format!(
@@ -397,6 +396,74 @@ impl Tool for EditFileTool {
             ..Default::default()
         })
     }
+}
+
+/// Stage one edit without touching disk. Batch callers commit only after
+/// every replacement has passed the existing unique-match and span guards.
+fn stage_replacement(
+    content: &str,
+    edit: &Replacement,
+) -> std::result::Result<(String, &'static str), String> {
+    if edit.old_string.is_empty() {
+        return Err("old_string must not be empty".to_string());
+    }
+
+    // #1771: cascading replacer chain — exact match first, then
+    // increasingly whitespace/indentation/escape-tolerant fallbacks.
+    let (range, replacer_name) = match super::replacer::find_replacement(content, &edit.old_string)
+    {
+        super::replacer::ChainOutcome::Match { range, replacer } => (range, replacer),
+        super::replacer::ChainOutcome::Ambiguous { count, replacer } => {
+            return Err(format!(
+                "Found {count} occurrences of the string (via {replacer} replacer). Please provide more context to make the match unique.",
+            ));
+        }
+        super::replacer::ChainOutcome::NoMatch => {
+            return Err(format!(
+                "String not found in file. No exact match, and no fuzzy match via the line-trimmed, whitespace-normalized, indentation-flexible, escape-normalized or block-anchor replacers.\n\nSearched for:\n```\n{}\n```",
+                edit.old_string
+            ));
+        }
+    };
+
+    // When the match came from the escape_normalized replacer, BOTH call
+    // strings carry the same double-escaping pathology — interpret
+    // new_string (and the guard's needle) with the same unescape rules
+    // that made old_string match. Splicing new_string verbatim would
+    // write literal `\n` text into the file as code, and guarding
+    // against the still-escaped old_string (1 physical line) would
+    // falsely reject every legitimate multi-line match (#1771 review).
+    let (guard_needle, splice_new) = if replacer_name == "escape_normalized" {
+        (
+            super::replacer::unescape_find(&edit.old_string),
+            super::replacer::unescape_find(&edit.new_string),
+        )
+    } else {
+        (edit.old_string.clone(), edit.new_string.clone())
+    };
+
+    // Safety guard: a fuzzy matcher must never silently swallow far more
+    // of the file than the old_string described.
+    let matched_text = &content[range.clone()];
+    if super::replacer::is_disproportionate_match(matched_text, &guard_needle) {
+        return Err(format!(
+            "Fuzzy match rejected as disproportionate: the {replacer_name} replacer matched {} lines / {} bytes for an old_string of {} lines / {} bytes. Provide more context so the match is precise.",
+            matched_text.lines().count(),
+            matched_text.len(),
+            guard_needle.lines().count(),
+            guard_needle.len(),
+        ));
+    }
+
+    // Perform replacement by byte range — the fuzzy-matched span may
+    // occur elsewhere as a plain substring, so a string replacen could
+    // hit the wrong occurrence.
+    let mut new_content = String::with_capacity(content.len() - range.len() + splice_new.len());
+    new_content.push_str(&content[..range.start]);
+    new_content.push_str(&splice_new);
+    new_content.push_str(&content[range.end..]);
+
+    Ok((new_content, replacer_name))
 }
 
 #[cfg(test)]
@@ -424,6 +491,147 @@ mod tests {
         );
     }
     use super::*;
+
+    #[tokio::test]
+    async fn batch_edits_apply_in_order_and_invalidate_file_state() {
+        use crate::file_state_cache::{CacheEntry, FileStateCache};
+        use std::{sync::Arc, time::SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.txt");
+        std::fs::write(&path, "标题\nalpha\nbeta\n").unwrap();
+        let cache = Arc::new(FileStateCache::new());
+        cache.put(CacheEntry::new(
+            path.clone(),
+            SystemTime::now(),
+            1,
+            12,
+            false,
+            None,
+        ));
+        let mut ctx = ToolContext::zero();
+        ctx.file_state_cache = Some(cache.clone());
+        let tool = EditFileTool::new(dir.path());
+        let result = tool
+            .execute_with_context(
+                &ctx,
+                &serde_json::json!({
+                    "filePath": "code.txt",
+                    "edits": [
+                        {"oldString": "标题\nalpha", "newString": "标题二\ngamma"},
+                        {"old_string": "gamma\nbeta", "new_string": "delta\n"}
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("2 replacements"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "标题二\ndelta\n\n");
+        assert!(cache.peek(&path).is_none());
+        assert_eq!(result.file_modified, Some(path));
+    }
+
+    #[tokio::test]
+    async fn failed_later_batch_edit_leaves_file_and_cache_unchanged() {
+        use crate::file_state_cache::{CacheEntry, FileStateCache};
+        use std::{sync::Arc, time::SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.txt");
+        let original = "first\nrepeat\nrepeat\n";
+        std::fs::write(&path, original).unwrap();
+        let cache = Arc::new(FileStateCache::new());
+        cache.put(CacheEntry::new(
+            path.clone(),
+            SystemTime::now(),
+            1,
+            12,
+            false,
+            None,
+        ));
+        let mut ctx = ToolContext::zero();
+        ctx.file_state_cache = Some(cache.clone());
+        for tool in [
+            EditFileTool::new(dir.path()),
+            fenced_tool(dir.path(), &["code.txt"], false),
+        ] {
+            for needle in ["missing", "repeat", ""] {
+                let result = tool
+                    .execute_with_context(
+                        &ctx,
+                        &serde_json::json!({
+                            "path": "code.txt", "edits": [
+                                {"old_string": "first", "new_string": "changed"},
+                                {"old_string": needle, "new_string": "bad"}
+                            ]
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!result.success, "{needle}");
+                assert!(result.output.contains("Edit 2 of 2 failed"));
+                assert!(result.output.contains("No changes were written"));
+                assert!(result.file_modified.is_none());
+                assert!(cache.peek(&path).is_some());
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_batch_is_a_recoverable_input_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.txt");
+        std::fs::write(&path, "original").unwrap();
+        let tool = EditFileTool::new(dir.path());
+        for mut args in [
+            serde_json::json!({"edits": []}),
+            serde_json::json!({"edits": [{"old_string": "original"}]}),
+            serde_json::json!({"edits": [{"old_string": "original", "new_string": "bad", "extra": true}]}),
+            serde_json::json!({"edits": [{"old_string": "original", "new_string": "bad"}], "old_string": null}),
+            serde_json::json!({"edits": [], "old_string": "original", "new_string": "bad"}),
+            serde_json::json!({"edits": null, "old_string": "original", "new_string": "bad"}),
+            serde_json::json!({"old_string": "original"}),
+        ] {
+            args["path"] = serde_json::json!("code.txt");
+            let error = tool
+                .execute(&args)
+                .await
+                .err()
+                .expect("invalid input must fail");
+            assert!(
+                error
+                    .downcast_ref::<crate::tools::ToolInputError>()
+                    .is_some(),
+                "{error:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_retains_write_fences_and_read_only_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.txt");
+        std::fs::write(&path, "one two").unwrap();
+        let args = serde_json::json!({"path": "code.txt", "edits": [
+            {"old_string": "one", "new_string": "three"},
+            {"old_string": "two", "new_string": "four"}
+        ]});
+        for tool in [
+            fenced_tool(dir.path(), &["code.txt"], true),
+            fenced_tool(dir.path(), &["other.txt"], false),
+            EditFileTool::new(dir.path()).with_file_access(FileAccessMode::ReadOnly),
+        ] {
+            assert!(!tool.execute(&args).await.unwrap().success);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "one two");
+        }
+        let result = fenced_tool(dir.path(), &["code.txt"], false)
+            .execute(&args)
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "three four");
+    }
 
     #[test]
     fn edit_file_tool_is_exclusive() {
@@ -1228,6 +1436,10 @@ mod tests {
         assert!(props.contains_key("path"));
         assert!(props.contains_key("old_string"));
         assert!(props.contains_key("new_string"));
+        assert_eq!(props["edits"]["type"], "array");
+        assert_eq!(props["edits"]["items"]["type"], "object");
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("anyOf").is_none());
         assert!(!props.contains_key("filePath"));
         assert!(!props.contains_key("oldString"));
         assert!(!props.contains_key("newString"));

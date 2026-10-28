@@ -90,8 +90,9 @@ pub type SteeringReceiver = mpsc::Receiver<SteeringMessage>;
 /// A message injected into the agent loop mid-session.
 #[derive(Debug, Clone)]
 pub enum SteeringMessage {
-    /// Inject a user-role follow-up message into the conversation.
-    FollowUp(Message),
+    /// Inject a user-role follow-up message into the conversation. Boxed so
+    /// the rare follow-up does not size every steering signal like a `Message`.
+    FollowUp(Box<Message>),
     /// Inject a system-role reminder (prepended to next LLM call).
     SystemReminder(String),
     /// Request the agent to pause and await input.
@@ -136,8 +137,11 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         };
-        tx.send(SteeringMessage::FollowUp(msg)).await.unwrap();
+        tx.send(SteeringMessage::FollowUp(Box::new(msg)))
+            .await
+            .unwrap();
         let received = rx.recv().await.unwrap();
         assert!(
             matches!(received, SteeringMessage::FollowUp(m) if m.content == "stop and focus on tests")

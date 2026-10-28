@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -627,9 +627,25 @@ struct WorkflowMetadata {
 }
 
 fn is_retryable_child_failure(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    [
+    let text = text.trim_start().to_ascii_lowercase();
+    // Legacy TaskResult has no typed stop reason. Canonical terminal messages
+    // must not become retryable merely because their explanation says "retry".
+    if [
         "token budget exceeded",
+        "the agent did not complete within",
+        "reached max iterations",
+        "activity timeout",
+        "idle progress timeout",
+        "cancelled",
+        "canceled",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+        || text.contains("[budget_exhausted]")
+    {
+        return false;
+    }
+    [
         "timed out",
         "timeout",
         "temporarily",
@@ -646,17 +662,33 @@ fn is_retryable_child_failure(text: &str) -> bool {
 fn classify_child_session_lifecycle_kind(
     result: &Result<octos_core::TaskResult>,
 ) -> ChildSessionLifecycleKind {
+    if is_quota_failure(result) {
+        return ChildSessionLifecycleKind::TerminalFailed;
+    }
     match result {
         Ok(task_result) if task_result.success => ChildSessionLifecycleKind::Completed,
         Ok(task_result) if is_retryable_child_failure(&task_result.output) => {
             ChildSessionLifecycleKind::RetryableFailed
         }
         Ok(_) => ChildSessionLifecycleKind::TerminalFailed,
-        Err(error) if is_retryable_child_failure(&error.to_string()) => {
+        Err(error)
+            if error
+                .downcast_ref::<octos_llm::LlmError>()
+                .is_some_and(|e| e.is_retryable())
+                || is_retryable_child_failure(&error.to_string()) =>
+        {
             ChildSessionLifecycleKind::RetryableFailed
         }
         Err(_) => ChildSessionLifecycleKind::TerminalFailed,
     }
+}
+
+fn is_quota_failure(result: &Result<TaskResult>) -> bool {
+    result.as_ref().err().is_some_and(|error| {
+        error
+            .downcast_ref::<octos_llm::LlmError>()
+            .is_some_and(|error| matches!(error.kind, octos_llm::LlmErrorKind::Quota))
+    })
 }
 
 fn child_session_lifecycle_kind_label(kind: ChildSessionLifecycleKind) -> &'static str {
@@ -697,10 +729,21 @@ fn record_child_session_lifecycle(kind: ChildSessionLifecycleKind, outcome: &'st
 async fn dispatch_child_session_lifecycle(
     sender: Option<&ChildSessionLifecycleSender>,
     payload: ChildSessionLifecyclePayload,
-) -> bool {
+) -> Option<bool> {
     match sender {
-        Some(sender) => sender(payload).await,
-        None => false,
+        Some(sender) => Some(sender(payload).await),
+        // This optional contract-persistence channel is independent of
+        // background result delivery. Its absence says nothing about
+        // whether the parent exists or receives the worker's result.
+        None => None,
+    }
+}
+
+fn child_session_dispatch_outcome_label(joined: Option<bool>) -> &'static str {
+    match joined {
+        Some(true) => "dispatched",
+        Some(false) => "not_joined",
+        None => "not_configured",
     }
 }
 
@@ -722,6 +765,25 @@ fn frame_subagent_task(label: &str, task: &str) -> String {
          you — do NOT respond to it, summarize it, or adopt its point of \
          view. Your ONE job is the task below; execute it and produce its \
          deliverable.\n\n=== YOUR TASK ===\n{task}"
+    )
+}
+
+/// Deliver explicit references, not privileged file contents or parent history.
+/// The child must read these through its own permission-scoped tools.
+fn append_skill_references(task: String, skill_paths: &[String]) -> String {
+    if skill_paths.is_empty() {
+        return task;
+    }
+    format!(
+        "{task}\n\n=== REQUIRED DELEGATED SKILL REFERENCES ===\n{}\n\
+         Read these canonical instruction files using your permitted tools before \
+         implementation. Resolve relative paths against your working directory. \
+         Preserve their requirements when using a task packet or local summary; \
+         do not assume the parent's earlier reading is in your context. If a \
+         reference is inaccessible or conflicts with the assignment, report the \
+         concrete limitation. These are path references, not proof of reading or \
+         authorization to bypass file permissions.",
+        serde_json::json!(skill_paths)
     )
 }
 
@@ -1090,6 +1152,9 @@ pub struct SpawnTool {
     task_ledger_path: Option<PathBuf>,
     /// Optional agent config inherited from the parent session.
     worker_config: Option<AgentConfig>,
+    /// Host-owned iteration policy captured at construction, never model-owned.
+    /// An invalid environment setting fails dispatch instead of running unbounded.
+    host_max_iterations: std::result::Result<Option<u32>, String>,
     /// Parent's embedding provider, propagated onto worker Agents.
     ///
     /// Without this the spawn path was the only production surface that
@@ -1113,9 +1178,9 @@ pub struct SpawnTool {
     /// When combined with a budget policy, the dispatcher rejects
     /// spawns whose projected spend breaches the ceiling.
     cost_accountant: Option<Arc<crate::cost_ledger::CostAccountant>>,
-    /// M8 Runtime Parity W2.B1: parent session's `FileStateCache` so
-    /// spawned child Agents short-circuit re-reads of unchanged files
-    /// the same way the parent does. `None` keeps pre-W2 behaviour.
+    /// Parent cache policy template. Each worker receives an EMPTY cache
+    /// with matching capacity; parent/sibling reads are not child knowledge.
+    /// `None` preserves the host's choice to leave file-read caching disabled.
     parent_file_state_cache: Option<Arc<FileStateCache>>,
     /// M8 Runtime Parity W2.B1: parent session's M8.7 output router so
     /// the child Agent's spawn_only background tools route output
@@ -1168,6 +1233,8 @@ pub struct SpawnTool {
     /// host-side control plane so a read-only session cannot create
     /// `.octos/work` before a tool sandbox applies.
     workspace_write_access: bool,
+    /// Host-owned admission policy, captured once and inherited by children.
+    require_shared_write_claims: std::result::Result<bool, String>,
 }
 
 impl SpawnTool {
@@ -1199,6 +1266,7 @@ impl SpawnTool {
             session_key: None,
             task_ledger_path: None,
             worker_config: None,
+            host_max_iterations: spawn_host_max_iterations_from_env(),
             embedder: None,
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
@@ -1212,6 +1280,7 @@ impl SpawnTool {
             sandbox: SandboxConfig::default(),
             deliverable_root: None,
             workspace_write_access: true,
+            require_shared_write_claims: super::output_claims::policy_from_env(),
         }
     }
 
@@ -1246,6 +1315,7 @@ impl SpawnTool {
             session_key: None,
             task_ledger_path: None,
             worker_config: None,
+            host_max_iterations: spawn_host_max_iterations_from_env(),
             embedder: None,
             mcp_agent_backend: None,
             mcp_agent_tool_name: None,
@@ -1259,6 +1329,7 @@ impl SpawnTool {
             sandbox: SandboxConfig::default(),
             deliverable_root: None,
             workspace_write_access: true,
+            require_shared_write_claims: super::output_claims::policy_from_env(),
         }
     }
 
@@ -1307,6 +1378,7 @@ impl SpawnTool {
             session_key: self.session_key.clone(),
             task_ledger_path: self.task_ledger_path.clone(),
             worker_config: self.worker_config.clone(),
+            host_max_iterations: self.host_max_iterations.clone(),
             embedder: self.embedder.clone(),
             mcp_agent_backend: self.mcp_agent_backend.clone(),
             mcp_agent_tool_name: self.mcp_agent_tool_name.clone(),
@@ -1339,6 +1411,7 @@ impl SpawnTool {
                 .as_ref()
                 .map(|root| root.join(child_id.to_string()).join("children")),
             workspace_write_access: self.workspace_write_access,
+            require_shared_write_claims: self.require_shared_write_claims.clone(),
         }
     }
 
@@ -1401,6 +1474,13 @@ impl SpawnTool {
     /// deliverable must also use [`Self::with_deliverable_root`].
     pub fn with_workspace_write_access(mut self, allowed: bool) -> Self {
         self.workspace_write_access = allowed;
+        self
+    }
+
+    /// Require cooperative output claims for shared writable native workers.
+    /// This is admission coordination, not a filesystem/security permission.
+    pub fn with_require_shared_write_claims(mut self, required: bool) -> Self {
+        self.require_shared_write_claims = Ok(required);
         self
     }
 
@@ -1499,6 +1579,32 @@ impl SpawnTool {
         self
     }
 
+    /// Set an authoritative native-child iteration policy. Zero requires
+    /// unlimited iterations even when a model supplies a finite request;
+    /// a positive value is a ceiling the model cannot raise or disable.
+    /// Overrides the construction-time `OCTOS_SPAWN_MAX_ITERATIONS` setting.
+    /// Token/cost budgets, cancellation, tool policies and permissions are unchanged.
+    pub fn with_host_max_iterations(mut self, limit: u32) -> Self {
+        self.host_max_iterations = Ok(Some(limit));
+        self
+    }
+
+    fn effective_worker_config(&self, requested: Option<u32>) -> Result<AgentConfig> {
+        let host_limit = self
+            .host_max_iterations
+            .as_ref()
+            .map_err(|error| eyre::eyre!("{error}"))?;
+        let mut config = self.worker_config.clone().unwrap_or_default();
+        let requested = resolve_spawn_max_iterations(requested);
+        config.max_iterations = match host_limit {
+            Some(0) => 0,
+            Some(limit) if requested == 0 => *limit,
+            Some(limit) => requested.min(*limit),
+            None => requested,
+        };
+        Ok(config)
+    }
+
     /// Configure an MCP-backed sub-agent for this tool instance. Callers
     /// that invoke spawn with `backend: "agent_mcp"` dispatch their task
     /// to `backend` and receive only the final contract-gated artifact in
@@ -1552,10 +1658,9 @@ impl SpawnTool {
         self
     }
 
-    /// M8 Runtime Parity W2.B1: inherit the parent session's
-    /// `FileStateCache` so spawned child Agents short-circuit re-reads
-    /// of unchanged files. Without this, every child re-reads the
-    /// entire workspace on every step.
+    /// Preserve the parent's file-cache policy, with fresh read knowledge for
+    /// each worker. Only a child's own repeated reads may be short-circuited;
+    /// neither an Arc clone nor a copied parent entry proves it saw the body.
     pub fn with_parent_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
         self.parent_file_state_cache = Some(cache);
         self
@@ -1814,32 +1919,36 @@ impl SpawnTool {
     }
 }
 
-/// Upper bound for a spawn's `max_iterations` override. A repo-scale review or
-/// deep research legitimately needs many one-tool-call-at-a-time steps, but an
-/// unattended worker still needs a finite runaway backstop, so the
-/// caller-supplied value is clamped to this ceiling.
-const MAX_SPAWN_MAX_ITERATIONS: u32 = 300;
+/// Native subagents use AgentConfig's zero = unlimited convention by default.
+/// Explicit host/token/cost policies and cancellation remain independent.
+pub(crate) const DEFAULT_SPAWN_MAX_ITERATIONS: u32 = 0;
 
-/// Default iteration budget for a spawned sub-agent when the caller does not set
-/// `max_iterations`. The bare `AgentConfig` default (`0`) is unlimited for a
-/// *interactive* turn; a background sub-agent does bounded-but-substantive work
-/// (a from-scratch repo review runs ~100–150 one-tool-call-at-a-time steps), so
-/// the historical 50-call default starved real work (agents capped on their
-/// first exploration pass, producing nothing). The token budget and loop
-/// detection remain the primary runaway guards; this cap is a secondary
-/// backstop. Callers can raise it up to [`MAX_SPAWN_MAX_ITERATIONS`] or lower it
-/// explicitly.
-pub(crate) const DEFAULT_SPAWN_MAX_ITERATIONS: u32 = 150;
-
-/// Keep enough headroom for repo-scale review while remaining finite.
-const _: () = assert!(DEFAULT_SPAWN_MAX_ITERATIONS > 50);
-
-/// Resolve the effective iteration budget for a spawn: a caller-supplied value
-/// clamped into `[1, MAX]`, or [`DEFAULT_SPAWN_MAX_ITERATIONS`] when unset.
+/// Preserve explicit values, including zero; never introduce a hidden ceiling.
 fn resolve_spawn_max_iterations(requested: Option<u32>) -> u32 {
-    requested
-        .map(|value| value.clamp(1, MAX_SPAWN_MAX_ITERATIONS))
-        .unwrap_or(DEFAULT_SPAWN_MAX_ITERATIONS)
+    requested.unwrap_or(DEFAULT_SPAWN_MAX_ITERATIONS)
+}
+
+fn parse_spawn_host_max_iterations(
+    value: Option<&str>,
+) -> std::result::Result<Option<u32>, String> {
+    value
+        .map(|value| {
+            value.trim().parse::<u32>().map_err(|_| {
+                "OCTOS_SPAWN_MAX_ITERATIONS must be a nonnegative integer (0 means unlimited)"
+                    .to_string()
+            })
+        })
+        .transpose()
+}
+
+fn spawn_host_max_iterations_from_env() -> std::result::Result<Option<u32>, String> {
+    match std::env::var("OCTOS_SPAWN_MAX_ITERATIONS") {
+        Ok(value) => parse_spawn_host_max_iterations(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("OCTOS_SPAWN_MAX_ITERATIONS must contain valid Unicode".to_string())
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -1854,6 +1963,9 @@ struct Input {
     /// worktree gives the child a dedicated git worktree under `.octos/work`.
     #[serde(default)]
     isolation: WorkerIsolation,
+    /// Literal output files/subtrees reserved for this worker's actual lifetime.
+    #[serde(default)]
+    owned_paths: Vec<String>,
     /// Tool names the subagent is allowed to use. Empty = all builtins. A
     /// narrowed list that omits `write_file` leaves the child unable to write a
     /// deliverable except via a shell redirect (which is only captured when a
@@ -1863,15 +1975,17 @@ struct Input {
     /// Extra context injected as a system-level prefix.
     #[serde(default)]
     context: Option<String>,
+    /// Canonical skill/instruction paths that the child must read using its own tools.
+    #[serde(default)]
+    skill_paths: Vec<String>,
     /// Prefixed model ID (e.g. "anthropic/claude-haiku") to use a different provider.
     #[serde(default)]
     model: Option<String>,
     /// Override context window size (tokens) for the sub-agent.
     #[serde(default)]
     context_window: Option<u32>,
-    /// Override the sub-agent's tool-call iteration budget (default 50).
-    /// Clamped to [`MAX_SPAWN_MAX_ITERATIONS`]. Raise it for repo-scale reviews
-    /// / research that need many one-tool-call-at-a-time steps.
+    /// Requested iteration limit. Omitted or zero means unlimited; a host-owned
+    /// policy may override it without changing other execution budgets.
     #[serde(default)]
     max_iterations: Option<u32>,
     /// Additional instructions appended to the subagent's system prompt.
@@ -2260,17 +2374,82 @@ fn extract_inline_podcast_script(task_desc: &str) -> Option<String> {
 /// - The recovery turn is sent as an `additional_instructions`-style
 ///   tail appended to the original task description, so the worker's
 ///   conversation history stays linear.
+struct SpawnRecoveryBoundary {
+    inner: Arc<dyn crate::progress::ProgressReporter>,
+    stopped: AtomicBool,
+}
+
+impl crate::progress::ProgressReporter for SpawnRecoveryBoundary {
+    fn report(&self, event: crate::progress::ProgressEvent) {
+        use crate::progress::ProgressEvent;
+        if matches!(
+            event,
+            ProgressEvent::TaskInterrupted { .. }
+                | ProgressEvent::MaxIterationsReached { .. }
+                | ProgressEvent::TokenBudgetExceeded { .. }
+                | ProgressEvent::ActivityTimeoutReached { .. }
+        ) {
+            self.stopped.store(true, Ordering::Release);
+        }
+        self.inner.report(event);
+    }
+
+    fn thread_id(&self) -> Option<&str> {
+        self.inner.thread_id()
+    }
+}
+
 async fn run_task_with_m8_9_recovery(
     worker: &Agent,
     subtask: &Task,
     task_desc: &str,
 ) -> Result<TaskResult> {
-    let initial = worker.run_task(subtask).await;
+    run_task_with_recovery_boundary(worker, subtask, task_desc, &AtomicBool::new(false)).await
+}
+
+async fn run_task_with_recovery_boundary(
+    worker: &Agent,
+    subtask: &Task,
+    task_desc: &str,
+    terminal_stop: &AtomicBool,
+) -> Result<TaskResult> {
+    let boundary = Arc::new(SpawnRecoveryBoundary {
+        inner: worker.reporter(),
+        stopped: AtomicBool::new(false),
+    });
+    let initial = crate::agent::TASK_REPORTER
+        .scope(boundary.clone(), worker.run_task(subtask))
+        .await;
     let needs_recovery = match &initial {
         Err(_) => true,
         Ok(task_result) => !task_result.success,
     };
     if !needs_recovery {
+        return initial;
+    }
+
+    // A fresh run resets run_task's local usage/iteration counters. Until the
+    // task API accepts a remaining-budget continuation, fail conservatively
+    // under any finite host budget rather than granting a second allowance.
+    // This also covers failures whose error does not carry exact token usage.
+    let config = worker.agent_config();
+    // max_timeout is an inactivity guard, not a cumulative allowance. Its
+    // terminal event forbids recovery; merely configuring it must not disable
+    // repair of an otherwise recoverable error.
+    let explicit_budget = config.max_iterations > 0 || config.max_tokens.is_some();
+    let quota_exhausted = is_quota_failure(&initial);
+    if worker.shutdown_signal().load(Ordering::Acquire)
+        || boundary.stopped.load(Ordering::Acquire)
+        || explicit_budget
+        || quota_exhausted
+    {
+        terminal_stop.store(true, Ordering::Release);
+        info!(
+            task_id = %subtask.id,
+            explicit_budget,
+            quota_exhausted,
+            "spawn recovery suppressed at cancellation or budget boundary"
+        );
         return initial;
     }
 
@@ -2302,7 +2481,23 @@ async fn run_task_with_m8_9_recovery(
         agent_id = %worker.id,
         "M8.9 spawn-task recovery: re-engaging worker after initial failure"
     );
-    worker.run_task(&recovery_task).await
+    // run_task builds fresh messages; the previous attempt's tool-result
+    // bodies are not included in this recovery prompt. The cache is local
+    // to this worker, so resetting its read claims cannot erase the parent's
+    // or a sibling's knowledge. Output routing remains shared independently.
+    if let Some(cache) = worker.file_state_cache() {
+        cache.clear();
+    }
+    let recovered = crate::agent::TASK_REPORTER
+        .scope(boundary.clone(), worker.run_task(&recovery_task))
+        .await;
+    if worker.shutdown_signal().load(Ordering::Acquire)
+        || boundary.stopped.load(Ordering::Acquire)
+        || is_quota_failure(&recovered)
+    {
+        terminal_stop.store(true, Ordering::Release);
+    }
+    recovered
 }
 
 /// Build the synthetic `[system-internal]` instruction the spawn-task
@@ -2987,7 +3182,7 @@ impl Tool for SpawnTool {
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "The task for the subagent to complete"
+                    "description": "The self-contained task for the subagent. Include ownership, inputs, acceptance evidence and handoff requirements; pass required canonical instruction paths in skill_paths rather than assuming the parent's reading is inherited."
                 },
                 "label": {
                     "type": "string",
@@ -3005,6 +3200,11 @@ impl Tool for SpawnTool {
                     "description": "Filesystem isolation for builtin subagents. shared uses the parent workspace; worktree creates a dedicated git worktree under .octos/work.",
                     "default": "shared"
                 },
+                "owned_paths": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "description": "Exclusive output paths for a native shared worker, relative to its workspace; literal files or subtrees, no globs/root/traversal. Overlap with a live owner is rejected. Required for writable shared workers when host policy enables it. Cooperative admission only, not a sandbox; wait for actual owner exit before reusing paths."
+                },
                 "allowed_tools": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -3019,6 +3219,11 @@ impl Tool for SpawnTool {
                     "type": "string",
                     "description": "Extra context prepended to the task prompt."
                 },
+                "skill_paths": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1 },
+                    "description": "Canonical skill/instruction file paths the child must read through its permitted tools. Relative paths resolve in the child's working directory. References are preserved in sync and background tasks; file contents and the parent's full history are not copied."
+                },
                 "model": model_prop,
                 "context_window": {
                     "type": "integer",
@@ -3026,8 +3231,9 @@ impl Tool for SpawnTool {
                 },
                 "max_iterations": {
                     "type": "integer",
-                    "minimum": 1,
-                    "description": "Tool-call iteration budget (default 50, capped). Large reviews/research may need 100-150."
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Requested iteration limit; omitted or 0 means unlimited. Positive values are preserved without a hidden ceiling. Host iteration policy takes precedence; token/cost budgets and cancellation remain active."
                 },
                 "additional_instructions": {
                     "type": "string",
@@ -3138,6 +3344,28 @@ impl Tool for SpawnTool {
                  (\"background\"|\"sync\"), `context`, `model`, `label`."
             ))
         })?;
+        if input
+            .skill_paths
+            .iter()
+            .any(|path| path.trim().is_empty() || path.contains('\0'))
+        {
+            return Err(super::ToolInputError::new(
+                "skill_paths must contain nonempty file paths without NUL characters",
+            )
+            .into());
+        }
+        // Resolve before creating any worker/supervisor state. Captured host
+        // policy applies identically to synchronous and detached native workers.
+        let effective_worker_config = match self.effective_worker_config(input.max_iterations) {
+            Ok(config) => config,
+            Err(error) => {
+                return Ok(ToolResult {
+                    output: format!("spawn configuration error: {error}"),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
         // Bug A (reviewer-role preflight): capture whether the CALLER named the
         // tools before a manifest / role template can fill the allow-list (they
         // only fill it when it is empty). A caller-explicit tool that is absent
@@ -3166,6 +3394,7 @@ impl Tool for SpawnTool {
             Some(ctx) => format!("{ctx}\n\n{}", input.task),
             None => input.task.clone(),
         };
+        let raw_task = append_skill_references(raw_task, &input.skill_paths);
         // #1704: the child's forked context is the parent's whole
         // conversation with this task appended LAST. A weaker model
         // pattern-matches the dominant conversation and answers AS THE
@@ -3209,6 +3438,42 @@ impl Tool for SpawnTool {
         let workflow = input.workflow.clone();
         let is_sync = input.mode == "sync";
         let is_agent_mcp = input.backend == "agent_mcp";
+        let require_claims = match &self.require_shared_write_claims {
+            Ok(required) => *required,
+            Err(error) => return Ok(super::output_claims::ClaimError::invalid(error).result()),
+        };
+        let writable = !super::output_claims::readonly_allowlist(&effective_allowed_tools);
+        if (is_agent_mcp && (require_claims && writable || !input.owned_paths.is_empty()))
+            || (input.isolation == WorkerIsolation::Worktree && !input.owned_paths.is_empty())
+        {
+            return Ok(super::output_claims::ClaimError {
+                code: "OUTPUT_CLAIMS_UNSUPPORTED",
+                message: "owned_paths are enforced only for native shared workers; external backends cannot satisfy strict shared-write ownership. Worktree workers already have independent output roots; omit parent-workspace claims there.".into(),
+                detail: serde_json::json!({}),
+            }.result());
+        }
+        if !is_agent_mcp
+            && input.isolation == WorkerIsolation::Shared
+            && require_claims
+            && writable
+            && input.owned_paths.is_empty()
+        {
+            return Ok(super::output_claims::ClaimError {
+                code: "OUTPUT_CLAIMS_REQUIRED",
+                message: "Host policy requires owned_paths for writable shared workers. Declare the specific output paths, use an isolated worktree, or restrict tools to a closed read-only allow-list.".into(),
+                detail: serde_json::json!({}),
+            }.result());
+        }
+        // Reserve before worker/model dispatch. This guard is moved into the
+        // detached future below, not released by early terminal/cancel statuses.
+        let output_claim_guard = match super::output_claims::OutputClaimGuard::acquire(
+            &self.working_dir,
+            &input.owned_paths,
+            &label,
+        ) {
+            Ok(guard) => guard.map(Arc::new),
+            Err(error) => return Ok(error.result()),
+        };
         if is_agent_mcp && input.isolation == WorkerIsolation::Worktree {
             return Ok(ToolResult {
                 output: "Status: FAILED\nworktree isolation is currently supported only for builtin subagents".to_string(),
@@ -3875,17 +4140,15 @@ impl Tool for SpawnTool {
             // supervisor (the top level wires `with_task_supervisor(
             // tool_registry.supervisor())`). Bind the clone to THIS child
             // registry's OWN supervisor — the one `ctx.task_supervisor`
-            // exposes — so `SpawnAgentTool`'s before/after task lookup finds
+            // exposes — so `SpawnAgentTool`'s exact returned-handle lookup finds
             // the task the delegate registers; otherwise `spawn_agent` returns
             // no `agent_id` and `delegate` fails with "did not register a task".
             //
             // This keeps each spawned subtree's nested tasks in its OWN
             // (private, per-child) supervisor rather than the shared session
             // one — a deliberate isolation choice. Sharing the session
-            // supervisor would (a) let `newest_spawned_task` mis-correlate
-            // across CONCURRENT sibling spawners racing the same map,
-            // (b) give the child's task-control aliases (wait/close/resume)
-            // session-wide reach, and (c) leak a child's own `run_pipeline`
+            // supervisor would give the child's task-control aliases
+            // (wait/close/resume) session-wide reach and leak a child's own `run_pipeline`
             // node tasks into the persisted session ledger. The trade-off:
             // grandchildren are not surfaced in the session task/list and the
             // fan-out cap is per-subtree, not global. The grandchild's RESULT
@@ -3943,6 +4206,9 @@ impl Tool for SpawnTool {
                 // own spawn tool calls see the higher value and the
                 // [`MAX_SPAWN_DEPTH`] gate fires at the bounded limit.
                 .with_spawn_depth(ctx.spawn_depth.saturating_add(1));
+            if let Some(guard) = output_claim_guard.as_ref() {
+                worker = worker.with_execution_lifetime_guard(guard.clone());
+            }
             // Phase 2-D of the SessionScope migration: propagate the
             // parent's scope into the child Agent so the child's tools
             // (shell, read_file, write_file, edit_file, plugin tool,
@@ -3955,15 +4221,7 @@ impl Tool for SpawnTool {
             // Keep an Arc handle to the child's tool registry so we can run
             // declared validators against it after `run_task` returns.
             let child_tools_handle = worker.tool_registry().clone();
-            // Apply the worker config plus the spawn's iteration budget: the
-            // caller's `max_iterations` (clamped) or the generous spawn default
-            // (`DEFAULT_SPAWN_MAX_ITERATIONS`) — a sub-agent does more than an
-            // interactive turn, so it must not inherit the bare 50 default.
-            {
-                let mut config = self.worker_config.clone().unwrap_or_default();
-                config.max_iterations = resolve_spawn_max_iterations(input.max_iterations);
-                worker = worker.with_config(config);
-            }
+            worker = worker.with_config(effective_worker_config);
             if let Some(factory) = self.child_prompt_context_manager_factory.as_ref() {
                 if let Some(manager) = factory(ChildPromptContextRequest {
                     parent_session_key: self.session_key.clone(),
@@ -3976,13 +4234,12 @@ impl Tool for SpawnTool {
                 }
             }
 
-            // M8 Runtime Parity W2.B1: inherit parent caches so the child
-            // observes the same file_state_cache + subagent_output_router
-            // + subagent_summary_generator the session actor wired. This
-            // closes the gap where spawned subagents had `file_state_cache:
-            // None` and re-read the entire workspace on every step.
+            // Read knowledge belongs to the worker's transcript. A fork can
+            // omit parent tool results, and an independent/worktree worker
+            // may never have seen any of them. Preserve cache capacity, not
+            // read claims; output routing and summaries still share handles.
             if let Some(ref cache) = self.parent_file_state_cache {
-                worker = worker.with_file_state_cache(cache.clone());
+                worker = worker.with_file_state_cache(Arc::new(cache.empty_for_new_context()));
             }
             if let Some(ref router) = self.parent_subagent_output_router {
                 worker = worker.with_subagent_output_router(router.clone());
@@ -4153,44 +4410,54 @@ impl Tool for SpawnTool {
                 .task_ledger_path
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned());
-            let tracked_task_id = self.task_supervisor.as_ref().map(|supervisor| {
-                supervisor.register_with_lineage(
-                    &label,
-                    &format!("spawn-{worker_id}"),
-                    self.session_key.as_deref(),
-                    task_ledger_path.as_deref(),
-                )
-            });
-            // Cap refusal: `register_with_lineage` signals a per-session
-            // child-fanout rejection with an empty-string sentinel. Spawning
-            // anyway would run a detached worker that is invisible to
-            // `task/list` and uncancellable (`cancel("")` no-ops), and the
-            // terminal guard below would be armed under `""`. Refuse the
-            // spawn synchronously so the LLM sees the cap instead of a fake
-            // "started in background" handle. (`None` = no supervisor at all —
-            // the legacy untracked path — which stays allowed.)
-            if tracked_task_id.as_deref() == Some("") {
-                tracing::error!(
-                    label = %label,
-                    "background spawn register refused (child fanout cap); not spawning"
-                );
-                return Ok(ToolResult {
-                    output: format!(
-                        "[TASK LIMIT] Cannot spawn background subagent '{label}': this \
-                         session reached its background-task fanout cap. Wait for \
-                         running tasks to finish (or cancel them) before spawning more. \
-                         Do not retry immediately."
-                    ),
-                    success: false,
-                    ..Default::default()
-                });
-            }
+            // Stamp the MASTER workspace atomically, not the per-page output
+            // or child worktree. Continuation batching and /stop scoping must
+            // share the originating session's workspace even after delivery.
+            let origin_workspace = self.working_dir.to_string_lossy();
+            let tracked_task_id = match self
+                .task_supervisor
+                .as_ref()
+                .map(|supervisor| {
+                    supervisor.try_register_with_lineage_and_workspace(
+                        &label,
+                        &format!("spawn-{worker_id}"),
+                        self.session_key.as_deref(),
+                        task_ledger_path.as_deref(),
+                        Some(origin_workspace.as_ref()),
+                    )
+                })
+                .transpose()
+            {
+                Ok(task_id) => task_id,
+                Err(error) => {
+                    let prefix = if matches!(
+                        error,
+                        crate::task_supervisor::RegisterTaskError::ChildFanoutExceeded { .. }
+                    ) {
+                        "[TASK LIMIT]"
+                    } else {
+                        "[TASK REGISTRATION FAILED]"
+                    };
+                    return Ok(ToolResult {
+                        output: format!(
+                            "{prefix} Cannot spawn background subagent '{label}': {error}. No worker was started; do not retry immediately."
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+            };
             let tracked_child_session_key = tracked_task_id.as_ref().and_then(|task_id| {
                 self.task_supervisor
                     .as_ref()
                     .and_then(|supervisor| supervisor.get_task(task_id))
                     .and_then(|task| task.child_session_key)
             });
+            if let (Some(guard), Some(task_id)) =
+                (output_claim_guard.as_ref(), tracked_task_id.as_ref())
+            {
+                guard.bind_task(task_id);
+            }
             if let (Some(supervisor), Some(task_id), Some(template)) = (
                 self.task_supervisor.as_ref(),
                 tracked_task_id.as_ref(),
@@ -4260,10 +4527,6 @@ impl Tool for SpawnTool {
             // workspace-declared command validator could escape to the host.
             let child_sandbox = self.sandbox.clone();
             let additional_instructions = input.additional_instructions;
-            // Spawn iteration budget (caller's clamped value or the generous
-            // spawn default), captured for the detached closure (`input` is not
-            // `'static`/available inside it).
-            let bg_max_iters = resolve_spawn_max_iterations(input.max_iterations);
             let default_worker_prompt = self.worker_prompt.clone();
             let bg_sender = self.background_result_sender.clone();
             let child_session_sender = self.child_session_sender.clone();
@@ -4283,7 +4546,6 @@ impl Tool for SpawnTool {
             let child_spawn_template =
                 self.child_spawn_clone(child_working_dir.clone(), &worker_id);
             let task_supervisor = self.task_supervisor.clone();
-            let worker_config = self.worker_config.clone();
             let worker_embedder = self.embedder.clone();
             let workflow_metadata = workflow.clone();
             let parent_session_key = self.session_key.clone();
@@ -4315,12 +4577,9 @@ impl Tool for SpawnTool {
             } else {
                 Some(ctx.tool_id.clone())
             };
-            // M8 Runtime Parity W2.B1: capture parent caches into the
-            // detached background closure so the bg child Agent gets the
-            // same FileStateCache + Router + SummaryGenerator as the sync
-            // path. Without these the detached subagent silently runs
-            // without M8.4/M8.7 wiring even when the session actor
-            // configured everything.
+            // Capture the file-cache policy template and shared output
+            // services. The detached worker creates its own empty read cache
+            // below; capturing the template must not copy read knowledge.
             let parent_file_state_cache = self.parent_file_state_cache.clone();
             let parent_subagent_output_router = self.parent_subagent_output_router.clone();
             let parent_subagent_summary_generator = self.parent_subagent_summary_generator.clone();
@@ -4363,7 +4622,15 @@ impl Tool for SpawnTool {
             // precomputed scope with the same policy and a worker CWD.
             let child_session_scope = child_session_scope.clone();
 
+            // Keep the supervisor handle for the immediate tool response before
+            // moving task state into the detached worker. Labels are not IDs.
+            let response_task_id = tracked_task_id.clone();
+            let response_child_session_key = tracked_child_session_key.clone();
+
             tokio::spawn(async move {
+                // Keep output ownership through recovery, validators and result
+                // delivery. Status may already be Cancelled while this runs.
+                let _output_claim_guard = output_claim_guard;
                 // codex round-5: the terminal guard was armed in the
                 // FOREGROUND (before this spawn) so the task id entered the
                 // process-global live-set synchronously within the spawning
@@ -4428,7 +4695,7 @@ impl Tool for SpawnTool {
                     .await;
                     record_child_session_lifecycle(
                         ChildSessionLifecycleKind::Spawned,
-                        if joined { "dispatched" } else { "not_joined" },
+                        child_session_dispatch_outcome_label(joined),
                     );
                 }
 
@@ -4526,7 +4793,7 @@ impl Tool for SpawnTool {
                 // sync path: bind the template to THIS child registry's own
                 // (private, per-child) supervisor — the one that backs the
                 // child's `ctx.task_supervisor` — so the nested spawn_agent's
-                // before/after lookup resolves against the same map the
+                // exact returned-handle lookup resolves against the same map the
                 // delegate registers into (see the sync-path rationale for the
                 // isolation trade-off).
                 let mut child_spawn_template = child_spawn_template;
@@ -4585,6 +4852,9 @@ impl Tool for SpawnTool {
                     // nesting depth + 1 so the detached child sees the
                     // higher value when its own spawn calls run.
                     .with_spawn_depth(child_spawn_depth);
+                if let Some(guard) = _output_claim_guard.as_ref() {
+                    worker = worker.with_execution_lifetime_guard(guard.clone());
+                }
                 if let Some(reporter) = child_transcript_reporter {
                     worker = worker.with_reporter(reporter);
                 }
@@ -4598,16 +4868,13 @@ impl Tool for SpawnTool {
                 // Keep an Arc to the child's tool registry for the
                 // post-`run_task` validator invocation below.
                 let child_tools_handle = worker.tool_registry().clone();
-                let mut effective_config = worker_config.clone().unwrap_or_default();
+                let mut effective_config = effective_worker_config;
                 effective_config.suppress_auto_send_files = true;
-                effective_config.max_iterations = bg_max_iters;
                 worker = worker.with_config(effective_config);
-                // M8 Runtime Parity W2.B1: apply parent caches to the
-                // detached background child before it consumes any
-                // user-facing instruction. See `with_parent_file_state_cache`
-                // for the contract.
+                // Match inline workers: each background context starts with
+                // empty read knowledge, even when the workspace is shared.
                 if let Some(ref cache) = parent_file_state_cache {
-                    worker = worker.with_file_state_cache(cache.clone());
+                    worker = worker.with_file_state_cache(Arc::new(cache.empty_for_new_context()));
                 }
                 if let Some(ref router) = parent_subagent_output_router {
                     worker = worker.with_subagent_output_router(router.clone());
@@ -4693,8 +4960,17 @@ impl Tool for SpawnTool {
 
                 // M8 Runtime Parity W2.B2: wrap `run_task` with single-shot
                 // M8.9 recovery for the detached background path too.
+                let recovery_terminal_stop = AtomicBool::new(false);
                 let mut result = match availability_check {
-                    Ok(()) => run_task_with_m8_9_recovery(&worker, &subtask, &task_desc).await,
+                    Ok(()) => {
+                        run_task_with_recovery_boundary(
+                            &worker,
+                            &subtask,
+                            &task_desc,
+                            &recovery_terminal_stop,
+                        )
+                        .await
+                    }
                     Err(error) => Err(error),
                 };
                 if let Ok(task_result) = result.as_mut() {
@@ -4942,7 +5218,9 @@ impl Tool for SpawnTool {
                     }
                 }
 
-                let terminal_kind = if contract_failure.is_some() {
+                let terminal_kind = if contract_failure.is_some()
+                    || recovery_terminal_stop.load(Ordering::Acquire)
+                {
                     ChildSessionLifecycleKind::TerminalFailed
                 } else {
                     classify_child_session_lifecycle_kind(&result)
@@ -5059,7 +5337,7 @@ impl Tool for SpawnTool {
                             .await;
                     record_child_session_lifecycle(
                         terminal_kind,
-                        if joined { "dispatched" } else { "not_joined" },
+                        child_session_dispatch_outcome_label(joined),
                     );
                     if let Some(supervisor) = task_supervisor.as_ref() {
                         if let Some(task_id) = tracked_task_id.as_ref() {
@@ -5080,11 +5358,13 @@ impl Tool for SpawnTool {
                             supervisor.mark_child_session_outcome(
                                 task_id,
                                 terminal_state,
-                                if joined {
-                                    crate::task_supervisor::ChildSessionJoinState::Joined
-                                } else {
-                                    crate::task_supervisor::ChildSessionJoinState::Orphaned
-                                },
+                                joined.map(|joined| {
+                                    if joined {
+                                        crate::task_supervisor::ChildSessionJoinState::Joined
+                                    } else {
+                                        crate::task_supervisor::ChildSessionJoinState::Orphaned
+                                    }
+                                }),
                             );
                         }
                     }
@@ -5290,8 +5570,21 @@ impl Tool for SpawnTool {
             });
 
             Ok(ToolResult {
-                output: format!("Spawned background task: {label}"),
+                output: match response_task_id.as_deref() {
+                    Some(task_id) => format!(
+                        "Spawned background task: {label}\nTask ID: {task_id}\nUse this task ID with wait_agent and read_task_output; the label is not a task handle."
+                    ),
+                    None => format!("Spawned background task: {label}"),
+                },
                 success: true,
+                structured_metadata: response_task_id.map(|task_id| {
+                    serde_json::json!({
+                        "task_id": task_id,
+                        "agent_id": task_id,
+                        "label": label,
+                        "child_session_key": response_child_session_key,
+                    })
+                }),
                 ..Default::default()
             })
         }
@@ -5301,3 +5594,91 @@ impl Tool for SpawnTool {
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod background_handle_contract {
+    use super::*;
+
+    struct DoneProvider;
+    #[async_trait]
+    impl LlmProvider for DoneProvider {
+        async fn chat(
+            &self,
+            _: &[octos_core::Message],
+            _: &[octos_llm::ToolSpec],
+            _: &octos_llm::ChatConfig,
+        ) -> Result<octos_llm::ChatResponse> {
+            Ok(octos_llm::ChatResponse {
+                content: Some("done".into()),
+                reasoning_content: None,
+                tool_calls: vec![],
+                stop_reason: octos_llm::StopReason::EndTurn,
+                usage: Default::default(),
+                provider_index: None,
+            })
+        }
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn should_return_actual_supervisor_id_in_text_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let tool = SpawnTool::new(Arc::new(DoneProvider), memory, dir.path().to_owned(), tx)
+            .with_task_supervisor(
+                supervisor.clone(),
+                "api:handle-test",
+                dir.path().join("tasks.jsonl"),
+            )
+            .with_sandbox(SandboxConfig {
+                mode: crate::sandbox::SandboxMode::None,
+                ..Default::default()
+            });
+        let result = tool
+            .execute(&serde_json::json!({
+                "task": "Return done", "label": "friendly-label", "mode": "background"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let tasks = supervisor.get_tasks_for_session("api:handle-test");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].workspace_root.as_deref(), dir.path().to_str());
+        assert_eq!(
+            tasks[0].task_ledger_path.as_deref(),
+            dir.path().join("tasks.jsonl").to_str()
+        );
+        let id = &tasks[0].id;
+        assert_ne!(id, "friendly-label");
+        assert!(
+            result
+                .output
+                .starts_with("Spawned background task: friendly-label")
+        );
+        assert!(
+            result.output.contains(id),
+            "the model must receive the usable handle, not just a label"
+        );
+        let metadata = result
+            .structured_metadata
+            .as_ref()
+            .expect("structured task handle");
+        assert_eq!(metadata["task_id"], id.as_str());
+        assert_eq!(metadata["agent_id"], id.as_str());
+        assert_eq!(metadata["label"], "friendly-label");
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while !supervisor.get_task(id).unwrap().status.is_terminal() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker finishes");
+    }
+}

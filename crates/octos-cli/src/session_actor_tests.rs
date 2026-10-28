@@ -89,6 +89,7 @@ fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -6349,6 +6350,7 @@ async fn build_minimal_actor_factory(
         memory_refresh_enabled: true,
         system_prompt: Arc::new(std::sync::RwLock::new(
             crate::commands::gateway::prompt::GatewayPromptParts {
+                uses_bundled_base: false,
                 pre_memory: "default prompt".to_string(),
                 post_memory: String::new(),
             },
@@ -11720,7 +11722,17 @@ async fn should_offer_exactly_the_hosts_durable_list_when_a_gateway_turn_starts(
     let session = test_session_key(dir.path());
 
     let usual = run_one_turn(&tx, &mut out_rx, &provider, "one").await;
-    assert!(usual.contains(&"read_file".to_owned()) && usual.contains(&"shell".to_owned()));
+    assert_eq!(
+        usual,
+        [
+            "discover_tools",
+            "edit_file",
+            "exec_command",
+            "read_file",
+            "run_tool",
+            "write_file"
+        ]
+    );
 
     // The host sets a list: the next turn keeps exactly the listed tools the
     // roster has (never an unknown one).

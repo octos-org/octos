@@ -225,6 +225,9 @@ impl std::fmt::Display for AgentId {
 }
 
 /// A message in the conversation history.
+/// Longest [`Message::participant`] label kept, in bytes.
+pub const MESSAGE_PARTICIPANT_MAX_BYTES: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: MessageRole,
@@ -260,6 +263,14 @@ pub struct Message {
     /// Legacy persisted rows omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Who spoke in a record written outside an agent turn, when the caller
+    /// distinguishes several participants on one side of the conversation
+    /// (e.g. two preset tutors answering the same person). One line, at most
+    /// [`MESSAGE_PARTICIPANT_MAX_BYTES`]. Memory extraction shows it so that
+    /// shared experiences and requests addressed to one participant keep
+    /// their scope. Legacy persisted rows omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -287,6 +298,7 @@ impl Message {
             client_message_id: Some(cmid.0),
             thread_id: None,
             source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -311,6 +323,7 @@ impl Message {
             client_message_id: Some(cmid.0),
             thread_id: Some(thread_id.0),
             source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -334,6 +347,7 @@ impl Message {
             client_message_id: None,
             thread_id: Some(thread_id.0),
             source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -358,6 +372,7 @@ impl Message {
             client_message_id: None,
             thread_id: Some(thread_id.0),
             source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -382,6 +397,7 @@ impl Message {
             client_message_id: None,
             thread_id: None,
             source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -404,6 +420,7 @@ impl Message {
             client_message_id: None,
             thread_id: None,
             source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -425,6 +442,7 @@ impl Message {
             client_message_id: None,
             thread_id: None,
             source: None,
+            participant: None,
             timestamp: Utc::now(),
         }
     }
@@ -743,6 +761,7 @@ mod tests {
             client_message_id: None,
             thread_id: None,
             source: None,
+            participant: None,
             timestamp: Utc::now(),
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -831,6 +850,22 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.source.is_none());
+    }
+
+    #[test]
+    fn should_round_trip_participant_and_omit_it_when_absent() {
+        // UPCR-2026-053: rows without a participant keep their exact bytes.
+        let mut msg = Message::assistant("a mountain road");
+        let bare = serde_json::to_string(&msg).unwrap();
+        assert!(!bare.contains("participant"), "{bare}");
+        msg.participant = Some("豆豆老师".to_owned());
+        let parsed: Message = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        assert_eq!(parsed.participant.as_deref(), Some("豆豆老师"));
+        let legacy: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":"hi","timestamp":"2026-04-24T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(legacy.participant.is_none());
     }
 
     #[test]

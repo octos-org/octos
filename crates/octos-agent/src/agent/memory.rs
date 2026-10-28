@@ -162,6 +162,7 @@ impl Agent {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         })
     }
 
@@ -271,6 +272,7 @@ impl Agent {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }];
 
         // Add working memory from context
@@ -325,6 +327,7 @@ impl Agent {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         });
 
         messages

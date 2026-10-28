@@ -107,6 +107,7 @@ fn assistant_tool_call_message(tool_name: &str, arguments: serde_json::Value) ->
         thread_id: Some("test-thread".to_string()),
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -566,6 +567,7 @@ fn message_info_from_history_message_hides_absolute_paths() {
         thread_id: None,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
 
     let info = message_info_from_history_message(&message, data_dir.path(), 7);
@@ -648,6 +650,7 @@ fn build_session_result_event_normalizes_persisted_media_paths_like_history_repl
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         data_dir.path(),
         1,
@@ -1344,6 +1347,7 @@ async fn spawn_only_file_delivery_is_visible_to_watcher_replay_after_reconnect()
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     )
     .await;
@@ -1529,6 +1533,7 @@ async fn topic_less_fallback_runs_when_candidate_topicless_file_is_empty() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     )
     .await;
@@ -1860,6 +1865,7 @@ async fn replay_committed_session_results_without_since_seq_replays_all_assistan
                     thread_id: Some("test-thread".to_string()),
                     timestamp: chrono::Utc::now(),
                     source: None,
+                    participant: None,
                 },
             )
             .await

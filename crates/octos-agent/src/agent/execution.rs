@@ -615,6 +615,25 @@ impl Agent {
         explicit_send_file_requested: bool,
         turn_attachment_ctx: &crate::tools::TurnAttachmentContext,
     ) -> JoinHandle<ToolCallResult> {
+        // Only invalid/unavailable wrappers reach this point: valid dispatch
+        // was resolved before batch admission. Never let an argument-modifying
+        // hook repair a wrapper after native concurrency/approval checks.
+        if tool_call.name == "run_tool" && self.tools.is_dispatch_gateway("run_tool") {
+            let permissions = self
+                .profile
+                .as_deref()
+                .map(crate::tools::ToolPermissions::from_profile)
+                .unwrap_or_default();
+            let reason = self
+                .tools
+                .resolve_dispatch_call(tool_call, &permissions)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unresolved dispatcher invocation".into());
+            let mut result = cancelled_result(tool_call);
+            result.0.content = format!("Error: {reason}");
+            return tokio::spawn(async move { result });
+        }
         // Clone Arc-wrapped fields so the spawned task is 'static
         let tools = self.tools.clone();
         // Peer-goal soak fix: pre-clone the real LLM provider + this agent's
@@ -646,6 +665,10 @@ impl Agent {
         // shared file-state cache.
         let agent_definitions = self.agent_definitions.clone();
         let file_state_cache = self.file_state_cache.clone();
+        // The caller can be dropped (for example a sync spawn timeout) while
+        // this separately scheduled tool is still writing. Move its lease into
+        // the task before scheduling, so it also covers a not-yet-polled task.
+        let execution_lifetime_guard = self.execution_lifetime_guard.clone();
         // M8 fix-first item 8 (gap 4b): if the agent carries a resolved
         // profile envelope, derive a ToolPermissions record once per turn
         // and clone it into every ToolContext. Today's pre-M8 default
@@ -715,6 +738,7 @@ impl Agent {
         let captured_router_ctx = octos_llm::current_router_context();
 
         tokio::spawn(async move {
+            let _execution_lifetime_guard = execution_lifetime_guard;
             let tool_start = Instant::now();
             debug!(tool = %tc_name, tool_id = %tc_id, "executing tool");
 
@@ -778,6 +802,7 @@ impl Agent {
                                 thread_id: None,
                                 timestamp: chrono::Utc::now(),
                                 source: None,
+                                participant: None,
                             },
                             Vec::new(),
                             Vec::new(),
@@ -847,6 +872,7 @@ impl Agent {
                                 thread_id: None,
                                 timestamp: chrono::Utc::now(),
                                 source: None,
+                                participant: None,
                             },
                             Vec::new(),
                             Vec::new(),
@@ -904,6 +930,7 @@ impl Agent {
                                 thread_id: None,
                                 timestamp: chrono::Utc::now(),
                                 source: None,
+                                participant: None,
                             },
                             Vec::new(),
                             Vec::new(),
@@ -999,6 +1026,7 @@ impl Agent {
                             thread_id: None,
                             timestamp: chrono::Utc::now(),
                             source: None,
+                            participant: None,
                         },
                         Vec::new(),
                         Vec::new(),
@@ -1093,7 +1121,11 @@ impl Agent {
                 // so the in-flight pipeline/LLM/web_search await is DROPPED at
                 // the next poll and the worker terminates promptly.
                 let cancel_token = bg_supervisor.cancel_token(&task_id);
+                // The spawn-only result returns before this second future
+                // finishes; retain ownership in the actual tool worker too.
+                let bg_execution_lifetime_guard = _execution_lifetime_guard.clone();
                 tokio::spawn(async move {
+                    let _execution_lifetime_guard = bg_execution_lifetime_guard;
                     let _terminal_guard = terminal_guard;
                     bg_supervisor.mark_running(&task_id);
                     // M8.7 (item 4): start a periodic-summary watcher for
@@ -1255,6 +1287,9 @@ impl Agent {
                     // Retry once on transient failure (e.g. ominix-api restart)
                     if let Ok(ref r) = result {
                         if !r.success
+                            && bg_tools
+                                .get(&bg_name)
+                                .is_some_and(|tool| tool.retry_background_on_transient_error())
                             && (r.output.contains("error sending request")
                                 || r.output.contains("connection refused"))
                         {
@@ -2085,13 +2120,13 @@ impl Agent {
                 // via `read_task_output`.
                 //
                 // Codex P2 (round 1+2): gate the envelope on the
-                // `read_task_output` tool actually being VISIBLE to the
-                // LLM in this turn — registered AND not filtered out by
+                // `read_task_output` being reachable directly or via the
+                // fixed dispatcher — registered AND not filtered out by
                 // provider policy / deferred set / context tag filter.
                 // Otherwise the envelope advertises a tool the LLM was
                 // not offered. Fall back to the legacy free-text message
                 // for those entry points.
-                let handle_payload = if tools.is_tool_visible("read_task_output") {
+                let handle_payload = if tools.is_tool_model_reachable("read_task_output") {
                     tools.spawn_only_handle_message(&tc_name, &task_id_for_handle, &[])
                 } else {
                     tools.spawn_only_message(&tc_name)
@@ -2108,6 +2143,7 @@ impl Agent {
                         thread_id: None,
                         timestamp: chrono::Utc::now(),
                         source: None,
+                        participant: None,
                     },
                     Vec::new(),
                     Vec::new(),
@@ -2250,7 +2286,7 @@ impl Agent {
                 tool_structured_metadata,
                 tool_cascades,
             ) = match result {
-                Ok(tool_result) => {
+                Ok(mut tool_result) => {
                     debug!(
                         tool = %tc_name,
                         success = tool_result.success,
@@ -2313,11 +2349,25 @@ impl Agent {
                     // Media the tool wants the model to see rides on the
                     // tool message's `media`; each provider renders it in
                     // its own shape for the current batch (octos_llm::tool_media).
-                    let tool_model_media: Vec<String> = tool_result
-                        .model_media
-                        .iter()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .collect();
+                    let mut tool_model_media = Vec::new();
+                    for path in &tool_result.model_media {
+                        let reference = path.to_string_lossy();
+                        if octos_llm::vision::is_image(&reference) {
+                            match octos_llm::vision::snapshot_image(
+                                &reference,
+                                ctx.session_scope.as_ref().map(|s| s.workspace()),
+                            ) {
+                                Ok(snapshot) => {
+                                    tool_model_media.push(snapshot.to_string_lossy().into_owned())
+                                }
+                                Err(error) => tool_result.output.push_str(&format!(
+                                    "\n[Image not shown: {reference}: {error}]"
+                                )),
+                            }
+                        } else {
+                            tool_model_media.push(reference.into_owned());
+                        }
+                    }
 
                     let output_preview =
                         octos_core::truncated_utf8(&tool_result.output, 200, "...");
@@ -2402,6 +2452,27 @@ impl Agent {
                 }
             };
 
+            // Preserve adapter identity before model-facing sanitization,
+            // which deliberately redacts long hex strings such as SHA-256.
+            let tool_structured_metadata = match (
+                crate::automatic_jobs::receipt(
+                    &tc_name,
+                    &content,
+                    tool_structured_metadata.as_ref(),
+                ),
+                tool_structured_metadata,
+            ) {
+                (Some(job), Some(serde_json::Value::Object(mut metadata))) => {
+                    metadata.insert(
+                        "octos_external_job".into(),
+                        job.metadata()["octos_external_job"].clone(),
+                    );
+                    Some(serde_json::Value::Object(metadata))
+                }
+                (Some(job), None) => Some(job.metadata()),
+                (_, metadata) => metadata,
+            };
+
             // After-tool hooks. Hook FEEDBACK (a checker reporting
             // diagnostics — see HookResult::Feedback) reaches the model:
             // appended to the tool message below AFTER truncation so it
@@ -2483,6 +2554,7 @@ impl Agent {
                     thread_id: None,
                     timestamp: chrono::Utc::now(),
                     source: None,
+                    participant: None,
                 },
                 tool_files_modified,
                 tool_files_to_send,
@@ -2554,6 +2626,8 @@ impl Agent {
         // started" bubble alongside it.
         Vec<(String, bool)>,
     )> {
+        let effective = self.effective_tool_response(response);
+        let response = &effective;
         let tool_names: Vec<&str> = response
             .tool_calls
             .iter()
@@ -2723,7 +2797,7 @@ impl Agent {
         let mut success_by_id: Vec<(String, bool)> = Vec::with_capacity(results.len());
 
         for (
-            message,
+            mut message,
             tool_files_modified,
             tool_files_to_send,
             tool_tokens,
@@ -2732,6 +2806,21 @@ impl Agent {
             _cascades,
         ) in results
         {
+            if success
+                && !self.steer_input_pending()
+                && let Some(call) = response
+                    .tool_calls
+                    .iter()
+                    .find(|call| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+            {
+                self.observe_external_job_result(
+                    call,
+                    &mut message,
+                    tool_structured_metadata.as_ref().map(|(_, value)| value),
+                    &turn_attachment_ctx,
+                )
+                .await;
+            }
             // Pair every executed tool result with its `tool_call_id` so
             // downstream gating logic does not need to guess at the
             // identity from content shape.
@@ -2759,6 +2848,102 @@ impl Agent {
             structured_metadata,
             success_by_id,
         ))
+    }
+
+    /// Admit receipt observation without fabricating an assistant tool call.
+    /// Approval-gated watches must be requested explicitly through the normal
+    /// suspend/resume path; tool output cannot grant itself human approval.
+    async fn observe_external_job_result(
+        &self,
+        call: &octos_core::ToolCall,
+        message: &mut Message,
+        metadata: Option<&serde_json::Value>,
+        attachments: &crate::tools::TurnAttachmentContext,
+    ) {
+        const WATCH: &str = "watch_external_job";
+        if call.name == WATCH
+            || !self.tools.is_spawn_only(WATCH)
+            || !self.tools.is_tool_model_reachable(WATCH)
+        {
+            return;
+        }
+        let Some(job) = crate::automatic_jobs::receipt(&call.name, &message.content, metadata)
+        else {
+            return;
+        };
+        let gateway =
+            self.tools.is_dispatch_gateway("run_tool") && self.tools.is_tool_visible("run_tool");
+        let permissions = self
+            .profile
+            .as_deref()
+            .map(crate::tools::ToolPermissions::from_profile)
+            .unwrap_or_default();
+        if !permissions.is_tool_allowed(WATCH)
+            || (gateway && !permissions.is_tool_allowed("run_tool"))
+        {
+            return;
+        }
+        if self
+            .config
+            .human_approval_rules
+            .as_ref()
+            .is_some_and(|rules| {
+                rules.matching_rule(WATCH).is_some()
+                    || (gateway && rules.matching_rule("run_tool").is_some())
+            })
+        {
+            message.content.push_str("\n[Runtime] External job observation requires approval. Request watch_external_job explicitly through the available tool interface; the submitted job must not be resubmitted.");
+            return;
+        }
+        let key = job.key();
+        if !self.tools.claim_automatic_job(&key) {
+            return;
+        }
+        let mut watch = octos_core::ToolCall {
+            id: format!("{}-auto-watch", call.id),
+            name: WATCH.into(),
+            arguments: job.arguments(),
+            metadata: None,
+        };
+        if gateway {
+            watch.arguments = serde_json::json!({"name": WATCH, "arguments": watch.arguments});
+            watch.name = "run_tool".into();
+        }
+        let request = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![watch],
+            stop_reason: octos_llm::StopReason::ToolUse,
+            usage: Default::default(),
+            provider_index: None,
+        };
+        let (admitted, blocked) = self.enforce_session_limits_on_tool_calls(&request);
+        if let Some(watch) = admitted.tool_calls.first() {
+            let native = self.effective_tool_call(watch);
+            match self.spawn_tool_task(&native, true, attachments).await {
+                Ok((handle, _, _, _, true, _, _)) => {
+                    message.content.push_str("\n[Runtime] External job watch registered automatically. Continue independent work; completion arrives as a notification. ");
+                    message.content.push_str(&handle.content);
+                    return;
+                }
+                Ok((refused, _, _, _, _, _, _)) => {
+                    message
+                        .content
+                        .push_str("\n[Runtime] Automatic job observation unavailable: ");
+                    message.content.push_str(&refused.content);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "automatic job watcher registration failed");
+                    message.content.push_str("\n[Runtime] Automatic job observation could not start. Inspect the existing receipt; do not resubmit the external job.");
+                }
+            }
+        } else {
+            for refusal in blocked {
+                message.content.push('\n');
+                message.content.push_str(&refusal.content);
+            }
+        }
+        self.tools.release_automatic_job(&key);
     }
 
     /// Serial dispatch core (M8.8): run `calls` one at a time, in order.
@@ -3089,6 +3274,7 @@ fn cancelled_result(tool_call: &octos_core::ToolCall) -> ToolCallResult {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Vec::new(),
         Vec::new(),
@@ -3122,6 +3308,7 @@ fn timed_out_result(tool_call: &octos_core::ToolCall, elapsed_secs: u64) -> Tool
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Vec::new(),
         Vec::new(),
@@ -3147,6 +3334,7 @@ fn panic_result(tool_call: &octos_core::ToolCall, reason: &str) -> ToolCallResul
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Vec::new(),
         Vec::new(),
@@ -3637,6 +3825,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     use std::sync::Arc;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use octos_core::{AgentId, ToolCall};
@@ -3767,12 +3956,107 @@ mod tests {
         assert_eq!(messages[0].role, octos_core::MessageRole::Tool);
         assert_eq!(messages[0].tool_call_id.as_deref(), Some("call_see"));
         assert_eq!(messages[0].content, "SEEING_TOOL_OUTPUT");
+        assert_eq!(messages[0].media.len(), 1);
+        assert_ne!(messages[0].media[0], image.to_string_lossy());
         assert_eq!(
-            messages[0].media,
-            vec![image.to_string_lossy().into_owned()]
+            std::fs::read(&messages[0].media[0]).unwrap(),
+            std::fs::read(&image).unwrap()
         );
         assert_eq!(messages[1].role, octos_core::MessageRole::Tool);
         assert!(messages[1].media.is_empty());
+    }
+
+    #[tokio::test]
+    async fn should_deliver_all_batch_read_images_as_immutable_main_history_media() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.png", "b.png"] {
+            std::fs::write(dir.path().join(name), b"\x89PNG\r\n\x1a\n").unwrap();
+        }
+        let tools = ToolRegistry::with_builtins(dir.path());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("batch-images"),
+            Arc::new(NoChatProvider),
+            tools,
+            memory,
+        );
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![octos_core::ToolCall {
+                id: "read-both".into(),
+                name: "read_file".into(),
+                metadata: None,
+                arguments: serde_json::json!({"files":[{"path":"a.png"},{"path":"b.png"}]}),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+        let (messages, _, _, _, _, success) = agent.execute_tools(&response).await.unwrap();
+        assert_eq!(success, [("read-both".into(), true)]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tool_call_id.as_deref(), Some("read-both"));
+        assert_eq!(messages[0].media.len(), 2);
+        for name in ["a.png", "b.png"] {
+            std::fs::write(dir.path().join(name), "changed").unwrap();
+        }
+        for path in &messages[0].media {
+            assert_eq!(std::fs::read(path).unwrap(), b"\x89PNG\r\n\x1a\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_dispatcher_native_timeout_cancels_mutation_and_drops_future() {
+        let dir = tempfile::tempdir().unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mutated = Arc::new(AtomicBool::new(false));
+        let mut tools = ToolRegistry::with_builtins(dir.path());
+        tools.register(DropAwareExclusiveTool {
+            dropped: dropped.clone(),
+        });
+        tools.register(MutatingTool {
+            mutated: mutated.clone(),
+        });
+
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("dispatch-timeout"),
+            Arc::new(NoChatProvider),
+            tools,
+            memory,
+        )
+        .with_config(crate::AgentConfig {
+            default_interactive_tool_timeout_secs: 1,
+            tool_timeout_secs: 1,
+            ..Default::default()
+        });
+        let calls = ["drop_aware_exclusive_tool", "mutating_tool"]
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| ToolCall {
+                id: format!("call_{idx}"),
+                name: "run_tool".into(),
+                arguments: serde_json::json!({"name":name,"arguments":{}}),
+                metadata: None,
+            })
+            .collect();
+        let response = ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: calls,
+            stop_reason: StopReason::ToolUse,
+            usage: LlmTokenUsage::default(),
+            provider_index: None,
+        };
+        let (messages, _, _, _, _, success) = agent.execute_tools(&response).await.unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(!mutated.load(Ordering::SeqCst));
+        assert!(messages[0].content.contains("drop_aware_exclusive_tool"));
+        assert_eq!(
+            success,
+            [("call_0".into(), false), ("call_1".into(), false)]
+        );
     }
 
     /// Sleeps far past the batch ceiling so the batch timeout always fires
@@ -3805,6 +4089,186 @@ mod tests {
 
     struct DropAwareExclusiveTool {
         dropped: Arc<AtomicBool>,
+    }
+
+    struct ExecutionLeaseDropSignal(Arc<AtomicBool>);
+
+    impl Drop for ExecutionLeaseDropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct HeldWriterTool {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        finished: Arc<tokio::sync::Notify>,
+        output: std::path::PathBuf,
+        exclusive: bool,
+    }
+
+    #[async_trait]
+    impl Tool for HeldWriterTool {
+        fn name(&self) -> &str {
+            "held_writer"
+        }
+
+        fn description(&self) -> &str {
+            "write only after the test releases the native tool future"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn concurrency_class(&self) -> crate::tools::ConcurrencyClass {
+            if self.exclusive {
+                crate::tools::ConcurrencyClass::Exclusive
+            } else {
+                crate::tools::ConcurrencyClass::Safe
+            }
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            self.started.notify_one();
+            self.release.notified().await;
+            std::fs::write(&self.output, "written after caller exit")?;
+            self.finished.notify_one();
+            Ok(ToolResult {
+                output: "writer finished".into(),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    async fn execution_lease_survives_caller_exit(exclusive: bool, spawn_only: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("owned-output");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(tokio::sync::Notify::new());
+        let lease_released = Arc::new(AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(HeldWriterTool {
+            started: started.clone(),
+            release: release.clone(),
+            finished: finished.clone(),
+            output: output.clone(),
+            exclusive,
+        });
+        if spawn_only {
+            tools.mark_spawn_only("held_writer", None);
+        }
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("lease-writer"),
+            Arc::new(NoChatProvider),
+            tools,
+            memory,
+        )
+        .with_execution_lifetime_guard(Arc::new(ExecutionLeaseDropSignal(lease_released.clone())));
+        let caller = tokio::spawn(async move {
+            let response = ChatResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![tool_call("call_write", "held_writer")],
+                stop_reason: StopReason::ToolUse,
+                usage: LlmTokenUsage::default(),
+                provider_index: None,
+            };
+            agent.execute_tools(&response).await.unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        if spawn_only {
+            tokio::time::timeout(Duration::from_secs(5), caller)
+                .await
+                .unwrap()
+                .unwrap();
+        } else {
+            // This drops the caller and Agent exactly as an outer registry
+            // timeout drops a synchronous spawn. Native tool tasks may survive.
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+        }
+        let released_before_writer_exited = lease_released.load(Ordering::SeqCst);
+        assert!(!output.exists());
+        // Drain the detached task even on RED, so failure does not leave a
+        // background writer behind or confuse cleanup with ownership release.
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), finished.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !lease_released.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(output).unwrap(),
+            "written after caller exit"
+        );
+        assert!(
+            !released_before_writer_exited,
+            "ownership was released while the native writer could still modify its output"
+        );
+    }
+
+    #[tokio::test]
+    async fn should_keep_execution_lease_when_serial_writer_outlives_caller() {
+        execution_lease_survives_caller_exit(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn should_keep_execution_lease_when_parallel_writer_outlives_caller() {
+        execution_lease_survives_caller_exit(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn should_keep_execution_lease_when_spawn_only_writer_outlives_caller() {
+        execution_lease_survives_caller_exit(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn should_release_execution_lease_when_native_tool_abort_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("aborted-output");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let lease_released = Arc::new(AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(HeldWriterTool {
+            started: started.clone(),
+            release: Arc::new(tokio::sync::Notify::new()),
+            finished: Arc::new(tokio::sync::Notify::new()),
+            output: output.clone(),
+            exclusive: true,
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(
+            AgentId::new("abort-writer"),
+            Arc::new(NoChatProvider),
+            tools,
+            memory,
+        )
+        .with_execution_lifetime_guard(Arc::new(ExecutionLeaseDropSignal(lease_released.clone())));
+        let handle = agent.spawn_tool_task(
+            &tool_call("call_abort", "held_writer"),
+            false,
+            &crate::tools::TurnAttachmentContext::default(),
+        );
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        drop(agent);
+        assert!(!lease_released.load(Ordering::SeqCst));
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(lease_released.load(Ordering::SeqCst));
+        assert!(!output.exists(), "cancelled writer must not have written");
     }
 
     #[async_trait]

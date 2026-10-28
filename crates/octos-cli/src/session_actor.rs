@@ -678,7 +678,7 @@ impl SessionActorPromptContextBridge {
 
     fn prompt_policy(request: &PromptContextRequest) -> PromptBuildPolicy {
         PromptBuildPolicy {
-            include_reasoning: false,
+            include_reasoning: PromptBuildPolicy::reasoning_for_model(&request.model_id),
             supports_media: true,
             max_prompt_token_estimate: None,
             model_capability_id: format!("{}/{}", request.provider_name, request.model_id),
@@ -727,7 +727,10 @@ impl PromptContextManager for SessionActorPromptContextBridge {
 
         let threshold = Self::threshold_tokens(&request);
         let mut compaction_performed = false;
-        if scratch.manager.state().token_estimate > threshold {
+        if scratch
+            .manager
+            .should_auto_compact(threshold, policy.include_reasoning)
+        {
             let before = scratch.manager.for_prompt(&policy);
             let summary_budget = threshold.clamp(256, 4096) as u32;
             let summary = before.compact_summary(summary_budget);
@@ -736,6 +739,7 @@ impl PromptContextManager for SessionActorPromptContextBridge {
                 CompactContextPolicy {
                     trigger: format!("agent_loop:{}", request.phase.as_str()),
                     keep_recent_items: Self::keep_items(),
+                    include_reasoning_in_budget: policy.include_reasoning,
                     ..CompactContextPolicy::default()
                 },
             );
@@ -3973,7 +3977,7 @@ impl ActorFactory {
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                (parts.pre_memory, parts.post_memory)
+                (parts.pre_memory_for_registry(&tools), parts.post_memory)
             }
         };
         // Per-chat soul override (set via /soul in this chat) — appended to
@@ -5040,7 +5044,7 @@ impl SessionActor {
 
     fn context_prompt_policy(&self) -> PromptBuildPolicy {
         PromptBuildPolicy {
-            include_reasoning: false,
+            include_reasoning: PromptBuildPolicy::reasoning_for_model(self.agent.model_id()),
             supports_media: true,
             max_prompt_token_estimate: None,
             model_capability_id: format!(
@@ -5060,8 +5064,7 @@ impl SessionActor {
             .context_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let state = manager.state();
-        if state.token_estimate > threshold {
+        if manager.should_auto_compact(threshold, policy.include_reasoning) {
             let before = manager.for_prompt(&policy);
             let summary_budget = threshold.clamp(256, 4096) as u32;
             let summary = before.compact_summary(summary_budget);
@@ -5070,6 +5073,7 @@ impl SessionActor {
                 CompactContextPolicy {
                     trigger: trigger.to_owned(),
                     keep_recent_items,
+                    include_reasoning_in_budget: policy.include_reasoning,
                     ..CompactContextPolicy::default()
                 },
             );

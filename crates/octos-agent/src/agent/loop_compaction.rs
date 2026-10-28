@@ -29,6 +29,7 @@ pub(crate) fn prepare_conversation_messages(
     messages: &mut Vec<Message>,
     turn: &mut LoopTurnState,
 ) {
+    let visible_tool_results = agent.cached_tool_result_visibility(messages);
     if agent.trim_to_context_window(messages) {
         turn.record_repair(LoopRepairReason::ContextTrimmed);
     }
@@ -47,8 +48,8 @@ pub(crate) fn prepare_conversation_messages(
     // With a caller-owned ContextManager the bridge replaces the vector with
     // its canonical frame before the model call, so this truncation cannot
     // affect the final prompt — but it mutates frame-derived rows (the
-    // envelope's model-visible content is bounded at 4096 bytes, above the
-    // 800-char cut here) and breaks the bridge's contiguous coverage match,
+    // envelope retains bounded tool pages, above the 800-char cut here)
+    // and breaks the bridge's contiguous coverage match,
     // which then re-records the whole conversation as duplicates. Tool-output
     // bounding is the ContextManager's job there (ToolOutputPolicy).
     if agent.prompt_context_manager.is_none() && truncate_old_tool_results(messages) {
@@ -57,6 +58,7 @@ pub(crate) fn prepare_conversation_messages(
     if normalize_tool_call_ids(messages) {
         turn.record_repair(LoopRepairReason::ToolCallIdsNormalized);
     }
+    agent.invalidate_removed_tool_results(visible_tool_results, messages);
 }
 
 /// Prepare a task turn for the next model call.
@@ -158,6 +160,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -173,6 +176,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -188,6 +192,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -213,6 +218,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -228,6 +234,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
