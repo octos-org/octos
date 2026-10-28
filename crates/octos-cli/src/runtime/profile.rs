@@ -763,7 +763,7 @@ impl ProfileRuntime {
             tools.apply_policy(policy);
         }
         if let Some(profile) = &self.agent_profile {
-            tools.filter_by_profile(&profile.tools);
+            profile.apply_to_registry(tools);
             if !profile.tools.allows("run_pipeline") {
                 tools.retain(|name| name != "run_pipeline");
             }
@@ -851,6 +851,7 @@ impl ProfileRuntime {
                 crate::commands::load_profile_prompt_template(&profile.name, template)
         {
             prompt_parts.pre_memory = template;
+            prompt_parts.uses_bundled_base = false;
         }
         let system_prompt = prompt_parts.joined();
 
@@ -2646,7 +2647,7 @@ mod tests {
             .expect("bootstrap should succeed");
 
         assert!(
-            rt.tool_specs.specs().iter().any(|s| s.name == "cron"),
+            rt.tool_specs.is_tool_model_reachable("cron"),
             "cron tool must be registered on the base ToolRegistry",
         );
         assert!(
@@ -2755,10 +2756,9 @@ mod tests {
             rt.tool_specs.get("shell").is_some(),
             "sub-account skill loading must not drop the shell tool"
         );
-        // RFC-0 (#1289): `shell` is emitted every turn — no activate_tools
-        // round-trip needed. Verify it stays visible after workspace rebind.
+        // The shell remains callable through the dispatcher after rebind.
         assert!(
-            rt.tool_specs.specs().iter().any(|s| s.name == "shell"),
+            rt.tool_specs.is_tool_model_reachable("shell"),
             "shell must be visible in specs"
         );
 
@@ -2779,8 +2779,8 @@ mod tests {
                 session.session_key
             );
             assert!(
-                session.tools.specs().iter().any(|s| s.name == "shell"),
-                "session {} must expose shell in specs",
+                session.tools.is_tool_model_reachable("shell"),
+                "session {} must retain shell access through the dispatcher",
                 session.session_key
             );
         }
@@ -2837,10 +2837,9 @@ mod tests {
         .await
         .expect("bootstrap should succeed (the rejection only suppresses the plugin)");
 
-        let specs = rt.tool_specs.specs();
-        let registered: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        let registered = rt.tool_specs.tool_names();
         assert!(
-            !registered.iter().any(|n| n == &"ut"),
+            !registered.iter().any(|n| n == "ut"),
             "unsigned skill tool `ut` must NOT load when host strict policy is on; \
              registered: {registered:?}"
         );

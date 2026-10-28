@@ -308,6 +308,13 @@ pub const UI_PROTOCOL_FEATURE_SMART_HOME_V1: &str = "smart_home.v1";
 pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1: &str =
     "session.append_message.full_history_retry.v1";
 
+/// UPCR-2026-053: `session/append_message` persists `participant` and memory
+/// extraction keeps its scope. Older servers silently ignore the field, so
+/// clients must not send it as the only record of who spoke unless this is
+/// acknowledged.
+pub const UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1: &str =
+    "session.append_message.participant.v1";
+
 /// Server-known feature registry. Used by
 /// [`UiProtocolCapabilities::for_negotiated_features`] (UPCR-2026-007) to
 /// intersect a client's `X-Octos-Ui-Features` request with the names the
@@ -344,6 +351,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
     UI_PROTOCOL_FEATURE_SMART_HOME_V1,
     UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+    UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
 ];
 
 /// The features an `octos serve --stdio` connection has without negotiating.
@@ -1753,6 +1761,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
             UI_PROTOCOL_FEATURE_SMART_HOME_V1,
             UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
         ])
     }
 
@@ -1783,7 +1792,8 @@ impl UiProtocolCapabilities {
                 // omit capabilities. Never infer safe replay on an old peer.
                 .filter(|feature| {
                     *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
-                }),
+                })
+                .filter(|feature| *feature != UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1),
         );
         capabilities.unsupported = UI_PROTOCOL_FIRST_SERVER_UNSUPPORTED_METHODS
             .iter()
@@ -3269,6 +3279,13 @@ pub struct SessionAppendMessageParams {
     /// thread) and `system` (rows are not thread-scoped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// UPCR-2026-053 — who spoke, when several participants share one side
+    /// of the conversation (e.g. two preset tutors answering one person).
+    /// `user` and `assistant` rows only; one line, no brackets or control
+    /// characters, at most [`crate::MESSAGE_PARTICIPANT_MAX_BYTES`] bytes.
+    /// Persisted on the row and shown to memory extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<String>,
 }
 
 /// Result for `session/append_message`. `thread_id` echoes the resolved

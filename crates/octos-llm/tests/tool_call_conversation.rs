@@ -303,6 +303,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         // 2. User: multi-part request
         Message {
@@ -318,6 +319,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         // 3. Assistant: parallel tool calls with EMPTY content (the problematic pattern)
         Message {
@@ -351,6 +353,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         // 4. Tool result: weather
         Message {
@@ -377,6 +380,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         // 5. Tool result: search
         Message {
@@ -404,6 +408,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         // 6. User: follow-up that requires synthesizing both results
         Message {
@@ -419,6 +424,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         // 7. Assistant: another tool call with empty content
         Message {
@@ -443,6 +449,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         // 8. Tool result: task created
         Message {
@@ -462,6 +469,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         // 9. User: final follow-up to get a response
         Message {
@@ -477,6 +485,7 @@ fn build_tool_call_conversation() -> Vec<Message> {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
     ]
 }

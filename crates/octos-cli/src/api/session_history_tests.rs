@@ -466,6 +466,7 @@ async fn session_fork_concurrent_same_child_one_wins() {
             thread_id: None,
             timestamp: now,
             source: None,
+            participant: None,
         };
         guard.add_message(&parent_b, msg).await.expect("seed b");
     }

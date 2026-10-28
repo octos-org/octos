@@ -156,6 +156,7 @@ pub async fn extract_findings(
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }];
 
     let config = ChatConfig {
@@ -228,6 +229,7 @@ pub async fn merge_findings(
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }];
 
     let config = ChatConfig {

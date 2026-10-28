@@ -574,48 +574,55 @@ impl Tool for WebSearchTool {
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query"
+        super::batch_read::schema(
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of results (1-10, default: 5)"
+                    },
+                    "lang": {
+                        "description": "BCP-47 language(s), e.g. \"en\" or [\"en\", \"zh-CN\"]: each is searched separately by the free news sources and results are kept to those languages",
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}}
+                        ]
+                    },
+                    "query_by_lang": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "The query in each language's own words, keyed by BCP-47 tag, e.g. {\"zh\": \"人工智能 监管\"}; each language is searched with its own query. Translate the query yourself when searching several languages."
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "ISO 3166-1 alpha-2 region for the Google News edition, e.g. US, TW"
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "Only results published since an ISO date (2026-09-01) or a span: 24h, 7d, 2w, 3m, 1y"
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["auto", "news", "general", "science", "it", "social"],
+                        "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (DuckDuckGo, Bing, Brave and Google results pages, Wikipedia, Wikidata), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
+                    }
                 },
-                "count": {
-                    "type": "integer",
-                    "description": "Number of results (1-10, default: 5)"
-                },
-                "lang": {
-                    "description": "BCP-47 language(s), e.g. \"en\" or [\"en\", \"zh-CN\"]: each is searched separately by the free news sources and results are kept to those languages",
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
-                },
-                "query_by_lang": {
-                    "type": "object",
-                    "additionalProperties": {"type": "string"},
-                    "description": "The query in each language's own words, keyed by BCP-47 tag, e.g. {\"zh\": \"人工智能 监管\"}; each language is searched with its own query. Translate the query yourself when searching several languages."
-                },
-                "region": {
-                    "type": "string",
-                    "description": "ISO 3166-1 alpha-2 region for the Google News edition, e.g. US, TW"
-                },
-                "since": {
-                    "type": "string",
-                    "description": "Only results published since an ISO date (2026-09-01) or a span: 24h, 7d, 2w, 3m, 1y"
-                },
-                "category": {
-                    "type": "string",
-                    "enum": ["auto", "news", "general", "science", "it", "social"],
-                    "description": "Metasearch engines to use: news (GDELT, Hacker News, Mastodon), general (DuckDuckGo, Bing, Brave and Google results pages, Wikipedia, Wikidata), science (arXiv, OpenAlex), it (Hacker News, GitHub, Stack Exchange), social (Mastodon). auto (default) = news when since <= 31 days or the query mentions news/latest/today, else general."
-                }
-            },
-            "required": ["query"]
-        })
+                "required": ["query"]
+            }),
+            "requests",
+        )
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        if args.get("requests").is_some() {
+            return super::batch_read::execute(self, &super::ToolContext::zero(), args, "requests")
+                .await;
+        }
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid web_search input")?;
 

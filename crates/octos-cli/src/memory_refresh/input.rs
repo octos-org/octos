@@ -186,10 +186,18 @@ pub(crate) fn build_input_lines(transcript: &[(usize, Message)]) -> Vec<InputLin
                 if text.trim().is_empty() {
                     continue;
                 }
+                let text = guard_line(redact_secrets(&text));
+                // UPCR-2026-053: a validated participant label (no brackets,
+                // one line) rides in front of the guarded text so items keep
+                // who took part and whom a request was addressed to.
+                let text = match msg.participant.as_deref() {
+                    Some(participant) => format!("(participant: {participant}) {text}"),
+                    None => text,
+                };
                 lines.push(InputLine {
                     idx: *idx,
                     role: msg.role,
-                    text: guard_line(redact_secrets(&text)),
+                    text,
                 });
             }
         }
@@ -304,7 +312,28 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
+    }
+
+    #[test]
+    fn should_show_participant_before_text_when_a_record_names_who_spoke() {
+        let mut tutor = msg(MessageRole::Assistant, "Think of a mountain road.");
+        tutor.participant = Some("豆豆老师".into());
+        let transcript = vec![
+            (
+                0,
+                msg(MessageRole::User, "this metaphor is easy to remember"),
+            ),
+            (1, tutor),
+        ];
+        let lines = build_input_lines(&transcript);
+        assert_eq!(lines[0].text, "this metaphor is easy to remember");
+        assert_eq!(
+            lines[1].text,
+            "(participant: 豆豆老师) Think of a mountain road."
+        );
+        assert_eq!(lines[1].role, MessageRole::Assistant);
     }
 
     #[test]

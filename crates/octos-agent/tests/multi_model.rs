@@ -617,6 +617,7 @@ async fn test_context_window_override_subagent() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         })
         .collect();
 

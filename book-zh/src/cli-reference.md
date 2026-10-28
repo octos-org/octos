@@ -15,6 +15,7 @@ Options:
       --base-url <URL>     自定义 API 端点
   -m, --message <MSG>      单条消息（非交互模式）
       --max-iterations <N> 每条消息的最大工具迭代次数（默认：50）
+      --profile <NAME>     运行时配置（默认：coding；使用标准的固定工具发现/调用接口）
   -v, --verbose            显示工具输出
       --no-retry           禁用重试
 ```
@@ -24,7 +25,8 @@ Options:
 - 方向键和行编辑（rustyline）
 - 持久化历史记录，保存在 `.octos/history/chat_history`
 - 退出方式：`/exit`、`/quit`、`exit`、`quit`、`:q`、Ctrl+C、Ctrl+D
-- 完整工具访问（Shell、文件、搜索、Web）
+- 默认固定接口：四个常用工具加工具发现/调用入口；Web、研究、流水线和
+  内置技能在获得授权时仍然可用（见[配置 → 运行时工具配置](./configuration.md#运行时工具配置)）。
 
 **示例：**
 
@@ -33,6 +35,7 @@ octos chat                              # 交互模式（默认）
 octos chat --provider deepseek          # 使用 DeepSeek
 octos chat --model glm-4-plus           # 自动识别为智谱
 octos chat --message "Fix auth bug"     # 单条消息，执行后退出
+octos chat --profile swarm              # 使用带显式工具策略的协作配置
 ```
 
 ---

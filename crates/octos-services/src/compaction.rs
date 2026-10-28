@@ -144,6 +144,7 @@ pub async fn maybe_compact_with_config(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::User,
@@ -156,6 +157,7 @@ pub async fn maybe_compact_with_config(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
     ];
 
@@ -189,6 +191,7 @@ pub async fn maybe_compact_with_config(
         thread_id: None,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
 
     let mut compacted = Vec::with_capacity(1 + recent.len());
@@ -284,6 +287,7 @@ pub async fn maybe_compact_handle(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::User,
@@ -296,6 +300,7 @@ pub async fn maybe_compact_handle(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
     ];
 
@@ -326,6 +331,7 @@ pub async fn maybe_compact_handle(
         thread_id: None,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
 
     let mut compacted = Vec::with_capacity(1 + recent.len());
@@ -395,6 +401,7 @@ mod tests {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         }
     }
 

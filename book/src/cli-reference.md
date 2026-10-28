@@ -15,8 +15,8 @@ Options:
       --base-url <URL>     Custom API endpoint
   -m, --message <MSG>      Single message (non-interactive)
       --max-iterations <N> Max tool iterations per message (default: 50)
-      --profile <NAME>     Runtime tool profile (default: coding — lean
-                           core-coding tools; coding-full = everything)
+      --profile <NAME>     Runtime profile (default: coding; standard
+                           fixed discovery/run interface)
   -v, --verbose            Show tool outputs
       --no-retry           Disable retry
 ```
@@ -26,8 +26,8 @@ Options:
 - Arrow keys and line editing (rustyline)
 - Persistent history at `.octos/history/chat_history`
 - Exit: `/exit`, `/quit`, `exit`, `quit`, `:q`, Ctrl+C, Ctrl+D
-- Lean default tool surface (files, shell, search, memory, spawn); web,
-  research, pipelines, and bundled skills via `--profile coding-full`
+- Fixed default interface: four common tools plus discovery/run gateways;
+  web, research, pipelines and bundled skills remain available when authorized
   (see [Configuration → Runtime Tool Profiles](./configuration.md#runtime-tool-profiles))
 
 **Examples:**
@@ -37,7 +37,7 @@ octos chat                              # Interactive (default)
 octos chat --provider deepseek          # Use DeepSeek
 octos chat --model glm-4-plus           # Auto-detects Zhipu
 octos chat --message "Fix auth bug"     # Single message, exit
-octos chat --profile coding-full        # Unfiltered tool set (web, skills, pipelines)
+octos chat --profile swarm              # Coordination profile with an explicit tool policy
 ```
 
 ---

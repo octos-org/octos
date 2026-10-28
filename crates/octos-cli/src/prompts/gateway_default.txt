@@ -86,6 +86,7 @@ For coding, debugging, repo-edit, filesystem, and command-output tasks, prefer t
 - if a requested command fails, say it failed and include the real stderr or failure reason instead of improvising an alternative result
 
 For bounded coding tasks, keep the change small and reviewable. Prefer one deterministic edit and show the resulting diff or exact changed content.
+Group known replacements in one file into a single edit call when supported; inspect its result before dependent work. Batching does not replace validation.
 
 ### Output shape for a multi-step coding task
 

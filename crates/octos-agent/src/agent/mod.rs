@@ -10,6 +10,7 @@ pub use budget::result_md_owner_content_is_peer;
 mod compaction;
 mod convergence;
 mod detection;
+mod dispatch;
 mod execution;
 mod llm_call;
 mod loop_compaction;
@@ -63,8 +64,8 @@ pub const DEFAULT_WORKER_PROMPT: &str = include_str!("../prompts/worker.txt");
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// Maximum number of LLM-loop iterations before stopping. `0` means
-    /// unlimited, which is the default for an interactive Codex-style turn.
-    /// Unattended entry points (spawn, MCP, pipelines) set an explicit cap.
+    /// unlimited, which is the default for interactive and spawned agents.
+    /// A host may configure an explicit limit for an execution entry point.
     pub max_iterations: u32,
     /// Maximum total tokens (input + output) before stopping. None = unlimited.
     pub max_tokens: Option<u32>,
@@ -453,6 +454,10 @@ pub struct Agent {
     /// [`crate::tools::ToolContext`] so file tools can short-circuit
     /// re-reads (M8.4). `None` keeps pre-M8.4 behaviour.
     pub(super) file_state_cache: Option<Arc<FileStateCache>>,
+    /// Runtime ownership retained by the agent and each native tool future.
+    /// Dropping a caller may detach a tool task; its ownership must last until
+    /// that task actually stops. This does not track external background jobs.
+    pub(super) execution_lifetime_guard: Option<Arc<dyn Send + Sync>>,
     /// M8.3 profile envelope applied at bootstrap. Recorded so callers can
     /// introspect the active profile name, compaction overrides, and model
     /// preferences. `None` means no profile was explicitly applied — the
@@ -666,6 +671,7 @@ impl Agent {
             persistent_retry_state: None,
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
             file_state_cache: None,
+            execution_lifetime_guard: None,
             profile: None,
             tiered_compaction: None,
             append_only_audit: Default::default(),
@@ -753,6 +759,7 @@ impl Agent {
             persistent_retry_state: None,
             agent_definitions: Arc::new(crate::agents::AgentDefinitions::new()),
             file_state_cache: None,
+            execution_lifetime_guard: None,
             profile: None,
             tiered_compaction: None,
             append_only_audit: Default::default(),
@@ -926,7 +933,7 @@ impl Agent {
     ///
     /// Checks `TASK_REPORTER` task-local first (set per-overflow-task), then
     /// falls back to the instance-level RwLock reporter.
-    pub(super) fn reporter(&self) -> Arc<dyn ProgressReporter> {
+    pub(crate) fn reporter(&self) -> Arc<dyn ProgressReporter> {
         TASK_REPORTER.try_with(|r| r.clone()).unwrap_or_else(|_| {
             self.reporter
                 .read()
@@ -991,6 +998,14 @@ impl Agent {
     /// files and invalidate entries on write. Absent = pre-M8.4 behaviour.
     pub fn with_file_state_cache(mut self, cache: Arc<FileStateCache>) -> Self {
         self.file_state_cache = Some(cache);
+        self
+    }
+
+    /// Retain a runtime lease through every native tool task, including tasks
+    /// that outlive a dropped caller. External background processes are outside
+    /// this lifetime; their host must manage ownership separately.
+    pub(crate) fn with_execution_lifetime_guard(mut self, guard: Arc<dyn Send + Sync>) -> Self {
+        self.execution_lifetime_guard = Some(guard);
         self
     }
 
@@ -1082,9 +1097,9 @@ impl Agent {
         self
     }
 
-    /// Test seam: pin the convergence-checkpoint thresholds instead of reading
-    /// the `OCTOS_CONVERGENCE_*` environment (process-global, so tests must
-    /// not set it). Values are used as given; the env path clamps its own.
+    /// Test seam: explicitly select periodic reflection and pin its thresholds
+    /// instead of reading the `OCTOS_CONVERGENCE_*` environment (process-global,
+    /// so tests must not set it). Values are used as given; the env path clamps its own.
     #[cfg(test)]
     pub(crate) fn with_convergence_intervals(
         mut self,
@@ -1747,70 +1762,26 @@ mod profile_integration_tests {
     }
 
     #[tokio::test]
-    async fn coding_profile_narrows_default_tool_set() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    async fn coding_profile_uses_the_same_fixed_dispatcher_as_default_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
         let base = agent_default(tmp.path()).await;
         let profiled = agent_with_builtin_profile(tmp.path(), "coding").await;
-
-        let base_names = tool_names(&base);
-        let lean_names = tool_names(&profiled);
-        // Lean default: `coding` narrows the surface to the core coding
-        // loop instead of passing the registry through untouched.
-        assert!(
-            lean_names.len() < base_names.len(),
-            "lean coding profile must narrow the default set \
-             ({} -> {})",
-            base_names.len(),
-            lean_names.len(),
-        );
-        assert!(
-            lean_names.iter().all(|n| base_names.contains(n)),
-            "lean set must be a subset of the default set",
-        );
-        for kept in [
-            "read_file",
-            "shell",
-            "bash",
-            "edit_file",
-            "grep",
-            "check",
-            "update_plan",
-        ] {
-            assert!(
-                lean_names.contains(&kept.to_string()),
-                "core-loop tool {kept} missing from lean set: {lean_names:?}",
-            );
-        }
-        for dropped in ["web_search", "browser", "image_generation"] {
-            assert!(
-                !lean_names.contains(&dropped.to_string()),
-                "non-core tool {dropped} must be filtered by the lean coding profile",
-            );
-        }
-
-        // The profiled agent also exposes the recorded profile handle.
-        let prof = profiled.profile().expect("profile handle present");
-        assert_eq!(prof.name, "coding");
-        assert_eq!(prof.version, 1);
-    }
-
-    #[tokio::test]
-    async fn coding_full_profile_matches_default_tool_set() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let base = agent_default(tmp.path()).await;
-        let profiled = agent_with_builtin_profile(tmp.path(), "coding-full").await;
-
-        // The byte-for-byte parity contract moved from `coding` to the
-        // `coding-full` escape hatch when the lean default landed.
+        assert_eq!(tool_names(&base), tool_names(&profiled));
         assert_eq!(
             tool_names(&base),
-            tool_names(&profiled),
-            "coding-full profile must preserve the default tool set byte-for-byte",
+            [
+                "discover_tools",
+                "edit_file",
+                "exec_command",
+                "read_file",
+                "run_tool",
+                "write_file"
+            ]
         );
-
-        let prof = profiled.profile().expect("profile handle present");
-        assert_eq!(prof.name, "coding-full");
-        assert_eq!(prof.version, 1);
+        for name in ["web_search", "apply_patch", "shell", "check", "update_plan"] {
+            assert!(profiled.tool_registry().is_tool_model_reachable(name));
+        }
+        assert_eq!(profiled.profile().unwrap().name, "coding");
     }
 
     #[tokio::test]
