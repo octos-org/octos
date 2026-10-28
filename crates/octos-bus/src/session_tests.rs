@@ -57,6 +57,7 @@ fn make_message(role: MessageRole, content: &str) -> Message {
         thread_id,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -2887,6 +2888,7 @@ async fn test_load_from_disk_merges_flat_and_per_user_histories() {
                 thread_id: None,
                 timestamp: newer,
                 source: None,
+                participant: None,
             })
             .unwrap()
         ),
@@ -2918,6 +2920,7 @@ async fn test_load_from_disk_merges_flat_and_per_user_histories() {
                 thread_id: None,
                 timestamp: older,
                 source: None,
+                participant: None,
             })
             .unwrap()
         ),
@@ -3200,6 +3203,7 @@ fn should_sanitize_loaded_messages_in_place() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     });
     handle.session.messages.push(Message {
         role: MessageRole::Assistant,
@@ -3212,6 +3216,7 @@ fn should_sanitize_loaded_messages_in_place() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     });
 
     let before = handle.session.messages.len();
@@ -3262,6 +3267,7 @@ async fn cold_reload_fails_interrupted_thinking_only_tail() {
             thread_id: Some("01a05fda-turn".into()),
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         };
         writer.add_message(spiral).await.unwrap();
     }
@@ -3406,6 +3412,7 @@ fn session_actor_does_not_continue_with_unsanitized_transcript_on_worktree_missi
         thread_id: None,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     });
 
     let gone = tmp.path().join("ghost-worktree");
@@ -3946,6 +3953,7 @@ async fn add_message_with_seq_accepts_legacy_replay_via_legacy_load() {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         }
     }
     let mut messages = vec![

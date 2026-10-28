@@ -620,6 +620,8 @@ fn session_open_result_includes_capabilities_field() {
         if *feature == UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2
             || *feature == UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1
             || *feature == UI_PROTOCOL_FEATURE_CONTEXT_STATE_V1
+            || *feature == UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1
+            || *feature == UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1
         {
             continue;
         }
@@ -4876,6 +4878,7 @@ fn upcr_042_append_message_round_trips_through_rpc_envelope() {
         source: "external_record:whiteboard".to_owned(),
         client_message_id: Some("cmid-1".to_owned()),
         thread_id: Some("cmid-0".to_owned()),
+        participant: None,
     });
     let rpc = append
         .clone()
@@ -4895,6 +4898,7 @@ fn upcr_042_append_message_round_trips_through_rpc_envelope() {
         source: "external_record:import".to_owned(),
         client_message_id: None,
         thread_id: None,
+        participant: None,
     };
     let json = serde_json::to_value(&bare).expect("params json");
     assert!(json.get("client_message_id").is_none());
@@ -7426,4 +7430,39 @@ fn memory_requests_refuse_caller_identity_and_origin_fields() {
         .unwrap()["status"],
         "accepted"
     );
+}
+
+#[test]
+fn full_history_append_retry_feature_is_explicitly_negotiated() {
+    let feature = UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1;
+    assert!(
+        !UiProtocolCapabilities::first_server_slice()
+            .supported_features
+            .iter()
+            .any(|f| f == feature)
+    );
+    assert!(
+        UiProtocolCapabilities::full_protocol()
+            .supported_features
+            .iter()
+            .any(|f| f == feature)
+    );
+    let advertised = UiProtocolCapabilities::for_negotiated_features(&[feature.to_owned()]);
+    assert!(advertised.supported_features.iter().any(|f| f == feature));
+    let legacy = UiProtocolCapabilities::for_negotiated_features(std::iter::empty::<&str>());
+    assert!(!legacy.supported_features.iter().any(|f| f == feature));
+}
+
+#[test]
+fn should_advertise_append_participant_only_when_negotiated() {
+    let feature = UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1;
+    let has = |caps: UiProtocolCapabilities| caps.supported_features.iter().any(|f| f == feature);
+    assert!(!has(UiProtocolCapabilities::first_server_slice()));
+    assert!(has(UiProtocolCapabilities::full_protocol()));
+    assert!(has(UiProtocolCapabilities::for_negotiated_features(&[
+        feature.to_owned()
+    ])));
+    assert!(!has(UiProtocolCapabilities::for_negotiated_features(
+        std::iter::empty::<&str>()
+    )));
 }

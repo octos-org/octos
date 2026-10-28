@@ -235,3 +235,347 @@ fn should_retry_failed_inloop_append_without_losing_pending_rows() {
     );
     assert!(std::fs::read(root).unwrap() == baseline);
 }
+
+struct BoundedToolProjectionProvider {
+    call: octos_core::ToolCall,
+    requests: Arc<StdMutex<Vec<Vec<Message>>>>,
+}
+
+#[async_trait::async_trait]
+impl octos_llm::LlmProvider for BoundedToolProjectionProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        _tools: &[octos_llm::ToolSpec],
+        _config: &octos_llm::ChatConfig,
+    ) -> eyre::Result<octos_llm::ChatResponse> {
+        let mut requests = self.requests.lock().unwrap();
+        requests.push(messages.to_vec());
+        let first = requests.len() == 1;
+        Ok(octos_llm::ChatResponse {
+            content: (!first).then(|| "done".to_string()),
+            reasoning_content: None,
+            tool_calls: if first {
+                vec![self.call.clone()]
+            } else {
+                vec![]
+            },
+            stop_reason: if first {
+                octos_llm::StopReason::ToolUse
+            } else {
+                octos_llm::StopReason::EndTurn
+            },
+            usage: Default::default(),
+            provider_index: None,
+        })
+    }
+
+    fn model_id(&self) -> &str {
+        "bounded-tool-fixture"
+    }
+    fn provider_name(&self) -> &str {
+        "fixture"
+    }
+    fn context_window(&self) -> u32 {
+        200_000
+    }
+}
+
+/// Exercise the native task loop and real AppUI bridge, observing the prompt
+/// at the provider boundary after real filesystem/command tool execution.
+async fn bounded_tool_projection(
+    dir: &std::path::Path,
+    tool_name: &str,
+    arguments: Value,
+    policy: Option<crate::context_manager::ToolOutputPolicy>,
+) -> (String, String) {
+    bounded_tool_projection_with_hooks(dir, tool_name, arguments, policy, None).await
+}
+
+async fn bounded_tool_projection_with_hooks(
+    dir: &std::path::Path,
+    tool_name: &str,
+    arguments: Value,
+    policy: Option<crate::context_manager::ToolOutputPolicy>,
+    hooks: Option<Arc<octos_agent::hooks::HookExecutor>>,
+) -> (String, String) {
+    let session = SessionKey::new("api", "bounded-tool-projection");
+    let mut manager = ContextManager::new(session.to_string(), None);
+    if let Some(policy) = policy {
+        manager = manager.with_tool_output_policy(policy);
+    }
+    let manager = Arc::new(StdMutex::new(manager));
+    let bridge = AppUiPromptContextBridge::new(session, dir.join("data"), manager.clone(), false);
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(BoundedToolProjectionProvider {
+        call: octos_core::ToolCall {
+            id: "call_bounded_tool".into(),
+            name: tool_name.into(),
+            arguments,
+            metadata: None,
+        },
+        requests: requests.clone(),
+    });
+    let mut tools = octos_agent::ToolRegistry::with_builtins(dir);
+    // The actual child roster has no recall tool: recovery must remain usable
+    // through its normal filesystem/command tools.
+    tools.retain(|name| matches!(name, "read_file" | "write_file" | "bash" | "shell"));
+    assert!(!tools.specs().iter().any(|tool| tool.name == "recall"));
+    let memory = Arc::new(
+        octos_memory::EpisodeStore::open(dir.join("memory"))
+            .await
+            .unwrap(),
+    );
+    let mut agent = octos_agent::Agent::new(
+        octos_core::AgentId::new("projection-worker"),
+        provider,
+        tools,
+        memory,
+    )
+    .with_system_prompt("Inspect the requested file.".into())
+    .with_config(octos_agent::AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    })
+    .with_prompt_context_manager(Arc::new(bridge));
+    if let Some(hooks) = hooks {
+        agent = agent.with_hooks(hooks);
+    }
+    let task = octos_core::Task::new(
+        octos_core::TaskKind::Code {
+            instruction: "Inspect the file".into(),
+            files: vec![],
+        },
+        octos_core::TaskContext {
+            working_dir: dir.into(),
+            ..Default::default()
+        },
+    );
+    assert!(agent.run_task(&task).await.unwrap().success);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let delivered = requests[1]
+        .iter()
+        .find(|row| row.role == MessageRole::Tool)
+        .unwrap()
+        .content
+        .clone();
+    let raw = manager
+        .lock()
+        .unwrap()
+        .tool_output_by_call_id("call_bounded_tool")
+        .unwrap();
+    (delivered, raw)
+}
+
+#[tokio::test]
+async fn bounded_tool_projection_retains_native_read_file_requested_range() {
+    for text in ["context-boundary ", "中文技能说明，保留完整指令。"] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = (1..=350)
+            .map(|line| format!("record_{line:03} {}\n", text.repeat(5)))
+            .collect::<String>();
+        std::fs::write(dir.path().join("reference.txt"), source).unwrap();
+        let (delivered, raw) = bounded_tool_projection(
+            dir.path(),
+            "read_file",
+            json!({"filePath": "reference.txt", "start_line": 70, "limit": 200}),
+            None,
+        )
+        .await;
+        assert!(raw.len() > 4096 && raw.len() <= octos_core::tool_output_limit("read_file"));
+        assert!(raw.contains("record_269") && !raw.contains("record_270"));
+        if !text.is_ascii() {
+            assert!(raw.len() > raw.chars().count());
+        }
+        assert_eq!(
+            delivered, raw,
+            "the model must receive the entire byte-bounded requested range, including CJK"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bounded_tool_projection_preserves_native_read_file_continuation_footer() {
+    for (line_count, text) in [
+        (10_000, "bounded file content".to_owned()),
+        (10, "宽".repeat(2_000)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = (1..=line_count)
+            .map(|line| format!("record_{line:05}: {text}\n"))
+            .collect::<String>();
+        std::fs::write(dir.path().join("large.txt"), source).unwrap();
+        let (delivered, raw) = bounded_tool_projection(
+            dir.path(),
+            "read_file",
+            json!({"path": "large.txt", "start_line": 1, "limit": 10_000}),
+            None,
+        )
+        .await;
+        assert!(
+            raw.contains("Continue with offset:"),
+            "the tool must have emitted real paging advice"
+        );
+        assert!(raw.len() <= octos_core::tool_output_limit("read_file"));
+        assert_eq!(
+            delivered, raw,
+            "projection must retain exact coverage and continuation for many lines and CJK wide lines"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bounded_tool_projection_preserves_bash_file_body_and_full_log_pointer() {
+    for line_count in [180, 1_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = (1..=line_count)
+            .map(|line| format!("record_{line:04} {}\n", "ordinary tool output ".repeat(5)))
+            .collect::<String>();
+        std::fs::write(dir.path().join("command-output.txt"), &source).unwrap();
+        let (delivered, raw) = bounded_tool_projection(
+            dir.path(),
+            "bash",
+            json!({"cmd": "cat command-output.txt"}),
+            None,
+        )
+        .await;
+        assert!(raw.len() > 4096 && raw.len() <= octos_core::tool_output_limit("bash"));
+        if line_count == 180 {
+            assert!(raw.contains("record_0180"));
+        } else {
+            assert!(
+                raw.contains("Full output:"),
+                "the bounded command output must retain its full-log pointer"
+            );
+            assert!(raw.contains("truncated"));
+        }
+        assert_eq!(
+            delivered, raw,
+            "the provider must receive the bounded Bash body, exit status, and log reference"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bounded_tool_projection_tighter_policy_keeps_usable_native_read_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = (1..=100)
+        .map(|line| format!("record_{line:03} {}\n", "ordinary text ".repeat(5)))
+        .collect::<String>();
+    std::fs::write(dir.path().join("reference.txt"), source).unwrap();
+    let policy = crate::context_manager::ToolOutputPolicy {
+        policy_id: "explicit-small-policy".into(),
+        inline_raw_threshold_bytes: 512,
+        model_visible_max_bytes: Some(1024),
+    };
+    let (delivered, raw) = bounded_tool_projection(
+        dir.path(),
+        "read_file",
+        json!({
+            "path": "reference.txt", "start_line": 20, "limit": 60
+        }),
+        Some(policy.clone()),
+    )
+    .await;
+    assert!(raw.len() > 1024);
+    assert!(delivered.starts_with(&raw[..1024]));
+    assert!(delivered.ends_with("[truncated]"));
+    assert!(
+        delivered.contains("start_line") && delivered.contains("limit"),
+        "recovery must name callable native read parameters: {delivered}"
+    );
+    assert!(
+        delivered.contains("If available"),
+        "recall is optional, not an advertised child capability"
+    );
+    assert!(
+        !delivered.contains("record_079"),
+        "the explicit smaller body budget must still apply"
+    );
+    let next_line: usize = delivered
+        .split("start_line: ")
+        .nth(1)
+        .unwrap()
+        .split(',')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(next_line > 20 && next_line < 79);
+    let (continued, continued_raw) = bounded_tool_projection(
+        dir.path(),
+        "read_file",
+        json!({
+            "path": "reference.txt", "start_line": next_line, "limit": 1
+        }),
+        Some(policy),
+    )
+    .await;
+    assert_eq!(
+        continued, continued_raw,
+        "the emitted recovery call must itself reach the provider intact"
+    );
+    assert!(continued.contains(&format!("record_{next_line:03}")));
+}
+
+#[tokio::test]
+async fn bounded_tool_projection_preserves_post_budget_hook_diagnostics() {
+    use octos_agent::hooks::{HookConfig, HookEvent, HookExecutor};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("output.txt"),
+        "ordinary command output\n".repeat(5_000),
+    )
+    .unwrap();
+    let diagnostics = dir.path().join("diagnostic.txt");
+    std::fs::write(
+        &diagnostics,
+        format!(
+            "{}\nFINAL_CHECKER_DIAGNOSTIC",
+            "checker detail ".repeat(125)
+        ),
+    )
+    .unwrap();
+    let hook = HookConfig {
+        event: HookEvent::AfterToolCall,
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "cat \"$1\"; exit 1".into(),
+            "hook".into(),
+            diagnostics.to_string_lossy().into_owned(),
+        ],
+        timeout_ms: 5_000,
+        tool_filter: vec!["bash".into()],
+        path_filter: vec![],
+        requires_bin: None,
+    };
+    let (delivered, raw) = bounded_tool_projection_with_hooks(
+        dir.path(),
+        "bash",
+        json!({"cmd": "cat output.txt"}),
+        None,
+        Some(Arc::new(HookExecutor::new(vec![hook.clone(), hook]))),
+    )
+    .await;
+    assert!(raw.len() > octos_core::tool_output_limit("bash"));
+    assert!(raw.contains("Full output:") && raw.contains("FINAL_CHECKER_DIAGNOSTIC"));
+    assert!(
+        delivered.contains("Full output:"),
+        "the native full-log reference must remain visible"
+    );
+    assert!(
+        delivered.contains("FINAL_CHECKER_DIAGNOSTIC"),
+        "post-budget diagnostics must survive projection"
+    );
+    assert_eq!(
+        delivered.matches("FINAL_CHECKER_DIAGNOSTIC").count(),
+        raw.matches("FINAL_CHECKER_DIAGNOSTIC").count(),
+        "every appended checker diagnostic must reach the model"
+    );
+    assert!(
+        delivered.contains("bytes omitted"),
+        "any projection loss must be explicitly reported"
+    );
+}

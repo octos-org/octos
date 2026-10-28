@@ -153,7 +153,7 @@ test.describe('Refactor capability proofs', () => {
         task &&
         task.child_session_key &&
         task.child_terminal_state &&
-        task.child_join_state
+        ['completed', 'failed', 'cancelled'].includes(task.status)
       ) {
         break;
       }
@@ -166,7 +166,17 @@ test.describe('Refactor capability proofs', () => {
     expect(['completed', 'retryable_failure', 'terminal_failure']).toContain(
       task.child_terminal_state,
     );
-    expect(['joined', 'orphaned']).toContain(task.child_join_state);
+    expect([undefined, null, 'joined']).toContain(task.child_join_state);
+    // A missing optional contract callback is not a delivery receipt. Check
+    // for a real assistant result recorded after the task became terminal.
+    const completedAt = Date.parse(task.completed_at);
+    expect(Number.isFinite(completedAt)).toBe(true);
+    await expect.poll(async () => {
+      const messages = await getMessages(sid);
+      return messages.some((message: any) =>
+        message.role === 'assistant' && Date.parse(message.timestamp) >= completedAt,
+      );
+    }, { timeout: 30_000 }).toBe(true);
   });
 
   test('podcast workflow task exposes typed runtime workflow metadata', async () => {

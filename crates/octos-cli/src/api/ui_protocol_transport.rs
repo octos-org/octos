@@ -2361,6 +2361,10 @@ struct ConnectionUiFeatures {
     /// task-return-unconsumed-steer-inputs: client asked for the
     /// dropped-before-terminal steer settlement guarantee.
     turn_steer_dropped_v1: bool,
+    /// Explicit acknowledgement of complete-live-history append retries.
+    session_append_full_history_retry_v1: bool,
+    /// UPCR-2026-053: client asked whether `participant` is persisted.
+    session_append_participant_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -2475,6 +2479,16 @@ impl ConnectionUiFeatures {
                 query,
                 UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
             ),
+            session_append_full_history_retry_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            ),
+            session_append_participant_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -2517,6 +2531,8 @@ impl ConnectionUiFeatures {
             skill_actions_v1: true,
             skill_action_jobs_v1: true,
             turn_steer_dropped_v1: true,
+            session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
             header_present: true,
             stdio_transport: true,
         }
@@ -2564,6 +2580,12 @@ impl ConnectionUiFeatures {
             skill_actions_v1: has(APPUI_FEATURE_SKILL_ACTIONS_V1),
             skill_action_jobs_v1: has(APPUI_FEATURE_SKILL_ACTION_JOBS_V1),
             turn_steer_dropped_v1: has(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1),
+            session_append_full_history_retry_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            ),
+            session_append_participant_v1: has(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1,
+            ),
             header_present: true,
             stdio_transport,
         }
@@ -2679,6 +2701,15 @@ impl ConnectionUiFeatures {
         }
         if self.turn_steer_dropped_v1 {
             requested.push(UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1);
+        }
+        if self.session_append_full_history_retry_v1 {
+            requested.push(
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_FULL_HISTORY_RETRY_V1,
+            );
+        }
+        if self.session_append_participant_v1 {
+            requested
+                .push(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_SESSION_APPEND_PARTICIPANT_V1);
         }
         UiProtocolCapabilities::for_negotiated_features(requested)
     }
@@ -4059,7 +4090,7 @@ pub(crate) fn prompt_cache_lane_identity(
 
 fn appui_context_prompt_policy(llm_provider: &dyn octos_llm::LlmProvider) -> PromptBuildPolicy {
     PromptBuildPolicy {
-        include_reasoning: false,
+        include_reasoning: PromptBuildPolicy::reasoning_for_model(llm_provider.model_id()),
         supports_media: true,
         max_prompt_token_estimate: None,
         model_capability_id: format!(
@@ -4085,12 +4116,13 @@ fn appui_compact_context_if_over_threshold(
 ) -> Vec<UiNotification> {
     let threshold = appui_context_compact_threshold_tokens(llm_provider.as_ref());
     let policy = appui_context_prompt_policy(llm_provider.as_ref());
-    if !manager.should_auto_compact(threshold) {
+    if !manager.should_auto_compact(threshold, policy.include_reasoning) {
         return Vec::new();
     }
     let budgets = appui_compaction_budgets(threshold);
     let summary_budget = budgets.summary_budget;
-    let compact_policy = appui_semantic_compact_policy(trigger, budgets);
+    let mut compact_policy = appui_semantic_compact_policy(trigger, budgets);
+    compact_policy.include_reasoning_in_budget = policy.include_reasoning;
     if !manager.should_retry_compaction(&compact_policy) {
         return Vec::new();
     }
@@ -4296,13 +4328,33 @@ fn appui_context_history_for_agent(
 /// re-project the prompt. These events intentionally bypass the canonical
 /// chat transcript (they are wake/snapshot metadata, not user-authored chat
 /// rows) but remain durable in the ContextManager v2 snapshot.
+struct TailContextEvent {
+    kind: ContextEventKind,
+    label: &'static str,
+    content: String,
+    /// None for one-shot notices; Some for snapshots whose empty initial
+    /// state adds no information. A later clearing snapshot is still recorded.
+    snapshot_is_empty: Option<bool>,
+}
+
+impl From<(ContextEventKind, &'static str, String)> for TailContextEvent {
+    fn from((kind, label, content): (ContextEventKind, &'static str, String)) -> Self {
+        Self {
+            kind,
+            label,
+            content,
+            snapshot_is_empty: None,
+        }
+    }
+}
+
 fn appui_append_tail_context_events(
     data_dir: &Path,
     session_id: &SessionKey,
     llm_provider: &Arc<dyn octos_llm::LlmProvider>,
     context_manager: &Arc<StdMutex<ContextManager>>,
     history: &mut Vec<Message>,
-    events: Vec<(ContextEventKind, &'static str, String)>,
+    events: Vec<TailContextEvent>,
 ) {
     if events.is_empty() {
         return;
@@ -4311,12 +4363,14 @@ fn appui_append_tail_context_events(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let mut appended = 0usize;
-    for (event_kind, label, content) in events {
-        appended += usize::from(
-            manager
-                .record_context_event(event_kind, label, content)
-                .is_some(),
-        );
+    for event in events {
+        let recorded = match event.snapshot_is_empty {
+            Some(empty) => {
+                manager.record_context_snapshot(event.kind, event.label, event.content, empty)
+            }
+            None => manager.record_context_event(event.kind, event.label, event.content),
+        };
+        appended += usize::from(recorded.is_some());
     }
     if appended == 0 {
         return;
@@ -4851,7 +4905,7 @@ impl AppUiPromptContextBridge {
 
     fn prompt_policy(request: &PromptContextRequest) -> PromptBuildPolicy {
         PromptBuildPolicy {
-            include_reasoning: false,
+            include_reasoning: PromptBuildPolicy::reasoning_for_model(&request.model_id),
             supports_media: true,
             max_prompt_token_estimate: None,
             model_capability_id: format!("{}/{}", request.provider_name, request.model_id),
@@ -4977,10 +5031,14 @@ impl PromptContextManager for AppUiPromptContextBridge {
         // block on a bounded SyncSender under backpressure, and a blocking
         // send while holding the scratch mutex would stall the bridge.
         let mut lifecycle_events: Vec<UiNotification> = Vec::new();
-        let compaction_pass = if scratch.manager.should_auto_compact(threshold) {
+        let compaction_pass = if scratch
+            .manager
+            .should_auto_compact(threshold, policy.include_reasoning)
+        {
             let budgets = appui_compaction_budgets(threshold);
             let trigger = format!("agent_loop:{}", request.phase.as_str());
-            let compact_policy = appui_semantic_compact_policy(trigger.clone(), budgets);
+            let mut compact_policy = appui_semantic_compact_policy(trigger.clone(), budgets);
+            compact_policy.include_reasoning_in_budget = policy.include_reasoning;
             scratch
                 .manager
                 .should_retry_compaction(&compact_policy)
@@ -12083,9 +12141,15 @@ fn coding_tool_policy_view(
     }
 }
 
-fn model_visible_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
+fn model_callable_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
     let mut names: Vec<String> = registry
-        .map(|registry| registry.specs().into_iter().map(|spec| spec.name).collect())
+        .map(|registry| {
+            registry
+                .tool_names()
+                .into_iter()
+                .filter(|name| registry.is_tool_model_reachable(name))
+                .collect()
+        })
         .unwrap_or_else(|| {
             super::coding_tool_contract::OCTOS_KNOWN_MODEL_VISIBLE_TOOLS
                 .iter()
@@ -12097,21 +12161,31 @@ fn model_visible_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec
     names
 }
 
+#[cfg(test)]
+mod dispatcher_capability_status_tests {
+    use super::*;
+
+    #[test]
+    fn dispatcher_capabilities_are_available_without_direct_model_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = octos_agent::ToolRegistry::with_builtins(dir.path());
+        assert!(!registry.is_tool_visible("web_search"));
+        assert!(model_callable_tool_names(Some(&registry)).contains(&"web_search".to_string()));
+        registry.set_provider_policy(octos_agent::tools::policy::ToolPolicy {
+            deny: vec!["web_search".into()],
+            ..Default::default()
+        });
+        assert!(!model_callable_tool_names(Some(&registry)).contains(&"web_search".to_string()));
+    }
+}
+
 fn registered_tool_names(registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
     let mut names = registry
         .map(|registry| registry.tool_names())
-        .unwrap_or_else(|| model_visible_tool_names(None));
+        .unwrap_or_else(|| model_callable_tool_names(None));
     names.sort();
     names.dedup();
     names
-}
-
-/// RFC-0 (#1289): LRU tool deferral was removed, so no tool is ever deferred.
-/// Retained (returning an empty set) so the coding tool contract's
-/// disabled-vs-deferred bookkeeping keeps compiling; every registered-but-
-/// -not-visible tool is now genuinely disabled (internal-hidden / policy).
-fn deferred_model_tool_names(_registry: Option<&octos_agent::ToolRegistry>) -> Vec<String> {
-    Vec::new()
 }
 
 async fn tool_status_list_result(
@@ -12156,45 +12230,20 @@ async fn tool_status_list_result(
                 .as_ref()
                 .map(|runtime| runtime.tool_specs.as_ref())
         });
-    let tool_names = model_visible_tool_names(registry);
+    let tool_names = model_callable_tool_names(registry);
     let registered_names = registered_tool_names(registry);
-    let deferred_names = deferred_model_tool_names(registry);
-    // Codex BLOCK (#1419 review): `deferred_model_tool_names` returns the RAW
-    // deferred set — `ToolRegistry::deferred_tool_names()` applies no
-    // provider-policy/context filter. A tool that is both deferred AND
-    // policy-denied can never be recovered by `activate_tools`
-    // (`is_tool_visible_post_activation` stays false), so it must NOT count as
-    // a recoverable "deferred" tool: keep it in the disabled set
-    // (`disabled_by_policy`) and drop it from the deferred listing the LLM
-    // sees. Mirrors the PR #865 standard ("the LLM never sees a name it can't
-    // actually call"). Only deferred names that WOULD become visible after
-    // activation are the genuine recoverable-deferred set.
-    let recoverable_deferred: Vec<String> = deferred_names
-        .iter()
-        .filter(|name| registry.is_some_and(|r| r.is_tool_visible_post_activation(name)))
-        .cloned()
-        .collect();
-    let visible_names: HashSet<&str> = tool_names.iter().map(String::as_str).collect();
-    let deferred_set: HashSet<&str> = recoverable_deferred.iter().map(String::as_str).collect();
-    // A registered-but-not-visible tool is either disabled by the effective
-    // tool policy OR merely LRU-deferred (registered, filtered out of
-    // `specs()`, recoverable via `activate_tools`). The coding tool contract
-    // checks the disabled set before the deferred set, so the recoverable
-    // deferred names MUST be excluded here — otherwise the canonical P0
-    // runtime/subagent tools regress to `disabled_by_policy` and the contract
-    // drops to `status: incomplete` on a healthy solo session. A deferred tool
-    // that policy still denies is intentionally NOT excluded (it stays
-    // disabled_by_policy). #970 / M14-E.
+    // Available includes native capabilities reached through run_tool. There
+    // is no activation step and no growing tool-schema list.
+    let callable_names: HashSet<&str> = tool_names.iter().map(String::as_str).collect();
+    // Registered but unreachable implementations remain disabled by policy
+    // or backend availability. Dispatch-only tools remain available.
     let disabled_tool_names = registered_names
         .iter()
-        .filter(|name| {
-            !visible_names.contains(name.as_str()) && !deferred_set.contains(name.as_str())
-        })
+        .filter(|name| !callable_names.contains(name.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
     let disabled_tool_refs: Vec<&str> = disabled_tool_names.iter().map(String::as_str).collect();
-    let deferred_name_refs: Vec<&str> = recoverable_deferred.iter().map(String::as_str).collect();
     let permission_state = effective_session_permission_state(state, session_id);
     let session_id_wire = session_id.to_string();
     let profile_id = active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_owned();
@@ -12209,7 +12258,7 @@ async fn tool_status_list_result(
             ),
             available_model_tools: &tool_name_refs,
             disabled_model_tools: &disabled_tool_refs,
-            deferred_model_tools: &deferred_name_refs,
+            deferred_model_tools: &[],
             include_coding_tool_contract: true,
         },
     ))
@@ -14942,6 +14991,7 @@ async fn raw_profile_llm_test(
         thread_id: None,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     }];
     let canonical_family = octos_llm::registry::lookup(&family_id)
         .map(|entry| entry.name)
@@ -31379,6 +31429,35 @@ async fn handle_session_append_message(
         return;
     }
 
+    // UPCR-2026-053: the label is shown verbatim inside memory-extraction
+    // input, so refuse anything that could break that line's framing rather
+    // than silently rewriting it.
+    let participant = match params.participant.as_deref().map(str::trim) {
+        None => None,
+        Some(label)
+            if role != MessageRole::System
+                && !label.is_empty()
+                && label.len() <= octos_core::MESSAGE_PARTICIPANT_MAX_BYTES
+                && !label
+                    .chars()
+                    .any(|c| c.is_control() || matches!(c, '[' | ']' | '(' | ')')) =>
+        {
+            Some(label.to_owned())
+        }
+        Some(_) => {
+            let _ = send_rpc_error(
+                ws,
+                Some(id),
+                RpcError::invalid_params(format!(
+                    "{method}: participant must be a non-empty single-line label of at most {} bytes without brackets, on a user or assistant row",
+                    octos_core::MESSAGE_PARTICIPANT_MAX_BYTES
+                ))
+                .with_data(json!({ "kind": "invalid_participant" })),
+            );
+            return;
+        }
+    };
+
     let message = Message {
         role,
         content: params.content,
@@ -31389,6 +31468,7 @@ async fn handle_session_append_message(
         client_message_id: client_message_id.clone(),
         thread_id: None,
         source: Some(source.to_owned()),
+        participant,
         timestamp: Utc::now(),
     };
     // Thread binding is resolved BEFORE the write so the echoed value always
@@ -31481,38 +31561,16 @@ async fn handle_session_append_message(
 
         let data_dir = sessions_guard.data_dir().to_path_buf();
         match sessions_guard
-            .add_message_once_with_seq(&params.session_id, message.clone())
+            .add_message_once_with_receipt(&params.session_id, message.clone())
             .await
         {
-            Ok((seq, true)) => AppendOutcome::Committed {
+            Ok((seq, true, thread_id)) => AppendOutcome::Committed {
                 seq,
-                thread_id: stamped_thread,
+                thread_id,
                 message: Box::new(message),
                 data_dir,
             },
-            Ok((seq, false)) => {
-                // Idempotent retry hit — echo the EXISTING row's binding, not
-                // a freshly minted one. A found row with no binding (a system
-                // row is legitimately unbound) stays unbound: substituting
-                // this request's stamp would report a thread the durable row
-                // never had, so the fallback only covers a row that cannot be
-                // located at all.
-                let thread_id = match client_message_id.as_deref() {
-                    Some(cmid) => sessions_guard
-                        .load(&params.session_id)
-                        .await
-                        .and_then(|session| {
-                            session
-                                .messages
-                                .iter()
-                                .find(|row| row.client_message_id.as_deref() == Some(cmid))
-                                .map(|row| row.thread_id.clone())
-                        })
-                        .unwrap_or(stamped_thread),
-                    None => stamped_thread,
-                };
-                AppendOutcome::RetryHit { seq, thread_id }
-            }
+            Ok((seq, false, thread_id)) => AppendOutcome::RetryHit { seq, thread_id },
             Err(error) => {
                 let _ = send_rpc_error(
                     ws,
@@ -32010,6 +32068,7 @@ fn build_btw_messages(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::User,
@@ -32022,6 +32081,7 @@ fn build_btw_messages(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
     ]
 }
@@ -36618,7 +36678,7 @@ async fn run_m14_codex_p0_tool_parity_fixture_turn(
         session_id,
         turn_id,
     };
-    let tool_names = model_visible_tool_names(Some(&registry));
+    let tool_names = model_callable_tool_names(Some(&registry));
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
 
     write_appui_evidence_json(
@@ -37956,6 +38016,7 @@ async fn model_join_review_summary(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::User,
@@ -37968,6 +38029,7 @@ async fn model_join_review_summary(
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         },
     ];
     let config = review_join_chat_config();
@@ -41479,45 +41541,54 @@ async fn run_standalone_turn(
         }
     }
 
-    let mut tail_context_events = peer_turn_start_notes(
+    let mut tail_context_events: Vec<TailContextEvent> = peer_turn_start_notes(
         &session_runtime.profile.data_dir.join("peers"),
         &session_id,
         ws.is_external(),
-    );
+    )
+    .into_iter()
+    .map(Into::into)
+    .collect();
     if !ws.is_external() {
         if let Ok(team) = state.ui_protocol.workspace_teams.get(
             &session_runtime.profile.data_dir,
             &session_runtime.workspace_root,
             &session_id,
         ) {
-            tail_context_events.push((
-                ContextEventKind::PeerResultsReady,
-                "workspace-peer-team",
-                team.index(&session_id),
-            ));
+            tail_context_events.push(TailContextEvent {
+                kind: ContextEventKind::PeerResultsReady,
+                label: "workspace-peer-team",
+                content: team.index(&session_id),
+                snapshot_is_empty: Some(
+                    team.members
+                        .iter()
+                        .all(|member| member.session_id == session_id),
+                ),
+            });
         }
     }
     if let Some(notes) = read_and_clear_goal_progress_notes(
         &session_runtime.profile.data_dir,
         &session_id.to_string(),
     ) {
-        tail_context_events.push((ContextEventKind::GoalProgress, "goal-progress", notes));
+        tail_context_events.push((ContextEventKind::GoalProgress, "goal-progress", notes).into());
     }
     if let Some(notes) = crate::autonomy::monitor_runtime::read_and_clear_monitor_notes(
         &session_runtime.profile.data_dir,
         &session_id.to_string(),
     ) {
-        tail_context_events.push((ContextEventKind::MonitorEvent, "monitor-events", notes));
+        tail_context_events.push((ContextEventKind::MonitorEvent, "monitor-events", notes).into());
     }
-    tail_context_events.push((
-        ContextEventKind::MemoryUpdate,
-        "memory-snapshot",
-        if volatile_memory_context.is_empty() {
+    tail_context_events.push(TailContextEvent {
+        kind: ContextEventKind::MemoryUpdate,
+        label: "memory-snapshot",
+        snapshot_is_empty: Some(volatile_memory_context.is_empty()),
+        content: if volatile_memory_context.is_empty() {
             "No injected memory is currently available.".to_owned()
         } else {
             volatile_memory_context
         },
-    ));
+    });
     let active_goal_snapshot = default_agent_orchestrator()
         .model_goal_snapshot(&session_id, &session_runtime.profile.profile_id);
     let goal_snapshot_context = if active_goal_snapshot["status"] == "active" {
@@ -41541,11 +41612,12 @@ async fn run_standalone_turn(
     } else {
         serde_json::json!({ "status": "none" })
     };
-    tail_context_events.push((
-        ContextEventKind::GoalSnapshot,
-        "session-goal-snapshot",
-        goal_snapshot_context.to_string(),
-    ));
+    tail_context_events.push(TailContextEvent {
+        kind: ContextEventKind::GoalSnapshot,
+        label: "session-goal-snapshot",
+        content: goal_snapshot_context.to_string(),
+        snapshot_is_empty: Some(active_goal_snapshot["status"] != "active"),
+    });
     appui_append_tail_context_events(
         &session_runtime.sessions_root,
         &session_id,

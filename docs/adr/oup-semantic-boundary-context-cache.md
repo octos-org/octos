@@ -438,9 +438,10 @@ Agent loop (`crates/octos-agent`):
   skipped on a grace iteration.
 - A delegated child (`delegate` tool) inherited `AgentConfig::default()`
   when no worker config was set, i.e. `max_iterations = 0` (unlimited, the
-  interactive default) on an unattended lane. Delegate children now fall
-  back to the spawn cap (`DEFAULT_SPAWN_MAX_ITERATIONS`) when the worker
-  config is unset or says unlimited.
+  interactive default) on an unattended lane. The original repair used a
+  finite spawn fallback. The later [worker execution policy](../spawn-worker-policy.md)
+  supersedes that fallback: unset/zero is unlimited, and delegate children
+  preserve explicitly configured positive limits.
 
 OUP server (`crates/octos-cli/src/api`):
 
