@@ -14,6 +14,12 @@ Before this change, an interrupted turn's dispatched prompt existed only in the 
 2. **Exactly-once replay**: reconnect/replay reads history, not in-flight state — the prompt appears once regardless of how many times the client reconnects.
 3. **Cancel is still recorded**: an explicit client cancel records the prompt with the turn's terminal reason, so the audit trail shows asked-and-cancelled, not asked-and-vanished.
 
+The dispatched-prompt commit also precedes `connection_closed`, provider-error,
+and `terminal_lost` terminal events (#2881). Connection cleanup cancels and joins
+the agent task before checking whether its prompt is already durable. Internal
+master continuations retain their existing do-not-persist behavior; interrupted
+media turns retain prompt text, with the existing attachment limitation unchanged.
+
 ## Acceptance
 
 octoscode-web#261 probe (`e2e-live/interrupted-turn-durability`): fails (red) on kernels without the contract, passes (green) once this change lands.

@@ -4314,6 +4314,7 @@ async fn stdio_shutdown_drain_waits_for_turn_finalization() {
     active_turns.lock().await.insert(
         session.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -4357,6 +4358,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
     active_turns.lock().await.insert(
         SessionKey("local:foreign".into()),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: TurnId::new(),
@@ -4382,6 +4384,7 @@ async fn stdio_shutdown_drain_gives_up_at_deadline_and_ignores_foreign_turns() {
     active_turns.lock().await.insert(
         session.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -18448,6 +18451,7 @@ async fn test_connection_turn(
 fn test_active_turn(turn_id: TurnId, abort: AbortHandle) -> ActiveTurn {
     let (tx, _rx) = mpsc::channel::<()>(1);
     ActiveTurn {
+        dispatched_prompt: None,
         owner: None,
         turn_id,
         profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -21539,6 +21543,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -21575,6 +21580,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: "someone-else".to_owned(),
             turn_id: turn_id.clone(),
@@ -21611,6 +21617,7 @@ async fn session_btw_reads_draft_only_for_a_non_terminal_turn() {
     active_turns_registry().lock().await.insert(
         session_id.clone(),
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             profile_id: MAIN_PROFILE_ID.to_owned(),
             turn_id: turn_id.clone(),
@@ -26515,6 +26522,7 @@ async fn session_rollback_rejects_when_turn_in_progress() {
         guard.insert(
             session_id.clone(),
             ActiveTurn {
+                dispatched_prompt: None,
                 owner: None,
                 turn_id: TurnId::new(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -27987,6 +27995,7 @@ async fn turn_state_get_returns_active_for_in_flight() {
         guard.insert(
             session_id.clone(),
             ActiveTurn {
+                dispatched_prompt: None,
                 owner: None,
                 turn_id: turn_id.clone(),
                 profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -32884,6 +32893,7 @@ async fn open_peer_with_active_turn(
     let handle = tokio::spawn(async { std::future::pending::<()>().await });
     let turn_state = Arc::new(TokioMutex::new(TurnState::Active));
     let entry = ActiveTurn {
+        dispatched_prompt: None,
         owner: None,
         turn_id: TurnId::new(),
         profile_id: profile.to_owned(),
@@ -41831,6 +41841,7 @@ fn synthetic_active_turn(
     let dummy_handle = tokio::spawn(async {});
     (
         ActiveTurn {
+            dispatched_prompt: None,
             owner: None,
             turn_id: turn_id.clone(),
             profile_id: MAIN_PROFILE_ID.to_owned(),
@@ -50528,3 +50539,6 @@ mod app_memory_tests;
 
 #[path = "ui_protocol_execution_environment_tests.rs"]
 mod execution_environment_tests;
+
+#[path = "ui_protocol_prompt_durability_tests.rs"]
+mod prompt_durability;
