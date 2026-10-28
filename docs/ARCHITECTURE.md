@@ -674,7 +674,9 @@ pub struct AgentConfig {
 
 Before feeding tool results back to the LLM, `sanitize_tool_output()` (in `sanitize.rs`) strips noise:
 - **Base64 data URIs**: `data:...;base64,<payload>` → `[base64-data-redacted]`
-- **Long hex strings**: 64+ contiguous hex chars (SHA-256, raw keys) → `[hex-redacted]`
+- **Credentials**: API-key prefixes, Bearer tokens and secret assignments → first 4 chars + `...[credential-redacted]`
+
+Content digests (SHA-256 and other long hex strings) pass through unchanged, so artifact paths and checksums stay usable.
 
 ### Context Compaction (three-tier — M8.5)
 
@@ -1730,7 +1732,7 @@ crates/
 - MCP: input schema validation (max depth 10, max size 64KB) prevents malicious tool definitions
 
 ### Data Safety
-- Tool output sanitization: strips base64 data URIs and long hex strings (`sanitize.rs`)
+- Tool output sanitization: strips base64 data URIs and redacts credentials (`sanitize.rs`)
 - UTF-8 safe truncation via `truncate_utf8()` across all tool outputs and email bodies
 - Session file collision prevention via percent-encoded filenames with hash suffix on truncation
 - Session files roll into 8 MiB segments and loads stop at `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB), preventing OOM on oversized histories

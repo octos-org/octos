@@ -566,7 +566,9 @@ pub struct AgentConfig {
 
 Before feeding tool results back to the LLM, `sanitize_tool_output()` (in `sanitize.rs`) strips noise:
 - **Base64 data URIs**: `data:...;base64,<payload>` → `[base64-data-redacted]`
-- **Long hex strings**: 64+ contiguous hex chars (SHA-256, raw keys) → `[hex-redacted]`
+- **Credentials**: API-key prefixes, Bearer tokens and secret assignments → first 4 chars + `...[credential-redacted]`
+
+Content digests (SHA-256 and other long hex strings) pass through unchanged, so artifact paths and checksums stay usable.
 
 ### Context Compaction
 
@@ -1375,7 +1377,7 @@ crates/
 - Prompt injection guard (`prompt_guard.rs`): 5 threat categories (SystemOverride, RoleConfusion, ToolCallInjection, SecretExtraction, InstructionInjection), 10 detection patterns. Sanitizes threats by wrapping in `[injection-blocked:...]`.
 
 ### Data Safety
-- Tool output sanitization (`sanitize.rs`): strips base64 data URIs, long hex strings (64+ chars), and **credential redaction** with 7 regex patterns covering OpenAI (`sk-...`), Anthropic (`sk-ant-...`), AWS (`AKIA...`), GitHub (`ghp_/gho_/ghs_/ghr_/github_pat_...`), GitLab (`glpat-...`), Bearer tokens, and generic `password`/`api_key` assignments
+- Tool output sanitization (`sanitize.rs`): strips base64 data URIs and applies **credential redaction** with 7 regex patterns covering OpenAI (`sk-...`), Anthropic (`sk-ant-...`), AWS (`AKIA...`), GitHub (`ghp_/gho_/ghs_/ghr_/github_pat_...`), GitLab (`glpat-...`), Bearer tokens, and generic `password`/`api_key` assignments
 - UTF-8 safe truncation via `truncate_utf8()` across all tool outputs and email bodies
 - Session file collision prevention via percent-encoded filenames with hash suffix on truncation
 - Session files roll into 8 MiB segments and loads stop at `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB), preventing OOM on oversized histories

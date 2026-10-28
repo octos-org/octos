@@ -566,7 +566,9 @@ pub struct AgentConfig {
 
 在将工具结果反馈给 LLM 之前，`sanitize_tool_output()`（在 `sanitize.rs` 中）剥离噪声：
 - **Base64 数据 URI**：`data:...;base64,<payload>` → `[base64-data-redacted]`
-- **长十六进制字符串**：64+ 个连续十六进制字符（SHA-256、原始密钥）→ `[hex-redacted]`
+- **凭据**：API 密钥前缀、Bearer token 和密钥赋值 → 保留前 4 个字符 + `...[credential-redacted]`
+
+内容摘要（SHA-256 及其他长十六进制字符串）原样保留，确保产物路径和校验和仍然可用。
 
 ### 上下文压缩
 
@@ -1381,7 +1383,7 @@ crates/
 
 ### 数据安全
 
-- 工具输出清理（`sanitize.rs`）：剥离 base64 数据 URI、长十六进制字符串（64+ 字符），以及**凭据脱敏** — 7 个正则表达式覆盖 OpenAI（`sk-...`）、Anthropic（`sk-ant-...`）、AWS（`AKIA...`）、GitHub（`ghp_/gho_/ghs_/ghr_/github_pat_...`）、GitLab（`glpat-...`）、Bearer token 和通用 `password`/`api_key` 赋值
+- 工具输出清理（`sanitize.rs`）：剥离 base64 数据 URI，并进行**凭据脱敏** — 7 个正则表达式覆盖 OpenAI（`sk-...`）、Anthropic（`sk-ant-...`）、AWS（`AKIA...`）、GitHub（`ghp_/gho_/ghs_/ghr_/github_pat_...`）、GitLab（`glpat-...`）、Bearer token 和通用 `password`/`api_key` 赋值
 - 通过 `truncate_utf8()` 在所有工具输出和邮件正文中实现 UTF-8 安全截断
 - 通过百分号编码文件名 + 截断时的哈希后缀防止会话文件冲突
 - 会话文件按 8 MiB 滚动分段，加载上限为 `OCTOS_SESSION_LOAD_BUDGET_BYTES`（32 MiB），防止超大历史导致 OOM

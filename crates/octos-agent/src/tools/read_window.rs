@@ -43,8 +43,8 @@
 //! shell tool's own output cap is 30,000 bytes
 //! (`octos_core::tool_output_limit("shell")`), so the advised `head -c 49152`
 //! can never arrive intact; and the loop sanitizer redacts exactly the
-//! content giant lines are made of (base64 data URIs, long hex —
-//! `sanitize.rs`), so what survives the cap is then redacted. Hence the
+//! content giant lines are made of (base64 data URIs — `sanitize.rs`),
+//! so what survives the cap is then redacted. Hence the
 //! in-tool `byte_offset`/`byte_limit` mode: raw slices, no gutter, footer
 //! naming the next `byte_offset`, and the bytes count toward the same
 //! coverage ledger as line reads.

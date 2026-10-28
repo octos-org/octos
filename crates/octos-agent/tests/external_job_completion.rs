@@ -304,11 +304,14 @@ async fn run_automatic_receipt(submission: Submission, gate: Gate) {
     }
     assert_eq!(supervisor.get_tasks_for_session("auto-owner").len(), 1);
     if matches!(submission, Submission::Shell | Submission::Exec) {
+        // Digests are identifiers, not credentials: the model sees the same
+        // request hash the watcher pins.
         assert!(
             result
                 .messages
                 .iter()
-                .all(|m| !m.content.contains(REQUEST_HASH))
+                .filter(|m| m.role == octos_core::MessageRole::Tool)
+                .any(|m| m.content.contains(REQUEST_HASH))
         );
     }
     assert!(
