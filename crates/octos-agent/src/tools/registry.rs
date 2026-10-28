@@ -303,6 +303,15 @@ pub struct ToolRegistry {
     /// visibility checks and discovery, and refused by `execute_with_context`.
     /// It only ever narrows: it never adds a tool the registry lacks.
     host_tool_allowlist: std::sync::RwLock<Option<Arc<HashSet<String>>>>,
+    /// #2865: tool names granted DIRECT model-callable status on top of the
+    /// fixed dispatch surface — host-owned peer app tools. A registered app
+    /// tool that is not on the fixed `DIRECT` list would otherwise vanish
+    /// from the peer's roster once the dispatch gateway is active (it is
+    /// neither in `DIRECT` nor reachable through it), breaking the peer's
+    /// documented tool contract. Populated by the host-peer registration
+    /// path via [`Self::grant_direct_surface`]; never widens any other
+    /// session's surface.
+    direct_surface_extra: std::collections::HashSet<String>,
 }
 
 /// Default per-tool execution-timeout backstop (seconds) for the registry
@@ -344,6 +353,7 @@ impl ToolRegistry {
             tool_timeout_secs: DEFAULT_REGISTRY_TOOL_TIMEOUT_SECS,
             internal_hidden: HashSet::new(),
             dispatch_surface_excluded: HashSet::new(),
+            direct_surface_extra: std::collections::HashSet::new(),
             filesystem_scope: FilesystemScope::Workspace,
             // #1607: default to a no-op sandbox. Constructors that receive a
             // real sandbox (`with_builtins_and_permissions`,
@@ -869,7 +879,8 @@ impl ToolRegistry {
             && self.is_dispatch_gateway("discover_tools")
             && self.is_tool_visible_post_activation("run_tool")
             && self.is_tool_visible_post_activation("discover_tools"))
-            || (super::dispatcher::DIRECT.contains(&name)
+            || ((super::dispatcher::DIRECT.contains(&name)
+                || self.direct_surface_extra.contains(name))
                 && !self.dispatch_surface_excluded.contains(name))
     }
 
@@ -887,6 +898,17 @@ impl ToolRegistry {
     /// for runtime plumbing).
     pub fn is_excluded_from_dispatch_surface(&self, name: &str) -> bool {
         self.dispatch_surface_excluded.contains(name)
+    }
+
+    /// Grant a tool DIRECT model-callable status on top of the fixed
+    /// dispatch surface (#2865): host-owned peer app tools are registered
+    /// into the peer session's registry, and without this grant the dispatch
+    /// gateway would keep them out of the peer's roster entirely. Only
+    /// widens the surface of THIS registry (one peer session); discovery and
+    /// `run_tool` remain available for everything else. An explicit
+    /// [`Self::exclude_from_dispatch_surface`] still wins over this grant.
+    pub fn grant_direct_surface(&mut self, name: impl Into<String>) {
+        self.direct_surface_extra.insert(name.into());
     }
 
     /// Includes optional tools reachable via the fixed gateway.
@@ -1296,6 +1318,10 @@ impl ToolRegistry {
             cached_specs: std::sync::Mutex::new(None),
             plugin_tools: self.plugin_tools.clone(),
             non_builtin_origins: self.non_builtin_origins.clone(),
+            // Carried: a snapshot serving a turn must keep the same
+            // direct-surface grants as the registry it was snapshotted
+            // from (host-owned peer app tools stay model-direct).
+            direct_surface_extra: self.direct_surface_extra.clone(),
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
             background_result_sender: None,
