@@ -875,13 +875,19 @@ impl ToolRegistry {
     }
 
     fn dispatch_surface_includes(&self, name: &str) -> bool {
+        // Exclusion is an independent external-turn boundary, not merely a
+        // modifier of the fixed DIRECT surface. It must still apply when a
+        // durable host list leaves only one gateway and thereby deactivates
+        // the pair check below.
+        if self.dispatch_surface_excluded.contains(name) {
+            return false;
+        }
         !(self.is_dispatch_gateway("run_tool")
             && self.is_dispatch_gateway("discover_tools")
             && self.is_tool_visible_post_activation("run_tool")
             && self.is_tool_visible_post_activation("discover_tools"))
-            || ((super::dispatcher::DIRECT.contains(&name)
-                || self.direct_surface_extra.contains(name))
-                && !self.dispatch_surface_excluded.contains(name))
+            || super::dispatcher::DIRECT.contains(&name)
+            || self.direct_surface_extra.contains(name)
     }
 
     /// O-015-A (#2862 regression): keep `name` registered but remove it from

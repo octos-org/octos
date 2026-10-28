@@ -977,3 +977,19 @@ fn should_drop_plugin_and_mcp_tools_with_allowlisted_names_from_an_external_turn
         assert_eq!(registry.origin(&name), Some(ToolOrigin::Builtin), "{name}");
     }
 }
+
+#[test]
+fn should_hide_an_excluded_gateway_when_its_pair_is_absent() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut registry = octos_agent::ToolRegistry::with_builtins(workspace.path());
+    // A host's durable tool list can leave only one side of the gateway pair.
+    // Explicit external-turn exclusion must not depend on the pair being
+    // complete, or the surviving gateway re-enters the model surface.
+    registry.retain(|name| matches!(name, "read_file" | "run_tool"));
+    super::confine_external_turn_tools(&mut registry);
+
+    assert!(registry.get("run_tool").is_some());
+    assert!(registry.is_excluded_from_dispatch_surface("run_tool"));
+    assert!(!registry.is_tool_visible("run_tool"));
+    assert!(registry.is_tool_visible("read_file"));
+}
