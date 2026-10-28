@@ -16,6 +16,17 @@ fn before_tool_hook(command: Vec<&str>, timeout_ms: u64) -> HookConfig {
     }
 }
 
+fn user_prompt_hook(command: Vec<&str>, timeout_ms: u64) -> HookConfig {
+    HookConfig {
+        event: HookEvent::UserPromptSubmit,
+        command: command.into_iter().map(String::from).collect(),
+        timeout_ms,
+        tool_filter: vec![],
+        path_filter: vec![],
+        requires_bin: None,
+    }
+}
+
 #[tokio::test]
 #[cfg(unix)]
 async fn should_fail_closed_with_guard_unavailable_when_before_tool_call_hook_trips_breaker() {
@@ -90,4 +101,31 @@ async fn should_re_arm_tripped_guard_breaker_explicitly() {
         matches!(r, HookResult::Error(_)),
         "after re_arm the hook runs again, got {r:?}"
     );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn should_apply_circuit_breaker_to_user_prompt_submit_hook() {
+    // Generic error exit (code 3) counts as a failure; after the threshold
+    // the hook is disabled. #2329: user_prompt_submit is a guard-class
+    // (before-)event, so the disabled gate surfaces as GuardUnavailable
+    // (fail-closed signal) instead of a silent Allow.
+    let executor = HookExecutor::with_threshold(
+        vec![user_prompt_hook(vec!["sh", "-c", "exit 3"], 1000)],
+        3,
+    );
+    let payload = HookPayload::user_prompt_submit("hi", "m", None, None);
+    for _ in 0..3 {
+        executor.run(HookEvent::UserPromptSubmit, &payload).await;
+    }
+    let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
+    match result {
+        HookResult::GuardUnavailable(msg) => {
+            assert!(
+                msg.contains("disabled after 3 consecutive infrastructure failures"),
+                "message should name the breaker trip: {msg}"
+            );
+        }
+        other => panic!("expected GuardUnavailable, got {other:?}"),
+    }
 }

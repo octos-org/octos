@@ -124,12 +124,27 @@ impl Agent {
                 iteration,
                 ctx.as_ref(),
             );
-            if let HookResult::Deny(reason) = hooks.run(HookEvent::BeforeLlmCall, &payload).await {
-                // #2249: a typed error (not a bare `eyre::bail!`) so the loop
-                // boundary classifies the deny as policy/expected instead of
-                // internal/bug. `HookDeniedError`'s Display keeps the exact
-                // user-facing wording this bail used to produce.
-                return Err(crate::hooks::HookDeniedError { reason }.into());
+            let result = hooks.run(HookEvent::BeforeLlmCall, &payload).await;
+            // #2329: GuardUnavailable joins Deny in the fail-closed arm —
+            // a tripped breaker is not a policy decision, so log it
+            // distinctly for operators, but never degrade to a silent Allow.
+            let was_guard_unavailable =
+                matches!(result, HookResult::GuardUnavailable(_));
+            match result {
+                HookResult::Deny(reason) | HookResult::GuardUnavailable(reason) => {
+                    if was_guard_unavailable {
+                        tracing::warn!(
+                            "guard hook breaker tripped before llm_call; failing closed: {reason}"
+                        );
+                    }
+                    // #2249: a typed error (not a bare `eyre::bail!`) so the
+                    // loop boundary classifies the deny as policy/expected
+                    // instead of internal/bug. `HookDeniedError`'s Display
+                    // keeps the exact user-facing wording this bail used to
+                    // produce.
+                    return Err(crate::hooks::HookDeniedError { reason }.into());
+                }
+                _ => {}
             }
         }
 

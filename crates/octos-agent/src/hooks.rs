@@ -2669,33 +2669,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
-    async fn should_apply_circuit_breaker_to_user_prompt_submit_hook() {
-        // Generic error exit (code 3) counts as a failure; after the threshold
-        // the hook is disabled. #2329: user_prompt_submit is a guard-class
-        // (before-)event, so the disabled gate surfaces as GuardUnavailable
-        // (fail-closed signal) instead of a silent Allow.
-        let executor = HookExecutor::with_threshold(
-            vec![user_prompt_hook(vec!["sh", "-c", "exit 3"], 1000)],
-            3,
-        );
-        let payload = HookPayload::user_prompt_submit("hi", "m", None, None);
-        for _ in 0..3 {
-            executor.run(HookEvent::UserPromptSubmit, &payload).await;
-        }
-        let result = executor.run(HookEvent::UserPromptSubmit, &payload).await;
-        match result {
-            HookResult::GuardUnavailable(msg) => {
-                assert!(
-                    msg.contains("disabled after 3 consecutive infrastructure failures"),
-                    "message should name the breaker trip: {msg}"
-                );
-            }
-            other => panic!("expected GuardUnavailable, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn should_be_noop_when_no_user_prompt_submit_hook_configured() {
         // Backwards-compat: an executor with only other events never fires for
         // UserPromptSubmit.
