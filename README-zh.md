@@ -210,6 +210,12 @@ Octos 管理会话标识、工作区作用域、对话历史和已提交事件�
 
 ### 工具、权限与人工输入
 
+直接运行 `octos chat`，默认使用四个常用工具及 `discover_tools` / `run_tool`
+两个固定入口。可选工具的参数说明通过对话结果返回，发现工具时不会改写工具声明列表。
+已授权的工具能力、批量读取、图片和 Agent 协作均保留。详见
+[固定调度入口说明](docs/fixed-tool-dispatcher.md)与[工具能力审查](docs/tool-capabilities.md)。
+[外部任务回执](docs/external-job-completion.md)可自动登记后台完成通知，无需模型反复查询。
+
 内核按照宿主的工具策略与平台沙箱配置执行文件系统、shell、Web 和 MCP 工具。
 宿主配置的生命周期 hooks 可以在模型调用和工具执行前后介入。OUP 暴露执行过程与
 需要决定的节点，让应用提供自己的审批界面，或将已授权范围内的决定交给控制 Agent。
@@ -327,6 +333,7 @@ Goal 记录 Agent 要完成什么，Loop 安排周期性轮次，Monitor 观察�
 - [Harness 开发者接口](docs/OCTOS_HARNESS_DEVELOPER_INTERFACE.md)
 - [产物与工作流集成指南](docs/OCTOS_HARNESS_DEVELOPER_GUIDE.md)
 - [Harness 兼容性与版本管理](docs/OCTOS_HARNESS_ABI_VERSIONING.md)
+- [基于工具结果的进展提醒与可选周期反思](docs/event-driven-reflection.md)
 - [文档站点](https://octos-org.github.io/octos/zh/)
 
 ## 参与开发

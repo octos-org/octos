@@ -32,6 +32,8 @@ redb = { workspace = true }
 metrics = { workspace = true }
 jsonwebtoken = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
+dirs = { workspace = true }
 
 [lints]
 workspace = true

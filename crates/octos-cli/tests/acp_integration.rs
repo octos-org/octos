@@ -68,6 +68,8 @@ impl octos_llm::LlmProvider for MockLlm {
 struct RecordingLlm {
     /// One entry per `chat()` call: the `content` of every incoming message.
     seen: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Optional full payload capture for tool-call/result pairing assertions.
+    seen_messages: Option<Arc<Mutex<Vec<Vec<octos_core::Message>>>>>,
     /// Assistant reply text keyed by call index (0-based); falls back to a
     /// generic reply if the call index is beyond the vec.
     replies: Vec<String>,
@@ -87,6 +89,9 @@ impl octos_llm::LlmProvider for RecordingLlm {
             .lock()
             .await
             .push(messages.iter().map(|m| m.content.clone()).collect());
+        if let Some(seen) = &self.seen_messages {
+            seen.lock().await.push(messages.to_vec());
+        }
         let reply = self
             .replies
             .get(idx)
@@ -269,6 +274,7 @@ async fn should_accumulate_conversation_history_across_multiple_prompts() {
     let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
         seen: seen.clone(),
+        seen_messages: None,
         replies: vec![
             "ASSISTANT_ONE".to_string(),
             "ASSISTANT_TWO".to_string(),
@@ -499,6 +505,7 @@ async fn should_restore_a_conversation_through_session_load() {
     let seen_one: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let llm_one: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
         seen: seen_one.clone(),
+        seen_messages: None,
         replies: vec!["REMEMBER_THIS".to_string()],
         calls: std::sync::atomic::AtomicUsize::new(0),
     });
@@ -548,6 +555,7 @@ async fn should_restore_a_conversation_through_session_load() {
     let seen_two: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let llm_two: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
         seen: seen_two.clone(),
+        seen_messages: None,
         replies: vec!["SECOND_REPLY".to_string()],
         calls: std::sync::atomic::AtomicUsize::new(0),
     });
@@ -745,6 +753,7 @@ async fn should_not_evict_a_live_session_on_reload() {
     let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
         seen: seen.clone(),
+        seen_messages: None,
         replies: vec!["FIRST".to_string(), "SECOND".to_string()],
         calls: std::sync::atomic::AtomicUsize::new(0),
     });
@@ -875,8 +884,10 @@ async fn should_sanitize_stored_history_when_loading_a_session() {
     }
 
     let seen: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_messages = Arc::new(Mutex::new(Vec::new()));
     let llm: Arc<dyn octos_llm::LlmProvider> = Arc::new(RecordingLlm {
         seen: seen.clone(),
+        seen_messages: Some(seen_messages.clone()),
         replies: vec!["AFTER_LOAD".to_string()],
         calls: std::sync::atomic::AtomicUsize::new(0),
     });
@@ -944,8 +955,9 @@ async fn should_sanitize_stored_history_when_loading_a_session() {
         "healthy rows still replay; recorded: {recorded:?}"
     );
 
-    // And the LLM must never see the orphan rows on the next prompt: no
-    // empty/whitespace-only payloads in the handed-over transcript.
+    // The context projection may repair an orphan with a synthetic result.
+    // Empty assistant text is valid only when the row still has a payload;
+    // validate actual tool-call/result pairing, not just content strings.
     let calls = seen.lock().await;
     let last = calls.last().expect("a turn ran after load");
     assert!(
@@ -953,9 +965,50 @@ async fn should_sanitize_stored_history_when_loading_a_session() {
             && last.iter().any(|c| c.contains("SEED_ASSISTANT")),
         "healthy rows reach the LLM: {last:?}"
     );
-    let blanks = last.iter().filter(|c| c.trim().is_empty()).count();
-    assert_eq!(
-        blanks, 0,
-        "sanitized history must not hand the LLM payload-free rows: {last:?}"
-    );
+    let payloads = seen_messages.lock().await;
+    let messages = payloads.last().expect("full prompt captured");
+    for (index, message) in messages.iter().enumerate() {
+        assert!(
+            !message.content.trim().is_empty()
+                || message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty())
+                || !message.media.is_empty()
+                || message
+                    .reasoning_content
+                    .as_ref()
+                    .is_some_and(|text| !text.trim().is_empty()),
+            "payload-free row at {index}: {message:?}"
+        );
+        for call in message.tool_calls.iter().flatten() {
+            let following = &messages[index + 1..];
+            assert_eq!(
+                following
+                    .iter()
+                    .filter(|m| m.tool_call_id.as_deref() == Some(&call.id))
+                    .count(),
+                1,
+                "tool call must have exactly one following result: {call:?}"
+            );
+            assert!(
+                following
+                    .iter()
+                    .take_while(|m| m.role == octos_core::MessageRole::Tool)
+                    .any(|m| m.tool_call_id.as_deref() == Some(&call.id)),
+                "result must immediately follow the tool-call batch: {call:?}"
+            );
+        }
+        if let Some(id) = &message.tool_call_id {
+            assert_eq!(
+                messages[..index]
+                    .iter()
+                    .flat_map(|m| m.tool_calls.iter().flatten())
+                    .filter(|call| &call.id == id)
+                    .count(),
+                1,
+                "tool result must have exactly one preceding call: {message:?}"
+            );
+        }
+    }
 }

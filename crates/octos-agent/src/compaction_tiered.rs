@@ -174,10 +174,12 @@ impl MicroCompactionPolicy {
                 if let Some(ref calls) = msg.tool_calls {
                     for call in calls {
                         id_to_meta.entry(call.id.clone()).or_insert_with(|| {
+                            let (name, arguments) =
+                                crate::tools::dispatcher::logical_call(&call.name, &call.arguments);
                             (
-                                call.name.clone(),
+                                name.to_string(),
                                 turn_counter,
-                                crate::compaction::describe_tool_call(&call.name, &call.arguments),
+                                crate::compaction::describe_tool_call(name, arguments),
                             )
                         });
                     }
@@ -357,19 +359,21 @@ impl WorkingSet {
                 continue;
             };
             for call in calls {
-                let is_read = is_read_tool(&call.name);
-                let is_write = is_write_tool(&call.name);
+                let (name, arguments) =
+                    crate::tools::dispatcher::logical_call(&call.name, &call.arguments);
+                let is_read = is_read_tool(name);
+                let is_write = is_write_tool(name);
                 if !is_read && !is_write {
                     continue;
                 }
-                let Some(path) = tool_target_path(&call.arguments) else {
+                let Some(path) = tool_target_path(arguments) else {
                     continue;
                 };
                 order += 1;
                 latest_touch.insert(path.clone(), order);
                 if is_read {
                     latest_read_by_path.insert(path.clone(), (order, call.id.clone()));
-                    if let Some(range) = read_range_key(&call.arguments) {
+                    if let Some(range) = read_range_key(arguments) {
                         reads.push((call.id.clone(), range.clone()));
                         latest_read_by_range.insert(range, (order, call.id.clone()));
                     }
@@ -971,6 +975,38 @@ mod tests {
         assert_eq!(parsed.reason, "tier1_superseded");
         // r2 (newest) survives untouched.
         assert!(!is_placeholder(&messages[4].content));
+    }
+
+    #[test]
+    fn fixed_dispatcher_compaction_deduplicates_native_and_wrapped_reads() {
+        let mut messages = vec![
+            user_msg("inspect"),
+            assistant_call_args(
+                "run_tool",
+                "first",
+                serde_json::json!({"name":"read_file","arguments":{"path":"a.txt","limit":100}}),
+            ),
+            tool_result("first", "stale content"),
+            assistant_call_args(
+                "read_file",
+                "second",
+                serde_json::json!({"path":"a.txt","limit":100}),
+            ),
+            tool_result("second", "fresh content"),
+        ];
+        MicroCompactionPolicy {
+            max_age_turns: 0,
+            max_size_bytes_per_result: u32::MAX,
+            pin_recent_files: 1,
+            dedup_duplicate_reads: true,
+        }
+        .prune(&mut messages, &[]);
+        let placeholder =
+            ToolResultPlaceholder::from_placeholder_content(&messages[2].content).unwrap();
+        assert_eq!(placeholder.tool_name, "read_file");
+        assert!(placeholder.target.as_deref().unwrap().contains("a.txt"));
+        assert_eq!(placeholder.reason, "tier1_superseded");
+        assert_eq!(messages[4].content, "fresh content");
     }
 
     #[test]

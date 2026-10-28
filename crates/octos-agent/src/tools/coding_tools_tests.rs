@@ -69,26 +69,17 @@ async fn update_plan_tool_emits_plan_updated_event() {
 
 #[test]
 fn truncate_capture_does_not_panic_on_multibyte_boundary() {
-    // Regression: `guard[len - MAX_CAPTURE_BYTES..]` sliced at a raw byte
-    // offset. A multibyte char straddling that offset panicked, silently
-    // killing the spawned reader task. Build a buffer whose cut point falls
-    // mid-'世' (3 bytes) and confirm the trim succeeds and stays valid UTF-8.
-    // An all-3-byte-char buffer: char boundaries are multiples of 3, and
-    // MAX_CAPTURE_BYTES (50_000) is not ≡ 0 (mod 3), so the raw cut offset
-    // `len - MAX_CAPTURE_BYTES` is guaranteed to fall mid-char.
-    let mut guard = "世".repeat(40_000); // 120_000 bytes, over the 2× trigger
-    let cut = guard.len().saturating_sub(MAX_CAPTURE_BYTES);
-    assert!(
-        !guard.is_char_boundary(cut),
-        "test precondition: the raw cut offset must fall mid-char"
-    );
-
-    truncate_capture_in_place(&mut guard); // must not panic
-    assert!(guard.starts_with("... (earlier output truncated)\n"));
-    assert!(
-        guard.contains('世'),
-        "the kept tail must remain valid UTF-8"
-    );
+    // Both the 64 KiB ring and the 50,000-byte display cut split a 3-byte
+    // character. Exercise the production capture path, not a legacy helper.
+    let dir = tempfile::tempdir().unwrap();
+    let capture = CommandOutput::new(dir.path()).unwrap();
+    capture.append("世".repeat(40_000).as_bytes());
+    capture.finish();
+    let mut view = capture.view(false);
+    let rendered = view.render(MAX_CAPTURE_BYTES);
+    assert!(rendered.contains('世'));
+    assert!(!rendered.contains('\u{fffd}'));
+    assert!(rendered.contains("Full output:"));
 }
 
 const CODEX_P0: &[&str] = &[
@@ -108,10 +99,11 @@ const CODEX_P0: &[&str] = &[
 fn builtins_expose_codex_p0_tool_names() {
     let temp = tempfile::tempdir().expect("tempdir");
     let registry = ToolRegistry::with_builtins(temp.path());
-    let names: std::collections::HashSet<_> =
-        registry.specs().into_iter().map(|spec| spec.name).collect();
     for name in CODEX_P0 {
-        assert!(names.contains(*name), "{name} should be model-visible");
+        assert!(
+            registry.is_tool_model_reachable(name),
+            "{name} should be model-reachable"
+        );
     }
 }
 
@@ -189,6 +181,165 @@ async fn request_user_input_emits_structured_metadata_event() {
 
 struct FakeSpawnTool;
 
+/// A native response can race an unrelated supervisor registration before
+/// reaching an alias. Only the returned ID belongs to this invocation.
+struct RacingSpawnTool {
+    omit_handle: bool,
+}
+
+#[async_trait::async_trait]
+impl Tool for RacingSpawnTool {
+    fn name(&self) -> &str {
+        "spawn"
+    }
+    fn description(&self) -> &str {
+        "spawn with an interleaved unrelated registration"
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+    async fn execute(&self, _: &Value) -> Result<ToolResult> {
+        unreachable!()
+    }
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        let supervisor = ctx.task_supervisor.as_ref().unwrap();
+        let task_id = supervisor.register_with_input(
+            "spawn",
+            "requested",
+            ctx.parent_session_key.as_deref(),
+            Some(args.clone()),
+        );
+        supervisor.mark_completed(&task_id, vec!["requested.txt".into()]);
+        // Deterministically reproduce the interleaving that a concurrent
+        // registration can create while native dispatch is awaited.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let unrelated = supervisor.register_with_input(
+            "spawn",
+            "unrelated",
+            ctx.parent_session_key.as_deref(),
+            None,
+        );
+        supervisor.mark_completed(&unrelated, vec!["unrelated.txt".into()]);
+        Ok(ToolResult {
+            output: "native launch succeeded".into(),
+            success: true,
+            structured_metadata: (!self.omit_handle)
+                .then(|| json!({"task_id": task_id, "agent_id": task_id})),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn spawn_aliases_use_returned_handle_not_newest_concurrent_registration() {
+    for name in ["spawn_agent", "delegate"] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(RacingSpawnTool { omit_handle: false });
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            parent_session_key: Some("api:race".into()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(
+                &ctx,
+                name,
+                &json!({"task":"requested work", "role":"reviewer", "timeout_ms": 100}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).unwrap();
+        let returned = supervisor
+            .get_task(payload["agent_id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            returned.output_files,
+            vec!["requested.txt"],
+            "{name} returned an unrelated task"
+        );
+        assert_eq!(
+            result.structured_metadata.as_ref().unwrap()["task_id"],
+            payload["agent_id"]
+        );
+        let unrelated = supervisor
+            .get_all_tasks()
+            .into_iter()
+            .find(|task| task.output_files == vec!["unrelated.txt"])
+            .unwrap();
+        assert!(
+            unrelated.role.is_none(),
+            "alias must not stamp the unrelated task's role"
+        );
+    }
+}
+
+#[tokio::test]
+async fn spawn_alias_without_returned_handle_never_adopts_an_unrelated_task() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::with_builtins(temp.path());
+    registry.register(RacingSpawnTool { omit_handle: true });
+    let supervisor = registry.supervisor();
+    let ctx = ToolContext {
+        task_supervisor: Some(supervisor.clone()),
+        ..ToolContext::zero()
+    };
+    let result = registry
+        .execute_with_context(
+            &ctx,
+            "spawn_agent",
+            &json!({"task":"requested", "role":"reviewer"}),
+        )
+        .await
+        .unwrap();
+    assert!(!result.success);
+    assert_eq!(
+        result.structured_metadata.unwrap()["reason"],
+        "spawn_missing_task_id"
+    );
+    assert!(
+        supervisor
+            .get_all_tasks()
+            .iter()
+            .all(|task| task.role.is_none())
+    );
+    assert!(result.output.contains("may already be running"));
+}
+
+#[tokio::test]
+async fn spawn_alias_accepts_completed_inline_backends_without_adopting_a_task() {
+    for args in [
+        json!({"task":"requested", "mode":"sync"}),
+        json!({"task":"requested", "backend":"agent_mcp"}),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::with_builtins(temp.path());
+        registry.register(RacingSpawnTool { omit_handle: true });
+        let supervisor = registry.supervisor();
+        let ctx = ToolContext {
+            task_supervisor: Some(supervisor.clone()),
+            ..ToolContext::zero()
+        };
+        let result = registry
+            .execute_with_context(&ctx, "spawn_agent", &args)
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        let payload: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(payload["status"], "completed");
+        assert!(payload.get("agent_id").is_none());
+        assert!(result.structured_metadata.unwrap().get("task_id").is_none());
+        assert!(
+            supervisor
+                .get_all_tasks()
+                .iter()
+                .all(|task| task.role.is_none())
+        );
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for FakeSpawnTool {
     fn name(&self) -> &str {
@@ -219,6 +370,7 @@ impl Tool for FakeSpawnTool {
         Ok(ToolResult {
             output: "spawned fake worker".to_string(),
             success: true,
+            structured_metadata: Some(json!({"task_id": task_id, "agent_id": task_id})),
             ..Default::default()
         })
     }
@@ -242,7 +394,11 @@ async fn spawn_agent_delegates_to_registered_spawn_tool() {
             &json!({
                 "message": "inspect parity",
                 "agent_type": "worker",
-                "reasoning_effort": "high"
+                "reasoning_effort": "high",
+                "max_iterations": 0,
+                "owned_paths": ["output/review"],
+                "isolation": "shared",
+                "skill_paths": ["skills/example/SKILL.md", "tools/TOOLS.md"]
             }),
         )
         .await
@@ -255,6 +411,13 @@ async fn spawn_agent_delegates_to_registered_spawn_tool() {
     assert_eq!(input["task"], "inspect parity");
     assert_eq!(input["label"], "codex-worker");
     assert_eq!(input["role"], crate::ROLE_IMPLEMENTER);
+    assert_eq!(input["max_iterations"], 0);
+    assert_eq!(input["owned_paths"], json!(["output/review"]));
+    assert_eq!(input["isolation"], "shared");
+    assert_eq!(
+        input["skill_paths"],
+        json!(["skills/example/SKILL.md", "tools/TOOLS.md"])
+    );
     assert!(
         input["additional_instructions"]
             .as_str()
@@ -1045,6 +1208,7 @@ async fn m14_c_wiring_delegate_pre_expands_role_allow_list_per_971() {
             &json!({
                 "role": "reviewer",
                 "task": "audit PR #1234",
+                "owned_paths": ["output/delegate-review"],
                 "timeout_ms": 5_000,
             }),
         )
@@ -1064,6 +1228,7 @@ async fn m14_c_wiring_delegate_pre_expands_role_allow_list_per_971() {
         .find(|t| t.tool_name == "spawn" || t.tool_name == "spawn_agent")
         .expect("task registered");
     let input = task.tool_input.expect("tool input recorded");
+    assert_eq!(input["owned_paths"], json!(["output/delegate-review"]));
     let allowed = input["allowed_tools"]
         .as_array()
         .expect("allowed_tools array on delegate spawn payload");
@@ -1548,7 +1713,31 @@ async fn write_stdin_talks_to_exec_session() {
         .await
         .expect("write stdin");
     assert!(written.success, "{}", written.output);
-    assert!(written.output.contains("got:octos"), "{}", written.output);
+    // A real terminal may return input echo before the shell is scheduled.
+    // Poll for the response rather than requiring execution within 100 ms.
+    let mut received = written.output;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !received.contains("got:octos") {
+            let next = registry
+                .execute(
+                    "write_stdin",
+                    &json!({
+                        "session_id":session_id,"yield_time_ms":20
+                    }),
+                )
+                .await
+                .expect("poll terminal");
+            assert!(next.success, "{}", next.output);
+            let value: Value = serde_json::from_str(&next.output).unwrap();
+            received.push_str(value["output"].as_str().unwrap());
+            if value["running"] == false {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("terminal responds before deadline");
+    assert!(received.contains("got:octos"), "{received}");
 }
 
 // -----------------------------------------------------------------------
@@ -1598,11 +1787,7 @@ async fn view_image_hands_a_raster_image_to_the_model() {
     let payload: Value = serde_json::from_str(&result.output).expect("json payload");
     assert_eq!(payload["shown_to_model"], json!(true));
     assert_eq!(result.model_media.len(), 1, "one image for the model");
-    assert!(
-        result.model_media[0].ends_with("grab.png"),
-        "the resolved file: {}",
-        result.model_media[0].display()
-    );
+    assert_eq!(std::fs::read(&result.model_media[0]).unwrap(), PNG_MAGIC);
     let meta = result.structured_metadata.expect("structured metadata");
     assert_eq!(meta["shown_to_model"], json!(true));
 }
@@ -2054,10 +2239,14 @@ async fn tool_search_reflects_post_builtins_registrations() {
         .await
         .expect("tool_search ok");
     let payload: Value = serde_json::from_str(&result.output).expect("payload");
-    assert_eq!(
-        payload["matches"].as_array().map(Vec::len),
-        Some(0),
-        "fresh registry should not match unknown tool name yet"
+    // Keyword matches (e.g. edit's "unique") are valid before registration;
+    // the invariant is that the newly coined exact tool is not present.
+    assert!(
+        payload["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["name"] != "post_builtin_xyz_unique")
     );
 
     // Inject a new tool AFTER with_builtins.
@@ -2151,10 +2340,11 @@ async fn tool_search_live_catalog_respects_visibility_filters() {
 async fn builtins_expose_p1_codex_tool_names() {
     let temp = tempfile::tempdir().expect("tempdir");
     let registry = ToolRegistry::with_builtins(temp.path());
-    let names: std::collections::HashSet<_> =
-        registry.specs().into_iter().map(|spec| spec.name).collect();
     for name in &["view_image", "tool_search", "tool_suggest"] {
-        assert!(names.contains(*name), "{name} must be model-visible");
+        assert!(
+            registry.is_tool_model_reachable(name),
+            "{name} must be model-reachable"
+        );
     }
 }
 
@@ -2170,10 +2360,11 @@ async fn builtins_expose_p1_codex_tool_names() {
 async fn builtins_expose_codex_naming_aliases() {
     let temp = tempfile::tempdir().expect("tempdir");
     let registry = ToolRegistry::with_builtins(temp.path());
-    let names: std::collections::HashSet<_> =
-        registry.specs().into_iter().map(|spec| spec.name).collect();
     for name in &["bash", "delegate"] {
-        assert!(names.contains(*name), "{name} must be model-visible");
+        assert!(
+            registry.is_tool_model_reachable(name),
+            "{name} must be model-reachable"
+        );
     }
 }
 
@@ -2629,15 +2820,11 @@ async fn exec_command_kills_child_process_on_timeout() {
 /// The stub MUST surface `image_generation` as model-visible so
 /// the canonical Codex tool surface is wire-complete.
 #[tokio::test]
-async fn builtins_expose_image_generation_tool_name() {
-    let temp = tempfile::tempdir().expect("tempdir");
+async fn unbound_image_generation_is_registered_but_not_discoverable() {
+    let temp = tempfile::tempdir().unwrap();
     let registry = ToolRegistry::with_builtins(temp.path());
-    let names: std::collections::HashSet<_> =
-        registry.specs().into_iter().map(|spec| spec.name).collect();
-    assert!(
-        names.contains("image_generation"),
-        "image_generation must be model-visible: {names:?}"
-    );
+    assert!(registry.get("image_generation").is_some());
+    assert!(!registry.is_tool_model_reachable("image_generation"));
 }
 
 /// Happy stub path: a valid prompt returns a structured

@@ -48,6 +48,13 @@ pub struct ModelHints {
     #[serde(default)]
     pub lacks_video: bool,
 
+    /// Keep tool-returned images in subsequent requests until their transcript
+    /// rows are compacted away. Opt-in: retains visual context and a stable
+    /// request prefix, at the cost of provider image/context usage. Video keeps
+    /// its current-batch-only behavior. Use immutable/versioned image paths.
+    #[serde(default)]
+    pub retain_tool_images: bool,
+
     /// Merge consecutive system messages into one (some providers reject multiples).
     #[serde(default = "default_true")]
     pub merge_system_messages: bool,
@@ -71,6 +78,7 @@ impl Default for ModelHints {
             fixed_temperature: false,
             lacks_vision: false,
             lacks_video: false,
+            retain_tool_images: false,
             merge_system_messages: true,
             reasoning_style: ReasoningStyle::None,
         }
@@ -140,7 +148,11 @@ impl ModelHints {
         // `lacks_vision`. `grok` is narrowed to `grok-4` since older Grok
         // families can reject enabled `reasoning_effort` values. An operator
         // may still explicitly request `none` for a compatible endpoint.
-        let reasoning_style = if m.contains("deepseek-v4") || m.contains("deepseek-reasoner") {
+        let reasoning_style = if m.contains("deepseek-v4")
+            || m.contains("deepseek-reasoner")
+            || m == "deepseek-flash"
+            || m.ends_with("/deepseek-flash")
+        {
             ReasoningStyle::EffortAndThinkingToggle
         } else if m.contains("kimi-k3")
             || m == "k3"
@@ -182,6 +194,7 @@ impl ModelHints {
             fixed_temperature,
             lacks_vision,
             lacks_video: false,
+            retain_tool_images: false,
             merge_system_messages: true,
             reasoning_style,
         }
@@ -563,13 +576,15 @@ impl OpenAIProvider {
                     })
                     .collect()
             });
-            // We do NOT re-send prior assistant reasoning_content for ordinary
-            // openai-compat models. Reasoning models re-derive their chain of
-            // thought each turn, so round-tripping the full verbose reasoning is
-            // pure context bloat (and grows unboundedly across a tool loop) —
-            // OpenAI's own API and codex both drop it.
+            // Preserve provider continuation fields according to the selected
+            // protocol, not a blanket assumption that prior reasoning is waste.
+            // DeepSeek's tool-enabled API requires prior reasoning on ALL
+            // assistant rows, including answers without tool calls:
+            // https://api-docs.deepseek.com/guides/thinking_mode/
+            // Without tools, DeepSeek ignores that field. The route's hints
+            // remain authoritative for compatible/non-official endpoints.
             //
-            // kimi-k2/k3 are the exception. With thinking enabled kimi-k2 (a)
+            // With thinking enabled kimi-k2 (a)
             // returns 400 "reasoning_content is missing in assistant tool call
             // message" if the field is absent, AND (b) per kimi's docs preserves
             // historical assistant reasoning for multi-step tool-use continuity
@@ -580,10 +595,9 @@ impl OpenAIProvider {
             // presence check when it's absent.
             //
             // kimi-k2/k3 are detected via fixed_temperature + model name
-            // containing "kimi-k2"/"kimi-k3". Other models (e.g. deepseek-v4,
-            // verified live to return 200 without the field, and non-official
-            // nvidia/vllm endpoints that don't expect it) get no
-            // reasoning_content at all.
+            // containing "kimi-k2"/"kimi-k3". Only Kimi receives a fabricated
+            // stub; missing DeepSeek history stays missing rather than being
+            // replaced with invented reasoning.
             let model_lower = self.model.to_lowercase();
             let needs_reasoning_stub = self.hints.fixed_temperature
                 && (model_lower.contains("kimi-k2")
@@ -594,7 +608,12 @@ impl OpenAIProvider {
                     || model_lower == "k3"
                     || model_lower.starts_with("k3-")
                     || model_lower.starts_with("kimi-for-coding"));
-            let reasoning = if role == "assistant" && needs_reasoning_stub {
+            let deepseek_tool_continuation = self.hints.reasoning_style
+                == ReasoningStyle::EffortAndThinkingToggle
+                && !tools.is_empty();
+            let reasoning = if role == "assistant" && deepseek_tool_continuation {
+                m.reasoning_content.as_deref()
+            } else if role == "assistant" && needs_reasoning_stub {
                 match m.reasoning_content.as_deref() {
                     Some(r) if !r.is_empty() => Some(r),
                     _ => Some("."),
@@ -605,11 +624,12 @@ impl OpenAIProvider {
 
             let mut content = build_openai_content(m, &content_hints, scope_root);
             if m.role == MessageRole::Tool {
-                let shown = crate::tool_media::for_tool_row(
+                let shown = crate::tool_media::for_tool_row_with_image_history(
                     messages,
                     index,
                     content_hints.lacks_vision,
                     content_hints.lacks_video,
+                    content_hints.retain_tool_images,
                 );
                 if let Some(note) = shown.note.as_deref() {
                     content = append_note(content, note);
@@ -1341,22 +1361,25 @@ fn is_image_modality_error(body: &str) -> bool {
 /// inlined (i.e. images are not already stripped by the configured
 /// `lacks_vision`). Decides whether a 400 is worth retrying text-only.
 fn request_has_user_images(messages: &[Message], hints: &ModelHints) -> bool {
-    !hints.lacks_vision && request_has_media(messages, vision::is_image)
+    !hints.lacks_vision && request_has_media(messages, vision::is_image, hints.retain_tool_images)
 }
 
 /// A user row's media, or a current-batch tool row's: both go out inline.
-fn request_has_media(messages: &[Message], kind: fn(&str) -> bool) -> bool {
+fn request_has_media(messages: &[Message], kind: fn(&str) -> bool, retain_history: bool) -> bool {
     messages.iter().enumerate().any(|(i, m)| {
         m.media.iter().any(|p| kind(p))
             && (m.role == MessageRole::User
-                || (m.role == MessageRole::Tool && crate::tool_media::is_current(messages, i)))
+                || (m.role == MessageRole::Tool
+                    && (retain_history || crate::tool_media::is_current(messages, i))))
     })
 }
 
 /// Whether the request carries a user-row video we would have sent as a
 /// `video_url` part. Decides whether a refusal is worth retrying without it.
 fn request_has_user_videos(messages: &[Message], hints: &ModelHints) -> bool {
-    !hints.lacks_video && !hints.lacks_vision && request_has_media(messages, vision::is_video)
+    !hints.lacks_video
+        && !hints.lacks_vision
+        && request_has_media(messages, vision::is_video, false)
 }
 
 fn request_has_user_media(messages: &[Message], hints: &ModelHints) -> bool {
@@ -2065,6 +2088,7 @@ mod tests {
             fixed_temperature: false,
             lacks_vision: true,
             lacks_video: false,
+            retain_tool_images: false,
             merge_system_messages: false,
             reasoning_style: ReasoningStyle::EffortAndThinkingToggle,
         };
@@ -2515,11 +2539,9 @@ mod tests {
     }
 
     #[test]
-    fn build_request_drops_prior_reasoning_content_for_non_kimi_model() {
-        // (a) A non-kimi reasoning model must NOT have prior verbose
-        // reasoning_content round-tripped back into the request — reasoning
-        // models re-derive their chain of thought each turn, so re-sending it
-        // is pure context bloat. The field must be absent entirely.
+    fn build_request_drops_deepseek_reasoning_when_no_tools_are_sent() {
+        // DeepSeek ignores prior reasoning on requests without tools. The
+        // tool-enabled continuity contract is tested separately below.
         let p = OpenAIProvider::new("key", "deepseek-v4-pro");
         let mut assistant = msg("the final answer");
         assistant.role = MessageRole::Assistant;
@@ -2539,6 +2561,102 @@ mod tests {
             "non-kimi model must drop prior reasoning_content, got: {:?}",
             a.get("reasoning_content")
         );
+    }
+
+    #[test]
+    fn should_preserve_deepseek_reasoning_when_tools_are_sent() {
+        let tools = [ToolSpec {
+            name: "read_file".into(),
+            description: "Read a workspace file".into(),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+        }];
+        for model in ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"] {
+            let provider = OpenAIProvider::new("key", model);
+            let mut assistant = msg("Prior answer without a tool call");
+            assistant.role = MessageRole::Assistant;
+            assistant.reasoning_content = Some("retained provider reasoning\n精确保留".into());
+            // Exercise transcript serialization too: resumed history must keep
+            // the actual provider field, including on a prior non-tool answer.
+            let assistant: Message =
+                serde_json::from_value(serde_json::to_value(assistant).unwrap()).unwrap();
+            let messages = [assistant, msg("Continue with the available tools")];
+            let value = serde_json::to_value(provider.build_request(
+                &messages,
+                &tools,
+                &ChatConfig::default(),
+                false,
+            ))
+            .unwrap();
+            assert_eq!(
+                value["messages"][0]["reasoning_content"], "retained provider reasoning\n精确保留",
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_not_invent_deepseek_reasoning_for_history_without_it() {
+        let tools = [ToolSpec {
+            name: "read_file".into(),
+            description: "Read a workspace file".into(),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+        }];
+        let provider = OpenAIProvider::new("key", "deepseek-flash");
+        for reasoning in [None, Some(String::new())] {
+            let mut assistant = msg("Imported answer");
+            assistant.role = MessageRole::Assistant;
+            assistant.reasoning_content = reasoning.clone();
+            let value = serde_json::to_value(provider.build_request(
+                &[assistant],
+                &tools,
+                &ChatConfig::default(),
+                false,
+            ))
+            .unwrap();
+            assert_eq!(
+                value["messages"][0]
+                    .get("reasoning_content")
+                    .and_then(|v| v.as_str()),
+                reasoning.as_deref()
+            );
+        }
+    }
+
+    #[test]
+    fn should_keep_deepseek_continuation_route_scoped() {
+        let tools = [ToolSpec {
+            name: "read_file".into(),
+            description: "Read a workspace file".into(),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+        }];
+        let mut assistant = msg("Previous result");
+        assistant.role = MessageRole::Assistant;
+        assistant.reasoning_content = Some("retained provider field".into());
+        let messages = [assistant];
+        let config = ChatConfig {
+            // Reflection requests retain tools but forbid new calls. They
+            // still need the same provider continuation fields.
+            tool_choice: crate::ToolChoice::None,
+            ..Default::default()
+        };
+        for (url, expected) in [
+            (
+                "https://api.deepseek.com/v1",
+                Some("retained provider field"),
+            ),
+            ("http://localhost:8000/v1", None),
+        ] {
+            let provider = OpenAIProvider::new("key", "deepseek-flash").with_base_url(url);
+            let value =
+                serde_json::to_value(provider.build_request(&messages, &tools, &config, false))
+                    .unwrap();
+            assert_eq!(
+                value["messages"][0]
+                    .get("reasoning_content")
+                    .and_then(|v| v.as_str()),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2774,6 +2892,7 @@ mod tests {
             fixed_temperature: true,
             lacks_vision: true,
             lacks_video: false,
+            retain_tool_images: false,
             merge_system_messages: false,
             reasoning_style: ReasoningStyle::None,
         });
@@ -3142,6 +3261,44 @@ mod tests {
             parts[1]["text"].as_str().unwrap().contains("call_1"),
             "{}",
             parts[1]
+        );
+    }
+
+    #[test]
+    fn should_retain_tool_images_and_request_prefix_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = media_loop(dir.path());
+        let later = media_loop_continued(dir.path());
+        let hints: ModelHints = serde_json::from_value(serde_json::json!({
+            "retain_tool_images": true
+        }))
+        .unwrap();
+        let provider = OpenAIProvider::new("key", "deepseek-v4-flash").with_hints(hints.clone());
+        let a = serde_json::to_value(provider.build_request(
+            &first,
+            &[],
+            &ChatConfig::default(),
+            false,
+        ))
+        .unwrap();
+        let b = serde_json::to_value(provider.build_request(
+            &later,
+            &[],
+            &ChatConfig::default(),
+            false,
+        ))
+        .unwrap();
+        let previous = a["messages"].as_array().unwrap();
+        let current = b["messages"].as_array().unwrap();
+        assert_eq!(
+            &current[..previous.len()],
+            previous.as_slice(),
+            "old image must remain in the same place: {b}"
+        );
+        assert!(b.to_string().contains("data:image/png"));
+        assert!(
+            request_has_user_images(&later, &hints),
+            "historical images must participate in modality fallback"
         );
     }
 

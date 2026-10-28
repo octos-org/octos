@@ -404,7 +404,13 @@ pub fn external_turn_tool_allowed(name: &str) -> bool {
 /// survive. The names alone would not do: a plugin or MCP server can offer a
 /// tool under an allowlisted name.
 pub fn confine_external_turn_tools(registry: &mut octos_agent::ToolRegistry) {
-    registry.retain_builtin(external_turn_tool_allowed);
+    // O-015-A (#2862 regression): the allowlist pass also has to keep the
+    // dispatch gateway pair alive — dropping run_tool/discover_tools flips
+    // the registry to pre-dispatcher semantics and re-exposed 18 builtin
+    // tools to EXTERNAL turns while the host's own turns on the same session
+    // stayed on the six-tool compact surface (a privilege inversion;
+    // serve_host_managed's intersection assertion encodes external ⊆ host).
+    registry.retain_external_turn_surface(external_turn_tool_allowed);
 }
 
 /// Host-managed authentication and lifecycle state (`AppState::host_managed`).

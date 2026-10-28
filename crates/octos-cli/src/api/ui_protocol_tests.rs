@@ -14410,7 +14410,7 @@ fn coding_tool_status_distinguishes_registered_hidden_tools_from_missing_tools()
     let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
     registry.set_context_filter(vec!["read".into()]);
 
-    let visible = model_visible_tool_names(Some(&registry));
+    let visible = model_callable_tool_names(Some(&registry));
     let registered = registered_tool_names(Some(&registry));
     assert!(!visible.iter().any(|name| name == "exec_command"));
     assert!(registered.iter().any(|name| name == "exec_command"));
@@ -32099,6 +32099,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         human_approval_rules: None,
         system_prompt: "test-system-prompt".to_string(),
         prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+            uses_bundled_base: false,
             pre_memory: "test-system-prompt".to_string(),
             post_memory: String::new(),
         },

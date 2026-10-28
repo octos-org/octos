@@ -296,7 +296,10 @@ fn summarize_message(msg: &Message, context: &[Message]) -> String {
             let mut parts = Vec::new();
             if let Some(ref calls) = msg.tool_calls {
                 for call in calls {
-                    parts.push(format!("- Called {}", call.name));
+                    parts.push(format!(
+                        "- Called {}",
+                        crate::tools::dispatcher::logical_call(&call.name, &call.arguments).0
+                    ));
                 }
             }
             if !msg.content.is_empty() {
@@ -351,7 +354,9 @@ fn find_tool_name(tool_msg: &Message, messages: &[Message]) -> String {
             if let Some(ref calls) = msg.tool_calls {
                 for call in calls {
                     if call.id == *target_id {
-                        return call.name.clone();
+                        return crate::tools::dispatcher::logical_call(&call.name, &call.arguments)
+                            .0
+                            .to_string();
                     }
                 }
             }
@@ -968,10 +973,12 @@ impl CompactionRunner {
                 if let Some(ref calls) = msg.tool_calls {
                     for call in calls {
                         id_to_meta.entry(call.id.clone()).or_insert_with(|| {
+                            let (name, arguments) =
+                                crate::tools::dispatcher::logical_call(&call.name, &call.arguments);
                             (
-                                call.name.clone(),
+                                name.to_string(),
                                 turn_counter,
-                                describe_tool_call(&call.name, &call.arguments),
+                                describe_tool_call(name, arguments),
                             )
                         });
                     }
@@ -1312,8 +1319,10 @@ pub fn latest_plan_snapshot(messages: &[Message]) -> Option<String> {
     for message in messages.iter().rev() {
         if let Some(calls) = message.tool_calls.as_ref() {
             for call in calls.iter().rev() {
-                if call.name == "update_plan" {
-                    if let Some(plan) = render_plan_checklist(&call.arguments) {
+                let (name, arguments) =
+                    crate::tools::dispatcher::logical_call(&call.name, &call.arguments);
+                if name == "update_plan" {
+                    if let Some(plan) = render_plan_checklist(arguments) {
                         return Some(plan);
                     }
                 }
@@ -2363,6 +2372,19 @@ mod tests {
         // Plan-free conversations carry no block.
         let plain = compact_messages(&[Message::user("hi")], 1024);
         assert!(!plain.contains(PLAN_BLOCK_BEGIN), "{plain}");
+    }
+
+    #[test]
+    fn fixed_dispatcher_plan_survives_compaction_without_rewriting_wire_call() {
+        let mut message = plan_message(
+            serde_json::json!([{"step":"validate deployment","status":"in_progress"}]),
+        );
+        let call = &mut message.tool_calls.as_mut().unwrap()[0];
+        call.arguments = serde_json::json!({"name":"update_plan","arguments":call.arguments});
+        call.name = "run_tool".into();
+        let summary = compact_messages(&[message.clone()], 1024);
+        assert!(summary.contains("- [>] validate deployment"), "{summary}");
+        assert_eq!(message.tool_calls.unwrap()[0].name, "run_tool");
     }
 
     /// #2132 multi-pass: after pass 1 drops the tool-call rows, the block

@@ -1,6 +1,8 @@
 //! Context window trimming and fallback truncation.
 
 use octos_core::{Message, MessageRole};
+use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use tracing::{info, warn};
 
 use super::Agent;
@@ -9,6 +11,38 @@ use crate::compaction_tiered::Tier1Report;
 use crate::prompt_context::{PromptContextPhase, PromptContextRequest};
 
 impl Agent {
+    /// Cached reads assert that their bodies are still visible to this model
+    /// context. A compaction that discards those bodies invalidates the claim,
+    /// even when it emits no summary or preservation validation then fails.
+    pub(super) fn invalidate_compacted_file_reads(&self) {
+        if let Some(cache) = &self.file_state_cache {
+            cache.clear();
+        }
+    }
+
+    /// Context bridges may replace the vector on every canonical projection.
+    /// Track tool bodies only while there are read claims to protect, without
+    /// copying large payloads or treating an appended tail as compaction.
+    pub(super) fn cached_tool_result_visibility(
+        &self,
+        messages: &[Message],
+    ) -> Option<HashSet<u64>> {
+        self.file_state_cache
+            .as_ref()
+            .filter(|cache| !cache.is_empty())
+            .map(|_| tool_result_visibility(messages))
+    }
+
+    pub(super) fn invalidate_removed_tool_results(
+        &self,
+        before: Option<HashSet<u64>>,
+        messages: &[Message],
+    ) {
+        if before.is_some_and(|before| !before.is_subset(&tool_result_visibility(messages))) {
+            self.invalidate_compacted_file_reads();
+        }
+    }
+
     pub(super) fn trim_to_context_window(&self, messages: &mut Vec<Message>) -> bool {
         use crate::compaction::{MIN_RECENT_MESSAGES, compact_messages, find_recent_boundary};
         use octos_llm::context::{estimate_message_tokens, estimate_tokens};
@@ -74,6 +108,7 @@ impl Agent {
                 participant: None,
             },
         );
+        self.invalidate_compacted_file_reads();
 
         info!(
             original_tokens = total,
@@ -109,6 +144,9 @@ impl Agent {
             return Ok(None);
         }
         let outcome = runner.run(messages, CompactionPhase::Preflight);
+        if outcome.performed {
+            self.invalidate_compacted_file_reads();
+        }
         info!(
             phase = "preflight",
             performed = outcome.performed,
@@ -150,6 +188,7 @@ impl Agent {
         };
         let report = runner.run_tier1(messages, protected_tool_call_ids, pass);
         if report.performed() {
+            self.invalidate_compacted_file_reads();
             info!(
                 results_pruned = report.results_pruned,
                 bytes_reclaimed = report.bytes_reclaimed,
@@ -206,6 +245,7 @@ impl Agent {
         }
         let outcome = runner.run(messages, CompactionPhase::TurnEnd);
         if outcome.performed {
+            self.invalidate_compacted_file_reads();
             info!(
                 phase = "turn_end",
                 iteration,
@@ -244,6 +284,7 @@ impl Agent {
             model_id: self.llm.model_id().to_owned(),
             context_window: self.llm.context_window(),
         };
+        let visible_tool_results = self.cached_tool_result_visibility(messages);
         match manager.prepare_prompt(request, messages) {
             Ok(report) => {
                 if report.prompt_replaced || report.compaction_performed {
@@ -269,6 +310,9 @@ impl Agent {
                 );
             }
         }
+        // A bridge may mutate before returning an error. Conversely,
+        // prompt_replaced alone can be a no-op or append-only projection.
+        self.invalidate_removed_tool_results(visible_tool_results, messages);
     }
 
     /// Run the post-compaction validator rail against the declared
@@ -347,6 +391,7 @@ impl Agent {
         if keep_from > 1 {
             let dropped = keep_from - 1;
             messages.drain(1..keep_from);
+            self.invalidate_compacted_file_reads();
             warn!(
                 messages_dropped = dropped,
                 messages_kept = messages.len(),
@@ -357,4 +402,24 @@ impl Agent {
         }
         false
     }
+}
+
+fn tool_result_visibility(messages: &[Message]) -> HashSet<u64> {
+    messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .map(|message| {
+            let mut hasher = DefaultHasher::new();
+            // Canonicalizing a provider ID preserves its paired result and
+            // must not invalidate otherwise unchanged file-read knowledge.
+            message
+                .tool_call_id
+                .as_deref()
+                .map(super::message_repair::normalize_tool_call_id)
+                .hash(&mut hasher);
+            message.content.hash(&mut hasher);
+            message.media.hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect()
 }

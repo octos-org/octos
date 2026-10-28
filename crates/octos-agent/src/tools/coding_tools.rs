@@ -17,11 +17,12 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+use super::command_output::{CommandOutput, wait_with_capture};
 use super::{
     ConcurrencyClass, TOOL_APPROVAL_CTX, TOOL_CTX, Tool, ToolApprovalDecision, ToolApprovalRequest,
     ToolContext, ToolResult,
@@ -49,10 +50,15 @@ fn exec_sessions() -> Arc<Mutex<HashMap<String, ExecSession>>> {
 
 #[derive(Clone)]
 struct ExecSession {
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
-    output: Arc<Mutex<String>>,
+    stdin: Arc<Mutex<Option<SessionInput>>>,
+    output: CommandOutput,
     exit_code: Arc<Mutex<Option<i32>>>,
     sandboxed: bool,
+}
+
+enum SessionInput {
+    Pipe(ChildStdin),
+    Terminal(super::terminal::TerminalWriter),
 }
 
 fn next_exec_session_id() -> String {
@@ -180,46 +186,6 @@ fn resolve_optional_workdir(
     };
     super::resolve_path_with_scope(base_dir, workdir, filesystem_scope)
         .map_err(|_| format!("workdir outside allowed filesystem scope: {workdir}"))
-}
-
-async fn append_reader_output<R>(mut reader: R, output: Arc<Mutex<String>>, label: &'static str)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut buf = [0_u8; 8192];
-    loop {
-        let read = match reader.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => read,
-        };
-        let chunk = String::from_utf8_lossy(&buf[..read]);
-        let mut guard = output.lock().await;
-        if label == "stderr" && !chunk.is_empty() {
-            guard.push_str("\n--- stderr ---\n");
-        }
-        guard.push_str(&chunk);
-        truncate_capture_in_place(&mut guard);
-    }
-}
-
-/// Trim an accumulating capture buffer to its last [`MAX_CAPTURE_BYTES`] once it
-/// grows past twice that, keeping the tail.
-///
-/// `len - MAX_CAPTURE_BYTES` is a raw BYTE offset that need not fall on a UTF-8
-/// char boundary — slicing there directly panics ("byte index N is not a char
-/// boundary") when a multibyte char (CJK/emoji) straddles it. Because this runs
-/// inside a `tokio::spawn`ed reader task, that panic silently kills the reader
-/// and the stream stops capturing. Advance the cut to the next char boundary
-/// first so the slice is always valid.
-fn truncate_capture_in_place(guard: &mut String) {
-    if guard.len() > MAX_CAPTURE_BYTES * 2 {
-        let mut keep_from = guard.len().saturating_sub(MAX_CAPTURE_BYTES);
-        while keep_from < guard.len() && !guard.is_char_boundary(keep_from) {
-            keep_from += 1;
-        }
-        let trimmed = guard[keep_from..].to_string();
-        *guard = format!("... (earlier output truncated)\n{trimmed}");
-    }
 }
 
 async fn request_command_approval(
@@ -385,7 +351,7 @@ impl Tool for ExecCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command. For long-running commands, set tty=true or yield_time_ms to receive a session_id and continue with write_stdin."
+        "Run a shell command. Set tty=true for a real terminal, or yield_time_ms for a pipe session; continue with write_stdin. Truncated output includes a full log path."
     }
 
     fn tags(&self) -> &[&str] {
@@ -405,7 +371,7 @@ impl Tool for ExecCommandTool {
                 "workdir": {"type": "string"},
                 "timeout_secs": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_SECS},
                 "yield_time_ms": {"type": "integer", "minimum": 0},
-                "max_output_tokens": {"type": "integer", "minimum": 1},
+                "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Maximum estimated tokens in captured output (ASCII ~4 chars/token, non-ASCII ~1.5); not bytes or an exact provider tokenizer."},
                 "tty": {"type": "boolean"}
             }
         })
@@ -520,6 +486,7 @@ impl ExecCommandTool {
         #[cfg(unix)]
         cmd.process_group(0);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        let capture = CommandOutput::new(&self.base_dir)?;
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -530,32 +497,27 @@ impl ExecCommandTool {
                 });
             }
         };
-        // Capture the pid BEFORE `wait_with_output` consumes the child — the
+        // Capture the pid BEFORE `wait_with_capture` consumes the child — the
         // timeout arm needs it to kill the process tree (dropping the wait
         // future does NOT kill a tokio child).
         let child_pid = child.id();
         // Armed for the whole wait: a dropped future (user interrupt ->
         // `agent_task.abort()`) reaches neither arm below. See `ChildGroupGuard`.
         let mut group_guard = ChildGroupGuard::new(child_pid);
-        let result = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        let result = timeout(
+            Duration::from_secs(timeout_secs),
+            wait_with_capture(child, capture.clone()),
+        )
+        .await;
         group_guard.disarm();
         match result {
             Ok(Ok(output)) => {
-                let mut text = String::new();
-                text.push_str(&String::from_utf8_lossy(&output.stdout));
-                if !output.stderr.is_empty() {
-                    if !text.is_empty() {
-                        text.push_str("\n--- stderr ---\n");
-                    }
-                    text.push_str(&String::from_utf8_lossy(&output.stderr));
-                }
+                let mut view = capture.view(false);
+                let mut text = view.render(MAX_CAPTURE_BYTES - 2048);
                 if text.is_empty() {
                     text.push_str("(no output)");
                 }
-                text.push_str(&format!(
-                    "\n\nExit code: {}",
-                    output.status.code().unwrap_or(-1)
-                ));
+                text.push_str(&format!("\n\nExit code: {}", output.code().unwrap_or(-1)));
                 // #28c — file-change receipt on the coding-session exec
                 // path too (same shared 28a module; same five acceptance
                 // semantics as ShellTool / BashTool).
@@ -576,26 +538,35 @@ impl ExecCommandTool {
                         );
                     }
                 }
-                // Scan BEFORE truncation (the denial line may be what gets
-                // cut), append AFTER (so the hint itself survives the cut).
-                let hint =
-                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
-                let max = input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES);
+                // Scan the retained tail before the final budget cut; earlier
+                // diagnostics remain available through the full log.
+                let hint = sandbox_denial_hint(!self.sandbox.is_noop(), output.success(), &text);
+                let max = MAX_CAPTURE_BYTES;
                 let mut out = truncate_output(text, max);
                 if let Some(hint) = hint {
                     out.push_str(hint);
                 }
                 Ok(ToolResult {
-                    output: out,
-                    success: output.status.success(),
+                    output: view.apply_token_budget(out, input.max_output_tokens),
+                    success: output.success(),
+                    structured_metadata: Some(view.metadata()),
                     ..Default::default()
                 })
             }
-            Ok(Err(error)) => Ok(ToolResult {
-                output: format!("Failed to execute command: {error}"),
-                success: false,
-                ..Default::default()
-            }),
+            Ok(Err(error)) => {
+                capture.record_error(&error);
+                let mut view = capture.view(false);
+                let text = format!(
+                    "Failed to execute command: {error}\n{}",
+                    view.render(MAX_CAPTURE_BYTES - 2048)
+                );
+                Ok(ToolResult {
+                    output: view.apply_token_budget(text, input.max_output_tokens),
+                    success: false,
+                    structured_metadata: Some(view.metadata()),
+                    ..Default::default()
+                })
+            }
             Err(_) => {
                 // Dropping the wait future does NOT kill a tokio child, so
                 // the wrapper shell and any grandchildren keep running. Kill
@@ -603,8 +574,15 @@ impl ExecCommandTool {
                 // SIGKILL on Unix, `taskkill /F /T` on Windows) — the same
                 // helper the `bash` tool uses.
                 kill_timed_out_child(child_pid).await;
+                let mut view = capture.view(false);
+                let text = format!(
+                    "Command timed out after {timeout_secs} seconds\n{}\nFull output: {}",
+                    view.render(MAX_CAPTURE_BYTES - 2048),
+                    view.path.display()
+                );
                 Ok(ToolResult {
-                    output: format!("Command timed out after {timeout_secs} seconds"),
+                    output: view.apply_token_budget(text, input.max_output_tokens),
+                    structured_metadata: Some(view.metadata()),
                     success: false,
                     ..Default::default()
                 })
@@ -618,12 +596,6 @@ impl ExecCommandTool {
         cwd: PathBuf,
         input: ExecCommandInput,
     ) -> Result<ToolResult> {
-        // Fail closed on an unhonorable sandbox config BEFORE spawning
-        // anything: the typed refusal (model-facing Display — operator
-        // remediation stays in the logs) IS the tool result. The wrap-level
-        // refusal command would also fail, but a background command discards
-        // its stderr, and the model deserves the full refusal text, not a
-        // truncated stderr line.
         if let Some(refusal) = self.sandbox.refusal() {
             return Ok(ToolResult {
                 output: refusal.to_string(),
@@ -631,94 +603,118 @@ impl ExecCommandTool {
                 ..Default::default()
             });
         }
-
-        let mut cmd = self.sandbox.wrap_command(&command, &cwd);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                return Ok(ToolResult {
-                    output: format!("Failed to execute command: {error}"),
-                    success: false,
-                    ..Default::default()
-                });
-            }
-        };
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let session_id = next_exec_session_id();
-        let output = Arc::new(Mutex::new(String::new()));
+        if self.bash_file_writes == BashFileWrites::Deny
+            && !super::shell::command_allows_write_explicitly(&command)
+            && super::shell::command_looks_like_file_write(&command)
+        {
+            return Ok(ToolResult {
+                output: "Command refused by tool_policy.bash_file_writes=deny".into(),
+                success: false,
+                ..Default::default()
+            });
+        }
+        let output = CommandOutput::new(&self.base_dir)?;
         let exit_code = Arc::new(Mutex::new(None));
-        // #2136 review: after the child exits, give the pipe readers a
-        // BOUNDED grace to drain before publishing the exit code, then
-        // publish regardless. A plain reader-join deadlocked when a
-        // descendant (a backgrounded `server &`, a daemon that inherits
-        // stdout) keeps a pipe write-end open — EOF never arrives and the
-        // session reported `running` forever. The grace closes the
-        // round-2 race (a fast-exiting command's final output — e.g. a
-        // denial line — is captured within the window, since its fds close
-        // at exit) without hanging on a surviving descendant; combined
-        // with sampling the exit code BEFORE the output, "not running"
-        // implies "output drained" in the common case.
-        const READER_DRAIN_GRACE: Duration = Duration::from_millis(200);
-        let stdout_reader = stdout
-            .map(|stdout| tokio::spawn(append_reader_output(stdout, output.clone(), "stdout")));
-        let stderr_reader = stderr
-            .map(|stderr| tokio::spawn(append_reader_output(stderr, output.clone(), "stderr")));
-        let exit_code_for_wait = exit_code.clone();
-        tokio::spawn(async move {
-            let code = child.wait().await.ok().and_then(|status| status.code());
-            let _ = tokio::time::timeout(READER_DRAIN_GRACE, async {
-                if let Some(handle) = stdout_reader {
-                    let _ = handle.await;
-                }
-                if let Some(handle) = stderr_reader {
-                    let _ = handle.await;
-                }
-            })
-            .await;
-            *exit_code_for_wait.lock().await = Some(code.unwrap_or(-1));
-        });
-        exec_sessions().lock().await.insert(
-            session_id.clone(),
-            ExecSession {
-                stdin: Arc::new(Mutex::new(stdin)),
-                output: output.clone(),
-                exit_code: exit_code.clone(),
-                sandboxed: !self.sandbox.is_noop(),
-            },
-        );
+        let status = exit_code.clone();
+        let seconds = input
+            .timeout_secs
+            .unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)
+            .clamp(1, MAX_EXEC_TIMEOUT_SECS);
+        let mut cmd = self.sandbox.wrap_command(&command, &cwd);
+        sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        let (stdin, pid) = if input.tty.unwrap_or(false) {
+            let terminal = super::terminal::launch(&cmd, output.clone(), seconds)?;
+            let pid = terminal.pid;
+            tokio::spawn(async move {
+                *status.lock().await = Some(terminal.done.await.unwrap_or(-1));
+            });
+            (Some(SessionInput::Terminal(terminal.writer)), pid)
+        } else {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(unix)]
+            cmd.process_group(0);
+            let mut child = cmd.spawn()?;
+            let pid = child.id();
+            let stdin = child.stdin.take().map(SessionInput::Pipe);
+            let captured = output.clone();
+            tokio::spawn(async move {
+                let mut guard = ChildGroupGuard::new(pid);
+                let code = match timeout(
+                    Duration::from_secs(seconds),
+                    wait_with_capture(child, captured.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(code)) => code.code().unwrap_or(-1),
+                    Ok(Err(error)) => {
+                        captured.record_error(error);
+                        -1
+                    }
+                    Err(_) => {
+                        captured.record_error(format!(
+                            "Command timed out after {seconds} seconds; capture interrupted"
+                        ));
+                        kill_timed_out_child(pid).await;
+                        -1
+                    }
+                };
+                captured.finish();
+                guard.disarm();
+                *status.lock().await = Some(code);
+            });
+            (stdin, pid)
+        };
+        // Cancellation before the first yielded result must not leak the child.
+        let mut startup_guard = ChildGroupGuard::new(pid);
+        let session_id = next_exec_session_id();
+        let session = ExecSession {
+            stdin: Arc::new(Mutex::new(stdin)),
+            output,
+            exit_code,
+            sandboxed: !self.sandbox.is_noop(),
+        };
+        exec_sessions()
+            .lock()
+            .await
+            .insert(session_id.clone(), session.clone());
         tokio::time::sleep(Duration::from_millis(
-            input.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_MS),
+            input
+                .yield_time_ms
+                .unwrap_or(DEFAULT_EXEC_YIELD_MS)
+                .min(30_000),
         ))
         .await;
-        // #2136 review round 3, P2: sample the exit code FIRST, then the
-        // output. The exit-code task sets the code only AFTER joining the
-        // pipe readers, so `code.is_some()` (not running) guarantees the
-        // output buffer is fully drained — reading output after the code
-        // therefore never sees a stale/empty capture with running:false.
-        let code = *exit_code.lock().await;
-        let captured = output.lock().await.clone();
-        Ok(ToolResult {
-            output: json!({
-                "session_id": session_id,
-                "running": code.is_none(),
-                "exit_code": code,
-                "output": session_output_payload(
-                    captured,
-                    code,
-                    !self.sandbox.is_noop(),
-                    input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES),
-                ),
-            })
-            .to_string(),
-            success: true,
-            ..Default::default()
-        })
+        let result = exec_session_result(&session_id, &session, input.max_output_tokens).await;
+        startup_guard.disarm();
+        Ok(result)
+    }
+}
+
+async fn exec_session_result(id: &str, session: &ExecSession, budget: Option<usize>) -> ToolResult {
+    let code = *session.exit_code.lock().await;
+    if code.is_some() {
+        session.stdin.lock().await.take();
+    }
+    let mut view = session.output.view(true);
+    let text = session_output_payload(
+        view.render(MAX_CAPTURE_BYTES),
+        code,
+        session.sandboxed,
+        MAX_CAPTURE_BYTES,
+    );
+    let text = view.apply_token_budget(text, budget);
+    let mut payload = view.metadata();
+    payload["session_id"] = json!(id);
+    payload["running"] = json!(code.is_none());
+    payload["exit_code"] = json!(code);
+    payload["output"] = json!(text);
+    ToolResult {
+        output: payload.to_string(),
+        success: true,
+        structured_metadata: Some(view.metadata()),
+        ..Default::default()
     }
 }
 
@@ -742,7 +738,7 @@ impl Tool for WriteStdinTool {
     }
 
     fn description(&self) -> &str {
-        "Write characters to a running exec_command session and return recent captured output."
+        "Write characters to an exec_command session and return only output since the previous read, with a complete log path and byte offsets."
     }
 
     fn tags(&self) -> &[&str] {
@@ -757,7 +753,7 @@ impl Tool for WriteStdinTool {
                 "session_id": {"type": "string"},
                 "chars": {"type": "string"},
                 "yield_time_ms": {"type": "integer", "minimum": 0},
-                "max_output_tokens": {"type": "integer", "minimum": 1}
+                "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Maximum estimated tokens in captured output (ASCII ~4 chars/token, non-ASCII ~1.5); not bytes or an exact provider tokenizer."}
             }
         })
     }
@@ -774,37 +770,36 @@ impl Tool for WriteStdinTool {
         };
         if let Some(chars) = input.chars.as_deref() {
             let mut stdin = session.stdin.lock().await;
-            if let Some(stdin) = stdin.as_mut() {
-                stdin.write_all(chars.as_bytes()).await?;
-                stdin.flush().await?;
-            } else {
-                return Ok(ToolResult {
-                    output: format!("exec session {} has no open stdin", input.session_id),
-                    success: false,
-                    ..Default::default()
-                });
+            match stdin.as_mut() {
+                Some(SessionInput::Pipe(pipe)) => {
+                    pipe.write_all(chars.as_bytes()).await?;
+                    pipe.flush().await?;
+                }
+                Some(SessionInput::Terminal(writer)) => {
+                    let writer = writer.clone();
+                    let bytes = chars.as_bytes().to_vec();
+                    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                        use std::io::Write;
+                        let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
+                        writer.write_all(&bytes)?;
+                        writer.flush()
+                    })
+                    .await??;
+                }
+                None => {
+                    return Ok(ToolResult {
+                        output: format!("exec session {} has no open stdin", input.session_id),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
             }
         }
-        tokio::time::sleep(Duration::from_millis(input.yield_time_ms.unwrap_or(250))).await;
-        // #2136 review round 3, P2: code before output (see spawn_session).
-        let code = *session.exit_code.lock().await;
-        let output = session.output.lock().await.clone();
-        Ok(ToolResult {
-            output: json!({
-                "session_id": input.session_id,
-                "running": code.is_none(),
-                "exit_code": code,
-                "output": session_output_payload(
-                    output,
-                    code,
-                    session.sandboxed,
-                    input.max_output_tokens.unwrap_or(MAX_CAPTURE_BYTES),
-                ),
-            })
-            .to_string(),
-            success: true,
-            ..Default::default()
-        })
+        tokio::time::sleep(Duration::from_millis(
+            input.yield_time_ms.unwrap_or(250).min(30_000),
+        ))
+        .await;
+        Ok(exec_session_result(&input.session_id, &session, input.max_output_tokens).await)
     }
 }
 
@@ -814,6 +809,8 @@ macro_rules! simple_codex_tool {
 
         #[async_trait]
         impl Tool for $name {
+
+
             fn name(&self) -> &str {
                 $tool_name
             }
@@ -1023,6 +1020,10 @@ fn normalize_spawn_agent_args_with_role(
             "context",
             "model",
             "context_window",
+            "max_iterations",
+            "skill_paths",
+            "owned_paths",
+            "isolation",
             "additional_instructions",
             "workflow",
             "backend",
@@ -1238,15 +1239,13 @@ fn normalize_spawn_agent_args_with_role(
     Value::Object(out)
 }
 
-fn newest_spawned_task(
-    supervisor: &crate::task_supervisor::TaskSupervisor,
-    before: &HashSet<String>,
-) -> Option<crate::task_supervisor::BackgroundTask> {
-    supervisor
-        .get_all_tasks()
-        .into_iter()
-        .filter(|task| !before.contains(&task.id))
-        .max_by_key(|task| task.started_at)
+fn spawned_task_id(result: &ToolResult) -> Option<&str> {
+    let metadata = result.structured_metadata.as_ref()?;
+    metadata
+        .get("task_id")
+        .or_else(|| metadata.get("agent_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
 }
 
 async fn spawn_agent_without_delegate(args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
@@ -1333,6 +1332,17 @@ impl Tool for SpawnAgentTool {
                 "role": {"type": "string"},
                 "mode": {"type": "string", "enum": ["background", "sync"]},
                 "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                "skill_paths": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Canonical instruction files the child must read through its permitted tools."
+                },
+                "owned_paths": {"type": "array", "items": {"type": "string"},
+                    "description": "Native shared-worker exclusive output paths; forwarded unchanged to spawn ownership admission."},
+                "isolation": {"type": "string", "enum": ["shared", "worktree"]},
+                "max_iterations": {
+                    "type": "integer", "minimum": 0,
+                    "description": "Optional iteration limit; 0 or omitted is unlimited. Host policy takes precedence."
+                },
                 "role": {
                     "type": "string",
                     "description": "Optional backend-owned role template that resolves to a tool budget + sandbox + model preference + prompt prefix. When set, the resolved template seeds the spawn payload; inline `allowed_tools` still wins.",
@@ -1424,27 +1434,36 @@ impl Tool for SpawnAgentTool {
             return spawn_agent_without_delegate(args, ctx).await;
         };
         let spawn_args = normalize_spawn_agent_args_with_role(args, role_template);
-        let before = ctx
-            .task_supervisor
-            .as_ref()
-            .map(|supervisor| {
-                supervisor
-                    .get_all_tasks()
-                    .into_iter()
-                    .map(|task| task.id)
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
         let result = delegate.execute_with_context(ctx, &spawn_args).await?;
         if !result.success {
             return Ok(result);
         }
-        let task = ctx
-            .task_supervisor
-            .as_ref()
-            .and_then(|supervisor| newest_spawned_task(supervisor, &before));
+        // Correlate this invocation by its returned native handle. Snapshot
+        // differences/newest-task heuristics can select a concurrent sibling.
+        let task = spawned_task_id(&result).and_then(|id| {
+            ctx.task_supervisor
+                .as_ref()
+                .and_then(|supervisor| supervisor.get_task(id))
+        });
+        // The external agent_mcp backend completes its dispatch inline even
+        // when the caller omitted mode; it has no native supervised handle.
+        let completes_inline = spawn_args.get("mode").and_then(Value::as_str) == Some("sync")
+            || spawn_args.get("backend").and_then(Value::as_str) == Some("agent_mcp");
+        if task.is_none() && !completes_inline {
+            return Ok(ToolResult {
+                output: format!(
+                    "spawn_agent: native spawn returned no resolvable supervised task_id. The worker may already be running; do not blindly respawn. Native output: {}",
+                    result.output
+                ),
+                success: false,
+                structured_metadata: Some(
+                    json!({"codex_tool": "spawn_agent", "reason": "spawn_missing_task_id"}),
+                ),
+                ..Default::default()
+            });
+        }
         let mut payload = json!({
-            "status": "started",
+            "status": if task.is_some() { "started" } else { "completed" },
             "output": result.output,
         });
         let mut resolved_task_id: Option<String> = None;
@@ -1554,6 +1573,10 @@ impl Tool for SpawnAgentTool {
             "octos_tool": "spawn",
             "spawn_args": spawn_args.clone(),
         });
+        if let Some(task_id) = resolved_task_id {
+            meta["task_id"] = json!(task_id);
+            meta["agent_id"] = json!(task_id);
+        }
         if let Some(template) = role_template {
             meta["role"] = json!(template.name);
             meta["role_summary"] = serde_json::to_value(template.summary()).unwrap_or(Value::Null);
@@ -1700,13 +1723,26 @@ struct AgentTargetInput {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Deserialize)]
+struct WaitAgentInput {
+    #[serde(flatten)]
+    target: AgentTargetInput,
+    #[serde(default)]
+    include_output: bool,
+    #[serde(default)]
+    max_output_bytes: Option<usize>,
+}
+
 fn collect_agent_statuses(
     supervisor: &crate::task_supervisor::TaskSupervisor,
     targets: &[String],
+    session_key: Option<&str>,
 ) -> (Vec<Value>, bool) {
     let statuses: Vec<Value> = targets
         .iter()
-        .map(|target| match supervisor.get_task(target) {
+        .map(|target| match supervisor.get_task(target).filter(|task| {
+            session_key.is_none_or(|session| task.session_key.as_deref() == Some(session))
+        }) {
             Some(task) => json!({
                 "agent_id": target,
                 "status": task.status.as_str(),
@@ -1719,7 +1755,8 @@ fn collect_agent_statuses(
             None => json!({
                 "agent_id": target,
                 "status": "unknown",
-                "terminal": true,
+                "terminal": false,
+                "error": "Task not found. Use the task ID returned by spawn or the id from check_background_tasks, not a label.",
             }),
         })
         .collect();
@@ -1730,16 +1767,31 @@ fn collect_agent_statuses(
 }
 
 async fn wait_agent_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
-    let input: AgentTargetInput =
-        serde_json::from_value(args.clone()).unwrap_or(AgentTargetInput {
-            target: None,
-            agent_id: None,
-            targets: Vec::new(),
-            timeout_ms: None,
-        });
+    let input: WaitAgentInput = match serde_json::from_value(args.clone()) {
+        Ok(input) => input,
+        Err(error) => {
+            return Ok(ToolResult {
+                output: format!("Invalid wait_agent arguments: {error}"),
+                success: false,
+                ..Default::default()
+            });
+        }
+    };
+    let include_output = input.include_output;
+    let output_budget = input.max_output_bytes.unwrap_or(4096).min(8192);
+    let input = input.target;
     let mut targets = input.targets;
     if let Some(target) = input.target.or(input.agent_id) {
         targets.push(target);
+    }
+    if targets.is_empty() || targets.iter().any(|target| target.trim().is_empty()) {
+        return Ok(ToolResult {
+            output:
+                "wait_agent requires at least one nonempty task ID in targets, target, or agent_id"
+                    .to_owned(),
+            success: false,
+            ..Default::default()
+        });
     }
     let Some(supervisor) = ctx.task_supervisor.as_ref() else {
         return Ok(ToolResult {
@@ -1750,16 +1802,41 @@ async fn wait_agent_body(_: &dyn Tool, args: &Value, ctx: &ToolContext) -> Resul
     };
     let timeout_ms = input.timeout_ms.unwrap_or(30_000).min(3_600_000);
     let started = Instant::now();
-    let statuses = loop {
-        let (statuses, all_terminal) = collect_agent_statuses(supervisor, &targets);
-        if all_terminal || started.elapsed() >= Duration::from_millis(timeout_ms) {
+    let mut statuses = loop {
+        let (statuses, all_terminal) =
+            collect_agent_statuses(supervisor, &targets, ctx.parent_session_key.as_deref());
+        let has_unknown = statuses.iter().any(|status| status["status"] == "unknown");
+        if has_unknown || all_terminal || started.elapsed() >= Duration::from_millis(timeout_ms) {
             break statuses;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
+    if include_output {
+        let per_task_budget = output_budget / statuses.len().max(1);
+        for status in &mut statuses {
+            if status["terminal"] != true {
+                continue;
+            }
+            let Some(task) = status["agent_id"]
+                .as_str()
+                .and_then(|id| supervisor.get_task(id))
+            else {
+                continue;
+            };
+            if let Some(mut output) = task.final_output {
+                let truncated = output.len() > per_task_budget;
+                octos_core::truncate_utf8(&mut output, per_task_budget, "");
+                status["output"] = json!(output);
+                status["output_truncated"] = json!(truncated);
+            } else {
+                // Absence of captured output is not proof of an empty answer.
+                status["output"] = Value::Null;
+            }
+        }
+    }
     Ok(ToolResult {
         output: json!({ "agents": statuses }).to_string(),
-        success: true,
+        success: statuses.iter().all(|status| status["status"] != "unknown"),
         ..Default::default()
     })
 }
@@ -1849,12 +1926,35 @@ simple_codex_tool!(
     "Resume a Codex-compatible subagent handle.",
     resume_agent_body
 );
-simple_codex_tool!(
-    WaitAgentTool,
-    "wait_agent",
-    "Inspect or wait on Codex-compatible subagent handles.",
-    wait_agent_body
-);
+pub struct WaitAgentTool;
+
+#[async_trait]
+impl Tool for WaitAgentTool {
+    fn name(&self) -> &str {
+        "wait_agent"
+    }
+    fn description(&self) -> &str {
+        "Wait for exact task IDs. With include_output=true, return status, artifacts and bounded final output together; avoid separate polling and result calls. Unknown IDs are not completed tasks."
+    }
+    fn tags(&self) -> &[&str] {
+        &["code"]
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object", "properties": {
+            "targets": {"type":"array", "items":{"type":"string"}, "description":"Exact task IDs returned by spawn."},
+            "target": {"type":"string", "description":"Single task ID; alias: agent_id."},
+            "timeout_ms": {"type":"integer", "minimum":0, "maximum":3600000},
+            "include_output": {"type":"boolean", "description":"Return final output together with status and artifact paths (default false)."},
+            "max_output_bytes": {"type":"integer", "minimum":0, "maximum":8192, "description":"Total final-output budget across tasks (default 4096)."}
+        }})
+    }
+    async fn execute(&self, args: &Value) -> Result<ToolResult> {
+        self.execute_with_context(&ToolContext::zero(), args).await
+    }
+    async fn execute_with_context(&self, ctx: &ToolContext, args: &Value) -> Result<ToolResult> {
+        wait_agent_body(self, args, ctx).await
+    }
+}
 simple_codex_tool!(
     CloseAgentTool,
     "close_agent",
@@ -1953,7 +2053,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Run a one-shot shell command and return stdout/stderr. Non-PTY, non-interactive. Codex-compatible alias of exec_command / shell with a stripped-down schema (`cmd`, optional `timeout_ms`)."
+        "Run a noninteractive shell command. Truncated output includes a full log path for read_file/grep."
     }
 
     fn tags(&self) -> &[&str] {
@@ -2090,6 +2190,7 @@ impl Tool for BashTool {
         #[cfg(unix)]
         cmd.process_group(0);
         sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
+        let capture = CommandOutput::new(&self.base_dir)?;
         let child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -2103,7 +2204,7 @@ impl Tool for BashTool {
         // codex review (#1172) P2: `tokio::process::Child` does NOT
         // kill the underlying process on drop, so a `timeout()` that
         // expires would leave the shell running and able to mutate
-        // the workspace later. Save the PID before `wait_with_output`
+        // the workspace later. Save the PID before `wait_with_capture`
         // takes ownership of the child, then on timeout send
         // SIGTERM -> brief grace -> SIGKILL (Unix) or `taskkill /F /T`
         // (Windows). Mirrors `ShellTool`'s kill-on-timeout path.
@@ -2111,22 +2212,20 @@ impl Tool for BashTool {
         // Armed for the whole wait: a dropped future (user interrupt ->
         // `agent_task.abort()`) reaches neither arm below. See `ChildGroupGuard`.
         let mut group_guard = ChildGroupGuard::new(child_pid);
-        let waited = timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await;
+        let waited = timeout(
+            Duration::from_secs(timeout_secs),
+            wait_with_capture(child, capture.clone()),
+        )
+        .await;
         group_guard.disarm();
         match waited {
             Ok(Ok(output)) => {
-                let mut text = String::new();
-                text.push_str(&String::from_utf8_lossy(&output.stdout));
-                if !output.stderr.is_empty() {
-                    if !text.is_empty() {
-                        text.push_str("\n--- stderr ---\n");
-                    }
-                    text.push_str(&String::from_utf8_lossy(&output.stderr));
-                }
+                let mut view = capture.view(false);
+                let mut text = view.render(MAX_CAPTURE_BYTES - 2048);
                 if text.is_empty() {
                     text.push_str("(no output)");
                 }
-                let exit_code = output.status.code().unwrap_or(-1);
+                let exit_code = output.code().unwrap_or(-1);
                 text.push_str(&format!("\n\nExit code: {exit_code}"));
                 // #28c — file-change receipt appended ONCE to THIS result's
                 // tail (28a semantics: prompt-cache stable, never a system
@@ -2150,32 +2249,46 @@ impl Tool for BashTool {
                     }
                 }
                 // Scan BEFORE truncation, append AFTER — see run_to_completion.
-                let hint =
-                    sandbox_denial_hint(!self.sandbox.is_noop(), output.status.success(), &text);
+                let hint = sandbox_denial_hint(!self.sandbox.is_noop(), output.success(), &text);
                 let mut out = truncate_output(text, MAX_CAPTURE_BYTES);
                 if let Some(hint) = hint {
                     out.push_str(hint);
                 }
                 Ok(ToolResult {
                     output: out,
-                    success: output.status.success(),
-                    structured_metadata: Some(json!({
-                        "codex_tool": "bash",
-                        "octos_tool": "exec_command",
-                        "exit_code": exit_code,
-                    })),
+                    success: output.success(),
+                    structured_metadata: Some({
+                        let mut metadata = view.metadata();
+                        metadata["codex_tool"] = json!("bash");
+                        metadata["exit_code"] = json!(exit_code);
+                        metadata
+                    }),
                     ..Default::default()
                 })
             }
-            Ok(Err(error)) => Ok(ToolResult {
-                output: format!("Failed to execute command: {error}"),
-                success: false,
-                ..Default::default()
-            }),
+            Ok(Err(error)) => {
+                capture.record_error(&error);
+                let mut view = capture.view(false);
+                Ok(ToolResult {
+                    output: format!(
+                        "Failed to execute command: {error}\n{}",
+                        view.render(MAX_CAPTURE_BYTES - 2048)
+                    ),
+                    success: false,
+                    structured_metadata: Some(view.metadata()),
+                    ..Default::default()
+                })
+            }
             Err(_) => {
                 kill_timed_out_child(child_pid).await;
+                let mut view = capture.view(false);
                 Ok(ToolResult {
-                    output: format!("Command timed out after {timeout_secs} seconds"),
+                    output: format!(
+                        "Command timed out after {timeout_secs} seconds\n{}\nFull output: {}",
+                        view.render(MAX_CAPTURE_BYTES - 2048),
+                        view.path.display()
+                    ),
+                    structured_metadata: Some(view.metadata()),
                     success: false,
                     ..Default::default()
                 })
@@ -2251,7 +2364,7 @@ impl Drop for ChildGroupGuard {
 /// then SIGKILL if any process remains. On Windows uses `taskkill /F /T`.
 /// Errors are swallowed because the call is best-effort cleanup —
 /// the timeout result has already been returned to the caller.
-async fn kill_timed_out_child(child_pid: Option<u32>) {
+pub(super) async fn kill_timed_out_child(child_pid: Option<u32>) {
     let Some(pid) = child_pid else {
         return;
     };
@@ -2378,6 +2491,8 @@ struct DelegateInput {
     task: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    owned_paths: Vec<String>,
 }
 
 const DEFAULT_DELEGATE_TIMEOUT_MS: u64 = 300_000;
@@ -2455,6 +2570,8 @@ impl Tool for DelegateAliasTool {
                     "type": "string",
                     "description": "Task description for the subagent"
                 },
+                "owned_paths": {"type": "array", "items": {"type": "string"},
+                    "description": "Exclusive output paths forwarded to native spawn; required for shared writers under host claim policy."},
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1000,
@@ -2589,13 +2706,9 @@ impl Tool for DelegateAliasTool {
             "mode": "background",
             "role": template.name,
             "allowed_tools": template.to_spawn_compatible_allow(),
+            "owned_paths": input.owned_paths,
         });
 
-        let before: HashSet<String> = supervisor
-            .get_all_tasks()
-            .into_iter()
-            .map(|task| task.id)
-            .collect();
         let spawn_result = spawn_agent.execute_with_context(ctx, &spawn_args).await?;
         if !spawn_result.success {
             return Ok(ToolResult {
@@ -2610,7 +2723,9 @@ impl Tool for DelegateAliasTool {
                 ..Default::default()
             });
         };
-        let Some(task_record) = newest_spawned_task(&supervisor, &before) else {
+        let Some(task_record) =
+            spawned_task_id(&spawn_result).and_then(|id| supervisor.get_task(id))
+        else {
             return Ok(ToolResult {
                 output: "delegate: spawn_agent did not register a new task with the supervisor"
                     .to_string(),
@@ -2684,6 +2799,7 @@ impl Tool for DelegateAliasTool {
                 "codex_tool": "delegate",
                 "role": template.name,
                 "agent_id": agent_id,
+                "task_id": agent_id,
                 "artifacts": artifacts,
                 "terminal": terminal,
             })),
@@ -2807,7 +2923,7 @@ impl Tool for ViewImageTool {
     }
 
     fn description(&self) -> &str {
-        "Inspect a local image file (PNG / JPEG / GIF / WEBP / BMP / SVG). Returns format, MIME type, and byte length so the host UI can render a preview."
+        "Inspect a local image file. PNG, JPEG and WEBP images up to 5 MiB are attached to the model; other formats or oversized images return metadata and an explicit reason they were not shown."
     }
 
     fn tags(&self) -> &[&str] {
@@ -2894,89 +3010,106 @@ impl Tool for ViewImageTool {
             FilesystemScope::Workspace => Some(self.base_dir.as_path()),
             FilesystemScope::Host => None,
         };
-        let (bytes, byte_length) = match read_image_header_no_follow(&resolved, ancestor_stop) {
-            Ok(pair) => pair,
-            Err(error) => {
-                return Ok(ToolResult {
-                    output: format!("view_image: failed to read {path}: {error}"),
-                    success: false,
-                    structured_metadata: Some(json!({
-                        "codex_tool": "view_image",
-                        "error_kind": "coding_tool_missing",
-                        "path": path,
-                    })),
-                    ..Default::default()
-                });
-            }
-        };
-        let (format, mime) = match detect_image_format(&bytes) {
-            Some(pair) => pair,
-            None => {
-                return Ok(ToolResult {
-                    output: format!(
-                        "view_image: {path} does not match a recognised image header (PNG / JPEG / GIF / WEBP / BMP / SVG)"
-                    ),
-                    success: false,
-                    structured_metadata: Some(json!({
-                        "codex_tool": "view_image",
-                        "error_kind": "coding_tool_denied",
-                        "reason": "unrecognised_image_format",
-                        "path": path,
-                    })),
-                    ..Default::default()
-                });
-            }
-        };
-        // Shown to the model when the provider can take it: a raster format
-        // every vision API accepts, under the smallest common size ceiling,
-        // and with an extension the providers' image detection recognises
-        // (they key on the path, not the bytes). Otherwise the model gets
-        // the metadata and a reason, never a silent nothing.
-        let shown = if !VISION_FORMATS.contains(&format) {
-            Err(format!(
-                "{format} is not a format the model can view; convert it to PNG or JPEG"
-            ))
-        } else if byte_length > MAX_MODEL_IMAGE_BYTES {
-            Err(format!(
-                "{byte_length} bytes is over the {MAX_MODEL_IMAGE_BYTES}-byte limit for showing an image to the model; downscale it"
-            ))
-        } else if !octos_llm::vision::is_image(&resolved.to_string_lossy()) {
-            Err("the file needs a .png, .jpg, .jpeg, .gif or .webp extension to be shown to the model".to_string())
-        } else {
-            Ok(())
-        };
-        let mut payload = json!({
+        inspect_image_file(&resolved, path, ancestor_stop, self.name())
+    }
+}
+
+/// Shared image read path. Callers must resolve and authorize the path first;
+/// this helper keeps bounded header reads, symlink checks and model-media limits
+/// identical for `read_file` and `view_image`.
+pub(super) fn inspect_image_file(
+    resolved: &std::path::Path,
+    path: &str,
+    ancestor_stop: Option<&std::path::Path>,
+    tool_name: &str,
+) -> Result<ToolResult> {
+    let (bytes, byte_length) = match read_image_header_no_follow(resolved, ancestor_stop) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return Ok(ToolResult {
+                output: format!("{tool_name}: failed to read {path}: {error}"),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": tool_name,
+                    "error_kind": "coding_tool_missing",
+                    "path": path,
+                })),
+                ..Default::default()
+            });
+        }
+    };
+    let (format, mime) = match detect_image_format(&bytes) {
+        Some(pair) => pair,
+        None => {
+            return Ok(ToolResult {
+                output: format!(
+                    "{tool_name}: {path} does not match a recognised image header (PNG / JPEG / GIF / WEBP / BMP / SVG)"
+                ),
+                success: false,
+                structured_metadata: Some(json!({
+                    "codex_tool": tool_name,
+                    "error_kind": "coding_tool_denied",
+                    "reason": "unrecognised_image_format",
+                    "path": path,
+                })),
+                ..Default::default()
+            });
+        }
+    };
+    // Shown to the model when the provider can take it: a raster format
+    // every vision API accepts, under the smallest common size ceiling,
+    // and with an extension the providers' image detection recognises
+    // (they key on the path, not the bytes). Otherwise the model gets
+    // the metadata and a reason, never a silent nothing.
+    let shown = if !VISION_FORMATS.contains(&format) {
+        Err(format!(
+            "{format} is not a format the model can view; convert it to PNG or JPEG"
+        ))
+    } else if byte_length > MAX_MODEL_IMAGE_BYTES {
+        Err(format!(
+            "{byte_length} bytes is over the {MAX_MODEL_IMAGE_BYTES}-byte limit for showing an image to the model; downscale it"
+        ))
+    } else if !octos_llm::vision::is_image(&resolved.to_string_lossy()) {
+        Err(
+            "the file needs a .png, .jpg, .jpeg, .gif or .webp extension to be shown to the model"
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    };
+    let mut payload = json!({
+        "path": path,
+        "format": format,
+        "mime_type": mime,
+        "byte_length": byte_length,
+    });
+    let model_media = match &shown {
+        Ok(()) => {
+            let snapshot =
+                octos_llm::vision::snapshot_image(&resolved.to_string_lossy(), ancestor_stop)?;
+            payload["shown_to_model"] = json!(true);
+            vec![snapshot]
+        }
+        Err(reason) => {
+            payload["shown_to_model"] = json!(false);
+            payload["not_shown_because"] = json!(reason);
+            Vec::new()
+        }
+    };
+    Ok(ToolResult {
+        output: payload.to_string(),
+        success: true,
+        structured_metadata: Some(json!({
+            "codex_tool": tool_name,
             "path": path,
             "format": format,
             "mime_type": mime,
             "byte_length": byte_length,
-        });
-        let model_media = match &shown {
-            Ok(()) => {
-                payload["shown_to_model"] = json!(true);
-                vec![resolved.clone()]
-            }
-            Err(reason) => {
-                payload["shown_to_model"] = json!(false);
-                payload["not_shown_because"] = json!(reason);
-                Vec::new()
-            }
-        };
-        Ok(ToolResult {
-            output: payload.to_string(),
-            success: true,
-            structured_metadata: Some(json!({
-                "codex_tool": "view_image",
-                "path": path,
-                "format": format,
-                "mime_type": mime,
-                "byte_length": byte_length,
-                "shown_to_model": shown.is_ok(),
-            })),
-            model_media,
-            ..Default::default()
-        })
-    }
+            "shown_to_model": shown.is_ok(),
+        })),
+        model_media,
+        ..Default::default()
+    })
 }
 
 /// `view_video`: the video counterpart of [`ViewImageTool`].
@@ -3584,6 +3717,10 @@ impl ImageGenerationTool {
 
 #[async_trait]
 impl Tool for ImageGenerationTool {
+    fn is_available(&self) -> bool {
+        self.backend_bound
+    }
+
     fn name(&self) -> &str {
         "image_generation"
     }
@@ -3770,3 +3907,113 @@ fn catalog_score(entry: &ToolCatalogEntry, query: &str, tokens: &[String]) -> i3
 #[cfg(test)]
 #[path = "coding_tools_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod background_handle_contract {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext {
+            task_supervisor: Some(Arc::new(crate::TaskSupervisor::new())),
+            ..ToolContext::zero()
+        }
+    }
+
+    #[tokio::test]
+    async fn should_collect_bounded_final_output_without_leaking_sibling_tasks() {
+        let mut ctx = context();
+        ctx.parent_session_key = Some("session-a".into());
+        let supervisor = ctx.task_supervisor.as_ref().unwrap();
+        let done = supervisor.register("work", "done", Some("session-a"));
+        supervisor.record_final_output(&done, "结果完成，检查通过");
+        supervisor.mark_completed(&done, vec!["report.txt".into()]);
+        let sibling = supervisor.register("work", "sibling", Some("session-b"));
+        supervisor.record_final_output(&sibling, "SIBLING_SECRET");
+        supervisor.mark_completed(&sibling, vec![]);
+        let result = wait_agent_body(
+            &WaitAgentTool,
+            &json!({
+                "targets":[done,sibling], "timeout_ms":0, "include_output":true,
+                "max_output_bytes":12
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let payload: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(!result.success);
+        assert_eq!(payload["agents"][0]["output"], "结果");
+        assert_eq!(payload["agents"][0]["output_truncated"], true);
+        assert_eq!(payload["agents"][0]["output_files"][0], "report.txt");
+        assert_eq!(payload["agents"][1]["status"], "unknown");
+        assert!(!result.output.contains("SIBLING_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn should_reject_unknown_task_handles_without_claiming_completion() {
+        let ctx = context();
+        let result = wait_agent_body(
+            &WaitAgentTool,
+            &json!({"targets":["friendly-label"], "timeout_ms":0}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.success, "a label is not a supervisor handle");
+        let value: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["agents"][0]["status"], "unknown");
+        assert_eq!(value["agents"][0]["terminal"], false);
+        assert!(
+            value["agents"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("not found")
+        );
+    }
+
+    #[tokio::test]
+    async fn should_preserve_known_states_and_reject_a_mixed_unknown_wait() {
+        let ctx = context();
+        let supervisor = ctx.task_supervisor.as_ref().unwrap();
+        let running = supervisor.register("work", "running", None);
+        supervisor.mark_running(&running);
+        let done = supervisor.register("work", "done", None);
+        supervisor.mark_completed(&done, vec![]);
+        let valid = wait_agent_body(
+            &WaitAgentTool,
+            &json!({"targets":[running, done], "timeout_ms":0}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(valid.success);
+        let value: Value = serde_json::from_str(&valid.output).unwrap();
+        assert_eq!(value["agents"][0]["status"], "running");
+        assert_eq!(value["agents"][0]["terminal"], false);
+        assert_eq!(value["agents"][1]["status"], "completed");
+        assert_eq!(value["agents"][1]["terminal"], true);
+        let mixed = wait_agent_body(
+            &WaitAgentTool,
+            &json!({"targets":[done, "missing"], "timeout_ms":0}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!mixed.success);
+        let value: Value = serde_json::from_str(&mixed.output).unwrap();
+        assert_eq!(value["agents"][0]["terminal"], true);
+        assert_eq!(value["agents"][1]["terminal"], false);
+    }
+
+    #[tokio::test]
+    async fn should_reject_empty_or_malformed_wait_targets() {
+        let ctx = context();
+        for args in [json!({}), json!({"targets":[]}), json!({"targets":"bad"})] {
+            let result = wait_agent_body(&WaitAgentTool, &args, &ctx).await.unwrap();
+            assert!(
+                !result.success,
+                "invalid target lists cannot mean all work completed"
+            );
+        }
+    }
+}

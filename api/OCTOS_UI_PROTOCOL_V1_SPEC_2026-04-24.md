@@ -1923,6 +1923,10 @@ Optional capability feature flags:
 - `coding_tool_contract.required_tools[]` entries describe the effective
   model-visible tool name, category, status, backend implementation or alias,
   capability flag, and policy state
+- `available` includes authorized capabilities reachable through the fixed
+  `run_tool` gateway. It does not require a separate direct tool declaration;
+  the default model request still advertises only the four common tools and
+  two gateways. Policy-denied and unavailable capabilities remain excluded.
 - `coding_tool_contract.missing_required_tools[]` lists any required
   Codex-parity tools that the backend cannot expose for the effective profile
 

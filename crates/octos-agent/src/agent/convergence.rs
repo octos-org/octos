@@ -1,8 +1,9 @@
-//! Soft convergence checkpoints for long-running interactive turns.
+//! Opt-in standalone convergence checkpoints for interactive turns.
 //!
-//! Unlike a hard iteration budget, these checkpoints never end the turn.
-//! They periodically give the model a tools-disabled round in which it must
-//! synthesize evidence, notice repeated work, and choose a smaller next step.
+//! By default, observed repetition is reported inline by the tool loop. Calls,
+//! tokens, elapsed time and edit counts alone do not justify another model
+//! request. The old tools-disabled reflection is available only in explicitly
+//! selected periodic mode for compatibility and controlled comparisons.
 
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,22 @@ use octos_core::TokenUsage;
 const DEFAULT_LLM_CALL_INTERVAL: u32 = 20;
 const DEFAULT_ACTIVE_TOKEN_INTERVAL: u64 = 100_000;
 const DEFAULT_ELAPSED_INTERVAL_SECS: u64 = 300;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ReflectionMode {
+    #[default]
+    Inline,
+    Periodic,
+}
+
+impl ReflectionMode {
+    fn from_setting(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("periodic") => Self::Periodic,
+            _ => Self::Inline,
+        }
+    }
+}
 
 /// Typed chronological envelope for a reflection. It is recorded once as a
 /// USER-role context event, never as a System row: Anthropic hoists every
@@ -76,8 +93,9 @@ impl CheckpointReason {
     }
 }
 
-/// Per-turn state for recurring, non-terminal reflection checkpoints.
+/// Per-turn state for optional, non-terminal reflection checkpoints.
 pub(super) struct ConvergenceController {
+    mode: ReflectionMode,
     started_at: Instant,
     last_checkpoint_at: Instant,
     llm_call_interval: u32,
@@ -119,14 +137,19 @@ impl ConvergenceController {
             10,
             86_400,
         ));
-        Self::new(
+        let mut controller = Self::new(
             started_at,
             llm_call_interval,
             active_token_interval,
             elapsed_interval,
-        )
+        );
+        controller.mode =
+            ReflectionMode::from_setting(std::env::var("OCTOS_CONVERGENCE_MODE").ok().as_deref());
+        controller
     }
 
+    /// Explicit thresholds select the legacy periodic mode (also used by the
+    /// deterministic test seam). Production defaults go through `from_env`.
     pub(super) fn new(
         started_at: Instant,
         llm_call_interval: u32,
@@ -134,6 +157,7 @@ impl ConvergenceController {
         elapsed_interval: Duration,
     ) -> Self {
         Self {
+            mode: ReflectionMode::Periodic,
             started_at,
             last_checkpoint_at: started_at,
             llm_call_interval,
@@ -149,10 +173,16 @@ impl ConvergenceController {
         }
     }
 
-    /// Queue an early checkpoint. File churn has priority over periodic
-    /// thresholds because it carries the most concrete evidence of drift.
+    /// Queue an early checkpoint only in legacy periodic mode. Forced signals
+    /// precede periodic thresholds; edit counts alone do not prove stalled work.
     pub(super) fn force(&mut self, reason: CheckpointReason) {
-        self.pending_reason = Some(reason);
+        if self.standalone_enabled() {
+            self.pending_reason = Some(reason);
+        }
+    }
+
+    pub(super) fn standalone_enabled(&self) -> bool {
+        self.mode == ReflectionMode::Periodic
     }
 
     /// Record one COMPLETED action call. Call this after a successful action
@@ -167,6 +197,11 @@ impl ConvergenceController {
     /// an N-call checkpoint fires only once N action calls have finished and
     /// the reflection runs before action call N+1.
     pub(super) fn due(&mut self, usage: &TokenUsage) -> Option<CheckpointReason> {
+        // Repetition evidence already accompanies the real tool result. Do
+        // not duplicate it with a separate history replay/tool-choice change.
+        if !self.standalone_enabled() {
+            return None;
+        }
         if let Some(reason) = self.pending_reason.take() {
             return Some(reason);
         }
@@ -322,6 +357,39 @@ mod tests {
         for _ in 0..count {
             controller.record_action_call();
         }
+    }
+
+    #[test]
+    fn should_require_explicit_periodic_mode_for_standalone_reflection() {
+        for setting in [None, Some("inline"), Some(""), Some("typo")] {
+            assert_eq!(
+                ReflectionMode::from_setting(setting),
+                ReflectionMode::Inline
+            );
+        }
+        assert_eq!(
+            ReflectionMode::from_setting(Some(" periodic ")),
+            ReflectionMode::Periodic
+        );
+    }
+
+    #[test]
+    fn should_ignore_periodic_thresholds_and_forced_calls_in_inline_mode() {
+        let mut controller = new_controller(2, 1_000);
+        controller.mode = ReflectionMode::Inline;
+        controller.last_checkpoint_at = Instant::now() - Duration::from_secs(7_200);
+        record_action_calls(&mut controller, 100);
+        let usage = TokenUsage {
+            input_tokens: 500_000,
+            output_tokens: 100_000,
+            ..Default::default()
+        };
+        controller.force(CheckpointReason::PeerPolling {
+            tool_name: "peer_gather".into(),
+        });
+        assert!(controller.due(&usage).is_none());
+        assert!(controller.take_context_message().is_none());
+        assert_eq!(controller.checkpoints(), 0);
     }
 
     #[test]

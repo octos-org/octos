@@ -33,6 +33,13 @@ use tracing::{info, warn};
 use crate::subprocess_env::{EnvAllowlist, sanitize_command_env, should_forward_env_name};
 use crate::tools::{Tool, ToolRegistry, ToolResult};
 
+#[path = "mcp_content.rs"]
+mod content;
+
+#[cfg(test)]
+#[path = "mcp_wire_tests.rs"]
+mod wire_tests;
+
 /// A live rmcp client session (any transport). Kept alive behind an `Arc`; when
 /// the last reference drops, rmcp closes the transport and (stdio) reaps the
 /// child via `kill_on_drop`. `sanitize_command_env` internally strips the shared
@@ -349,6 +356,8 @@ impl McpClient {
     const PROTECTED_NAMES: &[&str] = &[
         "shell",
         "read_file",
+        "discover_tools",
+        "run_tool",
         "write_file",
         "edit_file",
         "diff_edit",
@@ -569,6 +578,7 @@ impl McpClient {
                     input_schema: spec.input_schema,
                     service: spec.service,
                     concurrency_class: spec.concurrency_class,
+                    workspace: registry.workspace_root().map(std::path::Path::to_path_buf),
                 },
                 crate::tools::ToolOrigin::Mcp,
             );
@@ -583,6 +593,7 @@ struct McpTool {
     input_schema: serde_json::Value,
     service: McpService,
     concurrency_class: crate::tools::ConcurrencyClass,
+    workspace: Option<std::path::PathBuf>,
 }
 
 #[async_trait]
@@ -604,6 +615,15 @@ impl Tool for McpTool {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        self.execute_with_context(&crate::tools::ToolContext::zero(), args)
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        ctx: &crate::tools::ToolContext,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
         let mut param = CallToolRequestParams::new(self.name.clone());
         param.arguments = args.as_object().cloned();
 
@@ -617,20 +637,14 @@ impl Tool for McpTool {
             })?
             .map_err(|e| eyre::eyre!("MCP tool '{}' call failed: {e}", self.name))?;
 
-        // Flatten text content parts; non-text parts (images/resources) are
-        // dropped as the agent tool surface is text-only.
-        let output = result
-            .content
-            .iter()
-            .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        Ok(ToolResult {
-            output,
-            success: !result.is_error.unwrap_or(false),
-            ..Default::default()
-        })
+        let current = std::env::current_dir()?;
+        let workspace = ctx
+            .session_scope
+            .as_ref()
+            .map(|s| s.workspace())
+            .or(self.workspace.as_deref())
+            .unwrap_or(&current);
+        Ok(content::render(result, workspace))
     }
 }
 

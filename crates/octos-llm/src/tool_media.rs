@@ -63,6 +63,18 @@ pub fn for_tool_row(
     lacks_vision: bool,
     lacks_video: bool,
 ) -> ToolMedia {
+    for_tool_row_with_image_history(messages, idx, lacks_vision, lacks_video, false)
+}
+
+/// Opt-in image history for providers that retain visual evidence across tool
+/// batches. The normal modality guards still apply; old videos stay omitted.
+pub fn for_tool_row_with_image_history(
+    messages: &[Message],
+    idx: usize,
+    lacks_vision: bool,
+    lacks_video: bool,
+    retain_images: bool,
+) -> ToolMedia {
     let Some(msg) = messages.get(idx) else {
         return ToolMedia::default();
     };
@@ -85,6 +97,30 @@ pub fn for_tool_row(
         return ToolMedia::default();
     }
     if !is_current(messages, idx) {
+        if retain_images {
+            let mut notes = Vec::new();
+            if lacks_vision && !images.is_empty() {
+                notes.push(format!(
+                    "[image returned by this call cannot be shown to this model: {}. Say so; do not guess its contents.]",
+                    images.iter().map(|p| file_name(p)).collect::<Vec<_>>().join(", ")
+                ));
+            }
+            if !videos.is_empty() {
+                notes.push(format!(
+                    "[media this call returned was shown to you when it ran: {}]",
+                    videos
+                        .iter()
+                        .map(|p| file_name(p))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            return ToolMedia {
+                images: if lacks_vision { Vec::new() } else { images },
+                note: (!notes.is_empty()).then(|| notes.join("\n")),
+                ..ToolMedia::default()
+            };
+        }
         let names: Vec<String> = images
             .iter()
             .chain(videos.iter())
@@ -244,6 +280,23 @@ mod tests {
         assert!(blind.is_empty());
         let note = blind.note.unwrap();
         assert!(note.contains("a.png") && note.contains("b.mp4"), "{note}");
+    }
+
+    #[test]
+    fn retained_images_still_obey_modality_guards_and_do_not_retain_video() {
+        let msgs = vec![
+            row(MessageRole::Assistant, &[], true),
+            row(MessageRole::Tool, &["/t/old.png", "/t/old.mp4"], false),
+            row(MessageRole::Assistant, &[], true),
+            row(MessageRole::Tool, &[], false),
+        ];
+        let visible = for_tool_row_with_image_history(&msgs, 1, false, false, true);
+        assert_eq!(visible.images, vec!["/t/old.png"]);
+        assert!(visible.videos.is_empty());
+        assert!(visible.note.unwrap().contains("old.mp4"));
+        let blind = for_tool_row_with_image_history(&msgs, 1, true, false, true);
+        assert!(blind.is_empty());
+        assert!(blind.note.unwrap().contains("cannot be shown"));
     }
 
     #[test]
