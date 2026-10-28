@@ -215,7 +215,11 @@ impl<'a> ImageTransport<'a> {
                     .text("expires_after[seconds]", "86400");
                 self.endpoint.strip_suffix("/v1").unwrap_or(&self.endpoint)
             }
-            _ => unreachable!(),
+            MediaTransportMode::Auto | MediaTransportMode::Inline => {
+                return Err(eyre!(
+                    "image upload requires a resolved file transport mode"
+                ));
+            }
         };
         let response = self
             .client
@@ -344,7 +348,11 @@ impl<'a> ImageTransport<'a> {
                         MediaTransportMode::DeepSeekFiles => {
                             *part = serde_json::json!({"type":"file","file_id":reference.id})
                         }
-                        _ => unreachable!(),
+                        MediaTransportMode::Auto | MediaTransportMode::Inline => {
+                            return Err(eyre!(
+                                "image reference requires a resolved file transport mode"
+                            ));
+                        }
                     }
                     used.push(reference);
                 }

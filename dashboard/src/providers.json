@@ -151,6 +151,18 @@
       ] },
       { "id": "kimi-for-coding-highspeed", "input": 0.0, "output": 0.0, "max_output": 131072, "endpoints": [
         { "id": "moonshot-coding", "label": "Kimi Coding Plan", "base_url": "https://api.kimi.com/coding/v1", "api_key_env": "KIMI_API_KEY" }
+      ] },
+      { "id": "kimi-for-coding", "input": 0.0, "output": 0.0, "max_output": 0, "endpoints": [
+        { "id": "moonshot-coding", "label": "Kimi Coding Plan", "base_url": "https://api.kimi.com/coding/v1", "api_key_env": "KIMI_API_KEY" }
+      ] },
+      { "id": "k3-256k", "input": 0.0, "output": 0.0, "max_output": 131072, "endpoints": [
+        { "id": "moonshot-coding", "label": "Kimi Coding Plan", "base_url": "https://api.kimi.com/coding/v1", "api_key_env": "KIMI_API_KEY" }
+      ] },
+      { "id": "k3.1-pro-highspeed", "input": 0.0, "output": 0.0, "max_output": 0, "endpoints": [
+        { "id": "moonshot-coding", "label": "Kimi Coding Plan", "base_url": "https://api.kimi.com/coding/v1", "api_key_env": "KIMI_API_KEY" }
+      ] },
+      { "id": "k3.1-pro", "input": 0.0, "output": 0.0, "max_output": 0, "endpoints": [
+        { "id": "moonshot-coding", "label": "Kimi Coding Plan", "base_url": "https://api.kimi.com/coding/v1", "api_key_env": "KIMI_API_KEY" }
       ] }
     ]
   },
