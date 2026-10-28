@@ -28,6 +28,13 @@ facts and preferences, working procedures, environment facts, mistakes to avoid 
 injected memory back and is NOT new evidence.\n\
 - Every item MUST cite the transcript indices it rests on in \"evidence\" — the \
 [N:role] labels. Items without valid citations are discarded.\n\
+- Some lines name who spoke as (participant: NAME), e.g. several tutors \
+talking with the same user. Keep that scope in the item content: a shared \
+experience the user found helpful (e.g. an explanation they said works for them) \
+is durable and names the participant it happened with; a request the user \
+addressed to one participant applies to that participant only — never widen it \
+into a general preference; a request the user says applies to everyone stays \
+general. Never attribute anything to a participant who was not in that exchange.\n\
 - Skip: one-off requests, transient state (live metrics, timestamps), anything \
 already present in CURRENT MEMORY unchanged, secrets/credentials, and content \
 that merely restates memory.\n\
@@ -133,6 +140,14 @@ pub(crate) fn validate_items(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn should_keep_participant_scope_in_the_extraction_rules() {
+        assert!(EXTRACTION_SYSTEM_PROMPT.contains("(participant: NAME)"));
+        assert!(EXTRACTION_SYSTEM_PROMPT.contains("never widen it"));
+        assert!(EXTRACTION_SYSTEM_PROMPT.contains("names the participant it happened with"));
+    }
+
     use super::*;
 
     fn lines() -> Vec<InputLine> {

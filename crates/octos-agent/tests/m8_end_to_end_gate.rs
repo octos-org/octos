@@ -204,6 +204,7 @@ async fn end_to_end_resume_covers_transcript_and_worktree_and_cache() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Assistant,
@@ -229,6 +230,7 @@ async fn end_to_end_resume_covers_transcript_and_worktree_and_cache() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         Message {
             role: MessageRole::Tool,
@@ -241,6 +243,7 @@ async fn end_to_end_resume_covers_transcript_and_worktree_and_cache() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
     ];
 
@@ -277,6 +280,7 @@ async fn end_to_end_resume_covers_transcript_and_worktree_and_cache() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }];
     let err = ResumePolicy::sanitize(bad_transcript, None, Some(&gone_worktree))
         .expect_err("missing worktree must refuse");

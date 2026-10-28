@@ -47,8 +47,9 @@ pub use task::{
     TaskStatus, TokenUsage, UnsupportedSessionSummaryVersion,
 };
 pub use types::{
-    AgentId, ClientMessageId, EpisodeRef, IdentityError, IdentityKind, MAIN_PROFILE_ID, Message,
-    MessageRole, SessionKey, TaskId, ThreadId, ToolCall, TurnId, is_reserved_channel_name,
+    AgentId, ClientMessageId, EpisodeRef, IdentityError, IdentityKind, MAIN_PROFILE_ID,
+    MESSAGE_PARTICIPANT_MAX_BYTES, Message, MessageRole, SessionKey, TaskId, ThreadId, ToolCall,
+    TurnId, is_reserved_channel_name,
 };
 pub use ui_protocol::{EventEnvelope, TurnContext};
 pub use utils::{

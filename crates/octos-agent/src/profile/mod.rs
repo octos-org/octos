@@ -10,15 +10,10 @@
 //! across a dozen startup sites; afterwards, a single profile declaration
 //! consolidates the envelope.
 //!
-//! The built-in `coding` profile is the no-flag default and carries a lean
-//! core-coding allow list (files, shell, search, memory, spawn, the workspace
-//! check tool, plan tracking, user questions, tool_search and view_image) so `octos chat`
-//! does not ship every tool schema to the LLM on every round. The allow-list
-//! filter narrows the VISIBLE registry, so tools it excludes (web/research/
-//! media/pipeline) are restored via the `coding-full` built-in, which
-//! preserves the pre-lean unfiltered surface byte-for-byte.
-//! Alternate profiles (e.g. `swarm`) declare their own allow lists and
-//! expanded agent sets.
+//! The built-in `coding` profile uses the standard fixed dispatcher. Four
+//! common tools and two gateways are advertised; optional authorized tools
+//! remain available through discovery. Custom profiles can still narrow tool
+//! permissions and configure preloaded agents.
 //!
 //! # Forward compatibility
 //!
@@ -41,9 +36,8 @@
 //! 3. Finally the loader falls back to the crate-shipped built-in registry
 //!    (JSON files under `crates/octos-agent/src/assets/profiles/`).
 //!
-//! Today's built-in profiles are `coding` (the lean default), `coding-full`
-//! (the unfiltered pre-lean surface), and `swarm` (an allow-list extension
-//! that enables multi-worker swarm coordination tools).
+//! Built-in profiles are `coding` and `swarm`. Tool presentation is shared;
+//! profiles customize authorization and agent setup, not legacy tool surfaces.
 //!
 //! # Applied vs recorded settings
 //!
@@ -81,10 +75,6 @@ pub const PROFILE_SCHEMA_VERSION: u32 = 1;
 /// user-config search. Ordered (name, raw JSON text).
 const BUILTIN_PROFILES: &[(&str, &str)] = &[
     ("coding", include_str!("../assets/profiles/coding.json")),
-    (
-        "coding-full",
-        include_str!("../assets/profiles/coding-full.json"),
-    ),
     ("swarm", include_str!("../assets/profiles/swarm.json")),
 ];
 
@@ -104,7 +94,7 @@ pub enum ProfileSource {
 /// called out in the issue scope:
 ///
 /// - `default` — no filter; the registry passes through untouched. This is
-///   what the built-in `coding-full` profile uses so behaviour parity with
+///   what the built-in `coding` profile uses so behaviour parity with
 ///   the pre-M8.3 default path stays reachable.
 /// - `allow_list` — only the named tools survive. Names may reference
 ///   [`crate::tools::policy::ToolGroupInfo`] groups via `group:*` strings.
@@ -112,8 +102,8 @@ pub enum ProfileSource {
 ///   profiles that strip a single capability (e.g. drop `web_fetch` from
 ///   an otherwise-default set).
 ///
-/// `spawn_only` tools are *never* filtered out regardless of mode — they
-/// carry background-execution wiring that the runtime depends on.
+/// Host-installed `spawn_only` wiring is normally retained regardless of mode.
+/// Optional built-in observers opt out of that retention and are filtered.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ProfileTools {
@@ -141,8 +131,8 @@ impl ProfileTools {
     /// Mirrors [`crate::tools::ToolRegistry::filter_by_profile`]'s
     /// name-matching exactly — `group:<id>` expansion, `<prefix>*`
     /// wildcards, exact names, and the empty-allow-list pass-through —
-    /// but deliberately WITHOUT the spawn_only carve-out. Once a
-    /// spawn_only tool is registered it can never be evicted by the
+    /// but deliberately WITHOUT the legacy spawn_only carve-out. A background
+    /// tool that preserves its registration cannot be evicted by the
     /// filter, so bootstrap sites (chat/acp `run_pipeline`) consult this
     /// predicate FIRST and skip registration when the profile excludes
     /// the tool.
@@ -599,15 +589,7 @@ mod tests {
         let coding = ProfileDefinition::builtin("coding").expect("coding builtin");
         assert_eq!(coding.name, "coding");
         assert_eq!(coding.version, 1);
-        // Lean default: `coding` declares a core-loop allow list so the
-        // no-flag `octos chat` stops shipping every tool schema each round.
-        assert!(matches!(coding.tools, ProfileTools::AllowList { .. }));
-
-        // `coding-full` is the escape hatch that preserves the pre-lean
-        // unfiltered surface (one `--profile coding-full` away).
-        let full = ProfileDefinition::builtin("coding-full").expect("coding-full builtin");
-        assert_eq!(full.name, "coding-full");
-        assert!(matches!(full.tools, ProfileTools::Default));
+        assert!(matches!(coding.tools, ProfileTools::Default));
 
         let swarm = ProfileDefinition::builtin("swarm").expect("swarm builtin");
         assert_eq!(swarm.name, "swarm");
@@ -677,60 +659,21 @@ mod tests {
     fn should_load_builtin_coding_profile_without_error() {
         let coding = ProfileDefinition::builtin("coding").expect("coding");
         coding.validate().expect("valid");
-        // Lean default: the allow list covers the core coding loop ONLY.
-        // The exact envelope is pinned here so accidental JSON edits fail
-        // loudly instead of silently re-inflating (or hollowing out) the
-        // per-round tool-schema overhead.
-        match &coding.tools {
-            ProfileTools::AllowList { tools } => {
-                // #2133: the lean surface KEEPS files/shell/search/memory/spawn
-                // and ADDS the three core-loop tools it was missing — `check`,
-                // `update_plan`, `tool_search`. Only `apply_patch` is dropped
-                // (edit_file/diff_edit cover it), so the fs tools are named
-                // explicitly instead of via `group:fs`.
-                for required in [
-                    "read_file",
-                    "write_file",
-                    "edit_file",
-                    "diff_edit",
-                    "group:runtime",
-                    "group:search",
-                    "group:memory",
-                    "spawn",
-                    "ask_user_question",
-                    "check",
-                    "update_plan",
-                    "tool_search",
-                    "view_image",
-                    "view_video",
-                ] {
-                    assert!(
-                        tools.contains(&required.to_string()),
-                        "coding allow list must keep {required}, got {tools:?}",
-                    );
-                }
-                // Dropped or never-included: `apply_patch` (redundant), the
-                // `group:fs` alias (fs named explicitly to exclude apply_patch),
-                // and the heavy web / research / media / pipeline surfaces
-                // (restored via `--profile coding-full`).
-                for excluded in [
-                    "group:fs",
-                    "apply_patch",
-                    "group:web",
-                    "group:research",
-                    "group:media",
-                    "run_pipeline",
-                    "synthesize_research",
-                    "message",
-                    "cron",
-                ] {
-                    assert!(
-                        !tools.contains(&excluded.to_string()),
-                        "coding allow list must not name {excluded}",
-                    );
-                }
-            }
-            other => panic!("coding must declare a lean allow list, got {other:?}"),
+        assert!(matches!(coding.tools, ProfileTools::Default));
+        for name in [
+            "read_file",
+            "apply_patch",
+            "web_search",
+            "browser",
+            "spawn",
+            "run_pipeline",
+            "discover_tools",
+            "run_tool",
+        ] {
+            assert!(
+                coding.tools.allows(name),
+                "default profile must allow registered capability {name}"
+            );
         }
         // Today's coding default carries no compaction or permission
         // override — those live at the workspace / app-state level.
@@ -743,23 +686,8 @@ mod tests {
     }
 
     #[test]
-    fn should_load_builtin_coding_full_profile_as_unfiltered_escape_hatch() {
-        let full = ProfileDefinition::builtin("coding-full").expect("coding-full");
-        full.validate().expect("valid");
-        // `coding-full` preserves the pre-lean unfiltered registry
-        // byte-for-byte: no allow/deny list, no compaction or permission
-        // override.
-        assert!(
-            matches!(full.tools, ProfileTools::Default),
-            "coding-full must not filter tools",
-        );
-        assert!(full.compaction_policy.is_none());
-        assert_eq!(full.permissions, PermissionMode::Default);
-        // Same preloaded sub-agents as `coding` so switching profiles
-        // never changes spawn() manifest resolution.
-        let coding = ProfileDefinition::builtin("coding").expect("coding");
-        assert_eq!(full.agents, coding.agents);
-        assert!(ProfileDefinition::builtin_ids().contains(&"coding-full"));
+    fn builtin_profiles_do_not_offer_legacy_tool_surfaces() {
+        assert_eq!(ProfileDefinition::builtin_ids(), ["coding", "swarm"]);
     }
 
     /// Minimal schema-bearing tool used to stand in for bundled-skill /
@@ -790,85 +718,51 @@ mod tests {
     }
 
     #[test]
-    fn coding_profile_narrows_registry_to_core_coding_loop() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+    fn coding_profile_keeps_optional_capabilities_behind_fixed_dispatcher() {
+        let tmp = tempfile::tempdir().unwrap();
         let mut tools = ToolRegistry::with_builtins(tmp.path());
-        // Bundled-skill / plugin tools are plain registry entries that
-        // register BEFORE the profile narrowing runs in the chat/acp
-        // bootstrap — the allow list must apply to them exactly as it
-        // does to builtins.
         tools.register(StubTool {
             name: "get_weather",
         });
-        // `spawn` is registered by the chat/acp bootstrap (SpawnTool),
-        // not by `with_builtins`; a stub stands in so the inclusion
-        // assertion proves the lean profile keeps it (#2133 softened: spawn
-        // stays in the default surface).
         tools.register(StubTool { name: "spawn" });
-
-        let coding = ProfileDefinition::builtin("coding").expect("coding");
+        let coding = ProfileDefinition::builtin("coding").unwrap();
         coding.apply_to_registry(&mut tools);
-
-        let names: std::collections::BTreeSet<String> =
-            tools.specs().into_iter().map(|s| s.name).collect();
-
-        for included in [
-            "read_file",
-            "write_file",
-            "edit_file",
-            "diff_edit",
-            // group:runtime — all shells kept (interactive sessions live on
-            // exec_command + write_stdin; bash is the Codex-compatible alias).
-            "bash",
-            "shell",
-            "exec_command",
-            "write_stdin",
-            "glob",
-            "grep",
-            "list_dir",
+        assert_eq!(
+            tools
+                .specs()
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>(),
+            [
+                "discover_tools",
+                "edit_file",
+                "exec_command",
+                "read_file",
+                "run_tool",
+                "write_file"
+            ]
+        );
+        for name in [
             "spawn",
+            "get_weather",
+            "web_search",
+            "browser",
+            "apply_patch",
             "check",
-            "update_plan",
-            "tool_search",
-            "ask_user_question",
-            // A coding agent must be able to look at the screenshot it
-            // just took; `view_image` hands the model the image itself, and
-            // `view_video` a recording, for the models that take video.
             "view_image",
             "view_video",
+            "write_stdin",
         ] {
+            assert!(tools.get(name).is_some(), "lost implementation {name}");
             assert!(
-                names.contains(included),
-                "lean coding profile must keep {included}, got {names:?}",
+                tools.is_tool_model_reachable(name),
+                "lost model access to {name}"
             );
         }
-        for excluded in [
-            // #2133: only apply_patch is dropped (edit_file/diff_edit cover
-            // it); the heavy web/research/media surfaces stay out.
-            "apply_patch",
-            "web_search",
-            "web_fetch",
-            "browser",
-            "get_weather",
-            "synthesize_research",
-            "image_generation",
-            "workspace_diff",
-            "spawn_agent",
-            "delegate",
-        ] {
-            assert!(
-                !names.contains(excluded),
-                "lean coding profile must drop {excluded}, got {names:?}",
-            );
-        }
-        // Budget pin (#1578 harness review: 48 tools ≈ 9.3K tokens per
-        // round in the unfiltered default). The lean surface must stay a
-        // small fraction of that; 24 leaves headroom for the core loop +
-        // shells + memory while failing loudly on accidental bloat.
+        assert!(!tools.is_tool_visible("web_search"));
         assert!(
-            names.len() <= 24,
-            "lean coding profile grew to {} tools: {names:?}",
-            names.len(),
+            !tools.is_tool_model_reachable("image_generation"),
+            "unbound stub is unavailable"
         );
     }
 
@@ -881,8 +775,13 @@ mod tests {
         tools.mark_spawn_only("run_pipeline", None);
         tools.register(StubTool { name: "read_file" });
 
-        let coding = ProfileDefinition::builtin("coding").expect("coding");
-        coding.apply_to_registry(&mut tools);
+        let restricted = ProfileDefinition {
+            tools: ProfileTools::AllowList {
+                tools: vec!["read_file".into()],
+            },
+            ..Default::default()
+        };
+        restricted.apply_to_registry(&mut tools);
 
         let names: Vec<String> = tools.specs().into_iter().map(|s| s.name).collect();
         // Registry-level carve-out (M8.3): spawn_only tools are never
@@ -894,10 +793,10 @@ mod tests {
         );
         // ...which is exactly why the chat/acp bootstrap must consult
         // `ProfileTools::allows` BEFORE registering + marking a spawn_only
-        // tool. The lean coding profile says no; coding-full says yes.
-        assert!(!coding.tools.allows("run_pipeline"));
-        let full = ProfileDefinition::builtin("coding-full").expect("coding-full");
-        assert!(full.tools.allows("run_pipeline"));
+        // tool. An explicit restricted profile says no; the coding default says yes.
+        assert!(!restricted.tools.allows("run_pipeline"));
+        let coding = ProfileDefinition::builtin("coding").expect("coding");
+        assert!(coding.tools.allows("run_pipeline"));
     }
 
     #[test]

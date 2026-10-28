@@ -1005,6 +1005,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         };
         let mut assistant = mk(MessageRole::Assistant, "");
         assistant.tool_calls = Some(vec![octos_core::ToolCall {
@@ -1061,6 +1062,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         }
     }
 
@@ -1098,6 +1100,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         };
         let mut items = Vec::new();
         build_input_items(&m, &mut items, None);
@@ -1125,6 +1128,7 @@ mod tests {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         };
         // Should produce two top-level items: assistant message + function_call
         let mut items = Vec::new();

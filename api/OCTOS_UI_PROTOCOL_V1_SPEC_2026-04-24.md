@@ -438,6 +438,9 @@ Session, turn, and approval core:
   a turn, accepted `UPCR-2026-042`)
   — `session.append_message.full_history_retry.v1` additionally guarantees retry
   lookup outside the resident history window and the original thread receipt.
+  — `session.append_message.participant.v1` (UPCR-2026-053) acknowledges an
+  optional `participant` label on user/assistant records; memory extraction keeps
+  shared experiences and one-participant requests scoped to that participant.
 - `session/compact` (force a context-compaction pass on the session now; the manual `/compact` command).
   Manual and automatic compaction use the same session model selection: a
   peer's configured model lane (also for its request-context sessions), otherwise
@@ -1920,6 +1923,10 @@ Optional capability feature flags:
 - `coding_tool_contract.required_tools[]` entries describe the effective
   model-visible tool name, category, status, backend implementation or alias,
   capability flag, and policy state
+- `available` includes authorized capabilities reachable through the fixed
+  `run_tool` gateway. It does not require a separate direct tool declaration;
+  the default model request still advertises only the four common tools and
+  two gateways. Policy-denied and unavailable capabilities remain excluded.
 - `coding_tool_contract.missing_required_tools[]` lists any required
   Codex-parity tools that the backend cannot expose for the effective profile
 

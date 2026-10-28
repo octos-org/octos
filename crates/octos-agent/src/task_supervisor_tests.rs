@@ -615,6 +615,45 @@ fn should_persist_child_session_outcome_state() {
 }
 
 #[test]
+fn unobserved_child_join_keeps_terminal_failure_policy_without_inventing_an_orphan() {
+    let supervisor = TaskSupervisor::new();
+    let id = supervisor.register("spawn_subagent", "call-unobserved", Some("api:session"));
+    supervisor.mark_child_session_outcome(&id, ChildSessionTerminalState::RetryableFailure, None);
+    let task = supervisor.get_task(&id).unwrap();
+    assert_eq!(
+        task.child_terminal_state,
+        Some(ChildSessionTerminalState::RetryableFailure)
+    );
+    assert_eq!(
+        task.child_failure_action,
+        Some(ChildSessionFailureAction::Retry)
+    );
+    assert!(task.child_join_state.is_none());
+    assert!(task.child_joined_at.is_none());
+    let json = serde_json::to_value(&task).unwrap();
+    assert!(json.get("child_join_state").is_none());
+    let restored: BackgroundTask = serde_json::from_value(json).unwrap();
+    assert!(restored.child_join_state.is_none());
+    assert_eq!(restored.child_terminal_state, task.child_terminal_state);
+}
+
+#[test]
+fn absent_child_join_observation_does_not_erase_an_acknowledged_join() {
+    let supervisor = TaskSupervisor::new();
+    let id = supervisor.register("spawn_subagent", "call-joined", Some("api:session"));
+    supervisor.mark_child_session_outcome(
+        &id,
+        ChildSessionTerminalState::Completed,
+        ChildSessionJoinState::Joined,
+    );
+    let before = supervisor.get_task(&id).unwrap();
+    supervisor.mark_child_session_outcome(&id, ChildSessionTerminalState::Completed, None);
+    let after = supervisor.get_task(&id).unwrap();
+    assert_eq!(after.child_join_state, Some(ChildSessionJoinState::Joined));
+    assert_eq!(after.child_joined_at, before.child_joined_at);
+}
+
+#[test]
 fn should_track_failed_tasks_with_error() {
     let supervisor = TaskSupervisor::new();
     let id = supervisor.register("tts", "call-2", None);
@@ -2286,30 +2325,176 @@ fn tool_scoped_error_event_keeps_task_alive_and_completion_lands() {
     assert_eq!(task.output_files, vec!["review.md".to_string()]);
 }
 
-/// Defense in depth for the same class: a NON-tool-scoped fail-fast error
-/// (e.g. `invalid_request`) observed mid-run still marks the task failed
-/// eagerly — but that verdict is OBSERVER-derived, not the owner's. If
-/// the loop survives (retry / non-streaming fallback) and the owner join
-/// later reports success, the completion must override the premature
-/// failure instead of being dropped by the terminal guard.
+/// A diagnostic is not proof that the worker has stopped. In particular,
+/// malformed tool arguments and transport fallback can emit Internal or
+/// InvalidRequest while the same worker continues. Publishing a terminal
+/// failure here can launch a competing retry against the same outputs.
+#[test]
+fn diagnostic_error_does_not_end_task_or_schedule_recovery_before_owner_completion() {
+    use crate::harness_errors::HarnessError;
+
+    for error in [
+        HarnessError::Internal {
+            message: "malformed tool_call arguments: expected value".into(),
+        },
+        HarnessError::InvalidRequest {
+            detail: "http_400".into(),
+            message: "request rejected before transport fallback".into(),
+        },
+    ] {
+        let supervisor = TaskSupervisor::new();
+        let failures = collect_failure_signals(&supervisor);
+        let terminals = Arc::new(StdMutex::new(Vec::<TerminalEvent>::new()));
+        let sink = Arc::clone(&terminals);
+        supervisor.set_on_terminal(move |event| {
+            sink.lock().unwrap().push(event.clone());
+        });
+        let id = supervisor.register("spawn_subagent", "call-diagnostic", Some("api:session"));
+        supervisor.mark_synth_ack_emitted("call-diagnostic");
+        supervisor.mark_running(&id);
+        let event = error.to_event("api:session", id.clone(), None, None);
+        supervisor.apply_harness_event(&id, &event).unwrap();
+
+        let task = supervisor.get_task(&id).unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Running,
+            "the owner is still executing"
+        );
+        assert!(task.completed_at.is_none());
+        assert!(!task.failed_by_observer);
+        assert!(
+            task.runtime_detail
+                .as_deref()
+                .unwrap()
+                .contains(error.message())
+        );
+        assert!(
+            failures.lock().unwrap().is_empty(),
+            "no competing retry may be scheduled"
+        );
+        assert!(
+            terminals.lock().unwrap().is_empty(),
+            "no premature child-finished notice"
+        );
+
+        supervisor.mark_completed(&id, vec!["out/result.txt".into()]);
+        let task = supervisor.get_task(&id).unwrap();
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.output_files, vec!["out/result.txt"]);
+        assert!(failures.lock().unwrap().is_empty());
+        let terminals = terminals.lock().unwrap();
+        assert_eq!(terminals.len(), 1);
+        assert!(matches!(terminals[0].outcome, TerminalOutcome::Completed));
+    }
+}
+
+#[test]
+fn diagnostic_error_preserves_real_owner_failure_and_delayed_ack_recovery() {
+    let supervisor = TaskSupervisor::new();
+    let failures = collect_failure_signals(&supervisor);
+    let terminals = Arc::new(StdMutex::new(Vec::<TerminalEvent>::new()));
+    let sink = Arc::clone(&terminals);
+    supervisor.set_on_terminal(move |event| {
+        sink.lock().unwrap().push(event.clone());
+    });
+    let id = supervisor.register("spawn_subagent", "call-real-failure", Some("api:session"));
+    supervisor.mark_running(&id);
+    let event = crate::harness_errors::HarnessError::Internal {
+        message: "recoverable diagnostic".into(),
+    }
+    .to_event("api:session", id.clone(), None, None);
+    supervisor.apply_harness_event(&id, &event).unwrap();
+
+    // A late acknowledgement must not flush a stashed diagnostic failure.
+    supervisor.mark_synth_ack_emitted("call-real-failure");
+    assert!(failures.lock().unwrap().is_empty());
+    assert!(terminals.lock().unwrap().is_empty());
+    supervisor.mark_failed(&id, "worker actually stopped".into());
+    supervisor.mark_failed(&id, "duplicate owner mark".into());
+    let task = supervisor.get_task(&id).unwrap();
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert!(!task.failed_by_observer);
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].error_message, "worker actually stopped");
+    let terminals = terminals.lock().unwrap();
+    assert_eq!(terminals.len(), 1);
+    assert!(terminals[0].is_failure());
+}
+
+#[test]
+fn explicit_harness_failure_remains_terminal() {
+    let supervisor = TaskSupervisor::new();
+    let failures = collect_failure_signals(&supervisor);
+    let id = supervisor.register(
+        "spawn_subagent",
+        "call-explicit-failure",
+        Some("api:session"),
+    );
+    supervisor.mark_running(&id);
+    supervisor.mark_synth_ack_emitted("call-explicit-failure");
+    let event = HarnessEvent {
+        schema: crate::harness_events::HARNESS_EVENT_SCHEMA_V1.into(),
+        payload: HarnessEventPayload::Failure {
+            data: crate::harness_events::HarnessFailureEvent {
+                session_id: "api:session".into(),
+                task_id: id.clone(),
+                workflow: None,
+                phase: None,
+                message: "worker stopped after retries".into(),
+                retryable: Some(false),
+                extra: HashMap::new(),
+            },
+        },
+    };
+    supervisor.apply_harness_event(&id, &event).unwrap();
+    supervisor.mark_completed(&id, vec!["late.txt".into()]);
+    let task = supervisor.get_task(&id).unwrap();
+    assert_eq!(task.status, TaskStatus::Failed);
+    assert!(!task.failed_by_observer);
+    assert!(task.output_files.is_empty());
+    assert_eq!(failures.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn diagnostic_error_after_cancellation_preserves_cancellation_without_recovery() {
+    let supervisor = TaskSupervisor::new();
+    let failures = collect_failure_signals(&supervisor);
+    let id = supervisor.register("spawn_subagent", "call-cancel-error", Some("api:session"));
+    supervisor.mark_running(&id);
+    supervisor.cancel(&id).unwrap();
+    let before = supervisor.get_task(&id).unwrap();
+    let event = crate::harness_errors::HarnessError::Internal {
+        message: "diagnostic from cancelled worker".into(),
+    }
+    .to_event("api:session", id.clone(), None, None);
+    supervisor.apply_harness_event(&id, &event).unwrap();
+    supervisor.mark_synth_ack_emitted("call-cancel-error");
+    let after = supervisor.get_task(&id).unwrap();
+    assert_eq!(after.status, TaskStatus::Cancelled);
+    assert_eq!(after.runtime_state, TaskRuntimeState::Cancelled);
+    assert_eq!(after.error, before.error);
+    assert_eq!(after.completed_at, before.completed_at);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert!(failures.lock().unwrap().is_empty());
+}
+
+/// Compatibility with explicitly observer-derived failures already persisted
+/// by older supervisors: the owner's completion still overrides that verdict.
 #[test]
 fn owner_completion_overrides_observer_derived_failure() {
     let supervisor = TaskSupervisor::new();
     let id = supervisor.register("spawn", "call-observer", Some("api:session"));
     supervisor.mark_running(&id);
 
-    let event = crate::harness_errors::HarnessError::InvalidRequest {
-        detail: "http_400".to_string(),
-        message: "The supported API model names are ...".to_string(),
-    }
-    .to_event("api:session", id.clone(), None, None);
-    supervisor.apply_harness_event(&id, &event).unwrap();
+    supervisor.mark_failed_observed(&id, "legacy observer-derived failure".to_string());
 
     let task = supervisor.get_task(&id).expect("task missing");
     assert_eq!(
         task.status,
         TaskStatus::Failed,
-        "non-tool-scoped fail_fast errors still fail the task eagerly"
+        "explicit observer-derived failures preserve their compatibility contract"
     );
 
     supervisor.mark_completed(&id, vec!["out.txt".to_string()]);
@@ -5050,6 +5235,82 @@ fn orphan_restart_parks_then_client_reattach_revives_full_chain() {
         done.completed_at.is_some(),
         "completed_at stamps the real terminal"
     );
+}
+
+#[test]
+fn native_child_workspace_and_lineage_are_stable_from_first_durable_row() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let ledger = temp.path().join("tasks.jsonl");
+    let supervisor = TaskSupervisor::new();
+    supervisor.enable_persistence(&ledger).unwrap();
+    let origin = "/work/master";
+    let lineage = "/work/session/tasks.jsonl";
+    let id = supervisor
+        .try_register_with_lineage_and_workspace(
+            "spawn_subagent",
+            "call-native",
+            Some("api:master"),
+            Some(lineage),
+            Some(origin),
+        )
+        .unwrap();
+    let rows: Vec<PersistedTaskRecord> = std::fs::read_to_string(&ledger)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].task.workspace_root.as_deref(), Some(origin));
+    assert_eq!(rows[0].task.task_ledger_path.as_deref(), Some(lineage));
+    assert_eq!(
+        rows[0].task.parent_session_key.as_deref(),
+        Some("api:master")
+    );
+
+    supervisor.mark_completed(&id, vec!["/work/master/child/output/result.txt".into()]);
+    assert_eq!(
+        supervisor
+            .get_task(&id)
+            .unwrap()
+            .task_ledger_path
+            .as_deref(),
+        Some(lineage)
+    );
+    let restored = TaskSupervisor::new();
+    restored.enable_persistence(&ledger).unwrap();
+    let task = restored.get_task(&id).unwrap();
+    assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(task.workspace_root.as_deref(), Some(origin));
+    // Restore intentionally rebinds the ledger location; the origin workspace
+    // remains stable even when both artifacts and the task ledger move.
+    assert_eq!(task.task_ledger_path.as_deref(), ledger.to_str());
+}
+
+#[test]
+fn native_child_workspace_registration_refuses_failed_first_write() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let ledger = temp.path().join("tasks.jsonl");
+    let supervisor = TaskSupervisor::new();
+    supervisor.enable_persistence(&ledger).unwrap();
+    std::fs::create_dir(&ledger).unwrap();
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    supervisor.set_on_register(move |task| {
+        sink.lock().unwrap().push(task.id.clone());
+    });
+    let result = supervisor.try_register_with_lineage_and_workspace(
+        "spawn_subagent",
+        "call-no-durable-row",
+        Some("api:master"),
+        Some("/work/session/tasks.jsonl"),
+        Some("/work/master"),
+    );
+    assert!(matches!(
+        result,
+        Err(RegisterTaskError::WorkspacePersistFailed { .. })
+    ));
+    assert!(supervisor.get_all_tasks().is_empty());
+    assert!(observed.lock().unwrap().is_empty());
 }
 
 // #21 (round-4, codex #17 B3) — the peer-task registration's FIRST durable

@@ -147,7 +147,7 @@ Four engineers / agent workers run in parallel. Each track owns a clean slice wi
 - `octos-web/src/api/types.ts` — new POST request types
 
 **Deliverables**:
-- B1 — Spawn child agent wires `with_file_state_cache(parent.file_state_cache.clone())`, `with_subagent_output_router(parent.router.clone())`, `with_subagent_summary_generator(...)` — all inherited from parent session
+- B1 — Spawn child agents inherit file-cache capacity through an empty per-context cache (`empty_for_new_context`), plus shared `with_subagent_output_router(parent.router.clone())` and `with_subagent_summary_generator(...)`. Parent file-read claims must not cross an independent/sanitized context boundary.
 - B2 — Spawn task wraps `run_task` with M8.9 recovery loop (mirror of session_actor's pattern)
 - E — slides/site/podcast workflows surface per-phase validator output to assistant message ("✓ design phase: validators passed (5/5)")
 - API1 — `POST /api/tasks/{task_id}/cancel` → forwards to `TaskSupervisor::cancel(task_id)`. Returns 200 on accept, 404 if task unknown, 409 if already terminal.

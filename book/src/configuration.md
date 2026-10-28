@@ -237,33 +237,30 @@ public origin.
 ## Runtime Tool Profiles
 
 `octos chat` and `octos acp` resolve a **runtime profile** at startup that
-decides which tools are exposed to the LLM. Every tool schema in the registry
-is serialized into *every* LLM round, so the default profile is deliberately
-lean.
+controls tool authorization and agent setup. Model requests use a fixed set
+of common tools and dispatch gateways; optional schemas are returned through
+discovery instead of being serialized into every request.
 
 Built-in profiles:
 
-| Profile | Tool surface |
-|---------|--------------|
-| `coding` (default) | **Lean core-coding loop only**: files (`group:fs`), shell (`group:runtime`), search (`group:search`), long-term memory (`group:memory`), `spawn`, `ask_user_question` — ≈15–18 tools, ≈3.3K tokens of schemas per round. Web/research/media/messaging tools, `run_pipeline`, and bundled skills (weather, news, send_email, …) are **excluded**. |
-| `coding-full` | The unfiltered pre-lean surface — every native, bundled-skill, plugin, and MCP tool (≈48 tools, ≈9K tokens per round). Byte-for-byte the old `coding` behaviour. |
-| `swarm` | Coding set plus swarm-coordination tools (`send_to_agent`, `cancel_task`, `relaunch_task`, …). |
+| Profile | Tool access |
+|---------|-------------|
+| `coding` (default) | Four common direct tools plus `discover_tools` / `run_tool`. All registered and authorized optional capabilities remain accessible through discovery. |
+| `swarm` | The same fixed interface, with an explicit allowlist for coordination workflows. |
 
-Switching profiles:
-
-```bash
-octos chat --profile coding-full        # one-off: everything back
-ln -s coding-full ~/.octos/profile      # persistent default (name or path)
-```
+Run `octos chat` for the standard interface. Custom profiles still configure
+permissions, model preferences and agent setup. The old tool-surface variants
+and their presentation switches have been removed; no special profile flag is
+needed to access optional tools.
 
 Per-project customization — drop a profile file in
 `~/.octos/profiles/<name>/profile.json` (or pass a path via `--profile`) and
-add tools back with allow-list entries (`group:<id>`, exact names, or
+select authorized tools with allow-list entries (`group:<id>`, exact names, or
 `prefix*` wildcards):
 
 ```json
 {
-  "name": "coding-plus-web",
+  "name": "coding-project",
   "version": 1,
   "tools": {
     "mode": "allow_list",
@@ -280,13 +277,12 @@ Notes:
   applies to bundled-skill and plugin tools exactly as to builtins. Tools
   marked `spawn_only` are never evicted by the filter; `run_pipeline` is
   instead gated at registration time by the profile allow list.
-- Sub-agents are unaffected: `spawn` workers build their own registries, so
-  the built-in `research-worker` keeps `web_search`/`web_fetch` under the
-  lean default.
+- `spawn` workers build their own registries under their effective profiles
+  and permissions. Their standard interface also uses fixed dispatch.
 - `config.json`'s `tool_policy` (below) still applies and can further narrow
   (deny-wins) any profile.
-- `octos gateway` / `octos serve` do not use runtime profiles; their tool
-  surface is unchanged.
+- `octos gateway` / `octos serve` also use the standard dispatch interface;
+  host and session restrictions continue to determine available capabilities.
 
 ## Human Approval Rules
 

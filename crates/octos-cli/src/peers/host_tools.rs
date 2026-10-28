@@ -634,6 +634,20 @@ pub(crate) fn apply_session_host_tools(
                             context_id: context_id.clone(),
                         }),
                 );
+                // #2865: an app tool is part of the peer's documented tool
+                // contract — grant it DIRECT model-callable status so the
+                // fixed dispatch gateway does not drop it from the peer's
+                // roster (it is neither on the fixed DIRECT list nor
+                // reachable through run_tool discovery once the gateway is
+                // active). Native admission gates (approval, hooks) still
+                // apply: resolution precedes them.
+                registry.grant_direct_surface(decl.model_name.clone());
+
+                // The peer's ask channel rides with the app tools: a host-owned
+                // peer whose tools are model-direct must also keep
+                // ask_user_question visible, or the destructive-call ask flow
+                // (this module's contract) cannot reach its person.
+                registry.grant_direct_surface("ask_user_question".to_string());
             }
         }
     }

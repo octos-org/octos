@@ -372,6 +372,7 @@ async fn compaction_started_precedes_completed_in_lifecycle_batch() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         });
     }
 
@@ -446,6 +447,7 @@ fn open_snapshot_padding_history(messages: usize) -> Vec<octos_core::Message> {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         })
         .collect()
 }
@@ -3920,6 +3922,7 @@ fn test_message(role: MessageRole, content: impl Into<String>) -> Message {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     }
 }
 
@@ -14407,7 +14410,7 @@ fn coding_tool_status_distinguishes_registered_hidden_tools_from_missing_tools()
     let mut registry = octos_agent::ToolRegistry::with_builtins(temp.path());
     registry.set_context_filter(vec!["read".into()]);
 
-    let visible = model_visible_tool_names(Some(&registry));
+    let visible = model_callable_tool_names(Some(&registry));
     let registered = registered_tool_names(Some(&registry));
     assert!(!visible.iter().any(|name| name == "exec_command"));
     assert!(registered.iter().any(|name| name == "exec_command"));
@@ -14543,6 +14546,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14618,6 +14622,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14738,6 +14743,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14813,6 +14819,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14881,6 +14888,7 @@ fn shell_approval_still_emits_risk_field() {
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14994,6 +15002,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -19371,6 +19380,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             skill_action_jobs_v1: false,
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
+            session_append_participant_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -21098,6 +21108,7 @@ fn build_btw_messages_shapes_prompt_without_tools() {
         thread_id: None,
         timestamp: now,
         source: None,
+        participant: None,
     };
     let transcript = vec![
         mk(MessageRole::User, "please refactor the parser"),
@@ -22310,6 +22321,7 @@ fn final_assistant_content_already_persisted_ignores_tool_rows() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     };
     let messages = vec![tool_row];
     let final_content = "旧金山今天天气晴朗，气温17.1°C，湿度68%。需要更详细的湾区预报吗？";
@@ -22394,6 +22406,7 @@ fn final_assistant_carrier_trimmed_equality_rejects_non_assistant_roles() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     };
     assert!(!is_final_assistant_carrier_under_trimmed_equality(
         &user_row,
@@ -22471,6 +22484,7 @@ fn pre_stamp_turn_thread_id_stamps_user_assistant_and_tool_when_unbound() {
             thread_id: None,
             timestamp: chrono::Utc::now(),
             source: None,
+            participant: None,
         },
         turn_thread_id,
     );
@@ -22519,6 +22533,7 @@ fn pre_stamp_turn_thread_id_leaves_system_rows_alone() {
         thread_id: None,
         timestamp: chrono::Utc::now(),
         source: None,
+        participant: None,
     };
 
     let stamped = pre_stamp_turn_thread_id(system, "turn-abc");
@@ -26056,6 +26071,7 @@ fn prg_seed_user_assistant(session: &mut octos_bus::Session) {
         thread_id: Some("cmid-user-1".into()),
         timestamp: now,
         source: None,
+        participant: None,
     });
     session.messages.push(Message {
         role: MessageRole::Assistant,
@@ -26068,6 +26084,7 @@ fn prg_seed_user_assistant(session: &mut octos_bus::Session) {
         thread_id: Some("cmid-user-1".into()),
         timestamp: now + chrono::Duration::milliseconds(10),
         source: None,
+        participant: None,
     });
 }
 
@@ -26098,6 +26115,7 @@ async fn prg_state_with_persisted_turns(
                 thread_id: Some(tid.clone()),
                 timestamp: now,
                 source: None,
+                participant: None,
             };
             guard
                 .add_message(session_id, user)
@@ -26114,6 +26132,7 @@ async fn prg_state_with_persisted_turns(
                 thread_id: Some(tid.clone()),
                 timestamp: now + chrono::Duration::milliseconds(1),
                 source: None,
+                participant: None,
             };
             guard
                 .add_message(session_id, asst)
@@ -27780,6 +27799,7 @@ async fn thread_graph_get_surfaces_orphans() {
             thread_id: Some("cmid-1".into()),
             timestamp: now,
             source: None,
+            participant: None,
         });
         session.messages.push(Message {
             role: MessageRole::Assistant,
@@ -27792,6 +27812,7 @@ async fn thread_graph_get_surfaces_orphans() {
             thread_id: None, // <- orphan
             timestamp: now + chrono::Duration::milliseconds(10),
             source: None,
+            participant: None,
         });
     });
     let active_turns = active_turns_registry();
@@ -28097,6 +28118,7 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             thread_id: Some("cmid-user-1".into()),
             timestamp: now,
             source: None,
+            participant: None,
         });
         // Historical companion row; current producer paths carry its
         // media on the background-child payload instead.
@@ -28111,6 +28133,7 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             thread_id: Some("cmid-user-1".into()),
             timestamp: now + chrono::Duration::milliseconds(5),
             source: None,
+            participant: None,
         });
         // Background completion row.
         session.messages.push(Message {
@@ -28127,6 +28150,7 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             thread_id: Some("cmid-user-1".into()),
             timestamp: spawn_ack_ts,
             source: None,
+            participant: None,
         });
     });
     let approvals = PendingApprovalStore::default();
@@ -28543,6 +28567,7 @@ async fn message_commit_observer_runs_after_each_commit_in_order() {
             thread_id: None,
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         };
         manager
             .add_message_with_seq(&session_id, msg)
@@ -28604,6 +28629,7 @@ async fn message_commit_observer_is_not_retroactive_after_installation() {
         thread_id: None,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
     manager
         .add_message_with_seq(&session_id, msg)
@@ -28632,6 +28658,7 @@ async fn message_commit_observer_is_not_retroactive_after_installation() {
         thread_id: None,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
     manager
         .add_message_with_seq(&session_id, msg2)
@@ -28666,6 +28693,7 @@ fn is_metadata_only_assistant_row_truth_table() {
         thread_id: None,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
     assert!(is_metadata_only_assistant_row(&empty_assistant));
 
@@ -28694,6 +28722,7 @@ fn is_metadata_only_assistant_row_truth_table() {
         thread_id: None,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
     assert!(!is_metadata_only_assistant_row(&tool_message));
 
@@ -28709,6 +28738,7 @@ fn is_metadata_only_assistant_row_truth_table() {
         thread_id: None,
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
     assert!(!is_metadata_only_assistant_row(&user_message));
 }
@@ -28759,6 +28789,7 @@ async fn metadata_only_commits_emit_one_v2_assistant_persisted_row() {
         thread_id: Some(thread.clone()),
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
     let mk_tool = |out: &str, tc_id: &str| Message {
         role: MessageRole::Tool,
@@ -28771,6 +28802,7 @@ async fn metadata_only_commits_emit_one_v2_assistant_persisted_row() {
         thread_id: Some(thread.clone()),
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
 
     // Iteration 1: assistant returns only tool_calls (empty content).
@@ -30375,6 +30407,7 @@ async fn synth_ack_not_persisted_to_jsonl_when_spawn_only() {
         thread_id: Some("thread-spawn-only-synth-no-persist".into()),
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
     manager
         .add_message_with_seq(&session_id, preamble)
@@ -30401,6 +30434,7 @@ async fn synth_ack_not_persisted_to_jsonl_when_spawn_only() {
         thread_id: Some("thread-spawn-only-synth-no-persist".into()),
         timestamp: Utc::now(),
         source: None,
+        participant: None,
     };
     // Intentionally no `manager.add_message_with_seq(...)` call.
     // This is the post-fix shape — the ack never reaches JSONL.
@@ -30612,6 +30646,7 @@ async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
             thread_id: Some(format!("thread-{tool_name}")),
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         };
         manager
             .add_message_with_seq(&session_id, preamble)
@@ -30642,6 +30677,7 @@ async fn synth_ack_skip_invariants_hold_for_each_spawn_only_tool_name() {
             thread_id: Some(format!("thread-{tool_name}")),
             timestamp: Utc::now(),
             source: None,
+            participant: None,
         };
         // Production inputs at the persist site: the agent loop
         // sets `synthesized_from_spawn_only=true` whenever the
@@ -32063,6 +32099,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         human_approval_rules: None,
         system_prompt: "test-system-prompt".to_string(),
         prompt_parts: crate::commands::gateway::prompt::GatewayPromptParts {
+            uses_bundled_base: false,
             pre_memory: "test-system-prompt".to_string(),
             post_memory: String::new(),
         },
@@ -42157,6 +42194,7 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
                         thread_id: None,
                         timestamp: Utc::now(),
                         source: None,
+                        participant: None,
                     },
                 )
                 .await
