@@ -3,9 +3,77 @@
 //! Drop checkpoints a partial batch if the owning turn is cancelled/unwinds.
 
 use crate::context_manager::ContextManager;
-use octos_core::{Message, SessionKey};
+use octos_core::{Message, MessageRole, SessionKey};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// Commit an interrupted turn's dispatched prompt to durable history.
+///
+/// A turn's rows reach the canonical transcript only in the agent task's
+/// end-of-turn persist loop; an interrupt aborts that task first, so the
+/// dispatched, acknowledged prompt used to vanish from durable history and
+/// the context ledger then discarded its source-less twin on reload
+/// (#2831). Called on the interrupt path before the terminal emits.
+///
+/// The dying task persists `response.messages` under the same session
+/// manager lock, so the lock serializes the two live writers: any User row
+/// stamped with this turn's thread means the prompt (always that loop's
+/// first row) is already durable. The prompt is persisted as plain text —
+/// a media turn interrupted mid-flight keeps its text but not its
+/// attachments, which only the never-run persist loop would have written.
+/// Internal master continuations never persist their prompt (the
+/// transport's `skip_internal_user_persist`) and are excluded by the
+/// caller. Returns the committed sequence, or `None` when the row was
+/// already durable or the append failed (logged).
+pub(super) async fn persist_interrupted_turn_prompt(
+    sessions: &Arc<tokio::sync::Mutex<octos_bus::SessionManager>>,
+    session: &SessionKey,
+    turn_thread_id: &str,
+    prompt: &str,
+    data_dir: &Path,
+    manager: &Arc<Mutex<ContextManager>>,
+) -> Option<usize> {
+    let mut sessions = sessions.lock().await;
+    let already_durable = sessions
+        .get_or_create(session)
+        .await
+        .messages
+        .iter()
+        .any(|message| {
+            message.role == MessageRole::User
+                && message.thread_id.as_deref() == Some(turn_thread_id)
+        });
+    if already_durable {
+        return None;
+    }
+    let to_save = super::pre_stamp_turn_thread_id(Message::user(prompt), turn_thread_id);
+    match sessions
+        .add_message_with_seq(session, to_save.clone())
+        .await
+    {
+        Ok(seq) => {
+            let mut batch = AppUiContextCommitBatch::new(data_dir, manager, session);
+            batch.record(&to_save, seq);
+            if let Err(error) = batch.finish() {
+                tracing::warn!(
+                    session = %session.0,
+                    seq,
+                    %error,
+                    "interrupted turn: prompt row committed but the context checkpoint failed"
+                );
+            }
+            Some(seq)
+        }
+        Err(error) => {
+            tracing::warn!(
+                session = %session.0,
+                error = %error,
+                "interrupted turn: failed to persist the dispatched prompt"
+            );
+            None
+        }
+    }
+}
 
 pub(super) struct AppUiContextCommitBatch {
     data_dir: PathBuf,
@@ -232,6 +300,127 @@ mod tests {
                 .to_string()
                 .contains("Verified deck")
         );
+    }
+
+    #[tokio::test]
+    async fn should_commit_interrupted_turn_prompt_and_stamp_the_ledger_twin() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionKey("interrupt-prompt".into());
+        // The in-flight shape the interrupt hits: the bridge checkpoint
+        // persisted a snapshot whose prompt row is still source-less.
+        let manager = Arc::new(Mutex::new(ContextManager::new(session.to_string(), None)));
+        manager
+            .lock()
+            .unwrap()
+            .record_message(&Message::user("Hold this prompt"));
+        persist_context_manager_snapshot(
+            dir.path(),
+            &session.to_string(),
+            &manager.lock().unwrap(),
+        )
+        .unwrap();
+        let sessions = Arc::new(tokio::sync::Mutex::new(
+            SessionManager::open(dir.path()).unwrap(),
+        ));
+        let seq = super::persist_interrupted_turn_prompt(
+            &sessions,
+            &session,
+            "turn-thread-2831",
+            "Hold this prompt",
+            dir.path(),
+            &manager,
+        )
+        .await
+        .expect("interrupted prompt row must commit");
+        let history = sessions
+            .lock()
+            .await
+            .get_or_create(&session)
+            .await
+            .messages
+            .clone();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "Hold this prompt");
+        assert_eq!(history[0].thread_id.as_deref(), Some("turn-thread-2831"));
+        assert_eq!(seq, 0);
+        // The stamped twin survives reload instead of being discarded as an
+        // interrupted turn's uncommitted row (#2831).
+        let (reloaded, _) =
+            load_or_rebuild_context_manager(dir.path(), session.to_string(), None, &history);
+        assert_eq!(
+            prompt_value(&reloaded),
+            prompt_value(&manager.lock().unwrap())
+        );
+        assert!(
+            prompt_value(&reloaded)
+                .to_string()
+                .contains("Hold this prompt")
+        );
+        // A second interrupt-path call recognizes the durable row.
+        assert_eq!(
+            super::persist_interrupted_turn_prompt(
+                &sessions,
+                &session,
+                "turn-thread-2831",
+                "Hold this prompt",
+                dir.path(),
+                &manager,
+            )
+            .await,
+            None,
+            "already-durable prompt must not duplicate"
+        );
+        let history_after = sessions
+            .lock()
+            .await
+            .get_or_create(&session)
+            .await
+            .messages
+            .clone();
+        assert_eq!(history_after.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn should_skip_interrupted_prompt_when_the_dying_task_already_persisted_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionKey("interrupt-prompt-race".into());
+        let manager = Arc::new(Mutex::new(ContextManager::new(session.to_string(), None)));
+        let sessions = Arc::new(tokio::sync::Mutex::new(
+            SessionManager::open(dir.path()).unwrap(),
+        ));
+        // The dying task's shape: messages[0] already landed under the
+        // session lock, stamped with the turn thread.
+        let mut landed = Message::user("Hold this prompt");
+        landed.thread_id = Some("turn-thread-2831".into());
+        let seq = sessions
+            .lock()
+            .await
+            .add_message_with_seq(&session, landed.clone())
+            .await
+            .unwrap();
+        let mut batch = super::AppUiContextCommitBatch::new(dir.path(), &manager, &session);
+        batch.record(&landed, seq);
+        batch.finish().unwrap();
+        assert_eq!(
+            super::persist_interrupted_turn_prompt(
+                &sessions,
+                &session,
+                "turn-thread-2831",
+                "Hold this prompt",
+                dir.path(),
+                &manager,
+            )
+            .await,
+            None
+        );
+        let history = sessions
+            .lock()
+            .await
+            .get_or_create(&session)
+            .await
+            .messages
+            .clone();
+        assert_eq!(history.len(), 1, "the durable row must not duplicate");
     }
 
     #[test]

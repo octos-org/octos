@@ -901,19 +901,18 @@ async function handleRegister(e) {
 
         const tenant = await tenantRes.json();
 
-        // Always show the short hosted Unix bootstrap in the portal UI.
-        // This avoids regressing back to the older raw-flag install command.
-        const setupPath = tenant.id && tenant.auth_token
-            ? `/api/register/setup-script/${encodeURIComponent(tenant.id)}/${encodeURIComponent(tenant.auth_token)}`
-            : '';
-        window._setupCmdUnix = setupPath
-            ? `curl -fsSL "${window.location.origin}${setupPath}" | bash`
-            : (tenant.setup_command_unix || '');
-        window._setupCmdWin = tenant.setup_command_windows || '';
-
         // Use dashboard URL from API response (includes correct tunnel domain)
         const dashboardUrl = tenant.dashboard_url ||
             ('https://' + tenant.subdomain + '.' + window.location.hostname);
+
+        // #2344: the setup script is no longer served from a token-bearing
+        // public URL. The authenticated dashboard download is the delivery
+        // path, so the "command" boxes carry sign-in guidance instead.
+        const setupGuidance = isZh
+            ? `# 登录 ${dashboardUrl} ，在控制台的 Machine setup 页下载安装脚本。`
+            : `# Sign in at ${dashboardUrl} and download the machine setup from the dashboard.`;
+        window._setupCmdUnix = setupGuidance;
+        window._setupCmdWin = setupGuidance;
 
         // Show result
         document.getElementById('formStep1').style.display = 'none';
