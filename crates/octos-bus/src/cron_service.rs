@@ -1903,7 +1903,7 @@ mod tests {
     /// for the durable state avoids assuming a fixed scheduler/filesystem
     /// latency (25 ms was too short on Windows runners).
     async fn wait_for_store(path: &std::path::Path, expected: impl Fn(&CronStore) -> bool) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 if let Some(store) = load_store(path)
                     && expected(&store)
