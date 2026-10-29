@@ -42393,7 +42393,10 @@ async fn should_report_active_turn_on_session_list_when_a_turn_is_live() {
         None,
         None,
         false,
-        ConnectionUiFeatures::stdio_defaults(),
+        ConnectionUiFeatures {
+            workspace_session_refs_v1: false,
+            ..ConnectionUiFeatures::stdio_defaults()
+        },
         "list-busy-flag".into(),
         SessionListParams {
             workspace_id: None,
