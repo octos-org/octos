@@ -1899,6 +1899,24 @@ mod tests {
         (service, calls)
     }
 
+    /// Delivery runs in a detached task and persistence follows it. Waiting
+    /// for the durable state avoids assuming a fixed scheduler/filesystem
+    /// latency (25 ms was too short on Windows runners).
+    async fn wait_for_store(path: &std::path::Path, expected: impl Fn(&CronStore) -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(store) = load_store(path)
+                    && expected(&store)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed out waiting for cron store state");
+    }
+
     #[tokio::test]
     async fn serve_delivery_deletes_one_shot_only_after_ack() {
         let dir = tempfile::tempdir().unwrap();
@@ -1914,7 +1932,7 @@ mod tests {
             .unwrap();
         service.running.store(true, Ordering::Relaxed);
         service.on_timer().await;
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        wait_for_store(&dir.path().join("cron.json"), |store| store.jobs.is_empty()).await;
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert!(
             load_store(&dir.path().join("cron.json"))
@@ -1945,7 +1963,10 @@ mod tests {
             .unwrap();
         service.running.store(true, Ordering::Relaxed);
         service.on_timer().await;
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        wait_for_store(&dir.path().join("cron.json"), |store| {
+            store.jobs.len() == 1 && store.jobs[0].state.delivery_attempts == 1
+        })
+        .await;
         let first = load_store(&dir.path().join("cron.json")).unwrap();
         assert_eq!(first.jobs.len(), 1);
         assert_eq!(first.jobs[0].state.delivery_attempts, 1);
@@ -1959,13 +1980,16 @@ mod tests {
         assert_eq!(first.jobs[0].state.delivery_fire_at_ms, Some(0));
         assert!(first.jobs[0].state.last_run_at_ms.is_none());
 
-        for _ in 0..4 {
+        for attempt in 2..=5 {
             {
                 let mut store = service.store.lock().unwrap();
                 store.jobs[0].state.next_run_at_ms = Some(0);
             }
             service.on_timer().await;
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            wait_for_store(&dir.path().join("cron.json"), |store| {
+                store.jobs.len() == 1 && store.jobs[0].state.delivery_attempts == attempt
+            })
+            .await;
         }
         let last = load_store(&dir.path().join("cron.json")).unwrap();
         assert_eq!(
