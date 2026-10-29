@@ -45607,6 +45607,14 @@ fn progress_assistant_iteration(event: &Value) -> Option<u32> {
 /// and the persisted finalizer stitch into ONE segment); a delta without an
 /// iteration (e.g. a synthesized subagent line) falls back to the durable
 /// segment ordinal, matching what the persisted-row path would compute.
+fn envelope_tool_write_path(arguments: &Value) -> Option<String> {
+    let path = arguments.get("path")?.as_str()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(octos_core::truncated_utf8(path, 1024, "…"))
+}
+
 fn emit_progress_envelope(
     ledger: &UiProtocolLedger,
     session_id: &SessionKey,
@@ -45656,6 +45664,7 @@ fn emit_progress_envelope(
                     // `{}` args render as "" — the spec says omit, not
                     // empty-string.
                     .filter(|preview| !preview.is_empty()),
+                write_path: event.arguments.as_ref().and_then(envelope_tool_write_path),
             },
         ),
         UiNotification::ToolProgress(event) => {

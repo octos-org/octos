@@ -84,6 +84,7 @@ records.
 | 056 | Interrupted-turn durability: dispatched prompt commits to durable history | implemented (pending merge) | `..._056_INTERRUPTED_TURN_DURABILITY.md` | #2849 |
 | 057 | Read a file from a session workspace | proposed (implemented for review) | `..._057_SESSION_FILES_READ.md` | — |
 | 059 | Serve cron delivery through session continuations | proposed (implemented for review) | `..._059_SERVE_CRON_DELIVERY.md` | #2888 |
+| 061 | Structured write path in v2 tool replay | proposed (implemented for review) | `..._061_PROJECTION_WRITE_PATH.md` | #2894 |
 
 ## Renumbering history
 
