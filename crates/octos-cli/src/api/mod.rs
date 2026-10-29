@@ -40,6 +40,7 @@ pub(crate) mod static_files;
 pub mod swarm;
 mod ui_protocol_alpha2_bridge;
 mod ui_protocol_alpha9_bridge;
+pub(crate) mod workspace_registry;
 // Relocated to crate::contracts (Phase 3 of goal-in-chat) so `octos chat
 // --peers` can share the SAME process-global pending-prompt registry the WS
 // path uses without the `api` feature; re-exported here so api-internal paths
@@ -459,6 +460,10 @@ pub struct AppState {
     /// serve cwd under launchd is `~`, outside the profile root, and
     /// `/api/files` would 403 anything written there).
     pub appui_default_session_cwd: Option<PathBuf>,
+    /// Operator-approved roots for UPCR-2026-060 Workspace registration.
+    /// Seeded from the actual `serve --cwd` plus explicit configuration;
+    /// never implicitly widened to the whole home directory or `/`.
+    pub workspace_allowed_roots: Vec<PathBuf>,
     /// In-memory signed-preview token cache (issue #1001 follow-up).
     ///
     /// The SPA mints a token via `POST /api/my/preview/sign` and serves
@@ -562,6 +567,7 @@ impl AppState {
             content_classifier: None,
             task_query_store: None,
             appui_default_session_cwd: None,
+            workspace_allowed_roots: Vec::new(),
             preview_tokens: Arc::new(PreviewTokens::new()),
             work_secret_store: Arc::new(
                 octos_agent::bridge::work_secret::WorkSecretGrantStore::new(data_dir),
