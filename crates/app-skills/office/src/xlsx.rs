@@ -6,7 +6,7 @@ use eyre::{Result, bail};
 use serde::Deserialize;
 use serde_json::Number;
 
-use crate::ooxml::{output_path, write_package, xml, zip_text};
+use crate::ooxml::{output_path, validate_xml_text, write_package, xml, zip_text};
 
 const XML_DECL: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#;
 const MAX_ROWS: usize = 1_048_576;
@@ -194,21 +194,6 @@ fn validate_cell(cell: &XlsxCell) -> Result<()> {
     }
     if let Some(format) = &options.number_format {
         validate_xml_text(format, "number format")?;
-    }
-    Ok(())
-}
-
-fn validate_xml_text(text: &str, description: &str) -> Result<()> {
-    if text.chars().any(|c| {
-        !matches!(
-            c,
-            '\u{9}' | '\u{a}' | '\u{d}'
-                | '\u{20}'..='\u{d7ff}'
-                | '\u{e000}'..='\u{fffd}'
-                | '\u{10000}'..='\u{10ffff}'
-        )
-    }) {
-        bail!("{description} contains a character not allowed in XML");
     }
     Ok(())
 }

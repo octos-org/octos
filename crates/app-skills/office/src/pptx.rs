@@ -228,7 +228,7 @@ fn presentation_xml(slide_count: usize) -> String {
         ));
     }
     format!(
-        r#"{XML_DECL}<p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" saveSubsetFonts="1"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst><p:sldIdLst>{slide_ids}</p:sldIdLst><p:sldSz cx="{SLIDE_WIDTH}" cy="{SLIDE_HEIGHT}"/><p:notesSz cx="{SLIDE_HEIGHT}" cy="{SLIDE_WIDTH}"/></p:presentation>"#
+        r#"{XML_DECL}<p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" saveSubsetFonts="1"><p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst><p:sldIdLst>{slide_ids}</p:sldIdLst><p:sldSz cx="{SLIDE_WIDTH}" cy="{SLIDE_HEIGHT}"/><p:notesSz cx="6858000" cy="9144000"/></p:presentation>"#
     )
 }
 
@@ -395,6 +395,7 @@ mod tests {
         assert!(presentation.contains(r#"<p:sldId id="256" r:id="rId2"/>"#));
         assert!(presentation.contains(r#"<p:sldId id="257" r:id="rId3"/>"#));
         assert!(presentation.contains(r#"<p:sldSz cx="12192000" cy="6858000"/>"#));
+        assert!(presentation.contains(r#"<p:notesSz cx="6858000" cy="9144000"/>"#));
 
         let first = text(&output, "ppt/slides/slide1.xml");
         assert!(first.contains("Q3 &lt;Results&gt; &amp; Plan"));
