@@ -30,6 +30,7 @@ pub struct CronService {
     store: Mutex<CronStore>,
     inbound_tx: mpsc::Sender<InboundMessage>,
     delivery: Option<std::sync::Arc<dyn CronDelivery>>,
+    delivery_in_flight: Mutex<std::collections::HashSet<(String, i64)>>,
     running: AtomicBool,
     timer_handle: tokio::sync::Mutex<Option<JoinHandle<()>>>,
     /// Shutdown notification: every sleeper task in `arm_timer`
@@ -71,6 +72,7 @@ impl CronService {
             store: Mutex::new(store),
             inbound_tx,
             delivery: None,
+            delivery_in_flight: Mutex::new(std::collections::HashSet::new()),
             running: AtomicBool::new(false),
             timer_handle: tokio::sync::Mutex::new(None),
             shutdown_notify: tokio::sync::Notify::new(),
@@ -625,6 +627,18 @@ impl CronService {
                         continue;
                     }
                     if reserve.delivery.is_some() {
+                        let occurrence = (
+                            stored_job.id.clone(),
+                            stored_job.state.next_run_at_ms.unwrap_or(0),
+                        );
+                        if !reserve
+                            .delivery_in_flight
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(occurrence)
+                        {
+                            continue;
+                        }
                         stored_job.state.delivery_fire_at_ms = stored_job.state.next_run_at_ms;
                     }
                     due.push(stored_job.clone());
@@ -678,6 +692,7 @@ impl CronService {
             );
             if self.delivery.is_some() {
                 self.complete_delivery(job).await;
+                self.finish_delivery(job);
             }
             return;
         }
@@ -719,6 +734,7 @@ impl CronService {
                     }
                 }
             }
+            self.finish_delivery(job);
             return;
         }
 
@@ -760,6 +776,20 @@ impl CronService {
                 }
             }
         }
+    }
+
+    fn finish_delivery(&self, job: &CronJob) {
+        let occurrence = (
+            job.id.clone(),
+            job.state
+                .delivery_fire_at_ms
+                .or(job.state.next_run_at_ms)
+                .unwrap_or(0),
+        );
+        self.delivery_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&occurrence);
     }
 
     async fn complete_delivery(self: &std::sync::Arc<Self>, job: &CronJob) {
@@ -1946,6 +1976,25 @@ mod tests {
             1,
             "accepted occurrence never refires"
         );
+    }
+
+    #[tokio::test]
+    async fn serve_delivery_dedupes_concurrent_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, calls) = delivery_service(dir.path(), false);
+        service
+            .add_job_with_origin(
+                "concurrent".into(),
+                CronSchedule::At { at_ms: 0 },
+                payload("deliver", CronMode::Agent),
+                None,
+                CronOrigin::default(),
+            )
+            .unwrap();
+        service.running.store(true, Ordering::Relaxed);
+        let _ = tokio::join!(service.on_timer(), service.on_timer());
+        wait_for_store(&dir.path().join("cron.json"), |store| store.jobs.is_empty()).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
