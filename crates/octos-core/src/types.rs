@@ -518,13 +518,17 @@ pub struct EpisodeRef {
 }
 
 /// Unique key identifying a conversation session (channel:chat_id).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionKey(pub String);
 
 /// Synthetic profile ID used for main-profile session isolation.
 pub const MAIN_PROFILE_ID: &str = "_main";
 
 impl SessionKey {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn new(channel: &str, chat_id: &str) -> Self {
         Self(format!("{channel}:{chat_id}"))
     }

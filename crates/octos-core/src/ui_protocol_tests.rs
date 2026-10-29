@@ -380,6 +380,7 @@ fn full_protocol_capabilities_advertise_harness_task_control() {
 fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
     let params = SessionOpenParams {
         session_id: SessionKey("local:demo".into()),
+        session_ref: None,
         topic: Some("research".into()),
         profile_id: Some("coding".into()),
         cwd: Some("/repo".into()),
@@ -418,6 +419,7 @@ fn session_open_params_topic_cwd_and_sandbox_are_additive_and_round_trip() {
 fn session_open_client_commands_round_trip() {
     let params = SessionOpenParams {
         session_id: SessionKey("local:demo".into()),
+        session_ref: None,
         topic: None,
         profile_id: None,
         cwd: None,
@@ -882,6 +884,10 @@ fn ui_protocol_v1_wire_contract_is_golden() {
         &[
             "profile/local/create",
             "session/open",
+            "session/create",
+            "workspace/list",
+            "workspace/register",
+            "workspace/get",
             "turn/start",
             "turn/interrupt",
             "approval/respond",
@@ -1025,6 +1031,10 @@ fn ui_protocol_v1_wire_contract_is_golden() {
         UI_PROTOCOL_FIRST_SERVER_METHODS,
         &[
             "session/open",
+            "session/create",
+            "workspace/list",
+            "workspace/register",
+            "workspace/get",
             "turn/start",
             "turn/interrupt",
             "approval/respond",
@@ -1126,6 +1136,10 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
             "capabilities_schema_version": 2,
             "supported_methods": [
                 "session/open",
+                "session/create",
+                "workspace/list",
+                "workspace/register",
+                "workspace/get",
                 "turn/start",
                 "turn/interrupt",
                 "approval/respond",
@@ -1274,6 +1288,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "event.file_attached.v1",
                 "auxiliary.rest_to_ws.v1",
                 "session.files.read.v1",
+                "workspace.session_refs.v1",
                 "projection.write_path.v1",
                 "mcp.connector.manage.v1",
                 "coding.autonomy.v1",
@@ -5174,6 +5189,8 @@ fn aux_rest_to_ws_v1_result_dtos_round_trip_via_serde_json() {
         sessions: serde_json::json!([{ "id": "s-1", "message_count": 3 }]),
         workspace_root: None,
         profile_id: None,
+        next_cursor: None,
+        scope: None,
     };
     let value = serde_json::to_value(&listing).expect("serialize");
     let decoded: SessionListResult = serde_json::from_value(value).expect("deserialize");
@@ -5433,6 +5450,9 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let with_cwd = SessionListParams {
         cwd: Some("/home/me/proj".into()),
         profile_id: None,
+        workspace_id: None,
+        cursor: None,
+        limit: None,
     };
     assert_eq!(
         serde_json::to_value(&with_cwd).expect("serialize"),
@@ -5447,6 +5467,9 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     let with_profile = SessionListParams {
         cwd: Some("/home/me/proj".into()),
         profile_id: Some("dev".into()),
+        workspace_id: None,
+        cursor: None,
+        limit: None,
     };
     assert_eq!(
         serde_json::to_value(&with_profile).expect("serialize"),
@@ -5695,6 +5718,8 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
             sessions: serde_json::json!([{ "id": "s-1" }]),
             workspace_root: None,
             profile_id: None,
+            next_cursor: None,
+            scope: None,
         })
         .expect("serialize"),
         serde_json::json!({ "sessions": [{ "id": "s-1" }] }),
@@ -5705,6 +5730,8 @@ fn aux_rest_to_ws_v1_result_dtos_match_json_goldens() {
         sessions: serde_json::json!([{ "id": "s-1" }]),
         workspace_root: Some("/srv/project".into()),
         profile_id: Some("dev".into()),
+        next_cursor: None,
+        scope: None,
     };
     assert_eq!(
         serde_json::to_value(&scoped).expect("serialize"),
