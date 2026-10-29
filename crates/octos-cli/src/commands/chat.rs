@@ -972,15 +972,24 @@ pub(crate) fn create_embedder_in(
                 Some(p) => p.to_string(),
                 None => {
                     let download = crate::embed_model::downloads_allowed(cfg.auto_download);
-                    match crate::embed_model::ensure_default_model(data_dir, download) {
-                        Ok(p) => p.to_string_lossy().into_owned(),
-                        Err(err) => {
-                            tracing::warn!(
-                                %err,
-                                "default embedding model unavailable; memory search runs keyword-only"
-                            );
-                            return None;
-                        }
+                    let status = crate::embed_model::model_status(data_dir);
+                    if status.complete {
+                        status.path.to_string_lossy().into_owned()
+                    } else if download {
+                        // Session/profile bootstrap must not wait for the 334 MB
+                        // model. Recall starts keyword-only and backfills when ready.
+                        crate::embed_model::spawn_default_model_download(data_dir, true);
+                        return Some(Arc::new(
+                            crate::embed_model::DeferredEmbeddingProvider::new(
+                                data_dir.to_path_buf(),
+                            ),
+                        ));
+                    } else {
+                        tracing::warn!(
+                            path = %status.path.display(),
+                            "default embedding model unavailable; memory search runs keyword-only"
+                        );
+                        return None;
                     }
                 }
             };
