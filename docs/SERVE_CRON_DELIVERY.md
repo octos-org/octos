@@ -14,4 +14,4 @@ The original scheduled fire time is separate from retry backoff and is part of t
 
 ## Missed executions
 
-When a job is already due at service startup, it is delivered once and marked as a late delivery. A recurring job does not replay every missed interval: it catches up once, then advances from the accepted occurrence.
+When a job is already due at service startup, it is delivered once and marked as a late delivery. Ordinary timer delivery has a 60-second grace window; only startup catch-up or a delayed retry beyond that window is marked late. A recurring job does not replay every missed interval: it catches up once, then advances from the accepted occurrence.

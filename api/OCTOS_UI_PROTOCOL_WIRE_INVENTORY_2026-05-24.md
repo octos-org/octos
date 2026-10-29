@@ -129,6 +129,8 @@ spec and UPCR documents. The authoritative source remains code:
 | `memory/ingest` | shipped; app records into the Recall index (docs/adr/personal-memory-tiers.md, 2026-09-16) |
 | `memory/request` | explicit authenticated remember/correct/forget admission; accepted is not completion |
 | `memory/promote` | authenticated source-filtered Document nomination into existing consolidation |
+| `cron/create` | capability-gated create with server id and exact session/profile origin, UPCR-2026-058 |
+| `cron/delete` | idempotent delete with profile authorization, UPCR-2026-058 |
 | `cron/list` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `cron/toggle` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |
 | `launch/resolve` | shipped; backfilled from code constants (spec-vs-impl audit 2026-08-21) |

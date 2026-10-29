@@ -947,6 +947,8 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "memory/ingest",
             "memory/request",
             "memory/promote",
+            "cron/create",
+            "cron/delete",
             "cron/list",
             "cron/toggle",
             "router/set_mode",
@@ -1088,6 +1090,8 @@ fn ui_protocol_v1_wire_contract_is_golden() {
             "memory/ingest",
             "memory/request",
             "memory/promote",
+            "cron/create",
+            "cron/delete",
             "cron/list",
             "cron/toggle",
             "router/set_mode",
@@ -1187,7 +1191,9 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "memory/ingest",
             "memory/request",
             "memory/promote",
-                "cron/list",
+                "cron/create",
+            "cron/delete",
+            "cron/list",
                 "cron/toggle",
                 "router/set_mode",
                 "router/get_metrics",
@@ -5073,6 +5079,26 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
             methods::MEMORY_PROMOTE,
         ),
         (
+            UiCommand::CronCreate(CronCreateParams {
+                session_id: SessionKey("api:cron-test".into()),
+                schedule: CronCreateSchedule::Every { every_ms: 60_000 },
+                message: "tick".into(),
+                deliver: false,
+                channel: None,
+                chat_id: None,
+                mode: CronCreateMode::Agent,
+                timezone: None,
+            }),
+            methods::CRON_CREATE,
+        ),
+        (
+            UiCommand::CronDelete(CronDeleteParams {
+                session_id: SessionKey("api:cron-test".into()),
+                job_id: "job-1".into(),
+            }),
+            methods::CRON_DELETE,
+        ),
+        (
             UiCommand::CronList(CronListParams::default()),
             methods::CRON_LIST,
         ),
@@ -5086,8 +5112,8 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
     ];
     assert_eq!(
         cases.len(),
-        22,
-        "22 UiCommand arms cover the 22 auxiliary methods \
+        24,
+        "24 UiCommand arms cover the 24 auxiliary methods \
              (`session/list`, `session/snapshot`, `session/messages_page`, \
              `session/status.get`, `session/files.list`, `session/tasks.list`, \
              `session/workspace.get`, `session/title.set`, `session/delete`, \
@@ -5308,6 +5334,8 @@ fn aux_rest_to_ws_v1_methods_are_capability_gated() {
         methods::MEMORY_INGEST,
         methods::MEMORY_REQUEST,
         methods::MEMORY_PROMOTE,
+        methods::CRON_CREATE,
+        methods::CRON_DELETE,
         methods::CRON_LIST,
         methods::CRON_TOGGLE,
     ] {
@@ -5341,6 +5369,8 @@ fn aux_rest_to_ws_v1_methods_are_capability_gated() {
         methods::MEMORY_INGEST,
         methods::MEMORY_REQUEST,
         methods::MEMORY_PROMOTE,
+        methods::CRON_CREATE,
+        methods::CRON_DELETE,
         methods::CRON_LIST,
         methods::CRON_TOGGLE,
     ] {

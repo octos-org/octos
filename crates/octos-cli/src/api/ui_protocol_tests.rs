@@ -3799,6 +3799,12 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             }],
             "embed": false,
         }),
+        methods::CRON_CREATE => json!({
+            "session_id": session_id,
+            "schedule": { "kind": "Every", "every_ms": 60000 },
+            "message": "probe cron"
+        }),
+        methods::CRON_DELETE => json!({ "session_id": session_id, "job_id": "probe-job" }),
         methods::CRON_TOGGLE => json!({ "job_id": "probe-job", "enabled": false }),
         methods::ROUTER_SET_MODE => json!({
             "session_id": session_id,

@@ -1449,7 +1449,11 @@ impl ProfileRuntime {
                     .delivery_fire_at_ms
                     .or(job.state.next_run_at_ms)
                     .unwrap_or(job.created_at_ms);
-                let late = chrono::Utc::now().timestamp_millis() > scheduled_fire_at_ms;
+                // Ordinary timer delivery is not "late" merely because the
+                // scheduled instant has arrived. Only startup catch-up or a
+                // delayed retry beyond the grace window is marked late.
+                let late = chrono::Utc::now().timestamp_millis()
+                    > scheduled_fire_at_ms.saturating_add(60_000);
                 match crate::autonomy::agent_orchestrator::default_agent_orchestrator()
                     .enqueue_cron_fire_continuation(
                         &session,

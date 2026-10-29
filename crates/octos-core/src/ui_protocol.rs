@@ -440,6 +440,8 @@ fn method_capability_gate(method: &str) -> Option<&'static str> {
         | methods::MEMORY_INGEST
         | methods::MEMORY_REQUEST
         | methods::MEMORY_PROMOTE
+        | methods::CRON_CREATE
+        | methods::CRON_DELETE
         | methods::CRON_LIST
         | methods::CRON_TOGGLE => Some(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
         methods::AGENT_LIST
@@ -1353,6 +1355,8 @@ pub mod methods {
     /// Nominate eligible app documents into background consolidation.
     pub const MEMORY_PROMOTE: &str = "memory/promote";
     /// Replaces `GET /api/my/cron` — cron panel job listing.
+    pub const CRON_CREATE: &str = "cron/create";
+    pub const CRON_DELETE: &str = "cron/delete";
     pub const CRON_LIST: &str = "cron/list";
     /// Replaces `PUT /api/my/cron/{job_id}/enabled` — cron job toggle.
     pub const CRON_TOGGLE: &str = "cron/toggle";
@@ -1538,6 +1542,8 @@ pub const UI_PROTOCOL_COMMAND_METHODS: &[&str] = &[
     methods::MEMORY_INGEST,
     methods::MEMORY_REQUEST,
     methods::MEMORY_PROMOTE,
+    methods::CRON_CREATE,
+    methods::CRON_DELETE,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -1677,6 +1683,8 @@ pub const UI_PROTOCOL_FIRST_SERVER_METHODS: &[&str] = &[
     methods::MEMORY_INGEST,
     methods::MEMORY_REQUEST,
     methods::MEMORY_PROMOTE,
+    methods::CRON_CREATE,
+    methods::CRON_DELETE,
     methods::CRON_LIST,
     methods::CRON_TOGGLE,
     methods::ROUTER_SET_MODE,
@@ -4082,6 +4090,60 @@ pub struct CronListResult {
     pub truncated: bool,
 }
 
+/// UPCR-2026-058: one schedule accepted by `cron/create`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum CronCreateSchedule {
+    At { at_ms: i64 },
+    Every { every_ms: i64 },
+    Cron { expr: String },
+}
+
+/// UPCR-2026-058: whether a cron fire runs an agent turn or only delivers text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CronCreateMode {
+    #[default]
+    Agent,
+    Notify,
+}
+
+/// Params for `cron/create`. The server generates the job id and stamps the
+/// exact session/profile origin used by acknowledged serve delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronCreateParams {
+    pub session_id: SessionKey,
+    pub schedule: CronCreateSchedule,
+    pub message: String,
+    #[serde(default)]
+    pub deliver: bool,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub chat_id: Option<String>,
+    #[serde(default)]
+    pub mode: CronCreateMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CronCreateResult {
+    pub job: Value,
+}
+
+/// Params for idempotent `cron/delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronDeleteParams {
+    pub session_id: SessionKey,
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronDeleteResult {
+    pub deleted: bool,
+}
+
 /// Params for `cron/toggle`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronToggleParams {
@@ -4528,6 +4590,8 @@ pub enum UiCommand {
     MemoryIngest(MemoryIngestParams),
     MemoryRequest(MemoryRequestParams),
     MemoryPromote(MemoryPromoteParams),
+    CronCreate(CronCreateParams),
+    CronDelete(CronDeleteParams),
     CronList(CronListParams),
     CronToggle(CronToggleParams),
     // ---- Wave4-A: adaptive router controls ----
@@ -4590,6 +4654,8 @@ impl UiCommand {
             Self::MemoryIngest(_) => methods::MEMORY_INGEST,
             Self::MemoryRequest(_) => methods::MEMORY_REQUEST,
             Self::MemoryPromote(_) => methods::MEMORY_PROMOTE,
+            Self::CronCreate(_) => methods::CRON_CREATE,
+            Self::CronDelete(_) => methods::CRON_DELETE,
             Self::CronList(_) => methods::CRON_LIST,
             Self::CronToggle(_) => methods::CRON_TOGGLE,
             Self::RouterSetMode(_) => methods::ROUTER_SET_MODE,
@@ -4653,6 +4719,8 @@ impl UiCommand {
             Self::MemoryIngest(params) => serde_json::to_value(params),
             Self::MemoryRequest(params) => serde_json::to_value(params),
             Self::MemoryPromote(params) => serde_json::to_value(params),
+            Self::CronCreate(params) => serde_json::to_value(params),
+            Self::CronDelete(params) => serde_json::to_value(params),
             Self::CronList(params) => serde_json::to_value(params),
             Self::CronToggle(params) => serde_json::to_value(params),
             Self::RouterSetMode(params) => serde_json::to_value(params),
@@ -4763,6 +4831,8 @@ impl UiCommand {
             methods::MEMORY_INGEST => Ok(Self::MemoryIngest(decode_params(method, params)?)),
             methods::MEMORY_REQUEST => Ok(Self::MemoryRequest(decode_params(method, params)?)),
             methods::MEMORY_PROMOTE => Ok(Self::MemoryPromote(decode_params(method, params)?)),
+            methods::CRON_CREATE => Ok(Self::CronCreate(decode_params(method, params)?)),
+            methods::CRON_DELETE => Ok(Self::CronDelete(decode_params(method, params)?)),
             methods::CRON_LIST => Ok(Self::CronList(decode_optional_params(method, params)?)),
             methods::CRON_TOGGLE => Ok(Self::CronToggle(decode_params(method, params)?)),
             methods::ROUTER_SET_MODE => Ok(Self::RouterSetMode(decode_params(method, params)?)),
