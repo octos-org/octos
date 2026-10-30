@@ -22,7 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # Keep the skill's compression feature set minimal. Declaring the version here
 # (rather than inheriting) also supports Cargo's older workspace-dependency rules.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

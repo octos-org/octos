@@ -141,7 +141,7 @@ tree-sitter-typescript = "0.23"
 # Diff
 similar = "2"
 # Office file manipulation (DOCX/PPTX/XLSX are ZIP+XML)
-zip = "2"
+zip = "9"
 quick-xml = "0.37"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 # PDF text extraction (pure Rust; read_file auto-detects %PDF- magic)
