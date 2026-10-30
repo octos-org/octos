@@ -1117,6 +1117,19 @@ rows of `session/rollback`'s `thread` carry them too):
   On an assistant row that called tools, `{tool_call_id, tool_name}` per call,
   in call order, without the arguments. Omitted when the row made no call.
 
+Optional `file_mutations` (UPCR-2026-066, advertised as
+`state.session_file_mutations.v1`, additive and ungated): an oldest-first
+array of existing `UiFileMutationNotice` values (`path`, `operation`, optional
+`preview_id`, `tool_call_id`, `bytes_written`). Included with the `messages`
+section; omitted otherwise. It is a snapshot of actual mutations in retained
+ledger history through the result cursor, independent of `after` and the hot
+ring. Clients replace their session change list from this snapshot, then apply
+live notifications after the cursor. Old servers omit it; absence must not
+clear existing live observations. Preview IDs are fetched with
+`diff/preview/get`; no proposal or current workspace diff is synthesized.
+Existing session/profile/workspace authorization and ledger retention apply.
+Conversation rollback does not undo files and omits this optional snapshot.
+
 ### `turn/state/get`
 
 Purpose:

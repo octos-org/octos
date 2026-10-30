@@ -31128,7 +31128,20 @@ async fn handle_session_hydrate(
         None
     };
 
+    let file_mutations = if include_set.messages {
+        match ledger.retained_file_mutations(&params.session_id, &head_cursor) {
+            Ok(mutations) => Some(mutations),
+            Err(error) => {
+                let _ = send_rpc_error(ws, Some(id), error);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     let result = SessionHydrateResult {
+        file_mutations,
         session_id: params.session_id,
         cursor: head_cursor,
         context,
@@ -31347,6 +31360,7 @@ async fn handle_session_rollback(
         .collect::<Vec<_>>();
 
     let thread = SessionHydrateResult {
+        file_mutations: None,
         session_id: params.session_id.clone(),
         cursor: head_cursor,
         context: None,
