@@ -38,6 +38,12 @@ The end-of-turn append skips that initial user row, preserving separate steers
 and assistant/tool rows. Internal continuation prompts remain excluded. A
 failure to commit the request fails the turn before model/tool execution.
 
+Shared-history lanes (UPCR-2026-034) deduplicate only the precommitted request;
+its presence does not mean the turn finished. The other lane still sees the
+live draft and approval/question status until response rows commit or the
+running-turn registration ends. Match the dispatch's thread and start time
+so unrelated rows and an earlier use of the same turn ID cannot hide it.
+
 Reconnect through the normal authenticated profile/workspace and session/open
 cursor replay, then hydrate / query turn state. Pending approvals and questions
 remain answerable under the existing checks; explicit turn/interrupt still

@@ -42927,10 +42927,10 @@ async fn run_standalone_turn(
     // itself moves into the agent task below.
     let turn_end_summary = crate::session_actor::git_turn_summary(&prompt);
     // UPCR-2026-034, the parallel person context with shared history: until
-    // this turn's rows reach the transcript (at its end), the other lane of a
-    // sharing peer sees it from here: its request, the text streamed so far,
-    // and what it waits on. Dropped with this scope, whichever way the turn
-    // ends. No-op for a session that is not a lane.
+    // this turn's response reaches the transcript (at its end), the other
+    // lane sees the text streamed so far and what it waits on. The request
+    // is committed before execution and deduplicated against this projection.
+    // Dropped with this scope, whichever way the turn ends. No-op outside lanes.
     let _running_turn = crate::peers::shared_history::begin_running_turn(
         &session_id,
         &turn_id.0.to_string(),
