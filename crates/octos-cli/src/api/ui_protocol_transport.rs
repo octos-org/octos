@@ -8286,13 +8286,33 @@ async fn ui_protocol_connection(
                 .await;
             }
             UiCommand::WorkspaceList(_) => {
-                handle_workspace_list(&ws, &state, connection_profile_id, id).await;
+                super::workspace_protocol::handle_workspace_list(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                )
+                .await;
             }
             UiCommand::WorkspaceRegister(params) => {
-                handle_workspace_register(&ws, &state, connection_profile_id, id, params).await;
+                super::workspace_protocol::handle_workspace_register(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::WorkspaceGet(params) => {
-                handle_workspace_get(&ws, &state, connection_profile_id, id, params).await;
+                super::workspace_protocol::handle_workspace_get(
+                    &ws,
+                    &state,
+                    connection_profile_id,
+                    id,
+                    params,
+                )
+                .await;
             }
             UiCommand::SessionCreate(params) => {
                 handle_session_create(
@@ -9383,11 +9403,16 @@ where
                     .await;
                 }
                 UiCommand::WorkspaceList(_) => {
-                    handle_workspace_list(&ws, &state, connection_profile_id_owned.as_deref(), id)
-                        .await;
+                    super::workspace_protocol::handle_workspace_list(
+                        &ws,
+                        &state,
+                        connection_profile_id_owned.as_deref(),
+                        id,
+                    )
+                    .await;
                 }
                 UiCommand::WorkspaceRegister(params) => {
-                    handle_workspace_register(
+                    super::workspace_protocol::handle_workspace_register(
                         &ws,
                         &state,
                         connection_profile_id_owned.as_deref(),
@@ -9397,7 +9422,7 @@ where
                     .await;
                 }
                 UiCommand::WorkspaceGet(params) => {
-                    handle_workspace_get(
+                    super::workspace_protocol::handle_workspace_get(
                         &ws,
                         &state,
                         connection_profile_id_owned.as_deref(),
@@ -33836,508 +33861,7 @@ fn axum_path(value: String) -> axum::extract::Path<String> {
 // alongside the connection state and negotiated features, pushing the
 // handler past clippy's 7-arg lint; the parameters are a flat dependency
 // list, not a missing struct.
-#[allow(clippy::too_many_arguments)]
-async fn handle_session_list(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    headers: &HeaderMap,
-    identity: Option<&AuthIdentity>,
-    connection_profile_id: Option<&str>,
-    connection_is_external: bool,
-    features: ConnectionUiFeatures,
-    id: String,
-    params: SessionListParams,
-) {
-    if connection_is_external && features.workspace_session_refs_v1 {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::permission_denied(
-                "session/list SessionRef catalogs are not available to external clients",
-            )
-            .with_data(json!({ "kind": "external_method_denied" })),
-        );
-        return;
-    }
-    if features.workspace_session_refs_v1 {
-        return handle_session_ref_list(
-            ws,
-            state,
-            headers,
-            identity,
-            connection_profile_id,
-            id,
-            params,
-        )
-        .await;
-    }
-    if params.workspace_id.is_some() || params.cursor.is_some() || params.limit.is_some() {
-        let _ = send_rpc_error(
-            ws,
-            Some(id),
-            RpcError::invalid_params(
-                "workspace_id, cursor and limit require feature workspace.session_refs.v1",
-            )
-            .with_data(json!({
-                "kind": "feature_required",
-                "feature": octos_core::ui_protocol::UI_PROTOCOL_FEATURE_WORKSPACE_SESSION_REFS_V1,
-            })),
-        );
-        return;
-    }
-    // Per-project (`appui.sessions_in_cwd`) scoping. When the client sends a
-    // `cwd` AND the server flag is on AND the connection negotiated
-    // `session.workspace_cwd.v1`, the listing is scoped to `<cwd>/.octos`.
-    // Absent cwd / flag off → `None` → byte-identical legacy listing.
-    let cwd_scope =
-        match resolve_session_list_cwd_root(state, features, connection_profile_id, &params) {
-            Ok(scope) => scope,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
-    // When the listing is project-scoped, the effective profile is the one
-    // the store was resolved for (which may come from `params.profile_id` on
-    // an admin connection), so `active_turn` is stamped against the same
-    // wire keys session/open registers under.
-    let connection_profile_id = cwd_scope
-        .as_ref()
-        .map(|scope| scope.profile_id.as_str())
-        .or(connection_profile_id);
-    let identity_ext = identity.cloned().map(Extension);
-    // Per-session busy state. Read from the PROCESS-global registry, not this
-    // connection's `connection_turns`, so the flag is honest about a session
-    // another client — the TUI next to this browser tab — is mid-turn in but
-    // this connection never opened. Taken as one snapshot BEFORE the listing
-    // so no sessions lock is ever held while the registry lock is.
-    let busy_sessions = active_turn_sessions(&active_turns_registry()).await;
-    let response = super::handlers::list_sessions(
-        State(state.clone()),
-        headers.clone(),
-        identity_ext,
-        connection_profile_id,
-        cwd_scope.as_ref().map(|scope| scope.sessions_root.clone()),
-        &busy_sessions,
-    )
-    .await;
-    let method = octos_core::ui_protocol::methods::SESSION_LIST;
-    // Collection endpoint — no addressable session id. Treat any
-    // (unexpected) 404 as a generic resource-not-found rather than
-    // an `UNKNOWN_SESSION` miss.
-    let context = RestResourceContext::resource("session", "");
-    match rest_response_to_rpc_value(response, method, context).await {
-        Ok(sessions) => {
-            send_aux_rpc_result(
-                ws,
-                id,
-                method,
-                session_list_result_value(sessions, cwd_scope.as_ref()),
-            );
-        }
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-        }
-    }
-}
-
-async fn handle_session_ref_list(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    headers: &HeaderMap,
-    identity: Option<&AuthIdentity>,
-    connection_profile_id: Option<&str>,
-    id: String,
-    params: SessionListParams,
-) {
-    let profile_id = connection_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    let busy_sessions = active_turn_sessions(&active_turns_registry()).await;
-    let response = super::handlers::list_sessions(
-        State(state.clone()),
-        headers.clone(),
-        identity.cloned().map(Extension),
-        connection_profile_id,
-        None,
-        &busy_sessions,
-    )
-    .await;
-    let context = RestResourceContext::resource("session", "");
-    let global = match rest_response_to_rpc_value(
-        response,
-        octos_core::ui_protocol::methods::SESSION_LIST,
-        context,
-    )
-    .await
-    {
-        Ok(value) => match serde_json::from_value::<Vec<super::handlers::SessionInfo>>(value) {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                let _ = send_rpc_error(
-                    ws,
-                    Some(id),
-                    RpcError::internal_error(format!("failed to decode session catalog: {error}")),
-                );
-                return;
-            }
-        },
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-            return;
-        }
-    };
-    for info in &global {
-        if let Err(error) = super::workspace_registry::ensure_session_ref(
-            state,
-            profile_id,
-            &SessionKey(info.id.clone()),
-            None,
-            info,
-            false,
-        ) {
-            let _ = send_rpc_error(ws, Some(id), error);
-            return;
-        }
-    }
-    let workspaces = match super::workspace_registry::list_workspaces(state, profile_id) {
-        Ok(workspaces) => workspaces,
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-            return;
-        }
-    };
-    for workspace in workspaces.iter().filter(|workspace| {
-        params
-            .workspace_id
-            .as_deref()
-            .is_none_or(|id| id == workspace.workspace_id)
-    }) {
-        let root = crate::runtime::session::project_sessions_root(
-            Path::new(&workspace.canonical_path),
-            profile_id,
-        );
-        for info in super::handlers::list_profile_sessions(&root, &busy_sessions, profile_id) {
-            if let Err(error) = super::workspace_registry::ensure_session_ref(
-                state,
-                profile_id,
-                &SessionKey(info.id.clone()),
-                Some(workspace),
-                &info,
-                false,
-            ) {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        }
-    }
-    let records = match super::workspace_registry::catalog_records(
-        state,
-        profile_id,
-        params.workspace_id.as_deref(),
-    ) {
-        Ok(records) => records,
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-            return;
-        }
-    };
-    let cursor = match params.cursor.as_deref() {
-        Some(value) => match value.parse::<usize>() {
-            Ok(cursor) => cursor,
-            Err(_) => {
-                let _ = send_rpc_error(
-                    ws,
-                    Some(id),
-                    RpcError::invalid_params("session/list cursor is invalid"),
-                );
-                return;
-            }
-        },
-        None => 0,
-    };
-    let limit = params.limit.unwrap_or(50).clamp(1, 100) as usize;
-    let page: Vec<_> = records
-        .iter()
-        .skip(cursor)
-        .take(limit + 1)
-        .cloned()
-        .collect();
-    let next_cursor = (page.len() > limit).then(|| (cursor + limit).to_string());
-    let page = page.into_iter().take(limit).collect::<Vec<_>>();
-    let workspace_root = params.workspace_id.as_ref().and_then(|workspace_id| {
-        workspaces
-            .iter()
-            .find(|workspace| workspace.workspace_id == *workspace_id)
-            .map(|workspace| workspace.canonical_path.clone())
-    });
-    let scope = if params.workspace_id.is_some() {
-        "workspace"
-    } else {
-        "mixed"
-    };
-    let result = octos_core::ui_protocol::SessionListResult {
-        sessions: serde_json::to_value(page).unwrap_or_else(|_| json!([])),
-        workspace_root,
-        profile_id: Some(profile_id.to_owned()),
-        next_cursor,
-        scope: Some(scope.to_owned()),
-    };
-    let _ = send_rpc_result(
-        ws,
-        id,
-        serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-    );
-}
-
-async fn handle_workspace_list(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    connection_profile_id: Option<&str>,
-    id: String,
-) {
-    let profile_id = connection_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    match super::workspace_registry::list_workspaces(state, profile_id) {
-        Ok(workspaces) => {
-            let result = octos_core::ui_protocol::WorkspaceListResult { workspaces };
-            let _ = send_rpc_result(
-                ws,
-                id,
-                serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-            );
-        }
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-        }
-    }
-}
-
-async fn handle_workspace_register(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    connection_profile_id: Option<&str>,
-    id: String,
-    params: octos_core::ui_protocol::WorkspaceRegisterParams,
-) {
-    let profile_id = connection_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    match super::workspace_registry::register_workspace(
-        state,
-        profile_id,
-        &params.path,
-        params.display_name,
-    ) {
-        Ok(workspace) => {
-            let result = octos_core::ui_protocol::WorkspaceRegisterResult { workspace };
-            let _ = send_rpc_result(
-                ws,
-                id,
-                serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-            );
-        }
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-        }
-    }
-}
-
-async fn handle_workspace_get(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    connection_profile_id: Option<&str>,
-    id: String,
-    params: octos_core::ui_protocol::WorkspaceGetParams,
-) {
-    let profile_id = connection_profile_id.unwrap_or(MAIN_PROFILE_ID);
-    match super::workspace_registry::get_workspace(state, profile_id, &params.workspace_id) {
-        Ok(workspace) => {
-            let result = octos_core::ui_protocol::WorkspaceGetResult { workspace };
-            let _ = send_rpc_result(
-                ws,
-                id,
-                serde_json::to_value(result).unwrap_or_else(|_| json!({})),
-            );
-        }
-        Err(error) => {
-            let _ = send_rpc_error(ws, Some(id), error);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_session_create(
-    ws: &WsConnection,
-    state: &Arc<AppState>,
-    ledger: &Arc<UiProtocolLedger>,
-    approvals: &PendingApprovalStore,
-    questions: &PendingQuestionStore,
-    live_forwarders: &SharedLiveForwarders,
-    connection_profile_id: Option<&str>,
-    pinned_profile_id: Option<&str>,
-    features: ConnectionUiFeatures,
-    id: String,
-    params: octos_core::ui_protocol::SessionCreateParams,
-) -> bool {
-    let (profile_id, workspace) = match super::workspace_registry::resolve_workspace_for_create(
-        state,
-        connection_profile_id,
-        &params.workspace_id,
-        params.profile_id.as_deref(),
-    ) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            send_scope_error(ws, id, error);
-            return false;
-        }
-    };
-    let params = SessionOpenParams {
-        session_id: SessionKey::with_profile(
-            &profile_id,
-            "api",
-            &uuid::Uuid::now_v7().simple().to_string(),
-        ),
-        session_ref: None,
-        topic: None,
-        profile_id: Some(profile_id),
-        cwd: Some(workspace.canonical_path),
-        sandbox: None,
-        after: None,
-        client_commands: None,
-    };
-    handle_session_open_with_mode(
-        ws,
-        state,
-        ledger,
-        approvals,
-        questions,
-        live_forwarders,
-        connection_profile_id,
-        pinned_profile_id,
-        features,
-        id,
-        params,
-        false,
-        true,
-    )
-    .await
-}
-
-/// Resolve an optional `session/list` `cwd` into the per-project, per-profile
-/// session-store root (`<cwd>/.octos/<profile_id>`), applying the same gates
-/// the write path uses so list and open agree on where a project's sessions
-/// live:
-///
-/// 1. **Flag** — when `appui.sessions_in_cwd` is off, the `cwd` is ignored
-///    entirely (`Ok(None)` → legacy per-profile/global listing). This keeps a
-///    flag-off server byte-identical: nothing was ever written under
-///    `<cwd>/.octos`, so scoping to it would only ever return an empty list.
-/// 2. **Capability** — a `cwd` under the flag requires the connection to have
-///    negotiated `session.workspace_cwd.v1` (mirrors `session/open`'s cwd
-///    gate). A client that sends `cwd` without it gets a typed error rather
-///    than a silently-global list.
-/// 3. **Workspace safety** — the SAME [`validate_session_workspace_allowed`]
-///    gate `session/open` runs: the cwd must canonicalize to a directory AND
-///    must not be rooted under a banned system path. Without this a client
-///    could point the listing at `/etc` (or any service-writable path) and
-///    `SessionManager::open` would CREATE `<cwd>/.octos/…` there and enumerate
-///    it. On rejection we surface the typed error (consistent with
-///    `session/open`) rather than silently degrading.
-/// 4. **Profile scope** — `params.profile_id` follows the session/open rules:
-///    a user connection may only restate its own profile (anything else is an
-///    `auth_scope_violation`), an admin/token connection may name the profile
-///    it opens sessions under, and an unregistered profile is rejected by the
-///    same runtime gate as above.
-/// 5. **Profile namespace** — the store root is
-///    `<cwd>/.octos/<profile_id>` (via [`project_sessions_root`]), matching
-///    the write path so two profiles that share a project cwd never read each
-///    other's transcripts.
-///
-/// A trimmed-empty or absent `cwd` is always `Ok(None)` (legacy listing).
-fn resolve_session_list_cwd_root(
-    state: &AppState,
-    features: ConnectionUiFeatures,
-    connection_profile_id: Option<&str>,
-    params: &SessionListParams,
-) -> Result<Option<SessionListScope>, RpcError> {
-    let Some(cwd) = params
-        .cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|cwd| !cwd.is_empty())
-    else {
-        return Ok(None);
-    };
-    // Flag off → the store was never relocated; ignore the cwd (legacy).
-    if !state.session_cache.sessions_in_cwd() {
-        return Ok(None);
-    }
-    if !features.session_workspace_cwd {
-        return Err(RpcError::invalid_params(
-            "session/list cwd requires feature session.workspace_cwd.v1",
-        )
-        .with_data(json!({
-            "kind": "feature_required",
-            "feature": UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
-        })));
-    }
-    // Profile precedence mirrors session/open (`validate_session_scope`): a
-    // user connection is frozen to its own profile and may only restate it;
-    // an admin/token connection (no connection profile) may name the profile
-    // it opens sessions under, so the listing reads the SAME
-    // `<cwd>/.octos/<profile>` store those sessions were written to.
-    let requested_profile_id = params.profile_id.as_deref();
-    if requested_profile_id.is_some_and(str::is_empty) {
-        return Err(RpcError::invalid_params("profile_id cannot be empty"));
-    }
-    let active_profile_id = match (connection_profile_id, requested_profile_id) {
-        (Some(connection), Some(requested)) if requested != connection => {
-            return Err(authenticated_scope_mismatch_error(
-                "profile_id is outside the authenticated profile",
-                connection,
-                Some(requested),
-            ));
-        }
-        (Some(connection), _) => Some(connection),
-        (None, requested) => requested,
-    };
-    let workspace_root = canonical_existing_dir(cwd)?;
-    // SAME safety gate as session/open — reject banned system roots (and the
-    // missing-profile-runtime case) BEFORE opening a SessionManager that would
-    // otherwise materialize `<cwd>/.octos` at an arbitrary path.
-    validate_session_workspace_allowed(state, active_profile_id, &workspace_root)?;
-    // Namespace by the SAME profile the write path uses so the listing reads
-    // exactly the project store session/open writes for this scope.
-    let profile_id = resolve_session_profile_runtime(state, active_profile_id)
-        .map(|runtime| runtime.profile_id.clone())
-        .unwrap_or_else(|| active_profile_id.unwrap_or(MAIN_PROFILE_ID).to_string());
-    Ok(Some(SessionListScope {
-        sessions_root: crate::runtime::session::project_sessions_root(&workspace_root, &profile_id),
-        workspace_root,
-        profile_id,
-    }))
-}
-
-/// A `session/list` that was scoped to one project store: the canonical
-/// workspace root, the `<root>/.octos/<profile>` store it read, and that
-/// profile.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionListScope {
-    workspace_root: PathBuf,
-    sessions_root: PathBuf,
-    profile_id: String,
-}
-
-/// The `session/list` result body. A scoped listing attests the root and
-/// profile it read (see `SessionListResult::workspace_root`); a legacy
-/// listing stays the byte-identical `{ sessions }` it always was, which is
-/// how a client tells the two apart for the same `{cwd}` request.
-fn session_list_result_value(sessions: Value, scope: Option<&SessionListScope>) -> Value {
-    serde_json::to_value(octos_core::ui_protocol::SessionListResult {
-        sessions,
-        workspace_root: scope.map(|scope| scope.workspace_root.to_string_lossy().into_owned()),
-        profile_id: scope.map(|scope| scope.profile_id.clone()),
-        next_cursor: None,
-        scope: None,
-    })
-    .unwrap_or_else(|_| json!({}))
-}
+include!("ui_protocol_session_list.rs");
 
 /// `launch/resolve` — the pre-session launch probe. Resolves the launching
 /// profile (requested `--profile` → folder-sticky → global default) and reports
@@ -49956,7 +49480,11 @@ fn minimal_rpc_error_frame(id: Option<String>, message: &'static str) -> Option<
 /// and NO connection close. Instead we synthesize a guaranteed-tiny same-id
 /// JSON-RPC error reply (no echoed large payload) and send THAT, so the client
 /// always gets a reply to its id. The over-cap `result` is NOT echoed.
-fn send_rpc_result(ws: &WsConnection, id: String, result: Value) -> Result<(), SendError> {
+pub(crate) fn send_rpc_result(
+    ws: &WsConnection,
+    id: String,
+    result: Value,
+) -> Result<(), SendError> {
     match frame_for(&RpcResponse::success(id.clone(), result)) {
         Some(frame) => ws.send_lifecycle(frame),
         None => send_minimal_rpc_error_fallback(ws, Some(id)),
@@ -49977,7 +49505,11 @@ fn send_ui_rpc_result(ws: &WsConnection, id: String, result: UiRpcResult) -> Res
 /// `error.message` is so large that `frame_for` returns `None`, we drop the
 /// oversized data and emit a minimal same-id error with a short static message,
 /// so the client still gets a reply to its id rather than waiting forever.
-fn send_rpc_error(ws: &WsConnection, id: Option<String>, error: RpcError) -> Result<(), SendError> {
+pub(crate) fn send_rpc_error(
+    ws: &WsConnection,
+    id: Option<String>,
+    error: RpcError,
+) -> Result<(), SendError> {
     match frame_for(&RpcErrorResponse::new(id.clone(), error)) {
         Some(frame) => ws.send_lifecycle(frame),
         None => send_minimal_rpc_error_fallback(ws, id),
