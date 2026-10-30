@@ -3601,6 +3601,19 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
     let preview_id = PreviewId::new();
     let task_id = TaskId::new();
     let params = match method {
+        APPUI_METHOD_MCP_CONNECTOR_CREATE => json!({
+            "session_id": session_id,
+            "connector": {"transport": "http", "name": "probe", "url": "https://example.com/mcp"}
+        }),
+        APPUI_METHOD_MCP_CONNECTOR_UPDATE => json!({
+            "session_id": session_id, "connector_id": "mcp-probe", "patch": {"name": "probe"}
+        }),
+        APPUI_METHOD_MCP_CONNECTOR_DELETE | APPUI_METHOD_MCP_CONNECTOR_RECONNECT => json!({
+            "session_id": session_id, "connector_id": "mcp-probe"
+        }),
+        APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED => json!({
+            "session_id": session_id, "connector_id": "mcp-probe", "enabled": false
+        }),
         APPUI_METHOD_CLIENT_HELLO => json!({
             "transport": "stdio",
             "supported_features": [],
@@ -14558,6 +14571,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14635,6 +14649,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14757,6 +14772,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14834,6 +14850,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14904,6 +14921,7 @@ fn shell_approval_still_emits_risk_field() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -15019,6 +15037,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -19398,6 +19417,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
             session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -32111,6 +32131,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         tool_specs: Arc::new(base_tools),
         plugin_tool_names: Vec::new(),
         skill_actions: Vec::new(),
+        mcp_client: None,
         plugin_reload: None,
         plugin_dirs: Vec::new(),
         plugin_prompt_fragments: Vec::new(),

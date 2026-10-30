@@ -86,6 +86,7 @@ records.
 | 058 | Cron create and delete | proposed (implemented for review) | `..._058_CRON_CREATE_DELETE.md` | — |
 | 059 | Serve cron delivery through session continuations | proposed (implemented for review) | `..._059_SERVE_CRON_DELIVERY.md` | #2888 |
 | 061 | Structured write path in v2 tool replay | proposed (implemented for review) | `..._061_PROJECTION_WRITE_PATH.md` | #2894 |
+| 062 | MCP connector management and OAuth | proposed (PR1 implemented for review) | `..._062_MCP_CONNECTOR_MANAGEMENT.md` | #2679 |
 
 ## Renumbering history
 

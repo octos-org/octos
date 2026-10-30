@@ -753,6 +753,9 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   `skill.action_jobs.v1`, accepted `UPCR-2026-045`; persisted background skill
   action jobs only)
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
+- `mcp/connector/create`, `mcp/connector/update`, `mcp/connector/delete`,
+  `mcp/connector/set_enabled`, `mcp/connector/reconnect`
+  (gate `mcp.connector.manage.v1`, UPCR-2026-062)
 - `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
   local-solo only; #1057)
 - `onboarding/workspace_list`, `onboarding/workspace_create` (gate
@@ -1879,6 +1882,29 @@ Clients must use that method list to enable or disable slash commands.
 - return server-owned MCP and tool state so clients do not inspect backend
   config, provider config, MCP config, tool registry, memory, or sandbox state
   directly
+
+`mcp/connector/create`, `mcp/connector/update`, `mcp/connector/delete`,
+`mcp/connector/set_enabled`, and `mcp/connector/reconnect`
+(UPCR-2026-062, gate `mcp.connector.manage.v1`):
+
+- These methods mutate only the
+  session's authorized profile. They require the same profile-write scope as
+  provider saves; host-managed external and session-ingress clients are denied.
+- Stdio accepts only a deployment `allowlist_entry_id`, never arbitrary command,
+  args, or env. HTTP accepts no static secret headers. Responses and audit
+  records never contain secrets.
+- `mcp/status/list` remains available without this gate and reports real
+  disabled/connected/failed/closed state from the profile's live MCP client.
+- Limits: 32 connectors per profile and one explicit reconnect per connector
+  every 5 seconds. Mutations use the existing next-turn runtime transition.
+
+`mcp/oauth/*` (UPCR-2026-062, gate `mcp.oauth.v1`, PR2):
+
+- `start`, `complete`, `cancel`, and `revoke` use one-time, 10-minute flows bound
+  to session/profile. The preferred redirect is the allowed web Origin plus
+  `/oauth/mcp/callback`; `manual_callback_url` is the no-origin fallback.
+- Tokens are profile+URL namespaced in OS keyring or a 0600 encrypted data-dir
+  fallback, never returned by OUP or written to profile JSON.
 
 ### Coding Tool Contract Inspection
 

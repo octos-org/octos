@@ -2444,6 +2444,10 @@ mod tests {
 
     fn mcp_server(command: Option<&str>, url: Option<&str>) -> octos_agent::McpServerConfig {
         octos_agent::McpServerConfig {
+            id: None,
+            name: None,
+            enabled: true,
+            allowlist_entry_id: None,
             command: command.map(String::from),
             args: Vec::new(),
             env: std::collections::HashMap::new(),
