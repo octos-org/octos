@@ -271,6 +271,7 @@ impl Tool for EditFileTool {
             }
         };
 
+        let previous_content = super::file_mutation_previous_text(content.clone());
         let mut new_content = content;
         let mut replacers = Vec::with_capacity(edits.len());
         for (index, edit) in edits.iter().enumerate() {
@@ -393,6 +394,10 @@ impl Tool for EditFileTool {
             output: format!("{output}{}", format_note.unwrap_or_default()),
             success: true,
             file_modified: Some(path),
+            structured_metadata: Some(serde_json::json!({
+                "file_created": false,
+                "previous_content": previous_content,
+            })),
             ..Default::default()
         })
     }

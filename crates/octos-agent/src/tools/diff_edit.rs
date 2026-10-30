@@ -155,6 +155,7 @@ impl Tool for DiffEditTool {
             });
         }
 
+        let previous_content = super::file_mutation_previous_text(content.clone());
         let new_content = match apply_hunks(&content, &hunks) {
             Ok(c) => c,
             Err(e) => {
@@ -204,6 +205,10 @@ impl Tool for DiffEditTool {
             ),
             success: true,
             file_modified: Some(path),
+            structured_metadata: Some(serde_json::json!({
+                "file_created": false,
+                "previous_content": previous_content,
+            })),
             ..Default::default()
         })
     }
