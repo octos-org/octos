@@ -10631,3 +10631,300 @@ async fn fixed_dispatcher_deduplicates_same_native_call_in_one_batch() {
     assert_eq!(result.content, "done");
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
 }
+
+fn continuation_fixture(root: &std::path::Path, owner: &str) {
+    std::fs::create_dir_all(root.join(".octos")).unwrap();
+    std::fs::write(
+        root.join(".octos/continuation.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version":1,"task_id":"fixture","owner_agent":owner,"evidence_file":"evidence.json",
+            "stagnant_attempts":3,"deliverables":["candidate.bin"],"required_checks":[{"id":"layout","epsilon":0.0}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    continuation_report(root, 1, false);
+}
+fn continuation_report(root: &std::path::Path, attempt: usize, passed: bool) {
+    use sha2::{Digest, Sha256};
+    let bytes = format!("actually changed artifact {attempt}");
+    std::fs::write(root.join("candidate.bin"), &bytes).unwrap();
+    std::fs::write(root.join("evidence.json"),serde_json::to_vec(&serde_json::json!({
+        "schema_version":1,"task_id":"fixture","attempt":attempt,"phase":"checked",
+        "artifacts":[{"path":"candidate.bin","sha256":format!("{:x}",Sha256::digest(bytes.as_bytes()))}],
+        "checks":[{"id":"layout","status":if passed {"pass"} else {"fail"},"remaining":if passed {0} else {8}}]
+    })).unwrap()).unwrap();
+}
+#[tokio::test]
+async fn continuation_evidence_chat_yields_after_one_unchanged_completion_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    continuation_fixture(dir.path(), "evidence-chat");
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let provider = Arc::new(RequestRecordingProvider::new(
+        vec![end_turn("done", 10, 20), end_turn("done again", 10, 20)],
+        requests.clone(),
+    ));
+    let mut tools = ToolRegistry::new();
+    tools.set_workspace_root(dir.path().into());
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("evidence-chat"), provider, tools, memory).with_config(
+        AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    let error = agent
+        .process_message("finish this task", &[], vec![])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("needs_replan"));
+    let partial = error
+        .downcast_ref::<super::super::FailedConversationProgress>()
+        .unwrap();
+    assert!(
+        partial
+            .partial
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Required checks remain"))
+    );
+    assert_eq!(partial.partial.token_usage.output_tokens, 40);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "only the producer is called; no periodic critic"
+    );
+}
+#[tokio::test]
+async fn continuation_evidence_task_does_not_report_false_success() {
+    let dir = tempfile::tempdir().unwrap();
+    continuation_fixture(dir.path(), "evidence-task");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        end_turn("done", 10, 20),
+        end_turn("done again", 10, 20),
+    ]));
+    let tools = ToolRegistry::new();
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("evidence-task"), provider, tools, memory).with_config(
+        AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "finish".into(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().into(),
+            ..Default::default()
+        },
+    );
+    let result = agent.run_task(&task).await.unwrap();
+    assert!(!result.success);
+    assert!(result.output.contains("needs_replan"));
+    assert_eq!(result.token_usage.output_tokens, 40);
+}
+struct EvidenceWritingTool {
+    root: PathBuf,
+    pass: bool,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl crate::tools::Tool for EvidenceWritingTool {
+    fn name(&self) -> &str {
+        "revise_and_check"
+    }
+    fn description(&self) -> &str {
+        "Change artifact and run checks"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"attempt":{"type":"integer"}}})
+    }
+    async fn execute(&self, args: &serde_json::Value) -> Result<crate::tools::ToolResult> {
+        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let attempt = args["attempt"].as_u64().unwrap() as usize;
+        continuation_report(&self.root, attempt, self.pass);
+        Ok(crate::tools::ToolResult {
+            output: format!("artifact and check cycle {attempt} written"),
+            success: true,
+            file_modified: Some(self.root.join("candidate.bin")),
+            ..Default::default()
+        })
+    }
+}
+fn evidence_call(attempt: usize) -> ChatResponse {
+    tool_use(
+        vec![ToolCall {
+            id: format!("cycle-{attempt}"),
+            name: "revise_and_check".into(),
+            arguments: serde_json::json!({"attempt":attempt}),
+            metadata: None,
+        }],
+        10,
+        20,
+    )
+}
+#[tokio::test]
+async fn continuation_evidence_chat_can_repair_then_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    continuation_fixture(dir.path(), "evidence-repair");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        end_turn("done", 10, 20),
+        evidence_call(2),
+        end_turn("checked and complete", 10, 20),
+    ]));
+    let mut tools = ToolRegistry::new();
+    tools.set_workspace_root(dir.path().into());
+    tools.register(EvidenceWritingTool {
+        root: dir.path().into(),
+        pass: true,
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(AgentId::new("evidence-repair"), provider, tools, memory).with_config(
+        AgentConfig {
+            save_episodes: false,
+            ..Default::default()
+        },
+    );
+    let response = agent.process_message("finish", &[], vec![]).await.unwrap();
+    assert_eq!(response.content, "checked and complete");
+}
+#[tokio::test]
+async fn continuation_evidence_stops_changed_commands_with_flat_results() {
+    for task_mode in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        continuation_fixture(dir.path(), "evidence-churn");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RequestRecordingProvider::new(
+            (2..=8).map(evidence_call).collect(),
+            requests.clone(),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.set_workspace_root(dir.path().into());
+        tools.register(EvidenceWritingTool {
+            root: dir.path().into(),
+            pass: false,
+            calls: calls.clone(),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("evidence-churn"), provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            });
+        if task_mode {
+            let task = Task::new(
+                TaskKind::Code {
+                    instruction: "finish".into(),
+                    files: vec![],
+                },
+                TaskContext {
+                    working_dir: dir.path().into(),
+                    ..Default::default()
+                },
+            );
+            let result = agent.run_task(&task).await.unwrap();
+            assert!(!result.success);
+            assert!(result.output.contains("needs_replan"));
+        } else {
+            let error = agent
+                .process_message("finish", &[], vec![])
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("needs_replan"));
+            let progress = error
+                .downcast_ref::<super::super::FailedConversationProgress>()
+                .unwrap();
+            assert!(
+                progress
+                    .partial
+                    .files_modified
+                    .contains(&dir.path().join("candidate.bin"))
+            );
+        }
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 4);
+        assert_eq!(requests.lock().unwrap().len(), 4);
+    }
+}
+
+#[tokio::test]
+async fn continuation_evidence_chat_uses_stable_session_across_recreated_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    continuation_fixture(dir.path(), "session:profile:local:tui#peer-producer");
+    for (id, session, should_fail, expected_requests) in [
+        (
+            "ui-protocol-turn-1",
+            "profile:local:tui#peer-producer",
+            true,
+            2,
+        ),
+        (
+            "ui-protocol-turn-2",
+            "profile:local:tui#peer-producer",
+            true,
+            1,
+        ),
+        (
+            "ui-protocol-coordinator",
+            "profile:local:tui#coordinator",
+            false,
+            1,
+        ),
+    ] {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RequestRecordingProvider::new(
+            vec![end_turn("done", 1, 1), end_turn("done again", 1, 1)],
+            requests.clone(),
+        ));
+        let mut tools = ToolRegistry::new();
+        tools.set_workspace_root(dir.path().into());
+        let memory = Arc::new(EpisodeStore::open(dir.path().join(id)).await.unwrap());
+        let agent = Agent::new(AgentId::new(id), provider, tools, memory)
+            .with_parent_session_key(session)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                ..Default::default()
+            });
+        let result = agent.process_message("finish", &[], vec![]).await;
+        assert_eq!(result.is_err(), should_fail, "{id}");
+        if let Err(error) = result {
+            assert!(error.to_string().contains("needs_replan"));
+        }
+        assert_eq!(requests.lock().unwrap().len(), expected_requests, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn continuation_evidence_native_child_does_not_inherit_session_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    continuation_fixture(dir.path(), "session:parent-session");
+    let provider = Arc::new(ScriptedProvider::new(vec![end_turn("child done", 1, 1)]));
+    let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+    let agent = Agent::new(
+        AgentId::new("independent-child"),
+        provider,
+        ToolRegistry::new(),
+        memory,
+    )
+    .with_parent_session_key("parent-session")
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    });
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "finish child".into(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().into(),
+            ..Default::default()
+        },
+    );
+    let result = agent.run_task(&task).await.unwrap();
+    assert!(result.success);
+}

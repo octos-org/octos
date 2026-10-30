@@ -680,6 +680,7 @@ async fn test_spawn_returns_immediately() {
     // We can't easily create a real LLM + EpisodeStore for unit tests,
     // so just test the worker count and basic input parsing.
     let tool = SpawnTool {
+        continuation: None,
         llm: Arc::new(MockProvider),
         memory: Arc::new(create_test_store().await),
         working_dir: PathBuf::from("/tmp"),
@@ -5566,4 +5567,1022 @@ async fn spawn_falls_back_to_legacy_cwd_when_no_scope() {
         captured.is_none(),
         "without a parent scope the child Agent must NOT synthesise one; observed={captured:?}"
     );
+}
+
+struct NativeFeedbackProvider {
+    prompts: std::sync::Mutex<Vec<Vec<octos_core::Message>>>,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+}
+
+impl Default for NativeFeedbackProvider {
+    fn default() -> Self {
+        Self {
+            prompts: Default::default(),
+            entered: Default::default(),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for NativeFeedbackProvider {
+    async fn chat(
+        &self,
+        messages: &[octos_core::Message],
+        tools: &[octos_llm::ToolSpec],
+        config: &octos_llm::ChatConfig,
+    ) -> Result<octos_llm::ChatResponse> {
+        let call = {
+            let mut prompts = self.prompts.lock().unwrap();
+            prompts.push(messages.to_vec());
+            prompts.len()
+        };
+        self.entered.notify_one();
+        self.release.acquire().await.unwrap().forget();
+        let mut response = MockProvider.chat(messages, tools, config).await?;
+        response.content = Some(format!("child answer {call}"));
+        Ok(response)
+    }
+    fn model_id(&self) -> &str {
+        "native-feedback-test"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+async fn native_feedback_fixture() -> (
+    tempfile::TempDir,
+    Arc<NativeFeedbackProvider>,
+    ToolRegistry,
+    super::super::ToolContext,
+    String,
+) {
+    native_feedback_fixture_with_sender(Arc::new(|_| Box::pin(async { true }))).await
+}
+
+async fn native_feedback_fixture_with_sender(
+    sender: BackgroundResultSender,
+) -> (
+    tempfile::TempDir,
+    Arc<NativeFeedbackProvider>,
+    ToolRegistry,
+    super::super::ToolContext,
+    String,
+) {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = Arc::new(NativeFeedbackProvider::default());
+    let mut registry = ToolRegistry::with_builtins(temp.path());
+    let supervisor = registry.supervisor();
+    supervisor
+        .enable_persistence(temp.path().join("tasks.jsonl"))
+        .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let tool = SpawnTool::new(
+        provider.clone(),
+        Arc::new(create_test_store().await),
+        temp.path().into(),
+        tx,
+    )
+    .with_task_supervisor(
+        supervisor.clone(),
+        "api:native-feedback",
+        temp.path().join("tasks.jsonl"),
+    )
+    .with_background_result_sender(sender);
+    registry.register(tool);
+    let ctx = super::super::ToolContext {
+        task_supervisor: Some(supervisor.clone()),
+        parent_session_key: Some("api:native-feedback".into()),
+        session_scope: Some(Arc::new(
+            SessionScope::solo(temp.path().into(), Vec::new()).unwrap(),
+        )),
+        ..super::super::ToolContext::zero()
+    };
+    let started = registry.execute_with_context(&ctx, "spawn_agent", &serde_json::json!({
+        "task": "original child assignment", "allowed_tools": ["read_file"], "owned_paths": ["out/item"]
+    })).await.unwrap();
+    assert!(started.success, "{}", started.output);
+    let id = supervisor.get_all_tasks()[0].id.clone();
+    tokio::time::timeout(BACKGROUND_DEADLINE, provider.entered.notified())
+        .await
+        .unwrap();
+    (temp, provider, registry, ctx, id)
+}
+
+async fn native_feedback_finished(id: &str) {
+    tokio::time::timeout(BACKGROUND_DEADLINE, async {
+        while crate::task_supervisor::task_is_live(id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn should_deliver_native_feedback_to_running_child_prompt() {
+    let (_temp, provider, registry, ctx, id) = native_feedback_fixture().await;
+    let sent = registry
+        .execute_with_context(
+            &ctx,
+            "send_input",
+            &serde_json::json!({
+                "agent_id": id, "message": "reviewer: repair the missing check"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(sent.success, "{}", sent.output);
+    provider.release.add_permits(2);
+    native_feedback_finished(&id).await;
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 2);
+    assert!(
+        prompts[1]
+            .iter()
+            .any(|m| m.role == octos_core::MessageRole::User
+                && m.content == "reviewer: repair the missing check")
+    );
+    assert_eq!(
+        ctx.task_supervisor.as_ref().unwrap().get_all_tasks().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn should_resume_native_child_history_from_later_parent_registry() {
+    let (_temp, provider, _registry, ctx, id) = native_feedback_fixture().await;
+    provider.release.add_permits(1);
+    native_feedback_finished(&id).await;
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let old = ctx.task_supervisor.as_ref().unwrap().get_task(&id).unwrap();
+    // A later OUP turn restores task rows into a new registry/supervisor.
+    supervisor
+        .enable_persistence(_temp.path().join("tasks.jsonl"))
+        .unwrap();
+    let registry = ToolRegistry::with_builtins(_temp.path());
+    let later = super::super::ToolContext {
+        task_supervisor: Some(supervisor.clone()),
+        ..ctx
+    };
+    let resumed = registry
+        .execute_with_context(
+            &later,
+            "resume_agent",
+            &serde_json::json!({
+                "agent_id": id, "message": "continue from reviewer findings"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(resumed.success, "{}", resumed.output);
+    let body: serde_json::Value = serde_json::from_str(&resumed.output).unwrap();
+    let next = body["resumed_agent_id"].as_str().unwrap().to_string();
+    assert_ne!(next, id);
+    assert_eq!(
+        supervisor
+            .get_task(&next)
+            .unwrap()
+            .relaunched_from
+            .as_deref(),
+        Some(id.as_str())
+    );
+    assert_eq!(supervisor.get_task(&id).unwrap().status, old.status);
+    tokio::time::timeout(BACKGROUND_DEADLINE, provider.entered.notified())
+        .await
+        .unwrap();
+    provider.release.add_permits(1);
+    native_feedback_finished(&next).await;
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[1].iter().any(|m| m.content == "child answer 1"));
+    assert!(
+        prompts[1]
+            .iter()
+            .any(|m| m.content.contains("original child assignment"))
+    );
+    assert!(
+        prompts[1]
+            .iter()
+            .any(|m| m.content == "continue from reviewer findings")
+    );
+}
+
+#[tokio::test]
+async fn should_reject_cross_session_and_cancelled_native_feedback() {
+    let (_temp, provider, registry, ctx, id) = native_feedback_fixture().await;
+    let foreign = super::super::ToolContext {
+        parent_session_key: Some("api:foreign".into()),
+        ..ctx.clone()
+    };
+    let rejected = registry
+        .execute_with_context(
+            &foreign,
+            "send_input",
+            &serde_json::json!({
+                "agent_id": id, "message": "foreign input"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!rejected.success, "{}", rejected.output);
+    ctx.task_supervisor.as_ref().unwrap().cancel(&id).unwrap();
+    provider.release.add_permits(1);
+    native_feedback_finished(&id).await;
+    let rejected = registry
+        .execute_with_context(&ctx, "resume_agent", &serde_json::json!({ "agent_id": id }))
+        .await
+        .unwrap();
+    assert!(!rejected.success, "{}", rejected.output);
+    assert_eq!(provider.prompts.lock().unwrap().len(), 1);
+    assert_eq!(
+        ctx.task_supervisor.as_ref().unwrap().get_all_tasks().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn should_serialize_concurrent_native_followups_and_close_alias_chain() {
+    let (_temp, provider, registry, ctx, id) = native_feedback_fixture().await;
+    provider.release.add_permits(1);
+    native_feedback_finished(&id).await;
+    let first_args = serde_json::json!({"agent_id": id, "message": "first repair"});
+    let second_args = serde_json::json!({"agent_id": id, "message": "second repair"});
+    let (first, second) = tokio::join!(
+        registry.execute_with_context(&ctx, "resume_agent", &first_args),
+        registry.execute_with_context(&ctx, "resume_agent", &second_args),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert!(first.success, "{}", first.output);
+    assert!(second.success, "{}", second.output);
+    let first: serde_json::Value = serde_json::from_str(&first.output).unwrap();
+    let second: serde_json::Value = serde_json::from_str(&second.output).unwrap();
+    assert_eq!(first["resumed_agent_id"], second["resumed_agent_id"]);
+    let next = first["resumed_agent_id"].as_str().unwrap();
+    assert_eq!(
+        ctx.task_supervisor.as_ref().unwrap().get_all_tasks().len(),
+        2
+    );
+    provider.release.add_permits(4);
+    native_feedback_finished(next).await;
+    {
+        let prompts = provider.prompts.lock().unwrap();
+        let last = prompts.last().unwrap();
+        assert!(last.iter().any(|m| m.content == "first repair"));
+        assert!(last.iter().any(|m| m.content == "second repair"));
+    }
+    let closed = registry
+        .execute_with_context(&ctx, "close_agent", &serde_json::json!({"agent_id": id}))
+        .await
+        .unwrap();
+    assert!(closed.success, "{}", closed.output);
+    for handle in [&id, next] {
+        let resumed = registry
+            .execute_with_context(
+                &ctx,
+                "resume_agent",
+                &serde_json::json!({"agent_id": handle}),
+            )
+            .await
+            .unwrap();
+        assert!(!resumed.success, "closed chain resumed: {}", resumed.output);
+    }
+}
+
+#[tokio::test]
+async fn should_continue_feedback_queued_during_native_terminal_delivery() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let sender: BackgroundResultSender = {
+        let entered = entered.clone();
+        let release = release.clone();
+        Arc::new(move |_| {
+            let entered = entered.clone();
+            let release = release.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                true
+            })
+        })
+    };
+    let (_temp, provider, registry, ctx, id) = native_feedback_fixture_with_sender(sender).await;
+    provider.release.add_permits(1);
+    tokio::time::timeout(BACKGROUND_DEADLINE, entered.notified())
+        .await
+        .unwrap();
+    let old = ctx.task_supervisor.as_ref().unwrap().get_task(&id).unwrap();
+    assert!(old.status.is_terminal());
+    assert!(old.final_output.unwrap().contains("child answer 1"));
+    let sent = registry
+        .execute_with_context(
+            &ctx,
+            "send_input",
+            &serde_json::json!({
+                "agent_id": id, "message": "late review repair"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(sent.success, "{}", sent.output);
+    assert_eq!(
+        ctx.task_supervisor.as_ref().unwrap().get_all_tasks().len(),
+        1
+    );
+    let queued = registry
+        .execute_with_context(
+            &ctx,
+            "wait_agent",
+            &serde_json::json!({"agent_id":id,"timeout_ms":0,"include_output":true}),
+        )
+        .await
+        .unwrap();
+    let queued: serde_json::Value = serde_json::from_str(&queued.output).unwrap();
+    assert_eq!(queued["agents"][0]["terminal"], false);
+    assert!(queued["agents"][0].get("output").is_none());
+    release.notify_one();
+    tokio::time::timeout(BACKGROUND_DEADLINE, provider.entered.notified())
+        .await
+        .unwrap();
+    let tasks = ctx.task_supervisor.as_ref().unwrap().get_all_tasks();
+    assert_eq!(tasks.len(), 2);
+    let next = tasks.iter().find(|t| t.id != id).unwrap().id.clone();
+    assert_eq!(
+        tasks
+            .iter()
+            .find(|t| t.id == next)
+            .unwrap()
+            .relaunched_from
+            .as_deref(),
+        Some(id.as_str())
+    );
+    provider.release.add_permits(1);
+    tokio::time::timeout(BACKGROUND_DEADLINE, entered.notified())
+        .await
+        .unwrap();
+    release.notify_one();
+    native_feedback_finished(&next).await;
+    let waited = registry
+        .execute_with_context(
+            &ctx,
+            "wait_agent",
+            &serde_json::json!({"agent_id":id,"timeout_ms":0,"include_output":true}),
+        )
+        .await
+        .unwrap();
+    let waited: serde_json::Value = serde_json::from_str(&waited.output).unwrap();
+    assert_eq!(waited["agents"][0]["agent_id"], next);
+    assert!(
+        waited["agents"][0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("child answer 2")
+    );
+    let prompts = provider.prompts.lock().unwrap();
+    assert!(
+        prompts
+            .last()
+            .unwrap()
+            .iter()
+            .any(|m| m.content == "late review repair")
+    );
+}
+
+#[tokio::test]
+async fn should_reject_native_followup_after_parent_workspace_switch() {
+    let (_temp, provider, registry, ctx, id) = native_feedback_fixture().await;
+    let other = tempfile::tempdir().unwrap();
+    let changed = super::super::ToolContext {
+        session_scope: Some(Arc::new(
+            SessionScope::solo(other.path().into(), Vec::new()).unwrap(),
+        )),
+        ..ctx.clone()
+    };
+    let rejected = registry
+        .execute_with_context(
+            &changed,
+            "resume_agent",
+            &serde_json::json!({"agent_id": id}),
+        )
+        .await
+        .unwrap();
+    assert!(!rejected.success, "{}", rejected.output);
+    assert!(rejected.output.contains("scope"));
+    ctx.task_supervisor.as_ref().unwrap().cancel(&id).unwrap();
+    provider.release.add_permits(1);
+    native_feedback_finished(&id).await;
+}
+
+struct NativeArtifactRepairProvider;
+#[async_trait]
+impl LlmProvider for NativeArtifactRepairProvider {
+    async fn chat(
+        &self,
+        messages: &[octos_core::Message],
+        tools: &[octos_llm::ToolSpec],
+        config: &octos_llm::ChatConfig,
+    ) -> Result<octos_llm::ChatResponse> {
+        assert!(
+            tools
+                .iter()
+                .all(|tool| matches!(tool.name.as_str(), "read_file" | "write_file")),
+            "continuation broadened child permissions"
+        );
+        let repair = messages
+            .iter()
+            .any(|m| m.content == "repair the actual artifact");
+        let tool_results = messages
+            .iter()
+            .filter(|m| m.role == octos_core::MessageRole::Tool)
+            .count();
+        let call = if repair && tool_results < 2 {
+            Some((
+                "read-repair",
+                "read_file",
+                serde_json::json!({"path":"item.txt"}),
+            ))
+        } else if repair && tool_results < 3 {
+            Some((
+                "write-repair",
+                "write_file",
+                serde_json::json!({"path":"item.txt", "content":"reviewed and repaired"}),
+            ))
+        } else if !repair && tool_results == 0 {
+            Some((
+                "write-initial",
+                "write_file",
+                serde_json::json!({"path":"item.txt", "content":"initial draft"}),
+            ))
+        } else {
+            None
+        };
+        let mut response = MockProvider.chat(messages, tools, config).await?;
+        if let Some((id, name, arguments)) = call {
+            response.content = None;
+            response.stop_reason = octos_llm::StopReason::ToolUse;
+            response.tool_calls = vec![octos_core::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments,
+                metadata: None,
+            }];
+        }
+        Ok(response)
+    }
+    fn model_id(&self) -> &str {
+        "native-artifact-repair"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn should_repair_actual_artifact_through_native_resume_with_same_permissions() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::with_builtins(temp.path());
+    let supervisor = registry.supervisor();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    registry.register(
+        SpawnTool::new(
+            Arc::new(NativeArtifactRepairProvider),
+            Arc::new(create_test_store().await),
+            temp.path().into(),
+            tx,
+        )
+        .with_task_supervisor(
+            supervisor.clone(),
+            "api:artifact-repair",
+            temp.path().join("tasks.jsonl"),
+        )
+        .with_background_result_sender(Arc::new(|_| Box::pin(async { true }))),
+    );
+    let ctx = super::super::ToolContext {
+        task_supervisor: Some(supervisor.clone()),
+        parent_session_key: Some("api:artifact-repair".into()),
+        session_scope: Some(Arc::new(
+            SessionScope::solo(temp.path().into(), Vec::new()).unwrap(),
+        )),
+        ..super::super::ToolContext::zero()
+    };
+    let started = registry.execute_with_context(&ctx, "spawn_agent", &serde_json::json!({
+        "task":"write initial artifact", "allowed_tools":["read_file", "write_file"], "owned_paths":["item.txt"]
+    })).await.unwrap();
+    assert!(started.success, "{}", started.output);
+    let id = supervisor.get_all_tasks()[0].id.clone();
+    native_feedback_finished(&id).await;
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("item.txt")).unwrap(),
+        "initial draft"
+    );
+    let resumed = registry
+        .execute_with_context(
+            &ctx,
+            "resume_agent",
+            &serde_json::json!({
+                "agent_id": id, "message":"repair the actual artifact", "allowed_tools":["shell"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(resumed.success, "{}", resumed.output);
+    let body: serde_json::Value = serde_json::from_str(&resumed.output).unwrap();
+    let next = body["resumed_agent_id"].as_str().unwrap();
+    native_feedback_finished(next).await;
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("item.txt")).unwrap(),
+        "reviewed and repaired"
+    );
+    assert_eq!(
+        supervisor.get_task(next).unwrap().status,
+        crate::TaskStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn should_preserve_recovery_instruction_with_native_task_history() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("shared.txt"), "CACHE-KNOWLEDGE-BODY").unwrap();
+    let history = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let worker = Agent::new(
+        AgentId::new("native-recovery-history"),
+        Arc::new(ReadKnowledgeProvider {
+            observations: Default::default(),
+            fail_initial_after_read: true,
+        }),
+        ToolRegistry::with_builtins(temp.path()),
+        Arc::new(create_test_store().await),
+    )
+    .with_task_history(history.clone());
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "read twice".into(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: temp.path().into(),
+            ..Default::default()
+        },
+    );
+    let result = run_task_with_m8_9_recovery(&worker, &task, "read twice")
+        .await
+        .unwrap();
+    assert!(result.success, "{}", result.output);
+    let history = history.lock().unwrap();
+    assert!(history.iter().any(|m| {
+        m.role == octos_core::MessageRole::User
+            && m.content
+                .contains("Your previous attempt at the task below failed")
+    }));
+    assert!(
+        history
+            .iter()
+            .filter(|m| m.role == octos_core::MessageRole::Tool)
+            .count()
+            >= 2
+    );
+}
+
+#[tokio::test]
+async fn should_refuse_native_resume_after_budget_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut registry = ToolRegistry::with_builtins(temp.path());
+    let supervisor = registry.supervisor();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    registry.register(
+        SpawnTool::new(
+            Arc::new(MockProvider),
+            Arc::new(create_test_store().await),
+            temp.path().into(),
+            tx,
+        )
+        .with_agent_config(AgentConfig {
+            max_tokens: Some(0),
+            ..Default::default()
+        })
+        .with_task_supervisor(
+            supervisor.clone(),
+            "api:budget-resume",
+            temp.path().join("tasks.jsonl"),
+        )
+        .with_background_result_sender(Arc::new(|_| Box::pin(async { true }))),
+    );
+    let ctx = super::super::ToolContext {
+        task_supervisor: Some(supervisor.clone()),
+        parent_session_key: Some("api:budget-resume".into()),
+        ..super::super::ToolContext::zero()
+    };
+    let started = registry
+        .execute_with_context(
+            &ctx,
+            "spawn_agent",
+            &serde_json::json!({"task":"work", "allowed_tools":["read_file"]}),
+        )
+        .await
+        .unwrap();
+    assert!(started.success, "{}", started.output);
+    let id = supervisor.get_all_tasks()[0].id.clone();
+    native_feedback_finished(&id).await;
+    let resumed = registry
+        .execute_with_context(&ctx, "resume_agent", &serde_json::json!({"agent_id":id}))
+        .await
+        .unwrap();
+    assert!(!resumed.success, "{}", resumed.output);
+    assert!(
+        resumed.output.contains("budget boundary"),
+        "{}",
+        resumed.output
+    );
+    assert_eq!(supervisor.get_all_tasks().len(), 1);
+}
+
+#[tokio::test]
+async fn should_keep_native_cancellation_from_later_supervisor_terminal() {
+    let (temp, provider, _registry, ctx, id) = native_feedback_fixture().await;
+    let later = TaskSupervisor::new();
+    later
+        .enable_persistence(temp.path().join("tasks.jsonl"))
+        .unwrap();
+    later.cancel(&id).unwrap();
+    provider.release.add_permits(1);
+    native_feedback_finished(&id).await;
+    later.refresh_from_persistence().unwrap();
+    assert_eq!(
+        later.get_task(&id).unwrap().status,
+        crate::TaskStatus::Cancelled
+    );
+    assert_eq!(
+        ctx.task_supervisor
+            .as_ref()
+            .unwrap()
+            .get_task(&id)
+            .unwrap()
+            .status,
+        crate::TaskStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn should_reject_native_followup_after_parent_permissions_narrow() {
+    let (_temp, provider, registry, ctx, id) = native_feedback_fixture().await;
+    let mut profile = crate::profile::ProfileDefinition::default();
+    profile.tools = crate::profile::ProfileTools::DenyList {
+        tools: vec!["write_file".into()],
+    };
+    let changed = super::super::ToolContext {
+        permissions: super::super::ToolPermissions::from_profile(&profile),
+        ..ctx.clone()
+    };
+    let rejected = registry
+        .execute_with_context(
+            &changed,
+            "resume_agent",
+            &serde_json::json!({"agent_id":id}),
+        )
+        .await
+        .unwrap();
+    assert!(!rejected.success, "{}", rejected.output);
+    assert!(rejected.output.contains("permissions"));
+    ctx.task_supervisor.as_ref().unwrap().cancel(&id).unwrap();
+    provider.release.add_permits(1);
+    native_feedback_finished(&id).await;
+}
+
+struct NestedNativeFeedbackProvider;
+#[async_trait]
+impl LlmProvider for NestedNativeFeedbackProvider {
+    async fn chat(
+        &self,
+        messages: &[octos_core::Message],
+        tools: &[octos_llm::ToolSpec],
+        config: &octos_llm::ChatConfig,
+    ) -> Result<octos_llm::ChatResponse> {
+        if messages.iter().any(|m| {
+            m.role == octos_core::MessageRole::User && m.content.contains("grandchild assignment")
+        }) {
+            return MockProvider.chat(messages, tools, config).await;
+        }
+        let results: Vec<_> = messages
+            .iter()
+            .filter(|m| m.role == octos_core::MessageRole::Tool)
+            .collect();
+        if results.len() >= 2 {
+            assert!(
+                results.last().unwrap().content.contains("native_executor"),
+                "nested feedback failed: {}",
+                results.last().unwrap().content
+            );
+            return MockProvider.chat(messages, tools, config).await;
+        }
+        let (name, arguments) = if let Some(result) = results.first() {
+            let pattern =
+                Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+                    .unwrap();
+            let id = pattern
+                .find(&result.content)
+                .expect("spawn returned a native task ID")
+                .as_str();
+            (
+                "send_input",
+                serde_json::json!({"agent_id":id,"message":"nested reviewer feedback"}),
+            )
+        } else {
+            (
+                "spawn_agent",
+                serde_json::json!({"task":"grandchild assignment", "allowed_tools":["read_file"]}),
+            )
+        };
+        Ok(octos_llm::ChatResponse {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![octos_core::ToolCall {
+                id: format!("nested-{}", results.len()),
+                name: name.into(),
+                arguments,
+                metadata: None,
+            }],
+            stop_reason: octos_llm::StopReason::ToolUse,
+            usage: Default::default(),
+            provider_index: None,
+        })
+    }
+    fn model_id(&self) -> &str {
+        "nested-feedback"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+#[tokio::test]
+async fn should_allow_nested_native_worker_to_send_feedback_to_its_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let supervisor = Arc::new(TaskSupervisor::new());
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let tool = SpawnTool::new(
+        Arc::new(NestedNativeFeedbackProvider),
+        Arc::new(create_test_store().await),
+        temp.path().into(),
+        tx,
+    )
+    .with_agent_config(AgentConfig {
+        max_iterations: 5,
+        ..Default::default()
+    })
+    .with_task_supervisor(
+        supervisor.clone(),
+        "api:nested-feedback",
+        temp.path().join("tasks.jsonl"),
+    )
+    .with_background_result_sender(Arc::new(|_| Box::pin(async { true })));
+    let started = tool.execute(&serde_json::json!({"task":"drive nested worker feedback", "allowed_tools":["spawn_agent","send_input"]})).await.unwrap();
+    assert!(started.success, "{}", started.output);
+    let id = supervisor.get_all_tasks()[0].id.clone();
+    native_feedback_finished(&id).await;
+    let task = supervisor.get_task(&id).unwrap();
+    assert_eq!(
+        task.status,
+        crate::TaskStatus::Completed,
+        "{:?}",
+        task.error
+    );
+}
+
+struct NativeForkSnapshot(String);
+impl crate::prompt_context::PromptContextManager for NativeForkSnapshot {
+    fn prepare_prompt(
+        &self,
+        _: crate::prompt_context::PromptContextRequest,
+        messages: &mut Vec<octos_core::Message>,
+    ) -> std::result::Result<crate::prompt_context::PromptContextReport, String> {
+        if !messages.iter().any(|m| m.content == self.0) {
+            messages.insert(1, octos_core::Message::system(self.0.clone()));
+        }
+        Ok(Default::default())
+    }
+}
+
+#[tokio::test]
+async fn should_resume_native_child_with_original_context_bridge_and_lineage() {
+    let temp = tempfile::tempdir().unwrap();
+    let provider = Arc::new(NativeFeedbackProvider::default());
+    let factory_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let parent_marker = Arc::new(std::sync::Mutex::new(
+        "parent-at-original-spawn".to_string(),
+    ));
+    let factory: ChildPromptContextManagerFactory = {
+        let calls = factory_calls.clone();
+        let marker = parent_marker.clone();
+        Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(Arc::new(NativeForkSnapshot(marker.lock().unwrap().clone())))
+        })
+    };
+    let mut registry = ToolRegistry::with_builtins(temp.path());
+    let supervisor = registry.supervisor();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    registry.register(
+        SpawnTool::new(
+            provider.clone(),
+            Arc::new(create_test_store().await),
+            temp.path().into(),
+            tx,
+        )
+        .with_child_prompt_context_manager_factory(factory)
+        .with_task_supervisor(
+            supervisor.clone(),
+            "api:context-resume",
+            temp.path().join("tasks.jsonl"),
+        )
+        .with_background_result_sender(Arc::new(|_| Box::pin(async { true }))),
+    );
+    let ctx = super::super::ToolContext {
+        task_supervisor: Some(supervisor.clone()),
+        parent_session_key: Some("api:context-resume".into()),
+        ..super::super::ToolContext::zero()
+    };
+    let started = registry
+        .execute_with_context(
+            &ctx,
+            "spawn_agent",
+            &serde_json::json!({"task":"child bridge work","allowed_tools":["read_file"]}),
+        )
+        .await
+        .unwrap();
+    assert!(started.success, "{}", started.output);
+    let id = supervisor.get_all_tasks()[0].id.clone();
+    provider.release.add_permits(1);
+    native_feedback_finished(&id).await;
+    *parent_marker.lock().unwrap() = "unrelated-later-parent-turn".into();
+    let resumed = registry
+        .execute_with_context(
+            &ctx,
+            "resume_agent",
+            &serde_json::json!({"agent_id":id,"message":"bridge repair"}),
+        )
+        .await
+        .unwrap();
+    assert!(resumed.success, "{}", resumed.output);
+    let body: serde_json::Value = serde_json::from_str(&resumed.output).unwrap();
+    let next = body["resumed_agent_id"].as_str().unwrap();
+    provider.release.add_permits(1);
+    native_feedback_finished(next).await;
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+    let first = supervisor.get_task(&id).unwrap();
+    let successor = supervisor.get_task(next).unwrap();
+    assert_ne!(successor.child_session_key, first.child_session_key);
+    assert_eq!(
+        successor.projection_metadata.unwrap()["context_session_key"],
+        first.child_session_key.unwrap()
+    );
+    let prompts = provider.prompts.lock().unwrap();
+    let last = prompts.last().unwrap();
+    assert!(last.iter().any(|m| m.content == "parent-at-original-spawn"));
+    assert!(last.iter().any(|m| m.content == "child answer 1"));
+    assert!(
+        last.iter()
+            .all(|m| m.content != "unrelated-later-parent-turn")
+    );
+}
+
+#[tokio::test]
+async fn should_resolve_retired_native_alias_to_cancelled_successor_from_ledger() {
+    let (temp, provider, registry, ctx, id) = native_feedback_fixture().await;
+    provider.release.add_permits(1);
+    native_feedback_finished(&id).await;
+    // This parent view predates successor allocation; status lookup must not
+    // require importing the successor into its execution-ownership map.
+    let restored = Arc::new(TaskSupervisor::new());
+    restored
+        .enable_persistence(temp.path().join("tasks.jsonl"))
+        .unwrap();
+    let resumed = registry
+        .execute_with_context(
+            &ctx,
+            "resume_agent",
+            &serde_json::json!({"agent_id":id,"message":"repair before closing"}),
+        )
+        .await
+        .unwrap();
+    assert!(resumed.success, "{}", resumed.output);
+    let resumed: serde_json::Value = serde_json::from_str(&resumed.output).unwrap();
+    let next = resumed["resumed_agent_id"].as_str().unwrap().to_owned();
+    let closed = registry
+        .execute_with_context(&ctx, "close_agent", &serde_json::json!({"agent_id":id}))
+        .await
+        .unwrap();
+    assert!(closed.success, "{}", closed.output);
+    provider.release.add_permits(1);
+    native_feedback_finished(&next).await;
+    assert!(restored.get_task(&next).is_none());
+    let later = super::super::ToolContext {
+        task_supervisor: Some(restored.clone()),
+        ..ctx
+    };
+    let waited = registry
+        .execute_with_context(
+            &later,
+            "wait_agent",
+            &serde_json::json!({"agent_id":id,"timeout_ms":0,"include_output":true}),
+        )
+        .await
+        .unwrap();
+    let waited: serde_json::Value = serde_json::from_str(&waited.output).unwrap();
+    assert_eq!(waited["agents"][0]["agent_id"], next);
+    assert_eq!(waited["agents"][0]["status"], "cancelled");
+    assert!(
+        restored.get_task(&next).is_none(),
+        "read-only lineage lookup must not import execution ownership"
+    );
+    assert_eq!(
+        restored.get_task(&id).unwrap().status,
+        crate::TaskStatus::Completed
+    );
+    assert!(
+        !waited["agents"][0]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("child answer 1")
+    );
+}
+
+struct EvidenceEndTurnProvider {
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl octos_llm::LlmProvider for EvidenceEndTurnProvider {
+    async fn chat(
+        &self,
+        _: &[octos_core::Message],
+        _: &[octos_llm::ToolSpec],
+        _: &octos_llm::ChatConfig,
+    ) -> Result<octos_llm::ChatResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(octos_llm::ChatResponse {
+            content: Some("Done".into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            stop_reason: octos_llm::StopReason::EndTurn,
+            usage: Default::default(),
+            provider_index: None,
+        })
+    }
+    fn model_id(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+#[tokio::test]
+async fn spawn_recovery_boundary_should_return_evidence_handoff_without_restarting_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".octos")).unwrap();
+    std::fs::write(
+        dir.path().join(".octos/continuation.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version":1,"task_id":"evidence-recovery","owner_agent":"evidence-recovery",
+            "evidence_file":"missing.json","stagnant_attempts":3,"deliverables":["candidate.bin"],"required_checks":[{"id":"review"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let provider = Arc::new(EvidenceEndTurnProvider {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let worker = Agent::new(
+        AgentId::new("evidence-recovery"),
+        provider.clone(),
+        ToolRegistry::with_builtins(dir.path()),
+        Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap()),
+    )
+    .with_config(AgentConfig {
+        save_episodes: false,
+        ..Default::default()
+    });
+    let task = Task::new(
+        TaskKind::Code {
+            instruction: "work".into(),
+            files: vec![],
+        },
+        TaskContext {
+            working_dir: dir.path().into(),
+            ..Default::default()
+        },
+    );
+    let terminal = AtomicBool::new(false);
+    let result = run_task_with_recovery_boundary(&worker, &task, "work", &terminal)
+        .await
+        .unwrap();
+    assert!(!result.success);
+    assert!(result.output.starts_with("[needs_replan]"));
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        2,
+        "handoff must not trigger the old same-worker auto-recovery"
+    );
+    assert!(terminal.load(Ordering::Acquire));
 }

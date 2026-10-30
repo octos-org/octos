@@ -2664,6 +2664,7 @@ fn relaunch_unknown_task_returns_not_found() {
 #[test]
 fn relaunch_lineage_survives_runtime_detail_overwrite() {
     let supervisor = TaskSupervisor::new();
+    supervisor.set_on_relaunch(|_| {});
     let task_id = supervisor.register("run_pipeline", "call-relaunch-lineage", Some("session-L"));
     supervisor.mark_running(&task_id);
     supervisor.mark_failed(&task_id, "node 'design' failed".to_string());
@@ -5620,4 +5621,16 @@ fn terminal_timestamp_tie_respects_final_and_observer_authority() {
             candidate.failed_by_observer
         );
     }
+}
+
+#[test]
+fn should_refuse_relaunch_without_executor_and_create_no_placeholder() {
+    let supervisor = TaskSupervisor::new();
+    let id = supervisor.register("spawn", "original", Some("owner"));
+    supervisor.mark_completed(&id, Vec::new());
+    assert_eq!(
+        supervisor.relaunch(&id, RelaunchOpts::default()),
+        Err(TaskRelaunchError::MissingExecutor)
+    );
+    assert_eq!(supervisor.get_all_tasks().len(), 1);
 }

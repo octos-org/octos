@@ -7420,7 +7420,10 @@ fn completion_review_prompt_frames_result_for_the_model() {
     assert!(prompt.starts_with("[system-internal]"));
     assert!(prompt.contains("deep research"));
     assert!(prompt.contains("Found 3 sources on X."));
-    assert!(prompt.contains("Do NOT re-run"));
+    assert!(prompt.contains("execution finished, not acceptance"));
+    assert!(prompt.contains("continue authorized remaining work"));
+    assert!(prompt.contains("Do not repeat already verified work"));
+    assert!(prompt.contains("stop/pause instructions"));
     // Artifact files are surfaced so the review turn can inspect them.
     assert!(prompt.contains("report.md"));
     assert!(prompt.contains("data.csv"));

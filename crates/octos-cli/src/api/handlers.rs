@@ -1536,6 +1536,14 @@ pub async fn restart_task_from_node(
             })),
         )
             .into_response(),
+        Err(octos_agent::TaskRelaunchError::MissingExecutor) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "task_executor_unavailable",
+                "task_id": task_id,
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -7507,6 +7515,13 @@ mod tests {
         let task_id = supervisor.register("run_pipeline", "call-restart", Some("session"));
         supervisor.mark_running(&task_id);
         supervisor.mark_failed(&task_id, "design phase failed".to_string());
+        let executor = Arc::downgrade(&supervisor);
+        supervisor.set_on_relaunch(move |request| {
+            executor
+                .upgrade()
+                .unwrap()
+                .mark_running(&request.new_task_id);
+        });
 
         let store = crate::session_actor::SessionTaskQueryStore::default();
         let encoded = octos_bus::session::encode_path_component("session");
@@ -7542,12 +7557,41 @@ mod tests {
 
         // Upstream cached outputs are preserved by virtue of the original
         // task being left intact in the supervisor — the relaunch only
-        // adds a successor in the `Spawned` state.
+        // adds a successor that the attached executor starts.
         let original = supervisor.get_task(&task_id).unwrap();
         assert_eq!(original.status, octos_agent::TaskStatus::Failed);
         let new_id = json["new_task_id"].as_str().unwrap();
         let successor = supervisor.get_task(new_id).unwrap();
         assert_eq!(successor.tool_name, "run_pipeline");
+        assert_eq!(successor.status, octos_agent::TaskStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn restart_task_from_node_without_executor_returns_503_without_successor() {
+        let (store, supervisor, task_id) =
+            build_task_store_with_running_task("api-restart-503", "run_pipeline", "call-missing");
+        supervisor.mark_failed(&task_id, "worker exited".into());
+        let before = supervisor.get_all_tasks().len();
+        let state = Arc::new(AppState {
+            task_query_store: Some(store),
+            ..AppState::empty_for_tests()
+        });
+        let response = restart_task_from_node(
+            State(state),
+            HeaderMap::new(),
+            None,
+            axum::extract::Path(task_id),
+            Some(Json(RestartFromNodeRequest::default())),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "task_executor_unavailable");
+        assert!(body.get("new_task_id").is_none());
+        assert_eq!(supervisor.get_all_tasks().len(), before);
     }
 
     #[tokio::test]

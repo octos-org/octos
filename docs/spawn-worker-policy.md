@@ -1,5 +1,8 @@
 # Native spawned-worker execution policy
 
+For feedback, real continuation receipts and choosing native workers versus
+durable peers, see [worker continuations](subagent-and-peer-continuations.md).
+
 The native `spawn` tool uses `AgentConfig`'s iteration convention in both sync
 and background mode: omitted `max_iterations` and explicit `0` mean unlimited.
 Positive values are preserved; there is no implicit 150-iteration default or

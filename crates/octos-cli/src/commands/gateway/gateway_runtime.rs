@@ -1501,6 +1501,9 @@ impl GatewayRuntime {
                         Err(octos_agent::TaskRelaunchError::StillActive) => {
                             octos_bus::TaskRelaunchOutcome::StillActive
                         }
+                        Err(octos_agent::TaskRelaunchError::MissingExecutor) => {
+                            octos_bus::TaskRelaunchOutcome::MissingExecutor
+                        }
                     }
                 })),
                 #[cfg(feature = "api")]
