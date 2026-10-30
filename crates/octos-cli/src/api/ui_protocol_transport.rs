@@ -3375,6 +3375,16 @@ fn session_open_profiles() -> &'static SessionOpenProfileStore {
     SESSION_OPEN_PROFILES.get_or_init(SessionOpenProfileStore::default)
 }
 
+/// Resolve the profile that actually owns an opened session. Embedded profile
+/// prefixes are authoritative; the server-recorded open binding covers raw
+/// `web-*` ids on unscoped admin connections.
+pub(crate) fn session_bound_profile_id(session_id: &SessionKey) -> Option<String> {
+    session_id
+        .profile_id()
+        .map(ToOwned::to_owned)
+        .or_else(|| session_open_profiles().lookup(session_id))
+}
+
 /// Register a `peer-<slug>` session's wire key so `peer_send_input` can resolve
 /// it, and re-home any injections queued against the peer's PREVIOUS wire key
 /// onto this one (#436 P1 #1 reconnect). No-op for non-peer / unprofiled
@@ -22862,8 +22872,9 @@ pub(crate) fn validate_session_scope(
         return Ok(Some(connection_profile_id.to_string()));
     }
 
+    let session_profile_id = session_bound_profile_id(session_id);
     if let (Some(requested_profile_id), Some(session_profile_id)) =
-        (requested_profile_id, session_id.profile_id())
+        (requested_profile_id, session_profile_id.as_deref())
     {
         if requested_profile_id != session_profile_id {
             return Err(profile_mismatch_error(
@@ -22875,8 +22886,8 @@ pub(crate) fn validate_session_scope(
     }
 
     Ok(requested_profile_id
-        .or_else(|| session_id.profile_id())
-        .map(ToOwned::to_owned))
+        .map(ToOwned::to_owned)
+        .or(session_profile_id))
 }
 
 fn validate_authenticated_session_scope(
@@ -22892,12 +22903,12 @@ fn validate_authenticated_session_scope(
         ));
     }
 
-    match session_id.profile_id() {
+    match session_bound_profile_id(session_id) {
         Some(session_profile_id) if session_profile_id == connection_profile_id => Ok(()),
         Some(session_profile_id) => Err(authenticated_scope_mismatch_error(
             "session_id is outside the authenticated profile",
             connection_profile_id,
-            Some(session_profile_id),
+            Some(&session_profile_id),
         )),
         // SPA convention: a fresh session uses a raw `web-N` id with no
         // profile prefix. Accept it under profile auth — the auth layer
@@ -49735,6 +49746,10 @@ mod peer_purge;
 #[cfg(test)]
 #[path = "ui_protocol_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_session_scope_tests.rs"]
+mod session_scope_tests;
 
 #[cfg(test)]
 #[path = "ui_protocol_monitor_expired_tests.rs"]
