@@ -1273,6 +1273,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "event.spawn_complete.v1",
                 "event.file_attached.v1",
                 "auxiliary.rest_to_ws.v1",
+                "memory.session_scope.v1",
                 "session.files.read.v1",
                 "projection.write_path.v1",
                 "mcp.connector.manage.v1",

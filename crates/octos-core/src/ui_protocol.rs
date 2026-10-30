@@ -7875,7 +7875,7 @@ mod session_files_read_tests {
     #[test]
     fn should_gate_session_files_read_on_its_own_feature() {
         assert_eq!(
-            UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1, UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+            UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
             "session.files.read.v1"
         );
         assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
@@ -7887,12 +7887,22 @@ mod session_files_read_tests {
         assert!(!without_read.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
         assert!(!without_read.supports_method(methods::SESSION_FILES_READ));
 
-        let with_read = UiProtocolCapabilities::for_negotiated_features([
+        let memory_only = UiProtocolCapabilities::for_negotiated_features([
             UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
+        ]);
+        assert_eq!(
+            memory_only.supported_features,
+            vec!["memory.session_scope.v1".to_owned()]
+        );
+        assert!(!memory_only.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
+        assert!(!memory_only.supports_method(methods::SESSION_FILES_READ));
+
+        let with_read = UiProtocolCapabilities::for_negotiated_features([
             UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
         ]);
         assert!(with_read.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
         assert!(with_read.supports_method(methods::SESSION_FILES_READ));
+        assert!(!with_read.supports_feature(UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1));
 
         let full = UiProtocolCapabilities::full_protocol();
         assert!(full.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
