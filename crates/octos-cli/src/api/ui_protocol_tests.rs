@@ -9110,7 +9110,10 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         None,
         false,
         "memory-entity-unauth".into(),
-        MemoryEntityParams { name: "e-1".into() },
+        MemoryEntityParams {
+            session_id: None,
+            name: "e-1".into(),
+        },
     )
     .await;
     let frame = recv_rpc_json(&mut rx).await;
@@ -9125,6 +9128,7 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-search-unauth".into(),
         MemorySearchParams {
+            session_id: None,
             query: "dentist".into(),
             ..Default::default()
         },
@@ -9142,6 +9146,7 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-load-unauth".into(),
         MemoryLoadParams {
+            session_id: None,
             id: "doc:mail:1".into(),
         },
     )
@@ -9158,6 +9163,7 @@ async fn stdio_auth_bound_methods_return_typed_auth_unavailable() {
         false,
         "memory-ingest-unauth".into(),
         MemoryIngestParams {
+            session_id: None,
             records: vec![json!({ "id": "doc:mail:1" })],
             vectors: None,
             embed: Some(false),
@@ -9362,6 +9368,7 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         true,
         "mem-entity".into(),
         MemoryEntityParams {
+            session_id: None,
             name: "fleet".into(),
         },
     )
@@ -9386,6 +9393,7 @@ async fn memory_and_cron_rpc_methods_forward_rest_panel_bodies() {
         true,
         "mem-entity-miss".into(),
         MemoryEntityParams {
+            session_id: None,
             name: "missing".into(),
         },
     )
@@ -9539,6 +9547,7 @@ async fn memory_rpc_methods_declare_truncation_when_over_budget() {
         true,
         "mem-entity-cap".into(),
         MemoryEntityParams {
+            session_id: None,
             name: "whale".into(),
         },
     )
@@ -14555,6 +14564,7 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -14633,6 +14643,7 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -14756,6 +14767,7 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -14834,6 +14846,7 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -14905,6 +14918,7 @@ fn shell_approval_still_emits_risk_field() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -15021,6 +15035,7 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -19401,6 +19416,7 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             background_activity: false,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: false,
+            memory_session_scope_v1: false,
             coding_autonomy_v1: false,
             coding_agent_control_v1: false,
             coding_goal_runtime_v1: false,
@@ -46770,6 +46786,7 @@ fn ingest_doc_record(id: &str) -> Value {
 
 fn ingest_params(records: Vec<Value>) -> MemoryIngestParams {
     MemoryIngestParams {
+        session_id: None,
         records,
         vectors: None,
         embed: None,
@@ -46779,6 +46796,7 @@ fn ingest_params(records: Vec<Value>) -> MemoryIngestParams {
 #[test]
 fn memory_search_filter_defaults_limit_and_leaves_filters_open() {
     let filter = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "  dentist ".into(),
         ..Default::default()
     })
@@ -46793,6 +46811,7 @@ fn memory_search_filter_defaults_limit_and_leaves_filters_open() {
 #[test]
 fn memory_search_filter_clamps_limit_to_one_through_max() {
     let over = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "q".into(),
         limit: Some(MEMORY_SEARCH_MAX_LIMIT * 10),
         ..Default::default()
@@ -46800,6 +46819,7 @@ fn memory_search_filter_clamps_limit_to_one_through_max() {
     .expect("valid params");
     assert_eq!(over.limit, MEMORY_SEARCH_MAX_LIMIT);
     let zero = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "q".into(),
         limit: Some(0),
         ..Default::default()
@@ -46811,6 +46831,7 @@ fn memory_search_filter_clamps_limit_to_one_through_max() {
 #[test]
 fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
     let filter = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "hike".into(),
         kinds: vec!["document".into(), "doc".into(), "knowledge".into()],
         sources: vec![" mail ".into(), "".into(), "calendar".into()],
@@ -46846,6 +46867,7 @@ fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
     assert_eq!(filter.limit, 5);
 
     let rfc3339 = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "hike".into(),
         since: Some("2026-01-01T10:00:00+02:00".into()),
         ..Default::default()
@@ -46861,6 +46883,7 @@ fn memory_search_filter_parses_kinds_sources_and_time_bounds() {
 #[test]
 fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     let empty = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "   ".into(),
         ..Default::default()
     })
@@ -46868,6 +46891,7 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert_eq!(empty.code, rpc_error_codes::INVALID_PARAMS);
 
     let kind = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "q".into(),
         kinds: vec!["mail".into()],
         ..Default::default()
@@ -46877,6 +46901,7 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert!(kind.message.contains("unknown kind"), "{}", kind.message);
 
     let date = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "q".into(),
         since: Some("yesterday".into()),
         ..Default::default()
@@ -46886,6 +46911,7 @@ fn memory_search_filter_rejects_bad_input_with_invalid_params() {
     assert!(date.message.contains("`since`"), "{}", date.message);
 
     let ordered = memory_search_filter(&MemorySearchParams {
+        session_id: None,
         query: "q".into(),
         since: Some("2026-03-01".into()),
         until: Some("2026-02-01".into()),
@@ -47090,6 +47116,7 @@ fn memory_ingest_rejects_malformed_records() {
 #[test]
 fn memory_ingest_requires_vectors_parallel_to_records() {
     let mismatch = validate_memory_ingest(MemoryIngestParams {
+        session_id: None,
         records: vec![
             ingest_doc_record("doc:mail:1"),
             ingest_doc_record("doc:mail:2"),
@@ -47101,6 +47128,7 @@ fn memory_ingest_requires_vectors_parallel_to_records() {
     assert_eq!(mismatch.code, rpc_error_codes::INVALID_PARAMS);
 
     let parallel = validate_memory_ingest(MemoryIngestParams {
+        session_id: None,
         records: vec![
             ingest_doc_record("doc:mail:1"),
             ingest_doc_record("doc:mail:2"),

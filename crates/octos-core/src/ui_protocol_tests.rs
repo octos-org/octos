@@ -5038,12 +5038,14 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
         ),
         (
             UiCommand::MemoryEntity(MemoryEntityParams {
+                session_id: None,
                 name: "acme-corp".into(),
             }),
             methods::MEMORY_ENTITY,
         ),
         (
             UiCommand::MemorySearch(MemorySearchParams {
+                session_id: None,
                 query: "dentist".into(),
                 kinds: vec!["document".into()],
                 sources: vec!["calendar".into()],
@@ -5055,12 +5057,14 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
         ),
         (
             UiCommand::MemoryLoad(MemoryLoadParams {
+                session_id: None,
                 id: "doc:mail:42".into(),
             }),
             methods::MEMORY_LOAD,
         ),
         (
             UiCommand::MemoryIngest(MemoryIngestParams {
+                session_id: None,
                 records: vec![serde_json::json!({ "id": "doc:mail:42" })],
                 vectors: None,
                 embed: Some(false),
@@ -5069,6 +5073,7 @@ fn aux_rest_to_ws_v1_methods_round_trip_through_rpc_envelope() {
         ),
         (
             UiCommand::MemoryRequest(MemoryRequestParams {
+                session_id: None,
                 request_id: "req1".into(),
                 operation: MemoryRequestOperation::Remember,
                 content: Some("Likes diagrams.".into()),
@@ -5596,6 +5601,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/entity
     assert_eq!(
         serde_json::to_value(MemoryEntityParams {
+            session_id: None,
             name: "acme-corp".into(),
         })
         .expect("serialize"),
@@ -5606,6 +5612,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // wire shape is `{ query, kinds?, sources?, since?, until?, limit? }`.
     assert_eq!(
         serde_json::to_value(MemorySearchParams {
+            session_id: None,
             query: "dentist".into(),
             ..Default::default()
         })
@@ -5614,6 +5621,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     );
     assert_eq!(
         serde_json::to_value(MemorySearchParams {
+            session_id: None,
             query: "dentist".into(),
             kinds: vec!["document".into(), "knowledge".into()],
             sources: vec!["calendar".into()],
@@ -5639,6 +5647,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/load — `{ id }`
     assert_eq!(
         serde_json::to_value(MemoryLoadParams {
+            session_id: None,
             id: "bank:acme-corp".into(),
         })
         .expect("serialize"),
@@ -5648,6 +5657,7 @@ fn aux_rest_to_ws_v1_request_dtos_match_json_goldens() {
     // memory/ingest — `{ records, vectors?, embed? }`
     assert_eq!(
         serde_json::to_value(MemoryIngestParams {
+            session_id: None,
             records: vec![serde_json::json!({ "id": "doc:mail:1" })],
             vectors: Some(vec![Some(vec![0.5, 0.25]), None]),
             embed: Some(false),

@@ -265,3 +265,7 @@ snapshot. This raw AppUI extension is handled before the typed notification
 codec by compatible clients and is not part of `UI_PROTOCOL_NOTIFICATION_METHODS`.
 See the workspace-team contract in the OUP specification and
 `crates/octos-cli/src/api/ui_protocol_workspace_team.rs`.
+
+The seven `memory/*` methods also accept optional `session_id`, gated by
+`memory.session_scope.v1` (UPCR-2026-065). Omission keeps auth-profile routing;
+explicit scope uses the authorized session binding.

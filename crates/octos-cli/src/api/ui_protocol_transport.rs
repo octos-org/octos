@@ -69,20 +69,20 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_CODING_MONITOR_RUNTIME_V1, UI_PROTOCOL_FEATURE_CONTEXT_LIFECYCLE_V1,
     UI_PROTOCOL_FEATURE_CONTEXT_SEMANTIC_CACHE_V1, UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_ARTIFACTS_V1, UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1,
-    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
-    UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2, UI_PROTOCOL_FEATURE_REVIEW_START_V1,
-    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
-    UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1, UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
-    UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1, UI_PROTOCOL_FEATURE_USER_QUESTION_V1,
-    UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord, UiArtifactPaneItem, UiArtifactPaneSnapshot,
-    UiCommand, UiContextCompactionRecord, UiContextNormalizationReport, UiContextState, UiCursor,
-    UiFileMutationNotice, UiGitHistoryItem, UiGitPaneSnapshot, UiGitStatusItem, UiNotification,
-    UiPaneSnapshot, UiPaneSnapshotLimitation, UiProgressEvent, UiProgressMetadata,
-    UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,
-    UnsupportedCapabilityReport, UserQuestionRequestedEvent, UserQuestionRespondParams,
-    VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds, hydrate_sections,
-    progress_kinds, thread_status,
+    UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
+    UI_PROTOCOL_FEATURE_PLAN_TODOS_V1, UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+    UI_PROTOCOL_FEATURE_REVIEW_START_V1, UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1,
+    UI_PROTOCOL_FEATURE_SESSION_SANDBOX_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1, UI_PROTOCOL_FEATURE_THREAD_GRAPH_V1,
+    UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1, UI_PROTOCOL_FEATURE_TURN_STEER_DROPPED_V1,
+    UI_PROTOCOL_FEATURE_USER_QUESTION_V1, UI_PROTOCOL_FEATURE_VOICE_AUDIO_V1, UiAgentRecord,
+    UiArtifactPaneItem, UiArtifactPaneSnapshot, UiCommand, UiContextCompactionRecord,
+    UiContextNormalizationReport, UiContextState, UiCursor, UiFileMutationNotice, UiGitHistoryItem,
+    UiGitPaneSnapshot, UiGitStatusItem, UiNotification, UiPaneSnapshot, UiPaneSnapshotLimitation,
+    UiProgressEvent, UiProgressMetadata, UiProtocolCapabilities, UiRpcResult, UiWorkspacePaneEntry,
+    UiWorkspacePaneSnapshot, UnsupportedCapabilityReport, UserQuestionRequestedEvent,
+    UserQuestionRespondParams, VoiceAudioChunkEvent, approval_cancelled_reasons, approval_kinds,
+    hydrate_sections, progress_kinds, thread_status,
 };
 use octos_core::{
     AgentId, InboundMessage, MAIN_PROFILE_ID, Message, MessageOrigin, MessageRole, SessionKey,
@@ -2339,6 +2339,7 @@ struct ConnectionUiFeatures {
     /// Phase D-1 truly additive — pre-existing clients cannot trip into
     /// the new methods without explicit negotiation.
     auxiliary_rest_to_ws_v1: bool,
+    memory_session_scope_v1: bool,
     /// UPCR-2026-021 M15 autonomy capability root. Optional agent, goal,
     /// and loop groups are honoured only when this base capability is
     /// negotiated too.
@@ -2439,6 +2440,11 @@ impl ConnectionUiFeatures {
                 headers,
                 query,
                 UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
+            ),
+            memory_session_scope_v1: has_ui_feature(
+                headers,
+                query,
+                UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
             ),
             auxiliary_rest_to_ws_v1: has_ui_feature(
                 headers,
@@ -2542,6 +2548,7 @@ impl ConnectionUiFeatures {
             background_activity: true,
             projection_envelope_v2: false,
             auxiliary_rest_to_ws_v1: true,
+            memory_session_scope_v1: true,
             coding_autonomy_v1: true,
             coding_agent_control_v1: true,
             coding_goal_runtime_v1: true,
@@ -2598,6 +2605,7 @@ impl ConnectionUiFeatures {
             background_activity: has(UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1),
             projection_envelope_v2: has(UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2),
             auxiliary_rest_to_ws_v1: has(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1),
+            memory_session_scope_v1: has(UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1),
             coding_autonomy_v1: has(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1),
             coding_agent_control_v1: has(UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1),
             coding_goal_runtime_v1: has(UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1),
@@ -2699,6 +2707,9 @@ impl ConnectionUiFeatures {
         }
         if self.auxiliary_rest_to_ws_v1 {
             requested.push(UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1);
+            if self.memory_session_scope_v1 {
+                requested.push(UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1);
+            }
         }
         if self.coding_autonomy_v1 {
             requested.push(UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1);
@@ -22482,6 +22493,17 @@ fn route_rpc_command(
     features: ConnectionUiFeatures,
 ) -> Result<UiCommand, RpcError> {
     let method_str = request.method.as_str();
+    if method_str.starts_with("memory/")
+        && request
+            .params
+            .get("session_id")
+            .is_some_and(|value| !value.is_null())
+        && !features.memory_session_scope_v1
+    {
+        return Err(RpcError::invalid_params(
+            "session_id requires memory.session_scope.v1",
+        ));
+    }
     if !ui_protocol_server_supported_methods().contains(&method_str) {
         return Err(RpcError::method_not_supported(method_str));
     }
@@ -34339,7 +34361,7 @@ async fn handle_memory_overview(
     identity: Option<&AuthIdentity>,
     close_on_auth_unavailable: bool,
     id: String,
-    _params: MemoryOverviewParams,
+    params: MemoryOverviewParams,
 ) {
     let method = octos_core::ui_protocol::methods::MEMORY_OVERVIEW;
     let Some(identity) = identity.cloned() else {
@@ -34352,9 +34374,20 @@ async fn handle_memory_overview(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
-    let result =
-        super::memory_panel::my_memory(State(state.clone()), headers.clone(), Extension(identity))
-            .await;
+    let profile_id = match resolve_memory_profile_id(
+        state,
+        headers,
+        &identity,
+        params.session_id.as_deref(),
+        method,
+    ) {
+        Ok(profile_id) => profile_id,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let result = super::memory_panel::profile_memory(state.clone(), &profile_id).await;
     match result {
         Ok(axum::Json(overview)) => match serde_json::to_value(&overview) {
             // The REST body is forwarded whole under `overview` (the
@@ -34412,13 +34445,21 @@ async fn handle_memory_entity(
         return;
     };
     let entity_name = params.name.clone();
-    let result = super::memory_panel::my_memory_entity(
-        State(state.clone()),
-        headers.clone(),
-        Extension(identity),
-        axum_path(params.name),
-    )
-    .await;
+    let profile_id = match resolve_memory_profile_id(
+        state,
+        headers,
+        &identity,
+        params.session_id.as_deref(),
+        method,
+    ) {
+        Ok(profile_id) => profile_id,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
+    let result =
+        super::memory_panel::profile_memory_entity(state.clone(), &profile_id, params.name).await;
     match result {
         Ok(axum::Json(entity)) => {
             // `ok` is dropped — RPC success is carried by the envelope.
@@ -34459,7 +34500,7 @@ async fn handle_memory_entity(
 
 // ---------------------------------------------------------------------------
 // Recall / Knowledge index: `memory/search`, `memory/load`, `memory/ingest`
-// (docs/adr/personal-memory-tiers.md). Auth-bound like `memory/overview`:
+// (docs/adr/personal-memory-tiers.md). Auth-bound or explicitly session-bound:
 // the identity resolves to a profile through the same `/api/my/*` rules,
 // then the profile's live `ProfileRuntime` supplies the `RecallStore`, the
 // bank `MemoryStore` and the optional embedder. `RecallStore` is
@@ -34480,29 +34521,80 @@ const MEMORY_INGEST_EMBED_BATCH: usize = 16;
 const MEMORY_INGEST_KNOWLEDGE_REFUSAL: &str =
     "knowledge pages are written through save_memory / the memory bank, not ingest";
 
-/// Resolve the caller to its profile's live runtime: the identity →
-/// profile-id step is the one `memory/overview` takes through
-/// `memory_panel::my_memory` (`resolve_my_profile_id`), and the runtime
-/// lookup is the session path's `ensure_session_profile_runtime`. A
-/// profile without a bootstrappable runtime answers with the same
-/// `runtime_unavailable` message the session helpers use.
-async fn resolve_memory_profile_runtime(
+/// Resolve an explicit session through the same scope rules as session/open
+/// and file reads. Omitting it preserves the auth-bound `/api/my/*` contract.
+fn resolve_memory_profile_id(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     identity: &AuthIdentity,
+    session_id: Option<&str>,
     method: &str,
-) -> Result<(String, Arc<crate::runtime::ProfileRuntime>), RpcError> {
+) -> Result<String, RpcError> {
     let Some(profile_store) = state.profile_store.as_ref() else {
         return Err(RpcError::runtime_not_ready(format!(
             "{method}: profile store not configured on this server"
         )));
     };
-    let profile_id =
-        crate::api::auth_handlers::resolve_my_profile_id(identity, profile_store, state, headers)
-            .map_err(|status| {
-            let context = RestResourceContext::resource("profile", "");
-            rest_status_to_rpc_error(method, status, None, &context)
-        })?;
+    let status_error = |status| {
+        rest_status_to_rpc_error(
+            method,
+            status,
+            None,
+            &RestResourceContext::resource("profile", ""),
+        )
+    };
+    let Some(session_id) = session_id else {
+        return super::auth_handlers::resolve_my_profile_id(
+            identity,
+            profile_store,
+            state,
+            headers,
+        )
+        .map_err(status_error);
+    };
+    if session_id.trim().is_empty() {
+        return Err(RpcError::invalid_params("session_id cannot be empty"));
+    }
+    let key = SessionKey(session_id.to_owned());
+    let routed = super::handlers::routed_profile_id_from_headers(state, headers);
+    // User identity wins; a routed admin remains confined to its tenant.
+    let profile_id = validate_session_scope(
+        &key,
+        None,
+        authenticated_profile_id(identity).or(routed.as_deref()),
+    )?
+    .ok_or_else(|| RpcError::not_found("session", session_id))?;
+    // Unknown raw ids must not fall back to the requester's default memory.
+    if session_bound_profile_id(&key).is_none() {
+        return Err(RpcError::not_found("session", session_id));
+    }
+    let profile = profile_store
+        .get(&profile_id)
+        .map_err(|_| RpcError::internal_error("could not read profile"))?
+        .ok_or_else(|| RpcError::not_found("profile", &profile_id))?;
+    // App peers have a separate namespace and token contract. This feature
+    // supports profile memory only; never substitute the profile's store.
+    if crate::peers::app_binding::resolve_session_app_binding(
+        &profile_store.resolve_data_dir(&profile).join("peers"),
+        &key,
+    )
+    .is_bound_or_refused()
+    {
+        return Err(RpcError::invalid_params(
+            "session memory belongs to an app namespace",
+        ));
+    }
+    Ok(profile_id)
+}
+
+async fn resolve_memory_profile_runtime(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: &AuthIdentity,
+    session_id: Option<&str>,
+    method: &str,
+) -> Result<(String, Arc<crate::runtime::ProfileRuntime>), RpcError> {
+    let profile_id = resolve_memory_profile_id(state, headers, identity, session_id, method)?;
     // Boxed on purpose: the runtime lookup embeds the whole cold-bootstrap
     // future (`ProfileRuntime::bootstrap_with_host_plugins`), and the three
     // Recall handlers are inlined into the WS and stdio dispatch state
@@ -34639,14 +34731,21 @@ async fn handle_memory_search(
             return;
         }
     };
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
+    let (profile_id, runtime) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        params.session_id.as_deref(),
+        method,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let query = params.query.trim().to_owned();
     let query_vector = match runtime.embedder.as_ref() {
         Some(embedder) => match embedder.embed(&[query.as_str()]).await {
@@ -34725,14 +34824,21 @@ async fn handle_memory_load(
         );
         return;
     }
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
+    let (profile_id, runtime) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        params.session_id.as_deref(),
+        method,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let recall = runtime.recall.clone();
     let lookup_id = record_id.clone();
     let fetched = tokio::task::spawn_blocking(move || {
@@ -34978,6 +35084,7 @@ async fn handle_memory_ingest(
         let _ = send_rpc_error(ws, Some(id), auth_unavailable_error(method));
         return;
     };
+    let session_id = params.session_id.clone();
     let embed_requested = params.embed.unwrap_or(true);
     let ValidatedMemoryIngest { records, vectors } = match validate_memory_ingest(params) {
         Ok(validated) => validated,
@@ -34986,14 +35093,21 @@ async fn handle_memory_ingest(
             return;
         }
     };
-    let (profile_id, runtime) =
-        match resolve_memory_profile_runtime(state, headers, &identity, method).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let _ = send_rpc_error(ws, Some(id), error);
-                return;
-            }
-        };
+    let (profile_id, runtime) = match resolve_memory_profile_runtime(
+        state,
+        headers,
+        &identity,
+        session_id.as_deref(),
+        method,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let _ = send_rpc_error(ws, Some(id), error);
+            return;
+        }
+    };
     let mut embedded = 0usize;
     let (records, vectors): (Vec<octos_memory::Record>, Vec<Option<Vec<f32>>>) = match vectors {
         Some(vectors) => (records, vectors),

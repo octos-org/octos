@@ -35,12 +35,17 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use axum::Json;
+#[cfg(test)]
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
+#[cfg(test)]
+use axum::http::HeaderMap;
+use axum::http::StatusCode;
 use serde::Serialize;
 
 use super::AppState;
+#[cfg(test)]
 use super::router::AuthIdentity;
+#[cfg(test)]
 use crate::api::auth_handlers::resolve_my_profile_id;
 
 /// One recent daily-note file (`memory/YYYY-MM-DD.md`).
@@ -496,6 +501,7 @@ fn rfc3339(mtime: SystemTime) -> String {
 }
 
 /// GET /api/my/memory
+#[cfg(test)]
 pub async fn my_memory(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -506,8 +512,20 @@ pub async fn my_memory(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
+    profile_memory(state, &profile_id).await
+}
+
+/// Internal read after the transport has authorized the effective profile.
+pub(super) async fn profile_memory(
+    state: Arc<AppState>,
+    profile_id: &str,
+) -> Result<Json<MemoryOverviewResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let profile = ps
-        .get(&profile_id)
+        .get(profile_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
     let data_dir = ps.resolve_data_dir(&profile);
@@ -666,6 +684,7 @@ pub async fn my_memory(
 }
 
 /// GET /api/my/memory/entities/{name}
+#[cfg(test)]
 pub async fn my_memory_entity(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -677,8 +696,21 @@ pub async fn my_memory_entity(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let profile_id = resolve_my_profile_id(&identity, ps, &state, &headers)?;
+    profile_memory_entity(state, &profile_id, name).await
+}
+
+/// Internal read after the transport has authorized the effective profile.
+pub(super) async fn profile_memory_entity(
+    state: Arc<AppState>,
+    profile_id: &str,
+    name: String,
+) -> Result<Json<MemoryEntityResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let profile = ps
-        .get(&profile_id)
+        .get(profile_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
     let data_dir = ps.resolve_data_dir(&profile);

@@ -186,6 +186,9 @@ pub const UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2: &str = "projection.envelop
 /// once `octos-web` has migrated (tracked separately).
 pub const UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1: &str = "auxiliary.rest_to_ws.v1";
 
+/// Optional session-bound profile selection for all seven memory RPCs.
+pub const UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1: &str = "memory.session_scope.v1";
+
 /// Feature flag for reading session file contents through `session/files/read`.
 pub const UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1: &str = "session.files.read.v1";
 
@@ -343,6 +346,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_FILE_ATTACHED_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
     UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
     UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
@@ -392,6 +396,7 @@ pub const UI_PROTOCOL_STDIO_DEFAULT_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_PLAN_TODOS_V1,
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+    UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
     UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
     UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
     UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
@@ -1777,6 +1782,7 @@ impl UiProtocolCapabilities {
             UI_PROTOCOL_FEATURE_TURN_STATE_GET_V1,
             UI_PROTOCOL_FEATURE_SPAWN_COMPLETE_V1,
             UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+            UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
             UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
             UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
             UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
@@ -3874,12 +3880,16 @@ pub struct ContentBulkDeleteResult {
     pub deleted: usize,
 }
 
-/// Params for `memory/overview`. Empty today; the struct exists so
+/// Params for `memory/overview`. Optional session selection; the struct exists so
 /// `{}` / `null` params decode uniformly (mirrors
 /// [`SystemStatusGetParams`]; the wire `params` MEMBER must still be
 /// present — the frame parser rejects requests without one).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryOverviewParams {}
+pub struct MemoryOverviewParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
 
 /// Result for `memory/overview`. `overview` is the JSON body of the
 /// existing `GET /api/my/memory` handler (`MemoryOverviewResponse` —
@@ -3903,6 +3913,10 @@ pub struct MemoryOverviewResult {
 /// same string `memory/overview` returns in each entity summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEntityParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
     pub name: String,
 }
 
@@ -3941,6 +3955,10 @@ pub const MEMORY_INGEST_MAX_RECORDS: usize = 500;
 /// [`MEMORY_SEARCH_MAX_LIMIT`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemorySearchParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
     pub query: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<String>,
@@ -3967,6 +3985,10 @@ pub struct MemorySearchResult {
 /// `id` a `memory/search` hit returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryLoadParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
     pub id: String,
 }
 
@@ -3997,6 +4019,10 @@ pub struct MemoryLoadResult {
 /// records are refused — they are written through the memory bank.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemoryIngestParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
     pub records: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors: Option<Vec<Option<Vec<f32>>>>,
@@ -4031,10 +4057,14 @@ pub enum MemoryRequestOperation {
     Forget,
 }
 
-/// Authenticated profile only. Neither origin nor identity is caller-supplied.
+/// Authorized profile only. Neither origin nor identity is caller-supplied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryRequestParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
     pub request_id: String,
     pub operation: MemoryRequestOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4062,6 +4092,10 @@ pub struct MemoryRequestResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryPromoteParams {
+    /// Resolve memory from this session's authorized profile; omit for the legacy auth profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7841,7 +7875,7 @@ mod session_files_read_tests {
     #[test]
     fn should_gate_session_files_read_on_its_own_feature() {
         assert_eq!(
-            UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+            UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1, UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
             "session.files.read.v1"
         );
         assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));
@@ -7854,6 +7888,7 @@ mod session_files_read_tests {
         assert!(!without_read.supports_method(methods::SESSION_FILES_READ));
 
         let with_read = UiProtocolCapabilities::for_negotiated_features([
+            UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
             UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
         ]);
         assert!(with_read.supports_feature(UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1));

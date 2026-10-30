@@ -94,6 +94,7 @@ fn request(
     content: Option<&str>,
 ) -> MemoryRequestParams {
     MemoryRequestParams {
+        session_id: None,
         request_id: id.into(),
         operation,
         entry_id: entry.map(str::to_owned),
@@ -313,18 +314,22 @@ async fn memory_promote_handler_filters_own_records_and_validates_limits() {
     let user = person("alice");
     for p in [
         MemoryPromoteParams {
+            session_id: None,
             limit: Some(0),
             ..Default::default()
         },
         MemoryPromoteParams {
+            session_id: None,
             limit: Some(101),
             ..Default::default()
         },
         MemoryPromoteParams {
+            session_id: None,
             sources: vec![" ".into()],
             ..Default::default()
         },
         MemoryPromoteParams {
+            session_id: None,
             sources: vec!["reader".into(); 33],
             ..Default::default()
         },
@@ -333,6 +338,7 @@ async fn memory_promote_handler_filters_own_records_and_validates_limits() {
         assert_eq!(recv_rpc_json(&mut rx).await["error"]["code"], -32602);
     }
     let p = MemoryPromoteParams {
+        session_id: None,
         sources: vec!["reader".into()],
         min_visits: Some(1),
         limit: Some(1),
@@ -382,4 +388,208 @@ fn memory_write_methods_are_gated_for_session_ingress_and_capabilities() {
                 .is_err()
         );
     }
+}
+
+async fn session_memory_rpc(
+    state: &Arc<AppState>,
+    identity: &AuthIdentity,
+    method: &str,
+    params: Value,
+) -> Value {
+    let (ws, mut rx) = ws_connection_for_test(8);
+    let headers = HeaderMap::new();
+    let id = "session-memory".to_owned();
+    let command = route_rpc_command(
+        RpcRequest::new(id.clone(), method, params),
+        ConnectionUiFeatures::stdio_defaults(),
+    )
+    .unwrap();
+    match command {
+        UiCommand::MemoryOverview(p) => {
+            handle_memory_overview(&ws, state, &headers, Some(identity), false, id, p).await
+        }
+        UiCommand::MemoryEntity(p) => {
+            handle_memory_entity(&ws, state, &headers, Some(identity), false, id, p).await
+        }
+        UiCommand::MemorySearch(p) => {
+            handle_memory_search(&ws, state, &headers, Some(identity), false, id, p).await
+        }
+        UiCommand::MemoryLoad(p) => {
+            handle_memory_load(&ws, state, &headers, Some(identity), false, id, p).await
+        }
+        UiCommand::MemoryIngest(p) => {
+            handle_memory_ingest(&ws, state, &headers, Some(identity), false, id, p).await
+        }
+        UiCommand::MemoryRequest(p) => {
+            handle_memory_request(&ws, state, &headers, Some(identity), false, id, p).await
+        }
+        UiCommand::MemoryPromote(p) => {
+            handle_memory_promote(&ws, state, &headers, Some(identity), false, id, p).await
+        }
+        _ => panic!("not a memory request"),
+    }
+    recv_rpc_json(&mut rx).await
+}
+
+#[tokio::test]
+async fn session_memory_methods_follow_named_profile_and_refuse_other_users() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, alice, bob) = memory_state(dir.path()).await;
+    alice
+        .memory_store
+        .write_long_term("Alice's profile memory")
+        .await
+        .unwrap();
+    alice
+        .memory_store
+        .write_entity("topic", "Alice's entity")
+        .await
+        .unwrap();
+    bob.memory_store
+        .write_long_term("Bob's private memory")
+        .await
+        .unwrap();
+    let session = SessionKey(format!("web-memory-{}", uuid::Uuid::new_v4()));
+    session_open_profiles().record(session.clone(), "alice");
+    let document = json!({"id":"doc:reader:session", "kind":"document", "source":"reader", "timestamp":"2026-10-30T00:00:00Z", "title":"Alice document", "abstract":"Session scoped record", "body":"Alice body"});
+    alice
+        .recall
+        .upsert(
+            vec![serde_json::from_value(document.clone()).unwrap()],
+            vec![None],
+        )
+        .unwrap();
+    let cases = [
+        ("memory/overview", json!({})),
+        ("memory/entity", json!({"name":"topic"})),
+        ("memory/search", json!({"query":"Alice"})),
+        ("memory/load", json!({"id":"doc:reader:session"})),
+        (
+            "memory/ingest",
+            json!({"records":[document], "embed":false}),
+        ),
+        (
+            "memory/request",
+            json!({"request_id":"session-remember", "operation":"remember", "content":"Prefers examples"}),
+        ),
+        (
+            "memory/promote",
+            json!({"sources":["reader"], "min_visits":0, "limit":1}),
+        ),
+    ];
+    for (method, mut params) in cases {
+        params["session_id"] = json!(session.0.as_str());
+        for who in [AuthIdentity::Admin, person("alice")] {
+            let reply = session_memory_rpc(&state, &who, method, params.clone()).await;
+            assert!(reply.get("error").is_none(), "{method}: {reply}");
+            match method {
+                "memory/overview" => assert_eq!(
+                    reply["result"]["overview"]["long_term"],
+                    "Alice's profile memory"
+                ),
+                "memory/entity" => assert!(
+                    reply["result"]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Alice's entity")
+                ),
+                "memory/search" => {
+                    assert_eq!(reply["result"]["hits"][0]["title"], "Alice document")
+                }
+                "memory/load" => assert_eq!(reply["result"]["record"]["body"], "Alice body"),
+                _ => {}
+            }
+        }
+        let denied = session_memory_rpc(&state, &person("bob"), method, params).await;
+        assert_eq!(
+            denied["error"]["data"]["auth_scope_violation"], true,
+            "{method}: {denied}"
+        );
+    }
+    assert!(alice.memory_store.count_staging_notes().await > 0);
+    assert_eq!(bob.memory_store.count_staging_notes().await, 0);
+    assert!(bob.recall.get("doc:reader:session").unwrap().is_none());
+    assert!(
+        state
+            .profile_store
+            .as_ref()
+            .unwrap()
+            .get("admin")
+            .unwrap()
+            .is_none(),
+        "session selection must not create or write the auth default profile"
+    );
+}
+
+#[tokio::test]
+async fn session_memory_rejects_unknown_and_app_sessions_and_preserves_legacy_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, alice, _) = memory_state(dir.path()).await;
+    alice
+        .memory_store
+        .write_long_term("legacy Alice")
+        .await
+        .unwrap();
+    let reply = session_memory_rpc(&state, &person("alice"), "memory/overview", json!({})).await;
+    assert_eq!(reply["result"]["overview"]["long_term"], "legacy Alice");
+    for session in [
+        "",
+        "unknown-raw-session",
+        "alice:api:root#peerctx-app.unknown",
+    ] {
+        let reply = session_memory_rpc(
+            &state,
+            &AuthIdentity::Admin,
+            "memory/overview",
+            json!({"session_id":session}),
+        )
+        .await;
+        assert!(reply.get("error").is_some(), "{session}: {reply}");
+    }
+    // An encoded foreign profile cannot bypass the raw-binding ACL either.
+    let denied = session_memory_rpc(
+        &state,
+        &person("bob"),
+        "memory/overview",
+        json!({"session_id":"alice:api:root"}),
+    )
+    .await;
+    assert_eq!(denied["error"]["data"]["auth_scope_violation"], true);
+}
+
+#[test]
+fn session_memory_requires_negotiated_capability() {
+    let params = json!({"session_id":"web-coding"});
+    let old = ConnectionUiFeatures::from_requested_feature_tokens(
+        [UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1],
+        false,
+    );
+    assert!(
+        route_rpc_command(
+            RpcRequest::new("memory", "memory/overview", params.clone()),
+            old
+        )
+        .is_err()
+    );
+    let new = ConnectionUiFeatures::from_requested_feature_tokens(
+        [
+            UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
+            UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1,
+        ],
+        false,
+    );
+    assert!(route_rpc_command(RpcRequest::new("memory", "memory/overview", params), new).is_ok());
+    let state = AppState::empty_for_tests();
+    assert!(
+        new.advertised_capabilities(&state)
+            .supported_features
+            .iter()
+            .any(|feature| feature == UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1)
+    );
+    assert!(
+        !old.advertised_capabilities(&state)
+            .supported_features
+            .iter()
+            .any(|feature| feature == UI_PROTOCOL_FEATURE_MEMORY_SESSION_SCOPE_V1)
+    );
 }
