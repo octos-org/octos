@@ -293,6 +293,9 @@ pub enum ValidatorPhaseKind {
     /// Runs on completion / publish (expensive checks).
     #[default]
     Completion,
+    /// Whole-deliverable gate at a root agent's terminal response. Unlike
+    /// Completion this does not run against each unfinished page worker.
+    Delivery,
 }
 
 /// The typed body of a [`Validator`].

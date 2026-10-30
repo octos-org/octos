@@ -9,6 +9,7 @@ mod budget;
 pub use budget::result_md_owner_content_is_peer;
 mod compaction;
 mod convergence;
+mod delivery_contract;
 mod detection;
 mod dispatch;
 mod execution;

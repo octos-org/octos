@@ -10169,6 +10169,8 @@ struct RawProfileSkillsRemoveParams {
 #[serde(deny_unknown_fields)]
 struct RawLlmRoute {
     #[serde(default)]
+    media_transport: Option<octos_llm::media_transport::MediaTransportMode>,
+    #[serde(default)]
     route_id: Option<String>,
     #[serde(default)]
     label: Option<String>,
@@ -10311,13 +10313,24 @@ const LLM_SELECTION_KNOWN: &[&str] = &[
     "top_p",
     "reasoning_effort",
 ];
-const LLM_ROUTE_KNOWN: &[&str] = &["route_id", "label", "base_url", "api_key_env", "api_type"];
+const LLM_ROUTE_KNOWN: &[&str] = &[
+    "route_id",
+    "label",
+    "base_url",
+    "api_key_env",
+    "api_type",
+    "media_transport",
+];
 const LLM_MODEL_HINTS_KNOWN: &[&str] = &[
     "uses_completion_tokens",
     "fixed_temperature",
     "lacks_vision",
+    "image_file_references",
+    "lacks_video",
+    "retain_tool_images",
     "merge_system_messages",
     "reasoning_style",
+    "reasoning_history",
 ];
 /// Fields a client may plausibly send on this RPC that are REAL but owned
 /// by a different contract tier. They get a dedicated typed error pointing
@@ -14639,6 +14652,7 @@ async fn raw_profile_llm_upsert(
     let model_id = nonempty(params.selection.model_id)
         .ok_or_else(|| RpcError::invalid_params("selection.model_id is required"))?;
     let route = crate::profiles::LlmRouteConfig {
+        media_transport: params.selection.route.media_transport,
         route_id: nonempty(params.selection.route.route_id),
         label: nonempty(params.selection.route.label),
         base_url: nonempty(params.selection.route.base_url),
@@ -15001,6 +15015,7 @@ async fn raw_profile_llm_test(
     let model_id = nonempty(params.selection.model_id)
         .ok_or_else(|| RpcError::invalid_params("selection.model_id is required"))?;
     let route = crate::profiles::LlmRouteConfig {
+        media_transport: params.selection.route.media_transport,
         route_id: nonempty(params.selection.route.route_id),
         label: nonempty(params.selection.route.label),
         base_url: nonempty(params.selection.route.base_url),
@@ -15035,20 +15050,26 @@ async fn raw_profile_llm_test(
         }
     };
 
-    let provider =
-        match build_test_llm_provider(&family_id, &model_id, route.base_url.clone(), &api_key) {
-            Ok(provider) => provider,
-            Err(error) => {
-                return Ok(profile_llm_test_result(
-                    state,
-                    &profile_id,
-                    profile.as_ref(),
-                    false,
-                    "Provider connection failed",
-                    Some(error),
-                ));
-            }
-        };
+    let provider = match build_test_llm_provider(
+        &family_id,
+        &model_id,
+        route.base_url.clone(),
+        &api_key,
+        params.selection.model_hints,
+        route.media_transport,
+    ) {
+        Ok(provider) => provider,
+        Err(error) => {
+            return Ok(profile_llm_test_result(
+                state,
+                &profile_id,
+                profile.as_ref(),
+                false,
+                "Provider connection failed",
+                Some(error),
+            ));
+        }
+    };
 
     let messages = vec![Message {
         role: MessageRole::User,
@@ -15226,6 +15247,8 @@ fn build_test_llm_provider(
     model_id: &str,
     base_url: Option<String>,
     api_key: &str,
+    model_hints: Option<octos_llm::openai::ModelHints>,
+    media_transport: Option<octos_llm::media_transport::MediaTransportMode>,
 ) -> Result<Arc<dyn octos_llm::LlmProvider>, String> {
     let params = octos_llm::registry::CreateParams {
         // Empty means "keyless family" — let the factory apply its own
@@ -15233,7 +15256,8 @@ fn build_test_llm_provider(
         api_key: (!api_key.is_empty()).then(|| api_key.to_owned()),
         model: Some(model_id.to_owned()),
         base_url: base_url.clone(),
-        model_hints: None,
+        model_hints: model_hints.clone(),
+        media_transport,
         llm_timeout_secs: None,
         llm_connect_timeout_secs: None,
     };
@@ -15241,11 +15265,14 @@ fn build_test_llm_provider(
         Some(entry) => (entry.create)(params).map_err(|error| format!("provider error: {error:#}")),
         None => {
             let url = base_url.as_deref().unwrap_or("https://api.openai.com/v1");
-            Ok(Arc::new(
-                octos_llm::openai::OpenAIProvider::new(api_key, model_id)
-                    .with_base_url(url)
-                    .with_provider_label(family_id),
-            ))
+            let mut provider = octos_llm::openai::OpenAIProvider::new(api_key, model_id)
+                .with_base_url(url)
+                .with_media_transport(media_transport.unwrap_or_default())
+                .with_provider_label(family_id);
+            if let Some(hints) = model_hints {
+                provider = provider.with_hints(hints);
+            }
+            Ok(Arc::new(provider))
         }
     }
 }

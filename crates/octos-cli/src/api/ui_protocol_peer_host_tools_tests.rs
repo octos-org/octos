@@ -59,6 +59,7 @@ async fn fixture_with(setup: impl FnOnce(&mut AppState)) -> Fx {
                     family_id: Some("openai".to_string()),
                     model_id: Some("gpt-4o-mini".to_string()),
                     route: Some(crate::profiles::LlmRouteConfig {
+                        media_transport: None,
                         route_id: None,
                         label: None,
                         base_url: None,
@@ -1948,6 +1949,7 @@ async fn e2e_fixture(llm: Arc<dyn octos_llm::LlmProvider>, tools: Value) -> E2e 
                             family_id: Some("openai".to_string()),
                             model_id: Some("gpt-4o-mini".to_string()),
                             route: Some(crate::profiles::LlmRouteConfig {
+                                media_transport: None,
                                 route_id: None,
                                 label: None,
                                 base_url: None,

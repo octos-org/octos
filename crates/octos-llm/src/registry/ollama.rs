@@ -41,6 +41,7 @@ fn create(p: CreateParams) -> Result<Arc<dyn LlmProvider>> {
     let mut provider = OpenAIProvider::new("ollama", &model)
         .with_provider_label("ollama")
         .with_base_url(&url);
+    provider = provider.with_media_transport(p.media_transport.unwrap_or_default());
     if let Some(hints) = p.model_hints {
         provider = provider.with_hints(hints);
     }

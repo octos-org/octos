@@ -1,8 +1,10 @@
 //! Tool output sanitization.
 //!
-//! Strips base64 data URIs, long hex strings, and credentials from tool
+//! Strips base64 data URIs and credentials from tool
 //! results before feeding them back to the LLM, reducing context waste
 //! and preventing secret leakage.
+//! Content hashes are ordinary artifact identifiers, not credentials. Their
+//! length alone cannot justify rewriting paths, checksums, or validator evidence.
 
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -12,9 +14,6 @@ use regex::Regex;
 /// Base64 data URIs: `data:...;base64,<payload>`
 static DATA_URI_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"data:[^;]{1,100};base64,[A-Za-z0-9+/=]{64,}").unwrap());
-
-/// Long hex strings (64+ contiguous hex chars, e.g. SHA-256, SHA-512, raw keys).
-static HEX_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[0-9a-fA-F]{64,}").unwrap());
 
 // ---------------------------------------------------------------------------
 // Credential patterns
@@ -46,7 +45,7 @@ static BEARER_RE: LazyLock<Regex> =
 /// Generic secret assignments: `password|secret|token|api_key = "..."` or `= '...'`.
 static SECRET_ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(?:password|secret|api_key|apikey|access_token|auth_token|private_key)\s*[=:]\s*["']?[A-Za-z0-9_.+/=-]{8,}["']?"#,
+        r#"(?i)(?:password|secret|api_key|apikey|access_token|auth_token|private_key)(?:\\?["'])?\s*[=:]\s*(?:\\?["'])?[A-Za-z0-9_.+/=-]{8,}(?:\\?["'])?"#,
     )
     .unwrap()
 });
@@ -85,12 +84,11 @@ fn scrub_credentials(input: &str) -> Cow<'_, str> {
     Cow::Owned(result.into_owned())
 }
 
-/// Sanitize tool output by stripping base64 data URIs, long hex strings,
+/// Sanitize tool output by stripping base64 data URIs,
 /// credential patterns, and prompt injection attempts.
 pub fn sanitize_tool_output(input: &str) -> String {
     let after_data_uri = DATA_URI_RE.replace_all(input, "[base64-data-redacted]");
-    let after_hex = HEX_RE.replace_all(&after_data_uri, "[hex-redacted]");
-    let after_creds = scrub_credentials(&after_hex);
+    let after_creds = scrub_credentials(&after_data_uri);
     crate::prompt_guard::sanitize_injection(&after_creds)
 }
 
@@ -106,11 +104,33 @@ mod tests {
     }
 
     #[test]
-    fn test_strips_long_hex() {
+    fn test_preserves_artifact_paths_and_integrity_digests() {
+        for length in [64, 128] {
+            let hex = "a".repeat(length);
+            for input in [
+                format!("qa/{hex}/report.json"),
+                format!("C:\\artifacts\\{hex}\\result.json"),
+                format!("{hex}  build.tar.gz"),
+                format!(r#"{{"sha256":"{hex}","artifact":"objects/{hex}"}}"#),
+            ] {
+                assert_eq!(sanitize_tool_output(&input), input);
+            }
+        }
+    }
+
+    #[test]
+    fn test_hex_credentials_still_redacted_in_text_json_and_nested_json() {
         let hex = "a".repeat(64);
-        let input = format!("key: {hex} end");
-        let result = sanitize_tool_output(&input);
-        assert_eq!(result, "key: [hex-redacted] end");
+        for input in [
+            format!("api_key={hex}"),
+            format!("Authorization: Bearer {hex}"),
+            format!(r#"{{"api_key":"{hex}"}}"#),
+            serde_json::to_string(&format!(r#"{{"private_key":"{hex}"}}"#)).unwrap(),
+        ] {
+            let result = sanitize_tool_output(&input);
+            assert!(result.contains("[credential-redacted]"), "{result}");
+            assert!(!result.contains(&hex), "{result}");
+        }
     }
 
     #[test]
@@ -130,10 +150,14 @@ mod tests {
     #[test]
     fn test_multiple_replacements() {
         let hex = "f".repeat(64);
-        let input = format!("data:text/plain;base64,{} and {} end", "A".repeat(100), hex);
+        let input = format!(
+            "data:text/plain;base64,{} and secret={} end",
+            "A".repeat(100),
+            hex
+        );
         let result = sanitize_tool_output(&input);
         assert!(result.contains("[base64-data-redacted]"));
-        assert!(result.contains("[hex-redacted]"));
+        assert!(result.contains("[credential-redacted]"));
         assert!(!result.contains(&hex));
     }
 

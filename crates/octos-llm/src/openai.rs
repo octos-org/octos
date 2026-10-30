@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::media_transport::{ImageTransport, MediaTransportMode};
 use crate::vision;
 
 use crate::cache_manifest::{
@@ -41,6 +42,12 @@ pub struct ModelHints {
     #[serde(default)]
     pub lacks_vision: bool,
 
+    /// Whether this model accepts uploaded image references on a capable
+    /// endpoint. None inherits support from the provider adapter; false keeps
+    /// the same pixels inline. This does not select a provider protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_file_references: Option<bool>,
+
     /// Model takes images but not video (`video_url` parts stripped, the
     /// file named in a note instead). Not inferred from the model name, for
     /// the same reason as `lacks_vision`: the graceful fallback learns it
@@ -65,6 +72,44 @@ pub struct ModelHints {
     /// uses the generic OpenAI-compatible control.
     #[serde(default)]
     pub reasoning_style: ReasoningStyle,
+
+    /// Historical reasoning is a separate wire capability from sampling or
+    /// effort controls. None inherits the detected/catalog route contract;
+    /// explicit `omit` disables it for an endpoint that rejects the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_history: Option<ReasoningHistory>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningHistory {
+    Omit,
+    Preserve,
+    PreserveWithTools,
+    /// Compatibility with older Kimi histories lacking a required field.
+    /// Existing real reasoning is always preserved, never replaced by a stub.
+    PreserveOrPlaceholder,
+}
+
+impl ReasoningHistory {
+    fn content(self, message: &Message, has_tools: bool) -> Option<&str> {
+        if message.role != MessageRole::Assistant {
+            return None;
+        }
+        match self {
+            Self::Omit => None,
+            Self::Preserve => message.reasoning_content.as_deref(),
+            Self::PreserveWithTools if has_tools => message.reasoning_content.as_deref(),
+            Self::PreserveWithTools => None,
+            Self::PreserveOrPlaceholder => Some(
+                message
+                    .reasoning_content
+                    .as_deref()
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or("."),
+            ),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -77,10 +122,12 @@ impl Default for ModelHints {
             uses_completion_tokens: false,
             fixed_temperature: false,
             lacks_vision: false,
+            image_file_references: None,
             lacks_video: false,
             retain_tool_images: false,
             merge_system_messages: true,
             reasoning_style: ReasoningStyle::None,
+            reasoning_history: None,
         }
     }
 }
@@ -91,30 +138,25 @@ impl ModelHints {
     /// This is the single canonical location for all model-name heuristics.
     /// Called once at provider construction time, not on every request.
     pub fn detect(model: &str) -> Self {
+        if let Some(contract) = crate::registry::catalog_model_contract(model) {
+            return contract.model_hints.clone();
+        }
         let m = model.to_lowercase();
 
         let is_o_series = m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4");
+        // Legacy aliases without a catalog declaration share one classifier.
+        // New models belong in the catalog, not another request-time branch.
+        let is_kimi_with_effort = m.contains("kimi-k3")
+            || m == "k3"
+            || m.starts_with("k3-")
+            || m.starts_with("kimi-for-coding");
+        let is_kimi = m.contains("kimi-k2") || is_kimi_with_effort;
 
         let uses_completion_tokens =
             is_o_series || m.starts_with("gpt-5") || m.starts_with("gpt-4.1");
 
-        // kimi-k3 pins its sampling params server-side (temperature=1.0,
-        // top_p=0.95, …) and rejects overrides, so never send temperature. The
-        // Kimi *coding plan* (family `moonshot-coding`) exposes the SAME K3
-        // model under the bare ids `k3` / `kimi-for-coding*`, which don't
-        // contain `kimi-k3` — match them too, or the endpoint 400s with
-        // "invalid temperature: only 1 is allowed for this model".
-        let fixed_temperature = is_o_series
-            || m.starts_with("gpt-5")
-            || m.contains("kimi-k2")
-            || m.contains("kimi-k3")
-            || m == "k3"
-            // Kimi Code context-window variants (`k3-256k`) share the
-            // temperature restriction; dash-prefix only, so an unrelated
-            // "k30"-style name never matches.
-            || m.starts_with("k3-")
-            || m.starts_with("kimi-for-coding")
-            || m == "gpt-4.1-nano";
+        let fixed_temperature =
+            is_o_series || m.starts_with("gpt-5") || is_kimi || m == "gpt-4.1-nano";
 
         // Vision capability is NO LONGER inferred from the model name. The old
         // allow/deny list wrongly stripped images from vision-capable models —
@@ -138,8 +180,8 @@ impl ModelHints {
         // (incl. `deepseek-reasoner`, a V4-Flash thinking alias) wants
         // `reasoning_effort` + a `thinking` toggle; OpenAI reasoning models and
         // grok-4.x take a plain `reasoning_effort`; Kimi K3 takes a top-level
-        // `reasoning_effort` whose only accepted value is `"max"` (thinking is
-        // always on and K3 rejects the K2.x `thinking` object). Everything else
+        // `reasoning_effort` with low/high/max (thinking is always on and K3
+        // rejects the K2.x `thinking` object). Everything else
         // emits nothing.
         // Effort/thinking is only EMITTED when an operator sets `reasoning_effort`
         // (opt-in), and the style is config-overridable per route — important
@@ -154,11 +196,7 @@ impl ModelHints {
             || m.ends_with("/deepseek-flash")
         {
             ReasoningStyle::EffortAndThinkingToggle
-        } else if m.contains("kimi-k3")
-            || m == "k3"
-            || m.starts_with("k3-")
-            || m.starts_with("kimi-for-coding")
-        {
+        } else if is_kimi_with_effort {
             // K3, incl. the coding plan's bare `k3` / `k3-256k` and
             // `kimi-for-coding*` ids (same K3 model, different ids that don't
             // contain `kimi-k3`): per its quickstart docs `reasoning_effort`
@@ -193,10 +231,20 @@ impl ModelHints {
             uses_completion_tokens,
             fixed_temperature,
             lacks_vision,
+            image_file_references: None,
             lacks_video: false,
             retain_tool_images: false,
             merge_system_messages: true,
             reasoning_style,
+            reasoning_history: Some(
+                if reasoning_style == ReasoningStyle::EffortAndThinkingToggle {
+                    ReasoningHistory::PreserveWithTools
+                } else if is_kimi {
+                    ReasoningHistory::PreserveOrPlaceholder
+                } else {
+                    ReasoningHistory::Omit
+                },
+            ),
         }
     }
 }
@@ -285,6 +333,7 @@ pub struct OpenAIProvider {
     /// explicit opt-in/out must survive either builder-call order (mirrors
     /// `AnthropicProvider::prompt_caching_override`).
     prompt_cache_affinity_override: Option<bool>,
+    media_transport: MediaTransportMode,
 }
 
 const OFFICIAL_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -319,6 +368,7 @@ impl OpenAIProvider {
             provider_label: "openai".to_string(),
             prompt_cache_affinity: true,
             prompt_cache_affinity_override: None,
+            media_transport: MediaTransportMode::Auto,
         }
     }
 
@@ -368,6 +418,9 @@ impl OpenAIProvider {
             && !url.contains("api.deepseek.com")
         {
             self.hints.reasoning_style = ReasoningStyle::None;
+            if self.hints.reasoning_history == Some(ReasoningHistory::PreserveWithTools) {
+                self.hints.reasoning_history = Some(ReasoningHistory::Omit);
+            }
         }
         self.base_url = url;
         self
@@ -402,8 +455,31 @@ impl OpenAIProvider {
     }
 
     /// Override the auto-detected model hints.
-    pub fn with_hints(mut self, hints: ModelHints) -> Self {
+    pub fn with_hints(mut self, mut hints: ModelHints) -> Self {
+        if hints.image_file_references.is_none() {
+            hints.image_file_references = self.hints.image_file_references;
+        }
+        // Old/partial profiles do not know this field. They must not erase a
+        // route's continuation contract when overriding unrelated options.
+        if hints.reasoning_history.is_none() {
+            hints.reasoning_history =
+                if hints.reasoning_style == ReasoningStyle::EffortAndThinkingToggle {
+                    // Legacy proxy profiles used this style to opt into the full
+                    // DeepSeek contract. Keep that opt-in until explicitly overridden.
+                    Some(ReasoningHistory::PreserveWithTools)
+                } else {
+                    self.hints.reasoning_history
+                };
+        }
         self.hints = hints;
+        self
+    }
+
+    /// Select an image transport for this route. Auto enables only declared
+    /// official endpoints; custom proxies opt in explicitly. No model-name
+    /// matching is involved, and changing the base URL cannot reuse old IDs.
+    pub fn with_media_transport(mut self, mode: MediaTransportMode) -> Self {
+        self.media_transport = mode;
         self
     }
 
@@ -431,20 +507,11 @@ impl OpenAIProvider {
     /// image-modality fallback can re-send a rebuilt (text-only) request
     /// without duplicating the wire setup.
     async fn post_chat(&self, request: &OpenAIRequest<'_>) -> Result<reqwest::Response> {
-        self.client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(
-                crate::provider::DEFAULT_LLM_TIMEOUT_SECS,
-            ))
-            .json(request)
-            .send()
+        let body = serde_json::to_value(request).wrap_err_with(|| {
+            self.operational_message(crate::provider::OperationalStage::SerializeRequest)
+        })?;
+        self.send_with_media(&self.client, body)
             .await
-            .inspect_err(|error| crate::provider::log_android_transport_failure(error, false))
             .wrap_err_with(|| {
                 crate::provider::transport_error_message(
                     false,
@@ -474,17 +541,8 @@ impl OpenAIProvider {
         // Stream client: no total timeout, so a long healthy generation is not
         // cut off. Stalls are bounded by the client's per-read timeout and the
         // agent's stream-timeout guards (see build_streaming_http_client).
-        self.stream_client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.api_key.expose_secret()),
-            )
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
+        self.send_with_media(&self.stream_client, body)
             .await
-            .inspect_err(|error| crate::provider::log_android_transport_failure(error, true))
             .wrap_err_with(|| {
                 crate::provider::transport_error_message(
                     true,
@@ -493,6 +551,25 @@ impl OpenAIProvider {
                     crate::provider::ApiStyle::OpenAiChatCompletions,
                 )
             })
+    }
+
+    async fn send_with_media(
+        &self,
+        client: &Client,
+        body: serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        ImageTransport::new(
+            &self.base_url,
+            self.api_key.expose_secret(),
+            self.media_transport,
+            &self.client,
+        )
+        .send(
+            client,
+            body,
+            !self.hints.lacks_vision && self.hints.image_file_references != Some(false),
+        )
+        .await
     }
 
     /// Lane-attributed wording for operational failures (see
@@ -576,51 +653,14 @@ impl OpenAIProvider {
                     })
                     .collect()
             });
-            // Preserve provider continuation fields according to the selected
-            // protocol, not a blanket assumption that prior reasoning is waste.
-            // DeepSeek's tool-enabled API requires prior reasoning on ALL
-            // assistant rows, including answers without tool calls:
-            // https://api-docs.deepseek.com/guides/thinking_mode/
-            // Without tools, DeepSeek ignores that field. The route's hints
-            // remain authoritative for compatible/non-official endpoints.
-            //
-            // With thinking enabled kimi-k2 (a)
-            // returns 400 "reasoning_content is missing in assistant tool call
-            // message" if the field is absent, AND (b) per kimi's docs preserves
-            // historical assistant reasoning for multi-step tool-use continuity
-            // (K3's quickstart likewise mandates "add the complete assistant
-            // message returned by the API to the next request. Do not keep only
-            // `content`"). So for kimi-k2/k3 we keep the REAL reasoning when
-            // present, and fall back to a minimal "." stub only to satisfy the
-            // presence check when it's absent.
-            //
-            // kimi-k2/k3 are detected via fixed_temperature + model name
-            // containing "kimi-k2"/"kimi-k3". Only Kimi receives a fabricated
-            // stub; missing DeepSeek history stays missing rather than being
-            // replaced with invented reasoning.
-            let model_lower = self.model.to_lowercase();
-            let needs_reasoning_stub = self.hints.fixed_temperature
-                && (model_lower.contains("kimi-k2")
-                    || model_lower.contains("kimi-k3")
-                    // Kimi Code API ids: bare `k3`/`k3-256k` and the
-                    // K2.7 Code alias — thinking is always on for them,
-                    // so assistant tool-call messages need the stub too.
-                    || model_lower == "k3"
-                    || model_lower.starts_with("k3-")
-                    || model_lower.starts_with("kimi-for-coding"));
-            let deepseek_tool_continuation = self.hints.reasoning_style
-                == ReasoningStyle::EffortAndThinkingToggle
-                && !tools.is_empty();
-            let reasoning = if role == "assistant" && deepseek_tool_continuation {
-                m.reasoning_content.as_deref()
-            } else if role == "assistant" && needs_reasoning_stub {
-                match m.reasoning_content.as_deref() {
-                    Some(r) if !r.is_empty() => Some(r),
-                    _ => Some("."),
-                }
-            } else {
-                None
-            };
+            // The route resolves this capability once. Do not re-identify a
+            // model here: the correct destination can otherwise silently lose
+            // state when an API introduces a new model id.
+            let reasoning = self
+                .hints
+                .reasoning_history
+                .unwrap_or(ReasoningHistory::Omit)
+                .content(m, !tools.is_empty());
 
             let mut content = build_openai_content(m, &content_hints, scope_root);
             if m.role == MessageRole::Tool {
@@ -2084,6 +2124,7 @@ mod tests {
     #[test]
     fn test_model_hints_serde_roundtrip() {
         let hints = ModelHints {
+            image_file_references: None,
             uses_completion_tokens: true,
             fixed_temperature: false,
             lacks_vision: true,
@@ -2091,6 +2132,7 @@ mod tests {
             retain_tool_images: false,
             merge_system_messages: false,
             reasoning_style: ReasoningStyle::EffortAndThinkingToggle,
+            reasoning_history: Some(ReasoningHistory::PreserveWithTools),
         };
         let json = serde_json::to_string(&hints).unwrap();
         let parsed: ModelHints = serde_json::from_str(&json).unwrap();
@@ -2741,7 +2783,8 @@ mod tests {
             "k3",
             "k3-256k",
             "kimi-for-coding",
-            "kimi-for-coding-highspeed",
+            "k3.1-pro",
+            "k3.1-pro-highspeed",
         ] {
             let h = ModelHints::detect(id);
             assert!(
@@ -2760,6 +2803,90 @@ mod tests {
         // Guard: an unrelated model containing "k3" as a substring is NOT the
         // coding plan (exact match only), so it is unaffected.
         assert!(!ModelHints::detect("mock-k3000").fixed_temperature);
+        // This alias is K2.7 Code Highspeed, not K3: its API has no graded effort.
+        assert_eq!(
+            ModelHints::detect("kimi-for-coding-highspeed").reasoning_style,
+            ReasoningStyle::None
+        );
+    }
+
+    #[test]
+    fn should_keep_history_independent_of_sampling_and_effort_overrides() {
+        let mut assistant = Message::assistant("fixture answer");
+        assistant.reasoning_content = Some("fixture state".into());
+        let history = [assistant];
+        let config = ChatConfig::default();
+        for model in ["k3.1-pro", "kimi-k3", "kimi-k2.6"] {
+            let provider = OpenAIProvider::new("test", model).with_hints(ModelHints::default());
+            assert!(!provider.hints.fixed_temperature);
+            assert_eq!(provider.hints.reasoning_style, ReasoningStyle::None);
+            let body = serde_json::to_value(provider.build_request(&history, &[], &config, false))
+                .unwrap();
+            assert_eq!(
+                body["messages"][0]["reasoning_content"], "fixture state",
+                "{model}"
+            );
+        }
+        // Custom endpoints can independently opt in or out, without pretending
+        // to be Kimi or changing their temperature/effort protocol.
+        for (model, policy, expected) in [
+            (
+                "unknown-model",
+                ReasoningHistory::Preserve,
+                Some("fixture state"),
+            ),
+            ("k3.1-pro", ReasoningHistory::Omit, None),
+        ] {
+            let provider = OpenAIProvider::new("test", model).with_hints(ModelHints {
+                reasoning_history: Some(policy),
+                ..Default::default()
+            });
+            let body = serde_json::to_value(provider.build_request(&history, &[], &config, false))
+                .unwrap();
+            assert_eq!(
+                body["messages"][0]
+                    .get("reasoning_content")
+                    .and_then(|v| v.as_str()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn should_preserve_legacy_deepseek_proxy_opt_in_and_allow_explicit_opt_out() {
+        let mut assistant = Message::assistant("fixture answer");
+        assistant.reasoning_content = Some("fixture state".into());
+        let tools = [ToolSpec {
+            name: "read_file".into(),
+            description: "read".into(),
+            input_schema: serde_json::json!({}),
+        }];
+        for (policy, expected) in [
+            (None, Some("fixture state")),
+            (Some(ReasoningHistory::Omit), None),
+        ] {
+            let provider = OpenAIProvider::new("test", "deepseek-flash")
+                .with_base_url("http://localhost:8000/v1")
+                .with_hints(ModelHints {
+                    reasoning_style: ReasoningStyle::EffortAndThinkingToggle,
+                    reasoning_history: policy,
+                    ..Default::default()
+                });
+            let history = [assistant.clone()];
+            let body = serde_json::to_value(provider.build_request(
+                &history,
+                &tools,
+                &ChatConfig::default(),
+                false,
+            ))
+            .unwrap();
+            assert_eq!(
+                body["messages"][0]
+                    .get("reasoning_content")
+                    .and_then(|v| v.as_str()),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2888,6 +3015,7 @@ mod tests {
     #[test]
     fn test_with_hints_overrides_detection() {
         let p = OpenAIProvider::new("key", "gpt-4o").with_hints(ModelHints {
+            image_file_references: None,
             uses_completion_tokens: true,
             fixed_temperature: true,
             lacks_vision: true,
@@ -2895,6 +3023,7 @@ mod tests {
             retain_tool_images: false,
             merge_system_messages: false,
             reasoning_style: ReasoningStyle::None,
+            reasoning_history: None,
         });
         assert!(p.hints.uses_completion_tokens);
         assert!(p.hints.fixed_temperature);

@@ -3838,8 +3838,28 @@ impl TaskSupervisor {
     }
 
     fn append_persisted_task(path: &PathBuf, json: &str) -> std::io::Result<()> {
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(file, "{json}")?;
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = OpenOptions::new()
+            .read(true)
+            .create(true)
+            .append(true)
+            .open(path)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        // write_fmt may write the JSON body and newline separately. Distinct
+        // supervisors append to the same ledger, so serialize the complete row
+        // under an OS lock rather than allowing two bodies on one line.
+        let mut row = Vec::with_capacity(json.len() + 2);
+        if file.metadata()?.len() > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut tail = [0];
+            file.read_exact(&mut tail)?;
+            if tail[0] != b'\n' {
+                row.push(b'\n');
+            }
+        }
+        row.extend_from_slice(json.as_bytes());
+        row.push(b'\n');
+        file.write_all(&row)?;
         Ok(())
     }
 
@@ -3851,6 +3871,7 @@ impl TaskSupervisor {
             }
             Err(error) => return Err(error),
         };
+        fs2::FileExt::lock_shared(&file)?;
 
         let mut restored: HashMap<String, BackgroundTask> = HashMap::new();
         for line in BufReader::new(file).lines() {
@@ -3860,20 +3881,24 @@ impl TaskSupervisor {
             if line.trim().is_empty() {
                 continue;
             }
-            let Ok(record) = serde_json::from_str::<PersistedTaskRecord>(&line) else {
-                continue;
-            };
-            if record.schema_version > CURRENT_TASK_LEDGER_SCHEMA {
-                continue;
-            }
-            // Keep the freshest snapshot per id by `updated_at`, not blindly
-            // the last JSONL row: SUP1 and a later per-turn supervisor both
-            // append to the SAME per-session ledger, so rows can interleave
-            // such that an older snapshot lands after a newer one. (codex P2.)
-            match restored.get(&record.task.id) {
-                Some(existing) if !task_snapshot_advances(&record.task, existing) => {}
-                _ => {
-                    restored.insert(record.task.id.clone(), record.task);
+            // Recover complete records concatenated by legacy concurrent
+            // write_fmt appends. Stop at a torn fragment; never invent a row.
+            for record in
+                serde_json::Deserializer::from_str(&line).into_iter::<PersistedTaskRecord>()
+            {
+                let Ok(record) = record else { break };
+                if record.schema_version > CURRENT_TASK_LEDGER_SCHEMA {
+                    continue;
+                }
+                // Keep the freshest snapshot per id by `updated_at`, not blindly
+                // the last JSONL row: SUP1 and a later per-turn supervisor both
+                // append to the SAME per-session ledger, so rows can interleave
+                // such that an older snapshot lands after a newer one. (codex P2.)
+                match restored.get(&record.task.id) {
+                    Some(existing) if !task_snapshot_advances(&record.task, existing) => {}
+                    _ => {
+                        restored.insert(record.task.id.clone(), record.task);
+                    }
                 }
             }
         }

@@ -283,6 +283,23 @@ Current M9 sandbox-parity decision:
   [UPCR-2026-017](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_2026_017_RUNTIME_PROFILE_INSPECTION.md).
   They let TUI and other non-web clients render dashboard-equivalent login,
   provider, model, MCP, tool, and runtime status from server truth.
+  `profile/llm/upsert` accepts the optional
+  `selection.model_hints.reasoning_history` enum (`omit`, `preserve`,
+  `preserve_with_tools`, `preserve_or_placeholder`). Absent/null inherits the
+  selected route's continuation policy; an explicit value survives persistence
+  and readback. `lacks_video` and `retain_tool_images` are also accepted model
+  hints, matching the provider configuration. These fields do not change tool
+  permissions or select a different model/endpoint.
+  `selection.route.media_transport` optionally selects `auto`, `inline`,
+  `moonshot_files`, or `deepseek_files` for OpenAI chat routes. Absent/null
+  defaults to `auto`: recognized official endpoints use their Files adapter;
+  unknown routes keep inline images. Explicit adapters opt custom proxy routes
+  into that protocol. `selection.model_hints.image_file_references` is an
+  optional boolean: absent/null inherits the route capability, false retains
+  inline pixels, and true permits references only on a configured capable route.
+  Both fields round-trip through profile persistence and readback; each fallback
+  has its own route policy and capability. These fields neither change model
+  identity nor grant tool or endpoint access.
 - The additive local solo onboarding and permission-policy inspection methods
   (`profile/local/create`, `permission/profile/list`,
   `permission/profile/set`, and the extended `session/status/read` runtime

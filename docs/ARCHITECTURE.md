@@ -206,6 +206,70 @@ pub enum StreamEvent {
 pub type ChatStream = Pin<Box<dyn Stream<Item = StreamEvent> + Send>>;
 ```
 
+### Image transport
+
+`octos-llm/src/media_transport.rs` runs below `OpenAIProvider` request serialization
+for both chat and streaming. It replaces eligible inline image parts with uploaded
+references without changing pixels, message order, tool pairing, or reasoning history.
+It is independent of PPTX skills and model-name detection.
+
+- **Shared transport:** SHA-256 of bytes plus MIME identifies an image. The cache
+  namespace includes normalized endpoint, credential fingerprint, and adapter.
+  A per-image async lock coordinates uploads across provider instances and workers
+  within one process. Cancellation releases the lock; different images remain concurrent.
+- **Endpoint adapters:** Moonshot/Kimi upload with `purpose=image` and send
+  `image_url.url=ms://<id>`. DeepSeek uploads `purpose=user_data` to the root
+  `/files` route with a 24-hour expiry and sends `type=file,file_id=<id>`.
+- **Model capability:** `model_hints.image_file_references=false` preserves inline
+  pixels. Absent/null inherits the route capability. `true` never infers a Files
+  protocol from a model name. `lacks_vision` retains its existing separate meaning.
+
+Structured profiles configure `llm.primary.route.media_transport` (and the same
+field on each fallback) as `auto`, `inline`, `moonshot_files`, or `deepseek_files`.
+Flat CLI configuration uses `media_transport`. The SDK exposes
+`OpenAIProvider::with_media_transport`. Auto recognizes exact official Kimi coding,
+Moonshot, and DeepSeek endpoints; unknown proxies remain inline until explicitly
+configured. Dedicated non-OpenAI adapters, including Responses and OpenRouter,
+retain their existing media paths. An explicit policy here only affects the
+`OpenAIProvider` chat path.
+
+```json
+{
+  "family_id": "moonshot-coding",
+  "model_id": "k3.1-pro",
+  "route": { "media_transport": "auto" },
+  "model_hints": { "image_file_references": true, "retain_tool_images": true }
+}
+```
+
+A file-expiry response invalidates the used cached IDs and retries at most once;
+concurrent refreshes preserve a newer ID. A confirmed unsupported upload route or
+reference format falls back to the original inline images and is remembered for
+10 minutes. Authentication, quota, rate-limit and server errors are not reclassified
+as missing capabilities. Fail-fast turns do not perform these recovery attempts.
+No partial successful stream is replayed. DeepSeek image options that cannot be
+represented by a file part are kept inline; explicit low-detail images stay inline.
+
+References live **only in process memory**: restart/resume in a new process uploads
+again. Cache capacity is bounded (128 endpoint/account scopes, 4096 images per
+scope); in-progress uploads are not evicted. Provider expiry is honored with a 60-second
+margin and a 24-hour maximum local TTL; absent expiry uses a one-hour local TTL.
+Local eviction does not delete provider files. The transport does not promise
+lower image token billing or a higher provider prompt-cache hit rate: it removes
+repeated image bytes from request bodies. Existing prompt-cache manifests describe
+serialized input before transport rewriting, not post-upload HTTP payload sizes.
+Debug events under `octos::media_transport` distinguish uploads, reuse and refresh
+without logging image data, credentials or file IDs.
+
+Validation: `cargo test -p octos-llm` covers endpoint/account isolation, changed
+bytes, 18 concurrent workers, cancellation, unsupported protocols, expiry, and
+normal/streaming paths. `tests/media_transport_live.rs` is an ignored opt-in probe:
+set `OCTOS_MEDIA_PROBE_API_KEY`, `OCTOS_MEDIA_PROBE_BASE_URL`,
+`OCTOS_MEDIA_PROBE_MODEL`, `OCTOS_MEDIA_PROBE_IMAGE` (a synthetic PNG), and
+`OCTOS_MEDIA_PROBE_EXPECTED_TEXT`, then run
+`cargo test -p octos-llm --test media_transport_live -- --ignored --nocapture`.
+It sends the same image through chat and streaming from separate provider instances.
+
 ### Provider Registry (`registry/`)
 
 All providers are defined in `octos-llm/src/registry/` — one file per provider. Each file exports a `ProviderEntry` with metadata (name, aliases, default model, API key env var, base URL) and a `create()` factory function. Adding a new provider = one file + one line in `mod.rs`.
@@ -267,16 +331,47 @@ pub struct CreateParams {
 
 ### ModelHints (OpenAI provider)
 
-Auto-detected from model name at construction, overridable via config `model_hints`:
+Known wire contracts are declared beside the model id in `model_catalog.json`
+(`model_hints`, `context_window`, `max_output`). `ModelHints::detect` and context
+lookup consume that same entry. Legacy models without a declared contract retain
+name-based defaults. Route config `model_hints` can override those defaults.
 
 ```rust
 pub struct ModelHints {
     pub uses_completion_tokens: bool,  // o-series, gpt-5, gpt-4.1
     pub fixed_temperature: bool,       // o-series, kimi-k2.5
-    pub lacks_vision: bool,            // deepseek, minimax, mistral, yi-
+    pub lacks_vision: bool,            // explicit text-only endpoint override
+    pub lacks_video: bool,
+    pub retain_tool_images: bool,
     pub merge_system_messages: bool,   // default: true
+    pub reasoning_style: ReasoningStyle,
+    pub reasoning_history: Option<ReasoningHistory>,
 }
 ```
+
+`reasoning_history` governs assistant history serialization independently of
+temperature and effort: `preserve`, `preserve_with_tools`, or `omit`.
+`preserve_or_placeholder` retains the legacy Kimi fallback for imported history
+without reasoning; it never replaces actual returned reasoning. K3.1 uses
+`preserve`, without inventing missing reasoning. An absent/null field in an old
+profile inherits the route's policy. Legacy DeepSeek proxy profiles that set
+`reasoning_style: effort_and_thinking_toggle` still opt into tool continuation;
+an explicit history policy takes precedence.
+
+When adding a model, declare its wire behavior and limits in its catalog row,
+then exercise the registry-to-HTTP contract test. Do not add another model-name
+branch to message serialization. Coding-plan models are explicitly selected via
+`moonshot-coding`; their subscription credentials must not be auto-routed to the
+regular Moonshot API. Existing family defaults are unchanged. Limits of zero
+mean unknown, not zero capacity: the K3.1 output limit remains unspecified until
+verified; the configured request cap still applies. Coding-plan zero dollar
+prices denote subscription accounting, not free usage.
+
+Kimi declarations follow the [Coding Plan model table](https://www.kimi.com/code/docs/en/kimi-code/models.html)
+and [K3.1 continuation contract](https://platform.kimi.com/docs/guide/kimi-k3-1-pro-quickstart).
+`tests/kimi_model_contract.rs` checks all coding catalog entries, the destination,
+sampling/effort fields, streamed tool calls, and serialized/restored history.
+It requires no real API key or billable calls.
 
 ### SSE Streaming
 
@@ -579,7 +674,9 @@ pub struct AgentConfig {
 
 Before feeding tool results back to the LLM, `sanitize_tool_output()` (in `sanitize.rs`) strips noise:
 - **Base64 data URIs**: `data:...;base64,<payload>` → `[base64-data-redacted]`
-- **Long hex strings**: 64+ contiguous hex chars (SHA-256, raw keys) → `[hex-redacted]`
+- **Credentials**: API-key prefixes, Bearer tokens and secret assignments → first 4 chars + `...[credential-redacted]`
+
+Content digests (SHA-256 and other long hex strings) pass through unchanged, so artifact paths and checksums stay usable.
 
 ### Context Compaction (three-tier — M8.5)
 
@@ -1635,7 +1732,7 @@ crates/
 - MCP: input schema validation (max depth 10, max size 64KB) prevents malicious tool definitions
 
 ### Data Safety
-- Tool output sanitization: strips base64 data URIs and long hex strings (`sanitize.rs`)
+- Tool output sanitization: strips base64 data URIs and redacts credentials (`sanitize.rs`)
 - UTF-8 safe truncation via `truncate_utf8()` across all tool outputs and email bodies
 - Session file collision prevention via percent-encoded filenames with hash suffix on truncation
 - Session files roll into 8 MiB segments and loads stop at `OCTOS_SESSION_LOAD_BUDGET_BYTES` (32 MiB), preventing OOM on oversized histories

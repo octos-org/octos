@@ -2438,8 +2438,8 @@ impl Agent {
                 }
             };
 
-            // Preserve adapter identity before model-facing sanitization,
-            // which deliberately redacts long hex strings such as SHA-256.
+            // Preserve adapter identity before model-facing truncation and
+            // sanitization can rewrite the receipt text.
             let tool_structured_metadata = match (
                 crate::automatic_jobs::receipt(
                     &tc_name,

@@ -11,6 +11,7 @@ fn provider(base_url: String) -> Arc<dyn LlmProvider> {
         model: Some("qwen3.8-27b".into()),
         base_url: Some(base_url),
         model_hints: None,
+        media_transport: None,
         llm_timeout_secs: Some(2),
         llm_connect_timeout_secs: Some(1),
     })

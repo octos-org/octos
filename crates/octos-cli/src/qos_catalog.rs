@@ -284,6 +284,8 @@ pub(crate) fn build_adaptive_provider_chain(
             // using DEEPSEEK_API_KEY.
             let mut fb_config = config.clone();
             fb_config.api_key_env = fb.api_key_env.clone();
+            fb_config.media_transport = fb.media_transport;
+            fb_config.model_hints = fb.model_hints.clone();
             match create_provider_with_api_type(
                 &fb.provider,
                 &fb_config,
@@ -873,6 +875,7 @@ mod tests {
                     base_url: None,
                     api_key_env: None,
                     model_hints: None,
+                    media_transport: None,
                     api_type: None,
                     cost_per_m: Some(0.5),
                     strong: true,
@@ -886,6 +889,7 @@ mod tests {
                     base_url: None,
                     api_key_env: None,
                     model_hints: None,
+                    media_transport: None,
                     api_type: None,
                     cost_per_m: None,
                     strong: true,
@@ -1152,6 +1156,7 @@ mod tests {
                 base_url: None,
                 api_key_env: None,
                 model_hints: None,
+                media_transport: None,
                 api_type: None,
                 cost_per_m: Some(0.5),
                 strong: true,
@@ -1214,6 +1219,7 @@ mod tests {
                 base_url: None,
                 api_key_env: None,
                 model_hints: None,
+                media_transport: None,
                 api_type: None,
                 cost_per_m: Some(0.5),
                 strong: true,

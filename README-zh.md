@@ -20,6 +20,9 @@ Octos 的核心架构是 **可复用的内核 + 可编程的协议边界**。应
 [构建应用](#基于-octos-构建应用) · [通过 OUP 控制内核](#通过-oup-控制内核) ·
 [文档](https://octos-org.github.io/octos/zh/) · [English](README.md)
 
+交付文件的工作流可启用[根任务交付检查](docs/workspace-delivery-validation.md)，
+在主代理完成前验证真实输出，也覆盖脚本直接生成的文件。
+
 [OctoSense 集成源码导读](docs/octosense-integration-walkthrough.md)
 用一个日历请求串起请求准入、Tokio 任务、宿主工具调用和答案返回，
 并说明 app peer、人与系统 agent 的会话、存储边界，以及排查 OctoSense 时应阅读的源码版本。
@@ -307,6 +310,7 @@ Goal 记录 Agent 要完成什么，Loop 安排周期性轮次，Monitor 观察�
   `profile/llm/test` 和 `profile/llm/select` 支持发现、配置、连接测试与选择。
 - **配置工作流通道：** 已公告的 `profile/sub_providers/*` 方法管理逐节点路由使用的
   命名提供者通道；修改在对应运行时重新构建后生效。
+- **复用图片上传：** [媒体传输层](docs/ARCHITECTURE.md#image-transport)让同一进程的 worker 共享图片引用，端点适配器与模型能力独立配置。
 - **检查路由：** `router/status` 和 `router/failover` 提供路由事件；
   `router/get_metrics` 与 `router/set_mode` 提供已公告的指标查询和控制接口。
 

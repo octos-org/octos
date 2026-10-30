@@ -126,8 +126,8 @@ receipts, workspace rebinding, policy denial, and symlink escapes.
 ### Operational metadata and output redaction
 
 The execution layer captures the validated receipt envelope before text is
-truncated or sanitized for the model. This is necessary because ordinary
-output sanitization redacts 64-character hex strings, including SHA-256.
-Watcher identity must use the original hash; model-facing text keeps the
-existing redaction behavior. The real-shell regression test uses a full
-SHA-256 and verifies both successful notification and redacted model output.
+truncated or sanitized for the model, so watcher identity never depends on
+what survives in model-facing text. Output sanitization redacts credentials
+but keeps content digests, so the model sees the same `request_sha256` the
+watcher pins. The real-shell regression test uses a full SHA-256 and verifies
+both successful notification and the unmodified hash in model output.

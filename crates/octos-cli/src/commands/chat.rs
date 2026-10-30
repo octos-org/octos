@@ -1954,6 +1954,7 @@ pub fn create_provider_with_api_type(
         model,
         base_url,
         model_hints: config.model_hints.clone(),
+        media_transport: config.media_transport,
         llm_timeout_secs,
         llm_connect_timeout_secs,
     };
@@ -1983,7 +1984,11 @@ fn create_custom_provider(
         "openai" => {
             let mut provider = octos_llm::openai::OpenAIProvider::new(&key, model)
                 .with_base_url(&base_url)
+                .with_media_transport(config.media_transport.unwrap_or_default())
                 .with_provider_label("custom");
+            if let Some(hints) = config.model_hints.clone() {
+                provider = provider.with_hints(hints);
+            }
             let http_timeout = llm_timeout_secs.map(|t| {
                 (
                     t,

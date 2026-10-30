@@ -399,8 +399,18 @@ impl PromptBuildPolicy {
     /// Keep provider-required private history inside the owning session's
     /// model projection. The provider adapter still decides wire eligibility.
     pub(crate) fn reasoning_for_model(model: &str) -> bool {
-        octos_llm::openai::ModelHints::detect(model).reasoning_style
-            == octos_llm::openai::ReasoningStyle::EffortAndThinkingToggle
+        // Sampling controls and history replay are independent capabilities.
+        // Using the DeepSeek thinking-toggle style here discarded Kimi's
+        // persisted reasoning before its wire adapter could preserve it.
+        use octos_llm::openai::ReasoningHistory;
+        matches!(
+            octos_llm::openai::ModelHints::detect(model).reasoning_history,
+            Some(
+                ReasoningHistory::Preserve
+                    | ReasoningHistory::PreserveWithTools
+                    | ReasoningHistory::PreserveOrPlaceholder
+            )
+        )
     }
 }
 
@@ -5445,6 +5455,39 @@ mod tests {
                 .iter()
                 .all(|m| m.reasoning_content.is_none())
         );
+    }
+
+    #[test]
+    fn kimi_contract_reasoning_survives_context_projection_and_resume() {
+        let mut call = tool_call_message("call_kimi", "read_file");
+        call.reasoning_content = Some("provider continuation state".into());
+        let manager = ContextManager::from_session_history(
+            "kimi",
+            None,
+            &[
+                Message::user("task"),
+                call,
+                tool_result_message("call_kimi", "file content"),
+            ],
+        );
+        let restored = ContextManager::from_snapshot(manager.snapshot());
+        for model in ["k3.1-pro", "k3", "kimi-k2.5", "deepseek-flash"] {
+            let frame = restored.for_prompt(&PromptBuildPolicy {
+                include_reasoning: PromptBuildPolicy::reasoning_for_model(model),
+                ..Default::default()
+            });
+            let call = frame
+                .messages
+                .iter()
+                .find(|m| m.tool_calls.is_some())
+                .unwrap();
+            assert_eq!(
+                call.reasoning_content.as_deref(),
+                Some("provider continuation state"),
+                "Context projection dropped {model}'s declared continuation state before the wire adapter"
+            );
+        }
+        assert!(!PromptBuildPolicy::reasoning_for_model("gpt-4o"));
     }
 
     /// The safety property of the whole change: the fast path may never be

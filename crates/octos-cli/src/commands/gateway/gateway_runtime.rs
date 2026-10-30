@@ -995,6 +995,8 @@ impl GatewayRuntime {
                                 // registry resolves the correct env var (e.g. OPENAI_API_KEY)
                                 c.api_key_env = None;
                             }
+                            c.media_transport = fb.media_transport;
+                            c.model_hints = fb.model_hints.clone();
                             c
                         };
                         match chat::create_provider_with_api_type(

@@ -1656,7 +1656,7 @@ async fn llm_upsert_accepts_u32_max_context_window() {
 async fn llm_upsert_round_trips_typed_inference_fields() {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(local_profile_state(dir.path()));
-    let route = json!({ "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1" });
+    let route = json!({ "route_id": "fixture", "base_url": "http://127.0.0.1:9/v1", "media_transport": "moonshot_files" });
     raw_profile_llm_upsert(
         &state,
         &RpcRequest::new(
@@ -1672,7 +1672,13 @@ async fn llm_upsert_round_trips_typed_inference_fields() {
                     "top_p": 0.9,
                     "context_window": 16384,
                     "reasoning_effort": "high",
-                    "model_hints": { "uses_completion_tokens": true }
+                    "model_hints": {
+                        "uses_completion_tokens": true,
+                        "image_file_references": false,
+                        "reasoning_history": "preserve",
+                        "retain_tool_images": true,
+                        "lacks_video": true
+                    }
                 },
                 "set_primary": true
             }),
@@ -1731,7 +1737,21 @@ async fn llm_upsert_round_trips_typed_inference_fields() {
         primary.reasoning_effort,
         Some(octos_llm::ReasoningEffort::High)
     );
+    assert_eq!(
+        primary.route.as_ref().unwrap().media_transport,
+        Some(octos_llm::media_transport::MediaTransportMode::MoonshotFiles)
+    );
+    assert_eq!(
+        primary.model_hints.as_ref().unwrap().image_file_references,
+        Some(false)
+    );
     assert!(primary.model_hints.as_ref().unwrap().uses_completion_tokens);
+    assert_eq!(
+        primary.model_hints.as_ref().unwrap().reasoning_history,
+        Some(octos_llm::openai::ReasoningHistory::Preserve)
+    );
+    assert!(primary.model_hints.as_ref().unwrap().retain_tool_images);
+    assert!(primary.model_hints.as_ref().unwrap().lacks_video);
 
     // The list projection round-trips every configured field — and stays
     // truthful: a client must be able to tell saved values from inherited.
@@ -1752,6 +1772,23 @@ async fn llm_upsert_round_trips_typed_inference_fields() {
     assert_eq!(
         primary_json["model_hints"]["uses_completion_tokens"],
         json!(true)
+    );
+    assert_eq!(
+        primary_json["model_hints"]["reasoning_history"],
+        json!("preserve")
+    );
+    assert_eq!(
+        primary_json["model_hints"]["retain_tool_images"],
+        json!(true)
+    );
+    assert_eq!(primary_json["model_hints"]["lacks_video"], json!(true));
+    assert_eq!(
+        primary_json["route"]["media_transport"],
+        json!("moonshot_files")
+    );
+    assert_eq!(
+        primary_json["model_hints"]["image_file_references"],
+        json!(false)
     );
     assert_eq!(primary_json["cost_per_m"], json!(1.5));
 
@@ -7724,6 +7761,7 @@ async fn session_list_state_with_dev_runtime(tmp: &std::path::Path) -> AppState 
                     family_id: Some("openai".to_string()),
                     model_id: Some("gpt-4o-mini".to_string()),
                     route: Some(crate::profiles::LlmRouteConfig {
+                        media_transport: None,
                         route_id: None,
                         label: None,
                         base_url: None,
@@ -7951,6 +7989,7 @@ async fn launch_resolve_activates_empty_folder_then_resumes_after_store_exists()
                     family_id: Some("openai".to_string()),
                     model_id: Some("gpt-4o-mini".to_string()),
                     route: Some(crate::profiles::LlmRouteConfig {
+                        media_transport: None,
                         route_id: None,
                         label: None,
                         base_url: None,
@@ -8047,6 +8086,7 @@ async fn launch_resolve_prefers_persisted_default_profile() {
                     family_id: Some("openai".to_string()),
                     model_id: Some("gpt-4o-mini".to_string()),
                     route: Some(crate::profiles::LlmRouteConfig {
+                        media_transport: None,
                         route_id: None,
                         label: None,
                         base_url: None,
@@ -11902,6 +11942,7 @@ async fn runtime_policy_stamp_reports_the_runtime_that_serves_turns() {
                     family_id: Some(family.to_string()),
                     model_id: Some(model.to_string()),
                     route: Some(LlmRouteConfig {
+                        media_transport: None,
                         route_id: None,
                         label: None,
                         base_url: None,
@@ -40700,6 +40741,7 @@ async fn peer_originator_recorded_by_prepare_when_session_id_present() {
                     family_id: Some("openai".to_string()),
                     model_id: Some("gpt-4o-mini".to_string()),
                     route: Some(crate::profiles::LlmRouteConfig {
+                        media_transport: None,
                         route_id: None,
                         label: None,
                         base_url: None,
@@ -40921,6 +40963,7 @@ async fn peer_prepare_stages_brief_and_worktree() {
                     family_id: Some("openai".to_string()),
                     model_id: Some("gpt-4o-mini".to_string()),
                     route: Some(crate::profiles::LlmRouteConfig {
+                        media_transport: None,
                         route_id: None,
                         label: None,
                         base_url: None,
@@ -41362,6 +41405,7 @@ async fn peer_fleet_result_writer_and_gather_roundtrip() {
                     family_id: Some("openai".to_string()),
                     model_id: Some("gpt-4o-mini".to_string()),
                     route: Some(crate::profiles::LlmRouteConfig {
+                        media_transport: None,
                         route_id: None,
                         label: None,
                         base_url: None,
