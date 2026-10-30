@@ -557,6 +557,14 @@ fn map_file_mutation(
     let mut notice = UiFileMutationNotice::new(path, operation);
     notice.tool_call_id = string_field(event, &["tool_call_id", "id"]);
     notice.bytes_written = u64_field(event, &["bytes_written", "bytes"]);
+    notice.created = event.get("created").and_then(Value::as_bool);
+    if notice.created == Some(true) {
+        notice.operation = file_mutation_operations::CREATE.to_owned();
+    }
+    notice.previous_content = event
+        .get("previous_content")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
 
     let mut metadata = UiProgressMetadata::file_mutation(notice);
     metadata.message = string_field(event, &["message", "status"]);
@@ -1252,6 +1260,26 @@ mod tests {
         assert_eq!(notice.path, "src/lib.rs");
         assert_eq!(notice.operation, file_mutation_operations::WRITE);
         assert_eq!(notice.bytes_written, Some(128));
+
+        let created = map_progress_json(
+            &context(),
+            &json!({
+                "type": "file_modified",
+                "path": "src/new.rs",
+                "created": true,
+                "previous_content": "not on the wire"
+            }),
+        );
+        let notice = created
+            .status
+            .expect("created status")
+            .event
+            .metadata
+            .file_mutation
+            .expect("created metadata");
+        assert_eq!(notice.operation, file_mutation_operations::CREATE);
+        assert_eq!(notice.created, Some(true));
+        assert_eq!(notice.previous_content.as_deref(), Some("not on the wire"));
     }
 
     #[test]
