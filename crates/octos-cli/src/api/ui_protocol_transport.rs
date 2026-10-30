@@ -22189,6 +22189,14 @@ async fn handle_raw_appui_rpc_with_identity(
         | APPUI_METHOD_MCP_CONNECTOR_DELETE
         | APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
         | APPUI_METHOD_MCP_CONNECTOR_RECONNECT => {
+            if !features.mcp_connector_manage_v1 {
+                let _ = send_rpc_error(
+                    ws,
+                    Some(id),
+                    RpcError::method_not_supported(request.method.as_str()),
+                );
+                return true;
+            }
             if request.method == APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
                 && request
                     .params
@@ -22288,10 +22296,13 @@ async fn handle_raw_appui_rpc_with_identity(
                 }
             };
             if request.method == APPUI_METHOD_MCP_STATUS_LIST {
-                Ok(mcp_status_list_result(
+                Ok(super::mcp_connectors::status_list(
                     state,
                     &session_id,
                     active_profile_id.as_deref(),
+                    connection_profile_id,
+                    features.mcp_connector_manage_v1,
+                    ws.is_external(),
                 ))
             } else {
                 match tool_status_list_result(state, &session_id, active_profile_id.as_deref())
