@@ -29,10 +29,11 @@
 //! finished rows: its request (with its origin marker), the assistant text it
 //! has streamed so far (`[the app agent] (in progress)`), and one
 //! `[turn status]` line (`still running`, `waiting for approval: <tool>` or
-//! `waiting for an answer`). The kernel's transcript holds a turn's rows only
-//! once the turn ends, so these come from the in-memory registry of running
+//! `waiting for an answer`). The request is durable before model execution;
+//! the draft and status still come from the in-memory registry of running
 //! lane turns ([`begin_running_turn`]), read under a plain mutex (never
-//! across an await) and never blocking the running turn.
+//! across an await) and never blocking the running turn. A durable request
+//! is shown only once; response rows supersede the live projection at commit.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -358,9 +359,9 @@ fn status_tool_name(name: &str) -> String {
 
 /// The rows of the turn running on `session` (its request, the text it has
 /// streamed so far, and its status line), or none. `persisted` is the
-/// session's transcript as just read: when it already holds a user row of
-/// the running turn (the turn is committing its rows), the running turn is
-/// not shown again.
+/// session's transcript as just read. Its pre-execution user row replaces
+/// only the live request; assistant rows committed at the end replace the
+/// running projection.
 fn running_rows(
     session: &SessionKey,
     persisted: &[Message],
@@ -384,12 +385,23 @@ fn running_turn_rows(
     live: LiveTurnStatus,
     now: DateTime<Utc>,
 ) -> Vec<SharedRow> {
+    // A client may reuse a turn ID, and other threads may append meanwhile.
+    // Only rows from this dispatch can replace its live projection.
+    let belongs_to_dispatch = |message: &&Message| {
+        message.thread_id.as_deref() == Some(turn.turn_id.as_str())
+            && message.timestamp >= turn.started_at
+    };
     if persisted
         .iter()
-        .any(|message| message.role == MessageRole::User && message.timestamp >= turn.started_at)
+        .filter(belongs_to_dispatch)
+        .any(|message| message.role == MessageRole::Assistant)
     {
         return Vec::new();
     }
+    let request_persisted = persisted
+        .iter()
+        .filter(belongs_to_dispatch)
+        .any(|message| message.role == MessageRole::User);
     let row = |at, speaker: &str, text: String| SharedRow {
         at,
         conversation: conversation.map(str::to_owned),
@@ -397,7 +409,9 @@ fn running_turn_rows(
         text,
     };
     let mut rows = Vec::new();
-    if let Some(request) = &turn.request {
+    if let Some(request) = &turn.request
+        && !request_persisted
+    {
         let (speaker, text) = match split_origin_marker(request) {
             Some((marker, text)) => (marker, text),
             None => ("[from the host]", request.as_str()),
@@ -799,16 +813,55 @@ mod tests {
     #[test]
     fn a_running_turn_whose_rows_were_persisted_is_not_shown_twice() {
         let turn = running(Some("[from the person] hello"), 5);
-        let older = [msg(MessageRole::User, "[from the person] before", 4)];
+        let stamped = |role, content, secs| {
+            let mut message = msg(role, content, secs);
+            message.thread_id = Some(turn.turn_id.clone());
+            message
+        };
+        let older = [
+            stamped(MessageRole::User, "[from the person] before", 4),
+            stamped(MessageRole::Assistant, "older response", 4),
+        ];
         assert_eq!(
             running_turn_rows(&turn, &older, None, LiveTurnStatus::default(), at(9)).len(),
             2,
-            "rows from before the turn started do not hide it"
+            "rows from an earlier dispatch of the same turn ID do not hide it"
         );
-        let committing = [
-            msg(MessageRole::User, "[from the person] before", 4),
-            msg(MessageRole::User, "[from the person] hello", 5),
-        ];
+        let mut other_thread = stamped(MessageRole::Assistant, "other response", 6);
+        other_thread.thread_id = Some("another-turn".into());
+        assert_eq!(
+            running_turn_rows(
+                &turn,
+                &[other_thread],
+                None,
+                LiveTurnStatus::default(),
+                at(9)
+            )
+            .len(),
+            2
+        );
+
+        let mut committing = vec![stamped(MessageRole::User, "[from the person] hello", 5)];
+        let live = LiveTurnStatus {
+            draft: "Sending the mail now.".into(),
+            waiting: Some(TurnWaiting::Approval(vec!["mail_send".into()])),
+        };
+        let rows = with_running(
+            select_rows(&committing, None, 10),
+            running_turn_rows(&turn, &committing, None, live, at(9)),
+            10,
+        );
+        assert_eq!(
+            shown(&rows),
+            [
+                "[from the person] hello",
+                "[the app agent] (in progress) Sending the mail now.",
+                "[turn status] still running, waiting for approval: mail_send",
+            ],
+            "the durable prompt must neither duplicate nor hide the still-running turn"
+        );
+
+        committing.push(stamped(MessageRole::Assistant, "done", 9));
         assert!(
             running_turn_rows(&turn, &committing, None, LiveTurnStatus::default(), at(9))
                 .is_empty()
