@@ -35,6 +35,22 @@ HTTP endpoints must be http(s), must not contain URL userinfo, and are checked
 against private/loopback targets and the existing SSRF resolver. OAuth requires
 HTTPS. Secret headers are not accepted by the PR1 web contract.
 
+## OAuth callback and token storage
+
+`mcp/oauth/start` accepts an optional `redirect_uri`. The preferred value is the
+current web Origin plus `/oauth/mcp/callback`; it must match the connection
+Origin and be listed in `OCTOS_APPUI_ALLOWED_ORIGINS`. The same URI is used in
+OAuth dynamic registration. With no usable Origin, the flow uses
+`manual_callback_url`: the user pastes the complete callback URL from the browser
+address bar. Flow state is one-time and expires after 10 minutes. After
+`mcp/oauth/complete`, clients must remove code/state from browser history.
+
+Tokens are namespaced by `(profile_id, normalized_url)`. OS keyring is preferred;
+when it is unavailable, tokens are encrypted with XChaCha20-Poly1305 in the
+profile data dir. The random key and token files are created with mode 0600 and
+never stored in profile JSON or returned by OUP. `token_storage` reports
+`keyring` or `encrypted_file`; there is no plaintext fallback.
+
 ## Limits and status
 
 At most 32 connectors per profile. Explicit reconnects are limited to one every

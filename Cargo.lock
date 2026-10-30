@@ -5385,6 +5385,7 @@ version = "2.0.3"
 dependencies = [
  "async-trait",
  "base64",
+ "chacha20poly1305",
  "chromiumoxide",
  "chrono",
  "dirs",
@@ -5519,6 +5520,7 @@ dependencies = [
  "libc",
  "metrics",
  "metrics-exporter-prometheus",
+ "oauth2",
  "octos-agent",
  "octos-bus",
  "octos-core",
@@ -5542,6 +5544,7 @@ dependencies = [
  "redb",
  "regex",
  "reqwest 0.12.28",
+ "rmcp",
  "rpassword",
  "rusqlite",
  "rust-embed",

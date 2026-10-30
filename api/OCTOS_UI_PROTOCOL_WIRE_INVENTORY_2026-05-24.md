@@ -103,6 +103,10 @@ spec and UPCR documents. The authoritative source remains code:
 | `mcp/connector/delete` | idempotent profile-scoped delete, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
 | `mcp/connector/set_enabled` | persistent enable/disable, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
 | `mcp/connector/reconnect` | rate-limited runtime reconnect, gate `mcp.connector.manage.v1`, UPCR-2026-062 |
+| `mcp/oauth/start` | one-time OAuth flow with allowed-origin or manual callback, gate `mcp.oauth.v1`, UPCR-2026-062 |
+| `mcp/oauth/complete` | state/iss-validated callback exchange and scoped token storage, gate `mcp.oauth.v1`, UPCR-2026-062 |
+| `mcp/oauth/cancel` | idempotent OAuth flow cancellation, gate `mcp.oauth.v1`, UPCR-2026-062 |
+| `mcp/oauth/revoke` | profile-scoped token deletion and reconnect, gate `mcp.oauth.v1`, UPCR-2026-062 |
 | `tool/status/list` | shipped AppUI extra, UPCR-2026-017 / UPCR-2026-020 |
 | `profile/skills/list` | shipped AppUI extra when profile store is configured |
 | `profile/skills/registry/search` | shipped AppUI extra when profile store is configured |

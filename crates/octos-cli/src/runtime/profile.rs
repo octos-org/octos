@@ -1320,7 +1320,13 @@ impl ProfileRuntime {
         // empty for profile-only deployments; gateway / serve top-
         // level configs may add more on top).
         let mcp_client = if !config.mcp_servers.is_empty() {
-            match octos_agent::McpClient::start(&config.mcp_servers).await {
+            match octos_agent::McpClient::start_scoped(
+                &config.mcp_servers,
+                Some(&profile.id),
+                Some(data_dir),
+            )
+            .await
+            {
                 Ok(client) => {
                     let client = Arc::new(client);
                     client.register_tools(&mut tools);

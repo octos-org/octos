@@ -30,6 +30,8 @@ octos-workflows = { workspace = true }
 octos-store = { workspace = true }
 octos-services = { workspace = true }
 octos-swarm = { workspace = true }
+rmcp = { version = "1.8", default-features = false, features = ["client", "auth", "transport-streamable-http-client-reqwest"] }
+oauth2 = "5"
 # RFC-2 (issue #1291): `octos skills install` runs the manifest schema
 # validator at install time so the operator sees the error before the
 # agent loop ever loads the broken manifest. The validator lives in

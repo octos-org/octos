@@ -389,6 +389,10 @@ const APPUI_METHOD_MCP_CONNECTOR_UPDATE: &str = "mcp/connector/update";
 const APPUI_METHOD_MCP_CONNECTOR_DELETE: &str = "mcp/connector/delete";
 const APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED: &str = "mcp/connector/set_enabled";
 const APPUI_METHOD_MCP_CONNECTOR_RECONNECT: &str = "mcp/connector/reconnect";
+const APPUI_METHOD_MCP_OAUTH_START: &str = "mcp/oauth/start";
+const APPUI_METHOD_MCP_OAUTH_COMPLETE: &str = "mcp/oauth/complete";
+const APPUI_METHOD_MCP_OAUTH_CANCEL: &str = "mcp/oauth/cancel";
+const APPUI_METHOD_MCP_OAUTH_REVOKE: &str = "mcp/oauth/revoke";
 const APPUI_METHOD_TOOL_STATUS_LIST: &str = "tool/status/list";
 /// Manual, on-demand context compaction for an open session (the `/compact`
 /// TUI command). Forces the compaction pass regardless of the auto-compaction
@@ -570,6 +574,10 @@ const APPUI_EXTRA_METHODS: &[&str] = &[
     APPUI_METHOD_MCP_CONNECTOR_DELETE,
     APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED,
     APPUI_METHOD_MCP_CONNECTOR_RECONNECT,
+    APPUI_METHOD_MCP_OAUTH_START,
+    APPUI_METHOD_MCP_OAUTH_COMPLETE,
+    APPUI_METHOD_MCP_OAUTH_CANCEL,
+    APPUI_METHOD_MCP_OAUTH_REVOKE,
     APPUI_METHOD_TOOL_STATUS_LIST,
     APPUI_METHOD_AUTH_STATUS,
     APPUI_METHOD_AUTH_SEND_CODE,
@@ -641,6 +649,10 @@ const APPUI_STDIO_AUTH_BOUND_UNAVAILABLE_METHODS: &[&str] = &[
     APPUI_METHOD_MCP_CONNECTOR_DELETE,
     APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED,
     APPUI_METHOD_MCP_CONNECTOR_RECONNECT,
+    APPUI_METHOD_MCP_OAUTH_START,
+    APPUI_METHOD_MCP_OAUTH_COMPLETE,
+    APPUI_METHOD_MCP_OAUTH_CANCEL,
+    APPUI_METHOD_MCP_OAUTH_REVOKE,
     octos_core::ui_protocol::methods::SMART_HOME_STATUS_GET,
     octos_core::ui_protocol::methods::SMART_HOME_DEVICE_LIST,
     octos_core::ui_protocol::methods::SMART_HOME_DEVICE_COMMAND,
@@ -2384,6 +2396,8 @@ struct ConnectionUiFeatures {
     session_files_read_v1: bool,
     /// UPCR-2026-062: profile-scoped MCP connector management.
     mcp_connector_manage_v1: bool,
+    /// UPCR-2026-062: OAuth authorization for MCP connectors.
+    mcp_oauth_v1: bool,
     /// `true` when the client sent at least one feature token via the
     /// `X-Octos-Ui-Features` header or the `ui_feature` / `ui_features`
     /// query parameter (UPCR-2026-007). Distinguishes "no header at all"
@@ -2518,6 +2532,11 @@ impl ConnectionUiFeatures {
                 query,
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
             ),
+            mcp_oauth_v1: has_ui_feature(
+                headers,
+                query,
+                octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_OAUTH_V1,
+            ),
             header_present: has_any_ui_feature_token(headers, query),
             stdio_transport: false,
         }
@@ -2564,6 +2583,7 @@ impl ConnectionUiFeatures {
             session_append_participant_v1: false,
             session_files_read_v1: true,
             mcp_connector_manage_v1: true,
+            mcp_oauth_v1: true,
             header_present: true,
             stdio_transport: true,
         }
@@ -2623,6 +2643,7 @@ impl ConnectionUiFeatures {
             mcp_connector_manage_v1: has(
                 octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_CONNECTOR_MANAGE_V1,
             ),
+            mcp_oauth_v1: has(octos_core::ui_protocol::UI_PROTOCOL_FEATURE_MCP_OAUTH_V1),
             header_present: true,
             stdio_transport,
         }
@@ -8096,6 +8117,7 @@ async fn ui_protocol_connection(
             &active_turns,
             &connection_turns,
             features,
+            &connection_headers,
             connection_identity.as_ref(),
             connection_profile_id,
             id.clone(),
@@ -21839,6 +21861,7 @@ async fn handle_raw_appui_rpc(
         active_turns,
         connection_turns,
         features,
+        &HeaderMap::new(),
         None,
         connection_profile_id,
         id,
@@ -21856,6 +21879,7 @@ async fn handle_raw_appui_rpc_with_identity(
     active_turns: &SharedActiveTurns,
     connection_turns: &SharedConnectionTurns,
     features: ConnectionUiFeatures,
+    connection_headers: &HeaderMap,
     connection_identity: Option<&AuthIdentity>,
     connection_profile_id: Option<&str>,
     id: String,
@@ -22184,6 +22208,58 @@ async fn handle_raw_appui_rpc_with_identity(
             Err(auth_unavailable_error(APPUI_METHOD_AUTH_LOGOUT))
         }
         APPUI_METHOD_AUTH_LOGOUT => Ok(json!({ "ok": true })),
+        APPUI_METHOD_MCP_OAUTH_START
+        | APPUI_METHOD_MCP_OAUTH_COMPLETE
+        | APPUI_METHOD_MCP_OAUTH_CANCEL
+        | APPUI_METHOD_MCP_OAUTH_REVOKE => {
+            let result = match request.method.as_str() {
+                APPUI_METHOD_MCP_OAUTH_START => {
+                    super::mcp_connectors::oauth_start(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        connection_headers,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_OAUTH_COMPLETE => {
+                    super::mcp_connectors::oauth_complete(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_OAUTH_CANCEL => {
+                    super::mcp_connectors::oauth_cancel(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                APPUI_METHOD_MCP_OAUTH_REVOKE => {
+                    super::mcp_connectors::oauth_revoke(
+                        state,
+                        connection_identity,
+                        connection_profile_id,
+                        request.params.clone(),
+                    )
+                    .await
+                }
+                _ => Err(RpcError::internal_error("unhandled OAuth method")),
+            };
+            match result {
+                Ok(value) => send_aux_rpc_result(ws, id, request.method.as_str(), value),
+                Err(error) => {
+                    let _ = send_rpc_error(ws, Some(id), error);
+                }
+            }
+            return true;
+        }
         APPUI_METHOD_MCP_CONNECTOR_CREATE
         | APPUI_METHOD_MCP_CONNECTOR_UPDATE
         | APPUI_METHOD_MCP_CONNECTOR_DELETE
@@ -22555,6 +22631,10 @@ fn route_rpc_command(
         | APPUI_METHOD_MCP_CONNECTOR_DELETE
         | APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
         | APPUI_METHOD_MCP_CONNECTOR_RECONNECT => Some(features.mcp_connector_manage_v1),
+        APPUI_METHOD_MCP_OAUTH_START
+        | APPUI_METHOD_MCP_OAUTH_COMPLETE
+        | APPUI_METHOD_MCP_OAUTH_CANCEL
+        | APPUI_METHOD_MCP_OAUTH_REVOKE => Some(features.mcp_oauth_v1),
         octos_core::ui_protocol::methods::SESSION_FILES_READ => {
             Some(features.session_files_read_v1)
         }
@@ -22669,6 +22749,10 @@ fn raw_method_is_dispatched(method: &str, stdio_transport: bool) -> bool {
             | APPUI_METHOD_MCP_CONNECTOR_DELETE
             | APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED
             | APPUI_METHOD_MCP_CONNECTOR_RECONNECT
+            | APPUI_METHOD_MCP_OAUTH_START
+            | APPUI_METHOD_MCP_OAUTH_COMPLETE
+            | APPUI_METHOD_MCP_OAUTH_CANCEL
+            | APPUI_METHOD_MCP_OAUTH_REVOKE
             | APPUI_METHOD_TOOL_STATUS_LIST
             | APPUI_METHOD_ONBOARDING_WORKSPACE_PROBE
             | APPUI_METHOD_ONBOARDING_WORKSPACE_LIST
