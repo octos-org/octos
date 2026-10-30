@@ -128,8 +128,7 @@ impl Agent {
             // #2329: GuardUnavailable joins Deny in the fail-closed arm —
             // a tripped breaker is not a policy decision, so log it
             // distinctly for operators, but never degrade to a silent Allow.
-            let was_guard_unavailable =
-                matches!(result, HookResult::GuardUnavailable(_));
+            let was_guard_unavailable = matches!(result, HookResult::GuardUnavailable(_));
             match result {
                 HookResult::Deny(reason) | HookResult::GuardUnavailable(reason) => {
                     if was_guard_unavailable {

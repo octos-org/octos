@@ -110,10 +110,8 @@ async fn should_apply_circuit_breaker_to_user_prompt_submit_hook() {
     // the hook is disabled. #2329: user_prompt_submit is a guard-class
     // (before-)event, so the disabled gate surfaces as GuardUnavailable
     // (fail-closed signal) instead of a silent Allow.
-    let executor = HookExecutor::with_threshold(
-        vec![user_prompt_hook(vec!["sh", "-c", "exit 3"], 1000)],
-        3,
-    );
+    let executor =
+        HookExecutor::with_threshold(vec![user_prompt_hook(vec!["sh", "-c", "exit 3"], 1000)], 3);
     let payload = HookPayload::user_prompt_submit("hi", "m", None, None);
     for _ in 0..3 {
         executor.run(HookEvent::UserPromptSubmit, &payload).await;
