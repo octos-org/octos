@@ -1268,6 +1268,7 @@ fn ui_protocol_v1_representative_wire_payloads_are_golden() {
                 "event.file_attached.v1",
                 "auxiliary.rest_to_ws.v1",
                 "session.files.read.v1",
+                "projection.write_path.v1",
                 "coding.autonomy.v1",
                 "coding.agent_control.v1",
                 "coding.goal_runtime.v1",

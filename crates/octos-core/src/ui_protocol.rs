@@ -189,6 +189,10 @@ pub const UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1: &str = "auxiliary.rest_to
 /// Feature flag for reading session file contents through `session/files/read`.
 pub const UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1: &str = "session.files.read.v1";
 
+/// Feature flag for UPCR-2026-061: bounded redacted write paths in v2 tool
+/// replay. Optional fields are omitted for clients that do not support them.
+pub const UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1: &str = "projection.write_path.v1";
+
 /// Required feature flag for UPCR-2026-021 M15 autonomy inspection/control.
 pub const UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1: &str = "coding.autonomy.v1";
 
@@ -337,6 +341,7 @@ pub const UI_PROTOCOL_KNOWN_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_PROJECTION_ENVELOPE_V2,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
     UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
@@ -384,6 +389,7 @@ pub const UI_PROTOCOL_STDIO_DEFAULT_FEATURES: &[&str] = &[
     UI_PROTOCOL_FEATURE_BACKGROUND_ACTIVITY_V1,
     UI_PROTOCOL_FEATURE_AUXILIARY_REST_TO_WS_V1,
     UI_PROTOCOL_FEATURE_SESSION_FILES_READ_V1,
+    UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
     UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1,
@@ -4370,6 +4376,10 @@ pub enum PayloadV2 {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arguments_preview: Option<String>,
+        /// UPCR-2026-061: bounded redacted path for write_file/edit_file
+        /// replay, never the file content itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        write_path: Option<String>,
     },
     ToolProgress {
         tool_call_id: String,
@@ -7729,6 +7739,28 @@ mod session_files_read_tests {
                 .expect("decode read result"),
             UiRpcResult::SessionFilesRead(result)
         );
+    }
+
+    #[test]
+    fn should_add_projection_write_path_without_replaying_file_content() {
+        let payload = PayloadV2::ToolStart {
+            tool_call_id: "call-1".into(),
+            name: "write_file".into(),
+            arguments_preview: Some("content: ...".into()),
+            write_path: Some("artifacts/report.txt".into()),
+        };
+        let encoded = serde_json::to_value(&payload).expect("serialize write path");
+        assert_eq!(encoded["data"]["tool_call_id"], "call-1");
+        assert_eq!(encoded["data"]["write_path"], "artifacts/report.txt");
+        assert_eq!(
+            serde_json::from_value::<PayloadV2>(encoded).expect("decode write path"),
+            payload
+        );
+        assert_eq!(
+            UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1,
+            "projection.write_path.v1"
+        );
+        assert!(UI_PROTOCOL_KNOWN_FEATURES.contains(&UI_PROTOCOL_FEATURE_PROJECTION_WRITE_PATH_V1));
     }
 
     #[test]

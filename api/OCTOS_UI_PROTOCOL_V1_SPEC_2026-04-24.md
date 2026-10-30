@@ -3255,6 +3255,11 @@ that row's hydrated identity, enabling transcript/replay deduplication.
 
 Open the tool card identified by `tool_call_id`. Optional
 `arguments_preview` is bounded to 700 characters and is not replayable input.
+UPCR-2026-061 adds optional `write_path` for `write_file`/`edit_file`: the
+original string `path`, bounded to 1024 bytes and secret-redacted, so hydrate
+can restore write artifacts when long content precedes the path in the preview.
+File content is never replayed in this field. Clients advertise support with
+`projection.write_path.v1`; old clients may ignore the additive field.
 
 ```json
 { "type": "tool_start", "data": { "tool_call_id": "tc-1", "name": "read_file", "arguments_preview": "path: input.txt" } }

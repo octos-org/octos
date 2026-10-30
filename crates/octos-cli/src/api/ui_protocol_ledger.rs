@@ -3874,8 +3874,13 @@ pub(crate) fn redact_ui_notification_secrets(notification: &mut UiNotification) 
         }
         UiNotification::EnvelopeV2(envelope) => match &mut envelope.envelope.payload {
             PayloadV2::ToolStart {
-                arguments_preview, ..
-            } => redact_opt_in_place(arguments_preview),
+                arguments_preview,
+                write_path,
+                ..
+            } => {
+                redact_opt_in_place(arguments_preview);
+                redact_opt_in_place(write_path);
+            }
             PayloadV2::ToolEnd {
                 error,
                 output_preview,
@@ -4203,6 +4208,7 @@ mod tests {
                     &session,
                     turn.0.to_string(),
                     PayloadV2::ToolStart {
+                        write_path: None,
                         tool_call_id: "after-cold-recovery".into(),
                         name: "read_file".into(),
                         arguments_preview: None,
@@ -7802,6 +7808,7 @@ mod tests {
                 &session,
                 thread_id.clone(),
                 PayloadV2::ToolStart {
+                    write_path: None,
                     tool_call_id: "tc-1".into(),
                     name: "shell".into(),
                     arguments_preview: Some(preview.clone()),
@@ -7814,6 +7821,7 @@ mod tests {
                 &session,
                 thread_id,
                 PayloadV2::ToolStart {
+                    write_path: None,
                     tool_call_id: "tc-2".into(),
                     name: "shell".into(),
                     arguments_preview: Some(preview),
