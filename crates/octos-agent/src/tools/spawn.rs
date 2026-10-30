@@ -4758,7 +4758,11 @@ impl Tool for SpawnTool {
                             replay.child_prompt_context_manager_factory =
                                 template.child_prompt_context_manager_factory.clone();
                             replay.continuation = template.continuation.clone();
-                            replay.continuation.as_mut().unwrap().feedback = feedback;
+                            replay
+                                .continuation
+                                .as_mut()
+                                .expect("continuation template initialized before registration")
+                                .feedback = feedback;
                             replay.task_supervisor = Some(supervisor.clone());
                             let args = original_args.clone();
                             let mut ctx = original_ctx.clone();
