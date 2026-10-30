@@ -217,6 +217,7 @@ pub(crate) struct McpServerStatusView<'a> {
     pub id: &'a str,
     pub display_name: Option<&'a str>,
     pub transport: Option<&'a str>,
+    pub enabled: bool,
     pub status: &'a str,
     pub tool_count: usize,
     pub tools: &'a [&'a str],
@@ -919,6 +920,7 @@ fn mcp_server_status_value(server: &McpServerStatusView<'_>) -> Value {
         "id": server.id,
         "display_name": server.display_name,
         "transport": server.transport,
+        "enabled": server.enabled,
         "status": server.status,
         "tool_count": server.tool_count,
         "tools": server.tools,
@@ -948,12 +950,14 @@ fn mcp_status_summary(servers: &[McpServerStatusView<'_>]) -> Value {
     let mut connecting = 0;
     let mut failed = 0;
     let mut disabled = 0;
+    let mut closed = 0;
     for server in servers {
         match server.status {
             MCP_STATUS_CONNECTED => connected += 1,
             MCP_STATUS_CONNECTING => connecting += 1,
             MCP_STATUS_FAILED => failed += 1,
             MCP_STATUS_DISABLED => disabled += 1,
+            "closed" => closed += 1,
             _ => {}
         }
     }
@@ -962,6 +966,7 @@ fn mcp_status_summary(servers: &[McpServerStatusView<'_>]) -> Value {
         "connecting": connecting,
         "failed": failed,
         "disabled": disabled,
+        "closed": closed,
     })
 }
 
@@ -1484,6 +1489,7 @@ mod tests {
                 id: "fs",
                 display_name: Some("Filesystem"),
                 transport: Some("stdio"),
+                enabled: true,
                 status: MCP_STATUS_CONNECTED,
                 tool_count: 2,
                 tools: &["stat", "read"],
@@ -1493,6 +1499,7 @@ mod tests {
                 id: "remote",
                 display_name: None,
                 transport: Some("http"),
+                enabled: true,
                 status: MCP_STATUS_FAILED,
                 tool_count: 0,
                 tools: &[],
@@ -1519,6 +1526,7 @@ mod tests {
             id: "github",
             display_name: Some("GitHub"),
             transport: Some("stdio"),
+            enabled: true,
             status: MCP_STATUS_CONNECTED,
             tool_count: 4,
             tools: &["issue_read"],

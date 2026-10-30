@@ -487,6 +487,10 @@ pub struct ProfileRuntime {
     /// their owning plugin tools.
     pub skill_actions: Vec<LoadedSkillAction>,
 
+    /// Live MCP connections used by `tool_specs`, retained for real
+    /// connection/failure/closed status instead of inferring from tool names.
+    pub mcp_client: Option<Arc<octos_agent::McpClient>>,
+
     /// Immutable source for mutation-time plugin-layer replacement.
     pub plugin_reload: Option<Arc<ProfilePluginReloadConfig>>,
 
@@ -921,6 +925,7 @@ impl ProfileRuntime {
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             skill_actions: plugin_result.loaded_actions.clone(),
+            mcp_client: self.mcp_client.clone(),
             plugin_reload: Some(reload.clone()),
             plugin_dirs: reload.plugin_dirs.clone(),
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
@@ -1314,12 +1319,21 @@ impl ProfileRuntime {
         // Step 12: MCP servers from the profile's config (typically
         // empty for profile-only deployments; gateway / serve top-
         // level configs may add more on top).
-        if !config.mcp_servers.is_empty() {
+        let mcp_client = if !config.mcp_servers.is_empty() {
             match octos_agent::McpClient::start(&config.mcp_servers).await {
-                Ok(client) => client.register_tools(&mut tools),
-                Err(e) => warn!(profile_id = %profile.id, error = %e, "MCP initialization failed"),
+                Ok(client) => {
+                    let client = Arc::new(client);
+                    client.register_tools(&mut tools);
+                    Some(client)
+                }
+                Err(e) => {
+                    warn!(profile_id = %profile.id, error = %e, "MCP initialization failed");
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
         let plugin_base_tools = Arc::new(tools.snapshot_excluding(&[]));
 
         // Step 13: plugin loading.
@@ -1789,6 +1803,7 @@ impl ProfileRuntime {
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             skill_actions: plugin_result.loaded_actions.clone(),
+            mcp_client,
             plugin_reload: Some(plugin_reload),
             plugin_dirs,
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),

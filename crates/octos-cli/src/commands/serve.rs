@@ -1907,6 +1907,7 @@ impl ServeCommand {
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
             deployment_mode: config.mode.clone(),
             host_memory: config.memory.clone(),
+            mcp_stdio_allowlist: config.mcp_stdio_allowlist.clone(),
             pairing: pairing.clone(),
             solo_login_enabled: solo_login_enabled_flag,
             host_managed: host_managed.clone(),

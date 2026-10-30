@@ -3003,6 +3003,7 @@ pub(crate) fn config_from_profile(
         // config so the gateway actually spawns them and registers their
         // tools (was hard-zeroed: profile-level MCP config never took effect).
         mcp_servers: profile.config.mcp_servers.clone(),
+        mcp_stdio_allowlist: Vec::new(),
         sandbox: profile.config.sandbox.clone(),
         // (serve-side wiring lands with the UI/RPC follow-up).
         // #1768: thread the profile's snapshot opt-in so serve sessions
