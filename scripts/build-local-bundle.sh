@@ -113,7 +113,7 @@ fi
 TARBALL="octos-bundle-${TRIPLE}.tar.gz"
 rm -rf dist && mkdir dist
 for b in octos octos-sandbox news_fetch deep-search deep_crawl send_email account_manager \
-         voice clock weather; do
+         voice clock weather office; do
     cp "target/release/$b" dist/ 2>/dev/null || true
 done
 # Ship the canonical model catalog (the model-provisioning SSOT) next to the
