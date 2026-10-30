@@ -176,7 +176,7 @@ fn mutation_context(
     })
 }
 
-fn find_connector<'a>(profile: &'a UserProfile, id: &str) -> Result<usize, RpcError> {
+fn find_connector(profile: &UserProfile, id: &str) -> Result<usize, RpcError> {
     profile
         .config
         .mcp_servers
@@ -471,6 +471,10 @@ pub async fn delete(
             .config
             .mcp_servers
             .retain(|config| config.connector_id() != id);
+        reconnect_times()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&format!("{}:{id}", context.profile_id));
         profile.updated_at = chrono::Utc::now();
         finish_mutation(
             state,
@@ -544,6 +548,14 @@ pub async fn reconnect(
     let context = mutation_context(state, &session_id, connection_profile_id)?;
     let target = format!("mcp:{}:{id}", context.profile_id);
     let result = async {
+        let _guard = mutation_lock().lock().await;
+        let mut profile = context.profile.clone();
+        assign_legacy_ids(&mut profile);
+        let index = find_connector(&profile, &id)?;
+        if !profile.config.mcp_servers[index].enabled {
+            return Err(RpcError::invalid_params("disabled connector cannot reconnect")
+                .with_data(json!({"kind": "connector_disabled"})));
+        }
         let key = format!("{}:{id}", context.profile_id);
         {
             let mut times = reconnect_times().lock().unwrap_or_else(|error| error.into_inner());
@@ -552,14 +564,6 @@ pub async fn reconnect(
                     .with_data(json!({"kind": "reconnect_rate_limited", "retry_after_seconds": MCP_RECONNECT_MIN_INTERVAL.as_secs()})));
             }
             times.insert(key, Instant::now());
-        }
-        let _guard = mutation_lock().lock().await;
-        let mut profile = context.profile.clone();
-        assign_legacy_ids(&mut profile);
-        let index = find_connector(&profile, &id)?;
-        if !profile.config.mcp_servers[index].enabled {
-            return Err(RpcError::invalid_params("disabled connector cannot reconnect")
-                .with_data(json!({"kind": "connector_disabled"})));
         }
         let summary = connector_summary(&profile.config.mcp_servers[index]);
         profile.updated_at = chrono::Utc::now();

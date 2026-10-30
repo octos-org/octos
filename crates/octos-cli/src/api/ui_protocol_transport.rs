@@ -22240,7 +22240,7 @@ async fn handle_raw_appui_rpc_with_identity(
                     )
                     .await
                 }
-                _ => unreachable!(),
+                _ => Err(RpcError::internal_error("unhandled connector method")),
             };
             match result {
                 Ok(value) => send_aux_rpc_result(ws, id, request.method.as_str(), value),
