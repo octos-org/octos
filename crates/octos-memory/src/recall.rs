@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -159,6 +160,9 @@ pub struct RecallStore {
     /// Bumped on every vector-affecting change; the persisted graph is only
     /// reused when its manifest carries the same value.
     generation: RwLock<u64>,
+    /// In-process upsert epoch, including BM25-only text changes. It does not
+    /// invalidate an otherwise reusable persisted vector graph.
+    index_mutations: AtomicU64,
     graph_persisted: RwLock<bool>,
     /// Serialises graph dumps so two callers never interleave writes to the
     /// same graph files and manifest.
@@ -225,6 +229,7 @@ impl RecallStore {
             index: RwLock::new(HybridIndex::new(0)),
             meta: RwLock::new(HashMap::new()),
             generation: RwLock::new(0),
+            index_mutations: AtomicU64::new(0),
             graph_persisted: RwLock::new(false),
             persist_lock: std::sync::Mutex::new(()),
         };
@@ -680,6 +685,9 @@ impl RecallStore {
                 let generation = self.next_generation();
                 self.write_meta(&txn, generation)?;
             }
+            if report.inserted + report.updated > 0 {
+                self.index_mutations.fetch_add(1, Ordering::Relaxed);
+            }
         }
         txn.commit()?;
         if report.inserted + report.updated > 0 {
@@ -910,15 +918,28 @@ impl RecallStore {
         Ok(())
     }
 
-    /// One rebuild attempt: snapshot, build, then install only if no
-    /// mutation landed meanwhile (generation unchanged). Returns `false`
-    /// when a concurrent mutation won and the caller should retry.
+    /// One rebuild attempt: install only if neither vector generation nor
+    /// the BM25 upsert epoch changed since the database snapshot.
     fn try_rebuild(&self) -> Result<bool> {
+        self.try_rebuild_after_snapshot(|| {})
+    }
+
+    fn try_rebuild_after_snapshot(&self, after_snapshot: impl FnOnce()) -> Result<bool> {
         let now = Utc::now();
-        let started_at = *self.generation.read().unwrap();
-        let records = self.all_records()?;
+        // Writers update the live index before committing redb. Briefly take
+        // the writer slot so counters cannot describe an uncommitted change
+        // while our read transaction still sees the old rows. Release it as
+        // soon as the MVCC snapshot exists, before parsing/building anything.
+        let (started_at, mutations, txn) = {
+            let _writer = self.db.begin_write()?;
+            (
+                *self.generation.read().unwrap(),
+                self.index_mutations.load(Ordering::Relaxed),
+                self.db.begin_read()?,
+            )
+        };
+        let records = Self::records_from_snapshot(&txn)?;
         let vectors: HashMap<String, QuantizedVector> = {
-            let txn = self.db.begin_read()?;
             let vt = txn.open_table(VECTORS_TABLE)?;
             let mut m = HashMap::new();
             for entry in vt.iter()? {
@@ -929,8 +950,10 @@ impl RecallStore {
             }
             m
         };
+        drop(txn);
+        after_snapshot();
         let mut index = HybridIndex::new(self.config.dimension);
-        let mut meta = self.meta.write().unwrap();
+        let mut residency = Vec::with_capacity(records.len());
         let mut resident = 0usize;
         for r in &records {
             let hot = self.is_hot(r.timestamp, r.visits, now);
@@ -943,16 +966,23 @@ impl RecallStore {
                 resident += 1;
             }
             index.insert(&r.id, &r.index_text(), vec.as_deref());
-            if let Some(m) = meta.get_mut(&r.id) {
-                m.resident = vec.is_some();
-                m.stored_vector = vectors.contains_key(&r.id);
-            }
+            residency.push((&r.id, vec.is_some(), vectors.contains_key(&r.id)));
         }
-        drop(meta);
         {
             let mut slot = self.index.write().unwrap();
-            if *self.generation.read().unwrap() != started_at {
+            if *self.generation.read().unwrap() != started_at
+                || self.index_mutations.load(Ordering::Relaxed) != mutations
+            {
                 return Ok(false);
+            }
+            // Residency belongs to the same accepted snapshot as the index;
+            // a rejected rebuild must not overwrite concurrent ingest metadata.
+            let mut meta = self.meta.write().unwrap();
+            for (id, resident, stored_vector) in residency {
+                if let Some(m) = meta.get_mut(id) {
+                    m.resident = resident;
+                    m.stored_vector = stored_vector;
+                }
             }
             *slot = index;
             let _ = self.next_generation();
@@ -987,6 +1017,10 @@ impl RecallStore {
 
     pub fn all_records(&self) -> Result<Vec<Record>> {
         let txn = self.db.begin_read()?;
+        Self::records_from_snapshot(&txn)
+    }
+
+    fn records_from_snapshot(txn: &redb::ReadTransaction) -> Result<Vec<Record>> {
         let rt = txn.open_table(RECORDS_TABLE)?;
         let mut out = Vec::new();
         for entry in rt.iter()? {
@@ -1969,3 +2003,7 @@ mod tests {
         assert_eq!(hits[0].id, "doc:mail:b");
     }
 }
+
+#[cfg(test)]
+#[path = "recall_rebuild_tests.rs"]
+mod rebuild_tests;
