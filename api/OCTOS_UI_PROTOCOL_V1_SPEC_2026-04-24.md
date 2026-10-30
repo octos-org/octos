@@ -528,9 +528,10 @@ M12 Phase-D auxiliary REST→WS surface (all gated `auxiliary.rest_to_ws.v1`):
 - `session/list`, `session/snapshot`, `session/messages_page`,
   `session/status.get`, `session/files.list`, `session/tasks.list`,
   `session/workspace.get`, `session/title.set`, `session/delete`
+- `session/files/read` (gate `session.files.read.v1`, accepted `UPCR-2026-057`)
 - `system/status.get`
 - `content/list`, `content/delete`, `content/bulk_delete`
-- `memory/overview`, `memory/entity`, `cron/list`, `cron/toggle`
+- `memory/overview`, `memory/entity`, `cron/create`, `cron/delete`, `cron/list`, `cron/toggle`
 - `memory/search`, `memory/load`, `memory/ingest`, `memory/request`,
   `memory/promote` (Recall/Knowledge index —
   `docs/adr/personal-memory-tiers.md`; auth-bound like `memory/overview`,
@@ -752,6 +753,9 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   `skill.action_jobs.v1`, accepted `UPCR-2026-045`; persisted background skill
   action jobs only)
 - `mcp/status/list`, `tool/status/list` (accepted `UPCR-2026-017`)
+- `mcp/connector/create`, `mcp/connector/update`, `mcp/connector/delete`,
+  `mcp/connector/set_enabled`, `mcp/connector/reconnect`
+  (gate `mcp.connector.manage.v1`, UPCR-2026-062)
 - `onboarding/workspace_probe` (gate `onboarding.workspace_probe.v1`,
   local-solo only; #1057)
 - `onboarding/workspace_list`, `onboarding/workspace_create` (gate
@@ -1879,6 +1883,29 @@ Clients must use that method list to enable or disable slash commands.
   config, provider config, MCP config, tool registry, memory, or sandbox state
   directly
 
+`mcp/connector/create`, `mcp/connector/update`, `mcp/connector/delete`,
+`mcp/connector/set_enabled`, and `mcp/connector/reconnect`
+(UPCR-2026-062, gate `mcp.connector.manage.v1`):
+
+- These methods mutate only the
+  session's authorized profile. They require the same profile-write scope as
+  provider saves; host-managed external and session-ingress clients are denied.
+- Stdio accepts only a deployment `allowlist_entry_id`, never arbitrary command,
+  args, or env. HTTP accepts no static secret headers. Responses and audit
+  records never contain secrets.
+- `mcp/status/list` remains available without this gate and reports real
+  disabled/connected/failed/closed state from the profile's live MCP client.
+- Limits: 32 connectors per profile and one explicit reconnect per connector
+  every 5 seconds. Mutations use the existing next-turn runtime transition.
+
+`mcp/oauth/*` (UPCR-2026-062, gate `mcp.oauth.v1`, PR2):
+
+- `start`, `complete`, `cancel`, and `revoke` use one-time, 10-minute flows bound
+  to session/profile. The preferred redirect is the allowed web Origin plus
+  `/oauth/mcp/callback`; `manual_callback_url` is the no-origin fallback.
+- Tokens are profile+URL namespaced in OS keyring or a 0600 encrypted data-dir
+  fallback, never returned by OUP or written to profile JSON.
+
 ### Coding Tool Contract Inspection
 
 Proposed `UPCR-2026-020` extends the existing runtime inspection methods for
@@ -2087,6 +2114,17 @@ Request/response Rust types live in `crates/octos-core/src/ui_protocol.rs`
 - Params type: `SessionFilesListParams` — `{ session_id: string }`.
 - Result type: `SessionFilesListResult` — `{ files: SessionFileInfo[] }`.
 - Errors: `unknown_session` on REST 404.
+
+#### `session/files/read`
+
+- Gate: `session.files.read.v1` (accepted `UPCR-2026-057`).
+- Purpose: read-only, bounded download of one explicitly named regular file from the authorized session workspace. Complements `session/files.list`; it is not directory browsing or a general repository filesystem API.
+- Params type: `SessionFilesReadParams` — `{ session_id, path, offset?, length? }`.
+  `path` is workspace-relative and must not contain absolute roots, backslashes or `..`. `offset` defaults to 0; `length` defaults to and is clamped to 512 KiB (524,288 bytes), and must be nonzero.
+- Result type: `SessionFilesReadResult` — `{ session_id, path, size_bytes, offset, eof, mime_type, encoding, content_base64 }`. `encoding` is `"base64"`; only the requested chunk is returned. `size_bytes` is the full file size and `eof` marks whether this chunk reaches the current end. Clients may reassemble binary files in multiple requests.
+- Limits: files over 32 MiB return `workspace_file_too_large`. One base64 response stays below the 1 MiB WS frame limit.
+- Authorization and containment: the same session/profile workspace owner as #1377. The approved root is canonicalized once (allowing legitimate symlinked ancestors), then on Unix it and every user-controlled relative component are opened relative to a trusted directory descriptor with `O_NOFOLLOW` (non-Unix uses checked paths); type and size are validated on the opened descriptor. Absolute paths, traversal, directories, non-regular files and ancestor/leaf symlink escapes are refused. Host-managed external access is separately reviewable and, when enabled, requires that this connection has already opened the same session; another session returns `external_session_not_opened`.
+- Errors: `method_not_supported` without the feature, plus typed `data.kind` values `workspace_file_invalid_path`, `workspace_file_escape`, `workspace_file_not_found`, `workspace_file_not_regular`, `workspace_file_too_large`, `workspace_file_offset_out_of_range`, `workspace_file_invalid_length`, `session_workspace_not_found`, and `workspace_file_access_denied`. Absolute host paths are never included.
 
 #### `session/tasks.list`
 
@@ -2411,10 +2449,18 @@ Change record: [UPCR-2026-052](../docs/OCTOS_UI_PROTOCOL_CHANGE_REQUEST_UPCR_202
 - Result type: `CronListResult` — `{ jobs: CronJobRow[], count: number,
   gateway_running: bool }`. Mirrors the REST body minus the redundant
   `ok` flag; `gateway_running` reports whether a spawned gateway child
-  owns `cron.json` (toggles are refused while it does).
+  owns `cron.json` (toggles are refused while it does). Each row includes
+  `next_run`, `last_run`, `last_error`, and `enabled` for retry/disabled state.
 - Errors: `auth_unavailable` with WS close code `1008 auth_expired`;
   `resource_not_found` with `data.resource_type = "cron"` on REST 404
   (collection-style endpoint — id is empty).
+
+#### `cron/create` and `cron/delete` (UPCR-2026-058)
+
+- Gate: `auxiliary.rest_to_ws.v1`; host-managed external clients are denied.
+- `cron/create` accepts `{session_id,schedule,message,deliver?,channel?,chat_id?,mode?,timezone?}`. `schedule` is tagged `kind`: `At {at_ms}`, `Every {every_ms}`, or `Cron {expr}`. `mode` is `agent` or `notify`. The server generates the id and stamps the exact session/profile origin. Result: `{job}` rendered as a list row.
+- `cron/delete` accepts `{session_id,job_id}` and is idempotent. A missing job returns `{deleted: true}`; a present job whose persistence fails is an error, not a success.
+- Acknowledged delivery remains unchanged: queue acceptance is the commit point. Delivery refusal retains `last_error` and disables after five 15-minute retries; startup catch-up is one late occurrence, not a replay of every missed interval.
 
 #### `cron/toggle`
 
@@ -3243,6 +3289,11 @@ that row's hydrated identity, enabling transcript/replay deduplication.
 
 Open the tool card identified by `tool_call_id`. Optional
 `arguments_preview` is bounded to 700 characters and is not replayable input.
+UPCR-2026-061 adds optional `write_path` for `write_file`/`edit_file`: the
+original string `path`, bounded to 1024 bytes and secret-redacted, so hydrate
+can restore write artifacts when long content precedes the path in the preview.
+File content is never replayed in this field. Clients advertise support with
+`projection.write_path.v1`; old clients may ignore the additive field.
 
 ```json
 { "type": "tool_start", "data": { "tool_call_id": "tc-1", "name": "read_file", "arguments_preview": "path: input.txt" } }

@@ -90,6 +90,16 @@ pub struct CronJobState {
     pub next_run_at_ms: Option<i64>,
     pub last_run_at_ms: Option<i64>,
     pub last_status: Option<String>,
+    /// Consecutive failed delivery attempts for the current occurrence.
+    #[serde(default)]
+    pub delivery_attempts: u32,
+    /// Last queue/delivery error. Cleared when the session queue accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Original scheduled fire time for the in-flight occurrence. Retry
+    /// backoff changes next_run_at_ms but must not change the dedupe key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_fire_at_ms: Option<i64>,
 }
 
 /// A single cron job.

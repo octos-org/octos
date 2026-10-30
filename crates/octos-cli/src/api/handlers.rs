@@ -9,6 +9,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use octos_agent::inspect_workspace_contract;
 use octos_bus::file_handle::{
     encode_profile_file_handle, encode_tmp_upload_handle, resolve_legacy_file_request,
@@ -17,6 +18,9 @@ use octos_bus::file_handle::{
 // `Message` is used by non-test lib code (`dedupe_history_rows` below),
 // so this import must not be test-gated.
 use octos_core::Message;
+use octos_core::ui_protocol::{
+    RpcError, SessionFilesReadParams, SessionFilesReadResult, rpc_error_codes,
+};
 use octos_core::{MAIN_PROFILE_ID, SessionKey};
 use serde::{Deserialize, Serialize};
 
@@ -187,6 +191,26 @@ fn resolve_session_workspace_root(
     }
     let encoded = octos_bus::session::encode_path_component(base);
     Some(data_dir.join("users").join(encoded).join("workspace"))
+}
+
+/// Workspace binding for UPCR-2026-057. An approved external cwd recorded by
+/// `session/open` is authoritative even when it is outside the profile data
+/// dir; the legacy `/api/files` resolver deliberately rejects that broader
+/// case and must keep its narrower behavior. The legacy fallback remains for
+/// an evicted session that has no recorded binding.
+fn resolve_session_workspace_root_for_read(
+    state: &AppState,
+    data_dir: &std::path::Path,
+    profile_id: Option<&str>,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    let key = octos_core::SessionKey(session_id.to_owned());
+    if let Some(root) =
+        crate::api::ui_protocol_transport::session_workspace_root_for_profile(profile_id, &key)
+    {
+        return Some(root);
+    }
+    resolve_session_workspace_root(state, data_dir, profile_id, session_id)
 }
 
 /// True when `ws` is contained under the authenticated profile data dir.
@@ -1575,6 +1599,143 @@ pub async fn session_files(
     Json(files).into_response()
 }
 
+/// UPCR-2026-057: total file-size ceiling for session workspace reads.
+pub const SESSION_FILE_READ_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// UPCR-2026-057: maximum decoded bytes returned by one RPC response.
+pub const SESSION_FILE_READ_CHUNK_BYTES: u64 = 512 * 1024;
+
+fn workspace_file_error(code: i64, kind: &str, message: impl Into<String>) -> RpcError {
+    RpcError::new(code, message).with_data(serde_json::json!({ "kind": kind }))
+}
+
+/// Read one bounded chunk from an explicitly named file in a session workspace.
+/// The caller resolves the tenant root; this helper never accepts a host path,
+/// an upload handle, or a directory as a substitute for session authorization.
+pub async fn session_file_read(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    identity: Option<&AuthIdentity>,
+    params: SessionFilesReadParams,
+) -> Result<SessionFilesReadResult, RpcError> {
+    if let Err(_response) = authorized_routed_profile_id_from_headers(state, headers, identity) {
+        return Err(workspace_file_error(
+            rpc_error_codes::PERMISSION_DENIED,
+            "workspace_file_access_denied",
+            "session file access is not authorized",
+        ));
+    }
+    let data_dir = resolve_file_access_data_dir(state, headers, identity)
+        .await
+        .map_err(|_response| {
+            workspace_file_error(
+                rpc_error_codes::PERMISSION_DENIED,
+                "workspace_file_access_denied",
+                "session file access is not authorized",
+            )
+        })?;
+    let auth_profile = request_owner_profile(state, headers, identity);
+    read_session_workspace_file(state, &data_dir, auth_profile.as_deref(), params).await
+}
+
+async fn read_session_workspace_file(
+    state: &AppState,
+    data_dir: &std::path::Path,
+    profile_id: Option<&str>,
+    params: SessionFilesReadParams,
+) -> Result<SessionFilesReadResult, RpcError> {
+    let relative = std::path::Path::new(&params.path);
+    if params.path.trim().is_empty()
+        || relative.is_absolute()
+        || params.path.contains('\\')
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(workspace_file_error(
+            rpc_error_codes::INVALID_PARAMS,
+            "workspace_file_invalid_path",
+            "path must be a workspace-relative file path without '..'",
+        ));
+    }
+    let Some(workspace) =
+        resolve_session_workspace_root_for_read(state, data_dir, profile_id, &params.session_id)
+    else {
+        return Err(workspace_file_error(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            "session_workspace_not_found",
+            "session workspace was not found",
+        ));
+    };
+    // Canonicalizing the approved root preserves legitimate symlinked
+    // ancestors (for example macOS /var -> /private/var). Only the
+    // user-controlled relative components then need the no-follow walk.
+    let root = std::fs::canonicalize(&workspace).map_err(|_| {
+        workspace_file_error(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            "session_workspace_not_found",
+            "session workspace was not found",
+        )
+    })?;
+    let offset = params.offset.unwrap_or(0);
+    let length = params
+        .length
+        .map(u64::from)
+        .unwrap_or(SESSION_FILE_READ_CHUNK_BYTES);
+    if length == 0 {
+        return Err(workspace_file_error(
+            rpc_error_codes::INVALID_PARAMS,
+            "workspace_file_invalid_length",
+            "length must be greater than zero",
+        ));
+    }
+    let length = length.min(SESSION_FILE_READ_CHUNK_BYTES);
+    let (bytes, size_bytes, eof) =
+        read_file_chunk_no_follow(root, relative, offset, length).await?;
+    Ok(SessionFilesReadResult {
+        session_id: params.session_id,
+        path: params.path.clone(),
+        size_bytes,
+        offset,
+        eof,
+        mime_type: workspace_mime_type(relative).to_owned(),
+        encoding: "base64".to_owned(),
+        content_base64: BASE64_STANDARD.encode(bytes),
+    })
+}
+
+fn workspace_mime_type(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "md" | "markdown" => "text/markdown",
+        "txt" | "log" => "text/plain",
+        "json" | "jsonl" => "application/json",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
 // Helper for `ui_protocol_transport::handle_session_workspace_get` (M12 Phase D-5).
 // The REST route `GET /api/sessions/{id}/workspace-contract` was retired;
 // this function survives as the implementation backing the WS
@@ -2458,6 +2619,163 @@ async fn read_file_no_follow(path: std::path::PathBuf) -> std::io::Result<Vec<u8
     })
     .await
     .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
+#[cfg(unix)]
+fn open_workspace_file(
+    root: &std::path::Path,
+    relative: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+
+    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    // Walk the approved root itself component-by-component. NOFOLLOW on only
+    // the final leaf would still allow a post-validation ancestor swap.
+    let mut directory = open("/", directory_flags, Mode::empty())?;
+    for component in root.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => {
+                directory = openat(&directory, name, directory_flags, Mode::empty())?;
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "invalid workspace root",
+                ));
+            }
+        }
+    }
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid workspace file path",
+            ));
+        };
+        if components.peek().is_some() {
+            directory = openat(&directory, name, directory_flags, Mode::empty())?;
+        } else {
+            return Ok(
+                openat(&directory, name, file_flags, Mode::empty()).map(std::fs::File::from)?
+            );
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "empty workspace file path",
+    ))
+}
+
+#[cfg(not(unix))]
+fn open_workspace_file(
+    root: &std::path::Path,
+    relative: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    let path = super::file_mutations::checked_path(root, relative)?;
+    let metadata = path.symlink_metadata()?;
+    if metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "workspace path is not a regular file",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "workspace path is not a regular file",
+        ));
+    }
+    std::fs::OpenOptions::new().read(true).open(path)
+}
+
+fn workspace_open_error(error: std::io::Error) -> RpcError {
+    match error.kind() {
+        #[cfg(unix)]
+        _ if error.raw_os_error() == Some(libc::ELOOP)
+            || error.kind() == std::io::ErrorKind::NotADirectory =>
+        {
+            workspace_file_error(
+                rpc_error_codes::PERMISSION_DENIED,
+                "workspace_file_escape",
+                "workspace file must stay inside the session workspace",
+            )
+        }
+        #[cfg(not(unix))]
+        _ if error.kind() == std::io::ErrorKind::NotADirectory => workspace_file_error(
+            rpc_error_codes::PERMISSION_DENIED,
+            "workspace_file_escape",
+            "workspace file must stay inside the session workspace",
+        ),
+        std::io::ErrorKind::PermissionDenied => workspace_file_error(
+            rpc_error_codes::PERMISSION_DENIED,
+            "workspace_file_escape",
+            "workspace file must stay inside the session workspace",
+        ),
+        std::io::ErrorKind::NotFound => workspace_file_error(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            "workspace_file_not_found",
+            "workspace file was not found",
+        ),
+        std::io::ErrorKind::IsADirectory => workspace_file_error(
+            rpc_error_codes::RESOURCE_NOT_FOUND,
+            "workspace_file_not_regular",
+            "workspace path is not a regular file",
+        ),
+        _ => workspace_file_error(
+            rpc_error_codes::INTERNAL_ERROR,
+            "workspace_file_read_failed",
+            "workspace file could not be read",
+        ),
+    }
+}
+
+async fn read_file_chunk_no_follow(
+    root: std::path::PathBuf,
+    relative: &std::path::Path,
+    offset: u64,
+    length: u64,
+) -> Result<(Vec<u8>, u64, bool), RpcError> {
+    let relative = relative.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        use std::io::{Read, Seek};
+
+        let mut file = open_workspace_file(&root, &relative).map_err(workspace_open_error)?;
+        let size = file.metadata().map_err(workspace_open_error)?.len();
+        if size > SESSION_FILE_READ_MAX_BYTES {
+            return Err(workspace_file_error(
+                rpc_error_codes::INVALID_PARAMS,
+                "workspace_file_too_large",
+                format!("workspace file exceeds the {SESSION_FILE_READ_MAX_BYTES}-byte limit"),
+            ));
+        }
+        if offset > size {
+            return Err(workspace_file_error(
+                rpc_error_codes::INVALID_PARAMS,
+                "workspace_file_offset_out_of_range",
+                "offset exceeds the workspace file size",
+            ));
+        }
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(workspace_open_error)?;
+        let mut bytes = Vec::new();
+        file.take(length)
+            .read_to_end(&mut bytes)
+            .map_err(workspace_open_error)?;
+        let eof = offset.saturating_add(bytes.len() as u64) >= size;
+        Ok((bytes, size, eof))
+    })
+    .await;
+    match result {
+        Ok(value) => value,
+        Err(_) => Err(workspace_file_error(
+            rpc_error_codes::INTERNAL_ERROR,
+            "workspace_file_read_failed",
+            "workspace file could not be read",
+        )),
+    }
 }
 
 async fn serve_file_impl(
@@ -5688,6 +6006,325 @@ mod tests {
 
         assert!(map_workspace_belongs_to_tenant(&a_ws, tenant_a.path()));
         assert!(!map_workspace_belongs_to_tenant(&b_ws, tenant_a.path()));
+    }
+
+    fn workspace_for_session(data: &std::path::Path, session_id: &str) -> std::path::PathBuf {
+        let base = session_id.split('#').next().unwrap_or(session_id);
+        data.join("users")
+            .join(octos_bus::session::encode_path_component(base))
+            .join("workspace")
+    }
+
+    fn file_read_params(
+        session_id: &str,
+        path: &str,
+        offset: Option<u64>,
+        length: Option<u32>,
+    ) -> SessionFilesReadParams {
+        SessionFilesReadParams {
+            session_id: session_id.to_owned(),
+            path: path.to_owned(),
+            offset,
+            length,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_file_read_returns_bounded_chunks_and_metadata() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::empty_for_tests();
+        let workspace = workspace_for_session(data.path(), "api:demo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("report.md"), b"hello octos").unwrap();
+
+        let first = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params("api:demo", "report.md", Some(1), Some(4)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.size_bytes, 11);
+        assert_eq!(first.offset, 1);
+        assert!(!first.eof);
+        assert_eq!(first.mime_type, "text/markdown");
+        assert_eq!(first.encoding, "base64");
+        assert_eq!(
+            BASE64_STANDARD.decode(&first.content_base64).unwrap(),
+            b"ello"
+        );
+
+        let last = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params("api:demo", "report.md", Some(5), Some(100)),
+        )
+        .await
+        .unwrap();
+        assert!(last.eof);
+        assert_eq!(
+            BASE64_STANDARD.decode(&last.content_base64).unwrap(),
+            b" octos"
+        );
+
+        std::fs::write(workspace.join("raw.bin"), [0, 255, 1, 128]).unwrap();
+        let binary = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params("api:demo", "raw.bin", None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(binary.mime_type, "application/octet-stream");
+        assert_eq!(
+            BASE64_STANDARD.decode(binary.content_base64).unwrap(),
+            [0, 255, 1, 128]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_file_read_caps_chunk_below_ws_frame_limit() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::empty_for_tests();
+        let workspace = workspace_for_session(data.path(), "api:demo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("large.bin"), vec![7; 600 * 1024]).unwrap();
+        let result = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params("api:demo", "large.bin", None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            BASE64_STANDARD
+                .decode(result.content_base64.clone())
+                .unwrap()
+                .len() as u64,
+            SESSION_FILE_READ_CHUNK_BYTES
+        );
+        assert!(result.content_base64.len() < 1024 * 1024);
+        assert!(!result.eof);
+    }
+
+    #[tokio::test]
+    async fn session_file_read_rejects_traversal_directories_and_symlinks() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::empty_for_tests();
+        let workspace = workspace_for_session(data.path(), "api:demo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        for path in ["../secret.md", "/etc/passwd"] {
+            let error = read_session_workspace_file(
+                &state,
+                data.path(),
+                Some(MAIN_PROFILE_ID),
+                file_read_params("api:demo", path, None, None),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.data.as_ref().unwrap()["kind"],
+                "workspace_file_invalid_path"
+            );
+        }
+        std::fs::create_dir(workspace.join("directory")).unwrap();
+        let error = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params("api:demo", "directory", None, None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_not_regular"
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = data.path().join("outside.md");
+            std::fs::write(&outside, b"secret").unwrap();
+            std::os::unix::fs::symlink(&outside, workspace.join("escape.md")).unwrap();
+            let error = read_session_workspace_file(
+                &state,
+                data.path(),
+                Some(MAIN_PROFILE_ID),
+                file_read_params("api:demo", "escape.md", None, None),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.data.as_ref().unwrap()["kind"],
+                "workspace_file_escape"
+            );
+
+            let outside_dir = data.path().join("outside-dir");
+            std::fs::create_dir(&outside_dir).unwrap();
+            std::fs::write(outside_dir.join("secret.md"), b"secret").unwrap();
+            std::os::unix::fs::symlink(&outside_dir, workspace.join("dir-link")).unwrap();
+            let error = read_session_workspace_file(
+                &state,
+                data.path(),
+                Some(MAIN_PROFILE_ID),
+                file_read_params("api:demo", "dir-link/secret.md", None, None),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.data.as_ref().unwrap()["kind"],
+                "workspace_file_escape"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_file_read_rejects_symlinked_directory_components() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::empty_for_tests();
+        let workspace = workspace_for_session(data.path(), "api:demo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let outside_dir = data.path().join("outside-dir");
+        std::fs::create_dir(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("secret.md"), b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside_dir, workspace.join("dir-link")).unwrap();
+        let error = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params("api:demo", "dir-link/secret.md", None, None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_escape"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_open_error_maps_not_a_directory_to_escape() {
+        let error = workspace_open_error(std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_escape"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_file_read_supports_symlinked_workspace_ancestors() {
+        let data = tempfile::tempdir().unwrap();
+        let real_root = tempfile::tempdir().unwrap();
+        std::fs::write(real_root.path().join("report.md"), b"canonical").unwrap();
+        let alias = data.path().join("workspace-alias");
+        std::os::unix::fs::symlink(real_root.path(), &alias).unwrap();
+        let session = SessionKey("api:symlinked-root".to_owned());
+        crate::api::ui_protocol_transport::set_session_workspace_root_for_test(
+            MAIN_PROFILE_ID,
+            &session,
+            alias,
+        );
+        let state = AppState::empty_for_tests();
+        let result = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params(&session.0, "report.md", None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            BASE64_STANDARD.decode(result.content_base64).unwrap(),
+            b"canonical"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_file_read_uses_approved_external_workspace_binding() {
+        let data = tempfile::tempdir().unwrap();
+        let approved = tempfile::tempdir().unwrap();
+        assert!(!approved.path().starts_with(data.path()));
+        std::fs::write(approved.path().join("report.md"), b"approved").unwrap();
+        let session = SessionKey("api:external-cwd".to_owned());
+        crate::api::ui_protocol_transport::set_session_workspace_root_for_test(
+            MAIN_PROFILE_ID,
+            &session,
+            approved.path().to_path_buf(),
+        );
+        let state = AppState::empty_for_tests();
+        let result = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params(&session.0, "report.md", None, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            BASE64_STANDARD.decode(result.content_base64).unwrap(),
+            b"approved"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_file_read_enforces_size_offset_and_length_limits() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::empty_for_tests();
+        let workspace = workspace_for_session(data.path(), "api:demo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let path = workspace.join("huge.bin");
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(SESSION_FILE_READ_MAX_BYTES + 1)
+            .unwrap();
+        let error = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params("api:demo", "huge.bin", None, None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_too_large"
+        );
+
+        std::fs::write(workspace.join("small.md"), b"ok").unwrap();
+        let error = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params("api:demo", "small.md", Some(3), None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_offset_out_of_range"
+        );
+        let error = read_session_workspace_file(
+            &state,
+            data.path(),
+            Some(MAIN_PROFILE_ID),
+            file_read_params("api:demo", "small.md", None, Some(0)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.data.as_ref().unwrap()["kind"],
+            "workspace_file_invalid_length"
+        );
     }
 
     #[test]

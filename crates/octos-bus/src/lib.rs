@@ -53,7 +53,7 @@ pub mod whatsapp_channel;
 pub use bus::{AgentHandle, BusPublisher, create_bus};
 pub use channel::{Channel, ChannelHealth, ChannelManager};
 pub use cli_channel::CliChannel;
-pub use cron_service::{CronService, write_cron_json_atomic};
+pub use cron_service::{CronDelivery, CronService, write_cron_json_atomic};
 pub use cron_types::{CronJob, CronMode, CronOrigin, CronPayload, CronSchedule, CronStore};
 pub use dedup::MessageDedup;
 pub use heartbeat::HeartbeatService;

@@ -3601,6 +3601,19 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
     let preview_id = PreviewId::new();
     let task_id = TaskId::new();
     let params = match method {
+        APPUI_METHOD_MCP_CONNECTOR_CREATE => json!({
+            "session_id": session_id,
+            "connector": {"transport": "http", "name": "probe", "url": "https://example.com/mcp"}
+        }),
+        APPUI_METHOD_MCP_CONNECTOR_UPDATE => json!({
+            "session_id": session_id, "connector_id": "mcp-probe", "patch": {"name": "probe"}
+        }),
+        APPUI_METHOD_MCP_CONNECTOR_DELETE | APPUI_METHOD_MCP_CONNECTOR_RECONNECT => json!({
+            "session_id": session_id, "connector_id": "mcp-probe"
+        }),
+        APPUI_METHOD_MCP_CONNECTOR_SET_ENABLED => json!({
+            "session_id": session_id, "connector_id": "mcp-probe", "enabled": false
+        }),
         APPUI_METHOD_CLIENT_HELLO => json!({
             "transport": "stdio",
             "supported_features": [],
@@ -3767,6 +3780,10 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
         | methods::SESSION_TASKS_LIST
         | methods::SESSION_WORKSPACE_GET
         | methods::SESSION_DELETE => json!({ "session_id": session_id.to_string() }),
+        methods::SESSION_FILES_READ => json!({
+            "session_id": session_id.to_string(),
+            "path": "report.md"
+        }),
         methods::SESSION_TITLE_SET => json!({
             "session_id": session_id.to_string(),
             "title": "Dispatch parity",
@@ -3795,6 +3812,12 @@ fn dispatch_probe_request(method: &str) -> RpcRequest<Value> {
             }],
             "embed": false,
         }),
+        methods::CRON_CREATE => json!({
+            "session_id": session_id,
+            "schedule": { "kind": "Every", "every_ms": 60000 },
+            "message": "probe cron"
+        }),
+        methods::CRON_DELETE => json!({ "session_id": session_id, "job_id": "probe-job" }),
         methods::CRON_TOGGLE => json!({ "job_id": "probe-job", "enabled": false }),
         methods::ROUTER_SET_MODE => json!({
             "session_id": session_id,
@@ -14547,6 +14570,8 @@ fn shell_approval_event_is_typed_only_after_negotiation() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14623,6 +14648,8 @@ fn risk_default_is_unspecified_when_manifest_silent() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14744,6 +14771,8 @@ fn plugin_high_risk_approval_emits_risk_field_on_wire() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14820,6 +14849,8 @@ fn plugin_critical_risk_approval_emits_risk_critical() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -14889,6 +14920,8 @@ fn shell_approval_still_emits_risk_field() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -15003,6 +15036,8 @@ fn approval_cwd_is_sanitized_against_path_spoof() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -19381,6 +19416,8 @@ async fn session_open_includes_pane_snapshot_after_negotiation() {
             turn_steer_dropped_v1: false,
             session_append_full_history_retry_v1: false,
             session_append_participant_v1: false,
+            session_files_read_v1: false,
+            mcp_connector_manage_v1: false,
             header_present: true,
             stdio_transport: false,
         },
@@ -23850,8 +23887,7 @@ async fn m14_codex_tool_call_dual_emits_raw_and_envelope() {
                 if envelope.envelope.turn_id == turn_id.0.to_string()
                     && matches!(
                         &envelope.envelope.payload,
-                        PayloadV2::ToolStart { name, .. }
-                            if name == "update_plan"
+                        PayloadV2::ToolStart { name, .. } if name == "update_plan"
                     )
         )),
         "ledger must carry the canonical tool_start envelope"
@@ -26859,6 +26895,7 @@ async fn should_keep_background_identity_when_mixed_store_merge_reindexes_the_ro
                 &session_id,
                 "old-tool-turn".into(),
                 PayloadV2::ToolStart {
+                    write_path: None,
                     tool_call_id: format!("old-call-{index}"),
                     name: "read_file".into(),
                     arguments_preview: None,
@@ -27587,6 +27624,7 @@ fn should_limit_hydrate_identity_references_to_the_captured_scope_and_head() {
             &session,
             "after".into(),
             PayloadV2::ToolStart {
+                write_path: None,
                 tool_call_id: "unrelated-tool".into(),
                 name: "read_file".into(),
                 arguments_preview: None,
@@ -28186,6 +28224,7 @@ async fn session_hydrate_surfaces_replayed_envelopes_for_negotiated_client() {
             &session_id,
             "cmid-user-1".into(),
             PayloadV2::ToolStart {
+                write_path: None,
                 tool_call_id: "tc-shell-1".into(),
                 name: "shell".into(),
                 arguments_preview: None,
@@ -29560,6 +29599,7 @@ async fn v2_connection_receives_v2_envelopes_with_stage_one_fields() {
             &session_id,
             turn_id.0.to_string(),
             PayloadV2::ToolStart {
+                write_path: None,
                 tool_call_id: "call-v2-tool".into(),
                 name: "shell".into(),
                 arguments_preview: Some("command: \"cargo test\"".into()),
@@ -32091,6 +32131,7 @@ async fn make_m11e_profile_with_llm_and_sandbox(
         tool_specs: Arc::new(base_tools),
         plugin_tool_names: Vec::new(),
         skill_actions: Vec::new(),
+        mcp_client: None,
         plugin_reload: None,
         plugin_dirs: Vec::new(),
         plugin_prompt_fragments: Vec::new(),
@@ -45550,6 +45591,124 @@ fn should_keep_synthetic_final_distinct_from_same_iteration_model_preamble() {
     assert_eq!(
         final_assistant_segment_id(&response, "turn"),
         "turn:assistant:iteration:2:final"
+    );
+}
+
+#[test]
+fn should_replay_bounded_redacted_write_path_when_content_precedes_it() {
+    let ledger = UiProtocolLedger::new(32);
+    let session = SessionKey("local:write-path-replay".into());
+    let turn = TurnId::new();
+    let started = UiNotification::ToolStarted(ToolStartedEvent {
+        session_id: session.clone(),
+        topic: None,
+        turn_id: turn,
+        tool_call_id: "call-write-1".into(),
+        tool_name: "write_file".into(),
+        arguments: Some(json!({
+            "content": "x".repeat(2_000),
+            "path": "/workspace/AKIAIOSFODNN7EXAMPLE/report.txt"
+        })),
+    });
+    emit_progress_envelope(&ledger, &session, &started, None);
+
+    let replay = ledger
+        .replay_after(
+            &session,
+            Some(&UiCursor {
+                stream: session.0.clone(),
+                seq: 0,
+            }),
+        )
+        .unwrap();
+    assert_eq!(replay.len(), 1);
+    let UiProtocolLedgerEvent::Notification(UiNotification::EnvelopeV2(envelope)) =
+        &replay[0].event
+    else {
+        panic!("expected projected envelope");
+    };
+    let PayloadV2::ToolStart {
+        tool_call_id,
+        write_path,
+        arguments_preview,
+        ..
+    } = &envelope.envelope.payload
+    else {
+        panic!("expected tool/start");
+    };
+    assert_eq!(tool_call_id, "call-write-1");
+    assert_eq!(
+        write_path.as_deref(),
+        Some("/workspace/[REDACTED]/report.txt")
+    );
+    assert!(
+        !arguments_preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("path:"),
+        "the truncated preview is intentionally unable to recover the path"
+    );
+}
+
+#[tokio::test]
+async fn session_hydrate_replays_redacted_write_path_without_full_content() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = state_with_sessions(temp.path());
+    let ledger = event_ledger(&state).await;
+    let session = SessionKey("local:hydrate-write-path".into());
+    {
+        let sessions = state.sessions.as_ref().expect("sessions");
+        let mut guard = sessions.lock().await;
+        guard.get_or_create(&session).await;
+    }
+    let started = UiNotification::ToolStarted(ToolStartedEvent {
+        session_id: session.clone(),
+        topic: None,
+        turn_id: TurnId::new(),
+        tool_call_id: "call-hydrate-write".into(),
+        tool_name: "write_file".into(),
+        arguments: Some(json!({
+            "content": "x".repeat(2_000),
+            "path": "/workspace/AKIAIOSFODNN7EXAMPLE/report.txt"
+        })),
+    });
+    emit_progress_envelope(&ledger, &session, &started, None);
+    let (ws, mut rx) = ws_connection_for_test(8);
+    handle_session_hydrate(
+        &ws,
+        &state,
+        &ledger,
+        &PendingApprovalStore::default(),
+        &PendingQuestionStore::default(),
+        &active_turns_registry(),
+        None,
+        None,
+        features_for_projection_envelope_v2_test(),
+        "hydrate-write-path".into(),
+        SessionHydrateParams {
+            session_id: session,
+            after: None,
+            include: vec![],
+        },
+    )
+    .await;
+    let frame = recv_rpc_json(&mut rx).await;
+    let tools = frame["result"]["replayed_tool_envelopes"]
+        .as_array()
+        .expect("replayed tool envelopes");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(
+        tools[0]["payload"]["data"]["tool_call_id"],
+        "call-hydrate-write"
+    );
+    assert_eq!(
+        tools[0]["payload"]["data"]["write_path"],
+        "/workspace/[REDACTED]/report.txt"
+    );
+    assert!(
+        !tools[0]["payload"]["data"]
+            .to_string()
+            .contains(&"x".repeat(2_000))
     );
 }
 

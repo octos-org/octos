@@ -851,6 +851,7 @@ mod tests {
             tool_specs: Arc::new(base_tools),
             plugin_tool_names: Vec::new(),
             skill_actions: Vec::new(),
+            mcp_client: None,
             plugin_reload: None,
             plugin_dirs: Vec::new(),
             plugin_prompt_fragments: Vec::new(),

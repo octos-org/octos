@@ -18,6 +18,13 @@ pub trait EmbeddingProvider: Send + Sync {
 
     /// The dimensionality of the embedding vectors.
     fn dimension(&self) -> usize;
+
+    /// Whether this provider can currently produce vectors. Providers backed
+    /// by a deferred local model return false while the model downloads;
+    /// remote/configured providers are ready immediately.
+    fn is_ready(&self) -> bool {
+        true
+    }
 }
 
 /// OpenAI-compatible embedding provider.

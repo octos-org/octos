@@ -17,7 +17,7 @@ use octos_agent::{
     HookExecutor, PluginLoadOptions, PluginLoadResult, PluginLoader, SandboxConfig,
     ToolConfigStore, ToolPolicy, ToolRegistry, create_sandbox,
 };
-use octos_bus::CronService;
+use octos_bus::{CronDelivery, CronService};
 use octos_llm::{AdaptiveRouter, LlmProvider, QosCatalog};
 use octos_memory::{EpisodeStore, MemoryStore};
 use tracing::{info, warn};
@@ -487,6 +487,10 @@ pub struct ProfileRuntime {
     /// their owning plugin tools.
     pub skill_actions: Vec<LoadedSkillAction>,
 
+    /// Live MCP connections used by `tool_specs`, retained for real
+    /// connection/failure/closed status instead of inferring from tool names.
+    pub mcp_client: Option<Arc<octos_agent::McpClient>>,
+
     /// Immutable source for mutation-time plugin-layer replacement.
     pub plugin_reload: Option<Arc<ProfilePluginReloadConfig>>,
 
@@ -921,6 +925,7 @@ impl ProfileRuntime {
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             skill_actions: plugin_result.loaded_actions.clone(),
+            mcp_client: self.mcp_client.clone(),
             plugin_reload: Some(reload.clone()),
             plugin_dirs: reload.plugin_dirs.clone(),
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
@@ -1314,12 +1319,21 @@ impl ProfileRuntime {
         // Step 12: MCP servers from the profile's config (typically
         // empty for profile-only deployments; gateway / serve top-
         // level configs may add more on top).
-        if !config.mcp_servers.is_empty() {
+        let mcp_client = if !config.mcp_servers.is_empty() {
             match octos_agent::McpClient::start(&config.mcp_servers).await {
-                Ok(client) => client.register_tools(&mut tools),
-                Err(e) => warn!(profile_id = %profile.id, error = %e, "MCP initialization failed"),
+                Ok(client) => {
+                    let client = Arc::new(client);
+                    client.register_tools(&mut tools);
+                    Some(client)
+                }
+                Err(e) => {
+                    warn!(profile_id = %profile.id, error = %e, "MCP initialization failed");
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
         let plugin_base_tools = Arc::new(tools.snapshot_excluding(&[]));
 
         // Step 13: plugin loading.
@@ -1418,6 +1432,64 @@ impl ProfileRuntime {
         // hook empty, including for spawned agents and plugin reloads.
         let pipeline_factory = None;
 
+        #[derive(Clone)]
+        struct ServeCronDelivery {
+            profile_id: String,
+        }
+
+        #[async_trait::async_trait]
+        impl CronDelivery for ServeCronDelivery {
+            #[cfg(feature = "api")]
+            async fn deliver(&self, job: &octos_bus::CronJob) -> Result<(), String> {
+                let Some(session_id) = job.origin.session_id.as_deref() else {
+                    return Err("session_not_found".to_owned());
+                };
+                if job.origin.profile_id.as_deref() != Some(self.profile_id.as_str()) {
+                    return Err("session_profile_mismatch".to_owned());
+                }
+                let session = octos_core::SessionKey(session_id.to_owned());
+                // A newly opened session has no transcript file yet; its
+                // rehydrated workspace is the authoritative live-session check.
+                if crate::api::ui_protocol_transport::session_workspace_root_for_profile(
+                    Some(&self.profile_id),
+                    &session,
+                )
+                .is_none()
+                {
+                    return Err("session_open_required".to_owned());
+                }
+                let scheduled_fire_at_ms = job
+                    .state
+                    .delivery_fire_at_ms
+                    .or(job.state.next_run_at_ms)
+                    .unwrap_or(job.created_at_ms);
+                // Ordinary timer delivery is not "late" merely because the
+                // scheduled instant has arrived. Only startup catch-up or a
+                // delayed retry beyond the grace window is marked late.
+                let late = chrono::Utc::now().timestamp_millis()
+                    > scheduled_fire_at_ms.saturating_add(60_000);
+                match crate::autonomy::agent_orchestrator::default_agent_orchestrator()
+                    .enqueue_cron_fire_continuation(
+                        &session,
+                        &self.profile_id,
+                        &job.id,
+                        scheduled_fire_at_ms,
+                        &job.payload.message,
+                        late,
+                    )
+                {
+                    crate::autonomy::master_continuation_scheduler::MasterContinuationEnqueueOutcome::Queued(_)
+                    | crate::autonomy::master_continuation_scheduler::MasterContinuationEnqueueOutcome::Duplicate { .. } => Ok(()),
+                }
+            }
+
+            #[cfg(not(feature = "api"))]
+            async fn deliver(&self, _job: &octos_bus::CronJob) -> Result<(), String> {
+                let _ = &self.profile_id;
+                Err("session_open_required".to_owned())
+            }
+        }
+
         // M11-F regression fix REG-2: restore the CronTool registration.
         //
         // Pre-M11-F `serve.rs::try_create_agent` built one `CronService`
@@ -1430,17 +1502,12 @@ impl ProfileRuntime {
         // (`episodes.redb`, `memory.json`) that already live in
         // `data_dir`.
         //
-        // The `cron_tx` here is a dummy channel: serve mode does not
-        // route cron fires through the gateway-style inbound bus, so
-        // the timer-driven sends will fill the bounded channel and be
-        // dropped when the receiver is dropped at the end of this
-        // function. That preserves the pre-M11-F semantics — cron CRUD
-        // (`add` / `list` / `remove` / `enable` / `disable`) works in
-        // serve mode but actual firing only happens under `octos
-        // gateway`. We keep the `Arc<CronService>` alive by stashing it
-        // on `ProfileRuntime::cron_service`; without that field the
-        // tokio task `start()` spawned would be cancelled the moment
-        // this function returned.
+        // Serve uses an acknowledged delivery adapter: an exact existing
+        // session's durable continuation queue must accept the occurrence
+        // before the store records ok/deletes it. The gateway keeps its own
+        // inbound mpsc path unchanged. We keep the `Arc<CronService>` alive
+        // by stashing it on `ProfileRuntime::cron_service`; without that field
+        // the tokio task `start()` spawned would be cancelled on return.
         // A replacement runtime keeps the running service and its shutdown
         // owner: a second `start()` on the same `cron.json` would fire jobs
         // twice, and dropping the previous lifecycle would stop the timer.
@@ -1452,8 +1519,12 @@ impl ProfileRuntime {
         }) {
             Some((cron_service, lifecycle)) => (cron_service, Some(lifecycle)),
             None => {
-                let (cron_tx, _cron_rx) = tokio::sync::mpsc::channel(64);
-                let cron_service = Arc::new(CronService::new(data_dir.join("cron.json"), cron_tx));
+                let cron_service = Arc::new(CronService::new_with_delivery(
+                    data_dir.join("cron.json"),
+                    Arc::new(ServeCronDelivery {
+                        profile_id: profile.id.clone(),
+                    }),
+                ));
                 cron_service.start();
                 let lifecycle = Arc::new(ProfileRuntimeLifecycle {
                     cron_service: Some(cron_service.clone()),
@@ -1669,6 +1740,7 @@ impl ProfileRuntime {
                 memory_store.clone(),
                 embedder.clone(),
                 profile.id.clone(),
+                config.embedding.is_none(),
             );
         }
 
@@ -1731,6 +1803,7 @@ impl ProfileRuntime {
             tool_specs: Arc::new(tools),
             plugin_tool_names: plugin_result.tool_names.clone(),
             skill_actions: plugin_result.loaded_actions.clone(),
+            mcp_client,
             plugin_reload: Some(plugin_reload),
             plugin_dirs,
             plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
@@ -1873,6 +1946,7 @@ pub(crate) fn recall_config_for(
     // non-empty id lets the store adopt a new geometry (purging foreign
     // vectors), which must never happen because credentials or a model file
     // were merely unavailable this run.
+    let embedder = embedder.filter(|provider| provider.is_ready());
     recall_config.embedder_id = match (embedder.is_some(), config.embedding.as_ref()) {
         (false, _) => String::new(),
         // No `embedding` section but an embedder loaded ⇒ the bundled default.
@@ -1895,6 +1969,7 @@ pub(crate) fn spawn_recall_maintenance(
     memory_store: Arc<MemoryStore>,
     embedder: Option<Arc<dyn octos_llm::EmbeddingProvider>>,
     profile_id: String,
+    default_bundled_embedder: bool,
 ) {
     tokio::spawn(async move {
         if let Err(e) =
@@ -1906,7 +1981,24 @@ pub(crate) fn spawn_recall_maintenance(
             // Drain the whole backlog in bounded batches (an embedder change
             // on a large store) instead of stopping after the first batch.
             let mut total = 0usize;
+            let ready_deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
             loop {
+                if !e.is_ready() {
+                    if std::time::Instant::now() >= ready_deadline {
+                        tracing::warn!(profile = %profile_id, "recall: embedding model was not ready before the backfill deadline");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+                if default_bundled_embedder && recall.config().embedder_id.is_empty() {
+                    if let Err(error) = recall.adopt_embedder(crate::embed_model::DEFAULT_MODEL_ID)
+                    {
+                        tracing::warn!(profile = %profile_id, %error, "recall: failed to adopt the ready embedder");
+                        break;
+                    }
+                }
                 match octos_agent::memory_index::backfill_vectors(&recall, e, 512).await {
                     Ok(0) => break,
                     Ok(n) => total += n,

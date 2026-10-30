@@ -149,7 +149,7 @@ pub use hooks::{
     HookConfig, HookContext, HookDeniedError, HookEvent, HookExecutor, HookPayload,
     HookPayloadEnricher, HookResult,
 };
-pub use mcp::{McpClient, McpServerConfig};
+pub use mcp::{McpClient, McpServerConfig, McpServerStatus};
 pub use memory_segment::{
     MEMORY_CAPTURE_POLICY, MEMORY_SEGMENT_NAME, MemorySegmentProvider, compose_memory_segment,
     stable_memory_instructions, volatile_memory_content,
