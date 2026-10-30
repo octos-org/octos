@@ -730,7 +730,12 @@ mod tests {
             profile_store: Some(store.clone()),
             mcp_stdio_allowlist: vec![crate::config::McpStdioAllowlistEntry {
                 id: "echo".into(),
-                command: "/bin/echo".into(),
+                // Absolute executable paths are platform-specific; current_exe
+                // keeps this fixture valid on both Unix and Windows.
+                command: std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
                 args: vec!["fixed".into()],
                 env: HashMap::from([("SECRET".into(), "do-not-echo".into())]),
                 concurrency_class: None,

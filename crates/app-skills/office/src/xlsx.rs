@@ -448,9 +448,12 @@ mod tests {
         }))
         .unwrap();
 
-        let path = generate(input, temp.path()).unwrap();
+        // `output_path` canonicalizes the workspace (including Windows' UNC
+        // prefix), so containment must compare against the same canonical root.
+        let workspace = temp.path().canonicalize().unwrap();
+        let path = generate(input, &workspace).unwrap();
         assert!(path.is_absolute());
-        assert!(path.starts_with(temp.path()));
+        assert!(path.starts_with(&workspace));
         assert!(path.ends_with("nested/book.xlsx"));
 
         let workbook = member(&path, "xl/workbook.xml");
