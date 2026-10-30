@@ -591,6 +591,12 @@ Runtime, auth, profile, and onboarding inspection (server-handled
   staged member and is echoed in each result entry. The limit persists by peer
   slug across session reconnects. Usage is charged after each turn, so one
   turn can overshoot; later turns end with `peer_token_budget_exceeded`.)
+  Generated slugs use lowercase ASCII alphanumerics and hyphens, capped at
+  64 bytes including any numeric collision suffix. Titles or names without
+  ASCII alphanumerics (including Chinese and emoji) use a stable `peer-<hex>`
+  handle; display names and briefs retain their original text. Unnamed peers
+  suffix collisions; explicitly named peers reject duplicates. Clients must
+  use the returned slug/topic rather than derive them from display text.
 - `peer/prepare` host-owned app peers (accepted `UPCR-2026-034`, additive
   fields; a server that lists `peer/context/open` honors them): optional
   `model` names a configured `sub_provider` lane exactly like
