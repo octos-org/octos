@@ -404,6 +404,13 @@ impl WriteFileTool {
             }
         }
 
+        let created = !path.exists();
+        let previous_content = if created {
+            None
+        } else {
+            super::read_file_mutation_previous_text(&path).await
+        };
+
         // #1976 — per-path write fence. SECURITY ROUND (codex): the allowlist
         // decision and the actual open must target the SAME resolved object,
         // or an attacker who swaps a checked ancestor dir for a symlink
@@ -637,6 +644,10 @@ impl WriteFileTool {
             ),
             success: true,
             file_modified: Some(path),
+            structured_metadata: Some(serde_json::json!({
+                "file_created": created,
+                "previous_content": previous_content,
+            })),
             ..Default::default()
         })
     }
@@ -644,6 +655,29 @@ impl WriteFileTool {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn write_file_reports_created_and_previous_content_for_non_git_diffs() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = WriteFileTool::new(dir.path());
+        let created = tool
+            .execute(&serde_json::json!({"path": "note.txt", "content": "old\n"}))
+            .await
+            .unwrap();
+        assert!(created.success, "{}", created.output);
+        let metadata = created.structured_metadata.unwrap();
+        assert_eq!(metadata["file_created"], serde_json::json!(true));
+        assert!(metadata["previous_content"].is_null());
+
+        let overwritten = tool
+            .execute(&serde_json::json!({"path": "note.txt", "content": "new\n"}))
+            .await
+            .unwrap();
+        assert!(overwritten.success, "{}", overwritten.output);
+        let metadata = overwritten.structured_metadata.unwrap();
+        assert_eq!(metadata["file_created"], serde_json::json!(false));
+        assert_eq!(metadata["previous_content"], serde_json::json!("old\n"));
+    }
 
     #[tokio::test]
     async fn should_refuse_write_when_path_enters_a_git_directory() {

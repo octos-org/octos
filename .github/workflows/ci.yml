@@ -1214,11 +1214,11 @@ jobs:
     # octos-agent test binary only on security-path changes — so an ordinary
     # PR gets no macOS compile signal at all.
     #
-    # Compile-only, so the cost is one macos-14 runner for a cargo check, not
+    # Compile-only, so the cost is one macos-15 runner for a cargo check, not
     # a test run. Both steps pass --all-targets so cfg(test) code is compiled
     # too — #2263's break lived in feature-gated test modules, which a
     # lib-only check would never see.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1248,7 +1248,7 @@ jobs:
   build-macos-arm:
     if: github.event_name == 'push'
     needs: [check, test-octos-agent, test-octos-cli]
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -1448,7 +1448,7 @@ jobs:
           fi
 
   e2e-tool-regression:
-    runs-on: macos-14
+    runs-on: macos-15
     needs: [check, test-octos-agent, test-octos-cli, e2e-changes]
     # Run on pushes to main and on every PR whose diff touches the paths in
     # `e2e-changes`. PR-title keyword matching used to gate this job, so a PR
@@ -1603,7 +1603,7 @@ jobs:
         run: pkill -f "octos serve" || true
 
   security:
-    runs-on: macos-14
+    runs-on: macos-15
     needs: [check, test-octos-agent, test-octos-cli]
     # test-octos-cli is skipped on research-only PRs (see `scope`).
     if: >-

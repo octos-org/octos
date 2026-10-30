@@ -103,7 +103,11 @@ pub enum ProgressEvent {
     },
 
     /// File was modified.
-    FileModified { path: String },
+    FileModified {
+        path: String,
+        created: Option<bool>,
+        previous_content: Option<String>,
+    },
 
     /// Model-authored plan/todo checklist snapshot from the `update_plan`
     /// tool. Carried as the serialized `UiPlanRecord` JSON so this low-level
@@ -442,7 +446,7 @@ impl ProgressReporter for ConsoleReporter {
                     }
                 }
             }
-            ProgressEvent::FileModified { path } => {
+            ProgressEvent::FileModified { path, .. } => {
                 println!("{} {} {}", self.green("📝"), self.dim("Modified:"), path);
             }
             ProgressEvent::PlanUpdated { plan } => {

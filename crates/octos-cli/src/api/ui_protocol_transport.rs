@@ -46288,7 +46288,9 @@ fn materialize_file_mutation_diff(
     } else {
         std::env::current_dir().ok()?.join(path)
     };
-    let git_root = find_git_root_for_path(&absolute_path)?;
+    let Some(git_root) = find_git_root_for_path(&absolute_path) else {
+        return render_non_git_file_mutation_diff(notice, &absolute_path);
+    };
     let relative_path = absolute_path.strip_prefix(&git_root).ok()?;
 
     // Primary: working-tree vs index for a TRACKED file — the common edit case.
@@ -46314,6 +46316,75 @@ fn materialize_file_mutation_diff(
     // plain `git diff` above reports nothing and the preview would render an
     // empty "ready" box with no hunks. Render the whole file as additions.
     render_untracked_file_as_additions(&git_root, relative_path, &absolute_path)
+}
+
+/// Non-git fallback driven by authoritative writer metadata. We never infer a
+/// create from the post-write filesystem: overwrites and deletes require the
+/// bounded previous text captured before the mutation.
+fn render_non_git_file_mutation_diff(
+    notice: &UiFileMutationNotice,
+    absolute_path: &Path,
+) -> Option<String> {
+    let current = read_diff_preview_text(absolute_path);
+    match (notice.created, notice.previous_content.as_deref(), current) {
+        (Some(true), _, Some(current)) => render_no_index_text_diff("", &current, &notice.path),
+        (_, Some(previous), Some(current)) => {
+            render_no_index_text_diff(previous, &current, &notice.path)
+        }
+        (_, Some(previous), None) => render_no_index_text_diff(previous, "", &notice.path),
+        _ => None,
+    }
+}
+
+fn read_diff_preview_text(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_DIFF_PREVIEW_BYTES as u64 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn render_no_index_text_diff(previous: &str, current: &str, display_path: &str) -> Option<String> {
+    if previous == current
+        || previous.len() > MAX_DIFF_PREVIEW_BYTES
+        || current.len() > MAX_DIFF_PREVIEW_BYTES
+        || previous.contains('\0')
+        || current.contains('\0')
+    {
+        return None;
+    }
+    let dir = tempfile::tempdir().ok()?;
+    let before = dir.path().join("before");
+    let after = dir.path().join("after");
+    std::fs::write(&before, previous).ok()?;
+    std::fs::write(&after, current).ok()?;
+    let output = Command::new("git")
+        .arg("diff")
+        .arg("--no-index")
+        .arg("--")
+        .arg(&before)
+        .arg(&after)
+        .output()
+        .ok()?;
+    let diff = String::from_utf8(output.stdout).ok()?;
+    let mut normalized = String::with_capacity(diff.len());
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            normalized.push_str(&format!("diff --git a/{display_path} b/{display_path}"));
+        } else if line.starts_with("--- ") {
+            normalized.push_str(&format!("--- a/{display_path}"));
+        } else if line.starts_with("+++ ") {
+            normalized.push_str(&format!("+++ b/{display_path}"));
+        } else {
+            normalized.push_str(line);
+        }
+        normalized.push('\n');
+    }
+    finish_diff_preview(normalized.into_bytes())
 }
 
 /// Trim, cap, and drop-if-empty a raw `git diff` stdout into a preview body.
@@ -49749,6 +49820,10 @@ mod tests;
 #[cfg(test)]
 #[path = "ui_protocol_session_scope_tests.rs"]
 mod session_scope_tests;
+
+#[cfg(test)]
+#[path = "ui_protocol_non_git_diff_tests.rs"]
+mod non_git_diff_tests;
 
 #[cfg(test)]
 #[path = "ui_protocol_monitor_expired_tests.rs"]

@@ -167,7 +167,7 @@ impl ProgressReporter for ChannelStreamReporter {
                 }
             }
             ProgressEvent::LlmStatus { message, .. } => StreamProgressEvent::LlmStatus { message },
-            ProgressEvent::FileModified { path } => StreamProgressEvent::FileWritten { path },
+            ProgressEvent::FileModified { path, .. } => StreamProgressEvent::FileWritten { path },
             ProgressEvent::StreamRetry { .. } => StreamProgressEvent::BufferReset,
             // Forward discrete progress events as raw SSE JSON for the web client.
             ProgressEvent::Thinking { iteration } => {

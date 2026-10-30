@@ -2282,8 +2282,16 @@ impl Agent {
 
                     if let Some(ref file) = tool_result.file_modified {
                         info!(tool = %tc_name, file = %file.display(), "file modified");
+                        let metadata = tool_result.structured_metadata.as_ref();
                         reporter.report(ProgressEvent::FileModified {
                             path: file.display().to_string(),
+                            created: metadata
+                                .and_then(|value| value.get("file_created"))
+                                .and_then(serde_json::Value::as_bool),
+                            previous_content: metadata
+                                .and_then(|value| value.get("previous_content"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToOwned::to_owned),
                         });
                     }
 
@@ -2367,6 +2375,14 @@ impl Agent {
                     });
 
                     let success = tool_result.success;
+                    let mut structured_metadata = tool_result.structured_metadata.take();
+                    if let Some(serde_json::Value::Object(metadata)) = &mut structured_metadata {
+                        metadata.remove("file_created");
+                        metadata.remove("previous_content");
+                        if metadata.is_empty() {
+                            structured_metadata = None;
+                        }
+                    }
                     (
                         tool_result.output,
                         tool_files_modified,
@@ -2374,7 +2390,7 @@ impl Agent {
                         tool_model_media,
                         tool_result.tokens_used,
                         success,
-                        tool_result.structured_metadata,
+                        structured_metadata,
                         // A tool that RAN and reported failure still cascades
                         // (legacy behaviour); only never-ran input errors below
                         // opt out.

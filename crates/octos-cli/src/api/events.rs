@@ -213,8 +213,17 @@ pub(crate) fn event_to_json(event: &ProgressEvent, thread_id: Option<&str>) -> s
         ProgressEvent::Response { iteration, .. } => {
             serde_json::json!({"type": "response", "iteration": iteration})
         }
-        ProgressEvent::FileModified { path } => {
-            serde_json::json!({"type": "file_modified", "path": path})
+        ProgressEvent::FileModified {
+            path,
+            created,
+            previous_content,
+        } => {
+            serde_json::json!({
+                "type": "file_modified",
+                "path": path,
+                "created": created,
+                "previous_content": previous_content,
+            })
         }
         ProgressEvent::PlanUpdated { plan } => {
             serde_json::json!({"type": "plan_updated", "plan": plan})
